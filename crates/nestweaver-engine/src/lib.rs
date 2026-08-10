@@ -153,11 +153,25 @@ pub fn resolve_repo_selector<'a>(
         }
     }
 
-    if let Some(repo) = repos
+    let exact_locations = repos
         .iter()
-        .find(|repo| repo.url == selector || repo.local_root().is_some_and(|root| root == selector))
-    {
-        return Ok(repo);
+        .filter(|repo| {
+            repo.url == selector || repo.local_root().is_some_and(|root| root == selector)
+        })
+        .collect::<Vec<_>>();
+    match exact_locations.as_slice() {
+        [repo] => return Ok(*repo),
+        [] => {}
+        _ => {
+            let candidates = exact_locations
+                .iter()
+                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
+            );
+        }
     }
 
     let matches = repos
@@ -553,6 +567,45 @@ mod repo_selector_tests {
             repo("repo:b", "file:///b", Some("SAME"), Some("/b")),
         ];
         let error = resolve_repo_selector(&repos, "Same")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("repo:a") && error.contains("repo:b"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn selector_rejects_duplicate_exact_urls_and_local_roots() {
+        let duplicate_url = vec![
+            repo(
+                "repo:a",
+                "https://example.test/shared.git",
+                Some("a"),
+                Some("/a"),
+            ),
+            repo(
+                "repo:b",
+                "https://example.test/shared.git",
+                Some("b"),
+                Some("/b"),
+            ),
+        ];
+        let error = resolve_repo_selector(&duplicate_url, "https://example.test/shared.git")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("repo:a") && error.contains("repo:b"),
+            "{error}"
+        );
+
+        let duplicate_root = vec![
+            repo("repo:a", "file:///a", Some("a"), Some("/work/shared")),
+            repo("repo:b", "file:///b", Some("b"), Some("/work/shared")),
+        ];
+        let error = resolve_repo_selector(&duplicate_root, "/work/shared")
             .unwrap_err()
             .to_string();
         assert!(error.contains("ambiguous"), "{error}");

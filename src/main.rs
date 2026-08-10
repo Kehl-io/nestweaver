@@ -11517,10 +11517,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             if config_abs.is_none() && (launchd_owned || live_pidfile) {
                                 let rt = tokio::runtime::Runtime::new()
                                     .context("failed to create tokio runtime")?;
-                                rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
-                                    &db_path_abs,
-                                    nestweaver_client::autostart::daemon_boot_timeout(),
-                                ))?;
+                                let health =
+                                    rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                                        &db_path_abs,
+                                        nestweaver_client::autostart::daemon_boot_timeout(),
+                                    ))?;
+                                // A retry after a slow configless launchd boot
+                                // is allowed to finish the pending reset, but
+                                // only when the live binding for the healthy
+                                // PID attests compiled-default provenance. A
+                                // configured incumbent remains a no-op and
+                                // retains its durable intent. Missing,
+                                // malformed, stale, or PID-mismatched bindings
+                                // fail closed instead of clearing intent.
+                                let binding = nestweaver_daemon::lifecycle::
+                                    read_effective_config_binding_for_verified_pid(
+                                        &instance_id,
+                                        health.pid,
+                                    )
+                                    .context(
+                                        "cannot attest the already-running daemon's effective configuration",
+                                    )?;
+                                if matches!(
+                                    binding.effective_config,
+                                    nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+                                ) {
+                                    finish_manual_default_reset(&db_path_abs, parent_driven_start, &requested_start_config)?;
+                                }
                                 eprintln!("Daemon already running.");
                                 return Ok((EXIT_SUCCESS, None));
                             }
@@ -11650,20 +11673,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             "daemon start cannot confirm that the running launchd agent honors explicit --config",
                                         );
                                     }
-                                    // Deliberately NOT reaping the half-booted
+                                    // Deliberately do not reap the half-booted
                                     // agent: launchd owns its lifecycle and a
-                                    // bootout here would race launchd's next
-                                    // KeepAlive spawn. Report success-with-
-                                    // caveat (exit 0) and point at status+log
-                                    // instead of claiming a failure launchd may
-                                    // still turn into a healthy daemon.
-                                    eprintln!(
-                                        "Daemon is still booting under launchd; check \
-                                         `nestweaver daemon --db {} status` and the logs at {}",
+                                    // bootout here would race its next KeepAlive
+                                    // spawn. The reset is not durable until a
+                                    // live default binding is attested, so do
+                                    // not return a false successful completion.
+                                    return Err(error).context(format!(
+                                        "daemon is still booting under launchd; the default-config reset was not committed. Retry `nestweaver daemon --db {} start` after status becomes healthy. Logs: {}",
                                         db_path.display(),
                                         log_hint
-                                    );
-                                    return Ok((EXIT_SUCCESS, None));
+                                    ));
                                 }
                             }
                         }
@@ -11678,6 +11698,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             std::env::current_exe().context("cannot determine binary path")?;
                         let db_path_abs = abs_for_daemon(&db_path);
                         let config_abs = config.as_deref().map(abs_for_daemon);
+                        let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
                         let mut child = macos_temp_daemon_command(
                             &executable,
                             &db_path_abs,
@@ -11717,7 +11738,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                              ({status})"
                                         );
                                     }
-                                    eprintln!("Daemon started.");
                                 } else {
                                     // A concurrent start won the pidfile race.
                                     // Stop and reap this losing child if it has
@@ -11731,12 +11751,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         let _ = child.kill();
                                         let _ = child.wait();
                                     }
-                                    eprintln!("Daemon already running (PID {}).", health.pid);
                                 }
-                                verify_explicit_config_before_start_success(
+                                let ready = wait_for_started_daemon(
                                     &db_path_abs,
-                                    config_abs.as_deref(),
+                                    pre_start_pid,
+                                    &requested_start_config,
                                 )?;
+                                finish_manual_default_reset(
+                                    &db_path_abs,
+                                    parent_driven_start,
+                                    &requested_start_config,
+                                )?;
+                                if ready.pid == child.id() {
+                                    eprintln!("Daemon started.");
+                                } else {
+                                    eprintln!("Daemon already running (PID {}).", ready.pid);
+                                }
                                 Ok((EXIT_SUCCESS, None))
                             }
                             Err(error) => {

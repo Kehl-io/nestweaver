@@ -61,6 +61,14 @@ pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
     nestweaver_engine::sidecar_path(db_path, ".tantivy")
 }
 
+/// Open the graph for direct stdio serving without ever attempting to become
+/// a writer. A direct MCP process is a read-only peer of the daemon/watcher;
+/// briefly taking the writer lock first can race or block the actual owner.
+fn open_direct_read_only_store(db_path: &Path) -> Result<GraphStore, anyhow::Error> {
+    GraphStore::open_read_only(db_path)
+        .with_context(|| format!("open read-only GraphStore at {}", db_path.display()))
+}
+
 /// Run the brain server on stdio until the client closes stdin or sends
 /// no more lines. Returns Ok on clean shutdown; errors only on truly
 /// unrecoverable conditions (the database failing to open, etc.). Per-call
@@ -91,8 +99,7 @@ pub fn run_stdio_server(
         })
         .transpose()?;
 
-    let store = GraphStore::open_or_readonly(db_path)
-        .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
+    let store = open_direct_read_only_store(db_path)?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
     nestweaver_engine::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
     let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
@@ -1319,4 +1326,17 @@ fn direct_stdio_explicit_config_fails_before_opening_the_graph() {
         .to_string();
     assert!(error.contains("load --config"), "{error}");
     assert!(!db.exists(), "config failure must precede graph creation");
+}
+
+#[test]
+fn direct_stdio_store_coexists_with_a_live_writer_without_taking_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("graph.lbug");
+    let writer = GraphStore::create(&db).expect("create live writer");
+
+    let reader = open_direct_read_only_store(&db)
+        .expect("direct MCP read-only store must coexist with the writer");
+
+    drop(reader);
+    drop(writer);
 }
