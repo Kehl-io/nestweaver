@@ -4268,6 +4268,17 @@ mod brain_search_total_contract_tests {
     fn degraded_repo_is_not_reported_clean_by_either_contract_tool() {
         let store = GraphStore::in_memory().unwrap();
         store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:broken".to_string(),
+                url: "https://example.test/broken".to_string(),
+                indexed_sha: "broken-sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test-instance".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
             .set_contract_derivation_failed("repo:broken", "COPY Contract: duplicate primary key")
             .unwrap();
 
