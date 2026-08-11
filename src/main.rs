@@ -11532,6 +11532,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
                             let config_abs = config.as_deref().map(abs_for_daemon);
+                            // Without RunAtLoad launchd only *registers* the
+                            // agent at login; `install_and_start` kickstarts it
+                            // here, but nothing does after a reboot. Opt in via
+                            // `[daemon] start_at_login` in the very config this
+                            // agent will run with — a configless start has
+                            // nowhere to express the intent, so it stays off.
+                            // Already parsed once by `for_cold_start`, so this
+                            // re-read cannot be the first place a bad config is
+                            // noticed; it still fails closed if it were.
+                            let start_at_login = match config_abs.as_deref() {
+                                Some(path) => {
+                                    nestweaver_engine::InstanceConfig::from_file(path)
+                                        .with_context(|| {
+                                            format!(
+                                                "read [daemon] start_at_login from {}",
+                                                path.display()
+                                            )
+                                        })?
+                                        .daemon
+                                        .start_at_login
+                                }
+                                None => false,
+                            };
                             let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
 
                             // A configless manual start is a reset only when it
@@ -11613,6 +11636,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &log_file,
                                 index_cpu_percent.as_deref(),
                                 config_abs.as_deref(),
+                                start_at_login,
                             );
 
                             // Clean up any existing agent or fork-based daemon
