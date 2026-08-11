@@ -2926,29 +2926,63 @@ where
         let contract_txn = store
             .begin_transaction()
             .context("begin full contract derivation transaction")?;
-        let contracts_derived =
-            match apply_contract_derivation_on(&contract_txn, &r_uid, &contract_plan) {
-                Ok(count) => count,
-                Err(error) => {
-                    drop(contract_txn);
-                    if let Err(marker_error) =
-                        store.set_contract_derivation_failed(&r_uid, &error.to_string())
-                    {
-                        tracing::warn!(
-                            "recording contract derivation failure failed: {marker_error}"
-                        );
-                    }
-                    return Err(error).context("apply full contract derivation");
-                }
-            };
-        store
-            .commit_transaction(&contract_txn)
-            .context("commit full contract derivation transaction")?;
+        // This transaction opens AFTER symbols, edges, and MEMBER_OF have
+        // already committed in their own transactions. Returning Err from here
+        // therefore reported a failed index over a fully written graph — the
+        // same "committed work reported as a failure" defect as a cancelled
+        // index, reached by a different door.
+        //
+        // Degrade instead of failing the run. The preflight parse phase
+        // (`prepare_contract_derivation`, before the write guard) still rejects
+        // a malformed spec with no graph mutation at all, so this path is only
+        // reached when the graph is already durable and the *contracts* alone
+        // could not be applied. Dropping the transaction leaves the previously
+        // derived contract graph intact, exactly as split 1 guaranteed.
+        //
+        // `set_contract_derivation_failed` already marks the repo and split 2
+        // already taught every consumer to read it, so a degraded-but-successful
+        // result reuses that vocabulary end to end rather than inventing a
+        // second way to say the same thing.
+        //
+        // The two incremental paths deliberately keep returning Err: their
+        // contract apply shares one transaction with their symbol writes and
+        // SHA update, so a failure there rolls the entire change back and
+        // commits nothing. Failing is honest for them; it is not honest here.
+        let contract_apply =
+            apply_contract_derivation_checked(&contract_txn, &r_uid, &contract_plan).and_then(
+                |count| {
+                    store
+                        .commit_transaction(&contract_txn)
+                        .context("commit full contract derivation transaction")?;
+                    Ok(count)
+                },
+            );
         drop(contract_txn);
-        if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-            tracing::warn!("clearing contract derivation marker failed: {error}");
-        }
-        let contracts_status = crate::blast_radius::AnalysisStatus::Complete;
+        let (contracts_derived, contracts_status) = match contract_apply {
+            Ok(count) => {
+                if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+                    tracing::warn!("clearing contract derivation marker failed: {error}");
+                }
+                (count, crate::blast_radius::AnalysisStatus::Complete)
+            }
+            Err(error) => {
+                if let Err(marker_error) =
+                    store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                {
+                    tracing::warn!("recording contract derivation failure failed: {marker_error}");
+                }
+                // error!, not warn!: the index succeeds, so this line is the
+                // only place the failure is loud. The previous behavior at
+                // least surfaced a non-zero exit.
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    repo = %r_uid,
+                    "contract derivation failed; the graph is committed and this \
+                     repository is reported as degraded rather than failing the index"
+                );
+                (0, crate::blast_radius::AnalysisStatus::Degraded)
+            }
+        };
         tracing::info!(
             spec_files = spec_files.len(),
             handler_files = handler_files.len(),
@@ -3781,6 +3815,38 @@ fn prepare_contract_derivation(
         input_hashes,
         observed_input_hashes: std::collections::BTreeMap::new(),
     })
+}
+
+// Test seam for the post-write contract-apply failure path.
+//
+// Both production triggers were fixed (UID dedup and CSV dialect, #229) and the
+// strict preflight now rejects a malformed spec before any write, so there is no
+// longer a way to reach the degradation branch from a fixture. Without a seam
+// that branch would ship untested, which is the situation this whole item exists
+// to complain about.
+#[cfg(test)]
+thread_local! {
+    static FAIL_CONTRACT_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm a one-shot injected failure for the next post-write contract apply.
+#[cfg(test)]
+pub(crate) fn fail_next_contract_apply() {
+    FAIL_CONTRACT_APPLY.with(|cell| cell.set(true));
+}
+
+/// [`apply_contract_derivation_on`], consulting the test seam first. A plain
+/// passthrough in non-test builds.
+fn apply_contract_derivation_checked(
+    conn: &nestweaver_store::DbConnection<'_>,
+    r_uid: &str,
+    plan: &ContractDerivationPlan,
+) -> Result<usize, anyhow::Error> {
+    #[cfg(test)]
+    if FAIL_CONTRACT_APPLY.with(|cell| cell.replace(false)) {
+        anyhow::bail!("injected post-write contract apply failure");
+    }
+    apply_contract_derivation_on(conn, r_uid, plan)
 }
 
 /// Replace one repo's derived contract graph on an existing transaction.
@@ -6814,6 +6880,84 @@ function hello(name) { return "Hello " + name; }
              }\n",
         )
         .unwrap();
+    }
+
+    /// A post-write contract-apply failure must DEGRADE, not fail the index.
+    ///
+    /// The preflight parse phase runs before the write guard, so a malformed
+    /// spec is rejected with no graph mutation at all (covered by
+    /// `degraded_contract_derivation_is_not_reported_clean`). This branch is
+    /// the other one: the graph has already committed in earlier transactions
+    /// and only the contracts could not be applied. Returning Err there
+    /// reported a failed index over a fully written graph — committed work
+    /// reported as a failure.
+    ///
+    /// The two incremental paths deliberately still fail: their contract apply
+    /// shares one transaction with their symbol writes and SHA update, so a
+    /// failure rolls the whole change back and commits nothing.
+    #[test]
+    fn post_write_contract_apply_failure_degrades_instead_of_failing_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+
+        let store = GraphStore::in_memory().unwrap();
+        fail_next_contract_apply();
+        let result = reindex_into(&store, &src, "abc123")
+            .expect("a post-write contract failure must not fail the whole index");
+
+        // The index succeeded and says so honestly.
+        assert_eq!(
+            result.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded,
+            "a failed contract apply must report degraded, not complete"
+        );
+        assert_eq!(
+            result.contracts_derived, 0,
+            "no contracts were applied, so none may be claimed"
+        );
+        // The work that DID commit is still there — that is the whole point of
+        // not failing the run.
+        assert!(
+            result.symbols_count > 0,
+            "symbols committed before the contract phase must survive"
+        );
+
+        let repo_uid = store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the repo row must have been written")
+            .uid;
+
+        // Every downstream consumer must see the degradation, using split 2's
+        // vocabulary rather than a second way of saying the same thing.
+        let report = crate::contracts::drift_for_store(&store, Some(&repo_uid)).unwrap();
+        assert!(!report.is_clean(), "a degraded repo must not report clean");
+        assert_eq!(
+            report.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded
+        );
+        assert_eq!(report.degraded_repos, vec![repo_uid.clone()]);
+        let envelope = crate::contracts::drift_envelope(report, 50);
+        assert_eq!(envelope["clean"], serde_json::json!(false));
+        assert_eq!(envelope["contracts_status"], serde_json::json!("degraded"));
+
+        // A later healthy index clears the marker: degradation is a state, not
+        // a permanent stain.
+        let healthy = reindex_into(&store, &src, "def456").expect("healthy reindex must succeed");
+        assert_eq!(
+            healthy.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete
+        );
+        assert!(healthy.contracts_derived > 0);
+        assert!(
+            crate::contracts::drift_for_store(&store, Some(&repo_uid))
+                .unwrap()
+                .is_clean(),
+            "a successful re-index must clear the degradation marker"
+        );
     }
 
     /// A malformed recognized spec fails before graph/SHA publication, retains
