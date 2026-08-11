@@ -353,6 +353,12 @@ jobs:
         run: cargo build --locked
       - name: Validate canonical instance config
         run: cargo run --locked -- config validate examples/minimal-instance.toml
+      - name: Type-check benchmarks
+        # Bench targets are built by neither `cargo build` nor `cargo test`, so
+        # nothing here compiled them until this step existed and they rotted
+        # unnoticed. `check --benches` catches a bench that stops compiling
+        # without paying for a full release-profile `bench --no-run`.
+        run: cargo check --locked --benches
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's

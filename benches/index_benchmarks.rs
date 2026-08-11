@@ -12,22 +12,15 @@
 //! Scaling:
 //!   BENCH_FILES=500 cargo bench --bench index_benchmarks
 
-#[cfg(not(test))]
 use std::path::PathBuf;
-#[cfg(not(test))]
 use std::sync::Once;
 
-#[cfg(not(test))]
 use criterion::{Criterion, criterion_group, criterion_main};
-#[cfg(not(test))]
 use nestweaver_engine::index_directory_with_options;
-#[cfg(not(test))]
 use tempfile::tempdir;
 
-#[cfg(not(test))]
 static INIT_TRACING: Once = Once::new();
 
-#[cfg(not(test))]
 fn init_tracing() {
     INIT_TRACING.call_once(|| {
         use tracing_subscriber::fmt::format::FmtSpan;
@@ -43,7 +36,6 @@ fn init_tracing() {
 }
 
 /// Number of TypeScript files to generate. Pull from env to avoid recompile.
-#[cfg(not(test))]
 fn bench_files() -> usize {
     std::env::var("BENCH_FILES")
         .ok()
@@ -56,7 +48,6 @@ fn bench_files() -> usize {
 /// Each file exports a class with a constructor and two methods that call each
 /// other, producing a realistic symbol + reference density. Files in `src/`
 /// have varying subdirectories to exercise service-node grouping.
-#[cfg(not(test))]
 fn synth_ts_repo(n: usize) -> (tempfile::TempDir, PathBuf) {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -112,7 +103,6 @@ export function create{i}(n: number): Item{i} {{
 
 // ── bench: cold_index ─────────────────────────────────────────────────────
 
-#[cfg(not(test))]
 fn bench_cold_index(c: &mut Criterion) {
     init_tracing();
     let n = bench_files();
@@ -148,7 +138,6 @@ fn bench_cold_index(c: &mut Criterion) {
 
 // ── bench: warm_noop ──────────────────────────────────────────────────────
 
-#[cfg(not(test))]
 fn bench_warm_noop(c: &mut Criterion) {
     init_tracing();
     let n = bench_files();
@@ -194,10 +183,5 @@ fn bench_warm_noop(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(test))]
 criterion_group!(benches, bench_cold_index, bench_warm_noop);
-#[cfg(not(test))]
 criterion_main!(benches);
-
-#[cfg(test)]
-fn main() {}
