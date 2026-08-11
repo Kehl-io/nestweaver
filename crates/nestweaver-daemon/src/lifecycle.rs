@@ -1244,6 +1244,209 @@ pub fn log_hint(instance_id: &str) -> String {
     )
 }
 
+/// True if `db_path` lives under a temporary directory (`/tmp`, `/private/tmp`,
+/// `/var/folders`, or `$TMPDIR`). Daemons for temp DBs are ephemeral (tests,
+/// throwaway repros): they must never receive a persistent launchd agent, and
+/// their state directories are always reclaimable.
+///
+/// Lives here rather than in `launchd` because the predicate is not
+/// launchd-specific and `launchd` is macOS-gated, while state directories
+/// accumulate on every platform.
+pub fn is_temp_db_path(db_path: &Path) -> bool {
+    let mut bases: Vec<PathBuf> = vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var/folders"),
+        PathBuf::from("/private/var/folders"),
+    ];
+    if let Some(t) = std::env::var_os("TMPDIR") {
+        bases.push(PathBuf::from(t));
+    }
+    bases.iter().any(|b| db_path.starts_with(b))
+}
+
+/// Outcome of a [`gc_orphaned_state_dirs`] pass.
+#[derive(Debug, Default)]
+pub struct StateDirGcReport {
+    /// Instance directories deleted (database gone or under a temp dir).
+    pub removed: Vec<String>,
+    /// Bytes reclaimed by those deletions.
+    pub reclaimed_bytes: u64,
+    /// Directories whose database still exists.
+    pub kept: Vec<String>,
+    /// Directories spared because a live daemon still holds the pidfile lock.
+    pub spared: Vec<String>,
+    /// Directories left alone because their database could not be identified.
+    /// Not an error: unidentifiable means undeletable, by design.
+    pub unidentified: Vec<String>,
+}
+
+/// Is a live daemon holding `instance_id`'s pidfile lock?
+///
+/// The daemon opens the DB *before* taking the pidfile `flock(LOCK_EX)` and
+/// holds it for its whole lifetime, so a held lock means a healthy daemon.
+/// Fails toward `true` (spare) on any error we cannot interpret.
+#[cfg(unix)]
+fn instance_daemon_is_live(instance_id: &str) -> bool {
+    let pidfile = pidfile_path(instance_id);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pidfile)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock;
+    }
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn instance_daemon_is_live(_instance_id: &str) -> bool {
+    true
+}
+
+/// A daemon instance directory is named by the 8-hex instance id.
+///
+/// This is the **allowlist** the state sweep is built on. `config-intent/` is a
+/// sibling under the same root holding the persisted startup intent, and its
+/// own children are 64-hex database fingerprints — so neither that directory
+/// nor its contents can ever match this shape. Deleting `config-intent/` is the
+/// catastrophic failure here (it has happened once for real, via a hand-written
+/// `find … -exec rm -rf`), and structural exclusion is what prevents it. Never
+/// replace this with a denylist of known-bad names.
+fn is_instance_dir_name(name: &str) -> bool {
+    name.len() == 8
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
+}
+
+/// Recover the database path a daemon instance was serving, from the first line
+/// its startup wrote to `daemon.log`:
+///
+/// ```text
+/// [daemon] starting for /path/to/brain.lbug (instance repo-1a2b3c4d)
+/// ```
+///
+/// The instance id is a one-way hash of the database path, so this log line is
+/// the only record tying an existing directory back to its database. Returns
+/// `None` when the line is absent or unparseable, which makes the directory
+/// unidentifiable and therefore undeletable.
+fn db_path_from_daemon_log(log: &str) -> Option<PathBuf> {
+    let line = log
+        .lines()
+        .find(|line| line.starts_with("[daemon] starting for "))?;
+    let rest = line.strip_prefix("[daemon] starting for ")?;
+    // A database path may itself contain " (instance ", so anchor on the LAST
+    // occurrence — the suffix this line format always ends with.
+    let end = rest.rfind(" (instance ")?;
+    let path = &rest[..end];
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn directory_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => directory_size_bytes(&entry.path()),
+            Ok(file_type) if file_type.is_file() => {
+                entry.metadata().map(|meta| meta.len()).unwrap_or(0)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Reclaim daemon state directories whose database is gone or was temporary.
+///
+/// The state directory is keyed by a hash of `--db` and created whenever a
+/// daemon auto-spawns. Because writes are daemon-routed, nearly any write-path
+/// test spawns one against its temp database, and nothing removed the directory
+/// when that database went away — 8,525 directories / 547 MB accumulated on one
+/// machine in about a month, exactly one of them live, while `daemon gc`
+/// reported "clean".
+///
+/// Fail-closed at every step. A directory is deleted only when its name matches
+/// the instance-id shape, its database was positively identified, that database
+/// is temporary or missing, and no live daemon holds its pidfile lock. Anything
+/// unreadable, unparseable, or ambiguous is kept.
+pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
+    let root = persistent_state_root();
+    let mut report = StateDirGcReport::default();
+
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        // No state root yet is a clean machine, not a failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Allowlist first, before reading anything inside.
+        if !is_instance_dir_name(name) {
+            continue;
+        }
+        // symlink_metadata: never follow a symlink out of the state root.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            _ => continue,
+        }
+
+        let log = std::fs::read_to_string(path.join("daemon.log")).unwrap_or_default();
+        let Some(db_path) = db_path_from_daemon_log(&log) else {
+            report.unidentified.push(name.to_string());
+            continue;
+        };
+
+        if instance_daemon_is_live(name) {
+            report.spared.push(name.to_string());
+            continue;
+        }
+
+        if !(is_temp_db_path(&db_path) || !db_path.exists()) {
+            report.kept.push(name.to_string());
+            continue;
+        }
+
+        let size = directory_size_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                report.reclaimed_bytes += size;
+                report.removed.push(name.to_string());
+            }
+            // A directory that vanished under us needs no reporting; anything
+            // else stays visible as still present rather than silently counted.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => report.kept.push(name.to_string()),
+        }
+    }
+
+    report.removed.sort();
+    report.kept.sort();
+    report.spared.sort();
+    report.unidentified.sort();
+    Ok(report)
+}
+
 /// Launchd service label for the given instance.
 pub fn launchd_label(instance_id: &str) -> String {
     format!("io.kehl.nestweaver.{instance_id}")
@@ -2078,5 +2281,206 @@ mod tests {
             hint.contains(&log_dir("test1234").display().to_string()),
             "hint must name the directory holding both files: {hint}"
         );
+    }
+
+    /// Set BOTH XDG roots under one ENV_LOCK acquisition. Nesting
+    /// `with_xdg_state` inside `with_xdg_runtime` would deadlock: ENV_LOCK is a
+    /// plain std Mutex and is not reentrant.
+    fn with_xdg_state_and_runtime<T>(state: &Path, runtime: &Path, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state);
+            std::env::set_var("XDG_RUNTIME_DIR", runtime);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match previous_runtime {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Write a state directory as a real daemon boot would leave it.
+    fn seed_state_dir(instance: &str, db_path: &str) {
+        let dir = log_dir(instance);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("daemon.log"),
+            format!("[daemon] starting for {db_path} (instance label-{instance})\nDone: 2 notes\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn instance_dir_allowlist_admits_only_the_instance_id_shape() {
+        assert!(is_instance_dir_name("05c1b2b6"));
+        assert!(is_instance_dir_name("ffffffff"));
+        assert!(is_instance_dir_name("00000000"));
+        // The catastrophic one: the persisted-intent directory and its 64-hex
+        // database-fingerprint children must be structurally inexpressible.
+        assert!(!is_instance_dir_name("config-intent"));
+        assert!(!is_instance_dir_name(
+            "11f099ee842b018cde34fa942a9b537735ed79ee24a6e31fe59b00315ebee205"
+        ));
+        // Near misses.
+        assert!(
+            !is_instance_dir_name("05C1B2B6"),
+            "uppercase is not our shape"
+        );
+        assert!(!is_instance_dir_name("05c1b2b"), "7 chars");
+        assert!(!is_instance_dir_name("05c1b2b6a"), "9 chars");
+        assert!(!is_instance_dir_name("05c1b2g6"), "g is not hex");
+        assert!(!is_instance_dir_name(""));
+        assert!(!is_instance_dir_name(".."));
+    }
+
+    #[test]
+    fn db_path_is_recovered_from_the_daemon_log_boot_line() {
+        assert_eq!(
+            db_path_from_daemon_log(
+                "[daemon] starting for /tmp/x/test.lbug (instance x-05c1b2b6)\nDone: 2 notes\n"
+            ),
+            Some(PathBuf::from("/tmp/x/test.lbug"))
+        );
+        // A database path may itself contain the delimiter; the LAST occurrence
+        // is the real one.
+        assert_eq!(
+            db_path_from_daemon_log(
+                "[daemon] starting for /tmp/a (instance b)/t.lbug (instance x-05c1b2b6)\n"
+            ),
+            Some(PathBuf::from("/tmp/a (instance b)/t.lbug"))
+        );
+        // Unidentifiable inputs yield None, which makes a directory undeletable.
+        assert_eq!(db_path_from_daemon_log(""), None);
+        assert_eq!(db_path_from_daemon_log("Done: 2 notes\n"), None);
+        assert_eq!(
+            db_path_from_daemon_log("[daemon] starting for /tmp/x.lbug\n"),
+            None
+        );
+        assert_eq!(
+            db_path_from_daemon_log("[daemon] starting for  (instance x)\n"),
+            None
+        );
+    }
+
+    /// The regression guard the hazard section calls non-optional: a populated
+    /// `config-intent/` must survive `gc`. A hand-written `find … -exec rm -rf`
+    /// once deleted it for real, leaving the daemon with no persisted intent.
+    #[test]
+    fn gc_state_dirs_never_touches_config_intent() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            let db = PathBuf::from("/tmp/gone-forever-12345/test.lbug");
+            let intent_dir = last_successful_config_dir(&db);
+            std::fs::create_dir_all(&intent_dir).unwrap();
+            let intent_file = intent_dir.join("last-successful-config.json");
+            std::fs::write(&intent_file, r#"{"version":1}"#).unwrap();
+
+            // An unambiguous orphan sits beside it so the sweep is not a no-op:
+            // a test that deletes nothing would "protect" config-intent trivially.
+            seed_state_dir("05c1b2b6", "/tmp/gone-forever-12345/test.lbug");
+
+            let report = gc_orphaned_state_dirs().unwrap();
+
+            assert_eq!(report.removed, vec!["05c1b2b6".to_string()]);
+            assert!(
+                intent_file.exists(),
+                "config-intent must survive gc — deleting it reproduces the \
+                 missing-intent failure this sweep is supposed to avoid"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&intent_file).unwrap(),
+                r#"{"version":1}"#
+            );
+        });
+    }
+
+    #[test]
+    fn gc_state_dirs_reaps_orphans_keeps_live_databases_and_reports_unidentified() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            // Reaped: database path is gone.
+            seed_state_dir("aaaaaaaa", "/nonexistent-root-98765/brain.lbug");
+            // Reaped: temp database, whether or not it still exists.
+            seed_state_dir("bbbbbbbb", "/tmp/ephemeral-54321/test.lbug");
+            // Kept: the database still exists at a NON-temp path. It must be
+            // outside any tempdir — a `tempfile::tempdir()` lives under /tmp, so
+            // the temp rule would reap it and this case would prove nothing.
+            // The sweep only calls `.exists()`, so any stable real file serves.
+            let live_db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            assert!(live_db.exists() && !is_temp_db_path(&live_db));
+            seed_state_dir("cccccccc", live_db.to_str().unwrap());
+            // Kept and REPORTED: no boot line, so the database cannot be named.
+            let unknown = log_dir("dddddddd");
+            std::fs::create_dir_all(&unknown).unwrap();
+            std::fs::write(unknown.join("daemon.log"), "rotated away\n").unwrap();
+
+            let report = gc_orphaned_state_dirs().unwrap();
+
+            assert_eq!(
+                report.removed,
+                vec!["aaaaaaaa".to_string(), "bbbbbbbb".to_string()]
+            );
+            assert_eq!(report.kept, vec!["cccccccc".to_string()]);
+            assert_eq!(report.unidentified, vec!["dddddddd".to_string()]);
+            assert!(
+                report.reclaimed_bytes > 0,
+                "reclaimed bytes must be reported"
+            );
+            assert!(!log_dir("aaaaaaaa").exists());
+            assert!(!log_dir("bbbbbbbb").exists());
+            assert!(
+                log_dir("cccccccc").exists(),
+                "a live database keeps its logs"
+            );
+            assert!(unknown.exists(), "unidentifiable means undeletable");
+        });
+    }
+
+    /// Never reap a live daemon's directory, even when its database path is
+    /// gone — an unmounted volume must not cost a healthy daemon its logs.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_spares_a_directory_whose_daemon_holds_the_pidfile_lock() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("eeeeeeee", "/nonexistent-root-24680/brain.lbug");
+            let pidfile = pidfile_path("eeeeeeee");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, "12345\n").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            // A separate file description, so the sweep's LOCK_NB attempt
+            // genuinely contends the way another process would.
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            let report = gc_orphaned_state_dirs().unwrap();
+
+            assert_eq!(report.spared, vec!["eeeeeeee".to_string()]);
+            assert!(report.removed.is_empty());
+            assert!(log_dir("eeeeeeee").exists());
+
+            unsafe {
+                libc::flock(held.as_raw_fd(), libc::LOCK_UN);
+            }
+        });
     }
 }

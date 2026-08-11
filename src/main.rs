@@ -12447,7 +12447,49 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
-                    println!("daemon gc is a no-op here (launchd is macOS-only).");
+                    println!("No launch agents to sweep (launchd is macOS-only).");
+
+                    // State directories accumulate on EVERY platform: one is
+                    // created whenever a daemon auto-spawns, and nothing removed
+                    // it when the database went away. Reporting "clean" while
+                    // thousands sat beside the agents was the actual defect.
+                    let state = nestweaver_daemon::lifecycle::gc_orphaned_state_dirs()
+                        .context("sweep orphaned daemon state directories")?;
+                    if state.removed.is_empty() {
+                        println!(
+                            "No orphaned state directories found ({} kept, {} spared, {} unidentified).",
+                            state.kept.len(),
+                            state.spared.len(),
+                            state.unidentified.len()
+                        );
+                    } else {
+                        println!(
+                            "Removed {} orphaned state director(ies), reclaiming {}; \
+                             kept {}, spared {}, {} unidentified.",
+                            state.removed.len(),
+                            format_bytes(state.reclaimed_bytes),
+                            state.kept.len(),
+                            state.spared.len(),
+                            state.unidentified.len()
+                        );
+                    }
+                    if !state.spared.is_empty() {
+                        println!(
+                            "  spared (live daemon holds the pidfile lock): {}",
+                            state.spared.len()
+                        );
+                    }
+                    // Surfaced rather than folded into "kept": these are
+                    // directories the sweep could not identify, so they will
+                    // never be reclaimed until something can name their
+                    // database. Silence here would be the same dishonesty this
+                    // item exists to fix.
+                    if !state.unidentified.is_empty() {
+                        println!(
+                            "  left alone (database not identifiable from daemon.log): {}",
+                            state.unidentified.len()
+                        );
+                    }
                     Ok((EXIT_SUCCESS, None))
                 }
 

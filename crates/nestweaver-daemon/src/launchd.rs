@@ -12,22 +12,10 @@ fn launchd_agents_dir() -> PathBuf {
         .join("LaunchAgents")
 }
 
-/// True if `db_path` lives under a temporary directory (`/tmp`, `/private/tmp`,
-/// `/var/folders`, or `$TMPDIR`). Daemons for temp DBs are ephemeral (tests,
-/// throwaway repros) and must never receive a persistent launchd agent — that
-/// was the source of the leaked, crash-looping `io.kehl.nestweaver.*` agents.
-pub fn is_temp_db_path(db_path: &Path) -> bool {
-    let mut bases: Vec<PathBuf> = vec![
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        PathBuf::from("/var/folders"),
-        PathBuf::from("/private/var/folders"),
-    ];
-    if let Some(t) = std::env::var_os("TMPDIR") {
-        bases.push(PathBuf::from(t));
-    }
-    bases.iter().any(|b| db_path.starts_with(b))
-}
+/// Re-exported so this module's callers (and `main.rs`) keep a stable path.
+/// The predicate itself lives in `lifecycle` because it is not
+/// launchd-specific and this module is macOS-gated.
+pub use crate::lifecycle::is_temp_db_path;
 
 /// Escape a dynamic value for use as XML character data in a plist `<string>`.
 fn xml_escape(value: &str) -> String {
