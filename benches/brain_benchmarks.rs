@@ -26,21 +26,15 @@
 //! Results from a representative run are recorded in
 //! docs/architecture/project-brain.md Appendix C.
 
-#[cfg(not(test))]
 use std::path::PathBuf;
 
-#[cfg(not(test))]
 use criterion::{Criterion, criterion_group, criterion_main};
-#[cfg(not(test))]
 use nestweaver_engine::{HybridSearchConfig, build_brain_context_hybrid, index_markdown_directory};
-#[cfg(not(test))]
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
-#[cfg(not(test))]
 use tempfile::tempdir;
 
 /// Number of notes to generate. Pulled from env so larger runs don't
 /// require a recompile.
-#[cfg(not(test))]
 fn bench_notes() -> usize {
     std::env::var("BENCH_NOTES")
         .ok()
@@ -52,7 +46,6 @@ fn bench_notes() -> usize {
 /// preamble, frontmatter with a tag and a type, and ~3 wikilinks to
 /// other notes — roughly the density of a real PKM vault per the
 /// architecture doc.
-#[cfg(not(test))]
 fn synth_vault(n: usize) -> (tempfile::TempDir, PathBuf) {
     let dir = tempdir().unwrap();
     let root = dir.path().join("vault");
@@ -102,7 +95,6 @@ fn synth_vault(n: usize) -> (tempfile::TempDir, PathBuf) {
 
 // ── bench: cold_index ──────────────────────────────────────────────────────
 
-#[cfg(not(test))]
 fn bench_cold_index(c: &mut Criterion) {
     let n = bench_notes();
     let mut group = c.benchmark_group("cold_index");
@@ -126,7 +118,6 @@ fn bench_cold_index(c: &mut Criterion) {
 
 // ── bench: brain_context_query (after warm-up index + PPR) ─────────────────
 
-#[cfg(not(test))]
 fn bench_brain_context_query(c: &mut Criterion) {
     let n = bench_notes();
     let (_dir, root) = synth_vault(n);
@@ -160,7 +151,6 @@ fn bench_brain_context_query(c: &mut Criterion) {
 
 // ── bench: tantivy_search ──────────────────────────────────────────────────
 
-#[cfg(not(test))]
 fn bench_tantivy_search(c: &mut Criterion) {
     let n = bench_notes();
     let (_dir, root) = synth_vault(n);
@@ -180,7 +170,6 @@ fn bench_tantivy_search(c: &mut Criterion) {
 
 // ── bench: ppr_compute (unified scope) ─────────────────────────────────────
 
-#[cfg(not(test))]
 fn bench_ppr_compute(c: &mut Criterion) {
     let n = bench_notes();
     let (_dir, root) = synth_vault(n);
@@ -201,7 +190,6 @@ fn bench_ppr_compute(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(test))]
 criterion_group!(
     benches,
     bench_cold_index,
@@ -209,8 +197,4 @@ criterion_group!(
     bench_tantivy_search,
     bench_ppr_compute,
 );
-#[cfg(not(test))]
 criterion_main!(benches);
-
-#[cfg(test)]
-fn main() {}

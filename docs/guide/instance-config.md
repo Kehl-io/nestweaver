@@ -250,6 +250,30 @@ pin_sha = "abc123"    # optional: pin to a specific commit
 
 ### Optional sections
 
+#### `[daemon]` — Daemon lifecycle policy
+
+```toml
+[daemon]
+# macOS only. Emit RunAtLoad into the generated launch agent so the daemon
+# is *started* at login, not merely registered. Off by default.
+start_at_login = false  # default
+```
+
+Without `RunAtLoad`, launchd registers the agent at login but never starts it.
+`nestweaver daemon start` compensates with an explicit `launchctl kickstart`,
+which covers install time but **not a reboot** — after restarting, the daemon
+comes back only if something else starts it (typically the desktop app running
+as a login item). If you use the CLI or MCP without the app, enable this.
+
+It is opt-in rather than on by default because `RunAtLoad` boots a daemon that
+loads an embedding model at *every* login, including sessions that never touch
+NestWeaver. The one-hour idle exit bounds that cost but does not remove it.
+
+The setting is read from the config the launch agent will run with, so it only
+takes effect on a `daemon start` that was passed a `--config` (directly or via
+persisted config intent). Do not hand-edit the generated plist: every
+`daemon start` overwrites it with generated content.
+
 #### `[pr_impact]` — Pre-push / CI strict-gate policy
 
 Controls what `nestweaver pr-impact --strict` (and the strict `hooks --install

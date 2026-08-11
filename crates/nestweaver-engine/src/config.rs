@@ -222,6 +222,9 @@ pub struct InstanceConfig {
     /// Server-mode configuration (`[server]`).
     #[serde(default)]
     pub server: ServerConfig,
+    /// Daemon lifecycle policy (`[daemon]`).
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Local embedding model and hybrid-search blend configuration (`[embedding]`).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
@@ -711,6 +714,20 @@ pub struct ServerConfig {
     pub indexing: IndexingConfig,
 }
 
+/// `[daemon]` — daemon lifecycle policy.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DaemonConfig {
+    /// Emit `RunAtLoad` into the generated macOS launch agent, so the daemon
+    /// is *started* at login and not merely registered.
+    ///
+    /// Opt-in rather than defaulted on: `RunAtLoad` boots a daemon that loads
+    /// an embedding model at every login, including for sessions that never
+    /// touch NestWeaver. The one-hour idle exit bounds that cost but does not
+    /// remove it, so the choice belongs to the operator.
+    #[serde(default)]
+    pub start_at_login: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct IndexingConfig {
     #[serde(default = "default_workers")]
@@ -1157,6 +1174,26 @@ credential_method = "ssh"
 [[repos]]
 url = "https://github.com/example/repo"
 "#;
+
+    #[test]
+    fn daemon_start_at_login_is_opt_in_and_absent_by_default() {
+        // No `[daemon]` section at all — the overwhelmingly common case, and
+        // the one that must not start booting a daemon at every login.
+        let default = InstanceConfig::from_toml_str(MINIMAL_TOML)
+            .expect("minimal config must parse without a [daemon] section");
+        assert!(!default.daemon.start_at_login);
+
+        // Section present but the key omitted.
+        let empty_section =
+            InstanceConfig::from_toml_str(&format!("{MINIMAL_TOML}\n[daemon]\n")).unwrap();
+        assert!(!empty_section.daemon.start_at_login);
+
+        let opted_in = InstanceConfig::from_toml_str(&format!(
+            "{MINIMAL_TOML}\n[daemon]\nstart_at_login = true\n"
+        ))
+        .expect("[daemon] start_at_login must be an accepted key");
+        assert!(opted_in.daemon.start_at_login);
+    }
 
     #[test]
     fn shipped_instance_configs_parse() {

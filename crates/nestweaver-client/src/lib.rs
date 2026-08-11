@@ -78,7 +78,7 @@ impl RestartConfig {
                 anyhow::bail!(
                     "cannot honor persisted daemon configuration for {}: {error}. \
                      To deliberately reset this database to compiled defaults, run \
-                     `nestweaver daemon --db {} start`",
+                     `nestweaver daemon --db {} start --reset`",
                     db_path.display(),
                     db_path.display()
                 );
@@ -87,7 +87,7 @@ impl RestartConfig {
         let recorded = PathBuf::from(&record.config_path);
         let canonical = validate_restart_config(&recorded).with_context(|| {
             format!(
-                "persisted daemon config {} for {} is no longer usable; automatic startup refuses to fall back to compiled defaults. To deliberately reset, run `nestweaver daemon --db {} start`",
+                "persisted daemon config {} for {} is no longer usable; automatic startup refuses to fall back to compiled defaults. To deliberately reset, run `nestweaver daemon --db {} start --reset`",
                 recorded.display(),
                 db_path.display(),
                 db_path.display()
@@ -95,7 +95,7 @@ impl RestartConfig {
         })?;
         anyhow::ensure!(
             canonical == recorded,
-            "persisted daemon config path is not canonical: {}. To deliberately reset, run `nestweaver daemon --db {} start`",
+            "persisted daemon config path is not canonical: {}. To deliberately reset, run `nestweaver daemon --db {} start --reset`",
             recorded.display(),
             db_path.display()
         );

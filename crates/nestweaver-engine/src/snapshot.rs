@@ -807,6 +807,12 @@ pub fn schema_hashes(cfg: Option<&crate::config::InstanceConfig>) -> (String, St
 mod tests {
     use super::*;
 
+    /// The last engine release before the v2 snapshot floor was raised. A
+    /// historical fact, so it is correctly a literal — unlike the *current*
+    /// reader, which must track `MIN_SNAPSHOT_READER_VERSION` or these tests
+    /// break at every release that raises the floor.
+    const PRE_V2_READER: &str = "4.1.0";
+
     fn make_stamp(
         engine_version: &str,
         min_compatible: &str,
@@ -1169,8 +1175,14 @@ mod tests {
         verify_snapshot(&snap_dir).unwrap();
 
         let work = dir.path().join("work");
-        let materialized =
-            materialize_snapshot_with_config(&snap_dir, &work, "4.1.0", None, None).unwrap();
+        let materialized = materialize_snapshot_with_config(
+            &snap_dir,
+            &work,
+            MIN_SNAPSHOT_READER_VERSION,
+            None,
+            None,
+        )
+        .unwrap();
         let replica = nestweaver_store::GraphStore::open_read_only(&materialized).unwrap();
         assert_eq!(replica.embedding_count(), 2);
         assert_eq!(replica.embedding_dimension().unwrap(), 3);
@@ -1194,10 +1206,15 @@ mod tests {
         assert_eq!(stamp.format_version, SNAPSHOT_FORMAT_VERSION);
         assert_eq!(stamp.min_compatible_engine, MIN_SNAPSHOT_READER_VERSION);
         assert!(
-            !semver_ge("4.1.0", &stamp.min_compatible_engine),
-            "the last pre-v2 reader must reject the raised compatibility floor"
+            !semver_ge(PRE_V2_READER, &stamp.min_compatible_engine),
+            "the last pre-v2 reader must sit below the raised compatibility floor"
         );
-        load_snapshot_with_config(&snap_dir, "4.1.0", None, None)
+        // Assert the fence actually FENCES. Previously this test only checked
+        // the semver relation and then expected the same old reader to load,
+        // which is self-contradictory the moment the floor rises past it.
+        load_snapshot_with_config(&snap_dir, PRE_V2_READER, None, None)
+            .expect_err("a pre-v2 reader must be refused by the raised floor");
+        load_snapshot_with_config(&snap_dir, MIN_SNAPSHOT_READER_VERSION, None, None)
             .expect("the v2-capable reader must accept the v2 snapshot it wrote");
     }
 
@@ -1214,7 +1231,16 @@ mod tests {
         std::fs::write(work.join("sentinel"), b"old replica").unwrap();
         std::fs::write(snap_dir.join(GRAPH_FILE), b"tampered").unwrap();
 
-        assert!(materialize_snapshot_with_config(&snap_dir, &work, "4.1.0", None, None).is_err());
+        assert!(
+            materialize_snapshot_with_config(
+                &snap_dir,
+                &work,
+                MIN_SNAPSHOT_READER_VERSION,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read(work.join("sentinel")).unwrap(),
             b"old replica"
@@ -1241,7 +1267,7 @@ mod tests {
         let error = materialize_snapshot_with_config_and_hook(
             &snap_dir,
             &work,
-            "4.1.0",
+            MIN_SNAPSHOT_READER_VERSION,
             None,
             None,
             || std::fs::write(snap_dir.join(GRAPH_FILE), b"changed after verification").unwrap(),
@@ -1293,21 +1319,28 @@ mod tests {
         let db = make_test_db(dir.path());
         let core = make_stamp("4.1.0", "0.11.0", "core-effective", "");
         build_snapshot(&core_dir, &core, &make_manifest(), &db).unwrap();
-        load_snapshot_with_config(&core_dir, "4.1.0", None, None).unwrap();
+        load_snapshot_with_config(&core_dir, MIN_SNAPSHOT_READER_VERSION, None, None).unwrap();
 
         let extension_dir = dir.path().join("extension");
         let mut extension = core;
         extension.schema_hash_extensions = "extension-hash".to_string();
         extension.schema_hash_effective = "extension-effective".to_string();
         build_snapshot(&extension_dir, &extension, &make_manifest(), &db).unwrap();
-        let error = load_snapshot_with_config(&extension_dir, "4.1.0", None, None).unwrap_err();
+        let error =
+            load_snapshot_with_config(&extension_dir, MIN_SNAPSHOT_READER_VERSION, None, None)
+                .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("requires the matching instance config")
         );
-        load_snapshot_with_config(&extension_dir, "4.1.0", Some("extension-effective"), None)
-            .unwrap();
+        load_snapshot_with_config(
+            &extension_dir,
+            MIN_SNAPSHOT_READER_VERSION,
+            Some("extension-effective"),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -1,4 +1,3 @@
-#[cfg(not(test))]
 fn main() {
     #[cfg(feature = "embed")]
     {
@@ -49,6 +48,3 @@ fn main() {
         eprintln!("Benchmark requires --features embed");
     }
 }
-
-#[cfg(test)]
-fn main() {}

@@ -12,22 +12,10 @@ fn launchd_agents_dir() -> PathBuf {
         .join("LaunchAgents")
 }
 
-/// True if `db_path` lives under a temporary directory (`/tmp`, `/private/tmp`,
-/// `/var/folders`, or `$TMPDIR`). Daemons for temp DBs are ephemeral (tests,
-/// throwaway repros) and must never receive a persistent launchd agent — that
-/// was the source of the leaked, crash-looping `io.kehl.nestweaver.*` agents.
-pub fn is_temp_db_path(db_path: &Path) -> bool {
-    let mut bases: Vec<PathBuf> = vec![
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        PathBuf::from("/var/folders"),
-        PathBuf::from("/private/var/folders"),
-    ];
-    if let Some(t) = std::env::var_os("TMPDIR") {
-        bases.push(PathBuf::from(t));
-    }
-    bases.iter().any(|b| db_path.starts_with(b))
-}
+/// Re-exported so this module's callers (and `main.rs`) keep a stable path.
+/// The predicate itself lives in `lifecycle` because it is not
+/// launchd-specific and this module is macOS-gated.
+pub use crate::lifecycle::is_temp_db_path;
 
 /// Escape a dynamic value for use as XML character data in a plist `<string>`.
 fn xml_escape(value: &str) -> String {
@@ -231,11 +219,16 @@ pub fn generate_plist(
         log_path,
         index_cpu_percent,
         None,
+        false,
     )
 }
 
 /// Render a per-instance launch agent, optionally forwarding an absolute
 /// instance configuration path to the foreground `daemon run` process.
+///
+/// `start_at_login` emits `RunAtLoad`. Without it launchd *registers* the agent
+/// at login but never starts it — `install_and_start` compensates with an
+/// explicit `kickstart`, which covers install time but not reboot.
 pub fn generate_plist_with_config(
     instance_id: &str,
     binary_path: &Path,
@@ -243,6 +236,7 @@ pub fn generate_plist_with_config(
     log_path: &Path,
     index_cpu_percent: Option<&str>,
     config_path: Option<&Path>,
+    start_at_login: bool,
 ) -> String {
     let label = xml_escape(&lifecycle::launchd_label(instance_id));
     let binary = xml_escape(&binary_path.display().to_string());
@@ -266,6 +260,14 @@ pub fn generate_plist_with_config(
             )
         }
         None => String::new(),
+    };
+
+    // Opt-in. Omitted entirely rather than emitted as `<false/>` so a plist
+    // from a machine that never opted in is byte-identical to the old output.
+    let run_at_load = if start_at_login {
+        "    <key>RunAtLoad</key>\n    <true/>\n"
+    } else {
+        ""
     };
 
     format!(
@@ -299,7 +301,7 @@ pub fn generate_plist_with_config(
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
-{env_block}</dict>
+{run_at_load}{env_block}</dict>
 </plist>
 "#
     )
@@ -480,6 +482,7 @@ mod tests {
             Path::new("/tmp/log"),
             None,
             Some(Path::new("/Users/k/dev/repo/nestweaver-instance.toml")),
+            false,
         );
         assert!(
             plist.contains(
@@ -494,6 +497,64 @@ mod tests {
         );
     }
 
+    /// `RunAtLoad` is what makes the agent *start* at login rather than merely
+    /// register. It is opt-in, and when off the key must be absent entirely —
+    /// not `<false/>` — so plists on machines that never opted in are unchanged.
+    #[test]
+    fn plist_omits_run_at_load_unless_start_at_login_is_set() {
+        let plist = generate_plist_with_config(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+            None,
+            false,
+        );
+        assert!(!plist.contains("RunAtLoad"), "{plist}");
+        // The 5-arg convenience wrapper must not silently opt a caller in.
+        let default_plist = generate_plist(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+        );
+        assert!(!default_plist.contains("RunAtLoad"), "{default_plist}");
+    }
+
+    #[test]
+    fn plist_emits_run_at_load_when_start_at_login_is_set() {
+        let plist = generate_plist_with_config(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            Some("45"),
+            Some(Path::new("/Users/k/dev/repo/nestweaver-instance.toml")),
+            true,
+        );
+        assert!(
+            plist.contains("<key>RunAtLoad</key>\n    <true/>"),
+            "{plist}"
+        );
+        // RunAtLoad must sit as a sibling of the other top-level keys, not
+        // inside the EnvironmentVariables dict it is rendered next to.
+        assert!(
+            plist.contains(
+                "<key>ProcessType</key>\n    <string>Interactive</string>\n    \
+                 <key>RunAtLoad</key>\n    <true/>\n    <key>EnvironmentVariables</key>"
+            ),
+            "{plist}"
+        );
+        // Coexists with the other dynamic blocks without disturbing them.
+        assert_eq!(
+            parse_db_path_from_plist(&plist),
+            Some(PathBuf::from("/Users/k/dev/repo/brain.lbug"))
+        );
+        assert!(plist.contains("<string>--config</string>"), "{plist}");
+    }
+
     #[test]
     fn plist_escapes_all_dynamic_strings_and_round_trips_db_path() {
         let metacharacters = r#"& < > " '"#;
@@ -504,8 +565,15 @@ mod tests {
         let log = PathBuf::from(format!("/Users/k/Logs {metacharacters}/daemon.log"));
         let cpu = format!("cpu-{metacharacters}");
 
-        let plist =
-            generate_plist_with_config(&instance_id, &binary, &db, &log, Some(&cpu), Some(&config));
+        let plist = generate_plist_with_config(
+            &instance_id,
+            &binary,
+            &db,
+            &log,
+            Some(&cpu),
+            Some(&config),
+            false,
+        );
         let escaped = "&amp; &lt; &gt; &quot; &apos;";
 
         for expected in [
@@ -534,8 +602,15 @@ mod tests {
         let config = PathBuf::from(format!("/Users/k/Config {metacharacters}/instance.toml"));
         let log = PathBuf::from(format!("/Users/k/Logs {metacharacters}/daemon.log"));
         let cpu = format!("cpu-{metacharacters}");
-        let plist =
-            generate_plist_with_config(&instance_id, &binary, &db, &log, Some(&cpu), Some(&config));
+        let plist = generate_plist_with_config(
+            &instance_id,
+            &binary,
+            &db,
+            &log,
+            Some(&cpu),
+            Some(&config),
+            false,
+        );
         let dir = tempfile::tempdir().unwrap();
         let plist_path = dir.path().join("special-values.plist");
         std::fs::write(&plist_path, &plist).unwrap();
@@ -590,6 +665,52 @@ mod tests {
         assert_eq!(
             decoded["EnvironmentVariables"]["NESTWEAVER_INDEX_CPU_PERCENT"],
             serde_json::json!(cpu)
+        );
+        assert_eq!(decoded.get("RunAtLoad"), None);
+    }
+
+    /// launchd, not just the XML parser, has to accept `RunAtLoad` where we put
+    /// it. A structural string assertion cannot prove the key decodes as a
+    /// top-level boolean rather than landing inside a neighboring dict.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_with_run_at_load_decodes_as_a_top_level_boolean() {
+        let plist = generate_plist_with_config(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            Some("45"),
+            Some(Path::new("/Users/k/dev/repo/nestweaver-instance.toml")),
+            true,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let plist_path = dir.path().join("run-at-load.plist");
+        std::fs::write(&plist_path, &plist).unwrap();
+
+        let lint = Command::new("plutil")
+            .arg("-lint")
+            .arg(&plist_path)
+            .output()
+            .expect("plutil must be available on macOS");
+        assert!(
+            lint.status.success(),
+            "plutil rejected generated plist:\n{}",
+            String::from_utf8_lossy(&lint.stderr)
+        );
+
+        let json = Command::new("plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&plist_path)
+            .output()
+            .expect("plutil must decode generated plist");
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&json.stdout).expect("plutil must emit JSON");
+        assert_eq!(decoded["RunAtLoad"], serde_json::json!(true));
+        // Still a sibling of, not swallowed by, the env dict.
+        assert_eq!(
+            decoded["EnvironmentVariables"]["NESTWEAVER_INDEX_CPU_PERCENT"],
+            serde_json::json!("45")
         );
     }
 
