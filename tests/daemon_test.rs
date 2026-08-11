@@ -1482,6 +1482,119 @@ fn daemon_crash_recovery() {
         .stdout(contains("running").and(contains("PID")));
 }
 
+/// A configless `daemon start` must REUSE the last configuration that reached
+/// readiness instead of silently resetting to compiled defaults.
+///
+/// This is the boundary invariant. Before it, "preserve config across cold
+/// starts" was a property of the client-side autostart wrapper only: the
+/// desktop app issues a bare `daemon start`, so it booted a compiled-defaults
+/// daemon whose `data_instance_id` collapsed to the database-path hash.
+/// Project-scoped queries then returned nothing while plain search still looked
+/// fine — a silent failure reported as success.
+///
+/// Reset stays available, but only as an explicit `--reset`.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_configless_start_reuses_persisted_config_intent_until_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("intent-boundary").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    let config = dir.path().join("pinned.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+instance_id = "intent-boundary"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            dir.path().join("snapshots").display(),
+            dir.path().join("workspace").display()
+        ),
+    )
+    .unwrap();
+    let canonical = std::fs::canonicalize(&config).unwrap();
+
+    let status = || {
+        let output = daemon_action_cmd(&db_path, "status").output().unwrap();
+        assert!(output.status.success(), "status failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let intent_record = nestweaver_daemon::lifecycle::last_successful_config_path(&db_path);
+
+    // Establish the intent: one configured start that reaches readiness.
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(
+        status().contains(&format!("Config: {}", canonical.display())),
+        "configured start must report its config"
+    );
+    assert!(
+        intent_record.exists(),
+        "a configured start that reached readiness must persist its intent"
+    );
+    stop_daemon(&db_path);
+
+    // The regression this item exists to fix: a bare start — exactly what the
+    // desktop app issues — must come back configured, not defaulted.
+    daemon_action_cmd(&db_path, "start").assert().success();
+    assert!(
+        status().contains(&format!("Config: {}", canonical.display())),
+        "a configless start must reuse persisted intent rather than reset to \
+         compiled defaults — got: {}",
+        status()
+    );
+    stop_daemon(&db_path);
+
+    // Reset remains possible, but only when asked for explicitly.
+    daemon_action_cmd(&db_path, "start")
+        .arg("--reset")
+        .assert()
+        .success();
+    let after_reset = status();
+    assert!(
+        !after_reset.contains(&format!("Config: {}", canonical.display())),
+        "--reset must drop the pinned config — got: {after_reset}"
+    );
+    assert!(
+        !intent_record.exists(),
+        "--reset must discard the persisted intent record"
+    );
+    stop_daemon(&db_path);
+
+    // And the reset must STICK. With the record gone there is nothing left to
+    // honor, so the next bare start stays on compiled defaults rather than
+    // resurrecting the old config.
+    daemon_action_cmd(&db_path, "start").assert().success();
+    assert!(
+        !status().contains(&format!("Config: {}", canonical.display())),
+        "a reset must not be undone by the next configless start"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown() {
@@ -1928,11 +2041,20 @@ credential_method = "gh"
     let persisted = nestweaver_daemon::lifecycle::read_last_successful_config(&db_path).unwrap();
     assert_eq!(Path::new(&persisted.config_path), canonical_b);
 
-    // Once cold, the same explicit manual invocation is the reset escape
-    // hatch. It bypasses persisted intent and clears it only after the new
-    // default daemon is healthy and attested.
+    // Once cold, reset is still the escape hatch — but it is now an explicit
+    // `--reset` rather than a bare `start`. A configless start reuses persisted
+    // intent at the daemon boundary (see
+    // `daemon_configless_start_reuses_persisted_config_intent_until_reset`),
+    // because the desktop app issues exactly that command and was silently
+    // resetting configured databases to compiled defaults. Making a bare start
+    // reuse intent is the fix; it forces reset to become something a user asks
+    // for. Intent is still cleared only after the new default daemon is
+    // healthy and attested.
     daemon_action_cmd(&db_path, "stop").assert().success();
-    daemon_action_cmd(&db_path, "start").assert().success();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--reset")
+        .assert()
+        .success();
     assert!(status().contains("Config: none"));
     assert!(matches!(
         nestweaver_daemon::lifecycle::read_last_successful_config(&db_path),

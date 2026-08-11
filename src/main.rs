@@ -3181,6 +3181,15 @@ enum DaemonAction {
         /// parity to the direct-disk CLI path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Reset this database to compiled defaults, discarding the persisted
+        /// startup-intent record.
+        ///
+        /// Without this flag a configless start REUSES the last configuration
+        /// that reached readiness, so the app and a hand-typed `daemon start`
+        /// no longer silently drop to compiled defaults. Reset is an explicit
+        /// request rather than the accidental default.
+        #[arg(long, conflicts_with = "config")]
+        reset: bool,
         /// Hidden: redirect users who pass this flag here to the correct command.
         #[arg(long, hide = true)]
         track_interactions: bool,
@@ -11472,6 +11481,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 DaemonAction::Start {
                     idle_timeout,
                     config,
+                    reset,
                     track_interactions,
                 } => {
                     // Serialize every direct start from incumbent preflight
@@ -11491,12 +11501,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     // Validate before any platform-specific stop/install or
                     // daemonize mutation. A bad explicit path must leave an
-                    // already-running daemon untouched. `None` intentionally
-                    // means compiled defaults here: manual `daemon start` is
-                    // the reset path, while automatic parents have already
-                    // resolved persisted intent and pass it as `--config`.
-                    let requested_start_config =
-                        nestweaver_client::RestartConfig::for_cold_start(config.as_deref())?;
+                    // already-running daemon untouched.
+                    //
+                    // A configless start now REUSES the persisted intent rather
+                    // than meaning "compiled defaults". Resolving here — not
+                    // only in the client-side autostart wrapper — is what makes
+                    // the invariant hold at the boundary, so the desktop app's
+                    // bare `daemon start` and a hand-typed one behave alike.
+                    // Reset survives as `--reset`, an explicit request.
+                    let requested_start_config = if reset {
+                        // `--reset` conflicts with `--config` at the clap layer,
+                        // so this is unambiguously "compiled defaults".
+                        nestweaver_client::RestartConfig::CompiledDefaults
+                    } else {
+                        nestweaver_client::RestartConfig::for_automatic_cold_start(
+                            &db_path,
+                            config.as_deref(),
+                        )?
+                    };
+                    // Discard the record BEFORE spawning, not after attestation.
+                    // The child `daemon run` resolves intent itself, so a record
+                    // still on disk when it boots would make it come up
+                    // configured while this parent cleared the record behind it
+                    // — a reset that resets nothing this boot and everything the
+                    // next. An explicit `--reset` is exactly the case where
+                    // losing the record is the requested outcome, so the
+                    // post-attestation caution that protects an accidental
+                    // configless start does not apply.
+                    if reset {
+                        nestweaver_daemon::lifecycle::remove_last_successful_config(&db_path)
+                            .context("discard persisted startup intent for --reset")?;
+                    }
+                    // The config the child actually boots with. Everything that
+                    // SPAWNS or PERSISTS uses this; the incumbent-assertion
+                    // checks below deliberately keep using the explicit CLI arg,
+                    // because "I passed --config X" is a claim about the running
+                    // daemon and a reused record is not such a claim.
+                    //
+                    // Spawning with the raw arg instead is a real failure, not a
+                    // tidiness point: the parent captures `requested_start_config`
+                    // and attests the child against it, so a child booted from
+                    // `None` comes up CompiledDefaults and the start dies with
+                    // "replacement daemon effective config ... does not match
+                    // captured restart config".
+                    let effective_config: Option<PathBuf> =
+                        requested_start_config.as_path().map(PathBuf::from);
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
@@ -11532,6 +11581,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
                             let config_abs = config.as_deref().map(abs_for_daemon);
+                            // The resolved config the agent will boot with —
+                            // may come from the persisted record, not the CLI.
+                            let effective_config_abs =
+                                effective_config.as_deref().map(abs_for_daemon);
                             let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
 
                             // A configless manual start is a reset only when it
@@ -11595,8 +11648,49 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         return Ok((EXIT_SUCCESS, None));
                                     }
                                     Err(error) if launchd_owned || live_pidfile => {
-                                        return Err(error).context(
-                                            "refusing to stop a launchd/pidfile-owned incumbent before explicit --config provenance is verified",
+                                        // Self-heal. An incumbent attesting
+                                        // CompiledDefaults provenance IS the bad
+                                        // state this item exists to fix, and
+                                        // refusing here is what made it sticky:
+                                        // recovery needed a manual `daemon stop`
+                                        // first. Displace it instead.
+                                        //
+                                        // Everything else still refuses. A
+                                        // configured incumbent is someone else's
+                                        // deliberate state, and provenance we
+                                        // cannot read is not permission to kill
+                                        // — both fail closed, so any error or
+                                        // missing binding leaves it untouched.
+                                        let incumbent_is_compiled_defaults = (|| {
+                                            let rt = tokio::runtime::Runtime::new().ok()?;
+                                            let health = rt
+                                                .block_on(
+                                                    nestweaver_client::DaemonClient::wait_healthy(
+                                                        &db_path_abs,
+                                                        nestweaver_client::autostart::daemon_boot_timeout(),
+                                                    ),
+                                                )
+                                                .ok()?;
+                                            let binding = nestweaver_daemon::lifecycle::
+                                                read_effective_config_binding_for_verified_pid(
+                                                    &instance_id,
+                                                    health.pid,
+                                                )
+                                                .ok()?;
+                                            Some(matches!(
+                                                binding.effective_config,
+                                                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+                                            ))
+                                        })()
+                                        .unwrap_or(false);
+
+                                        if !incumbent_is_compiled_defaults {
+                                            return Err(error).context(
+                                                "refusing to stop a launchd/pidfile-owned incumbent before explicit --config provenance is verified",
+                                            );
+                                        }
+                                        eprintln!(
+                                            "Replacing a compiled-defaults daemon with the requested configuration."
                                         );
                                     }
                                     Err(_) => {
@@ -11612,7 +11706,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &db_path_abs,
                                 &log_file,
                                 index_cpu_percent.as_deref(),
-                                config_abs.as_deref(),
+                                effective_config_abs.as_deref(),
                             );
 
                             // Clean up any existing agent or fork-based daemon
@@ -11724,7 +11818,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let executable =
                             std::env::current_exe().context("cannot determine binary path")?;
                         let db_path_abs = abs_for_daemon(&db_path);
-                        let config_abs = config.as_deref().map(abs_for_daemon);
+                        let config_abs = effective_config.as_deref().map(abs_for_daemon);
                         let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
                         let mut child = macos_temp_daemon_command(
                             &executable,
@@ -11975,7 +12069,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 };
                                 let rt = tokio::runtime::Runtime::new()
                                     .expect("failed to create tokio runtime");
-                                let config_path = config.clone();
+                                let config_path = effective_config.clone();
                                 rt.block_on(async {
                                     if let Err(e) = nestweaver_daemon::run_server(
                                         &db_path,
@@ -12112,11 +12206,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         None
                     };
+                    // The foreground process launchd executes. A plist written
+                    // before this change — or by any caller that did not resolve
+                    // intent — carries no `--config`, and with RunAtLoad this is
+                    // now the primary path at login. Resolving here means the
+                    // record is honored even when nothing rewrote the plist.
+                    //
+                    // No `--reset` twin: `daemon start --reset` discards the
+                    // record, after which there is nothing here to honor. That
+                    // keeps reset expressible in exactly one place.
+                    let effective_config =
+                        nestweaver_client::RestartConfig::for_automatic_cold_start(
+                            &db_path,
+                            config.as_deref(),
+                        )?;
+                    if config.is_none()
+                        && let Some(resolved) = effective_config.as_path()
+                    {
+                        tracing::info!(
+                            config = %resolved.display(),
+                            "honoring persisted startup intent (no --config supplied)"
+                        );
+                    }
                     rt.block_on(async {
                         nestweaver_daemon::run_server(
                             &db_path,
                             idle,
-                            config.as_deref(),
+                            effective_config.as_path(),
                             server_opts,
                         )
                         .await
@@ -13360,7 +13476,7 @@ fn ensure_direct_store_fallback_allowed(
     match nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, None)? {
         nestweaver_client::RestartConfig::CompiledDefaults => Ok(()),
         nestweaver_client::RestartConfig::Configured(config) => anyhow::bail!(
-            "persisted daemon config {} for {} cannot be honored by the direct store, which refuses to fall back. Retry the daemon or deliberately reset with `nestweaver daemon --db {} start`",
+            "persisted daemon config {} for {} cannot be honored by the direct store, which refuses to fall back. Retry the daemon or deliberately reset with `nestweaver daemon --db {} start --reset`",
             config.display(),
             db_path.display(),
             db_path.display()
@@ -22100,6 +22216,67 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// `daemon start --reset` is the ONLY way to ask for compiled defaults now
+    /// that a configless start reuses persisted intent. `--reset --config` is
+    /// a contradiction — "reset to defaults" and "use this config" cannot both
+    /// hold — and must be rejected at parse time rather than silently resolved
+    /// in favor of one of them.
+    #[test]
+    fn daemon_start_reset_is_parseable_and_conflicts_with_config() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let base = ["nestweaver", "daemon", "--db", "/tmp/x.lbug", "start"];
+
+                let plain = Cli::try_parse_from(base).expect("bare start must parse");
+                assert!(matches!(
+                    plain.command,
+                    Commands::Daemon {
+                        action: DaemonAction::Start {
+                            reset: false,
+                            config: None,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+
+                let mut reset_argv = base.to_vec();
+                reset_argv.push("--reset");
+                let reset = Cli::try_parse_from(&reset_argv).expect("--reset must parse");
+                assert!(matches!(
+                    reset.command,
+                    Commands::Daemon {
+                        action: DaemonAction::Start {
+                            reset: true,
+                            config: None,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+
+                let mut both = base.to_vec();
+                both.extend(["--reset", "--config", "/tmp/instance.toml"]);
+                assert!(
+                    Cli::try_parse_from(&both).is_err(),
+                    "--reset with --config is contradictory and must be rejected"
+                );
+
+                // The reverse order must be rejected too — conflict rules are
+                // not order-sensitive, and a user could type either.
+                let mut both_reversed = base.to_vec();
+                both_reversed.extend(["--config", "/tmp/instance.toml", "--reset"]);
+                assert!(
+                    Cli::try_parse_from(&both_reversed).is_err(),
+                    "--config with --reset is contradictory and must be rejected"
+                );
             })
             .expect("spawn")
             .join()
