@@ -43,6 +43,17 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [4.1.2](https://github.com/Kehl-io/nestweaver/compare/v4.1.1...v4.1.2) (2026-08-11)
+
+
+### Bug Fixes
+
+* **daemon:** emit RunAtLoad in the generated launch agent, opt-in ([1080cc8](https://github.com/Kehl-io/nestweaver/commit/1080cc8592981bb9d4e91c4de25e925673241dad))
+* **daemon:** honor persisted config intent at the daemon boundary ([23af6bf](https://github.com/Kehl-io/nestweaver/commit/23af6bf4253a6d238388b0693a37ec96f558471c))
+* **daemon:** sweep orphaned daemon state directories ([bcd8307](https://github.com/Kehl-io/nestweaver/commit/bcd8307f77024ad0b47fcdc0f7e6e20275f2ebcb))
+* **index:** degrade post-write contract-apply failures instead of failing ([b754cad](https://github.com/Kehl-io/nestweaver/commit/b754cade46e37f04516485d1ed68a8a6f1d9d318))
+* **snapshot:** stop hardcoding a stale reader version in tests ([991da4c](https://github.com/Kehl-io/nestweaver/commit/991da4cfdd6810d499d40e057a5c57de322d1495))
+
 ## [4.1.1](https://github.com/Kehl-io/nestweaver/compare/v4.1.0...v4.1.1) (2026-08-10)
 
 
