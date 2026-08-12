@@ -2753,8 +2753,20 @@ mod tests {
         assert!(!guarded.is_held());
     }
 
-    /// The public entry point must read the process-global flag, so the guard
-    /// is actually wired up and not just present on the inner function.
+    /// The entry point agrees with the probe in the DISARMED state, and no
+    /// test leaves the process-global flag armed for its neighbours.
+    ///
+    /// Honest scope: this does NOT pin the wiring. Because the global is
+    /// already `false` here, it would still pass if someone hardcoded
+    /// `db_write_lock_probe(false, db_path)` — which is precisely the rot that
+    /// disables the guard. Pinning that direction requires observing the
+    /// entry point with the global ARMED, and arming a process-global inside a
+    /// parallel test binary is the exact race removed above (2 failures in 60
+    /// runs at `--test-threads=8`). Doing it properly needs a single-test
+    /// integration binary where nothing else runs concurrently; until then the
+    /// armed direction is covered only by
+    /// `write_lock_probe_refuses_to_run_against_its_own_store`, which tests the
+    /// inner function by value.
     #[test]
     fn write_lock_probe_entry_point_consults_the_local_store_flag() {
         assert!(

@@ -5394,6 +5394,98 @@ fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<Vec<Str
     argv_is_our_daemon(&argv, db_path).then_some(argv)
 }
 
+/// A process's command line as `ps` reports it: argv flattened on spaces.
+///
+/// Compiled on every platform so it is type-checked and testable here, but
+/// only *called* on non-Linux, where `/proc` does not exist.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn ps_command_line(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!cmdline.is_empty()).then_some(cmdline)
+}
+
+/// Substring identity check against a FLATTENED command line.
+///
+/// Strictly weaker than [`argv_is_our_daemon`]: with argument boundaries gone,
+/// position is unrecoverable, so `daemon` can only be looked for as a
+/// substring. Used solely where argv is unavailable (non-Linux) and only for
+/// the consumer where the forgeable-cmdline class cannot reach — see
+/// [`daemon_identity_cmdline_ok`].
+///
+/// Substring matching on the DB path is what makes this tolerate a path
+/// containing spaces, which is why it — and not whitespace-split positional
+/// matching — is the right fallback. `~/Library/Application Support/...` is the
+/// normal macOS location.
+///
+/// Compiled and unit-tested on every platform even though only non-Linux calls
+/// it, so the logic cannot rot behind a `cfg` that never gets built.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn cmdline_substring_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
+    if cmdline.is_empty() || !cmdline.contains("nestweaver") {
+        return false;
+    }
+    // Every daemon invocation carries the literal `daemon` subcommand. Checked
+    // as a substring rather than a position because the boundaries are gone;
+    // this is defense in depth over what `main` required, and it cannot break
+    // a spaced path.
+    if !cmdline.contains("daemon") {
+        return false;
+    }
+    let raw = db_path.to_string_lossy();
+    if !raw.is_empty() && cmdline.contains(raw.as_ref()) {
+        return true;
+    }
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        let canonical = canonical.to_string_lossy();
+        if !canonical.is_empty() && cmdline.contains(canonical.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does `pid`'s command line identify it as a daemon for `db_path`?
+///
+/// DELIBERATE ASYMMETRY — do not "simplify" this to share one source with
+/// [`daemon_stop_lock_holder_target`]. The two consumers face different
+/// threats:
+///
+/// * [`daemon_stop_lock_holder_target`] signals on DATABASE-LOCK evidence, so
+///   its candidate is any process holding the database — including
+///   `nestweaver index --repo daemon --db X`, which is attacker-shaped and
+///   forged a `daemon` token past a flattened check. It requires real argv and
+///   returns `None` on non-Linux, refusing to act.
+/// * This function's callers take their PID from the PIDFILE (or from a socket
+///   peer that short-circuits before the call). Nothing writes the daemon's
+///   pidfile but the daemon, so an `index --repo daemon` run cannot become the
+///   candidate here at all — the forgeable class is unreachable.
+///
+/// So non-Linux falls back to a flattened substring match rather than refusing.
+/// Refusing here caused a real macOS regression against `main`: a fork-based
+/// daemon (including the live `macos_temp_daemon_command` path) with a live
+/// pidfile and a missing socket got "that process is not a nestweaver daemon …
+/// remove the stale pidfile and socket manually" — a false statement, whose
+/// advice is exactly the operator action that caused the incident this whole
+/// change exists to prevent.
+fn daemon_identity_cmdline_ok(pid: i32, db_path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        daemon_cmdline_if_ours(pid, db_path).is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ps_command_line(pid)
+            .is_some_and(|cmdline| cmdline_substring_is_our_daemon(&cmdline, db_path))
+    }
+}
+
 /// Is the pidfile's flock currently held? The serving process owns LOCK_EX for
 /// its whole lifetime, so a held flock proves a live daemon owns THIS pidfile —
 /// regardless of how its `--db` path was spelled at start time (which a cmdline
@@ -5787,7 +5879,11 @@ fn daemon_identity_verified(
     pidfile: &std::path::Path,
     socket: &std::path::Path,
 ) -> bool {
-    if daemon_cmdline_if_ours(pid, db_path).is_some() {
+    // Command-line identity. On Linux this is the strong positional argv
+    // check; on other platforms it is a flattened substring match, which is
+    // sound HERE because this function's PID always comes from the pidfile.
+    // See `daemon_identity_cmdline_ok` for why that asymmetry is deliberate.
+    if daemon_identity_cmdline_ok(pid, db_path) {
         return true;
     }
     if !pidfile_flock_held(pidfile) {
@@ -20614,6 +20710,52 @@ mod abs_for_daemon_tests {
             &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug start"),
             db
         ));
+    }
+
+    /// The non-Linux fallback identity check. Only macOS calls it, but it is
+    /// compiled and exercised here so it cannot rot behind a `cfg` that never
+    /// gets built on this machine.
+    ///
+    /// Its whole reason to exist is tolerating a database path with SPACES —
+    /// `~/Library/Application Support/…` is the normal macOS location, and a
+    /// whitespace-split positional check can never match it.
+    #[test]
+    fn flattened_cmdline_fallback_tolerates_spaced_paths() {
+        let spaced =
+            std::path::Path::new("/Users/x/Library/Application Support/nestweaver/brain.lbug");
+        assert!(cmdline_substring_is_our_daemon(
+            "/usr/local/bin/nestweaver daemon --db /Users/x/Library/Application Support/nestweaver/brain.lbug start",
+            spaced
+        ));
+
+        let plain = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        assert!(cmdline_substring_is_our_daemon(
+            "nestweaver daemon --db /tmp/nw-f06/brain.lbug run",
+            plain
+        ));
+        // Not a nestweaver process at all.
+        assert!(!cmdline_substring_is_our_daemon("/usr/sbin/cron -s", plain));
+        // A nestweaver daemon for a DIFFERENT database.
+        assert!(!cmdline_substring_is_our_daemon(
+            "nestweaver daemon --db /tmp/other/brain.lbug start",
+            plain
+        ));
+        // A nestweaver invocation for this DB that is not the daemon.
+        assert!(!cmdline_substring_is_our_daemon(
+            "nestweaver search foo --db /tmp/nw-f06/brain.lbug",
+            plain
+        ));
+        assert!(!cmdline_substring_is_our_daemon("", plain));
+    }
+
+    /// `ps_command_line` is only called on non-Linux, but it must actually
+    /// work — verify it against this very process.
+    #[test]
+    fn ps_command_line_reads_a_live_process() {
+        let mine = ps_command_line(std::process::id() as i32)
+            .expect("ps must report our own command line");
+        assert!(!mine.is_empty());
+        assert_eq!(ps_command_line(-1), None, "a bogus PID must yield None");
     }
 
     /// Top-level globals may precede the subcommand and clap accepts them, so
