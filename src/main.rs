@@ -1623,6 +1623,92 @@ mod daemon_status_renderer_tests {
         ));
     }
 
+    /// The third state must never read as absence, must name the owner, and
+    /// must tell the operator what to do — reporting "not running" over a live
+    /// database owner is what turned one stuck daemon into a pile of spawns.
+    #[test]
+    fn unreachable_owner_is_reported_as_repairable_not_as_absent() {
+        // The socket path must be one that provably does not exist on the
+        // machine running the test — a hardcoded /run/user/... path is a real
+        // runtime dir on a developer box and made this assertion answer the
+        // host's state instead of the code's.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        assert!(!socket.exists());
+        let output = format_daemon_unreachable_status(
+            UnreachableOwner::DatabaseWriteLock { pid: 2643429 },
+            std::path::Path::new("/brain/brain.lbug"),
+            &socket,
+            std::path::Path::new("/run/nestweaver/deadbeef/daemon.pid"),
+            "/state/daemon.log",
+        );
+        assert!(
+            !output.contains("not running"),
+            "the third state must not be reported as absence: {output}"
+        );
+        assert!(output.starts_with("Daemon is running but UNREACHABLE (repairable)."));
+        assert!(output.contains("Owner:  PID 2643429 (holds this database's write lock)"));
+        assert!(output.contains("daemon.sock — MISSING"));
+        assert!(
+            output.contains("do NOT delete daemon.pid by hand"),
+            "the remediation must name the step that caused the incident: {output}"
+        );
+        // The remediation must not promise a repair the tools will not
+        // perform: `daemon stop` refuses to signal on lock evidence alone.
+        assert!(
+            !output.contains("daemon --db /brain/brain.lbug stop"),
+            "must not prescribe a stop that will refuse to act: {output}"
+        );
+        assert!(output.contains("does NOT prove it is a daemon"));
+        assert!(output.contains("ps -o pid=,lstart=,command= -p 2643429"));
+        assert!(output.contains("kill 2643429"));
+        // Output shape must match the other two status states.
+        assert!(output.contains("Config: unknown (daemon unreachable)"));
+        assert!(output.contains("Embedding:"));
+    }
+
+    /// A socket that exists but refuses connections is a different diagnosis
+    /// from one that was deleted, and must be described as what it is. The
+    /// pidfile-flock branch must also name NOBODY: the flock proves some
+    /// process holds that inode, never that the PID written inside it is that
+    /// process.
+    #[test]
+    fn unreachable_owner_distinguishes_a_present_socket_from_a_deleted_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, "not listening").unwrap();
+        let output = format_daemon_unreachable_status(
+            UnreachableOwner::PidfileLock,
+            std::path::Path::new("/brain/brain.lbug"),
+            &socket,
+            std::path::Path::new("/run/nestweaver/deadbeef/daemon.pid"),
+            "/state/daemon.log",
+        );
+        assert!(output.contains("Owner:  unidentified (a process holds the pidfile lock"));
+        assert!(output.contains("present but not accepting connections"));
+        assert!(
+            output.contains("`daemon stop` cannot help here"),
+            "the pidfile-lock branch must not prescribe a stop that no-ops: {output}"
+        );
+        assert!(output.contains("fuser -v /run/nestweaver/deadbeef/daemon.pid"));
+    }
+
+    /// An unreadable lock state is "possibly owned", never absence.
+    #[test]
+    fn unreadable_database_lock_is_not_reported_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format_daemon_unreachable_status(
+            UnreachableOwner::DatabaseLockUnreadable,
+            std::path::Path::new("/brain/brain.lbug"),
+            &dir.path().join("daemon.sock"),
+            &dir.path().join("daemon.pid"),
+            "/state/daemon.log",
+        );
+        assert!(!output.contains("not running"), "{output}");
+        assert!(output.contains("Owner:  unknown (this database's lock state could not be read)"));
+        assert!(output.contains("Treat it as owned until proven otherwise"));
+    }
+
     struct ClosedStdout;
 
     impl std::io::Write for ClosedStdout {
@@ -5178,13 +5264,238 @@ fn daemon_process_running_for_db(db_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure predicate: does this process cmdline look like a nestweaver
-/// daemon serving `db_path`? The daemon is always started as
-/// `nestweaver daemon --db <path> ...`, so require both markers. The DB path
-/// may be spelled differently at start vs. stop time, so accept the raw or
-/// canonical spelling.
-fn cmdline_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
+/// Which PID, if any, `daemon stop` is allowed to signal.
+///
+/// ONLY the pidfile PID and the socket peer are candidates. The database write
+/// lock is deliberately absent: holding the lock proves a process owns this
+/// database, NOT that it is a daemon. `nestweaver embed --local`, an index
+/// run, `brain add` discovery and every other `--no-daemon` command hold that
+/// same lock — and `embed --local` instructs the operator to stop the daemon
+/// first, so it runs in exactly the state where a lock-based retarget fires.
+/// Signalling on that evidence SIGTERMs and then SIGKILLs an hours-long embed
+/// mid-write.
+fn daemon_stop_signal_target(
+    pidfile_pid: Option<i32>,
+    socket_pid: Option<i32>,
+    alive: impl Fn(i32) -> bool,
+) -> Option<i32> {
+    match pidfile_pid {
+        Some(pid) if alive(pid) => Some(pid),
+        // A stale pidfile can name a DEAD pid while a daemon still serves the
+        // socket — retarget at the live socket peer rather than declaring "not
+        // running" and deleting a live daemon's socket.
+        _ => socket_pid.filter(|pid| alive(*pid)),
+    }
+}
+
+/// May the database write-lock holder be stopped?
+///
+/// Only when its argv independently proves daemon identity — `argv[1] ==
+/// "daemon"` and this database named as a whole argument. The lock alone never
+/// qualifies a process (see [`daemon_stop_signal_target`]): `nestweaver embed
+/// --db X --local` and `nestweaver index --db X` hold the same lock and fail
+/// the argv test, which is the entire point.
+///
+/// With this, the incident state (live daemon, hand-removed pidfile, deleted
+/// socket) is still repairable by `daemon stop`, while a non-daemon writer is
+/// merely reported.
+///
+/// Identity is re-checked immediately before the signal is sent, so the
+/// PID-reuse window is the same narrow TOCTOU the pidfile path has always had.
+/// It is narrowed, NOT closed — closing it needs `pidfd_open`.
+fn daemon_stop_lock_holder_target(db_path: &std::path::Path) -> Option<i32> {
+    daemon_stop_lock_holder_target_with(db_path, process_argv)
+}
+
+/// [`daemon_stop_lock_holder_target`] with the argv source injected, so both
+/// the accepting and the rejecting branch are testable against a REAL database
+/// write lock without having to forge a live process's argv.
+fn daemon_stop_lock_holder_target_with(
+    db_path: &std::path::Path,
+    argv_of: impl Fn(i32) -> Option<Vec<String>>,
+) -> Option<i32> {
+    let nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(pid) } =
+        nestweaver_daemon::lifecycle::db_write_lock(db_path)
+    else {
+        return None;
+    };
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return None;
+    }
+    let argv = argv_of(pid)?;
+    argv_is_our_daemon(&argv, db_path).then_some(pid)
+}
+
+/// Pure predicate: is this argv a nestweaver daemon serving `db_path`?
+///
+/// Matches by POSITION, not membership: the FIRST NON-FLAG argument after
+/// `argv[0]` must be `daemon`. A membership test ("some token equals
+/// `daemon`") is satisfied by any lock-holding invocation that merely carries
+/// `daemon` as an argument VALUE, and all of these hold this database's write
+/// lock:
+///
+/// * `nestweaver index --repo daemon --db <path>` (a directory named `daemon`)
+/// * `nestweaver index --name daemon --db <path>`
+/// * `nestweaver index --instance daemon --db <path>`
+///
+/// Leading flags must be skipped rather than rejected, because every top-level
+/// global may precede the subcommand and clap accepts it: `nestweaver --quiet
+/// daemon --db <path> start` is an ordinary thing for a wrapper script or a
+/// systemd unit to run. Requiring literal `argv[1] == "daemon"` silently
+/// disabled the one recovery path this guard exists to preserve.
+///
+/// CONSTRAINT, load-bearing: this is sound only because every top-level global
+/// is currently BOOLEAN (`--stats`, `-q`/`--quiet`, `-v`/`--verbose`,
+/// `--no-color`, `--plain`, `--no-embed`). A value-taking global would put its
+/// VALUE in the first non-flag position and break this. If you add one, this
+/// function must learn to consume its argument.
+///
+/// The DB path is likewise matched as a WHOLE ARGUMENT rather than a substring
+/// of a flattened string.
+///
+/// Deliberately absent: any check that `argv[0]` contains "nestweaver". In the
+/// default layout the database lives at `…/.local/nestweaver/brain.lbug`, so
+/// that substring was satisfied by the PATH, not the binary — it added no real
+/// evidence while breaking for renamed or symlinked installs. The conjunction
+/// that carries the weight is: holds THIS database's write lock, the `daemon`
+/// subcommand, and names THIS database.
+fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
+    // Skip leading boolean globals. An EMPTY argument is not a flag and not
+    // `daemon`, so it stops the scan and the argv is rejected — a forged
+    // `["bin", "", "daemon", ...]` must not shift `daemon` into place.
+    let subcommand = argv
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    if subcommand != Some("daemon") {
+        return false;
+    }
+    let mut spellings = vec![db_path.to_string_lossy().into_owned()];
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        spellings.push(canonical.to_string_lossy().into_owned());
+    }
+    spellings.retain(|spelling| !spelling.is_empty());
+    argv.iter().skip(1).any(|arg| {
+        spellings
+            .iter()
+            .any(|spelling| arg == spelling || arg.as_str() == format!("--db={spelling}"))
+    })
+}
+
+/// This process's argv, with argument boundaries intact.
+///
+/// `/proc/<pid>/cmdline` is NUL-separated, which is the only representation
+/// that preserves those boundaries. `ps -o command=` re-joins argv on spaces
+/// and is therefore unusable for positional matching — a path containing a
+/// space, or an argument value of `daemon`, both become indistinguishable from
+/// separate arguments. That flattening is exactly what made the earlier
+/// membership check unsound.
+///
+/// Interior empty arguments are PRESERVED. Filtering them out would silently
+/// re-index the argv and turn "the first non-flag argument" into "the first
+/// non-empty non-flag argument", which is a different (and forgeable) claim.
+#[cfg(target_os = "linux")]
+fn process_argv(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    // The kernel terminates the last argument with a NUL, which would
+    // otherwise yield a phantom trailing empty argument.
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(
+        raw.split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
+}
+
+/// Non-Linux: refuse to answer.
+///
+/// The only portable source is `ps -o command=`, which re-joins argv on
+/// spaces. That is not merely lossy, it is wrong in both directions:
+///
+/// * a database path containing a space can never equal any whitespace-split
+///   token, so `argv_is_our_daemon` could NEVER match — and on macOS the
+///   natural location is `~/Library/Application Support/…`, so this residual
+///   recovery path would be silently dead for those installs while looking
+///   implemented;
+/// * conversely, an argument containing a space can synthesize a `daemon`
+///   token in the subcommand position, which is a narrower reprise of the
+///   flattening bug that made the membership check exploitable.
+///
+/// Returning `None` is the honest answer: identity is unproven, callers refuse
+/// to signal, and stopping an unreachable daemon by database-lock evidence is
+/// a Linux-only capability until someone implements macOS
+/// `sysctl KERN_PROCARGS2`, which returns real NUL-separated argv.
+///
+/// KNOWN CONSEQUENCE, please weigh before shipping to macOS: this also empties
+/// the cmdline branch of [`daemon_identity_verified`], which previously
+/// substring-matched `ps` output. On macOS that leaves identity resting on the
+/// pidfile flock cross-checked against the socket peer — so a LEGACY
+/// fork-based macOS daemon whose socket is missing can no longer be identified
+/// by cmdline, and `daemon stop` will refuse it where it once acted. The
+/// launchd path (`launchd::stop_and_uninstall`) runs first and is unaffected,
+/// as are the pidfile-PID and socket-peer paths whenever a socket exists.
+/// `sysctl KERN_PROCARGS2` would restore it; I could not write or verify that
+/// on Linux, so I am surfacing the trade rather than guessing at it.
+#[cfg(not(target_os = "linux"))]
+fn process_argv(_pid: i32) -> Option<Vec<String>> {
+    None
+}
+
+/// Return the argv of `pid` when it is verifiably a nestweaver daemon serving
+/// `db_path`, else `None`. A stale pidfile PID may have been recycled by an
+/// unrelated process — callers must NOT signal the PID when this returns
+/// `None`.
+fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<Vec<String>> {
+    let argv = process_argv(pid)?;
+    argv_is_our_daemon(&argv, db_path).then_some(argv)
+}
+
+/// A process's command line as `ps` reports it: argv flattened on spaces.
+///
+/// Compiled on every platform so it is type-checked and testable here, but
+/// only *called* on non-Linux, where `/proc` does not exist.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn ps_command_line(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!cmdline.is_empty()).then_some(cmdline)
+}
+
+/// Substring identity check against a FLATTENED command line.
+///
+/// Strictly weaker than [`argv_is_our_daemon`]: with argument boundaries gone,
+/// position is unrecoverable, so `daemon` can only be looked for as a
+/// substring. Used solely where argv is unavailable (non-Linux) and only for
+/// the consumer where the forgeable-cmdline class cannot reach — see
+/// [`daemon_identity_cmdline_ok`].
+///
+/// Substring matching on the DB path is what makes this tolerate a path
+/// containing spaces, which is why it — and not whitespace-split positional
+/// matching — is the right fallback. `~/Library/Application Support/...` is the
+/// normal macOS location.
+///
+/// Compiled and unit-tested on every platform even though only non-Linux calls
+/// it, so the logic cannot rot behind a `cfg` that never gets built.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn cmdline_substring_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
     if cmdline.is_empty() || !cmdline.contains("nestweaver") {
+        return false;
+    }
+    // Every daemon invocation carries the literal `daemon` subcommand. Checked
+    // as a substring rather than a position because the boundaries are gone;
+    // this is defense in depth over what `main` required, and it cannot break
+    // a spaced path.
+    if !cmdline.contains("daemon") {
         return false;
     }
     let raw = db_path.to_string_lossy();
@@ -5200,20 +5511,39 @@ fn cmdline_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
     false
 }
 
-/// Return the cmdline of `pid` when it is verifiably a nestweaver daemon
-/// serving `db_path`, else `None`. A stale pidfile PID may have been recycled
-/// by an unrelated process — callers must NOT signal the PID when this returns
-/// `None`.
-fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Does `pid`'s command line identify it as a daemon for `db_path`?
+///
+/// DELIBERATE ASYMMETRY — do not "simplify" this to share one source with
+/// [`daemon_stop_lock_holder_target`]. The two consumers face different
+/// threats:
+///
+/// * [`daemon_stop_lock_holder_target`] signals on DATABASE-LOCK evidence, so
+///   its candidate is any process holding the database — including
+///   `nestweaver index --repo daemon --db X`, which is attacker-shaped and
+///   forged a `daemon` token past a flattened check. It requires real argv and
+///   returns `None` on non-Linux, refusing to act.
+/// * This function's callers take their PID from the PIDFILE (or from a socket
+///   peer that short-circuits before the call). Nothing writes the daemon's
+///   pidfile but the daemon, so an `index --repo daemon` run cannot become the
+///   candidate here at all — the forgeable class is unreachable.
+///
+/// So non-Linux falls back to a flattened substring match rather than refusing.
+/// Refusing here caused a real macOS regression against `main`: a fork-based
+/// daemon (including the live `macos_temp_daemon_command` path) with a live
+/// pidfile and a missing socket got "that process is not a nestweaver daemon …
+/// remove the stale pidfile and socket manually" — a false statement, whose
+/// advice is exactly the operator action that caused the incident this whole
+/// change exists to prevent.
+fn daemon_identity_cmdline_ok(pid: i32, db_path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        daemon_cmdline_if_ours(pid, db_path).is_some()
     }
-    let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    cmdline_is_our_daemon(&cmdline, db_path).then_some(cmdline)
+    #[cfg(not(target_os = "linux"))]
+    {
+        ps_command_line(pid)
+            .is_some_and(|cmdline| cmdline_substring_is_our_daemon(&cmdline, db_path))
+    }
 }
 
 /// Is the pidfile's flock currently held? The serving process owns LOCK_EX for
@@ -5237,30 +5567,147 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
     std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
 }
 
+/// Outcome of a runtime-file retirement attempt. Refusals are values, not
+/// silence: an operator who is told nothing was deleted (and why) is an
+/// operator who stops deleting things by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeCleanup {
+    /// Nothing owned these files; socket, binding and pidfile were retired.
+    Removed,
+    /// A process answered on the socket. Whatever the pidfile says, this
+    /// daemon is alive and serving.
+    LiveSocketPeer { pid: Option<i32> },
+    /// The pidfile is gone but the socket is still there. Nothing in this
+    /// codebase produces that combination — it means someone unlinked runtime
+    /// state under a daemon, which is exactly how path-based flock ownership
+    /// gets defeated.
+    PidfileUnlinkedUnderSocket,
+    /// A process holds this instance's database write lock. A process holding
+    /// the database is by definition not stale.
+    DatabaseOwned { pid: Option<i32> },
+    /// The database lock state could not be read. Fail closed.
+    DatabaseOwnershipUnknown,
+    /// The pidfile flock is held — the original (and still valid) guard.
+    PidfileOwned,
+    /// The pidfile could not even be opened; nothing can be proven.
+    PidfileUnavailable,
+}
+
+impl RuntimeCleanup {
+    /// Human-readable reason the runtime files were left alone, or `None` when
+    /// they were retired.
+    fn refusal(&self) -> Option<String> {
+        match self {
+            RuntimeCleanup::Removed => None,
+            RuntimeCleanup::LiveSocketPeer { pid } => Some(format!(
+                "a live daemon{} is answering on the socket",
+                pid.map(|pid| format!(" (PID {pid})")).unwrap_or_default()
+            )),
+            RuntimeCleanup::PidfileUnlinkedUnderSocket => Some(
+                "the pidfile is missing while the socket is still present — runtime state was \
+                 removed by hand under a daemon"
+                    .to_string(),
+            ),
+            RuntimeCleanup::DatabaseOwned { pid } => Some(format!(
+                "a process{} holds this instance's database write lock",
+                pid.map(|pid| format!(" (PID {pid})")).unwrap_or_default()
+            )),
+            RuntimeCleanup::DatabaseOwnershipUnknown => {
+                Some("this instance's database lock state could not be read".to_string())
+            }
+            RuntimeCleanup::PidfileOwned => {
+                Some("another process holds the pidfile lock".to_string())
+            }
+            RuntimeCleanup::PidfileUnavailable => {
+                Some("the pidfile could not be opened".to_string())
+            }
+        }
+    }
+}
+
 /// Retire failed-start runtime files only while proving no concurrent daemon
-/// owns them. Holding the pidfile flock closes the check-then-unlink race:
-/// another starter cannot acquire this inode before the stale socket is
-/// removed, and the pidfile is unlinked last so a later starter gets a fresh
-/// inode that this cleanup never touches.
+/// owns them.
+///
+/// The pidfile flock alone is NOT that proof. A flock is held on an inode, not
+/// a path: once an operator runs `rm -f daemon.pid` under a live daemon — the
+/// single most likely thing to happen during a recovery — the live daemon
+/// still holds its lock on an unlinked inode, `create(true)` here makes a
+/// brand-new file, and the flock succeeds trivially against no contention. The
+/// guard then concludes "unowned" and deletes a healthy daemon's socket. That
+/// is the incident this function exists to prevent, and the original guard
+/// caused it.
+///
+/// So corroborate with evidence an unlink cannot erase, cheapest first:
+///  1. a live peer on the socket (kernel-reported) — never remove a served
+///     socket, whatever the pidfile says;
+///  2. pidfile absent while the socket is present — the fingerprint of
+///     hand-removed state; refuse rather than guess;
+///  3. the database write lock (kernel-held on the database file itself) —
+///     a process holding the database is not stale;
+///  4. only then the pidfile flock, which still closes the concurrent-start
+///     race it was written for.
+///
+/// The pidfile is unlinked last so a later starter gets a fresh inode that this
+/// cleanup never touches.
 fn remove_unowned_daemon_runtime(
+    db_path: &std::path::Path,
     pidfile: &std::path::Path,
     socket: &std::path::Path,
     effective_config_binding: &std::path::Path,
-) {
+) -> RuntimeCleanup {
     use std::os::unix::io::AsRawFd;
 
-    let Ok(file) = std::fs::OpenOptions::new()
+    // 1. Something is serving this socket right now. This is the strongest
+    //    possible evidence and it does not depend on any file's contents.
+    if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+        return RuntimeCleanup::LiveSocketPeer {
+            pid: unix_socket_peer_pid(&stream),
+        };
+    }
+
+    // 2. Nothing this codebase does removes the pidfile while leaving the
+    //    socket behind (this function unlinks the socket first). That state
+    //    means external deletion, so the flock below proves nothing.
+    if !pidfile.exists() && socket.exists() {
+        return RuntimeCleanup::PidfileUnlinkedUnderSocket;
+    }
+
+    // 3. The database lock outlives any amount of runtime-file tampering.
+    match nestweaver_daemon::lifecycle::db_write_lock(db_path) {
+        nestweaver_daemon::lifecycle::DbWriteLock::Held { pid } => {
+            return RuntimeCleanup::DatabaseOwned { pid };
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Unknown => {
+            return RuntimeCleanup::DatabaseOwnershipUnknown;
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Free => {}
+    }
+
+    // 4. The original race guard, unchanged.
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(pidfile)
-    else {
-        return;
+    {
+        Ok(file) => file,
+        // `create(true)` fails with ENOENT when the per-instance runtime dir
+        // does not exist — a never-started instance, a fresh XDG_RUNTIME_DIR
+        // after a tmpfs reboot, a container, a CI runner. There is nothing
+        // there to own and nothing to retire, so this is success, not a
+        // refusal. Reporting it as one made `daemon stop` exit 1 while
+        // `daemon status` on the identical state exited 0. Deliberately does
+        // NOT create the directory: `stop` has no business materializing
+        // runtime state on its way to deleting it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeCleanup::Removed;
+        }
+        Err(_) => return RuntimeCleanup::PidfileUnavailable,
     };
     let fd = file.as_raw_fd();
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return;
+        return RuntimeCleanup::PidfileOwned;
     }
 
     let _ = std::fs::remove_file(socket);
@@ -5269,6 +5716,148 @@ fn remove_unowned_daemon_runtime(
     unsafe {
         libc::flock(fd, libc::LOCK_UN);
     }
+    RuntimeCleanup::Removed
+}
+
+/// Say out loud when runtime files were deliberately left in place. Silence
+/// here is what let an operator believe deleting them by hand was harmless.
+fn report_runtime_cleanup(outcome: &RuntimeCleanup) {
+    if let Some(reason) = outcome.refusal() {
+        eprintln!("Left daemon runtime files in place: {reason}.");
+    }
+}
+
+/// What proved that something still owns this instance when no client can
+/// reach it. Each variant carries a DIFFERENT amount of knowledge, and the
+/// report must not borrow confidence from one to describe another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreachableOwner {
+    /// The kernel named the process holding the lbug write lock on this
+    /// database. Strong: it really does own the database. It does NOT prove
+    /// the process is a daemon.
+    DatabaseWriteLock { pid: i32 },
+    /// The database write lock is held but the platform did not name a PID.
+    DatabaseWriteLockAnonymous,
+    /// The database lock state could not be read at all. `Unknown` means
+    /// "possibly owned" and must never be reported as absence.
+    DatabaseLockUnreadable,
+    /// Some process holds the pidfile flock. Weak: the flock lives on the
+    /// inode and the file's CONTENTS are an unrelated fact, so the PID written
+    /// in the pidfile is not evidence of who holds the lock. Deliberately
+    /// carries no PID.
+    PidfileLock,
+}
+
+/// The third daemon state, rendered.
+///
+/// Something owns this instance while no client can reach it. Reporting "not
+/// running" there is what invited the operator to start more daemons and make
+/// the incident worse.
+///
+/// The remediation must match what the tools will actually do. `daemon stop`
+/// signals only processes with proven daemon identity, so it will NOT stop a
+/// bare lock holder and the text must not promise that it will.
+fn format_daemon_unreachable_status(
+    owner: UnreachableOwner,
+    db_path: &std::path::Path,
+    socket: &std::path::Path,
+    pidfile: &std::path::Path,
+    log_hint: &str,
+) -> String {
+    let socket_state = if socket.exists() {
+        "present but not accepting connections"
+    } else {
+        "MISSING"
+    };
+    let (owner_line, guidance) = match owner {
+        UnreachableOwner::DatabaseWriteLock { pid } => (
+            format!("PID {pid} (holds this database's write lock)"),
+            format!(
+                "PID {pid} owns this database. Holding the write lock does NOT prove it is a \
+                 daemon — an `embed`, `index` or other `--no-daemon` run holds the same lock — \
+                 so identify it before touching it:\n\
+                 \x20 ps -o pid=,lstart=,command= -p {pid}\n\
+                 If it IS a nestweaver daemon, stop that process and start a fresh one:\n\
+                 \x20 kill {pid}   # then: nestweaver daemon --db {} start\n\
+                 If it is an indexing or embedding run, let it finish — killing it loses that \
+                 work and no daemon is stuck.",
+                db_path.display()
+            ),
+        ),
+        UnreachableOwner::DatabaseWriteLockAnonymous => (
+            "unidentified (this database's write lock is held; the kernel named no PID)"
+                .to_string(),
+            format!(
+                "Find the holder before touching anything:\n\
+                 \x20 fuser -v {}",
+                db_path.display()
+            ),
+        ),
+        UnreachableOwner::DatabaseLockUnreadable => (
+            "unknown (this database's lock state could not be read)".to_string(),
+            format!(
+                "The database lock could not be probed, so this instance may well be owned. \
+                 Treat it as owned until proven otherwise:\n\
+                 \x20 fuser -v {}",
+                db_path.display()
+            ),
+        ),
+        UnreachableOwner::PidfileLock => (
+            "unidentified (a process holds the pidfile lock; the pidfile's contents do not \
+             prove which)"
+                .to_string(),
+            format!(
+                "`daemon stop` cannot help here — it has no verified PID to signal. Identify \
+                 the lock holder first:\n\
+                 \x20 fuser -v {}",
+                pidfile.display()
+            ),
+        ),
+    };
+    format!(
+        "Daemon is running but UNREACHABLE (repairable).\n\
+         \x20 Owner:  {owner_line}\n\
+         \x20 DB:     {}\n\
+         \x20 Socket: {} — {socket_state}\n\
+         \x20 Log:    {log_hint}\n\
+         Something owns this instance; only its client endpoint is gone, so no client can \
+         reach it.\n\
+         Do NOT start another daemon, and do NOT delete daemon.pid by hand — an unlinked \
+         pidfile is what makes the next start believe this runtime is unowned.\n\
+         {guidance}\n\
+         {}",
+        db_path.display(),
+        socket.display(),
+        format_daemon_status_response(Err("daemon is unreachable (socket missing or refusing)")),
+    )
+}
+
+/// Does something still own this instance even though nothing answers its
+/// socket?
+///
+/// `Unknown` from the database probe is reported, not swallowed: its own
+/// contract says callers must treat it as possibly-owned, and status is
+/// exactly where treating it as absence caused the incident.
+fn unreachable_daemon_owner(
+    db_path: &std::path::Path,
+    pidfile: &std::path::Path,
+) -> Option<UnreachableOwner> {
+    match nestweaver_daemon::lifecycle::db_write_lock(db_path) {
+        nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(pid) } => {
+            return Some(UnreachableOwner::DatabaseWriteLock { pid });
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: None } => {
+            return Some(UnreachableOwner::DatabaseWriteLockAnonymous);
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Unknown => {
+            return Some(UnreachableOwner::DatabaseLockUnreadable);
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Free => {}
+    }
+    // The flock proves SOME process holds this inode. It does not say which,
+    // and the pidfile's contents are a separate fact that can be rewritten
+    // while the lock is held — so name nobody.
+    pidfile_flock_held(pidfile).then_some(UnreachableOwner::PidfileLock)
 }
 
 /// PID of the process on the other end of a connected unix socket, as
@@ -5350,7 +5939,11 @@ fn daemon_identity_verified(
     pidfile: &std::path::Path,
     socket: &std::path::Path,
 ) -> bool {
-    if daemon_cmdline_if_ours(pid, db_path).is_some() {
+    // Command-line identity. On Linux this is the strong positional argv
+    // check; on other platforms it is a flattened substring match, which is
+    // sound HERE because this function's PID always comes from the pidfile.
+    // See `daemon_identity_cmdline_ok` for why that asymmetry is deliberate.
+    if daemon_identity_cmdline_ok(pid, db_path) {
         return true;
     }
     if !pidfile_flock_held(pidfile) {
@@ -12057,11 +12650,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                 }
-                                remove_unowned_daemon_runtime(
+                                report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                                    &db_path_abs,
                                     &pidfile,
                                     &socket,
                                     &nestweaver_daemon::effective_config_binding_path(&instance_id),
-                                );
+                                ));
                                 anyhow::bail!(
                                     "temporary daemon for {} did not become healthy: {error:#}",
                                     db_path_abs.display()
@@ -12437,22 +13031,72 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // socket-peer pid instead of declaring "not running" and
                     // deleting a live daemon's socket (the same state the
                     // identity cross-check exists for).
-                    let pid = match pidfile_pid {
-                        Some(p) if unsafe { libc::kill(p, 0) } == 0 => Some(p),
-                        _ => socket_pid.filter(|p| unsafe { libc::kill(*p, 0) } == 0),
-                    };
+                    let pid = daemon_stop_signal_target(pidfile_pid, socket_pid, |pid| unsafe {
+                        libc::kill(pid, 0) == 0
+                    })
+                    // Last resort: the database write-lock holder, and ONLY
+                    // when its cmdline independently proves it is a daemon for
+                    // this DB. That keeps the incident state repairable while
+                    // leaving `embed`/`index` writers untouched.
+                    .or_else(|| daemon_stop_lock_holder_target(&db_path));
                     let Some(pid) = pid else {
-                        // Nothing alive on either the pidfile or the socket.
+                        // Nothing signalable on the pidfile or the socket.
+                        //
+                        // The database write lock is deliberately NOT consulted
+                        // as a stop target. It proves a process holds THIS
+                        // DATABASE, never that it is a daemon: `embed --local`,
+                        // an index run, and every `--no-daemon` command hold the
+                        // same lock, and `embed --local` in particular tells the
+                        // operator to stop the daemon first — so it runs
+                        // precisely in this state. Signalling on lock evidence
+                        // SIGTERMs, then SIGKILLs, a multi-hour embed mid-write.
+                        // Report the owner and let a human decide.
                         if launchd_stopped {
                             eprintln!("Daemon stopped.");
-                        } else {
-                            println!("Daemon is not running.");
+                            report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                                &db_path,
+                                &pidfile,
+                                &socket,
+                                &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                            ));
+                            return Ok((EXIT_SUCCESS, None));
                         }
-                        remove_unowned_daemon_runtime(
+                        if let Some(owner) = unreachable_daemon_owner(&db_path, &pidfile) {
+                            println!(
+                                "{}",
+                                format_daemon_unreachable_status(
+                                    owner, &db_path, &socket, &pidfile, &log_hint
+                                )
+                            );
+                            eprintln!(
+                                "Nothing was stopped: no process proved daemon identity, and a \
+                                 lock holder is not signalled on lock evidence alone."
+                            );
+                            report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                                &db_path,
+                                &pidfile,
+                                &socket,
+                                &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                            ));
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        let cleanup = remove_unowned_daemon_runtime(
+                            &db_path,
                             &pidfile,
                             &socket,
                             &nestweaver_daemon::effective_config_binding_path(&instance_id),
                         );
+                        // Only claim absence when nothing at all objected —
+                        // otherwise "Daemon is not running." would print
+                        // immediately above a line saying a live daemon is
+                        // answering on the socket.
+                        match cleanup.refusal() {
+                            None => println!("Daemon is not running."),
+                            Some(reason) => {
+                                println!("Daemon was NOT stopped: {reason}.");
+                                return Ok((EXIT_ERROR, None));
+                            }
+                        }
                         return Ok((EXIT_SUCCESS, None));
                     };
 
@@ -12501,11 +13145,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
-                            remove_unowned_daemon_runtime(
+                            report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                                &db_path,
                                 &pidfile,
                                 &socket,
                                 &nestweaver_daemon::effective_config_binding_path(&instance_id),
-                            );
+                            ));
                             return Ok((EXIT_SUCCESS, None));
                         }
                     }
@@ -12516,12 +13161,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    remove_unowned_daemon_runtime(
+                    // Wait for the corpse to actually be reaped before probing
+                    // ownership. A flat 200ms is not enough for a large-RSS
+                    // daemon to be torn down, and a probe that runs too early
+                    // sees the dying process still holding its record lock —
+                    // producing "Daemon killed." next to a refusal line saying
+                    // the database is still owned. Poll instead of guessing.
+                    let settle_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < settle_deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if unsafe { libc::kill(pid, 0) } != 0
+                            && nestweaver_daemon::lifecycle::db_write_lock(&db_path)
+                                .is_provably_free()
+                        {
+                            break;
+                        }
+                    }
+                    report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                        &db_path,
                         &pidfile,
                         &socket,
                         &nestweaver_daemon::effective_config_binding_path(&instance_id),
-                    );
+                    ));
                     eprintln!("Daemon killed.");
                     Ok((EXIT_SUCCESS, None))
                 }
@@ -12554,6 +13216,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("  Socket: {}", socket.display());
                             println!("  Log:    {log_hint}");
                             print_daemon_embedding_status(&db_path);
+                        } else if let Some(owner) = unreachable_daemon_owner(&db_path, &pidfile) {
+                            // The pidfile's identity is unverifiable, but
+                            // something still owns this instance. "Not running"
+                            // here is the report that invited the operator to
+                            // start more daemons.
+                            println!(
+                                "{}",
+                                format_daemon_unreachable_status(
+                                    owner, &db_path, &socket, &pidfile, &log_hint
+                                )
+                            );
                         } else {
                             println!(
                                 "{}",
@@ -12575,6 +13248,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // Third state. Neither the pidfile nor the socket names a
+                    // reachable daemon — but a process can still HOLD this
+                    // instance (its database write lock, or its pidfile lock)
+                    // with no way for a client to reach it. That is repairable
+                    // and must be reported as such: announcing "not running"
+                    // over a live, database-owning daemon is what turned one
+                    // stuck daemon into a pile of failed spawns.
+                    if let Some(owner) = unreachable_daemon_owner(&db_path, &pidfile) {
+                        println!(
+                            "{}",
+                            format_daemon_unreachable_status(
+                                owner, &db_path, &socket, &pidfile, &log_hint
+                            )
+                        );
                         return Ok((EXIT_SUCCESS, None));
                     }
                     println!(
@@ -20109,25 +20798,163 @@ mod abs_for_daemon_tests {
     #[test]
     fn cmdline_is_our_daemon_matches_only_our_daemon() {
         let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
 
-        assert!(cmdline_is_our_daemon(
-            "/usr/local/bin/nestweaver daemon --db /tmp/nw-f06/brain.lbug start",
+        assert!(argv_is_our_daemon(
+            &argv("/usr/local/bin/nestweaver daemon --db /tmp/nw-f06/brain.lbug start"),
             db
         ));
-        assert!(cmdline_is_our_daemon(
-            "nestweaver daemon --db /tmp/nw-f06/brain.lbug run",
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug run"),
             db
         ));
-        // Foreign process reusing the PID: no nestweaver marker.
-        assert!(!cmdline_is_our_daemon("/usr/sbin/cron -s", db));
+        // `--db=<path>` is the same invocation spelled differently.
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db=/tmp/nw-f06/brain.lbug start"),
+            db
+        ));
+        // Foreign process reusing the PID.
+        assert!(!argv_is_our_daemon(&argv("/usr/sbin/cron -s"), db));
         // A nestweaver daemon for a DIFFERENT DB must not match.
-        assert!(!cmdline_is_our_daemon(
-            "nestweaver daemon --db /tmp/other/brain.lbug start",
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/other/brain.lbug start"),
             db
         ));
         // A nestweaver CLI invocation that is not serving this DB must not match.
-        assert!(!cmdline_is_our_daemon("nestweaver search foo", db));
-        assert!(!cmdline_is_our_daemon("", db));
+        assert!(!argv_is_our_daemon(&argv("nestweaver search foo"), db));
+        assert!(!argv_is_our_daemon(&[], db));
+        // The DB path must be a WHOLE argument, never a substring of one.
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug.backup start"),
+            db
+        ));
+    }
+
+    /// The exploit that a membership test ("some token equals `daemon`")
+    /// let through: a lock-HOLDING, non-daemon invocation that merely carries
+    /// `daemon` as an argument VALUE. All three of these hold the database
+    /// write lock, and all three were signalled by `daemon stop`.
+    #[test]
+    fn daemon_as_an_argument_value_is_not_the_daemon_subcommand() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        for line in [
+            // Indexing a directory that happens to be named `daemon`.
+            "nestweaver index --repo daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver index --name daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver index --instance daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver embed --db /tmp/nw-f06/brain.lbug --local --model-id daemon",
+        ] {
+            assert!(
+                !argv_is_our_daemon(&argv(line), db),
+                "`daemon` as an argument value must not read as the subcommand: {line}"
+            );
+        }
+
+        // The real thing still matches: `daemon` at argv[1].
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug start"),
+            db
+        ));
+    }
+
+    /// The non-Linux fallback identity check. Only macOS calls it, but it is
+    /// compiled and exercised here so it cannot rot behind a `cfg` that never
+    /// gets built on this machine.
+    ///
+    /// Its whole reason to exist is tolerating a database path with SPACES —
+    /// `~/Library/Application Support/…` is the normal macOS location, and a
+    /// whitespace-split positional check can never match it.
+    #[test]
+    fn flattened_cmdline_fallback_tolerates_spaced_paths() {
+        let spaced =
+            std::path::Path::new("/Users/x/Library/Application Support/nestweaver/brain.lbug");
+        assert!(cmdline_substring_is_our_daemon(
+            "/usr/local/bin/nestweaver daemon --db /Users/x/Library/Application Support/nestweaver/brain.lbug start",
+            spaced
+        ));
+
+        let plain = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        assert!(cmdline_substring_is_our_daemon(
+            "nestweaver daemon --db /tmp/nw-f06/brain.lbug run",
+            plain
+        ));
+        // Not a nestweaver process at all.
+        assert!(!cmdline_substring_is_our_daemon("/usr/sbin/cron -s", plain));
+        // A nestweaver daemon for a DIFFERENT database.
+        assert!(!cmdline_substring_is_our_daemon(
+            "nestweaver daemon --db /tmp/other/brain.lbug start",
+            plain
+        ));
+        // A nestweaver invocation for this DB that is not the daemon.
+        assert!(!cmdline_substring_is_our_daemon(
+            "nestweaver search foo --db /tmp/nw-f06/brain.lbug",
+            plain
+        ));
+        assert!(!cmdline_substring_is_our_daemon("", plain));
+    }
+
+    /// `ps_command_line` is only called on non-Linux, but it must actually
+    /// work — verify it against this very process.
+    #[test]
+    fn ps_command_line_reads_a_live_process() {
+        let mine = ps_command_line(std::process::id() as i32)
+            .expect("ps must report our own command line");
+        assert!(!mine.is_empty());
+        assert_eq!(ps_command_line(-1), None, "a bogus PID must yield None");
+    }
+
+    /// Top-level globals may precede the subcommand and clap accepts them, so
+    /// a daemon started by a wrapper script or systemd unit as `nestweaver
+    /// --quiet daemon …` must still be recognized. Requiring literal
+    /// `argv[1] == "daemon"` silently disabled the only recovery path for the
+    /// incident this branch exists to fix.
+    #[test]
+    fn leading_global_flags_do_not_hide_the_daemon_subcommand() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        for line in [
+            "nestweaver --quiet daemon --db /tmp/nw-f06/brain.lbug start",
+            "nestweaver -q daemon --db /tmp/nw-f06/brain.lbug start",
+            "nestweaver -v --no-color daemon --db /tmp/nw-f06/brain.lbug run",
+            "nestweaver --stats --plain --no-embed daemon --db /tmp/nw-f06/brain.lbug start",
+        ] {
+            assert!(
+                argv_is_our_daemon(&argv(line), db),
+                "a daemon behind leading globals must stay recognizable: {line}"
+            );
+        }
+
+        // Skipping flags must not skip past a real subcommand: `index` is not
+        // a flag, so the scan stops there and rejects.
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver --quiet index --repo daemon --db /tmp/nw-f06/brain.lbug"),
+            db
+        ));
+    }
+
+    /// An EMPTY argument is not a flag and not `daemon`, so it terminates the
+    /// scan. Filtering empties out instead would re-index the argv and let a
+    /// forged `["bin", "", "daemon", …]` shift `daemon` into the subcommand
+    /// position — which it did.
+    #[test]
+    fn an_empty_argument_cannot_shift_the_subcommand_into_place() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        assert!(!argv_is_our_daemon(
+            &[
+                "foreignbin".to_string(),
+                String::new(),
+                "daemon".to_string(),
+                "/tmp/nw-f06/brain.lbug".to_string(),
+                "start".to_string(),
+            ],
+            db
+        ));
     }
 
     /// `daemon_cmdline_if_ours` returns None for a live process that is
@@ -22306,6 +23133,7 @@ mod daemon_cli_tests {
         use std::os::unix::io::AsRawFd;
 
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
         let pidfile = dir.path().join("daemon.pid");
         let socket = dir.path().join("daemon.sock");
         let binding = dir.path().join("effective-config.json");
@@ -22320,7 +23148,10 @@ mod daemon_cli_tests {
         std::fs::write(&binding, "incumbent binding").unwrap();
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
+        assert_eq!(
+            remove_unowned_daemon_runtime(&db_path, &pidfile, &socket, &binding),
+            RuntimeCleanup::PidfileOwned
+        );
         assert!(
             pidfile.exists(),
             "a concurrent owner's pidfile must survive"
@@ -22333,10 +23164,381 @@ mod daemon_cli_tests {
 
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(owner);
-        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
+        assert_eq!(
+            remove_unowned_daemon_runtime(&db_path, &pidfile, &socket, &binding),
+            RuntimeCleanup::Removed
+        );
         assert!(!socket.exists(), "unowned socket must be retired");
         assert!(!binding.exists(), "unowned binding must be retired");
         assert!(!pidfile.exists(), "unowned pidfile must be retired");
+    }
+
+    /// THE incident, at unit scale. An operator removes `daemon.pid` under a
+    /// live daemon; the pidfile flock — held on the now-unlinked inode — can no
+    /// longer be contended, so the old guard concluded "unowned" and deleted a
+    /// healthy daemon's socket. A real listener on the socket must veto that,
+    /// regardless of what the pidfile does or does not say.
+    #[cfg(unix)]
+    #[test]
+    fn hand_removed_pidfile_never_costs_a_live_daemon_its_socket() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let binding = dir.path().join("effective-config.json");
+
+        // A live daemon: listening socket, effective-config binding, pidfile
+        // flock held on the inode.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::write(&pidfile, format!("{}", std::process::id())).unwrap();
+        std::fs::write(&binding, "live binding").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        // The operator's recovery step. The flock survives on the unlinked
+        // inode, so it now protects nothing at this path.
+        std::fs::remove_file(&pidfile).unwrap();
+        assert!(
+            !pidfile_flock_held(&pidfile),
+            "an unlinked pidfile cannot be contended — this is precisely the defect"
+        );
+
+        let outcome = remove_unowned_daemon_runtime(&db_path, &pidfile, &socket, &binding);
+        assert!(
+            matches!(outcome, RuntimeCleanup::LiveSocketPeer { .. }),
+            "a served socket must veto cleanup, got {outcome:?}"
+        );
+        assert!(
+            socket.exists(),
+            "the live daemon's socket must survive a hand-removed pidfile"
+        );
+        assert!(binding.exists(), "the live binding must survive with it");
+        assert!(
+            std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            "the daemon must stay reachable"
+        );
+        assert!(
+            outcome.refusal().is_some(),
+            "the refusal must be reportable"
+        );
+
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        drop(listener);
+    }
+
+    /// The pidfile is gone but the socket is still there. Nothing in this
+    /// codebase produces that combination — cleanup removes the socket first —
+    /// so it is the fingerprint of hand-edited runtime state and must never be
+    /// read as "unowned", even when nothing answers the socket.
+    #[cfg(unix)]
+    #[test]
+    fn missing_pidfile_beside_a_socket_blocks_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let binding = dir.path().join("effective-config.json");
+        // A socket file with nothing listening: connect() fails, so only the
+        // path combination itself can raise the alarm.
+        std::fs::write(&socket, "orphaned socket").unwrap();
+        std::fs::write(&binding, "orphaned binding").unwrap();
+
+        assert_eq!(
+            remove_unowned_daemon_runtime(&db_path, &pidfile, &socket, &binding),
+            RuntimeCleanup::PidfileUnlinkedUnderSocket
+        );
+        assert!(socket.exists());
+        assert!(
+            binding.exists(),
+            "the effective-config binding must be retired with the socket or not at all"
+        );
+        assert!(
+            !pidfile.exists(),
+            "a refusal must not fabricate a pidfile at the path it refused to trust"
+        );
+    }
+
+    /// A process holding the database is not stale, whatever the runtime files
+    /// look like. This is the proof that survives any amount of `rm`.
+    #[cfg(unix)]
+    #[test]
+    fn database_write_lock_holder_blocks_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let binding = dir.path().join("effective-config.json");
+        std::fs::write(&db_path, b"database").unwrap();
+        std::fs::write(&binding, "live binding").unwrap();
+
+        // Hold the database write lock from a separate process (POSIX record
+        // locks never conflict with the calling process, so an in-process lock
+        // would be invisible). The forked child touches only async-signal-safe
+        // libc calls.
+        let c_path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(db_path.as_os_str().as_bytes()).unwrap()
+        };
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let holder = unsafe { libc::fork() };
+        assert!(holder >= 0, "fork failed");
+        if holder == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(11);
+                }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as libc::c_short;
+                lock.l_whence = libc::SEEK_SET as libc::c_short;
+                if libc::fcntl(fd, libc::F_SETLK, &lock) != 0 {
+                    libc::_exit(12);
+                }
+                let ready = [1u8];
+                libc::write(fds[1], ready.as_ptr() as *const libc::c_void, 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut ready = [0u8; 1];
+        let read = unsafe { libc::read(fds[0], ready.as_mut_ptr() as *mut libc::c_void, 1) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(read, 1, "the lock-holding child never signalled readiness");
+
+        let outcome = remove_unowned_daemon_runtime(&db_path, &pidfile, &socket, &binding);
+        assert!(
+            matches!(outcome, RuntimeCleanup::DatabaseOwned { .. }),
+            "a database owner must veto cleanup, got {outcome:?}"
+        );
+        assert!(binding.exists(), "the owner's binding must survive");
+        assert_eq!(
+            unreachable_daemon_owner(&db_path, &pidfile),
+            Some(UnreachableOwner::DatabaseWriteLock { pid: holder }),
+            "status must name the same owner the kernel named"
+        );
+
+        // THE REGRESSION THIS TEST EXISTS FOR: the lock holder is not a
+        // daemon — it is a bare process holding the database, exactly like
+        // `nestweaver embed --local` or an index run (this test's holder is a
+        // forked copy of the test binary, whose cmdline is not daemon-shaped).
+        // `daemon stop` must not select it as a signal target, or it SIGTERMs
+        // and then SIGKILLs an hours-long write mid-flight.
+        assert_eq!(
+            daemon_stop_signal_target(None, None, |pid| unsafe { libc::kill(pid, 0) == 0 }),
+            None,
+            "a database write-lock holder must never become a stop target"
+        );
+        assert_eq!(
+            daemon_stop_lock_holder_target(&db_path),
+            None,
+            "a lock holder whose argv is not daemon-shaped must not be signalled"
+        );
+
+        // Both branches of the ONE path that may signal a lock holder, against
+        // this same real, kernel-held lock. The argv source is injected because
+        // a live process's argv cannot be forged from a test; the lock evidence
+        // is genuine. The un-injected reader is covered end-to-end by the
+        // isolated-daemon reproduction.
+        let daemon_shaped = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "daemon".to_string(),
+                    "--db".to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                    "start".to_string(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, daemon_shaped),
+            Some(holder),
+            "a lock holder that IS a daemon for this DB must be stoppable — otherwise the \
+             incident state stops being repairable by `daemon stop`"
+        );
+
+        // …and the finding-1 false positive, against the same live lock: an
+        // index run whose --repo VALUE is `daemon`.
+        let value_named_daemon = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "index".to_string(),
+                    "--repo".to_string(),
+                    "daemon".to_string(),
+                    "--db".to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, value_named_daemon),
+            None,
+            "`--repo daemon` holds the write lock and must NOT be signalled"
+        );
+
+        assert!(
+            unsafe { libc::kill(holder, 0) } == 0,
+            "the lock holder must still be alive"
+        );
+
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(holder, &mut status, 0);
+        }
+    }
+
+    /// The path-evidence half of stop's target selection: a live pidfile PID
+    /// or the kernel-reported socket peer, and nothing else.
+    ///
+    /// Scope, precisely: this covers ONLY this pure helper. The call site
+    /// additionally chains `.or_else(daemon_stop_lock_holder_target)`, so this
+    /// test does NOT by itself prove the database lock stays out of the target
+    /// set — `database_write_lock_holder_blocks_cleanup` covers that branch
+    /// against a real lock, in both its accepting and rejecting form.
+    #[test]
+    fn stop_targets_only_pidfile_and_socket_evidence() {
+        let alive_all = |_: i32| true;
+        let dead_all = |_: i32| false;
+
+        // A live pidfile PID wins.
+        assert_eq!(
+            daemon_stop_signal_target(Some(11), Some(22), alive_all),
+            Some(11)
+        );
+        // A dead pidfile PID falls through to the live socket peer.
+        assert_eq!(
+            daemon_stop_signal_target(Some(11), Some(22), |pid| pid == 22),
+            Some(22)
+        );
+        // No pidfile at all: the socket peer still counts.
+        assert_eq!(
+            daemon_stop_signal_target(None, Some(22), alive_all),
+            Some(22)
+        );
+        // Neither alive: this helper yields nothing. (The call site may still
+        // consult the lock holder afterwards, under its own argv proof.)
+        assert_eq!(
+            daemon_stop_signal_target(Some(11), Some(22), dead_all),
+            None
+        );
+        assert_eq!(daemon_stop_signal_target(None, None, alive_all), None);
+    }
+
+    /// Identity requires `daemon` at argv[1]. Without it, the processes that
+    /// legitimately hold this database's write lock — an embed or an index
+    /// run — match the predicate and become signalable.
+    #[test]
+    fn daemon_identity_requires_the_daemon_subcommand() {
+        let db = std::path::Path::new("/tmp/nowhere-xyz-123/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug start"),
+            db
+        ));
+        assert!(argv_is_our_daemon(
+            &argv("/usr/local/bin/nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug run"),
+            db
+        ));
+        assert!(
+            !argv_is_our_daemon(
+                &argv("nestweaver embed --db /tmp/nowhere-xyz-123/brain.lbug --local"),
+                db
+            ),
+            "an embed run holds the write lock and must never read as a daemon"
+        );
+        assert!(
+            !argv_is_our_daemon(
+                &argv("nestweaver index --db /tmp/nowhere-xyz-123/brain.lbug"),
+                db
+            ),
+            "an index run holds the write lock and must never read as a daemon"
+        );
+    }
+
+    /// The kernel interface itself must hand back interior empty arguments.
+    /// `/bin/sh -c <script> "" ""` sets `$0` and `$1` to empty strings, which
+    /// is the shape that could otherwise shift a subcommand into position.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_argv_preserves_interior_empty_arguments() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30", "", ""])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id() as i32;
+
+        // Wait for the exec to land: before it, /proc/<pid>/cmdline still
+        // shows the forked parent. Ten seconds is enormous headroom for an
+        // exec of /bin/sh — this is not a throughput assertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut argv = Vec::new();
+        while std::time::Instant::now() < deadline {
+            argv = process_argv(pid).unwrap_or_default();
+            if argv.iter().any(|arg| arg == "sleep 30") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            "empty arguments must survive, and the NUL terminator must not add a phantom one"
+        );
+    }
+
+    /// `daemon stop` on an instance whose runtime dir does not exist — never
+    /// started, or a fresh XDG_RUNTIME_DIR after a tmpfs reboot / in a
+    /// container / on a CI runner — has nothing to retire. That is success.
+    /// Reporting it as a refusal made `stop` exit 1 while `status` on the
+    /// identical state exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_on_a_never_started_instance_is_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("run/nestweaver/deadbeef");
+        assert!(!runtime.exists(), "the runtime dir must be absent");
+
+        let outcome = remove_unowned_daemon_runtime(
+            &dir.path().join("db/brain.lbug"),
+            &runtime.join("daemon.pid"),
+            &runtime.join("daemon.sock"),
+            &runtime.join("effective-config.json"),
+        );
+
+        assert_eq!(outcome, RuntimeCleanup::Removed);
+        assert_eq!(
+            outcome.refusal(),
+            None,
+            "nothing to retire must not read as a refusal — that is what exits 1"
+        );
+        assert!(
+            !runtime.exists(),
+            "`stop` must not materialize runtime state on its way to deleting it"
+        );
     }
 }
 
