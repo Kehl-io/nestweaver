@@ -845,8 +845,8 @@ const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
 ///    stayed alive holding the DB write lock, and only an operator's SIGKILL
 ///    ever ended it; and
 ///  - broadcasting shutdown there tore down every listener while the process
-///    lived on, which is how a stuck WRITE drain also took READS down. Reads
-///    never needed the write gate (`ConnectionGuard::read` does not take
+///    lived on, which is how a stuck WRITE drain also took READS down. Almost
+///    no read needs the write gate (`ConnectionGuard::read` does not take
 ///    `write_mutex`), so they were not blocked by the drain itself — they died
 ///    because the UDS/TCP/MCP acceptors had already been shut down by that
 ///    premature broadcast, and every new `daemon status` / MCP / CLI read
@@ -854,7 +854,9 @@ const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
 ///
 /// Waiting instead keeps the daemon readable until the operator escalates —
 /// and if the write does finish, shutdown still completes cleanly rather than
-/// leaving a half-dead process behind.
+/// leaving a half-dead process behind. "Readable" is not absolute: `embed` and
+/// `plan_embed` take `write_mutex` themselves, so they stay blocked for the
+/// duration of the stuck write, and the ceiling message says so.
 ///
 /// The unbounded wait applies to in-flight WRITES ONLY. `indexing_active` on
 /// its own stays bounded by the ceiling — see the comment on that branch for
@@ -907,13 +909,33 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
             // The broadcast below is precisely what unblocks it: the worker
             // loop observes shutdown and breaks. That is the pre-existing,
             // working behaviour for this path, so it is kept intact.
+            //
+            // This branch DOES have a cost, and the message says so rather than
+            // letting the daemon do the dishonest thing quietly. Broadcasting
+            // stops every listener accepting, so read service ends here — and
+            // worker-pool index jobs bump `indexing_active` rather than
+            // `active_writes`, so if the flag is set because a job really is
+            // running, that unabortable `spawn_blocking` write keeps the process
+            // alive with nothing being served. That is the original incident,
+            // surviving in the server-mode index path. It is not a regression
+            // (`main` behaves identically) and it cannot be fixed from here: the
+            // worker's `in_flight` counter lives inside `IndexingStatus` and is
+            // never shared into `DaemonState`, so this loop cannot tell a stuck
+            // flag from a running job. Tracked as a follow-up alongside the
+            // SIGTERM broadcast; both come from the same root cause, that the
+            // broadcast is the only shutdown primitive and it is all-or-nothing.
             if elapsed >= ceiling_at {
                 tracing::warn!(
                     indexing_active = indexing,
                     waited_secs = elapsed.as_secs(),
                     "drain ceiling ({ceiling}s) reached with no in-flight writes — \
                      signalling shutdown. The index worker stops after its current \
-                     job; anything still queued is left for the next start"
+                     job; anything still queued is left for the next start. NOTE: \
+                     this closes every listener, so reads stop being served now — \
+                     and if an index job is genuinely still running, it cannot be \
+                     aborted, so the process may stay alive without serving \
+                     anything until it finishes. `kill -9` ends it sooner, \
+                     abandoning that job's write"
                 );
                 break;
             }
@@ -934,7 +956,15 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
                  listener immediately, so reads stay down for the whole stop \
                  grace (default: ceiling + 30s) before it escalates to SIGKILL \
                  anyway",
-                if indexing { " + an index job" } else { "" },
+                // Hedged: `indexing_active` is a flag, not a proof of work. It
+                // can stay set after the worker pool is drained, so claiming a
+                // running index job here would be the same kind of overclaim
+                // this line exists to stop making.
+                if indexing {
+                    " (indexing_active is also set)"
+                } else {
+                    ""
+                },
             );
         }
 
@@ -8435,6 +8465,12 @@ pub async fn run_server(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
                             );
+                            // Symmetry with the SIGTERM handler: this
+                            // broadcasts immediately, so a Shutdown RPC
+                            // arriving afterwards has nothing left to drain
+                            // and should not spawn a loop that would only
+                            // re-broadcast.
+                            active.shutdown_started.store(true, Ordering::Relaxed);
                             let _ = tx.send(true);
                             return;
                         }
