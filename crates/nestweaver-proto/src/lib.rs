@@ -26,6 +26,19 @@ mod additive_status_contract_tests {
         out
     }
 
+    /// An `EmbeddingStatus` exactly as a pre-4.2 daemon put it on the wire:
+    /// hand-built tags for fields 1-8 only, with nothing from 4.2 present.
+    fn pre_4_2_embedding_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(string_field(1, "ready")); // state
+        bytes.extend(string_field(2, "local")); // backend
+        bytes.extend(string_field(3, "auto")); // requested_device
+        bytes.extend(string_field(4, "cpu")); // selected_device
+        bytes.extend(string_field(5, "old-model")); // model_id
+        bytes.extend(varint_field(7, 1)); // metal_compiled
+        bytes
+    }
+
     /// A3: the additive-compat claim, tested rather than asserted.
     ///
     /// These are hand-built wire bytes carrying ONLY the fields an older
@@ -36,13 +49,7 @@ mod additive_status_contract_tests {
     /// instead of erroring or inventing progress.
     #[test]
     fn a_pre_4_2_daemons_bytes_decode_with_the_new_fields_at_their_defaults() {
-        let mut old_embedding = Vec::new();
-        old_embedding.extend(string_field(1, "ready")); // state
-        old_embedding.extend(string_field(2, "local")); // backend
-        old_embedding.extend(string_field(3, "auto")); // requested_device
-        old_embedding.extend(string_field(4, "cpu")); // selected_device
-        old_embedding.extend(string_field(5, "old-model")); // model_id
-        old_embedding.extend(varint_field(7, 1)); // metal_compiled
+        let old_embedding = pre_4_2_embedding_bytes();
 
         let decoded = EmbeddingStatus::decode(old_embedding.as_slice())
             .expect("a pre-4.2 EmbeddingStatus must still decode");
@@ -109,19 +116,38 @@ mod additive_status_contract_tests {
         assert_eq!(round_tripped.state, old_only.state);
         assert_eq!(round_tripped.model_id, old_only.model_id);
         assert_eq!(round_tripped.pass_total, 88_131);
-        // A default-valued new field must not appear on the wire at all, so an
-        // idle 4.2 daemon is byte-identical to a pre-4.2 one.
-        assert_eq!(old_only.encode_to_vec(), {
-            let idle = EmbeddingStatus {
-                pass_active: false,
-                pass_processed: 0,
-                pass_total: 0,
-                pass_started_at: 0,
-                pass_scope: String::new(),
-                ..old_only.clone()
-            };
-            idle.encode_to_vec()
-        });
+
+        // Proto3 omits default-valued scalars, so an IDLE 4.2 daemon must put
+        // exactly the pre-4.2 byte sequence on the wire — no new tags at all.
+        // Compared against the hand-built old-daemon bytes, not against
+        // another instance of this same struct: comparing a struct to itself
+        // with the new fields set to the values it already holds cannot fail
+        // and proves nothing.
+        let idle_4_2 = EmbeddingStatus {
+            state: "ready".to_string(),
+            backend: "local".to_string(),
+            requested_device: "auto".to_string(),
+            selected_device: "cpu".to_string(),
+            model_id: "old-model".to_string(),
+            metal_compiled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            idle_4_2.encode_to_vec(),
+            pre_4_2_embedding_bytes(),
+            "an idle 4.2 daemon must be byte-identical to a pre-4.2 one"
+        );
+
+        // And the converse, so the assertion above is known to be falsifiable:
+        // a RUNNING pass does add bytes.
+        assert_ne!(
+            EmbeddingStatus {
+                pass_active: true,
+                ..idle_4_2.clone()
+            }
+            .encode_to_vec(),
+            pre_4_2_embedding_bytes(),
+        );
     }
 
     #[test]
