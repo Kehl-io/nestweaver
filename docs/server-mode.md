@@ -472,6 +472,13 @@ alongside the returned rows:
 - Every row, including `response_format: "concise"`, carries its canonical
   domain-qualified `uid`. Hybrid deduplication uses that identity rather than
   presentation fields such as title or location.
+- `semantic_applied` is always `false` and `degraded_components` always empty.
+  `brain_search` is keyword/BM25-only and never requests a semantic leg, so
+  neither can it be degraded. Both are reported rather than omitted so a
+  caller checking them can distinguish "no semantic leg" from "field not
+  implemented on this path". The direct gRPC daemon response and both MCP
+  paths agree on this. Note the hybrid merge below does **not** yet carry
+  these two keys through, so a merged response may omit them entirely.
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
 server responses have valid, internally consistent exact-count metadata and
