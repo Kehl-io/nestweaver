@@ -13328,10 +13328,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                     }
                     if !state.spared.is_empty() {
+                        // Split by WHICH proof spared them. The pidfile flock is
+                        // forgeable by `rm -f daemon.pid`; the database write
+                        // lock is not, and the second count is exactly the set
+                        // the old pidfile-only test would have swept.
+                        let by_db = state.spared_without_pidfile_proof.len();
                         println!(
-                            "  spared (live daemon holds the pidfile lock): {}",
-                            state.spared.len()
+                            "  spared (live instance holds the pidfile lock): {}",
+                            state.spared.len() - by_db
                         );
+                        if by_db > 0 {
+                            println!(
+                                "  spared (database write lock still held, pidfile evidence \
+                                 absent or unreadable): {by_db}"
+                            );
+                        }
                     }
                     // Surfaced rather than folded into "kept": these are
                     // directories the sweep could not identify, so they will

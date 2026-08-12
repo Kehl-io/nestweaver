@@ -1417,11 +1417,72 @@ pub struct StateDirGcReport {
     pub reclaimed_bytes: u64,
     /// Directories whose database still exists.
     pub kept: Vec<String>,
-    /// Directories spared because a live daemon still holds the pidfile lock.
+    /// Directories spared because something still owns the instance — a live
+    /// socket peer, the database write lock, or the pidfile flock.
     pub spared: Vec<String>,
+    /// The subset of [`StateDirGcReport::spared`] whose proof was NOT the
+    /// pidfile flock. Reported separately because those are exactly the
+    /// instances the old pidfile-only test would have swept: the flock lives on
+    /// an inode, so `rm -f daemon.pid` erases it, while a served socket and the
+    /// database write lock survive.
+    pub spared_without_pidfile_proof: Vec<String>,
     /// Directories left alone because their database could not be identified.
     /// Not an error: unidentifiable means undeletable, by design.
     pub unidentified: Vec<String>,
+}
+
+/// What proved that a state directory's instance is still owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateDirOwner {
+    /// The kernel names a process holding this database's write lock. Survives
+    /// any amount of pidfile tampering.
+    DatabaseWriteLock { pid: Option<i32> },
+    /// The database lock state could not be read. Fail closed: possibly owned.
+    DatabaseOwnershipUnknown,
+    /// The pidfile flock is contended. Forgeable by `rm -f daemon.pid`, so it
+    /// is the LAST resort, never the only one.
+    PidfileLock,
+}
+
+/// Who, if anyone, still owns `instance_id`, strongest evidence first.
+///
+/// The pidfile flock alone is not an ownership test. A flock lives on an
+/// *inode*: an operator's `rm -f daemon.pid` during recovery leaves the live
+/// daemon holding a lock on an unlinked inode, and the next `flock` at that
+/// path succeeds against no contention at all. That is the exact forgery
+/// behind the runtime-ownership incident, and this sweep — which runs in
+/// precisely the situations where the pidfile has been disturbed — used to
+/// depend on it alone.
+///
+/// So consult [`db_write_lock`] first. It asks the kernel who holds the
+/// database file itself, which is the data: nobody deletes it during recovery,
+/// and `Unknown` fails closed exactly as it does for the runtime-removal
+/// callers.
+///
+/// Residual, stated rather than hidden: the database probe is by PATH. If the
+/// database was renamed or deleted out from under a running daemon (an
+/// unmounted volume, a test that removed its temp dir), the probe finds nothing
+/// and only the pidfile flock is left to speak. That corner — database path
+/// gone AND pidfile removed — remains undetectable here, and costs the instance
+/// its logs, not its socket or its life.
+///
+/// Must not be called from a process holding a read-write store open: the probe
+/// would fail closed for every candidate (see [`db_write_lock`]) and the sweep
+/// would spare everything. `daemon gc` runs in a CLI process that opens no
+/// store.
+#[cfg(unix)]
+fn state_dir_owner(instance_id: &str, db_path: &Path) -> Option<StateDirOwner> {
+    match db_write_lock(db_path) {
+        DbWriteLock::Held { pid } => return Some(StateDirOwner::DatabaseWriteLock { pid }),
+        DbWriteLock::Unknown => return Some(StateDirOwner::DatabaseOwnershipUnknown),
+        DbWriteLock::Free => {}
+    }
+    instance_pidfile_lock_held(instance_id).then_some(StateDirOwner::PidfileLock)
+}
+
+#[cfg(not(unix))]
+fn state_dir_owner(instance_id: &str, _db_path: &Path) -> Option<StateDirOwner> {
+    instance_pidfile_lock_held(instance_id).then_some(StateDirOwner::PidfileLock)
 }
 
 /// Is a live daemon holding `instance_id`'s pidfile lock?
@@ -1429,8 +1490,11 @@ pub struct StateDirGcReport {
 /// The daemon opens the DB *before* taking the pidfile `flock(LOCK_EX)` and
 /// holds it for its whole lifetime, so a held lock means a healthy daemon.
 /// Fails toward `true` (spare) on any error we cannot interpret.
+///
+/// Corroborating evidence only — see [`state_dir_owner`] for why this can never
+/// be the sole ownership test.
 #[cfg(unix)]
-fn instance_daemon_is_live(instance_id: &str) -> bool {
+fn instance_pidfile_lock_held(instance_id: &str) -> bool {
     let pidfile = pidfile_path(instance_id);
     let file = match std::fs::OpenOptions::new()
         .read(true)
@@ -1453,7 +1517,7 @@ fn instance_daemon_is_live(instance_id: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn instance_daemon_is_live(_instance_id: &str) -> bool {
+fn instance_pidfile_lock_held(_instance_id: &str) -> bool {
     true
 }
 
@@ -1526,8 +1590,14 @@ fn directory_size_bytes(dir: &Path) -> u64 {
 ///
 /// Fail-closed at every step. A directory is deleted only when its name matches
 /// the instance-id shape, its database was positively identified, that database
-/// is temporary or missing, and no live daemon holds its pidfile lock. Anything
-/// unreadable, unparseable, or ambiguous is kept.
+/// is temporary or missing, and nothing still owns the instance — neither the
+/// database write lock nor the pidfile flock (see [`state_dir_owner`]).
+/// Anything unreadable, unparseable, or ambiguous is kept.
+///
+/// Every directory that reaches the ownership test has a database path: one
+/// that cannot be resolved from `daemon.log` is reported as `unidentified` and
+/// left alone *before* the test runs, so there is no candidate whose deletion
+/// rests on an unprobed database.
 pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
     let root = persistent_state_root();
     let mut report = StateDirGcReport::default();
@@ -1560,7 +1630,27 @@ pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
             continue;
         };
 
-        if instance_daemon_is_live(name) {
+        if let Some(owner) = state_dir_owner(name, &db_path) {
+            match owner {
+                StateDirOwner::DatabaseWriteLock { pid } => {
+                    tracing::info!(
+                        instance = name,
+                        db = %db_path.display(),
+                        holder = ?pid,
+                        "sparing a state directory whose database is still held"
+                    );
+                    report.spared_without_pidfile_proof.push(name.to_string());
+                }
+                StateDirOwner::DatabaseOwnershipUnknown => {
+                    tracing::info!(
+                        instance = name,
+                        db = %db_path.display(),
+                        "sparing a state directory whose database lock state could not be read"
+                    );
+                    report.spared_without_pidfile_proof.push(name.to_string());
+                }
+                StateDirOwner::PidfileLock => {}
+            }
             report.spared.push(name.to_string());
             continue;
         }
@@ -1586,6 +1676,7 @@ pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
     report.removed.sort();
     report.kept.sort();
     report.spared.sort();
+    report.spared_without_pidfile_proof.sort();
     report.unidentified.sort();
     Ok(report)
 }
@@ -2631,6 +2722,80 @@ mod tests {
             unsafe {
                 libc::flock(held.as_raw_fd(), libc::LOCK_UN);
             }
+        });
+    }
+
+    /// THE gap, at unit scale. An operator removes `daemon.pid` under a live
+    /// daemon serving a temp database — the shape `gc` exists to reap. The
+    /// pidfile flock is gone with the inode, so the pidfile-only test says
+    /// "orphan" and the sweep deletes a LIVE instance's logs. The database
+    /// write lock still names the holder, and must veto the deletion.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_spares_a_live_database_holder_after_the_pidfile_is_removed() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        // Under /tmp, so the temp-database rule makes this a reap candidate —
+        // exactly the class `gc` sweeps by the thousand.
+        let db = db_dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        assert!(is_temp_db_path(&db));
+
+        let holder = fork_write_lock_holder(&db);
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("ffffffff", db.to_str().unwrap());
+            // No pidfile at all: the strongest form of the forgery, and what an
+            // operator's `rm -f daemon.pid` leaves behind.
+            assert!(!pidfile_path("ffffffff").exists());
+            let report = gc_orphaned_state_dirs().unwrap();
+            assert!(
+                log_dir("ffffffff").exists(),
+                "a live database holder must keep its logs"
+            );
+            report
+        });
+        reap(holder);
+
+        assert_eq!(report.spared, vec!["ffffffff".to_string()]);
+        assert_eq!(
+            report.spared_without_pidfile_proof,
+            vec!["ffffffff".to_string()],
+            "the sparing proof must be the database lock, not the (absent) pidfile"
+        );
+        assert!(report.removed.is_empty());
+    }
+
+    /// The evidence layers are independent: the pidfile flock still spares an
+    /// instance whose database path is gone (an unmounted volume), where the
+    /// path-based database probe can say nothing.
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_owner_falls_back_to_the_pidfile_lock_when_the_database_is_gone() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            let missing = PathBuf::from("/nonexistent-root-13579/brain.lbug");
+            assert_eq!(db_write_lock(&missing), DbWriteLock::Free);
+            assert_eq!(state_dir_owner("aaaabbbb", &missing), None);
+
+            let pidfile = pidfile_path("aaaabbbb");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, "12345\n").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            assert_eq!(
+                state_dir_owner("aaaabbbb", &missing),
+                Some(StateDirOwner::PidfileLock)
+            );
+
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
         });
     }
 
