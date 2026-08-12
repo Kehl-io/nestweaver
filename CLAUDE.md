@@ -18,7 +18,11 @@ All CLI commands and MCP tool calls route through a background daemon process
 that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
 invocation and self-terminates after an idle timeout. The client auto-restarts
 the daemon on version mismatch. Shutdown is graceful: the daemon drains active
-write RPCs before exiting (up to `NESTWEAVER_DRAIN_TIMEOUT_SECS`, default 660s).
+write RPCs before exiting. `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) is a
+reporting threshold, not a kill switch — in-flight writes run on `spawn_blocking`
+threads that cannot be aborted, so past the ceiling the daemon keeps waiting,
+keeps serving reads, and logs what it is waiting on. SIGKILL is the only thing
+that ends a stuck write (`nestweaver daemon stop` escalates to it).
 Indexing is CPU-throttled to a rolling 5s duty-cycle window so a saturated
 daemon stays under macOS CPU-violation limits; tune with
 `NESTWEAVER_INDEX_CPU_PERCENT` (percent of one core, 1–99, default 50; `0` or
@@ -43,7 +47,7 @@ by an error message the tool can print, so they belong somewhere findable.
 |----------|---------|---------|
 | `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` | 30 | How long a client waits for the daemon to bind its socket. Raise it on a slow cold start; the boot-failure message names it. Boot phase timings (`boot_ms`, `store_open_ms`, `extension_reconcile_ms`, `unattributed_ms`) are logged at bind so a slow boot is diagnosable rather than guessed at. |
 | `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a non-terminal warning naming this variable. Cancellation is COOPERATIVE and only observed up to the pre-write boundary, so the final stream event says whether the run aborted before writing or committed anyway (committed-after-cancellation names `index --force` as the repair). |
-| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | How long a shutting-down daemon drains active write RPCs. |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | How long a shutting-down daemon drains active write RPCs before it starts reporting that it is stuck. It is NOT a deadline: the daemon cannot abort an in-flight write, so past this point it keeps waiting (and keeps serving reads), logging the in-flight count and naming SIGKILL as the only escape. |
 | `NESTWEAVER_STOP_GRACE_SECS` | — | Grace period before a stopping daemon is escalated. |
 | `NESTWEAVER_INDEX_CPU_PERCENT` | 50 | Index CPU duty cycle, percent of one core (1–99; `0` or `>=100` disables). Also see the launchd note below. |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Opt-in required to honour `--no-daemon` / `NESTWEAVER_NO_DAEMON` outside CI. Without it the bypass is REFUSED, because it circumvents the single-writer lock. Not for normal use. |

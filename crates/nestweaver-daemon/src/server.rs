@@ -810,6 +810,102 @@ fn stop_active_watcher(state: &DaemonState) {
     }
 }
 
+/// Minimum spacing between repeats of the over-ceiling drain warning. The
+/// ceiling itself sets the cadence; this floor stops a tiny
+/// `NESTWEAVER_DRAIN_TIMEOUT_SECS` from turning the log into a spinner.
+const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
+
+/// Wait for in-flight writes and indexing to finish, then broadcast shutdown.
+///
+/// `ceiling` (`NESTWEAVER_DRAIN_TIMEOUT_SECS`) is a REPORTING threshold, not a
+/// kill switch, and this function must not pretend otherwise. Nothing in this
+/// process can abort an in-flight write: daemon writes run on `spawn_blocking`
+/// threads Tokio cannot cancel (see the "`spawn_blocking` work cannot be
+/// aborted" note on the exit path), and the shutdown broadcast this function
+/// ends with only stops listeners ACCEPTING — it cannot preempt work already
+/// running.
+///
+/// So the loop keeps waiting past the ceiling and says so. It used to log
+/// "drain timeout reached — forcing shutdown" and break, which was false twice
+/// over:
+///
+///  - nothing was forced. The broadcast does not abort the write, the process
+///    stayed alive holding the DB write lock, and only an operator's SIGKILL
+///    ever ended it; and
+///  - broadcasting shutdown there tore down every listener while the process
+///    lived on, which is how a stuck WRITE drain also took READS down. Reads
+///    never needed the write gate (`ConnectionGuard::read` does not take
+///    `write_mutex`), so they were not blocked by the drain itself — they died
+///    because the UDS/TCP/MCP acceptors had already been shut down by that
+///    premature broadcast, and every new `daemon status` / MCP / CLI read
+///    connection was refused for as long as the write ran.
+///
+/// Waiting instead keeps the daemon readable until the operator escalates —
+/// and if the write does finish, shutdown still completes cleanly rather than
+/// leaving a half-dead process behind.
+async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
+    let ceiling_at = std::time::Duration::from_secs(ceiling);
+    let half = std::time::Duration::from_secs(ceiling / 2);
+    let ninety = std::time::Duration::from_secs(ceiling * 9 / 10);
+    let repeat_every =
+        std::time::Duration::from_secs(ceiling.max(DRAIN_OVER_CEILING_REPORT_FLOOR_SECS));
+    let start = tokio::time::Instant::now();
+    let mut warned_half = false;
+    let mut warned_ninety = false;
+    // When the next over-ceiling report is due: first at the ceiling itself,
+    // then every `repeat_every` after that.
+    let mut next_over_ceiling_report = ceiling_at;
+
+    loop {
+        let writes = state.active_writes.load(Ordering::Relaxed);
+        // Index jobs bump `indexing_active`, not `active_writes`, so the
+        // drain must wait on both — otherwise a shutdown could proceed
+        // while the worker is mid-write.
+        let indexing = state.indexing_active.load(Ordering::Relaxed);
+        if writes == 0 && !indexing {
+            tracing::info!("no active writes or indexing — shutting down");
+            break;
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= next_over_ceiling_report {
+            next_over_ceiling_report = elapsed + repeat_every;
+            let pid = std::process::id();
+            tracing::warn!(
+                active_writes = writes,
+                indexing_active = indexing,
+                waited_secs = elapsed.as_secs(),
+                pid,
+                "drain ceiling ({ceiling}s) exceeded — still waiting on {writes} \
+                 in-flight write(s){}; the daemon CANNOT abort them and is NOT \
+                 shutting down yet. Reads are still being served. To end it now: \
+                 `nestweaver daemon stop` (escalates to SIGKILL) or `kill -9 \
+                 {pid}` — the in-flight write is then abandoned",
+                if indexing { " + an index job" } else { "" },
+            );
+        } else {
+            if !warned_half && elapsed >= half {
+                tracing::warn!(
+                    active_writes = writes,
+                    "drain at 50% of ceiling ({ceiling}s)"
+                );
+                warned_half = true;
+            }
+            if !warned_ninety && elapsed >= ninety {
+                tracing::warn!(
+                    active_writes = writes,
+                    "drain at 90% of ceiling ({ceiling}s)"
+                );
+                warned_ninety = true;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let _ = state.shutdown_tx.send(true);
+}
+
 /// Register a watcher's shutdown handle, returning its registration id (the
 /// watcher thread passes it to [`clear_watcher_registration`] on exit).
 ///
@@ -2938,7 +3034,16 @@ impl NestWeaverDaemon for DaemonService {
         // Without this the worker keeps claiming new jobs during the drain, so
         // under continuous webhook enqueue `indexing_active` never clears and
         // shutdown burns the full drain ceiling doing work it will abandon.
-        self.state.drained.store(true, Ordering::Relaxed);
+        //
+        // The swap doubles as the once-only guard on the drain task. A second
+        // Shutdown (or one arriving after SIGTERM, which sets the same flag)
+        // must not spawn a second `run_shutdown_drain`: the two would duplicate
+        // every drain warning forever — visible in the incident log as two
+        // interleaved 90%/ceiling report streams — and race the broadcast.
+        if self.state.drained.swap(true, Ordering::Relaxed) {
+            tracing::info!("shutdown already in progress — not starting a second drain");
+            return Ok(Response::new(ShutdownResponse { ok: true }));
+        }
 
         // Stop any active watcher BEFORE the drain wait — an orphaned
         // watcher's blocking thread would otherwise pin shutdown until the
@@ -2947,54 +3052,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         tokio::spawn(async move {
-            let ceiling = nestweaver_schema::drain_ceiling_from_env();
-
-            let timeout = std::time::Duration::from_secs(ceiling);
-            let half = std::time::Duration::from_secs(ceiling / 2);
-            let ninety = std::time::Duration::from_secs(ceiling * 9 / 10);
-            let start = tokio::time::Instant::now();
-            let mut warned_half = false;
-            let mut warned_ninety = false;
-
-            loop {
-                let writes = state.active_writes.load(Ordering::Relaxed);
-                // Index jobs bump `indexing_active`, not `active_writes`, so the
-                // drain must wait on both — otherwise a shutdown could proceed
-                // while the worker is mid-write.
-                let indexing = state.indexing_active.load(Ordering::Relaxed);
-                if writes == 0 && !indexing {
-                    tracing::info!("no active writes or indexing — shutting down");
-                    break;
-                }
-
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    tracing::warn!(
-                        active_writes = writes,
-                        "drain timeout ({ceiling}s) reached — forcing shutdown"
-                    );
-                    break;
-                }
-
-                if !warned_half && elapsed >= half {
-                    tracing::warn!(
-                        active_writes = writes,
-                        "drain at 50% of timeout ({ceiling}s)"
-                    );
-                    warned_half = true;
-                }
-                if !warned_ninety && elapsed >= ninety {
-                    tracing::warn!(
-                        active_writes = writes,
-                        "drain at 90% of timeout ({ceiling}s)"
-                    );
-                    warned_ninety = true;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-
-            let _ = state.shutdown_tx.send(true);
+            run_shutdown_drain(state, nestweaver_schema::drain_ceiling_from_env()).await;
         });
 
         Ok(Response::new(ShutdownResponse { ok: true }))
@@ -15434,6 +15492,167 @@ external_model = "unavailable-test-model"
             state.drained.load(Ordering::Relaxed),
             "shutdown must set drained immediately (before the drain wait loop) \
              so the worker pool stops claiming new jobs the moment shutdown begins"
+        );
+    }
+
+    /// A `tracing` writer that accumulates formatted events in memory so a
+    /// test can assert on what the daemon actually logged.
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A1: the drain ceiling cannot force anything, so it must not claim to —
+    /// and it must not tear the daemon down either.
+    ///
+    /// The production incident this guards: a `daemon restart` during a long
+    /// embed logged "drain timeout (660s) reached — forcing shutdown" three
+    /// times while the process stayed alive holding the DB write lock, and the
+    /// broadcast that accompanied that line closed every listener, so reads
+    /// (`daemon status`, MCP, every CLI query) timed out for an hour until an
+    /// operator sent SIGKILL.
+    ///
+    /// So this asserts all four halves of the honesty fix at once:
+    ///  1. the ceiling message names the in-flight write count and the escape
+    ///     hatch, and no longer says anything was forced;
+    ///  2. the drain does NOT broadcast shutdown at the ceiling (listeners stay
+    ///     up, so reads keep being served);
+    ///  3. it keeps waiting past the ceiling rather than breaking; and
+    ///  4. when the write finally lands it still shuts down cleanly.
+    ///
+    /// A 1s ceiling keeps this in real time without needing a paused clock;
+    /// the over-ceiling repeat floor (60s) means exactly one such report fires.
+    #[tokio::test]
+    async fn drain_ceiling_reports_honestly_and_keeps_serving() {
+        let state = test_state_with_writer();
+        // Stand in for an embed/index write that outlives the ceiling. Nothing
+        // in the daemon can abort one of these — that is the whole point.
+        state.active_writes.store(3, Ordering::Relaxed);
+        // Stand in for the serve loops: `watch::Sender::send` is a no-op error
+        // when every receiver has been dropped, so without a live subscriber
+        // the channel could never record the broadcast this test asserts on.
+        let shutdown_rx = state.shutdown_tx.subscribe();
+
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        // Observe the broadcast from OUTSIDE the drain, at a moment that is
+        // past the ceiling but before the write completes.
+        let probe_state = Arc::clone(&state);
+        let broadcast_at_ceiling = Arc::new(AtomicBool::new(false));
+        let probe_flag = Arc::clone(&broadcast_at_ceiling);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            probe_flag.store(*probe_state.shutdown_tx.borrow(), Ordering::Relaxed);
+            // Now let the "write" finish.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            probe_state.active_writes.store(0, Ordering::Relaxed);
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_shutdown_drain(Arc::clone(&state), 1),
+        )
+        .await
+        .expect("drain must finish once the in-flight write completes");
+
+        assert!(
+            !broadcast_at_ceiling.load(Ordering::Relaxed),
+            "the drain must NOT broadcast shutdown at the ceiling — that closes \
+             every listener while the process lives on, which is what took reads \
+             down during the incident"
+        );
+        assert!(
+            *shutdown_rx.borrow(),
+            "the drain must still broadcast shutdown once the write completes"
+        );
+
+        let text = logs.text();
+        assert!(
+            !text.contains("forcing shutdown"),
+            "the ceiling must not claim to force a shutdown it cannot perform: {text}"
+        );
+        assert!(
+            text.contains("drain ceiling (1s) exceeded"),
+            "the ceiling must report that it was exceeded: {text}"
+        );
+        assert!(
+            text.contains("still waiting on 3 in-flight write(s)"),
+            "the ceiling message must name what is still in flight: {text}"
+        );
+        assert!(
+            text.contains("kill -9"),
+            "the ceiling message must name the only thing that actually ends it: {text}"
+        );
+    }
+
+    /// A second Shutdown must not start a second drain. The incident log shows
+    /// two overlapping drains (two 90% warnings, two ceiling reports) from two
+    /// `daemon restart` attempts; now that the drain warns for as long as the
+    /// write runs, duplicated loops would double every line indefinitely.
+    #[tokio::test]
+    async fn duplicate_shutdown_does_not_start_a_second_drain() {
+        let state = test_state_with_writer();
+        // Keeps the first drain loop alive for the whole test.
+        state.indexing_active.store(true, Ordering::Relaxed);
+
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let service = DaemonService::new(Arc::clone(&state));
+        for _ in 0..2 {
+            let mut req = Request::new(ShutdownRequest {});
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            assert!(
+                service
+                    .shutdown(req)
+                    .await
+                    .expect("shutdown ok")
+                    .into_inner()
+                    .ok,
+                "a duplicate shutdown is still a successful no-op"
+            );
+        }
+
+        let text = logs.text();
+        assert!(
+            text.contains("shutdown already in progress"),
+            "the second Shutdown must be recognised as a duplicate: {text}"
         );
     }
 
