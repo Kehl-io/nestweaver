@@ -269,7 +269,15 @@ message SearchResultItem {
 // brain_status
 message BrainStatusRequest {}
 message EmbeddingStatus {
-  string state = 1;              // disabled | loading | ready | failed
+  // disabled | loading | ready | failed | embedding
+  //
+  // `embedding` was added in 4.2 and is reported INSTEAD of `ready` while a
+  // daemon-route embedding pass is in flight. It implies the model is loaded
+  // and usable — it is a strictly narrower `ready`. Consumers that only care
+  // about usability should treat `embedding` as ready; consumers that want an
+  // unambiguous machine signal should read `pass_active` instead of matching
+  // on this string.
+  string state = 1;
   string backend = 2;            // local | external
   string requested_device = 3;   // auto | metal | cpu
   string selected_device = 4;    // metal | cpu | empty
@@ -277,6 +285,25 @@ message EmbeddingStatus {
   string error = 6;
   bool metal_compiled = 7;
   bool fallback_used = 8;        // invariant: always false
+
+  // ── In-flight pass progress (added 4.2) ──────────────────────────
+  // All fields are proto3 scalars, so a daemon that predates them decodes as
+  // "no pass running" rather than as an error. They describe the daemon-route
+  // `Embed` RPC only; a direct (non-daemon) `nestweaver embed` prints its own
+  // per-batch counters and never reaches this daemon state.
+
+  // True while an `Embed` RPC is running on this daemon.
+  bool pass_active = 9;
+  // Nodes this pass has attempted so far (succeeded + failed + rejected).
+  uint64 pass_processed = 10;
+  // Eligible nodes this pass intends to embed, from the same preflight count
+  // `PlanEmbed` reports. 0 means "not yet computed" (preflight still running).
+  uint64 pass_total = 11;
+  // Unix seconds when the pass started; 0 when no pass is running. Lets a
+  // client derive elapsed/throughput/ETA without the daemon guessing for it.
+  int64 pass_started_at = 12;
+  // Scope string of the running pass (all | symbols | notes | headings).
+  string pass_scope = 13;
 }
 message EffectiveConfig {
   // The daemon's effective configuration source. Absence of EffectiveConfig
@@ -302,9 +329,28 @@ message BrainStatusResponse {
   int32 tantivy_doc_count = 9;
   bool indexing_active = 10;
   string indexing_repo = 11;  // repo currently being indexed (empty if idle)
-  int32 queue_depth = 12;     // number of pending + running jobs
+  // Depth of the server-side INDEX JOB queue (pending + running jobs). This
+  // has never counted gRPC write RPCs blocked on the daemon write lock, and
+  // still does not: it is fed by the SQLite job queue and is consumed by the
+  // web admin API and the Prometheus `nestweaver_index_queue_depth` gauge.
+  // Blocked write RPCs are reported by `write_queue_depth` below rather than
+  // being folded in here, because merging two differently-sourced populations
+  // into one integer would make an existing published metric mean something
+  // new without renaming it.
+  int32 queue_depth = 12;
   EmbeddingStatus embedding_status = 13;
   EffectiveConfig effective_config = 14;
+
+  // ── Write-path visibility (added 4.2) ────────────────────────────
+  // Number of gRPC write RPCs currently blocked waiting for the daemon write
+  // lock, NOT counting the one holding it. Non-zero means status is asserting
+  // "something is queued" instead of silently reporting 0 while a client waits.
+  int32 write_queue_depth = 15;
+  // The RPC currently holding the daemon write lock; empty when it is free.
+  string write_holder = 16;
+  // How long the current holder has held the write lock, in seconds; 0 when
+  // the lock is free.
+  int64 write_holder_seconds = 17;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison

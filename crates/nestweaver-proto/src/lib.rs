@@ -20,6 +20,7 @@ mod additive_status_contract_tests {
             error: String::new(),
             metal_compiled: true,
             fallback_used: false,
+            ..Default::default()
         };
         let brain_status = BrainStatusResponse {
             embedding_status: Some(status),
