@@ -5230,16 +5230,30 @@ fn daemon_stop_signal_target(
 
 /// May the database write-lock holder be stopped?
 ///
-/// Only when its cmdline independently proves daemon identity. The lock alone
-/// never qualifies a process — see [`daemon_stop_signal_target`] — so this
-/// requires `nestweaver`, the `daemon` subcommand, AND this database path.
-/// `nestweaver embed --db X --local` and `nestweaver index --db X` hold the
-/// same lock and fail that test, which is the entire point.
+/// Only when its argv independently proves daemon identity — `argv[1] ==
+/// "daemon"` and this database named as a whole argument. The lock alone never
+/// qualifies a process (see [`daemon_stop_signal_target`]): `nestweaver embed
+/// --db X --local` and `nestweaver index --db X` hold the same lock and fail
+/// the argv test, which is the entire point.
 ///
 /// With this, the incident state (live daemon, hand-removed pidfile, deleted
 /// socket) is still repairable by `daemon stop`, while a non-daemon writer is
 /// merely reported.
+///
+/// Identity is re-checked immediately before the signal is sent, so the
+/// PID-reuse window is the same narrow TOCTOU the pidfile path has always had.
+/// It is narrowed, NOT closed — closing it needs `pidfd_open`.
 fn daemon_stop_lock_holder_target(db_path: &std::path::Path) -> Option<i32> {
+    daemon_stop_lock_holder_target_with(db_path, process_argv)
+}
+
+/// [`daemon_stop_lock_holder_target`] with the argv source injected, so both
+/// the accepting and the rejecting branch are testable against a REAL database
+/// write lock without having to forge a live process's argv.
+fn daemon_stop_lock_holder_target_with(
+    db_path: &std::path::Path,
+    argv_of: impl Fn(i32) -> Option<Vec<String>>,
+) -> Option<i32> {
     let nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(pid) } =
         nestweaver_daemon::lifecycle::db_write_lock(db_path)
     else {
@@ -5248,44 +5262,77 @@ fn daemon_stop_lock_holder_target(db_path: &std::path::Path) -> Option<i32> {
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None;
     }
-    daemon_cmdline_if_ours(pid, db_path).map(|_| pid)
+    let argv = argv_of(pid)?;
+    argv_is_our_daemon(&argv, db_path).then_some(pid)
 }
 
-/// Pure predicate: does this process cmdline look like a nestweaver
-/// daemon serving `db_path`?
+/// Pure predicate: is this argv a nestweaver daemon serving `db_path`?
 ///
-/// Requires the `daemon` SUBCOMMAND, not merely the string "nestweaver".
-/// Without it, `nestweaver embed --db <path> --local` and `nestweaver index
-/// --db <path>` both match — and both are processes that hold this database's
-/// write lock while emphatically not being daemons, so a caller acting on this
-/// predicate would signal them.
-fn cmdline_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
-    if cmdline.is_empty() || !cmdline.contains("nestweaver") {
+/// Matches by POSITION, not membership. `daemon` must be `argv[1]` — the
+/// subcommand — because a membership test ("some token equals `daemon`")
+/// is satisfied by any lock-holding invocation that merely carries `daemon`
+/// as an argument VALUE:
+///
+/// * `nestweaver index --repo daemon --db <path>` (a directory named `daemon`)
+/// * `nestweaver index --name daemon --db <path>`
+/// * `nestweaver index --instance daemon --db <path>`
+///
+/// All three hold this database's write lock, and under a membership test all
+/// three read as daemons and get signalled. `daemon_restart_start_args` builds
+/// `["daemon", "--db", ...]`, so `argv[1]` is where the real subcommand always
+/// is.
+///
+/// The DB path is likewise matched as a WHOLE ARGUMENT rather than a substring
+/// of a flattened string.
+///
+/// Deliberately absent: any check that `argv[0]` contains "nestweaver". In the
+/// default layout the database lives at `…/.local/nestweaver/brain.lbug`, so
+/// that substring was satisfied by the PATH, not the binary — it added no real
+/// evidence while breaking for renamed or symlinked installs. The conjunction
+/// that carries the weight is: holds THIS database's write lock, `argv[1] ==
+/// "daemon"`, and names THIS database.
+fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
+    if argv.len() < 2 || argv[1] != "daemon" {
         return false;
     }
-    // `nestweaver daemon --db <path> {start,run,...}`: `daemon` is its own
-    // whitespace-delimited argument, never a fragment of a path.
-    if !cmdline.split_whitespace().any(|token| token == "daemon") {
-        return false;
-    }
-    let raw = db_path.to_string_lossy();
-    if !raw.is_empty() && cmdline.contains(raw.as_ref()) {
-        return true;
-    }
+    let mut spellings = vec![db_path.to_string_lossy().into_owned()];
     if let Ok(canonical) = std::fs::canonicalize(db_path) {
-        let canonical = canonical.to_string_lossy();
-        if !canonical.is_empty() && cmdline.contains(canonical.as_ref()) {
-            return true;
-        }
+        spellings.push(canonical.to_string_lossy().into_owned());
     }
-    false
+    spellings.retain(|spelling| !spelling.is_empty());
+    argv[2..].iter().any(|arg| {
+        spellings
+            .iter()
+            .any(|spelling| arg == spelling || arg.as_str() == format!("--db={spelling}"))
+    })
 }
 
-/// Return the cmdline of `pid` when it is verifiably a nestweaver daemon
-/// serving `db_path`, else `None`. A stale pidfile PID may have been recycled
-/// by an unrelated process — callers must NOT signal the PID when this returns
-/// `None`.
-fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String> {
+/// This process's argv, with argument boundaries intact.
+///
+/// `/proc/<pid>/cmdline` is NUL-separated, which is the only representation
+/// that preserves those boundaries. `ps -o command=` re-joins argv on spaces
+/// and is therefore unusable for positional matching — a path containing a
+/// space, or an argument value of `daemon`, both become indistinguishable from
+/// separate arguments. That flattening is exactly what made the previous
+/// membership check unsound.
+#[cfg(target_os = "linux")]
+fn process_argv(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
+}
+
+/// Non-Linux fallback: `ps` is all there is, so argument boundaries are lost
+/// to whitespace splitting. Positional matching still holds (`argv[1]` is the
+/// second token), which is what defeats the `--repo daemon` shape; what is NOT
+/// recoverable here is an argument containing a space. UNVERIFIED on macOS —
+/// this branch is `cfg`-gated out on Linux and was never compiled or run.
+#[cfg(not(target_os = "linux"))]
+fn process_argv(pid: i32) -> Option<Vec<String>> {
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
@@ -5293,8 +5340,22 @@ fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String>
     if !output.status.success() {
         return None;
     }
-    let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    cmdline_is_our_daemon(&cmdline, db_path).then_some(cmdline)
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Return the argv of `pid` when it is verifiably a nestweaver daemon serving
+/// `db_path`, else `None`. A stale pidfile PID may have been recycled by an
+/// unrelated process — callers must NOT signal the PID when this returns
+/// `None`.
+fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<Vec<String>> {
+    let argv = process_argv(pid)?;
+    argv_is_our_daemon(&argv, db_path).then_some(argv)
 }
 
 /// Is the pidfile's flock currently held? The serving process owns LOCK_EX for
@@ -5435,14 +5496,26 @@ fn remove_unowned_daemon_runtime(
     }
 
     // 4. The original race guard, unchanged.
-    let Ok(file) = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(pidfile)
-    else {
-        return RuntimeCleanup::PidfileUnavailable;
+    {
+        Ok(file) => file,
+        // `create(true)` fails with ENOENT when the per-instance runtime dir
+        // does not exist — a never-started instance, a fresh XDG_RUNTIME_DIR
+        // after a tmpfs reboot, a container, a CI runner. There is nothing
+        // there to own and nothing to retire, so this is success, not a
+        // refusal. Reporting it as one made `daemon stop` exit 1 while
+        // `daemon status` on the identical state exited 0. Deliberately does
+        // NOT create the directory: `stop` has no business materializing
+        // runtime state on its way to deleting it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeCleanup::Removed;
+        }
+        Err(_) => return RuntimeCleanup::PidfileUnavailable,
     };
     let fd = file.as_raw_fd();
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -20444,25 +20517,67 @@ mod abs_for_daemon_tests {
     #[test]
     fn cmdline_is_our_daemon_matches_only_our_daemon() {
         let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
 
-        assert!(cmdline_is_our_daemon(
-            "/usr/local/bin/nestweaver daemon --db /tmp/nw-f06/brain.lbug start",
+        assert!(argv_is_our_daemon(
+            &argv("/usr/local/bin/nestweaver daemon --db /tmp/nw-f06/brain.lbug start"),
             db
         ));
-        assert!(cmdline_is_our_daemon(
-            "nestweaver daemon --db /tmp/nw-f06/brain.lbug run",
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug run"),
             db
         ));
-        // Foreign process reusing the PID: no nestweaver marker.
-        assert!(!cmdline_is_our_daemon("/usr/sbin/cron -s", db));
+        // `--db=<path>` is the same invocation spelled differently.
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db=/tmp/nw-f06/brain.lbug start"),
+            db
+        ));
+        // Foreign process reusing the PID.
+        assert!(!argv_is_our_daemon(&argv("/usr/sbin/cron -s"), db));
         // A nestweaver daemon for a DIFFERENT DB must not match.
-        assert!(!cmdline_is_our_daemon(
-            "nestweaver daemon --db /tmp/other/brain.lbug start",
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/other/brain.lbug start"),
             db
         ));
         // A nestweaver CLI invocation that is not serving this DB must not match.
-        assert!(!cmdline_is_our_daemon("nestweaver search foo", db));
-        assert!(!cmdline_is_our_daemon("", db));
+        assert!(!argv_is_our_daemon(&argv("nestweaver search foo"), db));
+        assert!(!argv_is_our_daemon(&[], db));
+        // The DB path must be a WHOLE argument, never a substring of one.
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug.backup start"),
+            db
+        ));
+    }
+
+    /// The exploit that a membership test ("some token equals `daemon`")
+    /// let through: a lock-HOLDING, non-daemon invocation that merely carries
+    /// `daemon` as an argument VALUE. All three of these hold the database
+    /// write lock, and all three were signalled by `daemon stop`.
+    #[test]
+    fn daemon_as_an_argument_value_is_not_the_daemon_subcommand() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        for line in [
+            // Indexing a directory that happens to be named `daemon`.
+            "nestweaver index --repo daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver index --name daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver index --instance daemon --db /tmp/nw-f06/brain.lbug",
+            "nestweaver embed --db /tmp/nw-f06/brain.lbug --local --model-id daemon",
+        ] {
+            assert!(
+                !argv_is_our_daemon(&argv(line), db),
+                "`daemon` as an argument value must not read as the subcommand: {line}"
+            );
+        }
+
+        // The real thing still matches: `daemon` at argv[1].
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nw-f06/brain.lbug start"),
+            db
+        ));
     }
 
     /// `daemon_cmdline_if_ours` returns None for a live process that is
@@ -22848,8 +22963,52 @@ mod daemon_cli_tests {
         assert_eq!(
             daemon_stop_lock_holder_target(&db_path),
             None,
-            "a lock holder whose cmdline is not daemon-shaped must not be signalled"
+            "a lock holder whose argv is not daemon-shaped must not be signalled"
         );
+
+        // Both branches of the ONE path that may signal a lock holder, against
+        // this same real, kernel-held lock. The argv source is injected because
+        // a live process's argv cannot be forged from a test; the lock evidence
+        // is genuine. The un-injected reader is covered end-to-end by the
+        // isolated-daemon reproduction.
+        let daemon_shaped = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "daemon".to_string(),
+                    "--db".to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                    "start".to_string(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, daemon_shaped),
+            Some(holder),
+            "a lock holder that IS a daemon for this DB must be stoppable — otherwise the \
+             incident state stops being repairable by `daemon stop`"
+        );
+
+        // …and the finding-1 false positive, against the same live lock: an
+        // index run whose --repo VALUE is `daemon`.
+        let value_named_daemon = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "index".to_string(),
+                    "--repo".to_string(),
+                    "daemon".to_string(),
+                    "--db".to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, value_named_daemon),
+            None,
+            "`--repo daemon` holds the write lock and must NOT be signalled"
+        );
+
         assert!(
             unsafe { libc::kill(holder, 0) } == 0,
             "the lock holder must still be alive"
@@ -22862,10 +23021,14 @@ mod daemon_cli_tests {
         }
     }
 
-    /// `daemon stop` may only signal PIDs that carry daemon evidence: a live
-    /// pidfile PID or the kernel-reported socket peer. Nothing else — and
-    /// specifically not the database write-lock holder, which is routinely a
-    /// non-daemon (`embed --local`, `index`, any `--no-daemon` command).
+    /// The path-evidence half of stop's target selection: a live pidfile PID
+    /// or the kernel-reported socket peer, and nothing else.
+    ///
+    /// Scope, precisely: this covers ONLY this pure helper. The call site
+    /// additionally chains `.or_else(daemon_stop_lock_holder_target)`, so this
+    /// test does NOT by itself prove the database lock stays out of the target
+    /// set — `database_write_lock_holder_blocks_cleanup` covers that branch
+    /// against a real lock, in both its accepting and rejecting form.
     #[test]
     fn stop_targets_only_pidfile_and_socket_evidence() {
         let alive_all = |_: i32| true;
@@ -22886,8 +23049,8 @@ mod daemon_cli_tests {
             daemon_stop_signal_target(None, Some(22), alive_all),
             Some(22)
         );
-        // Neither alive: nothing to signal. There is no third source of
-        // targets — this is the assertion that keeps the database lock out.
+        // Neither alive: this helper yields nothing. (The call site may still
+        // consult the lock holder afterwards, under its own argv proof.)
         assert_eq!(
             daemon_stop_signal_target(Some(11), Some(22), dead_all),
             None
@@ -22895,30 +23058,67 @@ mod daemon_cli_tests {
         assert_eq!(daemon_stop_signal_target(None, None, alive_all), None);
     }
 
-    /// Identity requires the `daemon` subcommand. Without it, the processes
-    /// that legitimately hold this database's write lock — an embed or an
-    /// index run — match the predicate and become signalable.
+    /// Identity requires `daemon` at argv[1]. Without it, the processes that
+    /// legitimately hold this database's write lock — an embed or an index
+    /// run — match the predicate and become signalable.
     #[test]
     fn daemon_identity_requires_the_daemon_subcommand() {
         let db = std::path::Path::new("/tmp/nowhere-xyz-123/brain.lbug");
-        assert!(cmdline_is_our_daemon(
-            "nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug start",
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        assert!(argv_is_our_daemon(
+            &argv("nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug start"),
             db
         ));
-        assert!(cmdline_is_our_daemon(
-            "/usr/local/bin/nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug run",
+        assert!(argv_is_our_daemon(
+            &argv("/usr/local/bin/nestweaver daemon --db /tmp/nowhere-xyz-123/brain.lbug run"),
             db
         ));
         assert!(
-            !cmdline_is_our_daemon(
-                "nestweaver embed --db /tmp/nowhere-xyz-123/brain.lbug --local",
+            !argv_is_our_daemon(
+                &argv("nestweaver embed --db /tmp/nowhere-xyz-123/brain.lbug --local"),
                 db
             ),
             "an embed run holds the write lock and must never read as a daemon"
         );
         assert!(
-            !cmdline_is_our_daemon("nestweaver index --db /tmp/nowhere-xyz-123/brain.lbug", db),
+            !argv_is_our_daemon(
+                &argv("nestweaver index --db /tmp/nowhere-xyz-123/brain.lbug"),
+                db
+            ),
             "an index run holds the write lock and must never read as a daemon"
+        );
+    }
+
+    /// `daemon stop` on an instance whose runtime dir does not exist — never
+    /// started, or a fresh XDG_RUNTIME_DIR after a tmpfs reboot / in a
+    /// container / on a CI runner — has nothing to retire. That is success.
+    /// Reporting it as a refusal made `stop` exit 1 while `status` on the
+    /// identical state exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_on_a_never_started_instance_is_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("run/nestweaver/deadbeef");
+        assert!(!runtime.exists(), "the runtime dir must be absent");
+
+        let outcome = remove_unowned_daemon_runtime(
+            &dir.path().join("db/brain.lbug"),
+            &runtime.join("daemon.pid"),
+            &runtime.join("daemon.sock"),
+            &runtime.join("effective-config.json"),
+        );
+
+        assert_eq!(outcome, RuntimeCleanup::Removed);
+        assert_eq!(
+            outcome.refusal(),
+            None,
+            "nothing to retire must not read as a refusal — that is what exits 1"
+        );
+        assert!(
+            !runtime.exists(),
+            "`stop` must not materialize runtime state on its way to deleting it"
         );
     }
 }

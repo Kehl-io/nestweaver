@@ -603,8 +603,13 @@ static LOCAL_STORE_WRITE_LOCK_HELD: std::sync::atomic::AtomicBool =
 /// Declare whether this process now holds a read-write store open.
 ///
 /// This exists solely to arm the guard in [`db_write_lock`]. Call it with
-/// `true` immediately after a read-write `GraphStore` open and `false` when
-/// that store is dropped.
+/// `true` immediately after a read-write `GraphStore` open.
+///
+/// Nothing calls it with `false` in production and nothing should need to: the
+/// daemon holds its store for the whole process lifetime, and a process that
+/// released the store would gain nothing from probing a lock it no longer
+/// holds. `false` exists so tests can restore global state, and so a future
+/// caller with a genuinely scoped store open has a way to disarm.
 pub fn note_local_store_write_lock(held: bool) {
     LOCAL_STORE_WRITE_LOCK_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
 }
@@ -633,23 +638,35 @@ pub fn local_store_write_lock_held() -> bool {
 ///   conflict with its own `F_GETLK`.
 ///
 /// So this is only safe from a process that does NOT have the store open — the
-/// CLI before it starts anything, or the daemon before its own store open. The
-/// `debug_assert` below turns a future in-daemon call into a loud failure
-/// instead of a silently unlocked database; arm it with
-/// [`note_local_store_write_lock`].
+/// CLI before it starts anything, or the daemon before its own store open.
 ///
-/// (A `/proc/locks` reader would avoid the descriptor entirely on Linux, but it
-/// cannot distinguish "no lock" from "inode/device match failed" — a false
-/// `Free` here re-enables every bug this probe exists to prevent — and it has no
-/// macOS equivalent. Not worth the trade today.)
+/// The guard below is a REAL RUNTIME BRANCH, not a `debug_assert`. Release
+/// builds disable debug assertions by default (this workspace sets no
+/// `[profile.release] debug-assertions` override), so an assertion would have
+/// left the shipped binaries — the only ones where this matters — completely
+/// unguarded. Returning `Unknown` costs one relaxed atomic load and every
+/// caller already fails closed on it.
+///
+/// (A `/proc/locks` reader would avoid the descriptor entirely on Linux. It can
+/// distinguish a failed `stat` from a successful one with no matching row, so
+/// the ambiguity is manageable; what kills it is that there is no macOS
+/// equivalent, which would leave the hazard live on half the platforms. The
+/// runtime guard makes the question moot.)
 pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
     use std::os::unix::io::AsRawFd;
 
-    debug_assert!(
-        !local_store_write_lock_held(),
-        "db_write_lock() must not be called while this process holds the store open: closing \
-         the probe descriptor drops this process's own POSIX record locks on the database"
-    );
+    if local_store_write_lock_held() {
+        // Probing from here would close a descriptor to this database and take
+        // this process's own POSIX record locks down with it, silently
+        // admitting a second writer. Refuse. `Unknown` is the fail-closed
+        // answer: no caller treats it as free.
+        tracing::error!(
+            db = %db_path.display(),
+            "refusing to probe the database write lock from a process that holds the store \
+             open — the probe would release this process's own lock"
+        );
+        return DbWriteLock::Unknown;
+    }
 
     let path = canonical_db_path(db_path);
     if !path.exists() {
@@ -2692,6 +2709,34 @@ mod tests {
         reap(holder);
         // Once the holder is gone the kernel drops its lock — no file on disk
         // has to be cleaned up for the truth to change.
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+    }
+
+    /// The self-probe guard must work in RELEASE builds, so it is a runtime
+    /// branch rather than a `debug_assert` (this workspace sets no
+    /// `[profile.release] debug-assertions` override, so an assertion would
+    /// vanish from every shipped binary). Probing while holding the store open
+    /// must fail closed, never report `Free`.
+    #[test]
+    fn write_lock_probe_refuses_to_run_against_its_own_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+
+        note_local_store_write_lock(true);
+        let state = db_write_lock(&db);
+        note_local_store_write_lock(false);
+
+        assert_eq!(
+            state,
+            DbWriteLock::Unknown,
+            "a probe from a store-holding process must fail closed, not report Free"
+        );
+        assert!(!state.is_provably_free());
+        // And the guard must disarm cleanly.
         assert_eq!(db_write_lock(&db), DbWriteLock::Free);
     }
 
