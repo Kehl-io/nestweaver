@@ -1409,6 +1409,17 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
     let mut lines = vec![
         format!("  State:            {}", status.state),
         format!("  Backend:          {}", status.backend),
+    ];
+    // A3: a pass in flight gets its own line. Without it `State: ready` was
+    // the only thing status said during a 12h32m embed, so a healthy long run
+    // and a wedged daemon looked identical.
+    if let Some(progress) = nestweaver_client::progress::format_embed_progress(status) {
+        lines.push(format!("  Progress:         {progress}"));
+        if !status.pass_scope.is_empty() {
+            lines.push(format!("  Pass scope:       {}", status.pass_scope));
+        }
+    }
+    lines.extend([
         format!(
             "  Device:           {} -> {selected}",
             status.requested_device
@@ -1416,7 +1427,7 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
         format!("  Model:            {}", status.model_id),
         format!("  Metal compiled:   {}", status.metal_compiled),
         format!("  Fallback used:    {}", status.fallback_used),
-    ];
+    ]);
     if !status.error.is_empty() {
         lines.push(format!("  Error:            {}", status.error));
     }
@@ -1433,6 +1444,13 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
         error: value["error"].as_str().unwrap_or("").to_string(),
         metal_compiled: value["metal_compiled"].as_bool().unwrap_or(false),
         fallback_used: value["fallback_used"].as_bool().unwrap_or(false),
+        // Absent on an older daemon; proto3 defaults read as "no pass running",
+        // which is the honest answer when the daemon cannot tell us.
+        pass_active: value["pass_active"].as_bool().unwrap_or(false),
+        pass_processed: value["pass_processed"].as_u64().unwrap_or(0),
+        pass_total: value["pass_total"].as_u64().unwrap_or(0),
+        pass_started_at: value["pass_started_at"].as_i64().unwrap_or(0),
+        pass_scope: value["pass_scope"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -1513,6 +1531,7 @@ mod daemon_status_renderer_tests {
             error: String::new(),
             metal_compiled: false,
             fallback_used: false,
+            ..Default::default()
         }
     }
 
@@ -1532,6 +1551,38 @@ mod daemon_status_renderer_tests {
         assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
+    }
+
+    /// A3 acceptance: an operator looking at `brain status` during a long
+    /// embed must see that a pass is running and how far along it is. Before
+    /// this, the whole render was `State: ready` — identical to an idle daemon.
+    #[test]
+    fn a_running_pass_shows_a_progress_line_an_idle_daemon_does_not() {
+        let idle = format_embedding_status(&embedding());
+        assert!(!idle.contains("Progress:"), "{idle}");
+
+        let mut running = embedding();
+        running.state = "embedding".to_string();
+        running.pass_active = true;
+        running.pass_processed = 41_230;
+        running.pass_total = 88_131;
+        running.pass_scope = "all".to_string();
+        running.pass_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3600;
+
+        let text = format_embedding_status(&running);
+        assert!(text.contains("State:            embedding"), "{text}");
+        assert!(
+            text.contains("Progress:         41,230 / 88,131 (47%)"),
+            "{text}"
+        );
+        assert!(text.contains("ETA "), "{text}");
+        assert!(text.contains("Pass scope:       all"), "{text}");
+        // The pre-existing fields must survive the insertion.
+        assert!(text.contains("Model:            test-model"), "{text}");
     }
 
     #[test]
@@ -5848,6 +5899,23 @@ mod broken_pipe_policy_tests {
     }
 }
 
+/// Give the `daemon start` parent its stderr subscriber back after the fork.
+///
+/// `main` skips early tracing init for this command so the forked child can
+/// install `run_server`'s file-based subscriber (see the comment there). Once
+/// the fork outcome is known the parent is free to install its own; `try_init`
+/// because on the child's path a subscriber is already global.
+#[cfg(not(target_os = "macos"))]
+fn restore_parent_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::WARN.into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
@@ -5870,7 +5938,38 @@ fn main() {
             ..
         }
     );
-    if !is_daemon_run {
+    // A3. `daemon start` needs the same exemption on Linux, where it does NOT
+    // re-exec `daemon run`: it forks in-process with daemonize2 and calls
+    // `run_server` in the child (see the `cfg(not(target_os = "macos"))` start
+    // branch). The child therefore inherits whatever subscriber `main` already
+    // installed, so `run_server`'s file subscriber loses the same silent race
+    // — and every daemon log lands on the WARN-filtered stderr instead of
+    // `daemon.log.<date>`, which stays empty forever. That is the mechanism
+    // behind the incident's "daemon emitted nothing for ~13 hours": it was not
+    // that the daemon had nothing to say, it was that nothing it said was
+    // recorded. macOS spawns a fresh `daemon run` executable, so it is already
+    // covered by `is_daemon_run` and is deliberately left alone here.
+    //
+    // The cost, stated plainly: on this ONE command the parent runs its
+    // pre-fork phase with no subscriber at all, so tracing emitted before the
+    // fork is dropped rather than printed. That is not only the benign
+    // `socket_path` sun_path WARN (`lifecycle.rs:545`) — it also includes the
+    // security-relevant `refusing squatted /tmp socket fallback dir` ERROR
+    // (`lifecycle.rs:533`). The blast radius is small because the child
+    // re-derives the same socket path and re-emits both into the daemon log,
+    // and every arm below reinstalls the parent's subscriber the moment the
+    // fork decision is known. It is still a behavior change on this command.
+    #[cfg(not(target_os = "macos"))]
+    let forks_into_daemon = matches!(
+        &cli.command,
+        Commands::Daemon {
+            action: DaemonAction::Start { .. },
+            ..
+        }
+    );
+    #[cfg(target_os = "macos")]
+    let forks_into_daemon = false;
+    if !is_daemon_run && !forks_into_daemon {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -11243,6 +11342,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 };
 
                 let index_result = rt.block_on(async {
+                    // A3: `index_repo` serialises behind the daemon write lock.
+                    // Blocked behind a long embed it used to print nothing at
+                    // all, which read as a hang. This adds a periodic notice
+                    // naming the holder — it adds no timeout and does not
+                    // interrupt the RPC.
+                    let _waiting = nestweaver_client::progress::StatusNotifier::spawn(
+                        &db_path,
+                        "nestweaver index",
+                        nestweaver_client::progress::NoticeKind::Waiting {
+                            own_rpc: "index_repo",
+                        },
+                    );
                     let stream = client.inner_mut().index_repo(req).await?.into_inner();
                     consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
@@ -12123,6 +12234,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 });
                             }
                             daemonize2::Outcome::Parent(Ok(parent)) => {
+                                // A3: `main` deliberately skipped installing a
+                                // global subscriber for this command so the
+                                // forked child could install run_server's
+                                // file-based one. The fork is done, so the
+                                // parent may now have its stderr subscriber
+                                // back for the readiness/attestation work
+                                // below.
+                                restore_parent_stderr_tracing();
                                 // The double-fork only proves fork()
                                 // worked — run_server may still die during boot
                                 // (corrupt migration journal, DB lock, ...).
@@ -12159,6 +12278,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                             }
                             daemonize2::Outcome::Parent(Err(e)) => {
+                                // No child owns the file subscriber on this
+                                // path, so give the parent its stderr one back
+                                // before reporting the failure.
+                                restore_parent_stderr_tracing();
                                 anyhow::bail!("Failed to daemonize: {e}");
                             }
                             daemonize2::Outcome::Child(Err(e)) => {
@@ -17502,7 +17625,20 @@ where
                 }
 
                 eprintln!("Embedding via daemon (configured backend)…");
-                match rt.block_on(client.embed(scope, force, batch_size as u32)) {
+                // A3: the daemon route is a single unary RPC, so unlike the
+                // direct routes it printed nothing between "Embedding via
+                // daemon…" and "Done" — 12h32m of silence in the incident.
+                // Poll `brain status` (a read; it does not contend for the
+                // write lock) and echo the counters the daemon now publishes.
+                // Deliberately polling rather than adding a streaming RPC.
+                match rt.block_on(async {
+                    let _progress = nestweaver_client::progress::StatusNotifier::spawn(
+                        path,
+                        "nestweaver embed",
+                        nestweaver_client::progress::NoticeKind::EmbedProgress,
+                    );
+                    client.embed(scope, force, batch_size as u32).await
+                }) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
                         if resp.rejected > 0 {
@@ -22039,6 +22175,7 @@ mod diagnostics_cli_tests {
             error: "Metal probe failed".to_string(),
             metal_compiled: true,
             fallback_used: false,
+            ..Default::default()
         };
         let text = format_embedding_status(&status);
         assert!(text.contains("State:            failed"));

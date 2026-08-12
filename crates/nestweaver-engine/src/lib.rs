@@ -269,6 +269,7 @@ pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
 pub mod worker;
+pub mod write_gate;
 
 pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
@@ -424,6 +425,7 @@ pub use summaries::{
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
+pub use write_gate::{WriteGate, WriteLease};
 
 #[cfg(test)]
 mod resolve_user_path_tests {

@@ -50,6 +50,7 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 ## Server Mode
 When connected to a NestWeaver server (not a local daemon):
 - brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
+- brain_status also reports write_queue_depth (write RPCs blocked on the daemon write lock; distinct from queue_depth, which counts index jobs), write_holder, write_holder_seconds, and embedding_status.pass_* progress for an in-flight embedding pass
 - read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
 - regex_search runs trigram-accelerated exact regex over the graph store — identical locally and on the server (it does NOT use Tantivy)
 - blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available

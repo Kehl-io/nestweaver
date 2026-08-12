@@ -144,9 +144,14 @@ impl WorkerPool {
     ///
     /// When `drained` is `Some(flag)` and the flag is `true`, the worker sleeps
     /// instead of claiming new jobs (in-flight jobs finish naturally). Each job's
-    /// write phase acquires `write_mutex`, so an in-progress backup — which holds
+    /// write phase acquires the write gate, so an in-progress backup — which holds
     /// that lock while it copies — simply makes the worker WAIT for the lock.
     /// Writes are never skipped or dropped; the job proceeds once the lock frees.
+    ///
+    /// A3: the gate (rather than a bare mutex) so the worker's commit stamps
+    /// itself as the holder. A blocked `nestweaver index` is then told
+    /// `worker_commit` is in front of it instead of seeing an empty
+    /// `write_holder` and being shown nothing at all.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_with_drain(
         &self,
@@ -157,7 +162,7 @@ impl WorkerPool {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
         drained: Option<Arc<AtomicBool>>,
-        write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+        write_gate: Option<crate::write_gate::WriteGate>,
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
@@ -268,7 +273,7 @@ impl WorkerPool {
             let store = store.clone();
             let instance_id = instance_id.clone();
             let status_clone = status.clone();
-            let write_mutex = write_mutex.clone();
+            let write_gate = write_gate.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
             let reindex_tracker = self.reindex_tracker.clone();
@@ -315,7 +320,7 @@ impl WorkerPool {
                         if let Some(prepared) = prepared {
                             let queue_for_gate = queue_check.clone();
                             let job_for_gate = job_clone.clone();
-                            let write_mutex_for_gate = write_mutex.clone();
+                            let write_gate_for_commit = write_gate.clone();
                             let force_full_reindex = if prepared.repo_type == RepoType::Code {
                                 let tracker = reindex_tracker
                                     .lock()
@@ -339,9 +344,9 @@ impl WorkerPool {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
                                     // finishes — the write is deferred by contention, never dropped.
-                                    let _write_guard = write_mutex_for_gate
+                                    let _write_guard = write_gate_for_commit
                                         .as_ref()
-                                        .map(|m| m.clone().blocking_lock_owned());
+                                        .map(|gate| gate.blocking_lock("worker_commit"));
                                     let q = queue_for_gate.lock().unwrap_or_else(|e| e.into_inner());
                                     if !q
                                         .job_is_active(job_for_gate.id, &job_for_gate.repo_id)

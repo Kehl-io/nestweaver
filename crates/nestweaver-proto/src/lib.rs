@@ -9,6 +9,147 @@ mod additive_status_contract_tests {
     use super::*;
     use prost::Message;
 
+    /// Encode a length-delimited (wire type 2) string field.
+    fn string_field(tag: u32, value: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        prost::encoding::encode_varint(u64::from(tag << 3 | 2), &mut out);
+        prost::encoding::encode_varint(value.len() as u64, &mut out);
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    /// Encode a varint (wire type 0) field.
+    fn varint_field(tag: u32, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        prost::encoding::encode_varint(u64::from(tag << 3), &mut out);
+        prost::encoding::encode_varint(value, &mut out);
+        out
+    }
+
+    /// An `EmbeddingStatus` exactly as a pre-4.2 daemon put it on the wire:
+    /// hand-built tags for fields 1-8 only, with nothing from 4.2 present.
+    fn pre_4_2_embedding_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(string_field(1, "ready")); // state
+        bytes.extend(string_field(2, "local")); // backend
+        bytes.extend(string_field(3, "auto")); // requested_device
+        bytes.extend(string_field(4, "cpu")); // selected_device
+        bytes.extend(string_field(5, "old-model")); // model_id
+        bytes.extend(varint_field(7, 1)); // metal_compiled
+        bytes
+    }
+
+    /// A3: the additive-compat claim, tested rather than asserted.
+    ///
+    /// These are hand-built wire bytes carrying ONLY the fields an older
+    /// daemon knew about — not a new struct with new fields left at their
+    /// defaults, which would prove nothing. Decoding must succeed and leave
+    /// every field added in 4.2 at its proto3 default, so an upgraded client
+    /// talking to an old daemon reads "no pass running, nothing queued"
+    /// instead of erroring or inventing progress.
+    #[test]
+    fn a_pre_4_2_daemons_bytes_decode_with_the_new_fields_at_their_defaults() {
+        let old_embedding = pre_4_2_embedding_bytes();
+
+        let decoded = EmbeddingStatus::decode(old_embedding.as_slice())
+            .expect("a pre-4.2 EmbeddingStatus must still decode");
+        assert_eq!(decoded.state, "ready");
+        assert_eq!(decoded.model_id, "old-model");
+        assert!(decoded.metal_compiled);
+        assert!(
+            !decoded.pass_active,
+            "an old daemon must read as 'no pass running', never as a live embed"
+        );
+        assert_eq!(decoded.pass_processed, 0);
+        assert_eq!(decoded.pass_total, 0);
+        assert_eq!(decoded.pass_started_at, 0);
+        assert_eq!(decoded.pass_scope, "");
+
+        let mut old_status = Vec::new();
+        old_status.extend(varint_field(2, 42)); // notes
+        old_status.extend(varint_field(10, 1)); // indexing_active
+        old_status.extend(varint_field(12, 3)); // queue_depth
+        {
+            // embedding_status = 13, a nested message.
+            let mut nested = Vec::new();
+            prost::encoding::encode_varint(u64::from(13u32 << 3 | 2), &mut nested);
+            prost::encoding::encode_varint(old_embedding.len() as u64, &mut nested);
+            nested.extend_from_slice(&old_embedding);
+            old_status.extend(nested);
+        }
+
+        let decoded = BrainStatusResponse::decode(old_status.as_slice())
+            .expect("a pre-4.2 BrainStatusResponse must still decode");
+        assert_eq!(decoded.notes, 42);
+        assert!(decoded.indexing_active);
+        assert_eq!(decoded.queue_depth, 3, "the old meaning must be preserved");
+        assert_eq!(
+            decoded.write_queue_depth, 0,
+            "an old daemon reports no blocked writers rather than erroring"
+        );
+        assert_eq!(decoded.write_holder, "");
+        assert_eq!(decoded.write_holder_seconds, 0);
+        assert!(!decoded.embedding_status.expect("nested status").pass_active);
+    }
+
+    /// The other direction: a 4.2 daemon's bytes must remain readable by a
+    /// consumer that only knows the old fields. Prost skips unknown fields, so
+    /// re-decoding after stripping is not expressible here; what IS testable
+    /// is that setting the new fields never perturbs the old ones on the wire.
+    #[test]
+    fn new_progress_fields_do_not_disturb_the_pre_4_2_field_values() {
+        let old_only = EmbeddingStatus {
+            state: "ready".to_string(),
+            model_id: "m".to_string(),
+            ..Default::default()
+        };
+        let with_progress = EmbeddingStatus {
+            pass_active: true,
+            pass_processed: 41_230,
+            pass_total: 88_131,
+            pass_started_at: 1_700_000_000,
+            pass_scope: "all".to_string(),
+            ..old_only.clone()
+        };
+        let round_tripped = EmbeddingStatus::decode(with_progress.encode_to_vec().as_slice())
+            .expect("decode round trip");
+        assert_eq!(round_tripped.state, old_only.state);
+        assert_eq!(round_tripped.model_id, old_only.model_id);
+        assert_eq!(round_tripped.pass_total, 88_131);
+
+        // Proto3 omits default-valued scalars, so an IDLE 4.2 daemon must put
+        // exactly the pre-4.2 byte sequence on the wire — no new tags at all.
+        // Compared against the hand-built old-daemon bytes, not against
+        // another instance of this same struct: comparing a struct to itself
+        // with the new fields set to the values it already holds cannot fail
+        // and proves nothing.
+        let idle_4_2 = EmbeddingStatus {
+            state: "ready".to_string(),
+            backend: "local".to_string(),
+            requested_device: "auto".to_string(),
+            selected_device: "cpu".to_string(),
+            model_id: "old-model".to_string(),
+            metal_compiled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            idle_4_2.encode_to_vec(),
+            pre_4_2_embedding_bytes(),
+            "an idle 4.2 daemon must be byte-identical to a pre-4.2 one"
+        );
+
+        // And the converse, so the assertion above is known to be falsifiable:
+        // a RUNNING pass does add bytes.
+        assert_ne!(
+            EmbeddingStatus {
+                pass_active: true,
+                ..idle_4_2.clone()
+            }
+            .encode_to_vec(),
+            pre_4_2_embedding_bytes(),
+        );
+    }
+
     #[test]
     fn status_and_hybrid_responses_expose_additive_embedding_telemetry() {
         let status = EmbeddingStatus {
@@ -20,6 +161,7 @@ mod additive_status_contract_tests {
             error: String::new(),
             metal_compiled: true,
             fallback_used: false,
+            ..Default::default()
         };
         let brain_status = BrainStatusResponse {
             embedding_status: Some(status),

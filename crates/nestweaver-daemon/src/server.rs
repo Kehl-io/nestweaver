@@ -238,6 +238,192 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// The process-wide write gate. Homed in `nestweaver-engine` because the
+/// daemon is not the only writer: the worker pool and the web admin API take
+/// the same lock, and every one of them must stamp the holder so
+/// `write_holder` is never empty while the lock is genuinely held.
+pub use nestweaver_engine::write_gate::{WriteGate, WriteLease};
+
+/// Live progress of the daemon-route embedding pass.
+///
+/// `plan_embeddings` already computes the eligible/embedded/scoped triple and
+/// the CLI already prints it once; this keeps the eligible count around as the
+/// denominator and advances a numerator as the pass runs, so `brain status` can
+/// tell a healthy 12-hour embed from a wedged daemon.
+/// The whole of a running pass's reported state, behind ONE lock.
+///
+/// This was four separate atomics. It cannot be: `snapshot` reads four fields,
+/// and four atomic loads are not atomic as a group, so a read straddling a
+/// `begin`/`finish` could mix one pass's counters with another's — including
+/// the shape that started this whole item, a just-started pass rendering as
+/// `88,131 / 88,131 (100%)`. No ordering discipline over independent atomics
+/// fixes a multi-field read; only making the group indivisible does.
+///
+/// The cost is one uncontended mutex per embedded node — tens of nanoseconds
+/// against a model inference measured in milliseconds — and status reads
+/// happen every 15-60 seconds. Correctness by construction is worth far more
+/// here than the atomics were.
+#[derive(Debug)]
+struct PassState {
+    processed: u64,
+    total: u64,
+    /// Unix seconds. Always > 0 for a live pass.
+    started_at: i64,
+    scope: String,
+}
+
+/// Live progress of the daemon-route embedding pass.
+///
+/// `plan_embeddings` already computes the eligible/embedded/scoped triple and
+/// the CLI already prints it once; this keeps the eligible count around as the
+/// denominator and advances a numerator as the pass runs, so `brain status`
+/// can tell a healthy 12-hour embed from a wedged daemon.
+///
+/// `None` means no pass is running. `Some` is always wholly one pass's state:
+/// there is no window in which it is partly initialised or partly cleared.
+#[derive(Debug, Default)]
+pub struct EmbedProgress {
+    state: std::sync::Mutex<Option<PassState>>,
+}
+
+/// Immutable view of [`EmbedProgress`], read under `brain_status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbedProgressSnapshot {
+    pub active: bool,
+    pub processed: u64,
+    pub total: u64,
+    pub started_at: i64,
+    pub scope: String,
+}
+
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl EmbedProgress {
+    /// Poisoning must not wedge status reporting: a pass that panicked is
+    /// exactly when an operator needs `brain status` to keep answering.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<PassState>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claim the reporting slot for a starting pass. `total` is 0 until
+    /// preflight finishes, which is reported honestly rather than guessed at.
+    ///
+    /// Returns a guard that is INERT when a pass is already running. The write
+    /// lease is owned by the RPC future while the pass itself runs on a
+    /// blocking task, so a client that disconnects releases the lock while its
+    /// pass keeps embedding; a re-issued `embed` then acquires the gate with
+    /// the first pass still in flight. Without this claim its `begin` would
+    /// zero the shared counters and whichever guard dropped first would report
+    /// `pass_active: false` during a live embed — precisely the class of
+    /// status lie this work exists to remove. The second pass therefore
+    /// reports nothing rather than corrupting the first pass's numbers.
+    #[must_use]
+    pub fn begin(self: &Arc<Self>, scope: &str) -> EmbedProgressGuard {
+        let mut slot = self.lock();
+        if slot.is_some() {
+            drop(slot);
+            tracing::warn!(
+                scope,
+                "an embed pass is already in flight; this pass will run but its \
+                 progress is not reported (status keeps showing the first pass)"
+            );
+            return EmbedProgressGuard(None);
+        }
+        *slot = Some(PassState {
+            processed: 0,
+            total: 0,
+            started_at: unix_now_seconds(),
+            scope: scope.to_string(),
+        });
+        drop(slot);
+        EmbedProgressGuard(Some(Arc::clone(self)))
+    }
+
+    fn set_total(&self, total: u64) {
+        if let Some(state) = self.lock().as_mut() {
+            state.total = total;
+        }
+    }
+
+    fn advance(&self, by: u64) {
+        if let Some(state) = self.lock().as_mut() {
+            state.processed = state.processed.saturating_add(by);
+        }
+    }
+
+    fn processed(&self) -> u64 {
+        self.lock().as_ref().map(|s| s.processed).unwrap_or(0)
+    }
+
+    fn finish(&self) {
+        *self.lock() = None;
+    }
+
+    pub fn snapshot(&self) -> EmbedProgressSnapshot {
+        match self.lock().as_ref() {
+            None => EmbedProgressSnapshot::default(),
+            Some(state) => EmbedProgressSnapshot {
+                active: true,
+                processed: state.processed,
+                total: state.total,
+                started_at: state.started_at,
+                scope: state.scope.clone(),
+            },
+        }
+    }
+}
+
+/// How often a running embed pass logs a progress line. The production
+/// incident had the daemon silent for ~13 hours of continuous work, which is
+/// what made "working" and "wedged" indistinguishable in the log.
+#[cfg(feature = "embed")]
+const EMBED_PASS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The reporting slot for one embed pass.
+///
+/// `Some` when this pass owns the slot, `None` when another pass already did.
+/// Every mutation goes through the guard so a pass that did not claim the slot
+/// physically cannot touch the counters. Dropping releases the slot, so a pass
+/// that panics, unwinds, or is abandoned cannot leave `brain status` claiming
+/// an embed is running forever.
+pub struct EmbedProgressGuard(Option<Arc<EmbedProgress>>);
+
+impl EmbedProgressGuard {
+    fn set_total(&self, total: u64) {
+        if let Some(progress) = &self.0 {
+            progress.set_total(total);
+        }
+    }
+
+    fn advance(&self, by: u64) {
+        if let Some(progress) = &self.0 {
+            progress.advance(by);
+        }
+    }
+
+    fn processed(&self) -> u64 {
+        self.0.as_ref().map(|p| p.processed()).unwrap_or(0)
+    }
+
+    /// Whether this pass owns the reporting slot.
+    fn reports(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for EmbedProgressGuard {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.0 {
+            progress.finish();
+        }
+    }
+}
+
 /// Shared state held by the daemon process.
 #[derive(Clone)]
 enum SearchIndexReconciliation {
@@ -256,7 +442,7 @@ pub struct WatcherRegistration {
     handle: nestweaver_engine::ShutdownHandle,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct EmbeddingRuntimeStatus {
     state: String,
     backend: String,
@@ -446,9 +632,30 @@ fn finalize_embedding_status(
     status
 }
 
-fn embedding_status_proto(status: &EmbeddingRuntimeStatus) -> nestweaver_proto::EmbeddingStatus {
+/// The state string an operator should see.
+///
+/// `ready` is the truth about the model, not about the daemon: during the
+/// production incident an embed had been running for 12h32m and `state` still
+/// said `ready`, so nothing in status distinguished "idle and healthy" from
+/// "busy and healthy". While a pass is in flight the state narrows to
+/// `embedding`, which still implies the model is loaded and usable.
+fn effective_embedding_state(
+    status: &EmbeddingRuntimeStatus,
+    progress: &EmbedProgressSnapshot,
+) -> String {
+    if progress.active && status.state == "ready" {
+        "embedding".to_string()
+    } else {
+        status.state.clone()
+    }
+}
+
+fn embedding_status_proto(
+    status: &EmbeddingRuntimeStatus,
+    progress: &EmbedProgressSnapshot,
+) -> nestweaver_proto::EmbeddingStatus {
     nestweaver_proto::EmbeddingStatus {
-        state: status.state.clone(),
+        state: effective_embedding_state(status, progress),
         backend: status.backend.clone(),
         requested_device: status.requested_device.clone(),
         selected_device: status.selected_device.clone(),
@@ -456,12 +663,20 @@ fn embedding_status_proto(status: &EmbeddingRuntimeStatus) -> nestweaver_proto::
         error: status.error.clone(),
         metal_compiled: status.metal_compiled,
         fallback_used: status.fallback_used,
+        pass_active: progress.active,
+        pass_processed: progress.processed,
+        pass_total: progress.total,
+        pass_started_at: progress.started_at,
+        pass_scope: progress.scope.clone(),
     }
 }
 
-fn embedding_status_json(status: &EmbeddingRuntimeStatus) -> serde_json::Value {
+fn embedding_status_json(
+    status: &EmbeddingRuntimeStatus,
+    progress: &EmbedProgressSnapshot,
+) -> serde_json::Value {
     serde_json::json!({
-        "state": status.state,
+        "state": effective_embedding_state(status, progress),
         "backend": status.backend,
         "requested_device": status.requested_device,
         "selected_device": status.selected_device,
@@ -469,6 +684,11 @@ fn embedding_status_json(status: &EmbeddingRuntimeStatus) -> serde_json::Value {
         "error": status.error,
         "metal_compiled": status.metal_compiled,
         "fallback_used": status.fallback_used,
+        "pass_active": progress.active,
+        "pass_processed": progress.processed,
+        "pass_total": progress.total,
+        "pass_started_at": progress.started_at,
+        "pass_scope": progress.scope,
     })
 }
 
@@ -626,9 +846,16 @@ pub struct DaemonState {
     /// Embedding readiness and the exact usable model as one immutable
     /// snapshot. A handler can never observe `ready` without that model.
     embedding_runtime: Arc<EmbeddingRuntime>,
-    /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
-    /// single write transaction).
-    pub write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes writes so only one runs at a time (KùzuDB allows a single
+    /// write transaction), and accounts for who holds it and who is waiting.
+    /// Every writer in the process acquires through it — RPC handlers via
+    /// `lock(..)`, the worker pool and the web admin API via `blocking_lock(..)`
+    /// on their own clone — so `write_holder` is never empty while the lock is
+    /// held. `mutex()` exists only for tests that hold the raw lock.
+    pub write_gate: WriteGate,
+    /// Progress of the in-flight daemon-route embedding pass, surfaced through
+    /// `brain_status` so a long embed is distinguishable from a wedged daemon.
+    pub embed_progress: Arc<EmbedProgress>,
     /// Whether this daemon is running in server mode (TCP, no local source files).
     pub server_mode: bool,
     /// Whether this daemon serves a read-only snapshot replica. When true, all
@@ -3187,7 +3414,7 @@ impl NestWeaverDaemon for DaemonService {
         // no writer touches the files mid-copy, and the RAII guard releases the
         // lock on drop/panic — there is no persistent quiesce flag to leak.
         let staged = {
-            let _write_lock = self.state.write_mutex.lock().await;
+            let _write_lock = self.state.write_gate.lock("backup").await;
             let _guard = ConnectionGuard::write(&self.state);
             let store = self.state.store.clone();
             let cfg = config.clone();
@@ -3298,7 +3525,7 @@ impl NestWeaverDaemon for DaemonService {
         };
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
@@ -3307,7 +3534,7 @@ impl NestWeaverDaemon for DaemonService {
         );
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("watch_vault");
             let _guard = guard;
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
@@ -3391,7 +3618,7 @@ impl NestWeaverDaemon for DaemonService {
         };
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
@@ -3400,7 +3627,7 @@ impl NestWeaverDaemon for DaemonService {
         );
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("watch_code");
             let _guard = guard;
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
@@ -3785,7 +4012,7 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
 
         // Cooperative cancellation for the otherwise-uncancelable spawn_blocking
         // index. A watchdog trips this flag when the index exceeds an overall
@@ -3851,7 +4078,7 @@ impl NestWeaverDaemon for DaemonService {
         let cancel_for_index = cancel;
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("index_repo");
             let _guard = guard;
             // Dropped when the index task ends → fires the watchdog's `done_rx`
             // so it releases its stream sender and the response can terminate.
@@ -4084,9 +4311,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("index_vault");
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
@@ -4188,9 +4415,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("refresh_vault_since");
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
@@ -4294,9 +4521,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("materialize_projects");
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
@@ -4375,7 +4602,7 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("remove_vault").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -4401,7 +4628,7 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("remove_repo").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -4439,7 +4666,7 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("remove_project").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -4471,7 +4698,7 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("prune_stale").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let _req = request.into_inner();
@@ -4514,7 +4741,7 @@ impl NestWeaverDaemon for DaemonService {
                 "source and target instance IDs must differ",
             ));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("merge_instance").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let state = self.state.clone();
@@ -4578,9 +4805,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
-        let write_lock = self.state.write_mutex.clone();
+        let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock();
+            let _write_lock = write_lock.blocking_lock("purge_instance");
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Writing as i32,
@@ -4658,7 +4885,7 @@ impl NestWeaverDaemon for DaemonService {
         // (which copies under the same lock) and is visible to the shutdown
         // drain / idle timeout via `active_writes` — mirroring `prune_stale`
         // and `purge_instance`.
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("reindex_search").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let state = self.state.clone();
@@ -5098,7 +5325,17 @@ impl NestWeaverDaemon for DaemonService {
             String::new()
         };
         let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
-        let embedding_status = embedding_status_proto(&self.state.embedding_runtime.status());
+        let embedding_status = embedding_status_proto(
+            &self.state.embedding_runtime.status(),
+            &self.state.embed_progress.snapshot(),
+        );
+        let write_queue_depth = self.state.write_gate.waiting() as i32;
+        let (write_holder, write_holder_seconds) = self
+            .state
+            .write_gate
+            .holder_snapshot()
+            .map(|(rpc, held)| (rpc, held.as_secs() as i64))
+            .unwrap_or_else(|| (String::new(), 0));
 
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
@@ -5127,6 +5364,9 @@ impl NestWeaverDaemon for DaemonService {
             queue_depth,
             embedding_status: Some(embedding_status),
             effective_config: Some(effective_config_proto(&self.state.effective_config)),
+            write_queue_depth,
+            write_holder,
+            write_holder_seconds,
         }))
     }
 
@@ -5182,8 +5422,22 @@ impl NestWeaverDaemon for DaemonService {
             }
             value["queue_depth"] =
                 serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
+            // Write RPCs blocked on the daemon write lock are a different
+            // population from index jobs (see the proto comment on
+            // `queue_depth`), so they get their own documented key rather than
+            // being folded into an already-published metric.
+            value["write_queue_depth"] = serde_json::json!(self.state.write_gate.waiting());
+            let (write_holder, write_holder_seconds) = self
+                .state
+                .write_gate
+                .holder_snapshot()
+                .map(|(rpc, held)| (rpc, held.as_secs()))
+                .unwrap_or_else(|| (String::new(), 0));
+            value["write_holder"] = serde_json::json!(write_holder);
+            value["write_holder_seconds"] = serde_json::json!(write_holder_seconds);
             let embedding_status = self.state.embedding_runtime.status();
-            value["embedding_status"] = embedding_status_json(&embedding_status);
+            value["embedding_status"] =
+                embedding_status_json(&embedding_status, &self.state.embed_progress.snapshot());
             if let Ok(s) = serde_json::to_string(&value) {
                 json_resp.result_json = s;
             }
@@ -5478,7 +5732,7 @@ impl NestWeaverDaemon for DaemonService {
         // shutdown drain / idle timeout, and two concurrent callers cannot lose
         // updates (last-writer-wins). This is the single gated write path: the
         // MCP `tool_set_extension` routes here rather than mutating directly.
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("set_extension").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = r.into_inner();
@@ -6035,7 +6289,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("plan_embed").await;
         let _guard = ConnectionGuard::read(&self.state);
         let request = request.into_inner();
         let store = self.state.store.clone();
@@ -6057,7 +6311,7 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_mutex.lock().await;
+        let _write_lock = self.state.write_gate.lock("embed").await;
         let _guard = ConnectionGuard::write(&self.state);
 
         #[cfg(not(feature = "embed"))]
@@ -6101,8 +6355,19 @@ impl NestWeaverDaemon for DaemonService {
             let embed_model_id = status.model_id.clone();
 
             let store = self.state.store.clone();
+            let progress = Arc::clone(&self.state.embed_progress);
+            let progress_scope = scope.clone();
 
             let result = tokio::task::spawn_blocking(move || {
+                // Owned by the blocking task, not by the RPC future: a client
+                // that disconnects does not stop the pass, so progress must
+                // keep reporting `active` until the work actually ends. The
+                // guard is inert if another pass already owns the slot, so a
+                // second pass cannot zero the first one's counters or clear
+                // `pass_active` out from under it.
+                let progress = progress.begin(&progress_scope);
+                let pass_started = Instant::now();
+
                 let mut succeeded = 0u32;
                 let mut failed = 0u32;
                 let mut rejected = 0u32;
@@ -6123,6 +6388,47 @@ impl NestWeaverDaemon for DaemonService {
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
                 store.reset_embedding_force_guard();
+
+                // The denominator for `brain status`. `plan_embeddings` already
+                // computes eligible/embedded/scoped — the CLI prints it once
+                // and throws it away — so keeping it costs one preflight scan
+                // and turns the pass from opaque into "N of M".
+                // Cost note: on the daemon route the CLI has already called
+                // `PlanEmbed`, so this is a second full eligibility scan per
+                // pass. Kept deliberately — the daemon must not depend on a
+                // client having asked first (MCP and the web admin call
+                // `Embed` directly), and a second scan is immaterial against a
+                // pass measured in hours.
+                let plan = plan_embeddings(&store, &progress_scope, force)?;
+                progress.set_total(plan.eligible);
+                tracing::info!(
+                    scope = %progress_scope,
+                    force,
+                    batch_size,
+                    eligible = plan.eligible,
+                    already_embedded = plan.skipped,
+                    scoped = plan.scoped,
+                    "embed pass started"
+                );
+                let mut last_pass_log = Instant::now();
+                let mut log_pass_progress = |final_line: bool| {
+                    // A pass that does not own the reporting slot has no
+                    // meaningful counter to log; the owning pass is logging.
+                    if !progress.reports() {
+                        return;
+                    }
+                    if !final_line && last_pass_log.elapsed() < EMBED_PASS_LOG_INTERVAL {
+                        return;
+                    }
+                    last_pass_log = Instant::now();
+                    tracing::info!(
+                        scope = %progress_scope,
+                        processed = progress.processed(),
+                        total = plan.eligible,
+                        elapsed_seconds = pass_started.elapsed().as_secs(),
+                        "embed pass progress"
+                    );
+                };
 
                 if do_symbols {
                     let symbols = store
@@ -6163,6 +6469,7 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                            progress.advance(1);
                         }
                         if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
                             &store,
@@ -6172,6 +6479,7 @@ impl NestWeaverDaemon for DaemonService {
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
+                        log_pass_progress(false);
                     }
                 }
 
@@ -6211,6 +6519,7 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                            progress.advance(1);
                         }
                         if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
                             &store,
@@ -6220,6 +6529,7 @@ impl NestWeaverDaemon for DaemonService {
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
+                        log_pass_progress(false);
                     }
                 }
 
@@ -6259,6 +6569,7 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                            progress.advance(1);
                         }
                         if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
                             &store,
@@ -6268,6 +6579,7 @@ impl NestWeaverDaemon for DaemonService {
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
+                        log_pass_progress(false);
                     }
                 }
 
@@ -6288,7 +6600,14 @@ impl NestWeaverDaemon for DaemonService {
                     tracing::warn!("failed to record embedding model metadata: {e}");
                 }
 
-                tracing::info!(succeeded, failed, rejected, "embed RPC completed");
+                log_pass_progress(true);
+                tracing::info!(
+                    succeeded,
+                    failed,
+                    rejected,
+                    elapsed_seconds = pass_started.elapsed().as_secs(),
+                    "embed RPC completed"
+                );
                 Ok::<_, Status>(EmbedResponse {
                     succeeded,
                     failed,
@@ -8330,7 +8649,8 @@ pub async fn run_server(
         effective_config,
         permission_source,
         embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(embedding_status)),
-        write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        write_gate: WriteGate::new(),
+        embed_progress: Arc::new(EmbedProgress::default()),
         server_mode: is_server_mode,
         indexing_active: Arc::new(AtomicBool::new(false)),
         indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
@@ -8787,7 +9107,7 @@ pub async fn run_server(
                 scheduler_tx: Some(scheduler_tx.clone()),
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
-                write_mutex: Some(Arc::clone(&state.write_mutex)),
+                write_gate: Some(state.write_gate.clone()),
                 // Share the daemon's single job-queue connection. Opening a
                 // second connection from admin routes races the worker's WAL
                 // checkpoint and crashes with SIGBUS on macOS.
@@ -9253,7 +9573,7 @@ pub async fn run_server(
             let worker_instance = data_instance_id.clone();
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
-            let worker_write_mutex = Arc::clone(&state.write_mutex);
+            let worker_write_gate = state.write_gate.clone();
             let worker_count = state
                 .instance_cfg
                 .as_ref()
@@ -9305,7 +9625,7 @@ pub async fn run_server(
                     &mut worker_shutdown,
                     Some(indexing_status),
                     Some(worker_drained),
-                    Some(worker_write_mutex),
+                    Some(worker_write_gate),
                 )
                 .await;
             });
@@ -14606,7 +14926,8 @@ mod startup_helper_tests {
                 cfg!(feature = "embed"),
                 daemon_metal_compiled(),
             ))),
-            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            write_gate: WriteGate::new(),
+            embed_progress: Arc::new(EmbedProgress::default()),
             server_mode: false,
             read_only: false,
             indexing_active: Arc::new(AtomicBool::new(false)),
@@ -14684,7 +15005,8 @@ credential_method = "gh"
                 cfg!(feature = "embed"),
                 daemon_metal_compiled(),
             ))),
-            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            write_gate: WriteGate::new(),
+            embed_progress: Arc::new(EmbedProgress::default()),
             server_mode: false,
             read_only: false,
             indexing_active: Arc::new(AtomicBool::new(false)),
@@ -14753,6 +15075,248 @@ credential_method = "gh"
             value.get("effective_config").is_none(),
             "effective config provenance must remain typed-only so Combined federation cannot backfill it"
         );
+    }
+
+    /// A3. The incident: an embed had run 12h32m and `brain status` still said
+    /// `state: ready`, `queue_depth: 0`, with nothing progress-shaped anywhere.
+    /// Status must now say a pass is running, how far along it is, and that a
+    /// write is queued behind it — on both the typed and JSON routes.
+    #[tokio::test]
+    async fn status_reports_a_running_embed_pass_and_a_queued_write() {
+        let state = test_state_with_writer();
+        let pass = state.embed_progress.begin("all");
+        pass.set_total(88_131);
+        pass.advance(41_230);
+
+        // A write RPC holding the lock, and a second one blocked behind it —
+        // the exact shape that reported `queue_depth: 0` in production.
+        let holder = state.write_gate.lock("embed").await;
+        let gate = state.write_gate.clone();
+        let blocked = tokio::spawn(async move {
+            let lease = gate.lock("index_repo").await;
+            drop(lease);
+        });
+        // Let the blocked task reach the gate.
+        while state.write_gate.waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed brain status")
+            .into_inner();
+
+        assert_eq!(
+            typed.write_queue_depth, 1,
+            "a write RPC waiting on the gate must not report as zero queued"
+        );
+        assert_eq!(typed.write_holder, "embed");
+        let embedding = typed.embedding_status.expect("embedding status");
+        assert!(embedding.pass_active, "a running pass must say so");
+        assert_eq!(embedding.pass_processed, 41_230);
+        assert_eq!(embedding.pass_total, 88_131);
+        assert_eq!(embedding.pass_scope, "all");
+        assert!(
+            embedding.pass_started_at > 0,
+            "a running pass must carry a start stamp so the client can derive ETA"
+        );
+
+        let json = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .expect("JSON brain status")
+            .into_inner();
+        let value: serde_json::Value =
+            serde_json::from_str(&json.result_json).expect("valid status JSON");
+        assert_eq!(value["write_queue_depth"], 1);
+        assert_eq!(value["write_holder"], "embed");
+        assert_eq!(value["embedding_status"]["pass_active"], true);
+        assert_eq!(value["embedding_status"]["pass_processed"], 41_230);
+        assert_eq!(value["embedding_status"]["pass_total"], 88_131);
+        assert_eq!(
+            value["queue_depth"], 0,
+            "queue_depth keeps meaning index JOBS; the blocked RPC is reported separately"
+        );
+
+        drop(holder);
+        blocked.await.expect("blocked write completes");
+        // The gate must go quiet again, or status would permanently claim a
+        // phantom holder.
+        assert_eq!(state.write_gate.waiting(), 0);
+        assert!(state.write_gate.holder_snapshot().is_none());
+    }
+
+    /// The state vocabulary must narrow to `embedding` mid-pass, so one field
+    /// answers "is an embed in flight" — and must fall back to the runtime's
+    /// own state when the model is not ready, rather than dressing up a
+    /// failure as activity.
+    #[test]
+    fn embedding_state_narrows_to_embedding_only_while_a_pass_runs_on_a_ready_model() {
+        let ready = EmbeddingRuntimeStatus {
+            state: "ready".to_string(),
+            ..EmbeddingRuntimeStatus::default()
+        };
+        let idle = EmbedProgressSnapshot::default();
+        let running = EmbedProgressSnapshot {
+            active: true,
+            ..EmbedProgressSnapshot::default()
+        };
+        assert_eq!(effective_embedding_state(&ready, &idle), "ready");
+        assert_eq!(effective_embedding_state(&ready, &running), "embedding");
+
+        let failed = EmbeddingRuntimeStatus {
+            state: "failed".to_string(),
+            ..EmbeddingRuntimeStatus::default()
+        };
+        assert_eq!(effective_embedding_state(&failed, &running), "failed");
+    }
+
+    /// A pass that ends — normally, by panic, or by cancellation — must not
+    /// leave status claiming forever that an embed is running.
+    #[test]
+    fn a_dropped_pass_guard_clears_the_running_state() {
+        let progress = Arc::new(EmbedProgress::default());
+        {
+            let pass = progress.begin("notes");
+            pass.set_total(10);
+            pass.advance(3);
+            assert!(progress.snapshot().active);
+        }
+        assert_eq!(progress.snapshot(), EmbedProgressSnapshot::default());
+    }
+
+    /// A finished pass must leave nothing behind that a later reader could
+    /// pair with `active: true`.
+    #[test]
+    fn a_finished_pass_leaves_no_counters_behind_to_be_misattributed() {
+        let progress = Arc::new(EmbedProgress::default());
+        {
+            let pass = progress.begin("all");
+            pass.set_total(88_131);
+            pass.advance(88_131);
+            let live = progress.snapshot();
+            assert_eq!(
+                (live.processed, live.total, live.scope.as_str()),
+                (88_131, 88_131, "all")
+            );
+            assert!(live.started_at > 0);
+        }
+        assert_eq!(
+            progress.snapshot(),
+            EmbedProgressSnapshot::default(),
+            "a finished pass must not leave numbers a later reader could attribute to a new one"
+        );
+    }
+
+    /// The torn read, directly.
+    ///
+    /// A `snapshot` reads four values. While they lived in four independent
+    /// atomics, a read straddling `begin`/`finish` could mix one pass's
+    /// counters with another's — the shape this item started from (a
+    /// just-started pass rendering as `100%`), and a second variant this test
+    /// caught in the first attempted fix
+    /// (`active: true, processed: 41230, total: 0, started_at: 0`).
+    ///
+    /// No ordering discipline over *independently read* atomics closes a
+    /// four-field read. The one construction that would — a seqlock — is not
+    /// cheaper here (two atomic RMWs plus two fences against the two atomics
+    /// of an uncontended mutex) and, decisively, is unsound for the `scope:
+    /// String` field: a seqlock reader can observe a torn heap pointer and
+    /// dereference freed memory. Making the group indivisible is the right
+    /// answer, not merely the easy one.
+    ///
+    /// Two things keep this test from silently protecting nothing. The
+    /// `yield_now` gives the reader a scheduling point inside every pass —
+    /// without it the writer can finish its whole run inside one quantum and
+    /// the reader observes zero ACTIVE passes, skipping every assertion below
+    /// (measured at ~22% of runs, and it would then have missed the two broken
+    /// designs 39% and 58% of the time). And the completeness assertion counts
+    /// ACTIVE observations specifically, not total reads, so a vacuous run
+    /// fails instead of passing. With both, 2,000 iterations detect either
+    /// broken design in 100% of runs, faster than 20,000 did without them.
+    #[test]
+    fn a_reader_never_sees_two_passes_mixed_together() {
+        let progress = Arc::new(EmbedProgress::default());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_progress = Arc::clone(&progress);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                let pass = writer_progress.begin("all");
+                pass.set_total(88_131);
+                pass.advance(41_230);
+                // Hold the pass open across a scheduling point so the reader
+                // actually gets to observe passes in flight.
+                std::thread::yield_now();
+                drop(pass);
+            }
+            writer_stop.store(true, Ordering::Relaxed);
+        });
+
+        let mut active_observations = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            let snapshot = progress.snapshot();
+            if snapshot.active {
+                active_observations += 1;
+                assert!(
+                    snapshot.started_at > 0,
+                    "a live pass always carries its start stamp: {snapshot:?}"
+                );
+                assert_eq!(snapshot.scope, "all", "scope must belong to this pass");
+                assert!(
+                    snapshot.total == 0 || snapshot.processed <= snapshot.total,
+                    "processed must never exceed a total from a different pass: {snapshot:?}"
+                );
+            }
+        }
+        writer.join().expect("writer thread");
+        assert!(
+            active_observations > 0,
+            "the reader never caught a pass in flight, so every invariant above \
+             was skipped — this run proved nothing"
+        );
+    }
+
+    /// A disconnecting client releases the write lease while its pass keeps
+    /// embedding on the blocking pool, so a re-issued `embed` can start with
+    /// one already in flight. The second pass must not zero the first's
+    /// counters, and — the part that would turn an honest counter back into a
+    /// lie — must not clear `pass_active` when it finishes first.
+    #[test]
+    fn a_second_overlapping_pass_cannot_clobber_or_prematurely_clear_the_first() {
+        let progress = Arc::new(EmbedProgress::default());
+        let first = progress.begin("all");
+        first.set_total(88_131);
+        first.advance(41_230);
+
+        {
+            let second = progress.begin("notes");
+            assert!(!second.reports(), "the slot is already claimed");
+            second.set_total(7);
+            second.advance(7);
+
+            let live = progress.snapshot();
+            assert_eq!(live.processed, 41_230, "the first pass's count must stand");
+            assert_eq!(live.total, 88_131);
+            assert_eq!(live.scope, "all");
+        }
+
+        // The second guard has now dropped while the first pass is still
+        // running. Status must still report the first pass.
+        let after = progress.snapshot();
+        assert!(
+            after.active,
+            "an overlapping pass ending must not report the live embed as finished"
+        );
+        assert_eq!(after.processed, 41_230);
+
+        drop(first);
+        assert_eq!(progress.snapshot(), EmbedProgressSnapshot::default());
     }
 
     #[tokio::test]
@@ -15484,7 +16048,7 @@ external_model = "unavailable-test-model"
         let service = DaemonService::new(state.clone());
 
         // Hold the write gate, standing in for a backup's sidecar staging.
-        let gate = state.write_mutex.clone().lock_owned().await;
+        let gate = state.write_gate.mutex().lock_owned().await;
 
         let mut req = Request::new(ReindexSearchRequest {});
         req.extensions_mut().insert(crate::auth::IsAdmin(true));
@@ -15508,7 +16072,7 @@ external_model = "unavailable-test-model"
     async fn remove_project_holds_write_gate() {
         let state = test_state_with_writer();
         let service = DaemonService::new(state.clone());
-        let gate = state.write_mutex.clone().lock_owned().await;
+        let gate = state.write_gate.mutex().lock_owned().await;
         let mut request = Request::new(RemoveProjectRequest {
             project_uid: "proj:test:write-gate".to_string(),
         });
@@ -15542,7 +16106,7 @@ external_model = "unavailable-test-model"
         let state = test_state_with_writer();
         let service = DaemonService::new(state.clone());
 
-        let gate = state.write_mutex.clone().lock_owned().await;
+        let gate = state.write_gate.mutex().lock_owned().await;
 
         let args =
             serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" }).to_string();

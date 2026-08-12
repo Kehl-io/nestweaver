@@ -2272,6 +2272,13 @@ mod tests {
     /// instead, so the named file never contained the error being hunted.
     #[test]
     fn log_hint_names_the_dated_tracing_file_not_just_stderr() {
+        // `log_hint` and `log_dir` each resolve XDG_STATE_HOME independently,
+        // so without ENV_LOCK a sibling test swapping that var between the two
+        // calls makes them disagree and this assertion fail — on either root,
+        // depending on which way the swap lands. Every other test in this
+        // module that touches the XDG roots already takes the lock; this one
+        // read process-global state without it.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let hint = log_hint("test1234");
         assert!(
             hint.contains("daemon.log.<date>"),
