@@ -6673,18 +6673,18 @@ fn claim_pidfile_lock(pid_path: &Path) -> Result<std::fs::File, anyhow::Error> {
             .with_context(|| format!("create runtime dir: {}", parent.display()))?;
     }
 
+    // Do NOT truncate at open. `truncate(true)` empties the file the instant
+    // it is opened — before the flock below can decide whether we are even
+    // allowed to touch it — so a losing starter blanked the WINNER's pidfile
+    // and wrote its own (about to be dead) PID into it. Every later reader then
+    // saw a live daemon named by a stale PID. Lock first, write second.
     let pid_file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .open(pid_path)
         .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
-
-    {
-        use std::io::Write;
-        write!(&pid_file, "{}", std::process::id())
-            .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
-    }
 
     #[cfg(unix)]
     {
@@ -6694,6 +6694,19 @@ fn claim_pidfile_lock(pid_path: &Path) -> Result<std::fs::File, anyhow::Error> {
         if ret != 0 {
             anyhow::bail!("Another daemon instance is already running (pidfile locked)");
         }
+    }
+
+    // The lock is ours: now it is safe to replace the contents.
+    {
+        use std::io::{Seek, Write};
+        pid_file
+            .set_len(0)
+            .with_context(|| format!("truncate pidfile: {}", pid_path.display()))?;
+        (&pid_file)
+            .seek(std::io::SeekFrom::Start(0))
+            .with_context(|| format!("rewind pidfile: {}", pid_path.display()))?;
+        write!(&pid_file, "{}", std::process::id())
+            .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
     }
 
     Ok(pid_file)
@@ -7910,6 +7923,39 @@ pub async fn run_server(
     // lifetime; released on drop. A daemonize child proves it inherited the
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
+
+    // The pidfile lock is NOT sufficient proof of ownership. It is held on an
+    // inode: if anyone unlinked `daemon.pid` (which is exactly what an operator
+    // does while recovering a stuck instance), the live owner keeps its lock on
+    // a now-unlinked inode and the claim above succeeds against a brand-new
+    // file with no contention at all. Continuing from here would delete the
+    // live daemon's effective-config binding and, further down, unlink its
+    // socket before binding — leaving a healthy daemon that no client can
+    // reach. Corroborate with the database write lock, which lives on the
+    // database file itself and no recovery step removes.
+    //
+    // Read-only snapshot replicas are exempt: they never take the write lock,
+    // so a held lock says nothing about them.
+    let serves_snapshot = server_opts
+        .as_ref()
+        .and_then(|o| o.snapshot.as_ref())
+        .is_some();
+    if !serves_snapshot
+        && let lifecycle::DbWriteLock::Held { pid } = lifecycle::db_write_lock(&db_path)
+    {
+        let owner = pid
+            .map(|pid| format!("PID {pid}"))
+            .unwrap_or_else(|| "another process".to_string());
+        anyhow::bail!(
+            "refusing to start: {owner} already holds the write lock on {} for instance \
+             {instance_label}. The pidfile lock was free, which means {} was removed while that \
+             daemon was running — an unlinked pidfile cannot prove ownership. Stop the running \
+             daemon instead of starting a second one.",
+            db_path.display(),
+            lifecycle::pidfile_path(&instance_id).display()
+        );
+    }
+
     // We now exclusively own this instance's pidfile lock, so any binding left
     // by a crashed predecessor is stale. Clear it before fallible startup work;
     // a failed boot must not leave old provenance looking live.

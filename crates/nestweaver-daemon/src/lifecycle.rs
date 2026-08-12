@@ -560,6 +560,77 @@ pub fn effective_config_binding_path(instance_id: &str) -> PathBuf {
     runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE)
 }
 
+/// Who, if anyone, holds this database's write lock — the ONE ownership proof
+/// an operator's `rm` cannot erase.
+///
+/// The pidfile flock is held on an *inode*, not a path: unlink the pidfile and
+/// every path-based owner check is silently defeated, because the next caller
+/// creates a brand-new inode whose flock is trivially free. The database write
+/// lock has no such hole — it lives on the database file itself, which is the
+/// data, so nobody deletes it during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbWriteLock {
+    /// No process holds a write lock (or the database does not exist yet).
+    Free,
+    /// A process holds the write lock — by definition this instance is NOT
+    /// stale. `pid` is the kernel-reported holder when the platform names one.
+    Held { pid: Option<i32> },
+    /// The lock state could not be determined (unreadable file, `fcntl`
+    /// failure). Callers must treat this as "possibly owned", never as free.
+    Unknown,
+}
+
+impl DbWriteLock {
+    /// Is a live process holding the database? `Unknown` is deliberately NOT
+    /// counted: callers that destroy runtime state must use
+    /// [`DbWriteLock::is_provably_free`] instead.
+    pub fn is_held(self) -> bool {
+        matches!(self, DbWriteLock::Held { .. })
+    }
+
+    /// Only `Free` is safe to act destructively on.
+    pub fn is_provably_free(self) -> bool {
+        matches!(self, DbWriteLock::Free)
+    }
+}
+
+/// Probe the database write lock WITHOUT taking it.
+///
+/// lbug locks the whole database file with a POSIX record lock
+/// (`fcntl(F_SETLK, F_WRLCK)`; see `local_file_system.cpp`), so `F_GETLK` asks
+/// the kernel who owns it and reports the holder's PID. This is a pure query —
+/// it never creates the database, never takes a lock, and cannot disturb a
+/// running daemon.
+///
+/// Caveat worth knowing: POSIX record locks never conflict with the *calling*
+/// process, so a process that already holds the lock sees `Free`. Every caller
+/// here probes before opening the store, so that is not a live concern.
+pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
+    use std::os::unix::io::AsRawFd;
+
+    let path = canonical_db_path(db_path);
+    if !path.exists() {
+        return DbWriteLock::Free;
+    }
+    let Ok(file) = std::fs::File::open(&path) else {
+        return DbWriteLock::Unknown;
+    };
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as libc::c_short;
+    probe.l_whence = libc::SEEK_SET as libc::c_short;
+    probe.l_start = 0;
+    probe.l_len = 0;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) } != 0 {
+        return DbWriteLock::Unknown;
+    }
+    if probe.l_type == libc::F_UNLCK as libc::c_short {
+        return DbWriteLock::Free;
+    }
+    DbWriteLock::Held {
+        pid: (probe.l_pid > 0).then_some(probe.l_pid),
+    }
+}
+
 fn persistent_state_root() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
@@ -2482,5 +2553,137 @@ mod tests {
                 libc::flock(held.as_raw_fd(), libc::LOCK_UN);
             }
         });
+    }
+
+    /// Fork a child that takes a POSIX write lock (`fcntl(F_SETLK, F_WRLCK)`)
+    /// on `path` and holds it until killed. A *separate process* is required:
+    /// POSIX record locks never conflict with the calling process, so an
+    /// in-process lock would be invisible to `F_GETLK`.
+    ///
+    /// The child touches only async-signal-safe libc calls after `fork` (the
+    /// path CString and the pipe are prepared beforehand), which is what makes
+    /// this safe from a multi-threaded test harness.
+    fn fork_write_lock_holder(path: &Path) -> i32 {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(11);
+                }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as libc::c_short;
+                lock.l_whence = libc::SEEK_SET as libc::c_short;
+                if libc::fcntl(fd, libc::F_SETLK, &lock) != 0 {
+                    libc::_exit(12);
+                }
+                let ready = [1u8];
+                libc::write(fds[1], ready.as_ptr() as *const libc::c_void, 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut ready = [0u8; 1];
+        let read = unsafe { libc::read(fds[0], ready.as_mut_ptr() as *mut libc::c_void, 1) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(read, 1, "lock-holding child never signalled readiness");
+        pid
+    }
+
+    fn reap(pid: i32) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+
+    /// A database nobody has ever created cannot be owned.
+    #[test]
+    fn write_lock_probe_reports_free_for_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            db_write_lock(&dir.path().join("never-created.lbug")),
+            DbWriteLock::Free
+        );
+    }
+
+    /// An existing but unlocked database is provably free.
+    #[test]
+    fn write_lock_probe_reports_free_for_unlocked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        let state = db_write_lock(&db);
+        assert_eq!(state, DbWriteLock::Free);
+        assert!(state.is_provably_free());
+        assert!(!state.is_held());
+    }
+
+    /// The whole point: another process holding the database is visible to the
+    /// kernel by PID, and stays visible no matter what happens to the pidfile.
+    #[test]
+    fn write_lock_probe_names_the_holding_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        let holder = fork_write_lock_holder(&db);
+        let state = db_write_lock(&db);
+        assert_eq!(
+            state,
+            DbWriteLock::Held { pid: Some(holder) },
+            "the kernel must name the process holding the database write lock"
+        );
+        assert!(state.is_held());
+        assert!(!state.is_provably_free());
+
+        reap(holder);
+        // Once the holder is gone the kernel drops its lock — no file on disk
+        // has to be cleaned up for the truth to change.
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+    }
+
+    /// Ownership survives an operator deleting the pidfile: the flock evidence
+    /// disappears with the inode, the database lock does not.
+    #[test]
+    fn write_lock_probe_survives_pidfile_unlink() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let pidfile = dir.path().join("daemon.pid");
+        std::fs::write(&db, b"not really a database").unwrap();
+        std::fs::write(&pidfile, "1\n").unwrap();
+
+        let holder = fork_write_lock_holder(&db);
+        std::fs::remove_file(&pidfile).unwrap();
+
+        // A fresh pidfile at the same path flocks trivially — the old proof is
+        // gone — while the database lock still names the live owner.
+        let fresh = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "an unlinked-then-recreated pidfile must flock freely (this is the defect)"
+        );
+        assert_eq!(db_write_lock(&db), DbWriteLock::Held { pid: Some(holder) });
+
+        unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_UN) };
+        reap(holder);
     }
 }
