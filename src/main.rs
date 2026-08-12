@@ -5268,19 +5268,27 @@ fn daemon_stop_lock_holder_target_with(
 
 /// Pure predicate: is this argv a nestweaver daemon serving `db_path`?
 ///
-/// Matches by POSITION, not membership. `daemon` must be `argv[1]` — the
-/// subcommand — because a membership test ("some token equals `daemon`")
-/// is satisfied by any lock-holding invocation that merely carries `daemon`
-/// as an argument VALUE:
+/// Matches by POSITION, not membership: the FIRST NON-FLAG argument after
+/// `argv[0]` must be `daemon`. A membership test ("some token equals
+/// `daemon`") is satisfied by any lock-holding invocation that merely carries
+/// `daemon` as an argument VALUE, and all of these hold this database's write
+/// lock:
 ///
 /// * `nestweaver index --repo daemon --db <path>` (a directory named `daemon`)
 /// * `nestweaver index --name daemon --db <path>`
 /// * `nestweaver index --instance daemon --db <path>`
 ///
-/// All three hold this database's write lock, and under a membership test all
-/// three read as daemons and get signalled. `daemon_restart_start_args` builds
-/// `["daemon", "--db", ...]`, so `argv[1]` is where the real subcommand always
-/// is.
+/// Leading flags must be skipped rather than rejected, because every top-level
+/// global may precede the subcommand and clap accepts it: `nestweaver --quiet
+/// daemon --db <path> start` is an ordinary thing for a wrapper script or a
+/// systemd unit to run. Requiring literal `argv[1] == "daemon"` silently
+/// disabled the one recovery path this guard exists to preserve.
+///
+/// CONSTRAINT, load-bearing: this is sound only because every top-level global
+/// is currently BOOLEAN (`--stats`, `-q`/`--quiet`, `-v`/`--verbose`,
+/// `--no-color`, `--plain`, `--no-embed`). A value-taking global would put its
+/// VALUE in the first non-flag position and break this. If you add one, this
+/// function must learn to consume its argument.
 ///
 /// The DB path is likewise matched as a WHOLE ARGUMENT rather than a substring
 /// of a flattened string.
@@ -5289,10 +5297,18 @@ fn daemon_stop_lock_holder_target_with(
 /// default layout the database lives at `…/.local/nestweaver/brain.lbug`, so
 /// that substring was satisfied by the PATH, not the binary — it added no real
 /// evidence while breaking for renamed or symlinked installs. The conjunction
-/// that carries the weight is: holds THIS database's write lock, `argv[1] ==
-/// "daemon"`, and names THIS database.
+/// that carries the weight is: holds THIS database's write lock, the `daemon`
+/// subcommand, and names THIS database.
 fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
-    if argv.len() < 2 || argv[1] != "daemon" {
+    // Skip leading boolean globals. An EMPTY argument is not a flag and not
+    // `daemon`, so it stops the scan and the argv is rejected — a forged
+    // `["bin", "", "daemon", ...]` must not shift `daemon` into place.
+    let subcommand = argv
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    if subcommand != Some("daemon") {
         return false;
     }
     let mut spellings = vec![db_path.to_string_lossy().into_owned()];
@@ -5300,7 +5316,7 @@ fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
         spellings.push(canonical.to_string_lossy().into_owned());
     }
     spellings.retain(|spelling| !spelling.is_empty());
-    argv[2..].iter().any(|arg| {
+    argv.iter().skip(1).any(|arg| {
         spellings
             .iter()
             .any(|spelling| arg == spelling || arg.as_str() == format!("--db={spelling}"))
@@ -5313,40 +5329,60 @@ fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
 /// that preserves those boundaries. `ps -o command=` re-joins argv on spaces
 /// and is therefore unusable for positional matching — a path containing a
 /// space, or an argument value of `daemon`, both become indistinguishable from
-/// separate arguments. That flattening is exactly what made the previous
+/// separate arguments. That flattening is exactly what made the earlier
 /// membership check unsound.
+///
+/// Interior empty arguments are PRESERVED. Filtering them out would silently
+/// re-index the argv and turn "the first non-flag argument" into "the first
+/// non-empty non-flag argument", which is a different (and forgeable) claim.
 #[cfg(target_os = "linux")]
 fn process_argv(pid: i32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    // The kernel terminates the last argument with a NUL, which would
+    // otherwise yield a phantom trailing empty argument.
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
     Some(
         raw.split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect(),
     )
 }
 
-/// Non-Linux fallback: `ps` is all there is, so argument boundaries are lost
-/// to whitespace splitting. Positional matching still holds (`argv[1]` is the
-/// second token), which is what defeats the `--repo daemon` shape; what is NOT
-/// recoverable here is an argument containing a space. UNVERIFIED on macOS —
-/// this branch is `cfg`-gated out on Linux and was never compiled or run.
+/// Non-Linux: refuse to answer.
+///
+/// The only portable source is `ps -o command=`, which re-joins argv on
+/// spaces. That is not merely lossy, it is wrong in both directions:
+///
+/// * a database path containing a space can never equal any whitespace-split
+///   token, so `argv_is_our_daemon` could NEVER match — and on macOS the
+///   natural location is `~/Library/Application Support/…`, so this residual
+///   recovery path would be silently dead for those installs while looking
+///   implemented;
+/// * conversely, an argument containing a space can synthesize a `daemon`
+///   token in the subcommand position, which is a narrower reprise of the
+///   flattening bug that made the membership check exploitable.
+///
+/// Returning `None` is the honest answer: identity is unproven, callers refuse
+/// to signal, and stopping an unreachable daemon by database-lock evidence is
+/// a Linux-only capability until someone implements macOS
+/// `sysctl KERN_PROCARGS2`, which returns real NUL-separated argv.
+///
+/// KNOWN CONSEQUENCE, please weigh before shipping to macOS: this also empties
+/// the cmdline branch of [`daemon_identity_verified`], which previously
+/// substring-matched `ps` output. On macOS that leaves identity resting on the
+/// pidfile flock cross-checked against the socket peer — so a LEGACY
+/// fork-based macOS daemon whose socket is missing can no longer be identified
+/// by cmdline, and `daemon stop` will refuse it where it once acted. The
+/// launchd path (`launchd::stop_and_uninstall`) runs first and is unaffected,
+/// as are the pidfile-PID and socket-peer paths whenever a socket exists.
+/// `sysctl KERN_PROCARGS2` would restore it; I could not write or verify that
+/// on Linux, so I am surfacing the trade rather than guessing at it.
 #[cfg(not(target_os = "linux"))]
-fn process_argv(pid: i32) -> Option<Vec<String>> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-    )
+fn process_argv(_pid: i32) -> Option<Vec<String>> {
+    None
 }
 
 /// Return the argv of `pid` when it is verifiably a nestweaver daemon serving
@@ -20580,6 +20616,56 @@ mod abs_for_daemon_tests {
         ));
     }
 
+    /// Top-level globals may precede the subcommand and clap accepts them, so
+    /// a daemon started by a wrapper script or systemd unit as `nestweaver
+    /// --quiet daemon …` must still be recognized. Requiring literal
+    /// `argv[1] == "daemon"` silently disabled the only recovery path for the
+    /// incident this branch exists to fix.
+    #[test]
+    fn leading_global_flags_do_not_hide_the_daemon_subcommand() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        let argv =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
+
+        for line in [
+            "nestweaver --quiet daemon --db /tmp/nw-f06/brain.lbug start",
+            "nestweaver -q daemon --db /tmp/nw-f06/brain.lbug start",
+            "nestweaver -v --no-color daemon --db /tmp/nw-f06/brain.lbug run",
+            "nestweaver --stats --plain --no-embed daemon --db /tmp/nw-f06/brain.lbug start",
+        ] {
+            assert!(
+                argv_is_our_daemon(&argv(line), db),
+                "a daemon behind leading globals must stay recognizable: {line}"
+            );
+        }
+
+        // Skipping flags must not skip past a real subcommand: `index` is not
+        // a flag, so the scan stops there and rejects.
+        assert!(!argv_is_our_daemon(
+            &argv("nestweaver --quiet index --repo daemon --db /tmp/nw-f06/brain.lbug"),
+            db
+        ));
+    }
+
+    /// An EMPTY argument is not a flag and not `daemon`, so it terminates the
+    /// scan. Filtering empties out instead would re-index the argv and let a
+    /// forged `["bin", "", "daemon", …]` shift `daemon` into the subcommand
+    /// position — which it did.
+    #[test]
+    fn an_empty_argument_cannot_shift_the_subcommand_into_place() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+        assert!(!argv_is_our_daemon(
+            &[
+                "foreignbin".to_string(),
+                String::new(),
+                "daemon".to_string(),
+                "/tmp/nw-f06/brain.lbug".to_string(),
+                "start".to_string(),
+            ],
+            db
+        ));
+    }
+
     /// `daemon_cmdline_if_ours` returns None for a live process that is
     /// not a nestweaver daemon for the given DB (PID-reuse protection).
     #[test]
@@ -23088,6 +23174,47 @@ mod daemon_cli_tests {
                 db
             ),
             "an index run holds the write lock and must never read as a daemon"
+        );
+    }
+
+    /// The kernel interface itself must hand back interior empty arguments.
+    /// `/bin/sh -c <script> "" ""` sets `$0` and `$1` to empty strings, which
+    /// is the shape that could otherwise shift a subcommand into position.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_argv_preserves_interior_empty_arguments() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30", "", ""])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id() as i32;
+
+        // Wait for the exec to land: before it, /proc/<pid>/cmdline still
+        // shows the forked parent. Ten seconds is enormous headroom for an
+        // exec of /bin/sh — this is not a throughput assertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut argv = Vec::new();
+        while std::time::Instant::now() < deadline {
+            argv = process_argv(pid).unwrap_or_default();
+            if argv.iter().any(|arg| arg == "sleep 30") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            "empty arguments must survive, and the NUL terminator must not add a phantom one"
         );
     }
 

@@ -7942,6 +7942,15 @@ pub async fn run_server(
     // holds THIS DATABASE — not that it is a daemon, and not that anyone
     // deleted a pidfile: `embed --local`, an index run, and every `--no-daemon`
     // command hold the same lock for their duration.
+    //
+    // Matching only `Held` — and so proceeding on `Unknown` — is the one
+    // deliberate exception to the "treat Unknown as possibly-owned" rule every
+    // other caller follows. This probe runs BEFORE this process opens the
+    // store, so the self-probe guard cannot fire here, and if the lock really
+    // is held, `GraphStore::open_or_create` below fails on lbug's own lock a
+    // moment later. Failing closed here would instead refuse to boot whenever
+    // the database is merely unreadable-by-probe, which is a worse trade for
+    // the one caller whose next action already fails safely.
     let serves_snapshot = server_opts
         .as_ref()
         .and_then(|o| o.snapshot.as_ref())

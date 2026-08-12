@@ -653,9 +653,21 @@ pub fn local_store_write_lock_held() -> bool {
 /// equivalent, which would leave the hazard live on half the platforms. The
 /// runtime guard makes the question moot.)
 pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
+    db_write_lock_probe(local_store_write_lock_held(), db_path)
+}
+
+/// [`db_write_lock`] with the "do I hold the store open?" answer passed in.
+///
+/// Split out so the guard can be tested by VALUE rather than by mutating
+/// `LOCAL_STORE_WRITE_LOCK_HELD`. A test that flips a process-global flag
+/// races every sibling test that probes a lock — cargo runs them on parallel
+/// threads, and a mutex the siblings do not take guards nothing. That is not a
+/// hypothetical: the earlier version of this test failed 2 runs in 60 at
+/// `--test-threads=8`, in CI's main job.
+fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
     use std::os::unix::io::AsRawFd;
 
-    if local_store_write_lock_held() {
+    if local_store_held {
         // Probing from here would close a descriptor to this database and take
         // this process's own POSIX record locks down with it, silently
         // admitting a second writer. Refuse. `Unknown` is the fail-closed
@@ -2717,27 +2729,42 @@ mod tests {
     /// `[profile.release] debug-assertions` override, so an assertion would
     /// vanish from every shipped binary). Probing while holding the store open
     /// must fail closed, never report `Free`.
+    ///
+    /// Tested by VALUE through `db_write_lock_probe`. Setting the real
+    /// `LOCAL_STORE_WRITE_LOCK_HELD` flag here would make every sibling test
+    /// that probes a lock fail intermittently — they run on parallel threads
+    /// and take no shared lock — which is exactly what the first version of
+    /// this test did.
     #[test]
     fn write_lock_probe_refuses_to_run_against_its_own_store() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"not really a database").unwrap();
 
-        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+        assert_eq!(db_write_lock_probe(false, &db), DbWriteLock::Free);
 
-        note_local_store_write_lock(true);
-        let state = db_write_lock(&db);
-        note_local_store_write_lock(false);
-
+        let guarded = db_write_lock_probe(true, &db);
         assert_eq!(
-            state,
+            guarded,
             DbWriteLock::Unknown,
             "a probe from a store-holding process must fail closed, not report Free"
         );
-        assert!(!state.is_provably_free());
-        // And the guard must disarm cleanly.
-        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+        assert!(!guarded.is_provably_free());
+        assert!(!guarded.is_held());
+    }
+
+    /// The public entry point must read the process-global flag, so the guard
+    /// is actually wired up and not just present on the inner function.
+    #[test]
+    fn write_lock_probe_entry_point_consults_the_local_store_flag() {
+        assert!(
+            !local_store_write_lock_held(),
+            "no test may leave this process-global flag armed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        assert_eq!(db_write_lock(&db), db_write_lock_probe(false, &db));
     }
 
     /// Ownership survives an operator deleting the pidfile: the flock evidence
