@@ -346,7 +346,12 @@ message BrainStatusResponse {
   // lock, NOT counting the one holding it. Non-zero means status is asserting
   // "something is queued" instead of silently reporting 0 while a client waits.
   int32 write_queue_depth = 15;
-  // The RPC currently holding the daemon write lock; empty when it is free.
+  // What currently holds the daemon write lock — an RPC name for gRPC writers
+  // (`embed`, `index_repo`, ...), `worker_commit` for the server-side worker
+  // pool, `admin_remove_repo` for the web admin API. Empty when the lock is
+  // free. Every writer in the daemon process stamps this, so an empty value
+  // while `write_queue_depth` is non-zero indicates a daemon older than 4.2
+  // rather than an unidentifiable writer.
   string write_holder = 16;
   // How long the current holder has held the write lock, in seconds; 0 when
   // the lock is free.

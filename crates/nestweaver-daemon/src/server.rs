@@ -238,198 +238,11 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// The daemon write lock plus the metadata that makes waiting on it visible.
-///
-/// KùzuDB allows one write transaction, so every write RPC serialises on one
-/// mutex. Before A3 that mutex was anonymous: a client blocked on it could not
-/// be counted (`queue_depth` reports index JOBS, not RPCs) and could not be
-/// told what was in front of it. The gate wraps the same `Arc<Mutex<()>>` —
-/// handed unchanged to the worker pool and the web admin API — and adds a
-/// waiting counter and a holder stamp.
-///
-/// Scope, deliberately: only gRPC write RPCs that go through [`WriteGate::lock`]
-/// are counted. The worker pool takes the raw mutex for index jobs, and those
-/// are already visible through `indexing_active` / `queue_depth`.
-#[derive(Clone)]
-pub struct WriteGate {
-    mutex: Arc<tokio::sync::Mutex<()>>,
-    /// Write RPCs blocked in `lock`, excluding the one holding the mutex.
-    waiting: Arc<AtomicU32>,
-    holder: Arc<std::sync::Mutex<Option<WriteHolder>>>,
-}
-
-#[derive(Clone, Copy)]
-struct WriteHolder {
-    rpc: &'static str,
-    since: Instant,
-}
-
-impl std::fmt::Debug for WriteGate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteGate")
-            .field("waiting", &self.waiting.load(Ordering::Relaxed))
-            .field("holder", &self.holder_snapshot().map(|(rpc, _)| rpc))
-            .finish()
-    }
-}
-
-impl Default for WriteGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// RAII counter for a write RPC that is blocked on the gate. A guard rather
-/// than a bare increment so a client that disconnects mid-wait (dropping the
-/// handler future) still decrements — the same cancellation hazard
-/// [`ConnectionGuard`] exists for.
-struct WaitTicket(Arc<AtomicU32>);
-
-impl WaitTicket {
-    fn new(counter: &Arc<AtomicU32>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(Arc::clone(counter))
-    }
-}
-
-impl Drop for WaitTicket {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// Held write lock. Clears the holder stamp on drop, including on cancellation.
-pub struct WriteLease {
-    holder: Arc<std::sync::Mutex<Option<WriteHolder>>>,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-impl Drop for WriteLease {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = self.holder.lock() {
-            *slot = None;
-        }
-    }
-}
-
-/// Log a waiting write RPC once it has been blocked this long. Nothing was
-/// emitted for the 13 hours of the production incident; a single line per
-/// blocked RPC is proportionate.
-const WRITE_WAIT_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
-
-impl WriteGate {
-    pub fn new() -> Self {
-        Self::from_mutex(Arc::new(tokio::sync::Mutex::new(())))
-    }
-
-    /// Wrap an existing write mutex. Used by tests that want to hold the raw
-    /// mutex and observe the gate, and by construction sites that must hand
-    /// the same `Arc` to the worker pool.
-    pub fn from_mutex(mutex: Arc<tokio::sync::Mutex<()>>) -> Self {
-        Self {
-            mutex,
-            waiting: Arc::new(AtomicU32::new(0)),
-            holder: Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    /// The underlying mutex, for the worker pool and web admin API, which gate
-    /// their own writes on it without going through the RPC accounting.
-    pub fn mutex(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.mutex)
-    }
-
-    /// Acquire the write lock for `rpc`, counting the wait and stamping the
-    /// holder. This adds accounting, never a timeout: it waits as long as the
-    /// previous holder takes.
-    pub async fn lock(&self, rpc: &'static str) -> WriteLease {
-        let guard = match Arc::clone(&self.mutex).try_lock_owned() {
-            Ok(guard) => guard,
-            Err(_) => {
-                let ticket = WaitTicket::new(&self.waiting);
-                let blocked_on = self.holder_snapshot();
-                let waited_since = Instant::now();
-                tracing::debug!(
-                    rpc,
-                    blocked_on = blocked_on.as_ref().map(|(name, _)| name.as_str()),
-                    "write RPC is waiting for the daemon write lock"
-                );
-                let guard = Arc::clone(&self.mutex).lock_owned().await;
-                let waited = waited_since.elapsed();
-                if waited >= WRITE_WAIT_LOG_AFTER {
-                    tracing::info!(
-                        rpc,
-                        waited_seconds = waited.as_secs(),
-                        blocked_on = blocked_on.as_ref().map(|(name, _)| name.as_str()),
-                        "write RPC acquired the daemon write lock after waiting"
-                    );
-                }
-                drop(ticket);
-                guard
-            }
-        };
-        if let Ok(mut slot) = self.holder.lock() {
-            *slot = Some(WriteHolder {
-                rpc,
-                since: Instant::now(),
-            });
-        }
-        WriteLease {
-            holder: Arc::clone(&self.holder),
-            _guard: guard,
-        }
-    }
-
-    /// [`WriteGate::lock`] for handlers that acquire the lock from inside
-    /// `spawn_blocking` (the index/watch/purge routes). Same accounting; the
-    /// caller must not be on a runtime worker thread.
-    pub fn blocking_lock(&self, rpc: &'static str) -> WriteLease {
-        let guard = match Arc::clone(&self.mutex).try_lock_owned() {
-            Ok(guard) => guard,
-            Err(_) => {
-                let ticket = WaitTicket::new(&self.waiting);
-                let blocked_on = self.holder_snapshot();
-                let waited_since = Instant::now();
-                let guard = Arc::clone(&self.mutex).blocking_lock_owned();
-                let waited = waited_since.elapsed();
-                if waited >= WRITE_WAIT_LOG_AFTER {
-                    tracing::info!(
-                        rpc,
-                        waited_seconds = waited.as_secs(),
-                        blocked_on = blocked_on.as_ref().map(|(name, _)| name.as_str()),
-                        "write RPC acquired the daemon write lock after waiting"
-                    );
-                }
-                drop(ticket);
-                guard
-            }
-        };
-        if let Ok(mut slot) = self.holder.lock() {
-            *slot = Some(WriteHolder {
-                rpc,
-                since: Instant::now(),
-            });
-        }
-        WriteLease {
-            holder: Arc::clone(&self.holder),
-            _guard: guard,
-        }
-    }
-
-    /// Write RPCs blocked on the gate right now, excluding the holder.
-    pub fn waiting(&self) -> u32 {
-        self.waiting.load(Ordering::Relaxed)
-    }
-
-    /// `(rpc name, how long it has held the lock)`, or `None` when free.
-    pub fn holder_snapshot(&self) -> Option<(String, std::time::Duration)> {
-        self.holder
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .map(|held| (held.rpc.to_string(), held.since.elapsed()))
-    }
-}
+/// The process-wide write gate. Homed in `nestweaver-engine` because the
+/// daemon is not the only writer: the worker pool and the web admin API take
+/// the same lock, and every one of them must stamp the holder so
+/// `write_holder` is never empty while the lock is genuinely held.
+pub use nestweaver_engine::write_gate::{WriteGate, WriteLease};
 
 /// Live progress of the daemon-route embedding pass.
 ///
@@ -952,11 +765,12 @@ pub struct DaemonState {
     /// Embedding readiness and the exact usable model as one immutable
     /// snapshot. A handler can never observe `ready` without that model.
     embedding_runtime: Arc<EmbeddingRuntime>,
-    /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
-    /// single write transaction), and accounts for who holds it and who is
-    /// waiting. Use `write_gate.lock(rpc)` from RPC handlers; use
-    /// `write_gate.mutex()` when handing the raw mutex to the worker pool or
-    /// the web admin API.
+    /// Serializes writes so only one runs at a time (KùzuDB allows a single
+    /// write transaction), and accounts for who holds it and who is waiting.
+    /// Every writer in the process acquires through it — RPC handlers via
+    /// `lock(..)`, the worker pool and the web admin API via `blocking_lock(..)`
+    /// on their own clone — so `write_holder` is never empty while the lock is
+    /// held. `mutex()` exists only for tests that hold the raw lock.
     pub write_gate: WriteGate,
     /// Progress of the in-flight daemon-route embedding pass, surfaced through
     /// `brain_status` so a long embed is distinguishable from a wedged daemon.
@@ -9036,7 +8850,7 @@ pub async fn run_server(
                 scheduler_tx: Some(scheduler_tx.clone()),
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
-                write_mutex: Some(state.write_gate.mutex()),
+                write_gate: Some(state.write_gate.clone()),
                 // Share the daemon's single job-queue connection. Opening a
                 // second connection from admin routes races the worker's WAL
                 // checkpoint and crashes with SIGBUS on macOS.
@@ -9502,7 +9316,7 @@ pub async fn run_server(
             let worker_instance = data_instance_id.clone();
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
-            let worker_write_mutex = state.write_gate.mutex();
+            let worker_write_gate = state.write_gate.clone();
             let worker_count = state
                 .instance_cfg
                 .as_ref()
@@ -9554,7 +9368,7 @@ pub async fn run_server(
                     &mut worker_shutdown,
                     Some(indexing_status),
                     Some(worker_drained),
-                    Some(worker_write_mutex),
+                    Some(worker_write_gate),
                 )
                 .await;
             });
