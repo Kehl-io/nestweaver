@@ -97,6 +97,51 @@ For a ready local backend, `selected_device` is `metal` or `cpu` and
 `fallback_used` remains `false`. A ready external backend has an empty
 `selected_device` because it has no local device.
 
+### Embedding pass progress
+
+`state` reports `embedding` — not `ready` — while a daemon-route embedding
+pass is in flight. It is a strictly narrower `ready`: the model is loaded and
+usable. Treat `embedding` as ready for "can this daemon answer semantic
+queries"; read the boolean `pass_active` when you want an unambiguous machine
+signal rather than a string match.
+
+While a pass runs, `embedding_status` also carries `pass_active`,
+`pass_processed`, `pass_total`, `pass_started_at` (unix seconds), and
+`pass_scope`. `pass_total` is the eligible-node count from the same preflight
+`PlanEmbed` reports; it is `0` until that preflight finishes, which is
+reported as "total not yet counted" rather than as a fabricated percentage.
+Throughput and ETA are derived client-side from `pass_started_at`. All of
+these are proto3 scalars, so a daemon older than 4.2 decodes as "no pass
+running" instead of failing.
+
+`nestweaver brain status` renders the same numbers as a `Progress:` line, and
+`nestweaver embed` polls this status to print a live counter on the daemon
+route.
+
+### Write-path visibility
+
+`brain status` reports two different queues, and they are not
+interchangeable:
+
+- `queue_depth` — pending + running entries in the server-side **index job
+  queue**. This is what the admin API and the `nestweaver_index_queue_depth`
+  Prometheus gauge have always meant.
+- `write_queue_depth` — **write RPCs blocked on the daemon write lock**, not
+  counting the one holding it. A long `embed` holds that lock, so a queued
+  `index` shows up here and never in `queue_depth`.
+
+`write_holder` names what currently holds the write lock and
+`write_holder_seconds` how long it has held it. Every writer in the daemon
+process stamps it: RPC names for gRPC writers (`embed`, `index_repo`, ...),
+`worker_commit` for the worker pool, `admin_remove_repo` for the web admin
+API. An empty `write_holder` while `write_queue_depth` is non-zero means a
+daemon older than 4.2, not an unidentifiable writer.
+
+A CLI command blocked on the write lock prints a periodic stderr line naming
+the holder and how long it has held it. That line is a **message, not a
+timeout**: long-running write RPCs remain uncapped, and nothing in this path
+cancels or shortens them.
+
 ---
 
 ## Network Architecture
