@@ -3,6 +3,7 @@
 pub mod autostart;
 pub mod connect;
 pub mod hybrid;
+pub mod progress;
 pub mod repo_identity;
 
 // These modules moved to the `nestweaver-federation` crate (nw-017 Phase B,

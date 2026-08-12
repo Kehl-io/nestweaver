@@ -1409,6 +1409,17 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
     let mut lines = vec![
         format!("  State:            {}", status.state),
         format!("  Backend:          {}", status.backend),
+    ];
+    // A3: a pass in flight gets its own line. Without it `State: ready` was
+    // the only thing status said during a 12h32m embed, so a healthy long run
+    // and a wedged daemon looked identical.
+    if let Some(progress) = nestweaver_client::progress::format_embed_progress(status) {
+        lines.push(format!("  Progress:         {progress}"));
+        if !status.pass_scope.is_empty() {
+            lines.push(format!("  Pass scope:       {}", status.pass_scope));
+        }
+    }
+    lines.extend([
         format!(
             "  Device:           {} -> {selected}",
             status.requested_device
@@ -1416,7 +1427,7 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
         format!("  Model:            {}", status.model_id),
         format!("  Metal compiled:   {}", status.metal_compiled),
         format!("  Fallback used:    {}", status.fallback_used),
-    ];
+    ]);
     if !status.error.is_empty() {
         lines.push(format!("  Error:            {}", status.error));
     }
@@ -1433,6 +1444,13 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
         error: value["error"].as_str().unwrap_or("").to_string(),
         metal_compiled: value["metal_compiled"].as_bool().unwrap_or(false),
         fallback_used: value["fallback_used"].as_bool().unwrap_or(false),
+        // Absent on an older daemon; proto3 defaults read as "no pass running",
+        // which is the honest answer when the daemon cannot tell us.
+        pass_active: value["pass_active"].as_bool().unwrap_or(false),
+        pass_processed: value["pass_processed"].as_u64().unwrap_or(0),
+        pass_total: value["pass_total"].as_u64().unwrap_or(0),
+        pass_started_at: value["pass_started_at"].as_i64().unwrap_or(0),
+        pass_scope: value["pass_scope"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -1513,6 +1531,7 @@ mod daemon_status_renderer_tests {
             error: String::new(),
             metal_compiled: false,
             fallback_used: false,
+            ..Default::default()
         }
     }
 
@@ -1532,6 +1551,38 @@ mod daemon_status_renderer_tests {
         assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
         assert!(output.contains("  State:            ready"));
         assert!(output.contains("  Model:            test-model"));
+    }
+
+    /// A3 acceptance: an operator looking at `brain status` during a long
+    /// embed must see that a pass is running and how far along it is. Before
+    /// this, the whole render was `State: ready` — identical to an idle daemon.
+    #[test]
+    fn a_running_pass_shows_a_progress_line_an_idle_daemon_does_not() {
+        let idle = format_embedding_status(&embedding());
+        assert!(!idle.contains("Progress:"), "{idle}");
+
+        let mut running = embedding();
+        running.state = "embedding".to_string();
+        running.pass_active = true;
+        running.pass_processed = 41_230;
+        running.pass_total = 88_131;
+        running.pass_scope = "all".to_string();
+        running.pass_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3600;
+
+        let text = format_embedding_status(&running);
+        assert!(text.contains("State:            embedding"), "{text}");
+        assert!(
+            text.contains("Progress:         41,230 / 88,131 (47%)"),
+            "{text}"
+        );
+        assert!(text.contains("ETA "), "{text}");
+        assert!(text.contains("Pass scope:       all"), "{text}");
+        // The pre-existing fields must survive the insertion.
+        assert!(text.contains("Model:            test-model"), "{text}");
     }
 
     #[test]
@@ -11255,6 +11306,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 };
 
                 let index_result = rt.block_on(async {
+                    // A3: `index_repo` serialises behind the daemon write lock.
+                    // Blocked behind a long embed it used to print nothing at
+                    // all, which read as a hang. This adds a periodic notice
+                    // naming the holder — it adds no timeout and does not
+                    // interrupt the RPC.
+                    let _waiting = nestweaver_client::progress::StatusNotifier::spawn(
+                        &db_path,
+                        "nestweaver index",
+                        nestweaver_client::progress::NoticeKind::Waiting {
+                            own_rpc: "index_repo",
+                        },
+                    );
                     let stream = client.inner_mut().index_repo(req).await?.into_inner();
                     consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
@@ -17527,7 +17590,20 @@ where
                 }
 
                 eprintln!("Embedding via daemon (configured backend)…");
-                match rt.block_on(client.embed(scope, force, batch_size as u32)) {
+                // A3: the daemon route is a single unary RPC, so unlike the
+                // direct routes it printed nothing between "Embedding via
+                // daemon…" and "Done" — 12h32m of silence in the incident.
+                // Poll `brain status` (a read; it does not contend for the
+                // write lock) and echo the counters the daemon now publishes.
+                // Deliberately polling rather than adding a streaming RPC.
+                match rt.block_on(async {
+                    let _progress = nestweaver_client::progress::StatusNotifier::spawn(
+                        path,
+                        "nestweaver embed",
+                        nestweaver_client::progress::NoticeKind::EmbedProgress,
+                    );
+                    client.embed(scope, force, batch_size as u32).await
+                }) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
                         if resp.rejected > 0 {
@@ -22064,6 +22140,7 @@ mod diagnostics_cli_tests {
             error: "Metal probe failed".to_string(),
             metal_compiled: true,
             fallback_used: false,
+            ..Default::default()
         };
         let text = format_embedding_status(&status);
         assert!(text.contains("State:            failed"));
