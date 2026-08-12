@@ -4046,11 +4046,24 @@ fn tool_brain_search(
         //   - `daemon_brain_search_response_to_json` below, which forwards
         //     the proto fields verbatim (honest today)
         //   - `nestweaver-federation/src/results.rs::merge_json_results`,
-        //     the hybrid/federated merge, which currently DROPS both
-        //     fields: it rebuilds the response and re-adds `query`,
-        //     `engine`, the count keys and `expansion_terms` but not
-        //     these, so a merged hybrid response still exhibits the
-        //     ambiguity this site fixes. Pre-existing and untouched here.
+        //     the hybrid/federated merge. It rebuilds the response from
+        //     `wrap_merged_response`, so every field has to be re-added
+        //     deliberately; it now merges these two via
+        //     `merge_honesty_fields` (AND for `semantic_applied`, dedup
+        //     union for `degraded_components`, and an explicit
+        //     `honesty_fields_missing:<tier>` marker when a tier — e.g. an
+        //     older server — reported neither). Honest today.
+        //
+        // Still outstanding, deliberately not changed with this one:
+        //   - the STRUCTURED branch of `merge_structured_results` (the
+        //     `connected`-schema path used by brain_context /
+        //     project_context) rebuilds its response the same way and still
+        //     drops both fields. Unlike brain_search those tools have a real
+        //     semantic leg, so that gap is the more consequential one — but
+        //     `degraded_components` there also feeds
+        //     `semantic_response_is_degraded`, i.e. caching behaviour, so
+        //     closing it is more than a reporting change and belongs in its
+        //     own fix.
         "semantic_applied": false,
         "degraded_components": [],
     });
