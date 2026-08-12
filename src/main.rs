@@ -5861,7 +5861,28 @@ fn main() {
             ..
         }
     );
-    if !is_daemon_run {
+    // A3. `daemon start` needs the same exemption on Linux, where it does NOT
+    // re-exec `daemon run`: it forks in-process with daemonize2 and calls
+    // `run_server` in the child (see the `cfg(not(target_os = "macos"))` start
+    // branch). The child therefore inherits whatever subscriber `main` already
+    // installed, so `run_server`'s file subscriber loses the same silent race
+    // — and every daemon log lands on the WARN-filtered stderr instead of
+    // `daemon.log.<date>`, which stays empty forever. That is the mechanism
+    // behind the incident's "daemon emitted nothing for ~13 hours": it was not
+    // that the daemon had nothing to say, it was that nothing it said was
+    // recorded. macOS spawns a fresh `daemon run` executable, so it is already
+    // covered by `is_daemon_run` and is deliberately left alone here.
+    #[cfg(not(target_os = "macos"))]
+    let forks_into_daemon = matches!(
+        &cli.command,
+        Commands::Daemon {
+            action: DaemonAction::Start { .. },
+            ..
+        }
+    );
+    #[cfg(target_os = "macos")]
+    let forks_into_daemon = false;
+    if !is_daemon_run && !forks_into_daemon {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -12114,6 +12135,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 });
                             }
                             daemonize2::Outcome::Parent(Ok(parent)) => {
+                                // A3: `main` deliberately skipped installing a
+                                // global subscriber for this command so the
+                                // forked child could install run_server's
+                                // file-based one. The fork is done, so the
+                                // parent may now have its stderr subscriber
+                                // back for the readiness/attestation work
+                                // below. (Tracing emitted by the parent BEFORE
+                                // the fork — practically just the sun_path
+                                // fallback warning — is not captured; the
+                                // child records it in the daemon log.)
+                                let _ = tracing_subscriber::fmt()
+                                    .with_env_filter(
+                                        tracing_subscriber::EnvFilter::from_default_env()
+                                            .add_directive(tracing::Level::WARN.into()),
+                                    )
+                                    .with_writer(std::io::stderr)
+                                    .try_init();
                                 // The double-fork only proves fork()
                                 // worked — run_server may still die during boot
                                 // (corrupt migration journal, DB lock, ...).
