@@ -278,33 +278,56 @@ fn unix_now_seconds() -> i64 {
 }
 
 impl EmbedProgress {
-    /// Mark a pass started. `total` is 0 until preflight finishes, which is
-    /// reported honestly rather than guessed at.
-    pub fn begin(&self, scope: &str) {
+    /// Claim the reporting slot for a starting pass. `total` is 0 until
+    /// preflight finishes, which is reported honestly rather than guessed at.
+    ///
+    /// Returns a guard that is INERT when a pass is already active. The write
+    /// lease is owned by the RPC future while the pass itself runs on a
+    /// blocking task, so a client that disconnects releases the lock while its
+    /// pass keeps embedding; a re-issued `embed` then acquires the gate with
+    /// the first pass still in flight. Without this claim its `begin` would
+    /// zero the shared counters and whichever guard dropped first would report
+    /// `pass_active: false` during a live embed — precisely the class of
+    /// status lie this work exists to remove. The second pass therefore
+    /// reports nothing rather than corrupting the first pass's numbers.
+    #[must_use]
+    pub fn begin(self: &Arc<Self>, scope: &str) -> EmbedProgressGuard {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::warn!(
+                scope,
+                "an embed pass is already in flight; this pass will run but its \
+                 progress is not reported (status keeps showing the first pass)"
+            );
+            return EmbedProgressGuard(None);
+        }
         self.processed.store(0, Ordering::Relaxed);
         self.total.store(0, Ordering::Relaxed);
         self.started_at.store(unix_now_seconds(), Ordering::Relaxed);
         if let Ok(mut slot) = self.scope.lock() {
             scope.clone_into(&mut slot);
         }
-        self.active.store(true, Ordering::Release);
+        EmbedProgressGuard(Some(Arc::clone(self)))
     }
 
-    pub fn set_total(&self, total: u64) {
+    fn set_total(&self, total: u64) {
         self.total.store(total, Ordering::Relaxed);
     }
 
-    pub fn advance(&self, by: u64) {
+    fn advance(&self, by: u64) {
         self.processed.fetch_add(by, Ordering::Relaxed);
     }
 
-    pub fn processed(&self) -> u64 {
+    fn processed(&self) -> u64 {
         self.processed.load(Ordering::Relaxed)
     }
 
-    pub fn finish(&self) {
-        self.active.store(false, Ordering::Release);
+    fn finish(&self) {
         self.started_at.store(0, Ordering::Relaxed);
+        self.active.store(false, Ordering::Release);
     }
 
     pub fn snapshot(&self) -> EmbedProgressSnapshot {
@@ -331,15 +354,43 @@ impl EmbedProgress {
 #[cfg(feature = "embed")]
 const EMBED_PASS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// RAII marker so an embed pass that panics or is cancelled cannot leave
-/// `brain status` claiming a pass is still running forever.
-#[cfg(any(feature = "embed", test))]
-struct EmbedProgressGuard(Arc<EmbedProgress>);
+/// The reporting slot for one embed pass.
+///
+/// `Some` when this pass owns the slot, `None` when another pass already did.
+/// Every mutation goes through the guard so a pass that did not claim the slot
+/// physically cannot touch the counters. Dropping releases the slot, so a pass
+/// that panics, unwinds, or is abandoned cannot leave `brain status` claiming
+/// an embed is running forever.
+pub struct EmbedProgressGuard(Option<Arc<EmbedProgress>>);
 
-#[cfg(any(feature = "embed", test))]
+impl EmbedProgressGuard {
+    fn set_total(&self, total: u64) {
+        if let Some(progress) = &self.0 {
+            progress.set_total(total);
+        }
+    }
+
+    fn advance(&self, by: u64) {
+        if let Some(progress) = &self.0 {
+            progress.advance(by);
+        }
+    }
+
+    fn processed(&self) -> u64 {
+        self.0.as_ref().map(|p| p.processed()).unwrap_or(0)
+    }
+
+    /// Whether this pass owns the reporting slot.
+    fn reports(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 impl Drop for EmbedProgressGuard {
     fn drop(&mut self) {
-        self.0.finish();
+        if let Some(progress) = &self.0 {
+            progress.finish();
+        }
     }
 }
 
@@ -6128,9 +6179,11 @@ impl NestWeaverDaemon for DaemonService {
             let result = tokio::task::spawn_blocking(move || {
                 // Owned by the blocking task, not by the RPC future: a client
                 // that disconnects does not stop the pass, so progress must
-                // keep reporting `active` until the work actually ends.
-                progress.begin(&progress_scope);
-                let _progress_guard = EmbedProgressGuard(Arc::clone(&progress));
+                // keep reporting `active` until the work actually ends. The
+                // guard is inert if another pass already owns the slot, so a
+                // second pass cannot zero the first one's counters or clear
+                // `pass_active` out from under it.
+                let progress = progress.begin(&progress_scope);
                 let pass_started = Instant::now();
 
                 let mut succeeded = 0u32;
@@ -6158,6 +6211,12 @@ impl NestWeaverDaemon for DaemonService {
                 // computes eligible/embedded/scoped — the CLI prints it once
                 // and throws it away — so keeping it costs one preflight scan
                 // and turns the pass from opaque into "N of M".
+                // Cost note: on the daemon route the CLI has already called
+                // `PlanEmbed`, so this is a second full eligibility scan per
+                // pass. Kept deliberately — the daemon must not depend on a
+                // client having asked first (MCP and the web admin call
+                // `Embed` directly), and a second scan is immaterial against a
+                // pass measured in hours.
                 let plan = plan_embeddings(&store, &progress_scope, force)?;
                 progress.set_total(plan.eligible);
                 tracing::info!(
@@ -6171,6 +6230,11 @@ impl NestWeaverDaemon for DaemonService {
                 );
                 let mut last_pass_log = Instant::now();
                 let mut log_pass_progress = |final_line: bool| {
+                    // A pass that does not own the reporting slot has no
+                    // meaningful counter to log; the owning pass is logging.
+                    if !progress.reports() {
+                        return;
+                    }
                     if !final_line && last_pass_log.elapsed() < EMBED_PASS_LOG_INTERVAL {
                         return;
                     }
@@ -14825,9 +14889,9 @@ credential_method = "gh"
     #[tokio::test]
     async fn status_reports_a_running_embed_pass_and_a_queued_write() {
         let state = test_state_with_writer();
-        state.embed_progress.begin("all");
-        state.embed_progress.set_total(88_131);
-        state.embed_progress.advance(41_230);
+        let pass = state.embed_progress.begin("all");
+        pass.set_total(88_131);
+        pass.advance(41_230);
 
         // A write RPC holding the lock, and a second one blocked behind it —
         // the exact shape that reported `queue_depth: 0` in production.
@@ -14921,13 +14985,49 @@ credential_method = "gh"
     #[test]
     fn a_dropped_pass_guard_clears_the_running_state() {
         let progress = Arc::new(EmbedProgress::default());
-        progress.begin("notes");
-        progress.set_total(10);
-        progress.advance(3);
-        assert!(progress.snapshot().active);
         {
-            let _guard = EmbedProgressGuard(Arc::clone(&progress));
+            let pass = progress.begin("notes");
+            pass.set_total(10);
+            pass.advance(3);
+            assert!(progress.snapshot().active);
         }
+        assert_eq!(progress.snapshot(), EmbedProgressSnapshot::default());
+    }
+
+    /// A disconnecting client releases the write lease while its pass keeps
+    /// embedding on the blocking pool, so a re-issued `embed` can start with
+    /// one already in flight. The second pass must not zero the first's
+    /// counters, and — the part that would turn an honest counter back into a
+    /// lie — must not clear `pass_active` when it finishes first.
+    #[test]
+    fn a_second_overlapping_pass_cannot_clobber_or_prematurely_clear_the_first() {
+        let progress = Arc::new(EmbedProgress::default());
+        let first = progress.begin("all");
+        first.set_total(88_131);
+        first.advance(41_230);
+
+        {
+            let second = progress.begin("notes");
+            assert!(!second.reports(), "the slot is already claimed");
+            second.set_total(7);
+            second.advance(7);
+
+            let live = progress.snapshot();
+            assert_eq!(live.processed, 41_230, "the first pass's count must stand");
+            assert_eq!(live.total, 88_131);
+            assert_eq!(live.scope, "all");
+        }
+
+        // The second guard has now dropped while the first pass is still
+        // running. Status must still report the first pass.
+        let after = progress.snapshot();
+        assert!(
+            after.active,
+            "an overlapping pass ending must not report the live embed as finished"
+        );
+        assert_eq!(after.processed, 41_230);
+
+        drop(first);
         assert_eq!(progress.snapshot(), EmbedProgressSnapshot::default());
     }
 
