@@ -15054,12 +15054,25 @@ credential_method = "gh"
     /// counters with another's — the shape this item started from (a
     /// just-started pass rendering as `100%`), and a second variant this test
     /// caught in the first attempted fix
-    /// (`active: true, processed: 41230, total: 0, started_at: 0`). No
-    /// ordering discipline over independent atomics closes a four-field read;
-    /// only making the group indivisible does.
+    /// (`active: true, processed: 41230, total: 0, started_at: 0`).
     ///
-    /// Hammering a reader against a writer, this fails within a few thousand
-    /// iterations on any version that reads the fields independently.
+    /// No ordering discipline over *independently read* atomics closes a
+    /// four-field read. The one construction that would — a seqlock — is not
+    /// cheaper here (two atomic RMWs plus two fences against the two atomics
+    /// of an uncontended mutex) and, decisively, is unsound for the `scope:
+    /// String` field: a seqlock reader can observe a torn heap pointer and
+    /// dereference freed memory. Making the group indivisible is the right
+    /// answer, not merely the easy one.
+    ///
+    /// Two things keep this test from silently protecting nothing. The
+    /// `yield_now` gives the reader a scheduling point inside every pass —
+    /// without it the writer can finish its whole run inside one quantum and
+    /// the reader observes zero ACTIVE passes, skipping every assertion below
+    /// (measured at ~22% of runs, and it would then have missed the two broken
+    /// designs 39% and 58% of the time). And the completeness assertion counts
+    /// ACTIVE observations specifically, not total reads, so a vacuous run
+    /// fails instead of passing. With both, 2,000 iterations detect either
+    /// broken design in 100% of runs, faster than 20,000 did without them.
     #[test]
     fn a_reader_never_sees_two_passes_mixed_together() {
         let progress = Arc::new(EmbedProgress::default());
@@ -15068,20 +15081,23 @@ credential_method = "gh"
         let writer_progress = Arc::clone(&progress);
         let writer_stop = Arc::clone(&stop);
         let writer = std::thread::spawn(move || {
-            for _ in 0..20_000 {
+            for _ in 0..2_000 {
                 let pass = writer_progress.begin("all");
                 pass.set_total(88_131);
                 pass.advance(41_230);
+                // Hold the pass open across a scheduling point so the reader
+                // actually gets to observe passes in flight.
+                std::thread::yield_now();
                 drop(pass);
             }
             writer_stop.store(true, Ordering::Relaxed);
         });
 
-        let mut observations = 0u64;
+        let mut active_observations = 0u64;
         while !stop.load(Ordering::Relaxed) {
             let snapshot = progress.snapshot();
-            observations += 1;
             if snapshot.active {
+                active_observations += 1;
                 assert!(
                     snapshot.started_at > 0,
                     "a live pass always carries its start stamp: {snapshot:?}"
@@ -15094,7 +15110,11 @@ credential_method = "gh"
             }
         }
         writer.join().expect("writer thread");
-        assert!(observations > 0, "the reader must actually have sampled");
+        assert!(
+            active_observations > 0,
+            "the reader never caught a pass in flight, so every invariant above \
+             was skipped — this run proved nothing"
+        );
     }
 
     /// A disconnecting client releases the write lease while its pass keeps
