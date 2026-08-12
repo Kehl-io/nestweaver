@@ -594,19 +594,62 @@ impl DbWriteLock {
     }
 }
 
-/// Probe the database write lock WITHOUT taking it.
+/// Records that THIS process holds a read-write store open on some database.
+/// Set by the daemon after `GraphStore::open_or_create`; read by
+/// [`db_write_lock`] to refuse a probe that would destroy that lock.
+static LOCAL_STORE_WRITE_LOCK_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare whether this process now holds a read-write store open.
+///
+/// This exists solely to arm the guard in [`db_write_lock`]. Call it with
+/// `true` immediately after a read-write `GraphStore` open and `false` when
+/// that store is dropped.
+pub fn note_local_store_write_lock(held: bool) {
+    LOCAL_STORE_WRITE_LOCK_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Does this process hold a read-write store open, as far as
+/// [`note_local_store_write_lock`] has been told?
+pub fn local_store_write_lock_held() -> bool {
+    LOCAL_STORE_WRITE_LOCK_HELD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Probe the database write lock without acquiring it.
 ///
 /// lbug locks the whole database file with a POSIX record lock
 /// (`fcntl(F_SETLK, F_WRLCK)`; see `local_file_system.cpp`), so `F_GETLK` asks
-/// the kernel who owns it and reports the holder's PID. This is a pure query —
-/// it never creates the database, never takes a lock, and cannot disturb a
-/// running daemon.
+/// the kernel who owns it and reports the holder's PID.
 ///
-/// Caveat worth knowing: POSIX record locks never conflict with the *calling*
-/// process, so a process that already holds the lock sees `Free`. Every caller
-/// here probes before opening the store, so that is not a live concern.
+/// # This probe is NOT free of side effects for the calling process
+///
+/// POSIX record locks are per *process*, and the kernel drops **all** of a
+/// process's record locks on a file the moment that process closes **any**
+/// descriptor to it. This function opens the database and closes it again, so:
+///
+/// * if the caller already holds the lbug write lock on this database, this
+///   call **silently releases it**, admitting a second writer;
+/// * and it sees `Free` regardless, because a process's own locks never
+///   conflict with its own `F_GETLK`.
+///
+/// So this is only safe from a process that does NOT have the store open — the
+/// CLI before it starts anything, or the daemon before its own store open. The
+/// `debug_assert` below turns a future in-daemon call into a loud failure
+/// instead of a silently unlocked database; arm it with
+/// [`note_local_store_write_lock`].
+///
+/// (A `/proc/locks` reader would avoid the descriptor entirely on Linux, but it
+/// cannot distinguish "no lock" from "inode/device match failed" — a false
+/// `Free` here re-enables every bug this probe exists to prevent — and it has no
+/// macOS equivalent. Not worth the trade today.)
 pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
     use std::os::unix::io::AsRawFd;
+
+    debug_assert!(
+        !local_store_write_lock_held(),
+        "db_write_lock() must not be called while this process holds the store open: closing \
+         the probe descriptor drops this process's own POSIX record locks on the database"
+    );
 
     let path = canonical_db_path(db_path);
     if !path.exists() {

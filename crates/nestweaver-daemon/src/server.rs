@@ -7934,8 +7934,14 @@ pub async fn run_server(
     // reach. Corroborate with the database write lock, which lives on the
     // database file itself and no recovery step removes.
     //
-    // Read-only snapshot replicas are exempt: they never take the write lock,
-    // so a held lock says nothing about them.
+    // Read-only snapshot replicas are exempt: they never take the write lock
+    // (lbug sets it only when `!readOnly`; see storage_manager.cpp), so a held
+    // lock says nothing about them.
+    //
+    // State only what the kernel actually told us. The lock proves a process
+    // holds THIS DATABASE — not that it is a daemon, and not that anyone
+    // deleted a pidfile: `embed --local`, an index run, and every `--no-daemon`
+    // command hold the same lock for their duration.
     let serves_snapshot = server_opts
         .as_ref()
         .and_then(|o| o.snapshot.as_ref())
@@ -7947,10 +7953,9 @@ pub async fn run_server(
             .map(|pid| format!("PID {pid}"))
             .unwrap_or_else(|| "another process".to_string());
         anyhow::bail!(
-            "refusing to start: {owner} already holds the write lock on {} for instance \
-             {instance_label}. The pidfile lock was free, which means {} was removed while that \
-             daemon was running — an unlinked pidfile cannot prove ownership. Stop the running \
-             daemon instead of starting a second one.",
+            "refusing to start instance {instance_label}: {owner} holds the write lock on {}. \
+             This daemon claimed the instance pidfile lock ({}) anyway, so that lock is not \
+             evidence of ownership here — check what {owner} is before doing anything to it.",
             db_path.display(),
             lifecycle::pidfile_path(&instance_id).display()
         );
@@ -8031,6 +8036,12 @@ pub async fn run_server(
             }
         }
     };
+    // Arm the guard in `lifecycle::db_write_lock`. From here on this process
+    // holds lbug's POSIX record lock on the database, and that probe would
+    // silently drop it when its own descriptor closes.
+    if !read_only {
+        lifecycle::note_local_store_write_lock(true);
+    }
     let store_open_ms = boot_started.elapsed().as_millis() as u64;
 
     // Load sidecars (PageRank, interaction scores).
