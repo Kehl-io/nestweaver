@@ -5890,6 +5890,23 @@ mod broken_pipe_policy_tests {
     }
 }
 
+/// Give the `daemon start` parent its stderr subscriber back after the fork.
+///
+/// `main` skips early tracing init for this command so the forked child can
+/// install `run_server`'s file-based subscriber (see the comment there). Once
+/// the fork outcome is known the parent is free to install its own; `try_init`
+/// because on the child's path a subscriber is already global.
+#[cfg(not(target_os = "macos"))]
+fn restore_parent_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::WARN.into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
@@ -5923,6 +5940,16 @@ fn main() {
     // that the daemon had nothing to say, it was that nothing it said was
     // recorded. macOS spawns a fresh `daemon run` executable, so it is already
     // covered by `is_daemon_run` and is deliberately left alone here.
+    //
+    // The cost, stated plainly: on this ONE command the parent runs its
+    // pre-fork phase with no subscriber at all, so tracing emitted before the
+    // fork is dropped rather than printed. That is not only the benign
+    // `socket_path` sun_path WARN (`lifecycle.rs:545`) — it also includes the
+    // security-relevant `refusing squatted /tmp socket fallback dir` ERROR
+    // (`lifecycle.rs:533`). The blast radius is small because the child
+    // re-derives the same socket path and re-emits both into the daemon log,
+    // and every arm below reinstalls the parent's subscriber the moment the
+    // fork decision is known. It is still a behavior change on this command.
     #[cfg(not(target_os = "macos"))]
     let forks_into_daemon = matches!(
         &cli.command,
@@ -12204,17 +12231,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // file-based one. The fork is done, so the
                                 // parent may now have its stderr subscriber
                                 // back for the readiness/attestation work
-                                // below. (Tracing emitted by the parent BEFORE
-                                // the fork — practically just the sun_path
-                                // fallback warning — is not captured; the
-                                // child records it in the daemon log.)
-                                let _ = tracing_subscriber::fmt()
-                                    .with_env_filter(
-                                        tracing_subscriber::EnvFilter::from_default_env()
-                                            .add_directive(tracing::Level::WARN.into()),
-                                    )
-                                    .with_writer(std::io::stderr)
-                                    .try_init();
+                                // below.
+                                restore_parent_stderr_tracing();
                                 // The double-fork only proves fork()
                                 // worked — run_server may still die during boot
                                 // (corrupt migration journal, DB lock, ...).
@@ -12251,6 +12269,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                             }
                             daemonize2::Outcome::Parent(Err(e)) => {
+                                // No child owns the file subscriber on this
+                                // path, so give the parent its stderr one back
+                                // before reporting the failure.
+                                restore_parent_stderr_tracing();
                                 anyhow::bail!("Failed to daemonize: {e}");
                             }
                             daemonize2::Outcome::Child(Err(e)) => {
