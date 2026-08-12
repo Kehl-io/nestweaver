@@ -115,26 +115,44 @@ fn format_rate(per_hour: f64) -> String {
     }
 }
 
-/// One line naming what currently holds the daemon write lock, or `None` when
-/// it is free. Includes embed progress when the holder is an embed, so a
-/// blocked operator sees not only *what* is ahead of them but how far along it
-/// is.
-pub fn format_write_holder(status: &BrainStatusResponse) -> Option<String> {
-    if status.write_holder.is_empty() {
+/// The daemon write lock's state, as one clause: `` `embed` has held it for
+/// 12m32s `` — with embed progress appended only when the holder actually IS
+/// an embed, so an index's wait is never annotated with an embed's counters.
+///
+/// `None` when the lock is free AND nothing is queued. A non-empty
+/// `write_queue_depth` with an empty holder is still reported, because
+/// "somebody is blocked but status cannot name what on" is exactly the silence
+/// this module exists to break.
+fn format_write_lock_clause(status: &BrainStatusResponse) -> Option<String> {
+    let queued = status.write_queue_depth.max(0);
+    if status.write_holder.is_empty() && queued == 0 {
         return None;
     }
     let held = format_duration_secs(status.write_holder_seconds.max(0) as u64);
-    let mut line = format!(
-        "waiting for the daemon write lock; `{}` has held it for {held}",
-        status.write_holder
-    );
-    if let Some(progress) = status
-        .embedding_status
-        .as_ref()
-        .and_then(format_embed_progress)
+    let mut clause = if status.write_holder.is_empty() {
+        // Should not happen now that every writer stamps the gate, but a
+        // daemon older than that change reports exactly this shape.
+        "the daemon write lock is held by something that did not identify itself".to_string()
+    } else {
+        format!("`{}` has held it for {held}", status.write_holder)
+    };
+    // Only an embed's own progress may be attributed to an embed.
+    if status.write_holder == "embed"
+        && let Some(progress) = status
+            .embedding_status
+            .as_ref()
+            .and_then(format_embed_progress)
     {
-        line.push_str(&format!(" ({progress})"));
+        clause.push_str(&format!(" ({progress})"));
     }
+    Some(clause)
+}
+
+/// One line telling a blocked caller what is in front of it, or `None` when
+/// nothing is.
+pub fn format_write_holder(status: &BrainStatusResponse) -> Option<String> {
+    let clause = format_write_lock_clause(status)?;
+    let mut line = format!("waiting for the daemon write lock; {clause}");
     // `write_queue_depth` counts every waiter including this one, so only
     // mention the queue when somebody else is also in it.
     let others = status.write_queue_depth.saturating_sub(1);
@@ -142,6 +160,25 @@ pub fn format_write_holder(status: &BrainStatusResponse) -> Option<String> {
         line.push_str(&format!(" — {others} other write command(s) also queued"));
     }
     Some(line)
+}
+
+/// The same facts stated without claiming the caller is the one waiting.
+///
+/// Used when the holder's RPC name equals the caller's own: `write_holder` is
+/// a name, not an identity, so two concurrent `nestweaver index` runs are
+/// indistinguishable from one command looking at itself. Rather than stay
+/// silent (which left a genuinely blocked client with no output at all) or
+/// assert "waiting" (which would be false for the holder), report what status
+/// actually knows.
+pub fn format_write_lock_contention(status: &BrainStatusResponse) -> Option<String> {
+    let clause = format_write_lock_clause(status)?;
+    let queued = status.write_queue_depth.max(0);
+    if queued == 0 {
+        return None;
+    }
+    Some(format!(
+        "the daemon write lock is contended; {clause} — {queued} write command(s) queued behind it"
+    ))
 }
 
 /// What a poller prints on each tick.
@@ -238,7 +275,14 @@ async fn poll_loop(
         match client.brain_status().await {
             Ok(status) => {
                 let line = match kind {
-                    NoticeKind::Waiting { own_rpc } if status.write_holder == own_rpc => None,
+                    // Our own RPC name in `write_holder` is ambiguous: either
+                    // we hold the lock, or another client running the same
+                    // command does and we are queued behind it. Say what is
+                    // true either way rather than going silent on a blocked
+                    // client (which is the bug this module exists to fix).
+                    NoticeKind::Waiting { own_rpc } if status.write_holder == own_rpc => {
+                        format_write_lock_contention(&status)
+                    }
                     NoticeKind::Waiting { .. } => format_write_holder(&status),
                     NoticeKind::EmbedProgress => status
                         .embedding_status
@@ -320,6 +364,75 @@ mod tests {
             None,
             "an idle daemon must not claim a client is blocked"
         );
+    }
+
+    /// Review finding: embed progress was appended unconditionally, so a
+    /// writer blocked behind an INDEX could be shown an embed's counters as if
+    /// they described the index.
+    #[test]
+    fn a_non_embed_holder_is_never_annotated_with_embed_progress() {
+        let status = BrainStatusResponse {
+            write_holder: "index_repo".to_string(),
+            write_holder_seconds: 300,
+            write_queue_depth: 1,
+            // A pass genuinely is running — it just is not what holds the lock.
+            embedding_status: Some(active_pass(3600, 7200, 300)),
+            ..Default::default()
+        };
+        let line = format_write_holder(&status).expect("waiting line");
+        assert!(line.contains("`index_repo` has held it for 5m0s"), "{line}");
+        assert!(
+            !line.contains("3,600 / 7,200"),
+            "an index's wait must not be annotated with an embed's progress: {line}"
+        );
+    }
+
+    /// Review finding: a non-RPC writer (worker pool, web admin) used to leave
+    /// `write_holder` empty, and the notifier then printed nothing at all —
+    /// reproducing the exact silence this module exists to remove. Current
+    /// daemons always stamp, but an older one still reports this shape.
+    #[test]
+    fn a_queued_writer_is_told_something_even_when_the_holder_is_unnamed() {
+        let status = BrainStatusResponse {
+            write_holder: String::new(),
+            write_queue_depth: 1,
+            ..Default::default()
+        };
+        let line =
+            format_write_holder(&status).expect("a queued writer must never be left in silence");
+        assert!(line.contains("waiting for the daemon write lock"), "{line}");
+        assert!(line.contains("did not identify itself"), "{line}");
+    }
+
+    /// Review finding: `write_holder` is a NAME, not an identity. Two
+    /// concurrent `nestweaver index` runs made the blocked one match its own
+    /// `own_rpc` and go silent for its entire wait.
+    #[test]
+    fn same_named_contention_is_reported_rather_than_silenced() {
+        let contended = BrainStatusResponse {
+            write_holder: "index_repo".to_string(),
+            write_holder_seconds: 90,
+            write_queue_depth: 1,
+            ..Default::default()
+        };
+        let line = format_write_lock_contention(&contended)
+            .expect("a contended lock must produce a line even under a matching name");
+        assert!(line.contains("contended"), "{line}");
+        assert!(
+            line.contains("`index_repo` has held it for 1m30s"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("waiting for"),
+            "we cannot prove WE are the waiter, so do not claim it: {line}"
+        );
+
+        // Sole holder, nothing queued: stay quiet, the command has its own output.
+        let uncontended = BrainStatusResponse {
+            write_queue_depth: 0,
+            ..contended
+        };
+        assert_eq!(format_write_lock_contention(&uncontended), None);
     }
 
     #[test]
