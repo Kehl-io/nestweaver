@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -250,14 +250,40 @@ pub use nestweaver_engine::write_gate::{WriteGate, WriteLease};
 /// the CLI already prints it once; this keeps the eligible count around as the
 /// denominator and advances a numerator as the pass runs, so `brain status` can
 /// tell a healthy 12-hour embed from a wedged daemon.
+/// The whole of a running pass's reported state, behind ONE lock.
+///
+/// This was four separate atomics. It cannot be: `snapshot` reads four fields,
+/// and four atomic loads are not atomic as a group, so a read straddling a
+/// `begin`/`finish` could mix one pass's counters with another's — including
+/// the shape that started this whole item, a just-started pass rendering as
+/// `88,131 / 88,131 (100%)`. No ordering discipline over independent atomics
+/// fixes a multi-field read; only making the group indivisible does.
+///
+/// The cost is one uncontended mutex per embedded node — tens of nanoseconds
+/// against a model inference measured in milliseconds — and status reads
+/// happen every 15-60 seconds. Correctness by construction is worth far more
+/// here than the atomics were.
+#[derive(Debug)]
+struct PassState {
+    processed: u64,
+    total: u64,
+    /// Unix seconds. Always > 0 for a live pass.
+    started_at: i64,
+    scope: String,
+}
+
+/// Live progress of the daemon-route embedding pass.
+///
+/// `plan_embeddings` already computes the eligible/embedded/scoped triple and
+/// the CLI already prints it once; this keeps the eligible count around as the
+/// denominator and advances a numerator as the pass runs, so `brain status`
+/// can tell a healthy 12-hour embed from a wedged daemon.
+///
+/// `None` means no pass is running. `Some` is always wholly one pass's state:
+/// there is no window in which it is partly initialised or partly cleared.
 #[derive(Debug, Default)]
 pub struct EmbedProgress {
-    active: AtomicBool,
-    processed: AtomicU64,
-    total: AtomicU64,
-    /// Unix seconds; 0 when no pass is running.
-    started_at: std::sync::atomic::AtomicI64,
-    scope: std::sync::Mutex<String>,
+    state: std::sync::Mutex<Option<PassState>>,
 }
 
 /// Immutable view of [`EmbedProgress`], read under `brain_status`.
@@ -278,10 +304,16 @@ fn unix_now_seconds() -> i64 {
 }
 
 impl EmbedProgress {
+    /// Poisoning must not wedge status reporting: a pass that panicked is
+    /// exactly when an operator needs `brain status` to keep answering.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<PassState>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Claim the reporting slot for a starting pass. `total` is 0 until
     /// preflight finishes, which is reported honestly rather than guessed at.
     ///
-    /// Returns a guard that is INERT when a pass is already active. The write
+    /// Returns a guard that is INERT when a pass is already running. The write
     /// lease is owned by the RPC future while the pass itself runs on a
     /// blocking task, so a client that disconnects releases the lock while its
     /// pass keeps embedding; a re-issued `embed` then acquires the gate with
@@ -292,11 +324,9 @@ impl EmbedProgress {
     /// reports nothing rather than corrupting the first pass's numbers.
     #[must_use]
     pub fn begin(self: &Arc<Self>, scope: &str) -> EmbedProgressGuard {
-        if self
-            .active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let mut slot = self.lock();
+        if slot.is_some() {
+            drop(slot);
             tracing::warn!(
                 scope,
                 "an embed pass is already in flight; this pass will run but its \
@@ -304,46 +334,46 @@ impl EmbedProgress {
             );
             return EmbedProgressGuard(None);
         }
-        self.processed.store(0, Ordering::Relaxed);
-        self.total.store(0, Ordering::Relaxed);
-        self.started_at.store(unix_now_seconds(), Ordering::Relaxed);
-        if let Ok(mut slot) = self.scope.lock() {
-            scope.clone_into(&mut slot);
-        }
+        *slot = Some(PassState {
+            processed: 0,
+            total: 0,
+            started_at: unix_now_seconds(),
+            scope: scope.to_string(),
+        });
+        drop(slot);
         EmbedProgressGuard(Some(Arc::clone(self)))
     }
 
     fn set_total(&self, total: u64) {
-        self.total.store(total, Ordering::Relaxed);
+        if let Some(state) = self.lock().as_mut() {
+            state.total = total;
+        }
     }
 
     fn advance(&self, by: u64) {
-        self.processed.fetch_add(by, Ordering::Relaxed);
+        if let Some(state) = self.lock().as_mut() {
+            state.processed = state.processed.saturating_add(by);
+        }
     }
 
     fn processed(&self) -> u64 {
-        self.processed.load(Ordering::Relaxed)
+        self.lock().as_ref().map(|s| s.processed).unwrap_or(0)
     }
 
     fn finish(&self) {
-        self.started_at.store(0, Ordering::Relaxed);
-        self.active.store(false, Ordering::Release);
+        *self.lock() = None;
     }
 
     pub fn snapshot(&self) -> EmbedProgressSnapshot {
-        if !self.active.load(Ordering::Acquire) {
-            return EmbedProgressSnapshot::default();
-        }
-        EmbedProgressSnapshot {
-            active: true,
-            processed: self.processed.load(Ordering::Relaxed),
-            total: self.total.load(Ordering::Relaxed),
-            started_at: self.started_at.load(Ordering::Relaxed),
-            scope: self
-                .scope
-                .lock()
-                .map(|s| s.clone())
-                .unwrap_or_else(|_| String::new()),
+        match self.lock().as_ref() {
+            None => EmbedProgressSnapshot::default(),
+            Some(state) => EmbedProgressSnapshot {
+                active: true,
+                processed: state.processed,
+                total: state.total,
+                started_at: state.started_at,
+                scope: state.scope.clone(),
+            },
         }
     }
 }
@@ -14992,6 +15022,79 @@ credential_method = "gh"
             assert!(progress.snapshot().active);
         }
         assert_eq!(progress.snapshot(), EmbedProgressSnapshot::default());
+    }
+
+    /// A finished pass must leave nothing behind that a later reader could
+    /// pair with `active: true`.
+    #[test]
+    fn a_finished_pass_leaves_no_counters_behind_to_be_misattributed() {
+        let progress = Arc::new(EmbedProgress::default());
+        {
+            let pass = progress.begin("all");
+            pass.set_total(88_131);
+            pass.advance(88_131);
+            let live = progress.snapshot();
+            assert_eq!(
+                (live.processed, live.total, live.scope.as_str()),
+                (88_131, 88_131, "all")
+            );
+            assert!(live.started_at > 0);
+        }
+        assert_eq!(
+            progress.snapshot(),
+            EmbedProgressSnapshot::default(),
+            "a finished pass must not leave numbers a later reader could attribute to a new one"
+        );
+    }
+
+    /// The torn read, directly.
+    ///
+    /// A `snapshot` reads four values. While they lived in four independent
+    /// atomics, a read straddling `begin`/`finish` could mix one pass's
+    /// counters with another's — the shape this item started from (a
+    /// just-started pass rendering as `100%`), and a second variant this test
+    /// caught in the first attempted fix
+    /// (`active: true, processed: 41230, total: 0, started_at: 0`). No
+    /// ordering discipline over independent atomics closes a four-field read;
+    /// only making the group indivisible does.
+    ///
+    /// Hammering a reader against a writer, this fails within a few thousand
+    /// iterations on any version that reads the fields independently.
+    #[test]
+    fn a_reader_never_sees_two_passes_mixed_together() {
+        let progress = Arc::new(EmbedProgress::default());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_progress = Arc::clone(&progress);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..20_000 {
+                let pass = writer_progress.begin("all");
+                pass.set_total(88_131);
+                pass.advance(41_230);
+                drop(pass);
+            }
+            writer_stop.store(true, Ordering::Relaxed);
+        });
+
+        let mut observations = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            let snapshot = progress.snapshot();
+            observations += 1;
+            if snapshot.active {
+                assert!(
+                    snapshot.started_at > 0,
+                    "a live pass always carries its start stamp: {snapshot:?}"
+                );
+                assert_eq!(snapshot.scope, "all", "scope must belong to this pass");
+                assert!(
+                    snapshot.total == 0 || snapshot.processed <= snapshot.total,
+                    "processed must never exceed a total from a different pass: {snapshot:?}"
+                );
+            }
+        }
+        writer.join().expect("writer thread");
+        assert!(observations > 0, "the reader must actually have sampled");
     }
 
     /// A disconnecting client releases the write lease while its pass keeps
