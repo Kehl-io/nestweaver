@@ -3502,7 +3502,7 @@ fn authorized_symbol_total(
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n- semantic_applied is always false and degraded_components always empty: this tool is keyword/BM25-only and never runs a semantic leg, so ranking is lexical. The fields are reported rather than omitted so their absence is never mistaken for an older server\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable\n- Keyword matching only — it will not find conceptually related wording that shares no terms with the query",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4038,9 +4038,19 @@ fn tool_brain_search(
         // semantic leg was requested or degraded. Emitted unconditionally
         // (and on both the bm25 and substring branches, which converge
         // here) so callers can tell "no semantic leg" apart from "field
-        // not implemented on this path". The other two sites that must
-        // stay in agreement are the gRPC daemon's `brain_search` handler
-        // and `daemon_brain_search_response_to_json` below.
+        // not implemented on this path".
+        //
+        // Other sites that must stay in agreement when a semantic leg is
+        // added. This list is not a claim that they currently agree:
+        //   - the gRPC daemon's `brain_search` handler (honest today)
+        //   - `daemon_brain_search_response_to_json` below, which forwards
+        //     the proto fields verbatim (honest today)
+        //   - `nestweaver-federation/src/results.rs::merge_json_results`,
+        //     the hybrid/federated merge, which currently DROPS both
+        //     fields: it rebuilds the response and re-adds `query`,
+        //     `engine`, the count keys and `expansion_terms` but not
+        //     these, so a merged hybrid response still exhibits the
+        //     ambiguity this site fixes. Pre-existing and untouched here.
         "semantic_applied": false,
         "degraded_components": [],
     });
@@ -4884,17 +4894,24 @@ mod brain_search_total_contract_tests {
         assert_eq!(note_row["matched_headings"], json!(["Dedupneedle Alpha"]));
     }
 
-    /// The three `brain_search` response paths — the gRPC daemon handler,
-    /// the daemon-routed MCP conversion, and the in-process MCP tool — must
-    /// agree field-for-field on the semantic-honesty keys. An absent field is
-    /// indistinguishable from an unsupported one, so all three emit them
-    /// unconditionally.
+    /// Both MCP `brain_search` response paths — the daemon-routed conversion
+    /// and the in-process tool — must agree field-for-field on the
+    /// semantic-honesty keys. An absent field is indistinguishable from an
+    /// unsupported one, so both emit them unconditionally.
+    ///
+    /// Scope limit, deliberate: the gRPC daemon handler is the third emitter,
+    /// but it lives in `nestweaver-daemon`, which this crate does not depend
+    /// on, so its constants are MIRRORED below rather than observed. Editing
+    /// the handler to set `semantic_applied: true` would NOT fail this test.
+    /// Real cross-process coverage belongs in the root package's
+    /// `tests/daemon_test.rs`, which links both crates and already stands up
+    /// live daemons. What this test does pin is the proto struct literal:
+    /// it is exhaustive, so any new `BrainSearchResponse` field breaks
+    /// compilation here and forces a decision about honesty reporting.
     #[cfg(feature = "daemon")]
     #[test]
-    fn brain_search_semantic_honesty_fields_agree_across_all_paths() {
-        // 1. gRPC daemon: the handler builds its response with these exact
-        //    constants. Mirrored here because the handler lives in
-        //    nestweaver-daemon and is not linkable from this crate's tests.
+    fn brain_search_semantic_honesty_fields_agree_across_mcp_paths() {
+        // 1. gRPC daemon constants, mirrored (see the scope limit above).
         let grpc = nestweaver_proto::BrainSearchResponse {
             query: "honestyneedle".to_string(),
             engine: "bm25".to_string(),
@@ -4946,12 +4963,12 @@ mod brain_search_total_contract_tests {
             assert_eq!(
                 value.get("semantic_applied"),
                 Some(&json!(grpc.semantic_applied)),
-                "{label} disagrees with the gRPC daemon on `semantic_applied`"
+                "{label} disagrees with the mirrored gRPC constants on `semantic_applied`"
             );
             assert_eq!(
                 value.get("degraded_components"),
                 Some(&json!(grpc.degraded_components)),
-                "{label} disagrees with the gRPC daemon on `degraded_components`"
+                "{label} disagrees with the mirrored gRPC constants on `degraded_components`"
             );
         }
     }
