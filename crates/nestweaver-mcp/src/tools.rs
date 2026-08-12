@@ -4034,6 +4034,15 @@ fn tool_brain_search(
         "total_matches_relation": search_total_relation_label(total.relation),
         "returned_matches": returned_matches,
         "truncated": truncated,
+        // `brain_search` is keyword/BM25-only; it must not claim a
+        // semantic leg was requested or degraded. Emitted unconditionally
+        // (and on both the bm25 and substring branches, which converge
+        // here) so callers can tell "no semantic leg" apart from "field
+        // not implemented on this path". The other two sites that must
+        // stay in agreement are the gRPC daemon's `brain_search` handler
+        // and `daemon_brain_search_response_to_json` below.
+        "semantic_applied": false,
+        "degraded_components": [],
     });
     if engine == "substring" {
         response["engine_warning"] = json!(
@@ -4873,6 +4882,78 @@ mod brain_search_total_contract_tests {
             .find(|r| r["uid"] == "note:dup")
             .expect("note row present");
         assert_eq!(note_row["matched_headings"], json!(["Dedupneedle Alpha"]));
+    }
+
+    /// The three `brain_search` response paths — the gRPC daemon handler,
+    /// the daemon-routed MCP conversion, and the in-process MCP tool — must
+    /// agree field-for-field on the semantic-honesty keys. An absent field is
+    /// indistinguishable from an unsupported one, so all three emit them
+    /// unconditionally.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn brain_search_semantic_honesty_fields_agree_across_all_paths() {
+        // 1. gRPC daemon: the handler builds its response with these exact
+        //    constants. Mirrored here because the handler lives in
+        //    nestweaver-daemon and is not linkable from this crate's tests.
+        let grpc = nestweaver_proto::BrainSearchResponse {
+            query: "honestyneedle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 0,
+            results: Vec::new(),
+            expansion_terms: Vec::new(),
+            returned_matches: 0,
+            total_matches_relation: "eq".to_string(),
+            truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
+        };
+
+        // 2. Daemon-routed MCP: forwards the proto fields verbatim.
+        let daemon_json = daemon_brain_search_response_to_json(&grpc, false);
+
+        // 3. In-process MCP, both branches. No tantivy index → substring
+        //    fallback; with one → bm25. Both converge on one response literal,
+        //    but assert each so a future split cannot silently drop a field.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:honesty", "Honestyneedle Title"))
+            .unwrap();
+        let substring_json = tool_brain_search(
+            &store,
+            None,
+            json!({ "query": "honestyneedle", "response_format": "detailed" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(substring_json["engine"], "substring");
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let bm25_json = tool_brain_search(
+            &store,
+            Some(&index),
+            json!({ "query": "honestyneedle", "response_format": "detailed" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bm25_json["engine"], "bm25");
+
+        for (label, value) in [
+            ("daemon-routed MCP", &daemon_json),
+            ("in-process MCP (substring)", &substring_json),
+            ("in-process MCP (bm25)", &bm25_json),
+        ] {
+            assert_eq!(
+                value.get("semantic_applied"),
+                Some(&json!(grpc.semantic_applied)),
+                "{label} disagrees with the gRPC daemon on `semantic_applied`"
+            );
+            assert_eq!(
+                value.get("degraded_components"),
+                Some(&json!(grpc.degraded_components)),
+                "{label} disagrees with the gRPC daemon on `degraded_components`"
+            );
+        }
     }
 }
 
