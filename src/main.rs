@@ -4291,12 +4291,21 @@ const STOP_GRACE_BUFFER_SECS: u64 = 30;
 /// SIGKILL.
 ///
 /// T6.2 reconciliation: a legitimate large in-flight index can run far longer
-/// than the old fixed 60s default, and the daemon's own shutdown drain is
-/// bounded by `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) — so a 60s grace
-/// could SIGKILL mid-write of a non-atomic sidecar. When `NESTWEAVER_STOP_GRACE_SECS`
-/// is unset we derive the grace from that same drain ceiling (plus a small
-/// buffer) so the two can't drift and stop never kills a daemon that is still
-/// legitimately draining. An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
+/// than the old fixed 60s default, so a 60s grace could SIGKILL mid-write of a
+/// non-atomic sidecar. When `NESTWEAVER_STOP_GRACE_SECS` is unset we derive the
+/// grace from the drain ceiling (plus a small buffer) so the two can't drift.
+/// An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
+///
+/// A1 correction to that reconciliation: this grace is now a real DEADLINE, not
+/// a guarantee that stop never kills a legitimately draining daemon. The
+/// daemon's write drain is NOT bounded by `NESTWEAVER_DRAIN_TIMEOUT_SECS` —
+/// nothing can abort a `spawn_blocking` write, so past the ceiling the daemon
+/// keeps waiting and keeps serving reads rather than claiming a shutdown it
+/// cannot perform. A write still running when this grace expires WILL be
+/// SIGKILLed. That is the intended contract for an explicit `daemon stop`: the
+/// operator asked for the daemon to go away and the escalation is what makes
+/// that true. Operators who want to wait a stuck write out instead should leave
+/// the daemon alone (reads keep working) rather than raising this value.
 ///
 /// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
 /// unit-testable without touching process env).
@@ -12350,11 +12359,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // writes before exiting (a `spawn_blocking` write cannot be
                     // aborted), which can take longer than a couple of seconds for
                     // a large repo — so the grace window must exceed the max write
-                    // duration or `daemon stop` would SIGKILL mid-write. The
-                    // daemon's own drain is bounded by NESTWEAVER_DRAIN_TIMEOUT_SECS
-                    // (default 660s), so by default we derive the grace from that
-                    // ceiling rather than a fixed 60s that a real index blows past.
-                    // Override explicitly with NESTWEAVER_STOP_GRACE_SECS.
+                    // duration or `daemon stop` would SIGKILL mid-write. By
+                    // default we derive the grace from NESTWEAVER_DRAIN_TIMEOUT_SECS
+                    // (default 660s) rather than a fixed 60s that a real index
+                    // blows past. Override with NESTWEAVER_STOP_GRACE_SECS.
+                    //
+                    // A1: this is a deadline, not a promise. The daemon's write
+                    // drain is deliberately unbounded (a spawn_blocking write
+                    // cannot be aborted), so a write still running when the grace
+                    // expires IS SIGKILLed — see resolve_stop_grace_secs.
                     let grace_secs = resolve_stop_grace_secs(
                         std::env::var("NESTWEAVER_STOP_GRACE_SECS").ok().as_deref(),
                         std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")

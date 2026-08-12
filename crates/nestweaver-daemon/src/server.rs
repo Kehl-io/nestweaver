@@ -647,7 +647,19 @@ pub struct DaemonState {
     /// Per-client rate limiters (token bucket via governor).
     pub rate_limiters: Option<Arc<ClientRateLimiters>>,
     /// Whether the server-side worker pool is drained (not picking new jobs).
+    ///
+    /// NOT shutdown-private: the same `Arc` is handed to `AdminState`, and
+    /// `POST /admin/api/drain` sets it as a routine maintenance operation
+    /// (paired with `POST /admin/api/resume`). Never treat it as "a shutdown is
+    /// in progress" — see [`DaemonState::shutdown_started`] for that.
     pub drained: Arc<AtomicBool>,
+    /// Whether a shutdown drain has already been started, so a second Shutdown
+    /// RPC does not spawn a second `run_shutdown_drain`.
+    ///
+    /// Deliberately separate from `drained`: an operator who drains the worker
+    /// pool through the admin API must not thereby make every later Shutdown
+    /// RPC a silent no-op.
+    pub shutdown_started: Arc<AtomicBool>,
     /// Admin token for admin API authentication (separate from query token).
     pub admin_token: Option<String>,
     /// Shared admin state, set once after construction. Used by `serve_ui`
@@ -843,6 +855,10 @@ const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
 /// Waiting instead keeps the daemon readable until the operator escalates —
 /// and if the write does finish, shutdown still completes cleanly rather than
 /// leaving a half-dead process behind.
+///
+/// The unbounded wait applies to in-flight WRITES ONLY. `indexing_active` on
+/// its own stays bounded by the ceiling — see the comment on that branch for
+/// why waiting on it forever would be a hang rather than a safeguard.
 async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
     let ceiling_at = std::time::Duration::from_secs(ceiling);
     let half = std::time::Duration::from_secs(ceiling / 2);
@@ -868,7 +884,40 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
         }
 
         let elapsed = start.elapsed();
-        if elapsed >= next_over_ceiling_report {
+
+        if writes == 0 {
+            // Indexing-only wait: BOUNDED, deliberately.
+            //
+            // Only an in-flight write earns an unbounded wait — it holds the DB
+            // write lock, runs on a `spawn_blocking` thread nothing can cancel,
+            // and abandoning it is the operator's call. `indexing_active` is
+            // different: waiting on it forever is a hang, not a safeguard.
+            //
+            // `indexing_active` is cleared in exactly two places in
+            // `nestweaver-engine`'s worker loop, and with `drained` set (which
+            // the Shutdown handler does before this runs) BOTH are unreachable
+            // while the job queue is non-empty: the idle branch is skipped
+            // because the drained check `continue`s before a job is ever
+            // claimed, and the post-job branch clears only when pending +
+            // running + in-flight all reach zero. A server-mode daemon told to
+            // shut down with work still queued — the "continuous webhook
+            // enqueue" case the Shutdown handler already calls out — would
+            // never exit at all.
+            //
+            // The broadcast below is precisely what unblocks it: the worker
+            // loop observes shutdown and breaks. That is the pre-existing,
+            // working behaviour for this path, so it is kept intact.
+            if elapsed >= ceiling_at {
+                tracing::warn!(
+                    indexing_active = indexing,
+                    waited_secs = elapsed.as_secs(),
+                    "drain ceiling ({ceiling}s) reached with no in-flight writes — \
+                     signalling shutdown. The index worker stops after its current \
+                     job; anything still queued is left for the next start"
+                );
+                break;
+            }
+        } else if elapsed >= next_over_ceiling_report {
             next_over_ceiling_report = elapsed + repeat_every;
             let pid = std::process::id();
             tracing::warn!(
@@ -878,12 +927,19 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
                 pid,
                 "drain ceiling ({ceiling}s) exceeded — still waiting on {writes} \
                  in-flight write(s){}; the daemon CANNOT abort them and is NOT \
-                 shutting down yet. Reads are still being served. To end it now: \
-                 `nestweaver daemon stop` (escalates to SIGKILL) or `kill -9 \
-                 {pid}` — the in-flight write is then abandoned",
+                 shutting down. Most reads are still served — `embed` and \
+                 `plan_embed` are not, they take the same write gate. To end it \
+                 now: `kill -9 {pid}`, which abandons the in-flight write. Prefer \
+                 that over `nestweaver daemon stop`: its SIGTERM closes every \
+                 listener immediately, so reads stay down for the whole stop \
+                 grace (default: ceiling + 30s) before it escalates to SIGKILL \
+                 anyway",
                 if indexing { " + an index job" } else { "" },
             );
-        } else {
+        }
+
+        // Past the ceiling these are noise — the reports above have taken over.
+        if elapsed < ceiling_at {
             if !warned_half && elapsed >= half {
                 tracing::warn!(
                     active_writes = writes,
@@ -3034,13 +3090,21 @@ impl NestWeaverDaemon for DaemonService {
         // Without this the worker keeps claiming new jobs during the drain, so
         // under continuous webhook enqueue `indexing_active` never clears and
         // shutdown burns the full drain ceiling doing work it will abandon.
+        self.state.drained.store(true, Ordering::Relaxed);
+
+        // Once-only guard on the drain task. A second Shutdown must not spawn a
+        // second `run_shutdown_drain`: the two would duplicate every drain
+        // warning for as long as the write runs — visible in the incident log
+        // as two interleaved 90%/ceiling report streams — and race the
+        // broadcast.
         //
-        // The swap doubles as the once-only guard on the drain task. A second
-        // Shutdown (or one arriving after SIGTERM, which sets the same flag)
-        // must not spawn a second `run_shutdown_drain`: the two would duplicate
-        // every drain warning forever — visible in the incident log as two
-        // interleaved 90%/ceiling report streams — and race the broadcast.
-        if self.state.drained.swap(true, Ordering::Relaxed) {
+        // This MUST NOT key off `drained`. That flag is shared with
+        // `AdminState`, and `POST /admin/api/drain` sets it as routine
+        // maintenance; keying the guard off it would make every Shutdown RPC
+        // after any admin drain a silent no-op that never stops the watcher,
+        // never drains and never broadcasts, leaving `daemon restart` unable to
+        // stop the daemon until someone found `POST /admin/api/resume`.
+        if self.state.shutdown_started.swap(true, Ordering::Relaxed) {
             tracing::info!("shutdown already in progress — not starting a second drain");
             return Ok(Response::new(ShutdownResponse { ok: true }));
         }
@@ -8244,6 +8308,7 @@ pub async fn run_server(
         safeguards,
         rate_limiters: rate_limiters.clone(),
         drained: Arc::new(AtomicBool::new(false)),
+        shutdown_started: Arc::new(AtomicBool::new(false)),
         admin_token,
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
@@ -8393,6 +8458,10 @@ pub async fn run_server(
             // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
             // still drain via the worker loop's JoinSet; only NEW claims stop.
             drained.store(true, Ordering::Relaxed);
+            // SIGTERM broadcasts immediately below, so a Shutdown RPC arriving
+            // after it has nothing left to drain — claim the guard so it does
+            // not start a drain loop behind an already-broadcast shutdown.
+            state.shutdown_started.store(true, Ordering::Relaxed);
             // Stop any active watcher too — its `spawn_blocking` thread
             // would otherwise outlive the broadcast and pin process exit
             // (Tokio's runtime drop waits for blocking threads) until the
@@ -14510,6 +14579,7 @@ mod startup_helper_tests {
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
@@ -14587,6 +14657,7 @@ credential_method = "gh"
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
@@ -15575,8 +15646,11 @@ external_model = "unavailable-test-model"
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
             probe_flag.store(*probe_state.shutdown_tx.borrow(), Ordering::Relaxed);
-            // Now let the "write" finish.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Now let the "write" finish. The gap is generous on purpose: the
+            // loop tests `writes == 0` BEFORE it reports, so clearing too soon
+            // lets a scheduler stall break the loop having never emitted the
+            // ceiling report this test exists to assert on.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             probe_state.active_writes.store(0, Ordering::Relaxed);
         });
 
@@ -15614,6 +15688,107 @@ external_model = "unavailable-test-model"
         assert!(
             text.contains("kill -9"),
             "the ceiling message must name the only thing that actually ends it: {text}"
+        );
+        assert!(
+            text.contains("plan_embed"),
+            "\"reads are served\" is not unqualified — `embed`/`plan_embed` take the \
+             write gate and are exactly what an operator reaches for during an embed \
+             incident, so the line must say so: {text}"
+        );
+        assert!(
+            text.contains("reads stay down"),
+            "the line must not recommend `daemon stop` without saying its SIGTERM \
+             closes every listener and ends read service for the stop grace: {text}"
+        );
+    }
+
+    /// `drained` is NOT shutdown-private: the same `Arc` is handed to
+    /// `AdminState`, and `POST /admin/api/drain` sets it as routine maintenance.
+    /// Keying the once-only drain guard off it made every Shutdown RPC after any
+    /// admin drain a silent `ok: true` no-op — no watcher stop, no drain, no
+    /// broadcast — so `daemon restart` could not stop the daemon at all until
+    /// someone found `POST /admin/api/resume`.
+    #[tokio::test]
+    async fn shutdown_still_works_after_an_admin_api_drain() {
+        let state = test_state_with_writer();
+        // Exactly what POST /admin/api/drain does, through the shared Arc.
+        state.drained.store(true, Ordering::Relaxed);
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let mut req = Request::new(ShutdownRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(
+            service
+                .shutdown(req)
+                .await
+                .expect("shutdown ok")
+                .into_inner()
+                .ok
+        );
+
+        // The daemon is idle, so a real drain has nothing to wait for and
+        // broadcasts almost immediately. The early no-op return never would.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !*shutdown_rx.borrow() {
+                shutdown_rx.changed().await.expect("shutdown channel alive");
+            }
+        })
+        .await
+        .expect(
+            "a Shutdown arriving after an admin-API drain must still drain and \
+             broadcast — the once-only guard must not key off `drained`",
+        );
+    }
+
+    /// The unbounded wait is for in-flight WRITES only. `indexing_active` on its
+    /// own must stay bounded by the ceiling, because it cannot clear by itself
+    /// once the worker is drained with a non-empty queue: the worker's idle
+    /// branch is skipped (drained `continue`s before claiming) and its post-job
+    /// branch clears only when pending + running + in-flight all hit zero. A
+    /// server-mode daemon shut down with work still queued would otherwise never
+    /// exit — and would log "still waiting on 0 in-flight write(s)", asserting
+    /// an in-flight write it does not have.
+    #[tokio::test]
+    async fn drain_with_only_indexing_active_stays_bounded_by_the_ceiling() {
+        let state = test_state_with_writer();
+        state.drained.store(true, Ordering::Relaxed);
+        state.indexing_active.store(true, Ordering::Relaxed);
+        state.active_writes.store(0, Ordering::Relaxed);
+        let shutdown_rx = state.shutdown_tx.subscribe();
+
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_shutdown_drain(Arc::clone(&state), 1),
+        )
+        .await
+        .expect(
+            "an indexing-only drain MUST stay bounded: `indexing_active` cannot \
+             clear once the worker is drained with a non-empty queue, so waiting \
+             on it forever turns a bounded shutdown into a permanent hang",
+        );
+
+        assert!(
+            *shutdown_rx.borrow(),
+            "the bounded path must broadcast — that broadcast is what lets the \
+             worker loop observe shutdown and exit"
+        );
+
+        let text = logs.text();
+        assert!(
+            text.contains("drain ceiling (1s) reached with no in-flight writes"),
+            "the indexing-only ceiling must report itself accurately: {text}"
+        );
+        assert!(
+            !text.contains("still waiting on 0 in-flight write(s)"),
+            "the drain must never assert an in-flight write it does not have: {text}"
         );
     }
 
