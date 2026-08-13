@@ -5221,10 +5221,23 @@ mod tests {
             .unwrap();
     }
 
+    /// Liveness deadline for the cross-thread handoffs in the overlapping
+    /// publication test.
+    ///
+    /// Every wait below is backed by a condvar or an mpsc channel, so it wakes
+    /// the instant the event it names actually happens. The deadline therefore
+    /// only bounds a genuine hang (a lost notification, a deadlocked lease) —
+    /// it is NOT a throughput budget, and nothing about the property under
+    /// test depends on how promptly the OS schedules the spawned publisher.
+    /// A deadline sized near the test's own idle runtime made a loaded machine
+    /// look like a broken lease; a generous one costs nothing when healthy and
+    /// still fails in bounded time when the handoff is truly broken. The
+    /// ordering assertions in the test remain exact.
+    const PUBLICATION_HANDOFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
     #[test]
     fn overlapping_publications_serialize_before_the_second_mutation() {
         use std::sync::{Arc, mpsc};
-        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
@@ -5274,7 +5287,7 @@ mod tests {
         });
 
         assert!(
-            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            store.wait_for_index_publication_waiters(1, PUBLICATION_HANDOFF_DEADLINE),
             "publisher B must register as waiting on A's publication lease"
         );
         assert!(
@@ -5297,12 +5310,12 @@ mod tests {
         let generation_after_a = store.graph_generation();
 
         let b_established = established_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(PUBLICATION_HANDOFF_DEADLINE)
             .expect("publisher B must establish after A finalizes");
         b_established.unwrap();
         continue_tx.send(()).unwrap();
         done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(PUBLICATION_HANDOFF_DEADLINE)
             .expect("publisher B must finish")
             .unwrap();
         publisher_b.join().unwrap();
