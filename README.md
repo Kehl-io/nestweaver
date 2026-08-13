@@ -499,7 +499,12 @@ The status reports `requested_device`, `selected_device`, and `fallback_used`.
 A local backend is ready only when `selected_device` is `metal` or `cpu` and
 `fallback_used` is `false`; an external backend has no local selected device.
 When semantic retrieval was requested but unavailable, context responses keep
-the graph/PPR/BM25 result and report `"semantic"` in `degraded_components`.
+the graph/PPR/BM25 result and report `"semantic"` in `degraded_components`
+(the only value in that vocabulary today). Caveat: the hybrid/federated merge
+for `brain_context` / `project_context` rebuilds the `connected` response shape
+and currently drops both `semantic_applied` and `degraded_components`, so a
+merged two-tier context answer does not carry them. The direct, daemon, and
+`brain_search` paths do.
 
 **Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM;
 heavier models trade speed for quality. Forward Push PPR replaces power
@@ -619,7 +624,7 @@ The MCP server automatically starts a background daemon that owns the database. 
 ```sh
 nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
 nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
-pgrep -a nestweaver-daemon                        # find running daemons (Linux)
+pgrep -af "nestweaver daemon"                     # find running daemons (Linux)
 ```
 
 40 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.

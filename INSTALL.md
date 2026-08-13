@@ -67,6 +67,19 @@ the build uses the Ladybug sources resolved by `Cargo.lock`, rather than a
 prebuilt archive whose hidden ELF symbols cause zstd link errors. Cargo
 vendors the Ladybug sources with the crate.
 
+**x86_64 Linux needs one more linker flag.** Building Ladybug from source
+alongside Tantivy produces duplicate zstd symbols, and the tracked
+`.cargo/config.toml` does not carry the flag that tolerates them — CI appends it
+per job instead. Without it, linking fails on `x86_64-unknown-linux-gnu`:
+
+```sh
+cat >> .cargo/config.toml << 'EOF'
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+EOF
+```
+
 If OpenSSL is installed in a non-default location and the linker cannot find
 `ssl` or `crypto`, expose that installation while building:
 

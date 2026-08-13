@@ -92,10 +92,13 @@ nestweaver brain status --db <path> --json
 ```
 
 Runtime status includes `state`, `backend`, `requested_device`,
-`selected_device`, `model_id`, `error`, `metal_compiled`, and `fallback_used`.
+`selected_device`, `model_id`, `error`, `metal_compiled`, and `fallback_used`,
+plus the five `pass_*` fields documented under "Embedding pass progress" below.
 For a ready local backend, `selected_device` is `metal` or `cpu` and
 `fallback_used` remains `false`. A ready external backend has an empty
 `selected_device` because it has no local device.
+
+`state` is one of `disabled`, `loading`, `ready`, `failed`, or `embedding`.
 
 ### Embedding pass progress
 
@@ -104,6 +107,11 @@ pass is in flight. It is a strictly narrower `ready`: the model is loaded and
 usable. Treat `embedding` as ready for "can this daemon answer semantic
 queries"; read the boolean `pass_active` when you want an unambiguous machine
 signal rather than a string match.
+
+`embedding` is computed at read time and substitutes for `ready` only. A pass
+running while the underlying state is `loading` or `failed` still reports that
+underlying state, so `pass_active` — not the state string — is the reliable
+"is a pass running" signal.
 
 While a pass runs, `embedding_status` also carries `pass_active`,
 `pass_processed`, `pass_total`, `pass_started_at` (unix seconds), and
@@ -525,7 +533,12 @@ alongside the returned rows:
   and the hybrid merge below all agree on this. In a merge, `semantic_applied`
   is the AND across contributing tiers (only claimed when every tier applied
   it) and `degraded_components` is their deduplicated union (a component
-  degraded in either tier is degraded in the merged answer).
+  degraded in either tier is degraded in the merged answer). A tier that omits
+  `semantic_applied` counts as `false`, and if NO contributing tier reports
+  either field the merge omits both rather than inventing them — so on a merged
+  response, absence means "no tier reported", not "`false`".
+  `degraded_components` has exactly one value in the current vocabulary,
+  `"semantic"`.
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
 server responses have valid, internally consistent exact-count metadata and

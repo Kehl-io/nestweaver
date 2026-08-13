@@ -3331,12 +3331,39 @@ enum DaemonAction {
         #[arg(long, hide = true)]
         track_interactions: bool,
     },
-    /// Stop the running daemon
+    /// Stop the running daemon.
+    ///
+    /// Sends SIGTERM, which broadcasts shutdown IMMEDIATELY — every listener
+    /// closes at once, so read service stops right away rather than at the end
+    /// of a drain. This path does NOT run the graceful drain loop that the gRPC
+    /// Shutdown RPC uses; NESTWEAVER_DRAIN_TIMEOUT_SECS does not apply here. The
+    /// process lingers only until in-flight `spawn_blocking` writes finish,
+    /// during which it is unreachable.
+    ///
+    /// Escalates to SIGKILL after the stop grace (NESTWEAVER_STOP_GRACE_SECS,
+    /// else NESTWEAVER_DRAIN_TIMEOUT_SECS + 30s; 690s by default), so a write
+    /// still running at that point IS killed.
+    ///
+    /// Refuses to signal a process that only holds the database write lock
+    /// unless its /proc cmdline proves it is a daemon for this DB —
+    /// `embed --local`, `index`, and `--no-daemon` runs hold the same lock.
+    /// That cmdline recovery path is Linux-only.
     Stop,
-    /// Show daemon status
+    /// Show daemon status.
+    ///
+    /// Reports one of three states: running (reachable), not running, or
+    /// running-but-unreachable — something still owns this instance's database
+    /// write lock or pidfile lock with no way for a client to reach it. That
+    /// third state is repairable and names the owning PID when the kernel
+    /// reports one.
     Status,
-    /// Remove orphaned launch agents (macOS) left by ephemeral/test daemons —
-    /// ones whose `--db` path no longer exists or lives under a temp dir.
+    /// Remove orphaned daemon runtime state.
+    ///
+    /// On macOS, sweeps orphaned launch agents left by ephemeral/test daemons —
+    /// ones whose `--db` path no longer exists or lives under a temp dir. On
+    /// EVERY platform, also sweeps orphaned daemon state directories. Live
+    /// instances are spared, and each ownership proof (database write lock,
+    /// pidfile lock) is reported as its own separate fact.
     Gc,
     /// Run daemon in foreground (used by launchd)
     Run {

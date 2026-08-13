@@ -12,24 +12,40 @@ cargo fmt --all -- --check                                  # format check
 cargo fmt --all                                             # format in place
 ```
 
+On **x86_64 Linux a clean clone cannot link** (duplicate zstd symbols from
+building Ladybug from source alongside Tantivy). The tracked
+`.cargo/config.toml` does NOT carry the fix; CI appends it per job. Append it
+locally and do not commit it — see
+[CONTRIBUTING.md](CONTRIBUTING.md#x86_64-linux-extra-linker-flag-required).
+
 ## Daemon Architecture
 
 All CLI commands and MCP tool calls route through a background daemon process
 that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
 invocation and self-terminates after an idle timeout. The client auto-restarts
-the daemon on version mismatch. Shutdown is graceful: the daemon drains active
-write RPCs before exiting. `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) means
+the daemon on version mismatch.
+
+**Two different shutdown paths.** The graceful drain loop runs ONLY for the gRPC
+`Shutdown` RPC. `nestweaver daemon stop` sends SIGTERM, whose handler broadcasts
+shutdown immediately — no drain loop, no ceiling, no progress warnings — so
+`NESTWEAVER_DRAIN_TIMEOUT_SECS` does not govern `daemon stop` at all. It only
+derives that command's SIGKILL grace (see the table below). Because the
+broadcast closes every listener at once, reads are down for the entire stop
+grace, not just at the end of it.
+
+On the `Shutdown`-RPC path, `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) means
 two different things depending on what is still in flight. While a WRITE RPC is
 running it is a reporting threshold, not a kill switch — those run on
 `spawn_blocking` threads that cannot be aborted, so past the ceiling the daemon
-keeps waiting and logs what it is waiting on; SIGKILL is the only thing that
-ends a stuck write (`nestweaver daemon stop` escalates to it, but its SIGTERM
-closes every listener first). While only an INDEX job is in flight it is a real
-deadline: the daemon signals shutdown at the ceiling, because the worker's
-`indexing_active` flag cannot clear once the pool is drained with a non-empty
-queue, so waiting on it would hang forever. During a write drain MOST reads keep
-being served — `embed` and `plan_embed` are the exception, they take the same
-write gate and block until the write finishes.
+keeps waiting, keeps serving reads, and logs what it is waiting on; SIGKILL is
+the only thing that ends a stuck write. While only an INDEX job is in flight it
+is a real deadline: the daemon signals shutdown at the ceiling — which closes
+every listener and STOPS READ SERVICE — because the worker's `indexing_active`
+flag cannot clear once the pool is drained with a non-empty queue, so waiting on
+it would hang forever. Note the inversion: the unbounded write branch preserves
+reads, while the bounded index branch is the one that ends them. During a write
+drain MOST reads keep being served — `embed` and `plan_embed` are the exception,
+they take the same write gate and block until the write finishes.
 Indexing is CPU-throttled to a rolling 5s duty-cycle window so a saturated
 daemon stays under macOS CPU-violation limits; tune with
 `NESTWEAVER_INDEX_CPU_PERCENT` (percent of one core, 1–99, default 50; `0` or
@@ -54,8 +70,8 @@ by an error message the tool can print, so they belong somewhere findable.
 |----------|---------|---------|
 | `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` | 30 | How long a client waits for the daemon to bind its socket. Raise it on a slow cold start; the boot-failure message names it. Boot phase timings (`boot_ms`, `store_open_ms`, `extension_reconcile_ms`, `unattributed_ms`) are logged at bind so a slow boot is diagnosable rather than guessed at. |
 | `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a non-terminal warning naming this variable. Cancellation is COOPERATIVE and only observed up to the pre-write boundary, so the final stream event says whether the run aborted before writing or committed anyway (committed-after-cancellation names `index --force` as the repair). |
-| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | How long a shutting-down daemon drains before it stops waiting quietly. With an in-flight write RPC it is NOT a deadline — the daemon cannot abort one, so past this point it keeps waiting, keeps serving most reads (`embed`/`plan_embed` excepted — they take the write gate), logs the in-flight count, and names SIGKILL as the only escape. With only an index job in flight it IS a deadline: the daemon signals shutdown at the ceiling, which stops read service, because `indexing_active` cannot clear once the worker pool is drained with a non-empty queue. |
-| `NESTWEAVER_STOP_GRACE_SECS` | — | Grace period before a stopping daemon is escalated. |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling for the gRPC `Shutdown` RPC — NOT for `daemon stop`, whose SIGTERM skips the drain entirely. With an in-flight write RPC it is NOT a deadline: the daemon cannot abort one, so past this point it keeps waiting, keeps serving most reads (`embed`/`plan_embed` excepted — they take the write gate), logs the in-flight count, and names SIGKILL as the only escape. With only an index job in flight it IS a deadline: the daemon signals shutdown at the ceiling, which stops read service, because `indexing_active` cannot clear once the worker pool is drained with a non-empty queue. Also derives `NESTWEAVER_STOP_GRACE_SECS` and the client's owner-release wait (ceiling + 5s). |
+| `NESTWEAVER_STOP_GRACE_SECS` | drain ceiling + 30 (690) | How long `daemon stop` waits after SIGTERM before escalating to SIGKILL. Unset, it is derived from `NESTWEAVER_DRAIN_TIMEOUT_SECS` + 30s rather than a fixed value a real index would blow past. Unlike the drain ceiling this IS a deadline: a write still running when it expires is SIGKILLed. SIGTERM closes every listener immediately, so reads are down for the whole window, not just at the end. |
 | `NESTWEAVER_INDEX_CPU_PERCENT` | 50 | Index CPU duty cycle, percent of one core (1–99; `0` or `>=100` disables). Also see the launchd note below. |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Opt-in required to honour `--no-daemon` / `NESTWEAVER_NO_DAEMON` outside CI. Without it the bypass is REFUSED, because it circumvents the single-writer lock. Not for normal use. |
 | `NESTWEAVER_LBUG_MAX_THREADS` | 1 | Engine thread-pool size. `1` closes the nw-073 eviction-vs-read race; raise only if you measure a query-latency cost. |
@@ -217,7 +233,7 @@ Sidecar files written alongside the database:
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
 - `<db>.interactions.json` — agent interaction memory (query patterns, access frequency, follow-up signals)
 - `<db>.perspectives.json` — saved web UI perspectives (web crate only)
-- `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read)
+- `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read). Every entry also records the response-SHAPE version of the binary that wrote it (derived by `nestweaver-mcp/build.rs` from the shape-relevant crate sources). Foreign-shape entries are dropped at open and refused on lookup, so a release that adds a response field cannot serve the old shape from cache across an upgrade. The digest is deliberately over-broad: a comment-only edit in a hashed crate also invalidates the cache, costing one recompute
 - `<db>.parsed_cache.bin` — Cached parse results (symbols, references, type bindings) keyed by content hash, for skipping re-parsing unchanged files
 - `<db>.resolution_deps.bin` — Per-file resolution dependency tracker for incremental cross-file resolution
 - `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE (nw-103's import fan-out) cannot repair edges already written — only re-indexing can
