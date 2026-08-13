@@ -5233,7 +5233,12 @@ mod tests {
     /// look like a broken lease; a generous one costs nothing when healthy and
     /// still fails in bounded time when the handoff is truly broken. The
     /// ordering assertions in the test remain exact.
-    const PUBLICATION_HANDOFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    ///
+    /// 30s is ~6x the whole test's observed runtime under load (2.1-5.5s), so
+    /// it is unreachable without a real deadlock, while still failing fast
+    /// enough to be useful: the CI job that runs this sets no `timeout-minutes`,
+    /// so a hung wait would otherwise sit until GitHub's 360-minute default.
+    const PUBLICATION_HANDOFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[test]
     fn overlapping_publications_serialize_before_the_second_mutation() {
