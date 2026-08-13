@@ -95,10 +95,17 @@ pub struct CacheEntry {
     #[serde(default)]
     pub last_access: f64,
     /// Response-shape version of the binary that wrote this entry. HIT requires
-    /// equality (H1). Entries from a sidecar written before this field existed
-    /// decode as `0` (JSON) or fail the whole document (MessagePack, which
-    /// encodes structs positionally) — both outcomes are safe, since a real
-    /// shape version is never `0`.
+    /// equality (H1).
+    ///
+    /// Entries from a sidecar written before this field existed decode as `0`
+    /// on BOTH paths, and are therefore dropped by [`ResponseCache::open`]: a
+    /// real shape version is never `0` (`nestweaver-mcp`'s `build.rs` sets the
+    /// low bit to guarantee it). MessagePack encodes structs positionally, so
+    /// the old entry is a shorter array — but `#[serde(default)]` makes the
+    /// derived `visit_seq` substitute the default for the missing trailing
+    /// element rather than erroring, exactly as it already does for
+    /// `last_access` above. Both the binary and legacy-JSON paths are covered
+    /// by tests; do not assume the shorter array fails to decode.
     #[serde(default)]
     pub shape_version: u64,
 }
@@ -649,9 +656,83 @@ mod tests {
         assert_eq!(cache.get(key, 1, 1), None);
     }
 
-    /// A sidecar written before `shape_version` existed must not be served.
-    /// The JSON legacy path decodes it with `shape_version: 0`; a real binary
-    /// never uses 0, so it misses.
+    /// The entry layout every pre-`shape_version` binary wrote: the fields of
+    /// [`CacheEntry`] as they stood before H1, in declaration order. Serializing
+    /// THIS is what makes the test below a real upgrade test — it produces the
+    /// 7-element MessagePack array an old binary actually left on disk, rather
+    /// than a new-format entry with a zeroed field.
+    #[derive(Serialize)]
+    struct LegacyCacheEntry {
+        key_hash: u64,
+        tool: String,
+        response: Vec<u8>,
+        created_at: f64,
+        generation: u64,
+        scope_digest: u64,
+        last_access: f64,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyCacheDoc {
+        entries: Vec<LegacyCacheEntry>,
+    }
+
+    /// The real-world upgrade path: every live sidecar is binary `NWRC`
+    /// (MessagePack + ZSTD), not JSON. A binary sidecar written by a
+    /// pre-`shape_version` release must not be served.
+    ///
+    /// This also pins the decode behavior the field's doc comment relies on:
+    /// the shorter 7-element array does NOT fail to decode — `#[serde(default)]`
+    /// fills the missing trailing element with `0` — so the guarantee comes
+    /// from `open()` filtering on `shape_version`, not from a decode error.
+    #[test]
+    fn pre_shape_version_binary_sidecar_is_dropped_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let key = ResponseCache::key("brain_search", &json!({"query": "q"}));
+        let payload = zstd::encode_all(&b"{\"query\":\"q\"}"[..], ZSTD_LEVEL).unwrap();
+
+        let doc = LegacyCacheDoc {
+            entries: vec![LegacyCacheEntry {
+                key_hash: key,
+                tool: "brain_search".to_string(),
+                response: payload,
+                created_at: now_secs(),
+                generation: 5,
+                scope_digest: 99,
+                last_access: now_secs(),
+            }],
+        };
+        // Exactly how the old binary encoded it: MessagePack → ZSTD → NWRC.
+        let msgpack = rmp_serde::to_vec(&doc).unwrap();
+        let compressed = zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.push(CACHE_VERSION);
+        bytes.extend_from_slice(&compressed);
+        std::fs::write(ResponseCache::sidecar_path(&db_path), &bytes).unwrap();
+
+        // The document itself still decodes — assert that directly so a future
+        // change to serde/rmp behavior is caught here rather than silently
+        // turning this test into a decode-failure test that proves nothing.
+        let decoded = decode_cache_bytes(&bytes).expect("legacy 7-field entry must still decode");
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(
+            decoded.entries[0].shape_version, 0,
+            "a missing trailing field must default to 0, not error"
+        );
+
+        // And the cache must still refuse to serve it.
+        let mut cache = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB, TEST_SHAPE);
+        assert_eq!(
+            cache.len(),
+            0,
+            "a pre-shape_version binary sidecar must be dropped on open"
+        );
+        assert_eq!(cache.get(key, 5, 99), None);
+    }
+
+    /// The same guarantee on the legacy JSON path.
     #[test]
     fn pre_shape_version_sidecar_is_not_served() {
         let dir = tempfile::tempdir().unwrap();
