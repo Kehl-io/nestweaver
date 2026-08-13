@@ -1439,6 +1439,22 @@ fn dispatch_uncached(
 
 // ── F16: response cache ──────────────────────────────────────────────────────
 
+// H1: `RESPONSE_SHAPE_VERSION` — a content digest of the workspace sources,
+// computed by `build.rs`, that identifies the response SHAPES this binary
+// produces.
+//
+// The cache's other validity checks (`graph_generation`, `scope_digest`, TTL)
+// all describe the GRAPH. None of them describes the BINARY, so before this
+// existed an upgrade that added a field to a cached tool's response kept
+// serving pre-upgrade entries — the old shape, missing the new field — for up
+// to the full 24h TTL on an untouched graph.
+//
+// It is DERIVED, not hand-maintained, precisely so that a future author who
+// adds a response field does not have to remember anything: editing any
+// workspace source changes the digest and the cache invalidates itself. See
+// `crates/nestweaver-mcp/build.rs` for the scope and its one documented gap.
+include!(concat!(env!("OUT_DIR"), "/response_shape_version.rs"));
+
 /// Deterministic READ tools whose responses are safe to cache. A tool qualifies
 /// only if, given the same graph (same generation + scope digest) and the same
 /// normalized args, it returns the same response.
@@ -1807,9 +1823,9 @@ fn maybe_cached(
     // Lazily initialise the in-process cache for this db path, then check for a hit.
     let hit_bytes = RESPONSE_CACHE.with(|map| {
         let mut map = map.borrow_mut();
-        let cache = map
-            .entry(db_path.clone())
-            .or_insert_with(|| nestweaver_store::cache::ResponseCache::open(&db_path, max_mb));
+        let cache = map.entry(db_path.clone()).or_insert_with(|| {
+            nestweaver_store::cache::ResponseCache::open(&db_path, max_mb, RESPONSE_SHAPE_VERSION)
+        });
         cache.get(key, generation, scope_digest)
     });
 
@@ -1856,7 +1872,11 @@ fn maybe_cached(
             let should_flush = RESPONSE_CACHE.with(|map| {
                 let mut map = map.borrow_mut();
                 let cache = map.entry(db_path.clone()).or_insert_with(|| {
-                    nestweaver_store::cache::ResponseCache::open(&db_path, max_mb)
+                    nestweaver_store::cache::ResponseCache::open(
+                        &db_path,
+                        max_mb,
+                        RESPONSE_SHAPE_VERSION,
+                    )
                 });
                 cache.insert(key, name, &bytes, generation, scope_digest);
                 let count = FLUSH_COUNTER.with(|c| {
@@ -1905,7 +1925,11 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
         if let Some(cache) = map.get(db_path) {
             (cache.size_bytes(), cache.len())
         } else {
-            let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+            let cache = nestweaver_store::cache::ResponseCache::open(
+                db_path,
+                max_mb,
+                RESPONSE_SHAPE_VERSION,
+            );
             (cache.size_bytes(), cache.len())
         }
     });
@@ -10345,6 +10369,85 @@ mod cache_dispatch_tests {
         FLUSH_COUNTER.with(|c| c.set(0));
     }
 
+    /// H1: an upgrade must not serve a pre-upgrade response shape.
+    ///
+    /// Before the fix this test failed: the entry below satisfies the persisted
+    /// `graph_generation`, the scope digest and the 24h TTL, so `brain_search`
+    /// returned it verbatim (`hits=1 misses=0`) — without `semantic_applied` or
+    /// `degraded_components`, exactly the "no semantic leg vs not implemented"
+    /// ambiguity those fields exist to remove.
+    #[test]
+    fn pre_upgrade_response_shape_is_never_served() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "query": "greet", "limit": 5 });
+        // An entry exactly as the PREVIOUS binary would have left it on disk:
+        // same key algorithm, same persisted generation, same scope digest,
+        // written < 24h ago — but a response body without the fields the
+        // CURRENT binary emits, and stamped with that binary's shape version.
+        let key = nestweaver_store::cache::ResponseCache::key("brain_search", &args);
+        let scope_digest = whole_db_scope_digest(&db_path);
+        let old_shape = br#"{"query":"greet","engine":"bm25","results":[],"total_matches":0}"#;
+        let mut cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION ^ 0xD1FF,
+        );
+        cache.insert(
+            key,
+            "brain_search",
+            old_shape,
+            store.graph_generation(),
+            scope_digest,
+        );
+        cache.save();
+        reset_session();
+
+        let served = dispatch(&store, None, "brain_search", args, None).unwrap();
+        assert_ne!(
+            served,
+            serde_json::from_slice::<Value>(old_shape).unwrap(),
+            "the pre-upgrade entry must not be served verbatim"
+        );
+        assert_eq!(
+            CACHE_HITS.with(|c| c.get()),
+            0,
+            "a foreign-shape entry must not count as a hit"
+        );
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert!(
+            served.get("semantic_applied").is_some(),
+            "the recomputed response must carry the current shape's fields"
+        );
+        assert!(served.get("degraded_components").is_some());
+    }
+
+    /// The companion to the test above: the guard must not be so blunt that it
+    /// breaks caching. Same binary, same graph → still a hit.
+    #[test]
+    fn matching_shape_version_still_hits() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "query": "greet", "limit": 5 });
+        let _ = dispatch(&store, None, "brain_search", args.clone(), None).unwrap();
+        flush_response_cache();
+        RESPONSE_CACHE.with(|m| m.borrow_mut().clear());
+        let second = dispatch(&store, None, "brain_search", args, None).unwrap();
+
+        assert_eq!(
+            CACHE_HITS.with(|c| c.get()),
+            1,
+            "an entry written by THIS binary must still hit after a reopen"
+        );
+        assert!(second.get("semantic_applied").is_some());
+    }
+
     #[test]
     fn same_query_twice_is_a_cache_hit_byte_identical() {
         reset_session();
@@ -10369,6 +10472,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert_eq!(cache.len(), 1);
         // Exactly one miss (1st) then one hit (2nd).
@@ -10434,6 +10538,7 @@ mod cache_dispatch_tests {
         let mut cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         cache.insert(
             key,
@@ -10489,6 +10594,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(cache.is_empty(), "dirty responses must not be retained");
     }
@@ -10567,6 +10673,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -10701,6 +10808,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -10866,6 +10974,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -11025,6 +11134,7 @@ mod cache_dispatch_tests {
         let persisted_cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             persisted_cache.is_empty(),
@@ -11072,6 +11182,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
