@@ -5719,6 +5719,199 @@ fn remove_unowned_daemon_runtime(
     RuntimeCleanup::Removed
 }
 
+/// How long a failed start waits for its dying child to release the pidfile
+/// before giving up on retracting the claim. Only ever spent on a start that
+/// has already failed.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const FAILED_START_PIDFILE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What happened to the pidfile line a failed start left behind.
+///
+/// Wired into the non-macOS `daemonize2` launcher only, because that is the
+/// path whose failure was observed and can be tested here. macOS starts its
+/// temporary daemon through `claim_pidfile_lock`, which has the same
+/// write-before-proof shape; leaving it alone is deliberate rather than a
+/// judgement that it is fine. Compiled and unit-tested on every platform.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedStartPidfile {
+    /// The pidfile named a dead process and nobody held its lock, so the claim
+    /// was emptied. The file itself stays.
+    Retracted { pid: i32 },
+    /// No pidfile at that path.
+    Absent,
+    /// The pidfile claims nothing already.
+    AlreadyEmpty,
+    /// The named process is alive — it may be the daemon that won this
+    /// instance. Not ours to retract.
+    NamesLiveProcess { pid: i32 },
+    /// Another open file description holds the flock: a daemon owns this
+    /// inode right now.
+    Locked,
+    /// Could not open the pidfile, or its contents are not a PID. Fail closed.
+    Unreadable,
+}
+
+/// Retract the pidfile claim a *failed* start left behind, and only that.
+///
+/// `daemonize2` writes the pidfile before the child has proven it can open the
+/// database, so a start that loses the database-lock race exits leaving the
+/// pidfile naming its own dead PID while the healthy daemon keeps running.
+/// `status` recovers through the socket peer, so this never broke anything by
+/// itself — but a pidfile that names a dead process is exactly what makes an
+/// operator run `rm daemon.pid`, and that hand-removal under a live daemon IS
+/// the runtime-ownership incident. The lie is the hazard; remove the lie.
+///
+/// Two conditions, both required, both about *this* inode:
+///
+///  * nothing holds the `flock` — a live daemon (launcher-inherited or
+///    `claim_pidfile_lock`) holds it for its entire lifetime, so contention
+///    means an owner exists and we must not touch its file; and
+///  * the PID written there is dead (`kill(pid, 0)` → `ESRCH`) — a dead PID
+///    cannot be any daemon, so emptying its claim destroys no evidence.
+///
+/// Deliberately EMPTIES rather than unlinks. Unlinking is the operator action
+/// this whole class of bug comes from: it would hand a concurrent starter a
+/// fresh inode outside our lock, and it would make `remove_unowned_daemon_
+/// runtime` read "pidfile missing while the socket is present" — the
+/// fingerprint of hand-removed state — on a path we removed ourselves. An empty
+/// pidfile is the honest statement "no PID is claimed here".
+///
+/// That statement is only honest if every reader agrees, and the first version
+/// of this claimed they all did on the strength of three spot checks
+/// (`read_pid`, `daemon status`, the launcher's own flock branch). They were
+/// not all of them: `ensure_no_live_daemon_for_restore` and
+/// `ensure_no_live_daemon_for_snapshot_build` parsed the contents as an `i32`
+/// and failed CLOSED on the error, so `backup restore` and `snapshot build`
+/// both refused after a failed start — and the only remedy their message
+/// offered was "remove the stale pidfile", the exact operator action this
+/// branch exists to stop provoking. Both now treat empty as "no claim →
+/// permit". If you add a pidfile reader, it has to handle empty; there is no
+/// blanket guarantee here, only a maintained list.
+///
+/// Deliberately does NOT restore the previous contents: the value this
+/// overwrote was the pre-start PID, which is either equally dead or a daemon
+/// whose flock lives on an inode this path no longer refers to. Neither is a
+/// truth worth reinstating.
+///
+/// Lock first, write second — the same discipline as `claim_pidfile_lock`, for
+/// the same reason: truncating before the lock decides whether we may touch the
+/// file is what let a losing starter blank the winner's pidfile.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn retract_failed_start_pidfile(pidfile: &std::path::Path) -> FailedStartPidfile {
+    use std::io::{Read, Seek};
+    use std::os::unix::io::AsRawFd;
+
+    // No `create(true)`: a cleanup path has no business materializing the file
+    // it is about to blank.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FailedStartPidfile::Absent;
+        }
+        Err(_) => return FailedStartPidfile::Unreadable,
+    };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return FailedStartPidfile::Locked;
+    }
+    let outcome = (|| {
+        let mut contents = String::new();
+        if file.seek(std::io::SeekFrom::Start(0)).is_err()
+            || file
+                .by_ref()
+                .take(64)
+                .read_to_string(&mut contents)
+                .is_err()
+        {
+            return FailedStartPidfile::Unreadable;
+        }
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            return FailedStartPidfile::AlreadyEmpty;
+        }
+        let Ok(pid) = trimmed.parse::<i32>() else {
+            return FailedStartPidfile::Unreadable;
+        };
+        // Only ESRCH proves death. EPERM means a live process we cannot
+        // signal — still alive, so still not ours to retract.
+        if pid <= 0 {
+            return FailedStartPidfile::Unreadable;
+        }
+        if unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        {
+            return FailedStartPidfile::NamesLiveProcess { pid };
+        }
+        if file.set_len(0).is_err() {
+            return FailedStartPidfile::Unreadable;
+        }
+        FailedStartPidfile::Retracted { pid }
+    })();
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
+    outcome
+}
+
+/// [`retract_failed_start_pidfile`], retried until `deadline` while the only
+/// thing standing in the way is a process that has not finished dying.
+///
+/// The launcher can observe its start as failed before the daemonized
+/// grandchild has actually exited, and a still-running loser both holds the
+/// flock and answers `kill(pid, 0)`. Both refusals are transient in exactly
+/// that case, so give them a bounded chance to resolve. A genuinely healthy
+/// daemon refuses for the whole window and is left untouched — which is the
+/// correct outcome, merely a slower one, on a path that has already failed.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn retract_failed_start_pidfile_within(
+    pidfile: &std::path::Path,
+    deadline: std::time::Duration,
+) -> FailedStartPidfile {
+    let started = std::time::Instant::now();
+    loop {
+        let outcome = retract_failed_start_pidfile(pidfile);
+        match outcome {
+            FailedStartPidfile::NamesLiveProcess { .. } | FailedStartPidfile::Locked
+                if started.elapsed() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => return outcome,
+        }
+    }
+}
+
+/// Report what became of a failed start's pidfile claim. Only the interesting
+/// outcomes speak: a retraction changed on-disk state, and a refusal explains
+/// why a stale-looking PID is still there.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn report_failed_start_pidfile(outcome: FailedStartPidfile, pidfile: &std::path::Path) {
+    match outcome {
+        FailedStartPidfile::Retracted { pid } => eprintln!(
+            "Cleared this failed start's pidfile claim ({} named PID {pid}, which is not running).",
+            pidfile.display()
+        ),
+        FailedStartPidfile::NamesLiveProcess { pid } => eprintln!(
+            "Left {} alone: it names PID {pid}, which is still running.",
+            pidfile.display()
+        ),
+        FailedStartPidfile::Locked => eprintln!(
+            "Left {} alone: another process holds its lock.",
+            pidfile.display()
+        ),
+        FailedStartPidfile::Unreadable => eprintln!(
+            "Left {} alone: its contents could not be read as a PID.",
+            pidfile.display()
+        ),
+        FailedStartPidfile::Absent | FailedStartPidfile::AlreadyEmpty => {}
+    }
+}
+
 /// Say out loud when runtime files were deliberately left in place. Silence
 /// here is what let an operator believe deleting them by hand was harmless.
 fn report_runtime_cleanup(outcome: &RuntimeCleanup) {
@@ -12847,6 +13040,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                          Check the logs: {}",
                                         parent.first_child_exit_status, log_hint
                                     );
+                                    report_failed_start_pidfile(
+                                        retract_failed_start_pidfile_within(
+                                            &pidfile,
+                                            FAILED_START_PIDFILE_GRACE,
+                                        ),
+                                        &pidfile,
+                                    );
                                     std::process::exit(EXIT_ERROR);
                                 }
                                 match wait_for_started_daemon(
@@ -12867,6 +13067,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     }
                                     Err(error) => {
                                         eprintln!("Error: {error:#}");
+                                        // daemonize2 wrote the pidfile BEFORE
+                                        // the child proved it could open the
+                                        // database, so a start that lost the
+                                        // race has just left a pidfile naming
+                                        // its own dead PID beside a healthy
+                                        // daemon. Retract that claim: a
+                                        // stale-looking pidfile is what
+                                        // provokes `rm daemon.pid`, and that
+                                        // removal under a live daemon is the
+                                        // incident this branch exists to
+                                        // prevent.
+                                        report_failed_start_pidfile(
+                                            retract_failed_start_pidfile_within(
+                                                &pidfile,
+                                                FAILED_START_PIDFILE_GRACE,
+                                            ),
+                                            &pidfile,
+                                        );
                                         std::process::exit(EXIT_ERROR);
                                     }
                                 }
@@ -12876,6 +13094,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // path, so give the parent its stderr one back
                                 // before reporting the failure.
                                 restore_parent_stderr_tracing();
+                                // Deliberately NOT retracting the pidfile here.
+                                // `execute()` failed in the parent, so no child
+                                // of ours ever wrote one: anything at that path
+                                // predates this start, and blanking it would be
+                                // outside "the claim a failed start left behind,
+                                // and only that".
                                 anyhow::bail!("Failed to daemonize: {e}");
                             }
                             daemonize2::Outcome::Child(Err(e)) => {
@@ -13327,10 +13551,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             state.unidentified.len()
                         );
                     }
-                    if !state.spared.is_empty() {
+                    // Report each proof as its own fact. They are not exclusive
+                    // — a healthy daemon holds BOTH its database write lock and
+                    // its pidfile flock — so no line may be computed by
+                    // subtracting one list from another, and an empty list says
+                    // nothing at all rather than printing a zero.
+                    if !state.spared_database_write_lock.is_empty() {
                         println!(
-                            "  spared (live daemon holds the pidfile lock): {}",
-                            state.spared.len()
+                            "  spared (database write lock held): {}",
+                            state.spared_database_write_lock.len()
+                        );
+                        for (instance, pid) in &state.spared_database_write_lock {
+                            match pid {
+                                Some(pid) => println!("    {instance}: held by PID {pid}"),
+                                None => {
+                                    println!("    {instance}: held, but the kernel named no holder")
+                                }
+                            }
+                        }
+                    }
+                    if !state.spared_pidfile_lock.is_empty() {
+                        println!(
+                            "  spared (pidfile lock held): {}",
+                            state.spared_pidfile_lock.len()
+                        );
+                    }
+                    // NOT evidence of ownership — evidence that we could not
+                    // tell. Kept on its own line so it can never be read as
+                    // "something holds this".
+                    if !state.spared_database_unreadable.is_empty() {
+                        println!(
+                            "  spared (database lock state unreadable — spared conservatively): {}",
+                            state.spared_database_unreadable.len()
                         );
                     }
                     // Surfaced rather than folded into "kept": these are
@@ -19811,9 +20063,18 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// anything we cannot confirm is treated as still-running:
 /// - no `.lbug` in `data_dir` (fresh target, nothing to serve) → **permit**
 /// - pidfile absent → **permit**
+/// - pidfile present but EMPTY → **permit** (see below)
 /// - pidfile parses to a live pid → **refuse**
 /// - pidfile parses to a dead/stale pid → **permit**
 /// - pidfile present but unreadable / unparseable → **refuse**
+///
+/// Empty is "no PID is claimed here", which is the same fact as an absent
+/// pidfile and must be permitted for the same reason. It is not merely
+/// hypothetical: [`retract_failed_start_pidfile`] produces exactly this state
+/// after a start that lost the database-lock race. Treating it as unparseable
+/// refused the restore and told the operator to "remove the stale pidfile" —
+/// pushing them toward the `rm daemon.pid` that causes the runtime-ownership
+/// incident. Fail-closed on garbage is unchanged; empty is not garbage.
 fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
     let Some(db) = find_lbug_in_dir(data_dir) else {
         return Ok(());
@@ -19832,6 +20093,12 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
              / `nestweaver server stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
+        // Present but EMPTY → claims no PID at all, which is the same fact as
+        // an absent pidfile → permit. `retract_failed_start_pidfile` leaves
+        // exactly this after a failed start; refusing here would tell the
+        // operator to remove the pidfile by hand, which is the action this
+        // whole branch exists to stop provoking.
+        Ok(contents) if contents.trim().is_empty() => Ok(()),
         Ok(contents) => match contents.trim().parse::<i32>() {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
@@ -19863,7 +20130,9 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
 /// the wrong pidfile, miss the daemon actually writing this DB, and capture a
 /// torn hot-copy. Fail CLOSED on a present-but-unreadable/garbage pidfile — we
 /// cannot confirm the daemon is stopped, so refuse rather than risk a torn
-/// snapshot. Mirrors [`ensure_no_live_daemon_for_restore`].
+/// snapshot. An EMPTY pidfile claims no PID and is treated like an absent one;
+/// see [`ensure_no_live_daemon_for_restore`], which this mirrors, for why that
+/// distinction matters after a failed `daemon start`.
 fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
@@ -19878,6 +20147,10 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
              daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
+        // Present but EMPTY → no PID is claimed → quiesced, exactly as an
+        // absent pidfile is. This is the state a failed `daemon start` leaves
+        // behind via `retract_failed_start_pidfile`.
+        Ok(contents) if contents.trim().is_empty() => Ok(()),
         Ok(contents) => match contents.trim().parse::<i32>() {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
@@ -21217,6 +21490,32 @@ mod restore_guard_tests {
         assert!(sidecar.exists(), "sidecar untouched");
         assert!(!data_dir.path().with_extension("restoring").exists());
     }
+
+    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
+    /// permit the restore. This is the state `retract_failed_start_pidfile`
+    /// leaves after a failed `daemon start`; refusing here blocked a
+    /// destructive-but-legitimate restore and told the operator to "remove the
+    /// stale pidfile", which is the action this branch exists to stop
+    /// provoking. Fail-closed on genuine garbage is unchanged.
+    #[test]
+    fn restore_permits_an_empty_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+
+        let (data_dir, _db, _sidecar, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("an empty pidfile claims nothing and must not block a restore");
+
+        std::fs::write(&pidfile, b"  \n").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("a whitespace-only pidfile claims nothing either");
+
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect_err("garbage must still fail closed");
+    }
 }
 
 #[cfg(test)]
@@ -21310,6 +21609,34 @@ mod snapshot_build_guard_tests {
         let err = ensure_no_live_daemon_for_snapshot_build(&db)
             .expect_err("build must refuse when the pidfile cannot be parsed");
         assert!(err.to_string().contains("pidfile"), "err was: {err}");
+    }
+
+    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
+    /// permit the build. `retract_failed_start_pidfile` produces this state
+    /// after a failed `daemon start`; treating it as unparseable refused every
+    /// later `snapshot build` and told the operator to "remove the stale
+    /// pidfile" — the `rm daemon.pid` that causes the incident this branch
+    /// exists to prevent.
+    #[test]
+    fn snapshot_build_permits_an_empty_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("an empty pidfile claims nothing and must not block a build");
+
+        // Whitespace-only is the same claim, and a retraction that left a
+        // trailing newline must not be treated differently from one that did
+        // not.
+        std::fs::write(&pidfile, b"\n").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a whitespace-only pidfile claims nothing either");
+
+        // Garbage still fails closed: empty is not the same as unparseable.
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db).expect_err("garbage must still fail closed");
     }
 
     #[test]
@@ -23124,6 +23451,157 @@ mod daemon_cli_tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD),
             "PID {pid} must no longer be a waitable zombie"
+        );
+    }
+
+    /// A PID that is certainly dead: spawn, wait, and reuse the reaped id.
+    /// Every test below takes its inputs as paths and PIDs, so none of them
+    /// touches process-global state and none needs an env lock.
+    #[cfg(unix)]
+    fn reaped_pid() -> i32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id() as i32;
+        child.wait().expect("reap the short-lived child");
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the harness needs PID {pid} to be dead"
+        );
+        pid
+    }
+
+    /// The gap: `daemonize2` writes the pidfile before the child proves it can
+    /// open the database, so a losing start leaves the file naming its own dead
+    /// PID. Retract the claim — and keep the FILE, because unlinking is the
+    /// operator action this entire class of bug comes from.
+    #[cfg(unix)]
+    #[test]
+    fn failed_start_retracts_a_pidfile_claim_naming_its_own_dead_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let dead = reaped_pid();
+        std::fs::write(&pidfile, format!("{dead}")).unwrap();
+
+        assert_eq!(
+            retract_failed_start_pidfile(&pidfile),
+            FailedStartPidfile::Retracted { pid: dead }
+        );
+        assert!(pidfile.exists(), "the pidfile itself must not be unlinked");
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "");
+
+        // Idempotent: a second pass has nothing to say.
+        assert_eq!(
+            retract_failed_start_pidfile(&pidfile),
+            FailedStartPidfile::AlreadyEmpty
+        );
+    }
+
+    /// A live daemon holds its pidfile flock for its whole lifetime. Contention
+    /// is an owner, and an owner's pidfile is never ours to blank — this is the
+    /// guard that keeps the retraction from becoming the very bug it cleans up
+    /// after.
+    #[cfg(unix)]
+    #[test]
+    fn failed_start_leaves_a_locked_pidfile_untouched() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let dead = reaped_pid();
+        std::fs::write(&pidfile, format!("{dead}")).unwrap();
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        assert_eq!(
+            retract_failed_start_pidfile(&pidfile),
+            FailedStartPidfile::Locked
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap(),
+            format!("{dead}"),
+            "a locked pidfile's contents must survive"
+        );
+
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(owner);
+        assert_eq!(
+            retract_failed_start_pidfile(&pidfile),
+            FailedStartPidfile::Retracted { pid: dead }
+        );
+    }
+
+    /// The pidfile may name the daemon that WON. A living PID is never
+    /// retracted, however the start that observed it turned out.
+    #[cfg(unix)]
+    #[test]
+    fn failed_start_never_retracts_a_pidfile_naming_a_live_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let alive = std::process::id() as i32;
+        std::fs::write(&pidfile, format!("{alive}\n")).unwrap();
+
+        assert_eq!(
+            retract_failed_start_pidfile(&pidfile),
+            FailedStartPidfile::NamesLiveProcess { pid: alive }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap(),
+            format!("{alive}\n")
+        );
+        // And the bounded wait gives up on it rather than spinning forever.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            retract_failed_start_pidfile_within(&pidfile, std::time::Duration::from_millis(120)),
+            FailedStartPidfile::NamesLiveProcess { pid: alive }
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Fail closed on everything ambiguous, and never create the file.
+    #[cfg(unix)]
+    #[test]
+    fn failed_start_pidfile_retraction_fails_closed_on_ambiguous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-written.pid");
+        assert_eq!(
+            retract_failed_start_pidfile(&missing),
+            FailedStartPidfile::Absent
+        );
+        assert!(
+            !missing.exists(),
+            "the retraction must never materialize a pidfile"
+        );
+
+        let garbage = dir.path().join("garbage.pid");
+        std::fs::write(&garbage, "not-a-pid").unwrap();
+        assert_eq!(
+            retract_failed_start_pidfile(&garbage),
+            FailedStartPidfile::Unreadable
+        );
+        assert_eq!(std::fs::read_to_string(&garbage).unwrap(), "not-a-pid");
+
+        let zero = dir.path().join("zero.pid");
+        std::fs::write(&zero, "0\n").unwrap();
+        assert_eq!(
+            retract_failed_start_pidfile(&zero),
+            FailedStartPidfile::Unreadable
+        );
+
+        let empty = dir.path().join("empty.pid");
+        std::fs::write(&empty, "\n").unwrap();
+        assert_eq!(
+            retract_failed_start_pidfile(&empty),
+            FailedStartPidfile::AlreadyEmpty
         );
     }
 
