@@ -521,9 +521,11 @@ alongside the returned rows:
   `brain_search` is keyword/BM25-only and never requests a semantic leg, so
   neither can it be degraded. Both are reported rather than omitted so a
   caller checking them can distinguish "no semantic leg" from "field not
-  implemented on this path". The direct gRPC daemon response and both MCP
-  paths agree on this. Note the hybrid merge below does **not** yet carry
-  these two keys through, so a merged response may omit them entirely.
+  implemented on this path". The direct gRPC daemon response, both MCP paths,
+  and the hybrid merge below all agree on this. In a merge, `semantic_applied`
+  is the AND across contributing tiers (only claimed when every tier applied
+  it) and `degraded_components` is their deduplicated union (a component
+  degraded in either tier is degraded in the merged answer).
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
 server responses have valid, internally consistent exact-count metadata and

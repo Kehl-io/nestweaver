@@ -2306,6 +2306,26 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     assert_eq!(resp["returned_matches"], resp["total_matches"]);
     assert_eq!(resp["truncated"], false);
 
+    // Honesty fields must survive the federated merge. Both tiers are
+    // keyword/BM25-only and report `semantic_applied: false` with an empty
+    // `degraded_components`; the merged response a real hybrid caller
+    // receives must carry both, not drop them. Dropping them re-introduces
+    // exactly the ambiguity the fields exist to remove: a caller could not
+    // tell "no semantic leg ran" from "this path does not implement the
+    // field" from "the server is older than the field".
+    assert_eq!(
+        resp["semantic_applied"],
+        json!(false),
+        "merged hybrid brain_search must report semantic_applied (both tiers are \
+         BM25-only, so the merged answer had no semantic leg); got {resp}"
+    );
+    assert_eq!(
+        resp["degraded_components"],
+        json!([]),
+        "merged hybrid brain_search must report degraded_components; neither tier \
+         degraded anything, so the merged union is empty; got {resp}"
+    );
+
     // Symmetry: a local-only symbol must also surface through the same merge,
     // with both sources still labelled.
     let resp_local = hybrid

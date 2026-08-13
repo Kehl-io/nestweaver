@@ -158,6 +158,100 @@ fn union_expansion_terms(local: &Value, server: &Value) -> Vec<String> {
     terms
 }
 
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Merge the `semantic_applied` / `degraded_components` honesty fields across
+/// the two tiers of a federated response.
+///
+/// These fields exist so a caller can tell "no semantic leg ran" apart from
+/// "the field is not implemented on this path". Rebuilding a merged response
+/// without them re-creates exactly that ambiguity, so they are merged here
+/// rather than dropped.
+///
+/// Merge rules, and why:
+///
+/// - `semantic_applied` is **conjunctive (AND across contributing tiers)**. The
+///   merged result set is a union of rows from every tier, so the property can
+///   only be claimed for the whole answer if it holds for every tier that
+///   contributed to it. If one tier ran a semantic leg and the other did not,
+///   part of the merged ranking is purely lexical, and reporting `true` would
+///   overclaim on those rows. `false` is the honest, conservative answer. Today
+///   `brain_search` is keyword/BM25-only everywhere and both tiers report
+///   `false`, making the merge trivial — but the rule is written so it stays
+///   correct the moment a real semantic leg appears on one side.
+///
+///   **Known limitation, deliberately accepted:** this collapses two states a
+///   caller might want to tell apart. "Neither tier ran a semantic leg" and
+///   "local ran one, the server did not" both emit
+///   `semantic_applied: false, degraded_components: []`. A single boolean
+///   cannot carry per-tier provenance, and inventing a vocabulary to encode it
+///   would put values into `degraded_components` that no consumer understands —
+///   the field's documented vocabulary is `"semantic"` (README, docs/server-mode.md)
+///   and agents are told it means retrieval fell back to lexical ranking. If
+///   the mixed case ever becomes reachable and callers need to distinguish it,
+///   it belongs in `_meta` as per-tier provenance, not smuggled into this list.
+///
+/// - `degraded_components` is a **deduplicated union**, in local-then-server
+///   encounter order. Degradation is a property of the merged answer as a
+///   whole: if a component was degraded while producing any tier's rows, the
+///   rows the caller received are affected by that degradation, so it must be
+///   visible. Intersection or local-only would hide a real, server-side
+///   degradation behind a healthy local tier. Order is insertion order (not
+///   sorted) so the output is deterministic and matches the surrounding
+///   `union_expansion_terms` convention.
+///
+///   **Blind spot, also accepted:** the union is over *tiers*, not over rows
+///   that survived the merge. A tier that contributed zero surviving rows still
+///   flags the merged answer degraded — reachable via `query_merge` when the
+///   server returns nothing, and via `query_fallback`, where the server is
+///   queried precisely because local was sparse. Over-reporting degradation is
+///   the safe direction (the alternative silently drops a real degradation), so
+///   this is intentional, not an oversight.
+///
+/// - **A tier that omits `semantic_applied` forces the merged value to
+///   `false`** — we cannot claim a property we were not told about. Note this
+///   is not reachable today for `brain_search`: both tiers go through
+///   `dispatch::dispatch_typed_brain_search`, which always emits both keys, and
+///   proto3 scalars mean an older server decodes to `false`/`[]` rather than to
+///   an absent field. It is defensive, not a supported detection mechanism.
+///
+/// - **If no tier reports either field, nothing is emitted.** Inventing
+///   `semantic_applied: false` out of two silent tiers would destroy the very
+///   signal these fields carry: an entirely absent field still has to read as
+///   "not implemented on this path" at the top level. This also keeps the
+///   merge a no-op for tools (regex_search, count_patterns, …) that never had
+///   these fields.
+fn merge_honesty_fields(local: &Value, server: &Value, response: &mut Value) {
+    let tiers = [local, server];
+    let any_reported = tiers.iter().any(|value| {
+        value.get("semantic_applied").is_some() || value.get("degraded_components").is_some()
+    });
+    if !any_reported {
+        return;
+    }
+
+    let mut semantic_applied = true;
+    let mut degraded: Vec<String> = Vec::new();
+    for value in tiers {
+        semantic_applied &= value
+            .get("semantic_applied")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(items) = value.get("degraded_components").and_then(Value::as_array) {
+            for component in items.iter().filter_map(Value::as_str) {
+                push_unique(&mut degraded, component.to_string());
+            }
+        }
+    }
+
+    response["semantic_applied"] = Value::Bool(semantic_applied);
+    response["degraded_components"] = serde_json::json!(degraded);
+}
+
 /// Count the number of result items in a JSON response.
 ///
 /// Handles both `{ "results": [...] }` envelope and bare arrays.
@@ -264,6 +358,12 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
         let expansion_terms = union_expansion_terms(local, server);
         response["expansion_terms"] = serde_json::json!(expansion_terms);
     }
+
+    // `wrap_merged_response` emits only `results` + `_meta`, so every field the
+    // tiers reported has to be re-added deliberately. The honesty fields are
+    // merged (not copied) — see `merge_honesty_fields` for the rules — and are
+    // a no-op for tools that never carried them.
+    merge_honesty_fields(local, server, &mut response);
 
     response
 }
@@ -1613,5 +1713,111 @@ mod tests {
         assert_eq!(merged["tokens_used"], 1200);
         assert_eq!(merged["token_budget"], 5000);
         assert!(merged.get("external_refs").is_some());
+    }
+
+    /// Shape of a `brain_search` response as both tiers emit it today:
+    /// keyword/BM25-only, so `semantic_applied: false` and no degradation.
+    fn brain_search_tier(uid: &str, semantic_applied: bool, degraded: &[&str]) -> Value {
+        json!({
+            "query": "fn",
+            "engine": "bm25",
+            "results": [{"uid": uid, "score": 0.9}],
+            "total_matches": 1,
+            "total_matches_relation": "eq",
+            "returned_matches": 1,
+            "truncated": false,
+            "semantic_applied": semantic_applied,
+            "degraded_components": degraded,
+        })
+    }
+
+    #[test]
+    fn merge_carries_honesty_fields_when_both_tiers_are_keyword_only() {
+        // The live case: both tiers are BM25-only. The merged response must
+        // still SAY so — dropping the fields is the ambiguity they exist to
+        // remove.
+        let merged = merge_json_results(
+            &brain_search_tier("a", false, &[]),
+            &brain_search_tier("b", false, &[]),
+        );
+        assert_eq!(merged["semantic_applied"], json!(false));
+        assert_eq!(merged["degraded_components"], json!([]));
+    }
+
+    #[test]
+    fn merge_semantic_applied_is_conjunctive_across_tiers() {
+        // One tier with a semantic leg and one without produces a merged row
+        // set that is only partly semantically ranked; claiming `true` would
+        // overclaim on the lexical half.
+        let mixed = merge_json_results(
+            &brain_search_tier("a", true, &[]),
+            &brain_search_tier("b", false, &[]),
+        );
+        assert_eq!(mixed["semantic_applied"], json!(false));
+
+        let mixed_other_way = merge_json_results(
+            &brain_search_tier("a", false, &[]),
+            &brain_search_tier("b", true, &[]),
+        );
+        assert_eq!(mixed_other_way["semantic_applied"], json!(false));
+
+        // Only when EVERY contributing tier applied it is it true of the whole.
+        let both = merge_json_results(
+            &brain_search_tier("a", true, &[]),
+            &brain_search_tier("b", true, &[]),
+        );
+        assert_eq!(both["semantic_applied"], json!(true));
+    }
+
+    #[test]
+    fn merge_degraded_components_unions_and_dedupes() {
+        // A component degraded in either tier is degraded in the merged answer.
+        let merged = merge_json_results(
+            &brain_search_tier("a", false, &["semantic", "reranker"]),
+            &brain_search_tier("b", false, &["semantic", "expansion"]),
+        );
+        assert_eq!(
+            merged["degraded_components"],
+            json!(["semantic", "reranker", "expansion"]),
+            "union in local-then-server encounter order, deduplicated"
+        );
+    }
+
+    #[test]
+    fn merge_cannot_claim_semantic_for_a_tier_that_did_not_report_it() {
+        // Defensive only: not reachable for brain_search today, since both tiers
+        // go through `dispatch_typed_brain_search` (which always emits both keys)
+        // and proto3 scalars decode an older server to `false`/`[]` rather than
+        // to an absent field. If a partial response ever does arrive, the merge
+        // must not upgrade it to a claim — and must NOT invent a vocabulary term
+        // in `degraded_components`, whose documented values are consumed by
+        // agents as "retrieval fell back to lexical ranking".
+        let mut partial = brain_search_tier("b", false, &[]);
+        partial.as_object_mut().unwrap().remove("semantic_applied");
+
+        let merged = merge_json_results(&brain_search_tier("a", true, &[]), &partial);
+        assert_eq!(
+            merged["semantic_applied"],
+            json!(false),
+            "a tier that did not report cannot be assumed to have applied it"
+        );
+        assert_eq!(
+            merged["degraded_components"],
+            json!([]),
+            "an unreported field is not a degraded component; do not manufacture one"
+        );
+    }
+
+    #[test]
+    fn merge_omits_honesty_fields_when_no_tier_reported_them() {
+        // Two tiers that both predate the fields (or a tool that never had
+        // them). Synthesizing `false` here would manufacture a claim nobody
+        // made and destroy the "not implemented / older server" signal that an
+        // absent field carries.
+        let local = json!({"results": [{"uid": "a", "score": 0.9}]});
+        let server = json!({"results": [{"uid": "b", "score": 0.8}]});
+        let merged = merge_json_results(&local, &server);
+        assert!(merged.get("semantic_applied").is_none());
+        assert!(merged.get("degraded_components").is_none());
     }
 }
