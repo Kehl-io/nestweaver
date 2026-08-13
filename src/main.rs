@@ -5317,11 +5317,24 @@ fn daemon_stop_signal_target(
 
 /// May the database write-lock holder be stopped?
 ///
-/// Only when its argv independently proves daemon identity — `argv[1] ==
-/// "daemon"` and this database named as a whole argument. The lock alone never
-/// qualifies a process (see [`daemon_stop_signal_target`]): `nestweaver embed
-/// --db X --local` and `nestweaver index --db X` hold the same lock and fail
-/// the argv test, which is the entire point.
+/// Only when its argv independently proves it is running the `daemon`
+/// subcommand. The lock alone never qualifies a process (see
+/// [`daemon_stop_signal_target`]): `nestweaver embed --db X --local` and
+/// `nestweaver index --db X` hold the same lock, and their first non-flag
+/// argument is `embed`/`index`, so they fail the argv test — which is the
+/// entire point, and the constraint three review rounds closed on.
+///
+/// What is deliberately NOT required here is that the database appear as an
+/// ARGUMENT. `argv_is_our_daemon` demands that because its PID comes from a
+/// pidfile, which says nothing about which database the process serves. Here
+/// the PID comes from the kernel's own record-lock holder for THIS database
+/// file, which is strictly stronger evidence of "serves this database" than
+/// any argv text could be. Requiring the path twice only excluded the ways a
+/// daemon can legitimately be told which database to open without naming it in
+/// argv — `NESTWEAVER_DB` in the environment (a documented first-class
+/// selector: `[env: NESTWEAVER_DB]` on every subcommand) and the default
+/// database path — making a daemon started either documented way permanently
+/// unstoppable once its socket was gone.
 ///
 /// With this, the incident state (live daemon, hand-removed pidfile, deleted
 /// socket) is still repairable by `daemon stop`, while a non-daemon writer is
@@ -5350,10 +5363,16 @@ fn daemon_stop_lock_holder_target_with(
         return None;
     }
     let argv = argv_of(pid)?;
-    argv_is_our_daemon(&argv, db_path).then_some(pid)
+    argv_runs_daemon_subcommand(&argv).then_some(pid)
 }
 
 /// Pure predicate: is this argv a nestweaver daemon serving `db_path`?
+///
+/// For PIDs whose provenance carries NO evidence about which database they
+/// serve — a pidfile PID, a macOS cmdline probe. The write-lock path uses
+/// [`argv_runs_daemon_subcommand`] instead, because the kernel already told it
+/// which database the process holds; see
+/// [`daemon_stop_lock_holder_target_with`].
 ///
 /// Matches by POSITION, not membership: the FIRST NON-FLAG argument after
 /// `argv[0]` must be `daemon`. A membership test ("some token equals
@@ -5384,18 +5403,10 @@ fn daemon_stop_lock_holder_target_with(
 /// default layout the database lives at `…/.local/nestweaver/brain.lbug`, so
 /// that substring was satisfied by the PATH, not the binary — it added no real
 /// evidence while breaking for renamed or symlinked installs. The conjunction
-/// that carries the weight is: holds THIS database's write lock, the `daemon`
-/// subcommand, and names THIS database.
+/// that carries the weight is: the `daemon` subcommand, and names THIS
+/// database.
 fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
-    // Skip leading boolean globals. An EMPTY argument is not a flag and not
-    // `daemon`, so it stops the scan and the argv is rejected — a forged
-    // `["bin", "", "daemon", ...]` must not shift `daemon` into place.
-    let subcommand = argv
-        .iter()
-        .skip(1)
-        .find(|arg| !arg.starts_with('-'))
-        .map(String::as_str);
-    if subcommand != Some("daemon") {
+    if !argv_runs_daemon_subcommand(argv) {
         return false;
     }
     let mut spellings = vec![db_path.to_string_lossy().into_owned()];
@@ -5408,6 +5419,31 @@ fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
             .iter()
             .any(|spelling| arg == spelling || arg.as_str() == format!("--db={spelling}"))
     })
+}
+
+/// Half of [`argv_is_our_daemon`]: does this argv run the `daemon`
+/// SUBCOMMAND, whatever database it was pointed at?
+///
+/// Positional, not membership — the FIRST NON-FLAG argument after `argv[0]`
+/// must be `daemon`, so `nestweaver index --repo daemon --db <path>` (and the
+/// `--name`/`--instance` variants) are rejected even though they carry the
+/// token `daemon` as an argument VALUE and hold the same write lock. Leading
+/// boolean globals are skipped; see [`argv_is_our_daemon`] for why that is
+/// sound today and what would break it.
+///
+/// On its own this is NOT identity: it says nothing about which database the
+/// process serves. Only [`daemon_stop_lock_holder_target_with`] may use it
+/// alone, and only because it has already established from the kernel that
+/// this PID holds the write lock on the database in question.
+fn argv_runs_daemon_subcommand(argv: &[String]) -> bool {
+    // Skip leading boolean globals. An EMPTY argument is not a flag and not
+    // `daemon`, so it stops the scan and the argv is rejected — a forged
+    // `["bin", "", "daemon", ...]` must not shift `daemon` into place.
+    argv.iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        == Some("daemon")
 }
 
 /// This process's argv, with argument boundaries intact.
@@ -13282,14 +13318,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // socket-peer pid instead of declaring "not running" and
                     // deleting a live daemon's socket (the same state the
                     // identity cross-check exists for).
+                    let mut lock_holder_target = false;
                     let pid = daemon_stop_signal_target(pidfile_pid, socket_pid, |pid| unsafe {
                         libc::kill(pid, 0) == 0
                     })
                     // Last resort: the database write-lock holder, and ONLY
-                    // when its cmdline independently proves it is a daemon for
-                    // this DB. That keeps the incident state repairable while
-                    // leaving `embed`/`index` writers untouched.
-                    .or_else(|| daemon_stop_lock_holder_target(&db_path));
+                    // when its cmdline independently proves it is running the
+                    // `daemon` subcommand. That keeps the incident state
+                    // repairable while leaving `embed`/`index` writers
+                    // untouched. Which database it serves is already proven by
+                    // the kernel-held lock this PID came from.
+                    .or_else(|| {
+                        let target = daemon_stop_lock_holder_target(&db_path);
+                        lock_holder_target = target.is_some();
+                        target
+                    });
                     let Some(pid) = pid else {
                         // Nothing signalable on the pidfile or the socket.
                         //
@@ -13355,16 +13398,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // unrelated process. Verify identity before signaling. A
                     // kernel-reported socket peer PID is self-verifying — it
                     // IS the process serving this daemon's socket.
-                    if socket_pid != Some(pid)
-                        && !daemon_identity_verified(pid, &db_path, &pidfile, &socket)
-                    {
-                        eprintln!(
-                            "Error: pidfile {} names PID {pid}, but that process is not a \
-                             nestweaver daemon for {} — refusing to signal it. If no daemon is \
-                             running, remove the stale pidfile and socket manually.",
-                            pidfile.display(),
-                            db_path.display()
-                        );
+                    //
+                    // A lock-holder target is re-checked against the evidence
+                    // that SELECTED it (still holds this database's write lock,
+                    // still running the `daemon` subcommand), not against the
+                    // pidfile rule: its database is proven by the kernel lock,
+                    // and this branch is only ever reached when the pidfile is
+                    // gone or dead, so `daemon_identity_verified` would reject
+                    // every daemon that does not happen to name its database in
+                    // argv — including every `NESTWEAVER_DB` and default-path
+                    // start.
+                    let identity_ok = if socket_pid == Some(pid) {
+                        true
+                    } else if lock_holder_target {
+                        daemon_stop_lock_holder_target(&db_path) == Some(pid)
+                    } else {
+                        daemon_identity_verified(pid, &db_path, &pidfile, &socket)
+                    };
+                    if !identity_ok {
+                        if lock_holder_target {
+                            eprintln!(
+                                "Error: PID {pid} held the write lock on {} a moment ago but no \
+                                 longer proves daemon identity — refusing to signal it. Re-run \
+                                 `nestweaver daemon --db {} stop`.",
+                                db_path.display(),
+                                db_path.display()
+                            );
+                        } else {
+                            eprintln!(
+                                "Error: pidfile {} names PID {pid}, but that process is not a \
+                                 nestweaver daemon for {} — refusing to signal it. If no daemon \
+                                 is running, remove the stale pidfile and socket manually.",
+                                pidfile.display(),
+                                db_path.display()
+                            );
+                        }
                         return Ok((EXIT_ERROR, None));
                     }
 
@@ -23890,6 +23958,65 @@ mod daemon_cli_tests {
             daemon_stop_lock_holder_target_with(&db_path, value_named_daemon),
             None,
             "`--repo daemon` holds the write lock and must NOT be signalled"
+        );
+
+        // F2: `NESTWEAVER_DB` is a documented first-class database selector
+        // (`[env: NESTWEAVER_DB]` on every subcommand), so a daemon started the
+        // documented way has NO database path in its argv at all — and neither
+        // does one started on the default path. Requiring the path as an
+        // argument here made both permanently unstoppable once their socket was
+        // gone. The database is already proven by the kernel-held write lock
+        // this PID came from.
+        let env_selected_daemon = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "daemon".to_string(),
+                    "start".to_string(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, env_selected_daemon),
+            Some(holder),
+            "a daemon selected by NESTWEAVER_DB (or the default path) must still be stoppable"
+        );
+
+        // …and the constraint that must not be reopened: a writer that is not
+        // the daemon subcommand stays untouchable even though it holds the same
+        // lock and names the same database.
+        let embed_local = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "embed".to_string(),
+                    "--db".to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                    "--local".to_string(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, embed_local),
+            None,
+            "`embed --local` holds the write lock and must NEVER be signalled"
+        );
+
+        // The same, with the database selected by the environment rather than
+        // argv — the exact shape the F2 fix stopped requiring a path for.
+        let env_selected_embed = |pid: i32| {
+            (pid == holder).then(|| {
+                vec![
+                    "/usr/local/bin/nestweaver".to_string(),
+                    "embed".to_string(),
+                    "--local".to_string(),
+                ]
+            })
+        };
+        assert_eq!(
+            daemon_stop_lock_holder_target_with(&db_path, env_selected_embed),
+            None,
+            "an env-selected `embed --local` must NEVER be signalled either"
         );
 
         assert!(
