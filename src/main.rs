@@ -5775,9 +5775,19 @@ enum FailedStartPidfile {
 /// fresh inode outside our lock, and it would make `remove_unowned_daemon_
 /// runtime` read "pidfile missing while the socket is present" — the
 /// fingerprint of hand-removed state — on a path we removed ourselves. An empty
-/// pidfile is the honest statement "no PID is claimed here", and every reader
-/// (`read_pid`, `daemon status`, the launcher's own flock branch) already
-/// handles it.
+/// pidfile is the honest statement "no PID is claimed here".
+///
+/// That statement is only honest if every reader agrees, and the first version
+/// of this claimed they all did on the strength of three spot checks
+/// (`read_pid`, `daemon status`, the launcher's own flock branch). They were
+/// not all of them: `ensure_no_live_daemon_for_restore` and
+/// `ensure_no_live_daemon_for_snapshot_build` parsed the contents as an `i32`
+/// and failed CLOSED on the error, so `backup restore` and `snapshot build`
+/// both refused after a failed start — and the only remedy their message
+/// offered was "remove the stale pidfile", the exact operator action this
+/// branch exists to stop provoking. Both now treat empty as "no claim →
+/// permit". If you add a pidfile reader, it has to handle empty; there is no
+/// blanket guarantee here, only a maintained list.
 ///
 /// Deliberately does NOT restore the previous contents: the value this
 /// overwrote was the pre-start PID, which is either equally dead or a daemon
@@ -13084,13 +13094,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // path, so give the parent its stderr one back
                                 // before reporting the failure.
                                 restore_parent_stderr_tracing();
-                                report_failed_start_pidfile(
-                                    retract_failed_start_pidfile_within(
-                                        &pidfile,
-                                        FAILED_START_PIDFILE_GRACE,
-                                    ),
-                                    &pidfile,
-                                );
+                                // Deliberately NOT retracting the pidfile here.
+                                // `execute()` failed in the parent, so no child
+                                // of ours ever wrote one: anything at that path
+                                // predates this start, and blanking it would be
+                                // outside "the claim a failed start left behind,
+                                // and only that".
                                 anyhow::bail!("Failed to daemonize: {e}");
                             }
                             daemonize2::Outcome::Child(Err(e)) => {
@@ -13542,22 +13551,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             state.unidentified.len()
                         );
                     }
-                    if !state.spared.is_empty() {
-                        // Split by WHICH proof spared them. The pidfile flock is
-                        // forgeable by `rm -f daemon.pid`; the database write
-                        // lock is not, and the second count is exactly the set
-                        // the old pidfile-only test would have swept.
-                        let by_db = state.spared_without_pidfile_proof.len();
+                    // Report each proof as its own fact. They are not exclusive
+                    // — a healthy daemon holds BOTH its database write lock and
+                    // its pidfile flock — so no line may be computed by
+                    // subtracting one list from another, and an empty list says
+                    // nothing at all rather than printing a zero.
+                    if !state.spared_database_write_lock.is_empty() {
                         println!(
-                            "  spared (live instance holds the pidfile lock): {}",
-                            state.spared.len() - by_db
+                            "  spared (database write lock held): {}",
+                            state.spared_database_write_lock.len()
                         );
-                        if by_db > 0 {
-                            println!(
-                                "  spared (database write lock still held, pidfile evidence \
-                                 absent or unreadable): {by_db}"
-                            );
+                        for (instance, pid) in &state.spared_database_write_lock {
+                            match pid {
+                                Some(pid) => println!("    {instance}: held by PID {pid}"),
+                                None => {
+                                    println!("    {instance}: held, but the kernel named no holder")
+                                }
+                            }
                         }
+                    }
+                    if !state.spared_pidfile_lock.is_empty() {
+                        println!(
+                            "  spared (pidfile lock held): {}",
+                            state.spared_pidfile_lock.len()
+                        );
+                    }
+                    // NOT evidence of ownership — evidence that we could not
+                    // tell. Kept on its own line so it can never be read as
+                    // "something holds this".
+                    if !state.spared_database_unreadable.is_empty() {
+                        println!(
+                            "  spared (database lock state unreadable — spared conservatively): {}",
+                            state.spared_database_unreadable.len()
+                        );
                     }
                     // Surfaced rather than folded into "kept": these are
                     // directories the sweep could not identify, so they will
@@ -20037,9 +20063,18 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// anything we cannot confirm is treated as still-running:
 /// - no `.lbug` in `data_dir` (fresh target, nothing to serve) → **permit**
 /// - pidfile absent → **permit**
+/// - pidfile present but EMPTY → **permit** (see below)
 /// - pidfile parses to a live pid → **refuse**
 /// - pidfile parses to a dead/stale pid → **permit**
 /// - pidfile present but unreadable / unparseable → **refuse**
+///
+/// Empty is "no PID is claimed here", which is the same fact as an absent
+/// pidfile and must be permitted for the same reason. It is not merely
+/// hypothetical: [`retract_failed_start_pidfile`] produces exactly this state
+/// after a start that lost the database-lock race. Treating it as unparseable
+/// refused the restore and told the operator to "remove the stale pidfile" —
+/// pushing them toward the `rm daemon.pid` that causes the runtime-ownership
+/// incident. Fail-closed on garbage is unchanged; empty is not garbage.
 fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
     let Some(db) = find_lbug_in_dir(data_dir) else {
         return Ok(());
@@ -20058,6 +20093,12 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
              / `nestweaver server stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
+        // Present but EMPTY → claims no PID at all, which is the same fact as
+        // an absent pidfile → permit. `retract_failed_start_pidfile` leaves
+        // exactly this after a failed start; refusing here would tell the
+        // operator to remove the pidfile by hand, which is the action this
+        // whole branch exists to stop provoking.
+        Ok(contents) if contents.trim().is_empty() => Ok(()),
         Ok(contents) => match contents.trim().parse::<i32>() {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
@@ -20089,7 +20130,9 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
 /// the wrong pidfile, miss the daemon actually writing this DB, and capture a
 /// torn hot-copy. Fail CLOSED on a present-but-unreadable/garbage pidfile — we
 /// cannot confirm the daemon is stopped, so refuse rather than risk a torn
-/// snapshot. Mirrors [`ensure_no_live_daemon_for_restore`].
+/// snapshot. An EMPTY pidfile claims no PID and is treated like an absent one;
+/// see [`ensure_no_live_daemon_for_restore`], which this mirrors, for why that
+/// distinction matters after a failed `daemon start`.
 fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
@@ -20104,6 +20147,10 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
              daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
             pidfile.display(),
         ),
+        // Present but EMPTY → no PID is claimed → quiesced, exactly as an
+        // absent pidfile is. This is the state a failed `daemon start` leaves
+        // behind via `retract_failed_start_pidfile`.
+        Ok(contents) if contents.trim().is_empty() => Ok(()),
         Ok(contents) => match contents.trim().parse::<i32>() {
             // Present but garbage (non-numeric) → cannot confirm → fail closed.
             Err(_) => anyhow::bail!(
@@ -21443,6 +21490,32 @@ mod restore_guard_tests {
         assert!(sidecar.exists(), "sidecar untouched");
         assert!(!data_dir.path().with_extension("restoring").exists());
     }
+
+    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
+    /// permit the restore. This is the state `retract_failed_start_pidfile`
+    /// leaves after a failed `daemon start`; refusing here blocked a
+    /// destructive-but-legitimate restore and told the operator to "remove the
+    /// stale pidfile", which is the action this branch exists to stop
+    /// provoking. Fail-closed on genuine garbage is unchanged.
+    #[test]
+    fn restore_permits_an_empty_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+
+        let (data_dir, _db, _sidecar, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("an empty pidfile claims nothing and must not block a restore");
+
+        std::fs::write(&pidfile, b"  \n").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("a whitespace-only pidfile claims nothing either");
+
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect_err("garbage must still fail closed");
+    }
 }
 
 #[cfg(test)]
@@ -21536,6 +21609,34 @@ mod snapshot_build_guard_tests {
         let err = ensure_no_live_daemon_for_snapshot_build(&db)
             .expect_err("build must refuse when the pidfile cannot be parsed");
         assert!(err.to_string().contains("pidfile"), "err was: {err}");
+    }
+
+    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
+    /// permit the build. `retract_failed_start_pidfile` produces this state
+    /// after a failed `daemon start`; treating it as unparseable refused every
+    /// later `snapshot build` and told the operator to "remove the stale
+    /// pidfile" — the `rm daemon.pid` that causes the incident this branch
+    /// exists to prevent.
+    #[test]
+    fn snapshot_build_permits_an_empty_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("an empty pidfile claims nothing and must not block a build");
+
+        // Whitespace-only is the same claim, and a retraction that left a
+        // trailing newline must not be treated differently from one that did
+        // not.
+        std::fs::write(&pidfile, b"\n").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a whitespace-only pidfile claims nothing either");
+
+        // Garbage still fails closed: empty is not the same as unparseable.
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db).expect_err("garbage must still fail closed");
     }
 
     #[test]
