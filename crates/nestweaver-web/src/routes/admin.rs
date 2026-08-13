@@ -529,10 +529,12 @@ pub async fn remove_repo(
     // Delete graph data under write mutex. An already-claimed worker will
     // also acquire this mutex before indexing; when it runs, it checks
     // whether the repo node still exists and skips if deleted.
-    let write_mutex = state.write_mutex.clone();
+    let write_gate = state.write_gate.clone();
     let db_path = state.db_path.clone();
     tokio::task::spawn_blocking(move || {
-        let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
+        let _guard = write_gate
+            .as_ref()
+            .map(|gate| gate.blocking_lock("admin_remove_repo"));
         run_admin_remove_repo_with(
             &store,
             &db_path,
@@ -1683,7 +1685,7 @@ mod tests {
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
-            write_mutex: None,
+            write_gate: None,
             job_queue: None,
         })
     }
@@ -1941,7 +1943,7 @@ url = "https://github.com/example/existing"
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
-            write_mutex: None,
+            write_gate: None,
             job_queue: None,
         });
 
@@ -2070,7 +2072,7 @@ url = "https://github.com/example/existing"
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
-            write_mutex: None,
+            write_gate: None,
             job_queue: None,
         });
         let app = Router::new()

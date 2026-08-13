@@ -387,10 +387,10 @@ fn ensure_daemon_impl(
         warn!(pid, "unowned daemon pidfile is stale — cleaning up");
     }
 
-    // Clean up stale socket if present.
-    if sock.exists() {
-        let _ = fs::remove_file(&sock);
-    }
+    // Clean up a stale socket — but never one a live daemon is still serving.
+    // See [`remove_socket_unless_served`]; the spawn-lock re-check below adopts
+    // a surviving incumbent.
+    remove_socket_unless_served(&sock);
 
     // Before spawning, check for a legacy daemon using the old DefaultHasher-
     // based instance ID (pre-SHA-256 upgrade). If found, shut it down so the
@@ -651,6 +651,33 @@ fn socket_accepts_connections(sock: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
+/// Retire a leftover socket, unless a process is still serving it. Returns
+/// whether the socket was removed.
+///
+/// The caller reaches here having acquired the pidfile `flock`, which it treats
+/// as proof that no daemon owns this instance. It is not. The lock lives on an
+/// INODE, not on a path: once `daemon.pid` has been unlinked under a running
+/// daemon — the single most likely thing an operator does while recovering a
+/// stuck instance — the owner keeps its lock on a now-unlinked inode, the
+/// caller's `create(true)` open makes a brand-new file, and the flock succeeds
+/// against no contention at all. Unlinking the socket then strands a HEALTHY
+/// daemon that no client can ever reach again, while every subsequent command
+/// silently answers from the direct path.
+///
+/// A socket that accepts a connection is kernel-reported evidence that a
+/// process is listening on it right now, and no amount of runtime-file
+/// tampering can forge it. It outranks the flock, so it wins.
+///
+/// Racing a daemon that is exiting between the probe and the unlink only leaves
+/// a socket file behind, which the next start removes: strictly the safe
+/// direction.
+fn remove_socket_unless_served(sock: &Path) -> bool {
+    if !sock.exists() || socket_accepts_connections(sock) {
+        return false;
+    }
+    fs::remove_file(sock).is_ok()
+}
+
 /// Override for how long a client waits for a daemon to bind its socket.
 pub const DAEMON_BOOT_TIMEOUT_ENV: &str = "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS";
 
@@ -849,6 +876,48 @@ credential_method = "gh"
             !runtime.exists(),
             "bad explicit config must fail before runtime-dir/pidfile mutation"
         );
+    }
+
+    /// F1: the pidfile flock is path-defeatable, so it must not authorise
+    /// unlinking a socket that a live daemon is still serving.
+    #[test]
+    fn a_served_socket_survives_socket_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing there at all: nothing to remove, and no error.
+        let absent = dir.path().join("absent.sock");
+        assert!(!remove_socket_unless_served(&absent));
+        assert!(!absent.exists());
+
+        // A leftover socket nobody is serving: retired, as before.
+        let stale = dir.path().join("stale.sock");
+        {
+            let listener = UnixListener::bind(&stale).unwrap();
+            drop(listener);
+        }
+        // Dropping the listener leaves the inode but closes the listen queue.
+        assert!(stale.exists());
+        assert!(!socket_accepts_connections(&stale));
+        assert!(remove_socket_unless_served(&stale));
+        assert!(!stale.exists());
+
+        // A socket a daemon is serving RIGHT NOW: never removed, whatever the
+        // pidfile says or does not say. This is the incident: an operator ran
+        // `rm daemon.pid`, so the client's flock succeeded trivially against a
+        // brand-new inode while the daemon kept serving this socket.
+        let live = dir.path().join("live.sock");
+        let listener = UnixListener::bind(&live).unwrap();
+        assert!(socket_accepts_connections(&live));
+        assert!(
+            !remove_socket_unless_served(&live),
+            "a served socket must never be unlinked — doing so strands a healthy daemon"
+        );
+        assert!(
+            live.exists(),
+            "the live daemon's socket must still be there"
+        );
+        drop(listener);
+        let _ = fs::remove_file(&live);
     }
 
     #[test]

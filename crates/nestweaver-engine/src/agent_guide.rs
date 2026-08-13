@@ -780,7 +780,10 @@ fn render_legacy_tool_tables(out: &mut String) {
     out.push_str("| Tool | Purpose |\n");
     out.push_str("|------|---------|\n");
     out.push_str(
-        "| `brain_status` | Counts of vaults, notes, symbols, repos. Call to verify indexing. |\n",
+        "| `brain_status` | Counts of vaults, notes, symbols, repos. Call to verify indexing. \
+         On a daemon it also reports embedding state (including `pass_*` progress for an \
+         in-flight embedding pass) and write-lock liveness (`write_queue_depth`, \
+         `write_holder`), which is how you tell \"stuck\" apart from \"still working\". |\n",
     );
     out.push_str("| `stale_check` | Compare indexed SHA to current git HEAD. Shows if re-indexing is needed. |\n");
     out.push_str("| `brain_diff` | Files and symbols changed since a given SHA. Useful before code review. |\n");
@@ -928,7 +931,16 @@ pub fn generate_claude_md_with_rules(
     out.push_str(
         "- `semantic_applied` / `degraded_components` — retrieval that fell back to \
          lexical ranking orders results differently. Say so rather than implying \
-         relevance you did not get.\n",
+         relevance you did not get. `degraded_components` has exactly one value \
+         today, `\"semantic\"`; treat any other string as a newer server, not as \
+         something you can interpret. `brain_search` is keyword/BM25-only, so it \
+         always reports `semantic_applied: false` with an empty \
+         `degraded_components` — that is not a degradation, and the fields are \
+         emitted rather than omitted so their absence is never mistaken for an \
+         older server. On `brain_context` / `project_context` / `investigate`, \
+         where a semantic leg genuinely exists, `semantic_applied: false` DOES \
+         mean lexical-only ranking. `investigate` omits `degraded_components` \
+         when empty; the other two always emit it.\n",
     );
     out.push_str(
         "- `notifications` / `note` — read them. A caveat like `cochange-no-coverage` \

@@ -92,10 +92,63 @@ nestweaver brain status --db <path> --json
 ```
 
 Runtime status includes `state`, `backend`, `requested_device`,
-`selected_device`, `model_id`, `error`, `metal_compiled`, and `fallback_used`.
+`selected_device`, `model_id`, `error`, `metal_compiled`, and `fallback_used`,
+plus the five `pass_*` fields documented under "Embedding pass progress" below.
 For a ready local backend, `selected_device` is `metal` or `cpu` and
 `fallback_used` remains `false`. A ready external backend has an empty
 `selected_device` because it has no local device.
+
+`state` is one of `disabled`, `loading`, `ready`, `failed`, or `embedding`.
+
+### Embedding pass progress
+
+`state` reports `embedding` — not `ready` — while a daemon-route embedding
+pass is in flight. It is a strictly narrower `ready`: the model is loaded and
+usable. Treat `embedding` as ready for "can this daemon answer semantic
+queries"; read the boolean `pass_active` when you want an unambiguous machine
+signal rather than a string match.
+
+`embedding` is computed at read time and substitutes for `ready` only. A pass
+running while the underlying state is `loading` or `failed` still reports that
+underlying state, so `pass_active` — not the state string — is the reliable
+"is a pass running" signal.
+
+While a pass runs, `embedding_status` also carries `pass_active`,
+`pass_processed`, `pass_total`, `pass_started_at` (unix seconds), and
+`pass_scope`. `pass_total` is the eligible-node count from the same preflight
+`PlanEmbed` reports; it is `0` until that preflight finishes, which is
+reported as "total not yet counted" rather than as a fabricated percentage.
+Throughput and ETA are derived client-side from `pass_started_at`. All of
+these are proto3 scalars, so a daemon older than 4.2 decodes as "no pass
+running" instead of failing.
+
+`nestweaver brain status` renders the same numbers as a `Progress:` line, and
+`nestweaver embed` polls this status to print a live counter on the daemon
+route.
+
+### Write-path visibility
+
+`brain status` reports two different queues, and they are not
+interchangeable:
+
+- `queue_depth` — pending + running entries in the server-side **index job
+  queue**. This is what the admin API and the `nestweaver_index_queue_depth`
+  Prometheus gauge have always meant.
+- `write_queue_depth` — **write RPCs blocked on the daemon write lock**, not
+  counting the one holding it. A long `embed` holds that lock, so a queued
+  `index` shows up here and never in `queue_depth`.
+
+`write_holder` names what currently holds the write lock and
+`write_holder_seconds` how long it has held it. Every writer in the daemon
+process stamps it: RPC names for gRPC writers (`embed`, `index_repo`, ...),
+`worker_commit` for the worker pool, `admin_remove_repo` for the web admin
+API. An empty `write_holder` while `write_queue_depth` is non-zero means a
+daemon older than 4.2, not an unidentifiable writer.
+
+A CLI command blocked on the write lock prints a periodic stderr line naming
+the holder and how long it has held it. That line is a **message, not a
+timeout**: long-running write RPCs remain uncapped, and nothing in this path
+cancels or shortens them.
 
 ---
 
@@ -472,6 +525,20 @@ alongside the returned rows:
 - Every row, including `response_format: "concise"`, carries its canonical
   domain-qualified `uid`. Hybrid deduplication uses that identity rather than
   presentation fields such as title or location.
+- `semantic_applied` is always `false` and `degraded_components` always empty.
+  `brain_search` is keyword/BM25-only and never requests a semantic leg, so
+  neither can it be degraded. Both are reported rather than omitted so a
+  caller checking them can distinguish "no semantic leg" from "field not
+  implemented on this path". The direct gRPC daemon response, both MCP paths,
+  and the hybrid merge below all agree on this. In a merge, `semantic_applied`
+  is the AND across contributing tiers (only claimed when every tier applied
+  it) and `degraded_components` is their deduplicated union (a component
+  degraded in either tier is degraded in the merged answer). A tier that omits
+  `semantic_applied` counts as `false`, and if NO contributing tier reports
+  either field the merge omits both rather than inventing them — so on a merged
+  response, absence means "no tier reported", not "`false`".
+  `degraded_components` has exactly one value in the current vocabulary,
+  `"semantic"`.
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
 server responses have valid, internally consistent exact-count metadata and

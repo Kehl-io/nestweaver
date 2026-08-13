@@ -1439,6 +1439,22 @@ fn dispatch_uncached(
 
 // ── F16: response cache ──────────────────────────────────────────────────────
 
+// H1: `RESPONSE_SHAPE_VERSION` — a content digest of the workspace sources,
+// computed by `build.rs`, that identifies the response SHAPES this binary
+// produces.
+//
+// The cache's other validity checks (`graph_generation`, `scope_digest`, TTL)
+// all describe the GRAPH. None of them describes the BINARY, so before this
+// existed an upgrade that added a field to a cached tool's response kept
+// serving pre-upgrade entries — the old shape, missing the new field — for up
+// to the full 24h TTL on an untouched graph.
+//
+// It is DERIVED, not hand-maintained, precisely so that a future author who
+// adds a response field does not have to remember anything: editing any
+// workspace source changes the digest and the cache invalidates itself. See
+// `crates/nestweaver-mcp/build.rs` for the scope and its one documented gap.
+include!(concat!(env!("OUT_DIR"), "/response_shape_version.rs"));
+
 /// Deterministic READ tools whose responses are safe to cache. A tool qualifies
 /// only if, given the same graph (same generation + scope digest) and the same
 /// normalized args, it returns the same response.
@@ -1807,9 +1823,9 @@ fn maybe_cached(
     // Lazily initialise the in-process cache for this db path, then check for a hit.
     let hit_bytes = RESPONSE_CACHE.with(|map| {
         let mut map = map.borrow_mut();
-        let cache = map
-            .entry(db_path.clone())
-            .or_insert_with(|| nestweaver_store::cache::ResponseCache::open(&db_path, max_mb));
+        let cache = map.entry(db_path.clone()).or_insert_with(|| {
+            nestweaver_store::cache::ResponseCache::open(&db_path, max_mb, RESPONSE_SHAPE_VERSION)
+        });
         cache.get(key, generation, scope_digest)
     });
 
@@ -1856,7 +1872,11 @@ fn maybe_cached(
             let should_flush = RESPONSE_CACHE.with(|map| {
                 let mut map = map.borrow_mut();
                 let cache = map.entry(db_path.clone()).or_insert_with(|| {
-                    nestweaver_store::cache::ResponseCache::open(&db_path, max_mb)
+                    nestweaver_store::cache::ResponseCache::open(
+                        &db_path,
+                        max_mb,
+                        RESPONSE_SHAPE_VERSION,
+                    )
                 });
                 cache.insert(key, name, &bytes, generation, scope_digest);
                 let count = FLUSH_COUNTER.with(|c| {
@@ -1905,7 +1925,11 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
         if let Some(cache) = map.get(db_path) {
             (cache.size_bytes(), cache.len())
         } else {
-            let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+            let cache = nestweaver_store::cache::ResponseCache::open(
+                db_path,
+                max_mb,
+                RESPONSE_SHAPE_VERSION,
+            );
             (cache.size_bytes(), cache.len())
         }
     });
@@ -3502,7 +3526,7 @@ fn authorized_symbol_total(
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n- semantic_applied is always false and degraded_components always empty: this tool is keyword/BM25-only and never runs a semantic leg, so ranking is lexical. The fields are reported rather than omitted so their absence is never mistaken for an older server\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable\n- Keyword matching only — it will not find conceptually related wording that shares no terms with the query",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4034,6 +4058,45 @@ fn tool_brain_search(
         "total_matches_relation": search_total_relation_label(total.relation),
         "returned_matches": returned_matches,
         "truncated": truncated,
+        // `brain_search` is keyword/BM25-only; it must not claim a
+        // semantic leg was requested or degraded. Emitted unconditionally
+        // (and on both the bm25 and substring branches, which converge
+        // here) so callers can tell "no semantic leg" apart from "field
+        // not implemented on this path".
+        //
+        // Other sites that must stay in agreement when a semantic leg is
+        // added. This list is not a claim that they currently agree:
+        //   - the gRPC daemon's `brain_search` handler (honest today)
+        //   - `daemon_brain_search_response_to_json` below, which forwards
+        //     the proto fields verbatim (honest today)
+        //   - `nestweaver-federation/src/results.rs::merge_json_results`,
+        //     the hybrid/federated merge. It rebuilds the response from
+        //     `wrap_merged_response`, so every field has to be re-added
+        //     deliberately; it now merges these two via
+        //     `merge_honesty_fields` (AND for `semantic_applied`, dedup
+        //     union for `degraded_components`). Honest today.
+        //
+        // Still outstanding, deliberately not changed with this one:
+        //   - the STRUCTURED branch of `merge_structured_results` (the
+        //     `connected`-schema path used by brain_context /
+        //     project_context) rebuilds its response the same way and still
+        //     drops both fields. Note the asymmetry this leaves: brain_search,
+        //     which has no semantic leg and whose fields are trivially
+        //     `false`/`[]`, now carries them through a merge, while the two
+        //     tools that DO have a semantic leg — where the ambiguity actually
+        //     costs the caller something — still lose them.
+        //
+        //     Deferred purely on scope: different tool family, different
+        //     response schema, its own tests. It is NOT blocked on caching.
+        //     `semantic_response_is_degraded` (above) has exactly two call
+        //     sites, both inside `maybe_cached`, reached only from
+        //     `dispatch_cancellable` — the local in-process dispatch, strictly
+        //     upstream of any federated merge. `hybrid.rs` has no response
+        //     cache and never writes merged output back, so nothing downstream
+        //     of the merge reads these values. Closing that gap would be a
+        //     pure reporting change too.
+        "semantic_applied": false,
+        "degraded_components": [],
     });
     if engine == "substring" {
         response["engine_warning"] = json!(
@@ -4874,6 +4937,85 @@ mod brain_search_total_contract_tests {
             .expect("note row present");
         assert_eq!(note_row["matched_headings"], json!(["Dedupneedle Alpha"]));
     }
+
+    /// Both MCP `brain_search` response paths — the daemon-routed conversion
+    /// and the in-process tool — must agree field-for-field on the
+    /// semantic-honesty keys. An absent field is indistinguishable from an
+    /// unsupported one, so both emit them unconditionally.
+    ///
+    /// Scope limit, deliberate: the gRPC daemon handler is the third emitter,
+    /// but it lives in `nestweaver-daemon`, which this crate does not depend
+    /// on, so its constants are MIRRORED below rather than observed. Editing
+    /// the handler to set `semantic_applied: true` would NOT fail this test.
+    /// Real cross-process coverage belongs in the root package's
+    /// `tests/daemon_test.rs`, which links both crates and already stands up
+    /// live daemons. What this test does pin is the proto struct literal:
+    /// it is exhaustive, so any new `BrainSearchResponse` field breaks
+    /// compilation here and forces a decision about honesty reporting.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn brain_search_semantic_honesty_fields_agree_across_mcp_paths() {
+        // 1. gRPC daemon constants, mirrored (see the scope limit above).
+        let grpc = nestweaver_proto::BrainSearchResponse {
+            query: "honestyneedle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 0,
+            results: Vec::new(),
+            expansion_terms: Vec::new(),
+            returned_matches: 0,
+            total_matches_relation: "eq".to_string(),
+            truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
+        };
+
+        // 2. Daemon-routed MCP: forwards the proto fields verbatim.
+        let daemon_json = daemon_brain_search_response_to_json(&grpc, false);
+
+        // 3. In-process MCP, both branches. No tantivy index → substring
+        //    fallback; with one → bm25. Both converge on one response literal,
+        //    but assert each so a future split cannot silently drop a field.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:honesty", "Honestyneedle Title"))
+            .unwrap();
+        let substring_json = tool_brain_search(
+            &store,
+            None,
+            json!({ "query": "honestyneedle", "response_format": "detailed" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(substring_json["engine"], "substring");
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let bm25_json = tool_brain_search(
+            &store,
+            Some(&index),
+            json!({ "query": "honestyneedle", "response_format": "detailed" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bm25_json["engine"], "bm25");
+
+        for (label, value) in [
+            ("daemon-routed MCP", &daemon_json),
+            ("in-process MCP (substring)", &substring_json),
+            ("in-process MCP (bm25)", &bm25_json),
+        ] {
+            assert_eq!(
+                value.get("semantic_applied"),
+                Some(&json!(grpc.semantic_applied)),
+                "{label} disagrees with the mirrored gRPC constants on `semantic_applied`"
+            );
+            assert_eq!(
+                value.get("degraded_components"),
+                Some(&json!(grpc.degraded_components)),
+                "{label} disagrees with the mirrored gRPC constants on `degraded_components`"
+            );
+        }
+    }
 }
 
 fn tool_schema_note_get() -> Value {
@@ -5130,7 +5272,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nIn server mode, includes additional fields: server_mode, indexing_active, indexing_repo, queue_depth.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nIn server mode, includes additional fields: server_mode, indexing_active, indexing_repo, queue_depth.\n\nWhen served by a daemon it also reports write-path liveness: `write_queue_depth` (write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs), `write_holder`, `write_holder_seconds`, and, inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` for an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". These write-path and pass fields come from the daemon, so the direct `--no-daemon` and MCP-over-HTTP payloads do not carry them.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -10227,6 +10369,85 @@ mod cache_dispatch_tests {
         FLUSH_COUNTER.with(|c| c.set(0));
     }
 
+    /// H1: an upgrade must not serve a pre-upgrade response shape.
+    ///
+    /// Before the fix this test failed: the entry below satisfies the persisted
+    /// `graph_generation`, the scope digest and the 24h TTL, so `brain_search`
+    /// returned it verbatim (`hits=1 misses=0`) — without `semantic_applied` or
+    /// `degraded_components`, exactly the "no semantic leg vs not implemented"
+    /// ambiguity those fields exist to remove.
+    #[test]
+    fn pre_upgrade_response_shape_is_never_served() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "query": "greet", "limit": 5 });
+        // An entry exactly as the PREVIOUS binary would have left it on disk:
+        // same key algorithm, same persisted generation, same scope digest,
+        // written < 24h ago — but a response body without the fields the
+        // CURRENT binary emits, and stamped with that binary's shape version.
+        let key = nestweaver_store::cache::ResponseCache::key("brain_search", &args);
+        let scope_digest = whole_db_scope_digest(&db_path);
+        let old_shape = br#"{"query":"greet","engine":"bm25","results":[],"total_matches":0}"#;
+        let mut cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION ^ 0xD1FF,
+        );
+        cache.insert(
+            key,
+            "brain_search",
+            old_shape,
+            store.graph_generation(),
+            scope_digest,
+        );
+        cache.save();
+        reset_session();
+
+        let served = dispatch(&store, None, "brain_search", args, None).unwrap();
+        assert_ne!(
+            served,
+            serde_json::from_slice::<Value>(old_shape).unwrap(),
+            "the pre-upgrade entry must not be served verbatim"
+        );
+        assert_eq!(
+            CACHE_HITS.with(|c| c.get()),
+            0,
+            "a foreign-shape entry must not count as a hit"
+        );
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert!(
+            served.get("semantic_applied").is_some(),
+            "the recomputed response must carry the current shape's fields"
+        );
+        assert!(served.get("degraded_components").is_some());
+    }
+
+    /// The companion to the test above: the guard must not be so blunt that it
+    /// breaks caching. Same binary, same graph → still a hit.
+    #[test]
+    fn matching_shape_version_still_hits() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "query": "greet", "limit": 5 });
+        let _ = dispatch(&store, None, "brain_search", args.clone(), None).unwrap();
+        flush_response_cache();
+        RESPONSE_CACHE.with(|m| m.borrow_mut().clear());
+        let second = dispatch(&store, None, "brain_search", args, None).unwrap();
+
+        assert_eq!(
+            CACHE_HITS.with(|c| c.get()),
+            1,
+            "an entry written by THIS binary must still hit after a reopen"
+        );
+        assert!(second.get("semantic_applied").is_some());
+    }
+
     #[test]
     fn same_query_twice_is_a_cache_hit_byte_identical() {
         reset_session();
@@ -10251,6 +10472,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert_eq!(cache.len(), 1);
         // Exactly one miss (1st) then one hit (2nd).
@@ -10316,6 +10538,7 @@ mod cache_dispatch_tests {
         let mut cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         cache.insert(
             key,
@@ -10371,6 +10594,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(cache.is_empty(), "dirty responses must not be retained");
     }
@@ -10449,6 +10673,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -10583,6 +10808,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -10748,6 +10974,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),
@@ -10907,6 +11134,7 @@ mod cache_dispatch_tests {
         let persisted_cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             persisted_cache.is_empty(),
@@ -10954,6 +11182,7 @@ mod cache_dispatch_tests {
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,
             nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+            RESPONSE_SHAPE_VERSION,
         );
         assert!(
             cache.is_empty(),

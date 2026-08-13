@@ -93,6 +93,26 @@ initial native build can take several minutes. See
 [INSTALL.md](INSTALL.md#build-from-source) for CMake, C++, OpenSSL, zstd,
 `pkg-config`, and Protocol Buffers prerequisites.
 
+#### x86_64 Linux: extra linker flag required
+
+The tracked `.cargo/config.toml` is **not sufficient on x86_64 Linux**.
+Building Ladybug from source and Tantivy in the same binary produces duplicate
+zstd symbols, so linking fails without
+`-Wl,--allow-multiple-definition`. CI appends the stanza to
+`.cargo/config.toml` before every Linux job rather than tracking it, so a clean
+clone cannot link test binaries until you do the same locally:
+
+```sh
+cat >> .cargo/config.toml << 'EOF'
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+EOF
+```
+
+Do not commit that stanza. CI additionally passes
+`-C link-arg=-fuse-ld=mold` for speed; `mold` is optional locally.
+
 ### Check suite
 
 Run all of these before submitting a PR:

@@ -5148,6 +5148,12 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Stand-in for a binary's response-shape version in tests that exercise
+    /// the response cache's GENERATION behavior. Any stable non-zero value
+    /// works; these tests hold it fixed so shape versioning is not the variable
+    /// under test.
+    const RESPONSE_SHAPE_FIXTURE: u64 = 0xE1691E;
+
     fn owned_contract_uid(repo_uid: &str, bare_shape: &str) -> String {
         format!(
             "contract:{repo_uid}:{}",
@@ -5221,10 +5227,28 @@ mod tests {
             .unwrap();
     }
 
+    /// Liveness deadline for the cross-thread handoffs in the overlapping
+    /// publication test.
+    ///
+    /// Every wait below is backed by a condvar or an mpsc channel, so it wakes
+    /// the instant the event it names actually happens. The deadline therefore
+    /// only bounds a genuine hang (a lost notification, a deadlocked lease) —
+    /// it is NOT a throughput budget, and nothing about the property under
+    /// test depends on how promptly the OS schedules the spawned publisher.
+    /// A deadline sized near the test's own idle runtime made a loaded machine
+    /// look like a broken lease; a generous one costs nothing when healthy and
+    /// still fails in bounded time when the handoff is truly broken. The
+    /// ordering assertions in the test remain exact.
+    ///
+    /// 30s is ~6x the whole test's observed runtime under load (2.1-5.5s), so
+    /// it is unreachable without a real deadlock, while still failing fast
+    /// enough to be useful: the CI job that runs this sets no `timeout-minutes`,
+    /// so a hung wait would otherwise sit until GitHub's 360-minute default.
+    const PUBLICATION_HANDOFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[test]
     fn overlapping_publications_serialize_before_the_second_mutation() {
         use std::sync::{Arc, mpsc};
-        use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
@@ -5274,7 +5298,7 @@ mod tests {
         });
 
         assert!(
-            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            store.wait_for_index_publication_waiters(1, PUBLICATION_HANDOFF_DEADLINE),
             "publisher B must register as waiting on A's publication lease"
         );
         assert!(
@@ -5297,12 +5321,12 @@ mod tests {
         let generation_after_a = store.graph_generation();
 
         let b_established = established_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(PUBLICATION_HANDOFF_DEADLINE)
             .expect("publisher B must establish after A finalizes");
         b_established.unwrap();
         continue_tx.send(()).unwrap();
         done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(PUBLICATION_HANDOFF_DEADLINE)
             .expect("publisher B must finish")
             .unwrap();
         publisher_b.join().unwrap();
@@ -8333,7 +8357,8 @@ function hello(name) { return "Hello " + name; }
                 store.bump_graph_generation();
             }
             store.save_graph_generation(&generation_path).unwrap();
-            let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+            let mut cache =
+                nestweaver_store::cache::ResponseCache::open(&db_path, 1, RESPONSE_SHAPE_FIXTURE);
             cache.insert(
                 cache_key,
                 "brain_search",
@@ -8354,7 +8379,8 @@ function hello(name) { return "Hello " + name; }
         );
         recovering.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(!recovering.pagerank_scores().contains_key("stale"));
-        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        let mut cache =
+            nestweaver_store::cache::ResponseCache::open(&db_path, 1, RESPONSE_SHAPE_FIXTURE);
         assert!(
             cache
                 .get(cache_key, recovering.graph_generation(), scope_digest)
@@ -8399,7 +8425,8 @@ function hello(name) { return "Hello " + name; }
         assert!(clean.graph_generation() > 8);
         clean.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(!clean.pagerank_scores().contains_key("stale"));
-        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        let mut cache =
+            nestweaver_store::cache::ResponseCache::open(&db_path, 1, RESPONSE_SHAPE_FIXTURE);
         assert!(
             cache
                 .get(cache_key, clean.graph_generation(), scope_digest)

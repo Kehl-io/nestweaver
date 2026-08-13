@@ -139,7 +139,12 @@ pub struct AdminState {
     /// Webhook per-repo branch map, shared with the webhook handler via RwLock.
     pub webhook_repo_branches:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
-    /// Write mutex shared with the daemon to prevent races between admin
+    /// Write gate shared with the daemon to prevent races between admin
     /// repo deletion and worker indexing. `None` in tests or non-server mode.
-    pub write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+    ///
+    /// A3: the gate rather than a bare mutex so this deletion stamps itself as
+    /// the write-lock holder. Unlike the worker pool it sets neither
+    /// `indexing_active` nor `queue_depth`, so before this it was a writer that
+    /// nothing in `brain status` could see.
+    pub write_gate: Option<nestweaver_engine::WriteGate>,
 }

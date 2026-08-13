@@ -560,6 +560,149 @@ pub fn effective_config_binding_path(instance_id: &str) -> PathBuf {
     runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE)
 }
 
+/// Who, if anyone, holds this database's write lock — the ONE ownership proof
+/// an operator's `rm` cannot erase.
+///
+/// The pidfile flock is held on an *inode*, not a path: unlink the pidfile and
+/// every path-based owner check is silently defeated, because the next caller
+/// creates a brand-new inode whose flock is trivially free. The database write
+/// lock has no such hole — it lives on the database file itself, which is the
+/// data, so nobody deletes it during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbWriteLock {
+    /// No process holds a write lock (or the database does not exist yet).
+    Free,
+    /// A process holds the write lock — by definition this instance is NOT
+    /// stale. `pid` is the kernel-reported holder when the platform names one.
+    Held { pid: Option<i32> },
+    /// The lock state could not be determined (unreadable file, `fcntl`
+    /// failure). Callers must treat this as "possibly owned", never as free.
+    Unknown,
+}
+
+impl DbWriteLock {
+    /// Is a live process holding the database? `Unknown` is deliberately NOT
+    /// counted: callers that destroy runtime state must use
+    /// [`DbWriteLock::is_provably_free`] instead.
+    pub fn is_held(self) -> bool {
+        matches!(self, DbWriteLock::Held { .. })
+    }
+
+    /// Only `Free` is safe to act destructively on.
+    pub fn is_provably_free(self) -> bool {
+        matches!(self, DbWriteLock::Free)
+    }
+}
+
+/// Records that THIS process holds a read-write store open on some database.
+/// Set by the daemon after `GraphStore::open_or_create`; read by
+/// [`db_write_lock`] to refuse a probe that would destroy that lock.
+static LOCAL_STORE_WRITE_LOCK_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare whether this process now holds a read-write store open.
+///
+/// This exists solely to arm the guard in [`db_write_lock`]. Call it with
+/// `true` immediately after a read-write `GraphStore` open.
+///
+/// Nothing calls it with `false` in production and nothing should need to: the
+/// daemon holds its store for the whole process lifetime, and a process that
+/// released the store would gain nothing from probing a lock it no longer
+/// holds. `false` exists so tests can restore global state, and so a future
+/// caller with a genuinely scoped store open has a way to disarm.
+pub fn note_local_store_write_lock(held: bool) {
+    LOCAL_STORE_WRITE_LOCK_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Does this process hold a read-write store open, as far as
+/// [`note_local_store_write_lock`] has been told?
+pub fn local_store_write_lock_held() -> bool {
+    LOCAL_STORE_WRITE_LOCK_HELD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Probe the database write lock without acquiring it.
+///
+/// lbug locks the whole database file with a POSIX record lock
+/// (`fcntl(F_SETLK, F_WRLCK)`; see `local_file_system.cpp`), so `F_GETLK` asks
+/// the kernel who owns it and reports the holder's PID.
+///
+/// # This probe is NOT free of side effects for the calling process
+///
+/// POSIX record locks are per *process*, and the kernel drops **all** of a
+/// process's record locks on a file the moment that process closes **any**
+/// descriptor to it. This function opens the database and closes it again, so:
+///
+/// * if the caller already holds the lbug write lock on this database, this
+///   call **silently releases it**, admitting a second writer;
+/// * and it sees `Free` regardless, because a process's own locks never
+///   conflict with its own `F_GETLK`.
+///
+/// So this is only safe from a process that does NOT have the store open — the
+/// CLI before it starts anything, or the daemon before its own store open.
+///
+/// The guard below is a REAL RUNTIME BRANCH, not a `debug_assert`. Release
+/// builds disable debug assertions by default (this workspace sets no
+/// `[profile.release] debug-assertions` override), so an assertion would have
+/// left the shipped binaries — the only ones where this matters — completely
+/// unguarded. Returning `Unknown` costs one relaxed atomic load and every
+/// caller already fails closed on it.
+///
+/// (A `/proc/locks` reader would avoid the descriptor entirely on Linux. It can
+/// distinguish a failed `stat` from a successful one with no matching row, so
+/// the ambiguity is manageable; what kills it is that there is no macOS
+/// equivalent, which would leave the hazard live on half the platforms. The
+/// runtime guard makes the question moot.)
+pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
+    db_write_lock_probe(local_store_write_lock_held(), db_path)
+}
+
+/// [`db_write_lock`] with the "do I hold the store open?" answer passed in.
+///
+/// Split out so the guard can be tested by VALUE rather than by mutating
+/// `LOCAL_STORE_WRITE_LOCK_HELD`. A test that flips a process-global flag
+/// races every sibling test that probes a lock — cargo runs them on parallel
+/// threads, and a mutex the siblings do not take guards nothing. That is not a
+/// hypothetical: the earlier version of this test failed 2 runs in 60 at
+/// `--test-threads=8`, in CI's main job.
+fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
+    use std::os::unix::io::AsRawFd;
+
+    if local_store_held {
+        // Probing from here would close a descriptor to this database and take
+        // this process's own POSIX record locks down with it, silently
+        // admitting a second writer. Refuse. `Unknown` is the fail-closed
+        // answer: no caller treats it as free.
+        tracing::error!(
+            db = %db_path.display(),
+            "refusing to probe the database write lock from a process that holds the store \
+             open — the probe would release this process's own lock"
+        );
+        return DbWriteLock::Unknown;
+    }
+
+    let path = canonical_db_path(db_path);
+    if !path.exists() {
+        return DbWriteLock::Free;
+    }
+    let Ok(file) = std::fs::File::open(&path) else {
+        return DbWriteLock::Unknown;
+    };
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as libc::c_short;
+    probe.l_whence = libc::SEEK_SET as libc::c_short;
+    probe.l_start = 0;
+    probe.l_len = 0;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) } != 0 {
+        return DbWriteLock::Unknown;
+    }
+    if probe.l_type == libc::F_UNLCK as libc::c_short {
+        return DbWriteLock::Free;
+    }
+    DbWriteLock::Held {
+        pid: (probe.l_pid > 0).then_some(probe.l_pid),
+    }
+}
+
 fn persistent_state_root() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
@@ -1274,11 +1417,89 @@ pub struct StateDirGcReport {
     pub reclaimed_bytes: u64,
     /// Directories whose database still exists.
     pub kept: Vec<String>,
-    /// Directories spared because a live daemon still holds the pidfile lock.
+    /// Directories spared because something still owns the instance: the
+    /// database write lock, an unreadable database lock state, or the pidfile
+    /// flock. The union of the three lists below, deduplicated — a healthy
+    /// daemon appears in two of them, because two independent facts are true of
+    /// it at once.
     pub spared: Vec<String>,
+    /// Instances whose database write lock the kernel reports as HELD, with the
+    /// holder PID when the platform named one. Proof an `rm -f daemon.pid`
+    /// cannot erase, because it lives on the database file itself.
+    pub spared_database_write_lock: Vec<(String, Option<i32>)>,
+    /// Instances whose database lock state could not be READ. This is not
+    /// evidence of ownership; it is a refusal to guess. Reported apart from
+    /// [`StateDirGcReport::spared_database_write_lock`] because "a process holds
+    /// this database" and "we could not tell" are different facts and must
+    /// never share a sentence.
+    pub spared_database_unreadable: Vec<String>,
+    /// Instances whose pidfile flock is contended. Real evidence in the normal
+    /// case, and forgeable by unlinking the pidfile — which is why it is
+    /// reported alongside the database answer rather than instead of it.
+    pub spared_pidfile_lock: Vec<String>,
     /// Directories left alone because their database could not be identified.
     /// Not an error: unidentifiable means undeletable, by design.
     pub unidentified: Vec<String>,
+}
+
+/// Everything known about who still owns a state directory's instance.
+///
+/// Both facts, always, because they answer different questions and a healthy
+/// daemon makes both true at once. An earlier version returned the first
+/// evidence it found and stopped: a perfectly healthy daemon with an intact,
+/// flocked pidfile was then reported under a heading that said its pidfile
+/// evidence was "absent or unreadable", which was simply false in the normal
+/// case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateDirOwnership {
+    /// What the kernel says about this database's write lock.
+    database: DbWriteLock,
+    /// Whether the pidfile flock is contended.
+    pidfile_lock_held: bool,
+}
+
+impl StateDirOwnership {
+    /// Anything but "the database is provably free AND nobody holds the
+    /// pidfile" means keep the directory. `Unknown` is not ownership, but it is
+    /// not permission to delete either.
+    fn is_owned(self) -> bool {
+        !self.database.is_provably_free() || self.pidfile_lock_held
+    }
+}
+
+/// Probe both ownership facts for `instance_id`.
+///
+/// The pidfile flock alone is not an ownership test. A flock lives on an
+/// *inode*: an operator's `rm -f daemon.pid` during recovery leaves the live
+/// daemon holding a lock on an unlinked inode, and the next `flock` at that
+/// path succeeds against no contention at all. That is the exact forgery
+/// behind the runtime-ownership incident, and this sweep — which runs in
+/// precisely the situations where the pidfile has been disturbed — used to
+/// depend on it alone.
+///
+/// [`db_write_lock`] is the corroboration: it asks the kernel who holds the
+/// database file itself, which is the data, so nobody deletes it during
+/// recovery. `Unknown` fails closed exactly as it does for the runtime-removal
+/// callers.
+///
+/// Residual, stated rather than hidden: the database probe is by PATH. If the
+/// database was renamed or deleted out from under a running daemon (an
+/// unmounted volume, a test that removed its temp dir), the probe finds nothing
+/// and only the pidfile flock is left to speak. That corner — database path
+/// gone AND pidfile removed — remains undetectable here, and costs the instance
+/// its logs, not its socket or its life. There is no socket-peer probe:
+/// [`socket_path`] creates and logs on the over-long-path fallback, which is
+/// not acceptable to run per candidate across thousands of directories.
+///
+/// Must not be called from a process holding a read-write store open: the probe
+/// would fail closed for every candidate (see [`db_write_lock`]) and the sweep
+/// would spare everything. `daemon gc` runs in a CLI process that opens no
+/// store.
+fn state_dir_ownership(instance_id: &str, db_path: &Path) -> StateDirOwnership {
+    StateDirOwnership {
+        database: db_write_lock(db_path),
+        pidfile_lock_held: instance_pidfile_lock_held(instance_id),
+    }
 }
 
 /// Is a live daemon holding `instance_id`'s pidfile lock?
@@ -1286,8 +1507,11 @@ pub struct StateDirGcReport {
 /// The daemon opens the DB *before* taking the pidfile `flock(LOCK_EX)` and
 /// holds it for its whole lifetime, so a held lock means a healthy daemon.
 /// Fails toward `true` (spare) on any error we cannot interpret.
+///
+/// Corroborating evidence only — see [`state_dir_ownership`] for why this can never
+/// be the sole ownership test.
 #[cfg(unix)]
-fn instance_daemon_is_live(instance_id: &str) -> bool {
+fn instance_pidfile_lock_held(instance_id: &str) -> bool {
     let pidfile = pidfile_path(instance_id);
     let file = match std::fs::OpenOptions::new()
         .read(true)
@@ -1310,7 +1534,7 @@ fn instance_daemon_is_live(instance_id: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn instance_daemon_is_live(_instance_id: &str) -> bool {
+fn instance_pidfile_lock_held(_instance_id: &str) -> bool {
     true
 }
 
@@ -1383,8 +1607,14 @@ fn directory_size_bytes(dir: &Path) -> u64 {
 ///
 /// Fail-closed at every step. A directory is deleted only when its name matches
 /// the instance-id shape, its database was positively identified, that database
-/// is temporary or missing, and no live daemon holds its pidfile lock. Anything
-/// unreadable, unparseable, or ambiguous is kept.
+/// is temporary or missing, and nothing still owns the instance — neither the
+/// database write lock nor the pidfile flock (see [`state_dir_ownership`]).
+/// Anything unreadable, unparseable, or ambiguous is kept.
+///
+/// Every directory that reaches the ownership test has a database path: one
+/// that cannot be resolved from `daemon.log` is reported as `unidentified` and
+/// left alone *before* the test runs, so there is no candidate whose deletion
+/// rests on an unprobed database.
 pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
     let root = persistent_state_root();
     let mut report = StateDirGcReport::default();
@@ -1417,7 +1647,34 @@ pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
             continue;
         };
 
-        if instance_daemon_is_live(name) {
+        let ownership = state_dir_ownership(name, &db_path);
+        if ownership.is_owned() {
+            // Record every fact that is true, not just the first one found.
+            match ownership.database {
+                DbWriteLock::Held { pid } => {
+                    tracing::info!(
+                        instance = name,
+                        db = %db_path.display(),
+                        holder = ?pid,
+                        "sparing a state directory whose database is still held"
+                    );
+                    report
+                        .spared_database_write_lock
+                        .push((name.to_string(), pid));
+                }
+                DbWriteLock::Unknown => {
+                    tracing::info!(
+                        instance = name,
+                        db = %db_path.display(),
+                        "sparing a state directory whose database lock state could not be read"
+                    );
+                    report.spared_database_unreadable.push(name.to_string());
+                }
+                DbWriteLock::Free => {}
+            }
+            if ownership.pidfile_lock_held {
+                report.spared_pidfile_lock.push(name.to_string());
+            }
             report.spared.push(name.to_string());
             continue;
         }
@@ -1443,6 +1700,9 @@ pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
     report.removed.sort();
     report.kept.sort();
     report.spared.sort();
+    report.spared_database_write_lock.sort();
+    report.spared_database_unreadable.sort();
+    report.spared_pidfile_lock.sort();
     report.unidentified.sort();
     Ok(report)
 }
@@ -2272,6 +2532,13 @@ mod tests {
     /// instead, so the named file never contained the error being hunted.
     #[test]
     fn log_hint_names_the_dated_tracing_file_not_just_stderr() {
+        // `log_hint` and `log_dir` each resolve XDG_STATE_HOME independently,
+        // so without ENV_LOCK a sibling test swapping that var between the two
+        // calls makes them disagree and this assertion fail — on either root,
+        // depending on which way the swap lands. Every other test in this
+        // module that touches the XDG roots already takes the lock; this one
+        // read process-global state without it.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let hint = log_hint("test1234");
         assert!(
             hint.contains("daemon.log.<date>"),
@@ -2475,6 +2742,12 @@ mod tests {
             let report = gc_orphaned_state_dirs().unwrap();
 
             assert_eq!(report.spared, vec!["eeeeeeee".to_string()]);
+            assert_eq!(report.spared_pidfile_lock, vec!["eeeeeeee".to_string()]);
+            assert!(
+                report.spared_database_write_lock.is_empty(),
+                "the database path is gone, so the database probe must claim nothing"
+            );
+            assert!(report.spared_database_unreadable.is_empty());
             assert!(report.removed.is_empty());
             assert!(log_dir("eeeeeeee").exists());
 
@@ -2482,5 +2755,326 @@ mod tests {
                 libc::flock(held.as_raw_fd(), libc::LOCK_UN);
             }
         });
+    }
+
+    /// THE gap, at unit scale. An operator removes `daemon.pid` under a live
+    /// daemon serving a temp database — the shape `gc` exists to reap. The
+    /// pidfile flock is gone with the inode, so the pidfile-only test says
+    /// "orphan" and the sweep deletes a LIVE instance's logs. The database
+    /// write lock still names the holder, and must veto the deletion.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_spares_a_live_database_holder_after_the_pidfile_is_removed() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        // Under /tmp, so the temp-database rule makes this a reap candidate —
+        // exactly the class `gc` sweeps by the thousand.
+        let db = db_dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        assert!(is_temp_db_path(&db));
+
+        let holder = fork_write_lock_holder(&db);
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("ffffffff", db.to_str().unwrap());
+            // No pidfile at all: the strongest form of the forgery, and what an
+            // operator's `rm -f daemon.pid` leaves behind.
+            assert!(!pidfile_path("ffffffff").exists());
+            let report = gc_orphaned_state_dirs().unwrap();
+            assert!(
+                log_dir("ffffffff").exists(),
+                "a live database holder must keep its logs"
+            );
+            report
+        });
+        reap(holder);
+
+        assert_eq!(report.spared, vec!["ffffffff".to_string()]);
+        assert_eq!(
+            report.spared_database_write_lock,
+            vec![("ffffffff".to_string(), Some(holder))],
+            "the kernel must name the holder, and the report must carry the PID"
+        );
+        assert!(
+            report.spared_pidfile_lock.is_empty(),
+            "there is no pidfile, so no pidfile proof may be claimed"
+        );
+        assert!(report.spared_database_unreadable.is_empty());
+        assert!(report.removed.is_empty());
+    }
+
+    /// The DEFAULT healthy case: a daemon holding both its database write lock
+    /// and its pidfile flock. Both facts are true and both must be reported.
+    /// Returning the first proof found and stopping made `gc` print that the
+    /// pidfile evidence was "absent or unreadable" about a daemon whose pidfile
+    /// was present and locked — a false statement in the normal case, which is
+    /// worse than the silence it replaced.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_reports_both_proofs_for_a_healthy_instance() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        let holder = fork_write_lock_holder(&db);
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("abcdabcd", db.to_str().unwrap());
+            let pidfile = pidfile_path("abcdabcd");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, format!("{holder}\n")).unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let report = gc_orphaned_state_dirs().unwrap();
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+            report
+        });
+        reap(holder);
+
+        assert_eq!(report.spared, vec!["abcdabcd".to_string()]);
+        assert_eq!(
+            report.spared_database_write_lock,
+            vec![("abcdabcd".to_string(), Some(holder))]
+        );
+        assert_eq!(
+            report.spared_pidfile_lock,
+            vec!["abcdabcd".to_string()],
+            "an intact, flocked pidfile must be reported as the real evidence it is"
+        );
+        assert!(report.spared_database_unreadable.is_empty());
+        assert!(report.removed.is_empty());
+    }
+
+    /// The evidence layers are independent: the pidfile flock still spares an
+    /// instance whose database path is gone (an unmounted volume), where the
+    /// path-based database probe can say nothing.
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_ownership_falls_back_to_the_pidfile_lock_when_the_database_is_gone() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            let missing = PathBuf::from("/nonexistent-root-13579/brain.lbug");
+            assert_eq!(db_write_lock(&missing), DbWriteLock::Free);
+            let unowned = state_dir_ownership("aaaabbbb", &missing);
+            assert!(!unowned.is_owned());
+            assert_eq!(unowned.database, DbWriteLock::Free);
+            assert!(!unowned.pidfile_lock_held);
+
+            let pidfile = pidfile_path("aaaabbbb");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, "12345\n").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            let owned = state_dir_ownership("aaaabbbb", &missing);
+            assert!(owned.is_owned());
+            assert_eq!(
+                owned.database,
+                DbWriteLock::Free,
+                "a missing database path must not be reported as held"
+            );
+            assert!(owned.pidfile_lock_held);
+
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        });
+    }
+
+    /// Fork a child that takes a POSIX write lock (`fcntl(F_SETLK, F_WRLCK)`)
+    /// on `path` and holds it until killed. A *separate process* is required:
+    /// POSIX record locks never conflict with the calling process, so an
+    /// in-process lock would be invisible to `F_GETLK`.
+    ///
+    /// The child touches only async-signal-safe libc calls after `fork` (the
+    /// path CString and the pipe are prepared beforehand), which is what makes
+    /// this safe from a multi-threaded test harness.
+    fn fork_write_lock_holder(path: &Path) -> i32 {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(11);
+                }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as libc::c_short;
+                lock.l_whence = libc::SEEK_SET as libc::c_short;
+                if libc::fcntl(fd, libc::F_SETLK, &lock) != 0 {
+                    libc::_exit(12);
+                }
+                let ready = [1u8];
+                libc::write(fds[1], ready.as_ptr() as *const libc::c_void, 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut ready = [0u8; 1];
+        let read = unsafe { libc::read(fds[0], ready.as_mut_ptr() as *mut libc::c_void, 1) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(read, 1, "lock-holding child never signalled readiness");
+        pid
+    }
+
+    fn reap(pid: i32) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+
+    /// A database nobody has ever created cannot be owned.
+    #[test]
+    fn write_lock_probe_reports_free_for_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            db_write_lock(&dir.path().join("never-created.lbug")),
+            DbWriteLock::Free
+        );
+    }
+
+    /// An existing but unlocked database is provably free.
+    #[test]
+    fn write_lock_probe_reports_free_for_unlocked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        let state = db_write_lock(&db);
+        assert_eq!(state, DbWriteLock::Free);
+        assert!(state.is_provably_free());
+        assert!(!state.is_held());
+    }
+
+    /// The whole point: another process holding the database is visible to the
+    /// kernel by PID, and stays visible no matter what happens to the pidfile.
+    #[test]
+    fn write_lock_probe_names_the_holding_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        let holder = fork_write_lock_holder(&db);
+        let state = db_write_lock(&db);
+        assert_eq!(
+            state,
+            DbWriteLock::Held { pid: Some(holder) },
+            "the kernel must name the process holding the database write lock"
+        );
+        assert!(state.is_held());
+        assert!(!state.is_provably_free());
+
+        reap(holder);
+        // Once the holder is gone the kernel drops its lock — no file on disk
+        // has to be cleaned up for the truth to change.
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
+    }
+
+    /// The self-probe guard must work in RELEASE builds, so it is a runtime
+    /// branch rather than a `debug_assert` (this workspace sets no
+    /// `[profile.release] debug-assertions` override, so an assertion would
+    /// vanish from every shipped binary). Probing while holding the store open
+    /// must fail closed, never report `Free`.
+    ///
+    /// Tested by VALUE through `db_write_lock_probe`. Setting the real
+    /// `LOCAL_STORE_WRITE_LOCK_HELD` flag here would make every sibling test
+    /// that probes a lock fail intermittently — they run on parallel threads
+    /// and take no shared lock — which is exactly what the first version of
+    /// this test did.
+    #[test]
+    fn write_lock_probe_refuses_to_run_against_its_own_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+
+        assert_eq!(db_write_lock_probe(false, &db), DbWriteLock::Free);
+
+        let guarded = db_write_lock_probe(true, &db);
+        assert_eq!(
+            guarded,
+            DbWriteLock::Unknown,
+            "a probe from a store-holding process must fail closed, not report Free"
+        );
+        assert!(!guarded.is_provably_free());
+        assert!(!guarded.is_held());
+    }
+
+    /// The entry point agrees with the probe in the DISARMED state, and no
+    /// test leaves the process-global flag armed for its neighbours.
+    ///
+    /// Honest scope: this does NOT pin the wiring. Because the global is
+    /// already `false` here, it would still pass if someone hardcoded
+    /// `db_write_lock_probe(false, db_path)` — which is precisely the rot that
+    /// disables the guard. Pinning that direction requires observing the
+    /// entry point with the global ARMED, and arming a process-global inside a
+    /// parallel test binary is the exact race removed above (2 failures in 60
+    /// runs at `--test-threads=8`). Doing it properly needs a single-test
+    /// integration binary where nothing else runs concurrently; until then the
+    /// armed direction is covered only by
+    /// `write_lock_probe_refuses_to_run_against_its_own_store`, which tests the
+    /// inner function by value.
+    #[test]
+    fn write_lock_probe_entry_point_consults_the_local_store_flag() {
+        assert!(
+            !local_store_write_lock_held(),
+            "no test may leave this process-global flag armed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not really a database").unwrap();
+        assert_eq!(db_write_lock(&db), db_write_lock_probe(false, &db));
+    }
+
+    /// Ownership survives an operator deleting the pidfile: the flock evidence
+    /// disappears with the inode, the database lock does not.
+    #[test]
+    fn write_lock_probe_survives_pidfile_unlink() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let pidfile = dir.path().join("daemon.pid");
+        std::fs::write(&db, b"not really a database").unwrap();
+        std::fs::write(&pidfile, "1\n").unwrap();
+
+        let holder = fork_write_lock_holder(&db);
+        std::fs::remove_file(&pidfile).unwrap();
+
+        // A fresh pidfile at the same path flocks trivially — the old proof is
+        // gone — while the database lock still names the live owner.
+        let fresh = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "an unlinked-then-recreated pidfile must flock freely (this is the defect)"
+        );
+        assert_eq!(db_write_lock(&db), DbWriteLock::Held { pid: Some(holder) });
+
+        unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_UN) };
+        reap(holder);
     }
 }
