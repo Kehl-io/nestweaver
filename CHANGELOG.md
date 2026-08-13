@@ -43,6 +43,47 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [5.0.0](https://github.com/Kehl-io/nestweaver/compare/v4.1.2...v5.0.0) (2026-08-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **store:** `ResponseCache::open` takes a third argument, the caller's response-shape version. It is public API of `nestweaver-store`, so this is a breaking signature change and b42d580 mislabelled it as a patch-level fix.
+
+### Features
+
+* **cli:** show embed progress and name what a blocked write is waiting on ([c0ce343](https://github.com/Kehl-io/nestweaver/commit/c0ce34316e9f8e79de951f9af6c481ee710c48b2))
+* **daemon:** report embed-pass progress and write-lock contention ([2d392a0](https://github.com/Kehl-io/nestweaver/commit/2d392a04f64bf96ab514f7604a7e2df8cb944265))
+* **proto:** expose embed-pass progress and write-path depth on brain_status ([5e55b62](https://github.com/Kehl-io/nestweaver/commit/5e55b62d0cf38667d4b386e9762cc14c680db087))
+
+
+### Bug Fixes
+
+* **cli:** accept leading global flags before the daemon subcommand ([d054cd2](https://github.com/Kehl-io/nestweaver/commit/d054cd2439a147105c6582c067501a87252c6b67))
+* **client:** stop an auto-start from unlinking a live daemon's socket ([b11b823](https://github.com/Kehl-io/nestweaver/commit/b11b82385f024d6dcbb6c2b52f13e375fb9b54ef))
+* **cli:** keep the wait notifier from going silent or misattributing progress ([7abbec4](https://github.com/Kehl-io/nestweaver/commit/7abbec45a96088846e4a9a207e1c61a1fa0b98c5))
+* **cli:** let `daemon stop` reach a daemon selected by NESTWEAVER_DB ([c2644b9](https://github.com/Kehl-io/nestweaver/commit/c2644b9d6247e699fe57c3e51601f24f808848d0))
+* **cli:** match the daemon subcommand by argv position, not by token membership ([fcc3079](https://github.com/Kehl-io/nestweaver/commit/fcc3079cfa338f8333c3c90a5efa88c60064e8cc))
+* **cli:** restore macOS cmdline identity for pidfile-sourced PIDs ([1b88d97](https://github.com/Kehl-io/nestweaver/commit/1b88d97ea0cbfd20b1f628df860f8cb2ef89719d))
+* **cli:** restore parent tracing on the daemonize error path ([6f36030](https://github.com/Kehl-io/nestweaver/commit/6f36030c77292b3170eb0d9b260365f61b9741ae))
+* **cli:** stop `daemon start` from silencing the daemon's own log file ([f12c859](https://github.com/Kehl-io/nestweaver/commit/f12c859f7ccd591c11df853cfcd933204aa3578a))
+* **cli:** stop a failed daemon start from leaving a pidfile naming a dead PID ([c848828](https://github.com/Kehl-io/nestweaver/commit/c8488286470b0fefd56174d4921c09030968dd3e))
+* **daemon:** make an embed-progress snapshot indivisible ([c141036](https://github.com/Kehl-io/nestweaver/commit/c14103659165f418f0e56394b013e99ceca92611))
+* **daemon:** make every writer stamp the write gate, not just RPC handlers ([ac1d283](https://github.com/Kehl-io/nestweaver/commit/ac1d2834d5c6eedb1b5327f49d8aa159fd70e6e9))
+* **daemon:** never signal a process on database-lock evidence alone ([cfa0c0e](https://github.com/Kehl-io/nestweaver/commit/cfa0c0e32088747e6dac4a750ad22a2be8252e99))
+* **daemon:** prove runtime ownership with the database lock, not the pidfile path ([aae7181](https://github.com/Kehl-io/nestweaver/commit/aae7181e7cdaca0e7c018fe22418c3682e3cf77c))
+* **daemon:** prove state-dir ownership with the database lock, not the pidfile ([6e0e0f2](https://github.com/Kehl-io/nestweaver/commit/6e0e0f246f2a7c4edc8b7a7904be4c6864cc386c))
+* **daemon:** re-bound the shutdown drain and correct its remedy advice ([6ce7982](https://github.com/Kehl-io/nestweaver/commit/6ce798236f07b9607a0e1f4e8d95eefb217f0cd6))
+* **daemon:** report both ownership proofs, and stop empty pidfiles from refusing ([d202213](https://github.com/Kehl-io/nestweaver/commit/d2022139d38fd95e5f85eaa4936f075714e5de6d))
+* **daemon:** stop an overlapping embed pass from falsifying status ([9bcab05](https://github.com/Kehl-io/nestweaver/commit/9bcab05cd24d903f832b866965788d8d9b7a02f0))
+* **daemon:** stop the drain ceiling claiming a shutdown it cannot force ([fa1b82f](https://github.com/Kehl-io/nestweaver/commit/fa1b82ff0e1bb95de4620c901e64c40fcc256a26))
+* **federation:** carry brain_search honesty fields through the hybrid merge ([90feaa4](https://github.com/Kehl-io/nestweaver/commit/90feaa41fa00e66cc529138203cbbc70785c72fc))
+* **federation:** drop the unreachable honesty marker and correct three stale claims ([94863dd](https://github.com/Kehl-io/nestweaver/commit/94863dd880a78232179734b259dc9410100a501d))
+* **mcp:** emit semantic honesty fields from in-process brain_search ([d0a2053](https://github.com/Kehl-io/nestweaver/commit/d0a20538acd5bae2450b969da4c63643b4b35ecf))
+* **store:** narrow the response-shape digest and correct its decode claim ([3e46d74](https://github.com/Kehl-io/nestweaver/commit/3e46d741fe233b52d5cdf65fac03ff5d8cc8f0d4))
+* **store:** stop the response cache serving pre-upgrade response shapes ([b42d580](https://github.com/Kehl-io/nestweaver/commit/b42d580b36fa48e5be1777679b59dd6fa2da8630))
+* Wave A honesty cluster + hardening pass ([a94bfc4](https://github.com/Kehl-io/nestweaver/commit/a94bfc40a1f6215a6781e041fdbfa90a002bcf6b))
+
 ## [4.1.2](https://github.com/Kehl-io/nestweaver/compare/v4.1.1...v4.1.2) (2026-08-11)
 
 
