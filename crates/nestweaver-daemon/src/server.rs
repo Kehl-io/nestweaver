@@ -1219,8 +1219,10 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
                  shutting down. NEW writes are already being refused with \
                  UNAVAILABLE, so this count only falls. Most reads are still \
                  served, though they can stall for seconds while a write \
-                 commits — `embed` and `plan_embed` are not served at all, they \
-                 take the same write gate. This is \
+                 commits. `embed` takes the write gate AND the write guard, so \
+                 it is refused outright; `plan_embed` takes the gate but counts \
+                 as a read, so it is not refused — it BLOCKS until the \
+                 in-flight write releases the gate. This is \
                  the same drain whether you sent SIGTERM (`nestweaver daemon \
                  stop`) or the Shutdown RPC (`nestweaver daemon restart`); \
                  neither escalates on its own. To end it now — abandoning the \
@@ -1333,12 +1335,19 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
     // blocking thread would otherwise pin shutdown (Tokio's runtime drop waits
     // for blocking threads) until someone kills the process.
     //
-    // Consequence of the guard above: only the FIRST trigger stops the watcher,
-    // so a watcher registered after a drain began is not stopped here. That hole
-    // is closed on the exit path — the belt-and-suspenders `stop_active_watcher`
-    // after `uds_serve` returns runs before the worker await and before runtime
-    // drop, so such a watcher still cannot pin process exit. Verified by
-    // inspection of the call ordering, not by test.
+    // Consequence of the guard above: only the FIRST trigger stops the watcher.
+    // A watcher registered after a drain began would therefore not be stopped
+    // here — but no such watcher can exist via the RPC route any more. This
+    // function sets `shutdown_started` at the guard above, and
+    // `watch_vault`/`watch_code` now take `ConnectionGuard::write` BEFORE
+    // `register_watcher`, so every registration attempt after this point is
+    // refused with UNAVAILABLE and no watcher thread is ever spawned. The write
+    // gate closed this hole as a side effect of making the drain monotone.
+    //
+    // The belt-and-suspenders `stop_active_watcher` after `uds_serve` returns is
+    // kept regardless: it runs before the worker await and before runtime drop,
+    // so anything registered by a path not covered above still cannot pin
+    // process exit. Verified by inspection of the call ordering, not by test.
     stop_active_watcher(&state);
 
     tokio::spawn(async move {
@@ -1360,10 +1369,13 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
 /// Looping restores it. The second and later signals are cheap: the once-guard
 /// inside `begin_shutdown_drain` refuses them and logs, so a supervisor's
 /// repeated SIGTERMs neither start a second drain nor cut the first one short.
-/// It does NOT close the late-watcher hole documented on `begin_shutdown_drain`:
-/// the once-guard returns before `stop_active_watcher` is reached, so a second
-/// signal still does not stop a watcher registered after the drain began. That
-/// hole stays closed where it already was, on the exit path.
+/// The loop itself does not stop a late-registered watcher — the once-guard
+/// returns before `stop_active_watcher` is reached — but that no longer matters
+/// for the RPC route: `watch_vault`/`watch_code` now take
+/// `ConnectionGuard::write` BEFORE `register_watcher`, so once `shutdown_started`
+/// is set no new watcher can be registered at all. A watcher already running
+/// when the drain began is stopped by the first trigger, and the belt-and-braces
+/// `stop_active_watcher` on the exit path still covers anything else.
 ///
 /// Hoisted out of `run_server` so it can be unit-tested with a real signal —
 /// see `sigterm_does_not_broadcast_while_a_write_is_in_flight`.
@@ -3557,8 +3569,13 @@ impl NestWeaverDaemon for DaemonService {
         // no writer touches the files mid-copy, and the RAII guard releases the
         // lock on drop/panic — there is no persistent quiesce flag to leak.
         let staged = {
-            let _write_lock = self.state.write_gate.lock("backup").await;
+            // Guard BEFORE the write gate: during a drain the gate is held by the
+            // in-flight write for as long as it runs, so taking it first meant this
+            // request queued for minutes and only then learned it was refused. A
+            // client with a deadline saw DEADLINE_EXCEEDED instead of the
+            // explanatory UNAVAILABLE, which defeats the point of the message.
             let _guard = ConnectionGuard::write(&self.state)?;
+            let _write_lock = self.state.write_gate.lock("backup").await;
             let store = self.state.store.clone();
             let cfg = config.clone();
             tracing::info!("backup: staging under write lock");
@@ -3654,6 +3671,15 @@ impl NestWeaverDaemon for DaemonService {
 
         let shutdown_handle = watcher.shutdown_handle();
 
+        // Refuse BEFORE registering. `register_watcher` mutates
+        // `state.watcher_stop`, and the only thing that clears it is
+        // `clear_watcher_registration` inside the spawned thread below — which
+        // never runs if the guard refuses. Registering first therefore left the
+        // daemon holding a shutdown handle for a `BrainWatcher` dropped on the
+        // very next line, on behalf of a request that was rejected: state
+        // mutated by a refused RPC.
+        let guard = ConnectionGuard::write(&self.state)?;
+
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         let watcher_id = match register_watcher(&self.state, shutdown_handle, false) {
             Ok(id) => id,
@@ -3666,8 +3692,6 @@ impl NestWeaverDaemon for DaemonService {
             }
             Err(e) => return Err(e),
         };
-
-        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
@@ -3743,6 +3767,15 @@ impl NestWeaverDaemon for DaemonService {
         let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
         let shutdown_handle = watcher.shutdown_handle();
 
+        // Refuse BEFORE registering — and here the ordering matters more than in
+        // `watch_vault`, because `force` is passed through. With the guard
+        // second, `nestweaver watch --force` during a drain would STOP THE
+        // RUNNING INCUMBENT WATCHER and then refuse the request that replaced
+        // it, leaving no watcher at all plus a registration pointing at a
+        // dropped `CodeWatcher`. Destroying live state on behalf of a rejected
+        // request is not something a refusal is allowed to do.
+        let guard = ConnectionGuard::write(&self.state)?;
+
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         // With `force`, an already-running watcher (e.g. orphaned by a
         // kill -9'd `watch` CLI) is stopped and replaced instead of
@@ -3759,8 +3792,6 @@ impl NestWeaverDaemon for DaemonService {
             }
             Err(e) => return Err(e),
         };
-
-        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
@@ -4745,8 +4776,13 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_gate.lock("remove_vault").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("remove_vault").await;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4771,8 +4807,13 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_gate.lock("remove_repo").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("remove_repo").await;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4809,8 +4850,13 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_gate.lock("remove_project").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("remove_project").await;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4841,8 +4887,13 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_gate.lock("prune_stale").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("prune_stale").await;
 
         let _req = request.into_inner();
         let state = self.state.clone();
@@ -4884,8 +4935,13 @@ impl NestWeaverDaemon for DaemonService {
                 "source and target instance IDs must differ",
             ));
         }
-        let _write_lock = self.state.write_gate.lock("merge_instance").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("merge_instance").await;
 
         let state = self.state.clone();
 
@@ -5028,8 +5084,13 @@ impl NestWeaverDaemon for DaemonService {
         // (which copies under the same lock) and is visible to the shutdown
         // drain / idle timeout via `active_writes` — mirroring `prune_stale`
         // and `purge_instance`.
-        let _write_lock = self.state.write_gate.lock("reindex_search").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("reindex_search").await;
 
         let state = self.state.clone();
         #[allow(clippy::result_large_err)]
@@ -5875,8 +5936,13 @@ impl NestWeaverDaemon for DaemonService {
         // shutdown drain / idle timeout, and two concurrent callers cannot lose
         // updates (last-writer-wins). This is the single gated write path: the
         // MCP `tool_set_extension` routes here rather than mutating directly.
-        let _write_lock = self.state.write_gate.lock("set_extension").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("set_extension").await;
 
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
@@ -6454,8 +6520,13 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let _write_lock = self.state.write_gate.lock("embed").await;
+        // Guard BEFORE the write gate: during a drain the gate is held by the
+        // in-flight write for as long as it runs, so taking it first meant this
+        // request queued for minutes and only then learned it was refused. A
+        // client with a deadline saw DEADLINE_EXCEEDED instead of the
+        // explanatory UNAVAILABLE, which defeats the point of the message.
         let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("embed").await;
 
         #[cfg(not(feature = "embed"))]
         {
@@ -16711,6 +16782,76 @@ external_model = "unavailable-test-model"
         drop(read);
 
         drop(in_flight);
+    }
+
+    /// A refused request must not leave state behind.
+    ///
+    /// `watch_vault`/`watch_code` used to call `register_watcher` first and take
+    /// the write guard second. During a drain that registered a shutdown handle
+    /// for a watcher that was then dropped when the guard refused, and nothing
+    /// ever cleared it — `clear_watcher_registration` only runs inside the
+    /// thread that never spawned. Every later watch session in that process
+    /// would then be told "a watcher is already running".
+    ///
+    /// `watch_code` was the worse of the two because it forwards `force`:
+    /// `nestweaver watch --force` mid-drain would STOP the running incumbent
+    /// watcher and then refuse the request that was meant to replace it,
+    /// destroying live state on behalf of a rejected call.
+    #[tokio::test]
+    async fn a_refused_watch_leaves_no_watcher_registration() {
+        let state = test_state_with_writer();
+        let service = DaemonService {
+            state: Arc::clone(&state),
+        };
+        // A real directory: `watch_code` rejects a non-existent repo path long
+        // before it reaches the guard, so a fake path would make this test pass
+        // for the wrong reason.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path().to_string_lossy().into_owned();
+
+        // A watcher registered before shutdown, standing in for the incumbent
+        // that `--force` would otherwise tear down.
+        let incumbent =
+            nestweaver_engine::CodeWatcher::new(&state.db_path, repo_dir.path(), "test-instance");
+        register_watcher(&state, incumbent.shutdown_handle(), false)
+            .expect("the incumbent registers before shutdown");
+
+        state.active_writes.store(1, Ordering::Relaxed);
+        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+
+        for force in [false, true] {
+            let refusal = service
+                .watch_code(tonic::Request::new(nestweaver_proto::WatchCodeRequest {
+                    repo_path: repo_path.clone(),
+                    instance_id: String::new(),
+                    force,
+                }))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("watch_code(force={force}) must be refused"));
+            assert_eq!(refusal.code(), tonic::Code::Unavailable, "{refusal:?}");
+        }
+
+        // `begin_shutdown_drain` legitimately stops and clears the incumbent —
+        // that is the drain doing its job. What must NOT happen is a refused
+        // call putting something back. With the guard after `register_watcher`,
+        // both passes above would have stored a fresh handle for a `CodeWatcher`
+        // dropped moments later, so this slot would be `Some` again and every
+        // later watch session in the process would be told one is already
+        // running.
+        let registered = state
+            .watcher_stop
+            .lock()
+            .expect("watcher_stop lock")
+            .is_some();
+        assert!(
+            !registered,
+            "a refused watch must not register a watcher it never started — the \
+             slot is left holding a handle to a dropped watcher and nothing ever \
+             clears it"
+        );
+
+        state.active_writes.store(0, Ordering::Relaxed);
     }
 
     /// The link nothing else covers: that a REAL SIGTERM routes into the drain

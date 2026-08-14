@@ -4466,9 +4466,15 @@ enum InteractionCommands {
 /// flush WAL and unwind after a drain that ran to the full ceiling, before
 /// `daemon stop` gives up watching and reports.
 ///
-/// Mirrored by `LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS` in `nestweaver-daemon`, which
-/// derives the launchd plist's `ExitTimeOut` the same way. Unlike this one,
-/// that IS a kill deadline — launchd enforces it.
+/// DELIBERATELY SMALLER than `LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS` (60) in
+/// `nestweaver-daemon`, which derives the launchd plist's `ExitTimeOut` from the
+/// same drain ceiling. The two used to be equal, and that was a defect: both
+/// deadlines landed at the same instant, so this command could print "still
+/// running and still serving reads" about a process launchd had just SIGKILLed.
+/// The gap is the point — this side must give up watching STRICTLY BEFORE the
+/// supervisor kills. Unlike this one, launchd's IS a kill deadline, and it
+/// enforces it. Docker's `stop_grace_period` (720s) is set with the same
+/// ordering in mind.
 const STOP_GRACE_BUFFER_SECS: u64 = 30;
 
 /// How long `daemon stop --force` waits for a clean exit before SIGKILL.
@@ -4503,18 +4509,28 @@ const STOP_WAIT_NOTICE_SECS: u64 = 60;
 /// change exists to remove, so it must not be reintroduced by the command
 /// announcing the fix.
 ///
-/// The in-flight-write sentence is hedged for the same reason: in an index-only
-/// drain there is no write to be unable to abort.
+/// THE NEGATIVE BRANCH REPORTS THE OBSERVATION, NOT A CAUSE. All the caller
+/// knows is that one `connect()` did not answer. The index-only ceiling
+/// broadcast is the *likely* explanation and is named as such, but it is not
+/// the only one: ECONNREFUSED while the process is mid-exit, `EMFILE`/`ENFILE`
+/// in this CLI process, a socket already swept by `daemon gc`, or a full listen
+/// backlog all produce the same failed connect — including 690s into a WRITE
+/// drain, where "no in-flight write" would be flatly false. Stating a
+/// fabricated diagnosis confidently is the same defect as the overclaim this
+/// branch exists to fix, merely inverted, so the wording stays hedged and the
+/// write-specific sentence is omitted rather than negated.
 fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) -> String {
     let state_line = if serving_reads {
         "It is still running and still answering on its socket — reads are still served, \
          though they can stall for seconds while a write commits. Work that cannot be \
          aborted (`spawn_blocking` is not cancellable) has to finish."
     } else {
-        "It is still running but is NO LONGER answering on its socket: the drain reached \
-         its ceiling with no in-flight write and broadcast shutdown, which closes every \
-         listener, and the process is now finishing unabortable work with nothing being \
-         served. Reads are DOWN."
+        "It is still running, but its socket did not answer just now, so reads may be \
+         DOWN. The likeliest cause is the index-only drain: with nothing in the write \
+         queue the daemon broadcasts at the drain ceiling, which closes every listener \
+         while the process keeps finishing unabortable work. This probe cannot tell that \
+         apart from a socket already cleaned up, a refused connection during exit, or a \
+         local file-descriptor limit — check the daemon log before concluding."
     };
     format!(
         "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
@@ -13604,13 +13620,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // state the identity cross-check above exists to
                         // prevent — and strand the clients that are still being
                         // served reads while the write drains.
-                        // OBSERVE whether reads are still being served rather
-                        // than asserting it. The index-only drain broadcasts at
-                        // the ceiling, which closes every listener 30s before
-                        // this grace expires — claiming "still serving reads"
-                        // there would be the same overclaim this change removes.
-                        // A socket that refuses connections, or one now owned by
-                        // a different PID, both mean "not this daemon's reads".
+                        // LIVENESS RE-CHECK before claiming anything. Up to
+                        // 100ms passed since the wait loop's last probe, and a
+                        // daemon that finished draining inside that window
+                        // stopped exactly as asked. Without this the socket
+                        // probe below would find nothing listening and the CLI
+                        // would announce "STILL DRAINING … Reads are DOWN" about
+                        // a clean stop, return EXIT_ERROR, and — because this
+                        // arm deliberately skips the runtime sweep — strand the
+                        // dead daemon's pidfile and socket. Reporting a success
+                        // as the most alarming failure available is the same
+                        // overclaim class, pointing the other way.
+                        if unsafe { libc::kill(pid, 0) } != 0 {
+                            eprintln!("Daemon stopped.");
+                            report_runtime_cleanup(&remove_unowned_daemon_runtime(
+                                &db_path,
+                                &pidfile,
+                                &socket,
+                                &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                            ));
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+
+                        // OBSERVE whether the socket answers; do NOT infer why.
+                        // The index-only drain broadcasts at the ceiling, which
+                        // closes every listener 30s before this grace expires,
+                        // so "still serving reads" cannot be asserted — but a
+                        // failed connect does not prove that particular cause
+                        // either (ECONNREFUSED mid-exit, EMFILE in this process,
+                        // a socket swept by `daemon gc`, a full listen backlog).
+                        // The message therefore reports the observation and
+                        // hedges the cause. A socket owned by a different PID is
+                        // likewise not this daemon's read service.
                         let serving_reads = daemon_socket_reported_pid(&socket) == Some(pid);
                         eprintln!(
                             "{}",
@@ -22756,17 +22797,42 @@ mod stop_grace_tests {
     /// branches are asserted here because the honest branch is the whole point:
     /// a message that could only ever say the reassuring thing would not be
     /// reporting, it would be guessing.
+    ///
+    /// It must not overcorrect either. A failed `connect()` is one observation
+    /// with several possible causes, so this test pins that the message reports
+    /// the observation and HEDGES the cause. An earlier version asserted the
+    /// fixed string "no in-flight write", which locked in a diagnosis the probe
+    /// cannot support — the branch's own defect class, inverted.
     #[test]
     fn still_draining_message_does_not_claim_reads_when_the_socket_is_gone() {
         let msg = stop_still_draining_message(4242, 690, false);
 
         assert!(
-            msg.contains("NO LONGER answering on its socket") && msg.contains("Reads are DOWN"),
-            "when the listeners are gone the message must say so plainly: {msg}"
+            msg.contains("socket did not answer"),
+            "the message must report what was actually observed — one failed \
+             connect: {msg}"
+        );
+        assert!(
+            msg.contains("reads may be") && msg.contains("DOWN"),
+            "and must not leave the operator thinking read service is fine: {msg}"
         );
         assert!(
             !msg.contains("reads are still served"),
             "this is the overclaim the branch exists to prevent: {msg}"
+        );
+        // The hedge is the point. A single failed connect is also produced by
+        // ECONNREFUSED mid-exit, EMFILE in this process, a socket swept by
+        // `daemon gc`, or a full backlog — including during a WRITE drain,
+        // where a confident "no in-flight write" would be flatly wrong.
+        assert!(
+            msg.contains("likeliest cause") && msg.contains("cannot tell that apart"),
+            "the message must present the index-only drain as the likely cause, \
+             not as an established fact: {msg}"
+        );
+        assert!(
+            !msg.contains("no in-flight write"),
+            "the probe cannot observe whether a write is in flight, so it must \
+             not state it either way: {msg}"
         );
         // Still not a kill, and still names both escapes — the reporting
         // contract does not weaken just because the news is worse.
@@ -22779,19 +22845,13 @@ mod stop_grace_tests {
             !msg.contains("sending SIGKILL"),
             "this path must not kill anything: {msg}"
         );
-        // The message must not diagnose a write that is not there. It may
-        // mention the absence of one (and does); what it must not do is assert
-        // one exists, which is what the original unconditional wording — "an
-        // in-flight write cannot be aborted ... so it has to finish" — did.
+        // The message must not diagnose a write it cannot see. The original
+        // unconditional wording — "an in-flight write cannot be aborted ... so
+        // it has to finish" — asserted one exists on every path.
         assert!(
             !msg.contains("an in-flight write cannot be aborted"),
-            "an index-only drain has no in-flight write; diagnosing one would be \
-             a fabrication: {msg}"
-        );
-        assert!(
-            msg.contains("no in-flight write"),
-            "and it should say positively what it did observe, so the operator \
-             knows which drain branch they are in: {msg}"
+            "this branch cannot know whether a write is in flight; diagnosing \
+             one would be a fabrication: {msg}"
         );
     }
 

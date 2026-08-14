@@ -11,7 +11,9 @@ supervisor is in the picture.
   writes drain — though an individual read can stall for seconds while a write
   commits, which is pre-existing store behaviour and not caused by the drain.
 - **New writes are refused** (`UNAVAILABLE`) once shutdown starts, so the drain
-  is monotone and is guaranteed to finish. Reads are not gated.
+  is monotone and is guaranteed to finish. Reads are not gated. This covers the
+  gRPC surface; the web admin routes take the write gate but are outside this
+  guard and are invisible to the drain either way.
 - An idle daemon exits **immediately**. Nothing about this makes a normal stop
   slower.
 - If a write is still in flight when the stop grace expires, `daemon stop`

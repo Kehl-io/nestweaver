@@ -54,13 +54,22 @@ migration paths (pre-SHA-256 instance IDs; pre-v0.26.2 `$TMPDIR` sockets) and
 neither is on the `daemon stop` route, but "nothing escalates automatically" is
 true of `daemon stop` only, not of the binary as a whole.
 
-**The drain is monotone.** Once shutdown starts, `ConnectionGuard::write`
-refuses new writes with `UNAVAILABLE`. This is not a nicety: because listeners
-now stay up by design, without it a webhook feed, watcher, MCP client or agent
-loop could start a new write minutes into a drain and reset the drain's exit
-condition indefinitely — leaving `--force`/`kill -9` as the only way out, which
-would make the unsafe kill *more* likely on a busy daemon, not less. Reads are
-deliberately not gated.
+**The drain is monotone over the gRPC surface.** Once shutdown starts,
+`ConnectionGuard::write` refuses new writes with `UNAVAILABLE`. This is not a
+nicety: because listeners now stay up by design, without it a webhook feed,
+watcher, MCP client or agent loop could start a new write minutes into a drain
+and reset the drain's exit condition indefinitely — leaving `--force`/`kill -9`
+as the only way out, which would make the unsafe kill *more* likely on a busy
+daemon, not less. Reads are deliberately not gated, and every gated RPC takes the
+guard BEFORE the write gate so a refusal is immediate rather than queued behind
+the in-flight write.
+
+The claim is scoped to gRPC on purpose. The **web admin** routes
+(`nestweaver-web/src/routes/admin.rs`) take the write gate but no
+`ConnectionGuard::write`, and `AdminState` is never handed `shutdown_started`, so
+they can neither be refused nor consult the flag. They are also invisible to the
+drain's exit condition, which means the drain neither waits for them nor is
+extended by them. Pre-existing, not introduced or fixed here.
 
 **Under a process supervisor none of that is a guarantee.** The unbounded drain
 describes what this process does with SIGTERM; a supervisor that SIGKILLs on its
