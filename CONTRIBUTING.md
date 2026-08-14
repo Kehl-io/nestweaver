@@ -103,8 +103,8 @@ Do not add the `zstd` crate as a dependency. It pulls in `zstd-sys`, which
 compiles a **second** complete copy, and `rust-lld` — the default linker on
 x86_64 Linux — then refuses to link anything, with dozens of duplicate `ZSTD_*`
 symbols. That is what `-Wl,--allow-multiple-definition` used to suppress; the
-flag never merged the copies, it only silenced the linker and left two sets of
-zstd state in one process.
+flag never merged the copies, it only told the linker to pick one definition
+silently while the other stayed in the binary.
 
 CI passes `-C link-arg=-fuse-ld=mold` for speed; `mold` is optional locally.
 

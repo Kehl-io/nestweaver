@@ -322,9 +322,9 @@ fn source_build_configuration_is_intact_and_reproducible() {
 /// Adding the `zstd` crate back pulls in `zstd-sys`, which compiles a second
 /// complete copy; `rust-lld` then fails every link with duplicate `ZSTD_*`
 /// symbols. The historical response was `-Wl,--allow-multiple-definition`,
-/// which suppressed the error without merging the copies — two zstd instances
-/// with independent state stayed in the process. Assert both halves here: no
-/// second copy in the tree, and no suppression flag anywhere.
+/// which suppressed the error without merging the copies — the linker picked
+/// one definition silently and the other stayed in the binary. Assert both
+/// halves here: no second copy in the tree, and no suppression flag anywhere.
 #[test]
 fn exactly_one_copy_of_zstd_is_linked() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

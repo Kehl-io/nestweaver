@@ -15,8 +15,8 @@
 //! complete copy of the same zstd 1.5.7. `rust-lld` — the default linker on
 //! x86_64 Linux — rejects that with duplicate-symbol errors, which is why the
 //! tree carried `-Wl,--allow-multiple-definition`. That flag never merged the
-//! two copies; it just told the linker to pick one and stay quiet, leaving two
-//! sets of zstd state in one process.
+//! two copies; it told the linker to pick one definition silently and left the
+//! other in the binary.
 //!
 //! This module removes the second copy. It declares the handful of stable
 //! public zstd entry points it needs and lets them resolve against the copy
@@ -25,13 +25,28 @@
 //! `zstd` static library that `build.rs` compiles from lbug's vendored sources
 //! in the prebuilt-lbug path. Both paths already emit the link directives.
 //!
+//! What this requires of lbug is narrow but real: it must keep *defining* the
+//! `ZSTD_*` entry points with *global* binding. Note that hiding them — the
+//! stated intent of the `ZSTDLIB_VISIBILITY` line above, which does not
+//! currently do so — would NOT break this: ELF visibility governs dynamic
+//! export, not static resolution, so a hidden-but-global symbol still links.
+//! Only removing the symbols, or localizing them to `STB_LOCAL`, produces a
+//! link error. There is no configuration in which this silently binds to a
+//! different zstd.
+//!
 //! # Format
 //!
-//! This is the same libzstd that produced the existing archives, driven through
-//! the same public API the `zstd` crate uses, so the bytes on disk are
-//! unchanged: `.nwsnap.zst` backups and `NWRC` response-cache sidecars written
-//! by earlier versions still read, and archives written now are still readable
-//! by any standard zstd implementation.
+//! Wire-compatible in both directions, with the same libzstd driven through the
+//! same public API the `zstd` crate used: `.nwsnap.zst` backups and `NWRC`
+//! response-cache sidecars written by earlier versions still read, and what is
+//! written now is readable by any standard zstd implementation.
+//!
+//! The exact bytes are *not* always identical, so do not content-address a
+//! compressed blob across this change. [`encode_all`] uses `ZSTD_compress`,
+//! which records the frame content size in the header; the `zstd` crate's bulk
+//! path did not, so every non-empty one-shot frame differs (and is one byte
+//! longer for small inputs). [`Encoder`] output — the `.nwsnap.zst` path — is
+//! byte-identical.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::io::{self, Read, Write};
@@ -186,6 +201,10 @@ pub struct Encoder<W: Write> {
     stream: NonNull<ZstdStream>,
     writer: Option<W>,
     buffer: Vec<u8>,
+    /// Set after a zstd error. `zstd.h` documents the stream as undefined once
+    /// `ZSTD_compressStream2` fails, and `io::Write` permits a caller to keep
+    /// writing after an error, so refuse instead of touching it.
+    poisoned: bool,
 }
 
 // SAFETY: a `ZSTD_CStream` is owned exclusively by its `Encoder` and carries no
@@ -211,12 +230,18 @@ impl<W: Write> Encoder<W> {
             stream,
             writer: Some(writer),
             buffer,
+            poisoned: false,
         })
     }
 
     /// Drive `ZSTD_compressStream2` over `input` until zstd is done with the
     /// directive, writing every produced byte to the inner writer.
     fn run(&mut self, input: &[u8], end_op: c_int) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "zstd: compression stream used after an error",
+            ));
+        }
         let mut in_buffer = ZstdInBuffer {
             src: input.as_ptr().cast::<c_void>(),
             size: input.len(),
@@ -230,14 +255,20 @@ impl<W: Write> Encoder<W> {
             };
             // SAFETY: both buffers describe live allocations for the duration
             // of the call, and `self.stream` is a live `ZSTD_CStream`.
-            let remaining = check(unsafe {
+            let remaining = match check(unsafe {
                 ZSTD_compressStream2(
                     self.stream.as_ptr(),
                     &mut out_buffer,
                     &mut in_buffer,
                     end_op,
                 )
-            })?;
+            }) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
             if out_buffer.pos > 0 {
                 let writer = self
                     .writer
@@ -309,6 +340,15 @@ pub struct Decoder<R: Read> {
     /// Bytes of `input[..filled]` already consumed by zstd.
     consumed: usize,
     eof: bool,
+    /// True when the last `ZSTD_decompressStream` returned 0 — "frame
+    /// completely decoded and fully flushed" (`zstd.h`). Starts `false`: input
+    /// that ends before any frame completes is truncated, and must be reported
+    /// as an error rather than as a short-but-successful read.
+    frame_complete: bool,
+    /// Set after a zstd error. `zstd.h` documents the stream as undefined once
+    /// `ZSTD_decompressStream` fails, and `io::Read` permits a caller to call
+    /// `read` again after an error, so refuse instead of touching it.
+    poisoned: bool,
 }
 
 // SAFETY: as for `Encoder` — the `ZSTD_DStream` is exclusively owned and only
@@ -336,25 +376,45 @@ impl<R: Read> Decoder<R> {
             filled: 0,
             consumed: 0,
             eof: false,
+            frame_complete: false,
+            poisoned: false,
         })
+    }
+
+    /// The inner reader is exhausted. Distinguish a clean end-of-stream from a
+    /// truncated one.
+    fn end_of_input(&self) -> io::Result<usize> {
+        if self.frame_complete {
+            Ok(0)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "zstd: incomplete frame — the compressed input ends mid-frame",
+            ))
+        }
     }
 }
 
 impl<R: Read> Read for Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "zstd: decompression stream used after an error",
+            ));
+        }
         if buf.is_empty() {
             return Ok(0);
         }
         loop {
             if self.consumed == self.filled {
                 if self.eof {
-                    return Ok(0);
+                    return self.end_of_input();
                 }
                 self.filled = self.reader.read(&mut self.input)?;
                 self.consumed = 0;
                 if self.filled == 0 {
                     self.eof = true;
-                    return Ok(0);
+                    return self.end_of_input();
                 }
             }
 
@@ -370,10 +430,20 @@ impl<R: Read> Read for Decoder<R> {
             };
             // SAFETY: both buffers describe live allocations for the duration
             // of the call, and `self.stream` is a live `ZSTD_DStream`.
-            check(unsafe {
+            let remaining = match check(unsafe {
                 ZSTD_decompressStream(self.stream.as_ptr(), &mut out_buffer, &mut in_buffer)
-            })?;
+            }) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
             self.consumed = in_buffer.pos;
+            // 0 means the frame is decoded and flushed; anything else means
+            // zstd is mid-frame and still wants input. Latching it is what lets
+            // `end_of_input` tell a complete stream from a truncated one.
+            self.frame_complete = remaining == 0;
             if out_buffer.pos > 0 {
                 return Ok(out_buffer.pos);
             }
@@ -394,14 +464,37 @@ impl<R: Read> Drop for Decoder<R> {
 mod tests {
     use super::*;
 
-    /// The symbols must resolve against a real libzstd, not merely link. lbug
-    /// vendors 1.5.7 (`lbug-src/third_party/versions.txt`).
+    /// Deterministic, effectively incompressible bytes.
+    ///
+    /// Truncation tests need a frame whose compressed form is larger than the
+    /// tail being cut off. Repetitive filler compresses to a few dozen bytes
+    /// and makes such a test silently vacuous, so generate from an LCG instead.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// The symbols must resolve against the libzstd lbug vendors, not merely
+    /// link against something. Pinned exactly rather than as a floor: a loose
+    /// bound would also pass against a stray system libzstd, and the point of
+    /// this test is to prove *which* copy answered.
+    ///
+    /// lbug 0.19.1 vendors 1.5.7 (`lbug-src/third_party/versions.txt`). If an
+    /// lbug bump changes it, update this constant deliberately after checking
+    /// that the entry points this module declares are unchanged.
     #[test]
-    fn links_against_a_real_libzstd() {
-        assert!(
-            version_number() >= 10407,
-            "unexpected libzstd version {}",
-            version_number()
+    fn links_against_the_libzstd_lbug_vendors() {
+        assert_eq!(
+            version_number(),
+            10507,
+            "expected lbug's vendored libzstd 1.5.7"
         );
     }
 
@@ -417,6 +510,79 @@ mod tests {
     fn one_shot_round_trips_empty_input() {
         let compressed = encode_all(b"", 3).unwrap();
         assert_eq!(decode_all(&compressed).unwrap(), Vec::<u8>::new());
+    }
+
+    /// A truncated frame must be an error, never a short success.
+    ///
+    /// This is the failure mode that matters: a `.nwsnap.zst` cut short by an
+    /// interrupted write or a partial copy. Returning `Ok` with fewer bytes
+    /// would let `backup_inspect` report a manifest from a damaged archive, and
+    /// would hand `cache.rs` a silently truncated payload. `tar` and the
+    /// manifest checksums catch *some* of that downstream, but the compression
+    /// layer must signal it in its own right.
+    #[test]
+    fn truncated_frames_are_an_error_not_a_short_read() {
+        // Big enough that dropping a large tail still leaves whole blocks that
+        // decode fine — the case a length-only check would miss.
+        let data = incompressible(2_000_000);
+        let compressed = encode_all(&data, 3).unwrap();
+
+        for cut in [1usize, 50, 5000] {
+            assert!(
+                cut < compressed.len(),
+                "fixture too compressible: {} bytes cannot lose {cut}",
+                compressed.len()
+            );
+            let truncated = &compressed[..compressed.len() - cut];
+            let error = match decode_all(truncated) {
+                Ok(bytes) => panic!(
+                    "truncation by {cut} bytes was accepted, yielding {} bytes",
+                    bytes.len()
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "truncation by {cut}: {error}"
+            );
+        }
+    }
+
+    /// Empty input is a truncated frame, not an empty stream: zero bytes cannot
+    /// contain a frame header.
+    #[test]
+    fn empty_input_is_an_incomplete_frame() {
+        let error = decode_all(b"").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+    }
+
+    /// `io::Read` allows another `read` after an error. The decoder must keep
+    /// reporting the problem rather than reporting success.
+    #[test]
+    fn a_truncated_decoder_keeps_failing_on_reread() {
+        let compressed = encode_all(&incompressible(100_000), 3).unwrap();
+        let truncated = &compressed[..compressed.len() - 20];
+        let mut decoder = Decoder::new(truncated).unwrap();
+        let mut sink = Vec::new();
+        assert!(decoder.read_to_end(&mut sink).is_err());
+        let mut buf = [0u8; 64];
+        assert!(
+            decoder.read(&mut buf).is_err(),
+            "a second read reported success after a truncated stream"
+        );
+    }
+
+    /// A stream cut mid-frame after a complete earlier frame is still
+    /// truncated: the latch must reset when the next frame starts.
+    #[test]
+    fn truncation_after_a_complete_frame_is_still_an_error() {
+        let mut compressed = encode_all(b"first frame", 3).unwrap();
+        let second = encode_all(&incompressible(100_000), 3).unwrap();
+        assert!(second.len() > 30, "fixture too compressible");
+        compressed.extend_from_slice(&second[..second.len() - 30]);
+        let error = decode_all(&compressed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
     }
 
     #[test]
