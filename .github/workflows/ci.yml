@@ -11,6 +11,12 @@ env:
   RUST_BACKTRACE: 1
   LBUG_BUILD_FROM_SOURCE: "1"
   CFLAGS: "-DZSTD_DISABLE_ASM"
+  # mold, purely for link speed. Set as an env override rather than appended to
+  # .cargo/config.toml: a second [target.x86_64-unknown-linux-gnu] table is a
+  # TOML duplicate key and fails the build outright. No duplicate-symbol
+  # suppression belongs here — exactly one copy of zstd is linked, so nothing
+  # needs tolerating. See .cargo/config.toml.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   # Detect what actually changed so we don't recompile the entire Rust
@@ -323,9 +329,6 @@ jobs:
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Use mold as the linker
-        run: |
-          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -388,9 +391,6 @@ jobs:
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Use mold as the linker
-        run: |
-          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -435,9 +435,6 @@ jobs:
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Use mold as the linker
-        run: |
-          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -498,9 +495,6 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Use mold as the linker
-        run: |
-          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -638,9 +632,6 @@ jobs:
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Use mold as the linker
-        run: |
-          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Install frontend dependencies
         working-directory: crates/nestweaver-web/frontend
         run: npm ci

@@ -12,6 +12,10 @@ LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
 # copy through `nestweaver_store::zstd`. Adding the `zstd` crate back would pull
 # in zstd-sys, compile a second copy, and make rust-lld reject every link with
 # duplicate symbols. The historical response was to tell the linker to tolerate
-# duplicates, which suppressed the error while leaving two sets of zstd state in
-# the process. `exactly_one_copy_of_zstd_is_linked` in tests/cli_test.rs guards
-# both halves.
+# duplicates, which suppressed the error without removing the second copy: the
+# linker silently picked one definition and the other stayed in the binary.
+# `exactly_one_copy_of_zstd_is_linked` in tests/cli_test.rs guards both halves.
+#
+# mold is deliberately NOT set here: CI installs it, a contributor may not have
+# it, and a missing linker is a worse first experience than a slower one. CI
+# adds it via CARGO_TARGET_<TRIPLE>_RUSTFLAGS.
