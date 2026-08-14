@@ -1381,7 +1381,7 @@ pub fn dispatch_cancellable(
     // `brain_status` is excluded on purpose: it is the diagnostic that REPORTS
     // this condition, so it must answer immediately rather than block on it.
     if name != "brain_status" {
-        wait_out_index_publication(store);
+        wait_out_index_publication(store, cancel);
     }
 
     // F16: serve cacheable read tools from (or populate) the response cache.
@@ -1416,7 +1416,10 @@ fn index_publication_wait() -> std::time::Duration {
 /// * It does NOT acquire the publication lease. Acquisition is exclusive and
 ///   blocking, so a waiting reader would serialize every other reader behind
 ///   the writer, turning a latency blip into a real outage.
-fn wait_out_index_publication(store: &GraphStore) {
+fn wait_out_index_publication(
+    store: &GraphStore,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
     if !store.is_index_publication_dirty() {
         return;
     }
@@ -1424,8 +1427,20 @@ fn wait_out_index_publication(store: &GraphStore) {
     if budget.is_zero() {
         return;
     }
+    // Never wait on a publication that cannot complete. A wedged marker names
+    // a writer we can prove is dead (or one we cannot attribute at all), so
+    // waiting buys nothing and charges the full budget to EVERY tool on EVERY
+    // call — including tools that never consult PageRank and would otherwise
+    // have answered in milliseconds. Fail straight through to the classified
+    // WEDGED error, which names the repair.
+    if let Some(db_path) = store.db_path()
+        && nestweaver_engine::index_publication::status(db_path).is_wedged()
+    {
+        return;
+    }
     let started = std::time::Instant::now();
-    if store.wait_until_index_publication_clean(budget) {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    if store.wait_until_index_publication_clean_interruptible(budget, &cancelled) {
         tracing::debug!(
             "waited {}ms for an in-flight index publication to finish",
             started.elapsed().as_millis()
@@ -1465,8 +1480,7 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
     let preamble = "This is an index PUBLICATION window, not a dirty git working tree — \
                     editing files in a repo does not cause it.";
     if status.is_wedged() {
-        let repair =
-            nestweaver_engine::index_publication::IndexPublicationStatus::repair_command(&db_path);
+        let repair = status.repair_command_for(&db_path);
         anyhow!(
             "index publication WEDGED: ranked queries are failing closed because {} exists \
              and {writer} (marker age {age}). {preamble} The PageRank and generation sidecars \
@@ -5642,8 +5656,8 @@ fn tool_brain_status(
                         "index publication marker state cannot be determined (permissions or \
                          I/O error on the sidecar directory); ranked queries fail closed."
                     },
-                    "action": nestweaver_engine::index_publication::IndexPublicationStatus
-                        ::repair_command(store.db_path().unwrap_or(std::path::Path::new("<db>"))),
+                    "action": status.repair_command_for(
+                        store.db_path().unwrap_or(std::path::Path::new("<db>"))),
                 }));
             }
             json!({

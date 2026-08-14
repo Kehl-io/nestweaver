@@ -1794,13 +1794,18 @@ enum Commands {
     /// because the PageRank and generation sidecars may predate the committed
     /// graph. This is about index PUBLICATION, not a dirty git working tree.
     ///
-    /// Recovery is not a delete: PageRank is recomputed against the committed
-    /// graph and the generation advanced and persisted BEFORE the marker is
-    /// cleared. A publication whose writer process is still alive is left
-    /// strictly alone, and a marker whose state cannot be read (permissions,
-    /// I/O error) is reported rather than cleared.
+    /// Recovery is not a delete: the stale PageRank sidecar is removed and the
+    /// generation advanced and persisted BEFORE the marker is cleared, then
+    /// PageRank is recomputed against the committed graph. A publication whose
+    /// writer process is still alive is left strictly alone.
+    ///
+    /// Without --force this refuses any marker it cannot prove was abandoned:
+    /// one carrying no writer pid (written by an older release, truncated by a
+    /// crash, or created by hand) and one whose state cannot be read at all.
+    /// --force overrides exactly that conservatism. It never overrides a writer
+    /// that is demonstrably alive.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered (e.g. a live writer, or an unreadable marker)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. A live writer is never overridden, even with\n--force; stop that process first."
     )]
     Repair {
         #[arg(
@@ -1812,6 +1817,11 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Report the publication state without clearing anything")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Recover a marker that carries no usable writer pid, or whose state cannot be read. Never overrides a live writer."
+        )]
+        force: bool,
     },
     /// Check if the indexed graph is stale by comparing each repo's
     /// indexed SHA against git HEAD. (Same as `brain stale-check`.)
@@ -6493,7 +6503,9 @@ fn repair_outcome_name(
 /// Shipped regardless of auto-heal, because auto-heal deliberately declines in
 /// several safe-but-stuck cases: an unattributed marker (written by an older
 /// binary, or hand-created), an undeterminable one, and any database whose only
-/// writer never runs again. Before this existed, the sole escape was
+/// writer never runs again. The third is served by a plain run; the first two
+/// need `--force`, and this command names that next step instead of exiting
+/// with no remedy. Before this existed, the sole escape was
 /// `rm <db>.index-dirty`, discoverable only by reading the source — and an `rm`
 /// is the *wrong* repair, because it makes sidecars that predate the committed
 /// graph authoritative again.
@@ -6501,6 +6513,7 @@ fn run_repair_index_publication(
     db_path: &std::path::Path,
     json: bool,
     dry_run: bool,
+    force: bool,
 ) -> anyhow::Result<i32> {
     use nestweaver_engine::index_publication as pubstat;
 
@@ -6511,9 +6524,11 @@ fn run_repair_index_publication(
     if status.dirty && !dry_run {
         match nestweaver_store::GraphStore::open(db_path) {
             Ok(store) => {
-                outcome = Some(
-                    nestweaver_engine::index::recover_abandoned_index_publication(&store, true)?,
-                );
+                outcome = Some(if force {
+                    nestweaver_engine::index::force_recover_index_publication(&store)?
+                } else {
+                    nestweaver_engine::index::recover_abandoned_index_publication(&store, true)?
+                });
             }
             Err(error) => {
                 // The write lock is held — almost always by a running daemon,
@@ -6543,6 +6558,8 @@ fn run_repair_index_publication(
             "db": db_path.display().to_string(),
             "marker_path": status.marker_path,
             "dry_run": dry_run,
+            "force": force,
+            "needs_forced_repair": after.needs_forced_repair(),
             "before": {
                 "dirty": status.dirty,
                 "determinable": status.determinable,
@@ -6601,6 +6618,22 @@ fn run_repair_index_publication(
     }
     if after.dirty {
         eprintln!("The publication is still dirty. See the reason above.");
+        // Name the next step. Exiting 1 with no remedy is exactly what left
+        // `rm <db>.index-dirty` as the folk repair in the first place.
+        if !force && after.needs_forced_repair() {
+            eprintln!(
+                "This marker carries no writer this command can prove is gone, so the \
+                 automatic check declined. If no indexer is running for this database, \
+                 re-run with --force:\n    nestweaver repair --db {} --force",
+                db_path.display()
+            );
+        } else if after.writer_alive == Some(true) {
+            eprintln!(
+                "A live writer (pid {}) owns this publication. Wait for it to finish or stop \
+                 that process; --force will not override it.",
+                after.writer_pid.unwrap_or(0)
+            );
+        }
     }
     Ok(exit)
 }
@@ -7366,10 +7399,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::Repair { db, json, dry_run } => {
+        Commands::Repair {
+            db,
+            json,
+            dry_run,
+            force,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
             require_existing_db(&db_path)?;
-            let code = run_repair_index_publication(&db_path, json, dry_run)?;
+            let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
         }
 

@@ -1286,10 +1286,24 @@ impl GraphStore {
     /// is exclusive and blocking, so a waiting reader would serialize every
     /// other reader behind the writer — turning a latency blip into an outage.
     pub fn wait_until_index_publication_clean(&self, timeout: std::time::Duration) -> bool {
+        self.wait_until_index_publication_clean_interruptible(timeout, &|| false)
+    }
+
+    /// [`Self::wait_until_index_publication_clean`], but polls `abort` on every
+    /// iteration and gives up early when it returns true.
+    ///
+    /// The MCP dispatch boundary already threads a cancellation flag for query
+    /// timeouts and client disconnects. Without this, a cancelled call would
+    /// still sleep out the whole budget before noticing nobody is listening.
+    pub fn wait_until_index_publication_clean_interruptible(
+        &self,
+        timeout: std::time::Duration,
+        abort: &dyn Fn() -> bool,
+    ) -> bool {
         if !self.is_index_publication_dirty() {
             return true;
         }
-        if timeout.is_zero() {
+        if timeout.is_zero() || abort() {
             return false;
         }
         let deadline = std::time::Instant::now() + timeout;
@@ -1303,6 +1317,9 @@ impl GraphStore {
             std::thread::sleep(backoff.min(remaining));
             if !self.is_index_publication_dirty() {
                 return true;
+            }
+            if abort() {
+                return false;
             }
             backoff = (backoff * 2).min(max_backoff);
         }
@@ -2534,6 +2551,30 @@ mod tests {
             "a waiting reader must never register as a publication-lease waiter"
         );
         remover.join().unwrap();
+    }
+
+    #[test]
+    fn an_interruptible_wait_abandons_the_budget_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(crate::index_publication::marker_path(&db_path), b"1:1\n").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                cancelled.store(true, Ordering::Release);
+            });
+            assert!(!store.wait_until_index_publication_clean_interruptible(
+                std::time::Duration::from_secs(30),
+                &|| cancelled.load(Ordering::Acquire)
+            ));
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a cancelled wait must not sleep out its whole budget"
+        );
     }
 
     #[test]

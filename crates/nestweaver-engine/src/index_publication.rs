@@ -99,17 +99,50 @@ impl IndexPublicationStatus {
             return true;
         }
         match self.writer_alive {
+            // A live writer is a publication in flight, not a wedge.
             Some(true) => false,
+            // A dead writer cannot finish. Wedged regardless of age.
             Some(false) => true,
-            None => self
-                .marker_age_s
-                .is_some_and(|age| Duration::from_secs(age) >= WEDGED_MARKER_AGE),
+            None => match self.marker_age_s {
+                Some(age) => Duration::from_secs(age) >= WEDGED_MARKER_AGE,
+                // Nothing attributable at all: no pid to probe, no timestamp to
+                // age out. A marker written by an older binary, truncated by a
+                // crash, or hand-created with `touch` lands here, and NOTHING
+                // can clear it on its own — auto-heal declines because it
+                // cannot prove the writer is dead. Reporting it as merely
+                // transient would promise a recovery that never arrives, and
+                // would leave every caller paying the bounded wait forever.
+                // Call it wedged so the operator is told to run `repair
+                // --force`, which is the one thing that does resolve it.
+                None => true,
+            },
         }
     }
 
+    /// True when the wedge can only be cleared by an explicit operator
+    /// override — the marker is present but carries no writer we can prove
+    /// dead, so the automatic predicate must decline.
+    pub fn needs_forced_repair(&self) -> bool {
+        self.dirty && (!self.determinable || self.writer_pid.is_none())
+    }
+
     /// The operator escape hatch to name in a wedged-state message.
+    ///
+    /// A marker carrying no writer we can prove dead needs the explicit
+    /// override, so name it. Printing the bare command for a case that is
+    /// guaranteed to decline would send the operator round the same loop the
+    /// automatic predicate already lost.
     pub fn repair_command(db_path: &Path) -> String {
         format!("nestweaver repair --db {}", db_path.display())
+    }
+
+    /// The repair command appropriate to THIS status.
+    pub fn repair_command_for(&self, db_path: &Path) -> String {
+        if self.needs_forced_repair() {
+            format!("nestweaver repair --db {} --force", db_path.display())
+        } else {
+            Self::repair_command(db_path)
+        }
     }
 }
 
@@ -285,6 +318,99 @@ mod tests {
             None,
             "a live writer is never abandoned even with an unowned lease"
         );
+    }
+
+    #[test]
+    fn an_unattributed_marker_is_wedged_not_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        // The legacy / `touch`-created marker: present, but nothing to attribute.
+        std::fs::write(marker_path(&db_path), b"dirty").unwrap();
+        let status = status(&db_path);
+        assert!(status.dirty);
+        assert_eq!(status.writer_pid, None);
+        assert_eq!(status.writer_alive, None);
+        assert_eq!(status.marker_age_s, None);
+        assert!(
+            status.is_wedged(),
+            "an unattributable marker cannot clear itself; reporting it as \
+             transient promises a recovery that never arrives"
+        );
+        assert!(
+            status.needs_forced_repair(),
+            "and the only thing that resolves it is an explicit override"
+        );
+    }
+
+    #[test]
+    fn the_named_repair_command_matches_what_the_case_actually_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        std::fs::write(marker_path(&db_path), b"dirty").unwrap();
+        assert!(
+            status(&db_path)
+                .repair_command_for(&db_path)
+                .ends_with("--force"),
+            "an unattributable marker must be told to use --force"
+        );
+
+        let dead = {
+            let mut c = std::process::Command::new("/bin/true").spawn().unwrap();
+            let pid = c.id() as i32;
+            c.wait().unwrap();
+            pid
+        };
+        std::fs::write(
+            marker_path(&db_path),
+            format_marker_payload(dead as u32, 1, None),
+        )
+        .unwrap();
+        assert!(
+            !status(&db_path)
+                .repair_command_for(&db_path)
+                .ends_with("--force"),
+            "a provably-dead attributed writer needs no override"
+        );
+    }
+
+    #[test]
+    fn an_undeterminable_marker_needs_forced_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let status = status_from(&db_path, MarkerState::Undeterminable("EACCES".into()));
+        assert!(status.is_wedged());
+        assert!(status.needs_forced_repair());
+    }
+
+    #[test]
+    fn an_attributed_live_publication_never_needs_forced_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        std::fs::write(
+            marker_path(&db_path),
+            format_marker_payload(std::process::id(), 1, None),
+        )
+        .unwrap();
+        let status = status(&db_path);
+        assert!(!status.is_wedged());
+        assert!(!status.needs_forced_repair());
+    }
+
+    #[test]
+    fn a_young_timestamped_marker_without_a_pid_is_still_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // No pid, but a fresh timestamp: age-based classification still applies.
+        std::fs::write(marker_path(&db_path), format!("x:{now}\n")).unwrap();
+        let status = status(&db_path);
+        assert_eq!(status.writer_pid, None);
+        assert!(status.marker_age_s.is_some());
+        assert!(!status.is_wedged(), "a young marker is transient");
     }
 
     #[test]

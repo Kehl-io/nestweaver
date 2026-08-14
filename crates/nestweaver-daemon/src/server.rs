@@ -8770,13 +8770,21 @@ pub async fn run_server(
     {
         let store = state.store.clone();
         tokio::task::spawn_blocking(move || {
-            // nw-C1: the daemon is a WRITER. If a prior indexer died between
-            // establishing `<db>.index-dirty` and finalizing, every ranked
-            // query in this database fails closed forever. Reconcile it here,
-            // before warming, so the warm below succeeds and the first PPR
-            // query does not meet the wedge. A live publication is left
+            // nw-C1: a read-write daemon is a WRITER. If a prior indexer died
+            // between establishing `<db>.index-dirty` and finalizing, every
+            // ranked query in this database fails closed forever. Reconcile it
+            // here, before warming, so the warm below succeeds and the first
+            // PPR query does not meet the wedge. A live publication is left
             // strictly alone (see `recover_abandoned_index_publication`).
-            nestweaver_engine::index::recover_abandoned_index_publication_best_effort(&store, true);
+            //
+            // The gate must mirror how THIS daemon opened the store, exactly
+            // like the neighbouring reconcile passes: a snapshot-replica daemon
+            // opens read-only, and a read-only caller must report the condition
+            // rather than recompute PageRank, persist `.generation`, and delete
+            // the marker out from under whoever holds the write lock.
+            nestweaver_engine::index::recover_abandoned_index_publication_best_effort(
+                &store, !read_only,
+            );
             match store.warm_ppr_cache() {
                 Ok(()) => tracing::info!("PPR adjacency cache warmed"),
                 // nw-C2: this specific failure used to be swallowed as a
