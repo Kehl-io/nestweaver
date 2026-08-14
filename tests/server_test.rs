@@ -2397,6 +2397,130 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     );
 }
 
+/// MUST-HAVE: the honesty fields survive the STRUCTURED federated merge.
+///
+/// `brain_context` (and `project_context`) go through
+/// `merge_structured_results`, which rebuilds the `connected`-schema envelope
+/// field by field. Every field it does not re-add deliberately is dropped.
+/// Unlike `brain_search`, these tools DO have a semantic leg, so
+/// `semantic_applied` / `degraded_components` carry real information here: a
+/// caller has to be able to tell "the semantic leg ran" from "it did not" from
+/// "this path never reports it". Dropping them in the merge silently converts
+/// the first two into the third.
+///
+/// This runs against the real two-daemon federated path (local UDS daemon +
+/// authenticated gRPC server, `HybridClient` in Merge mode), not a hand-built
+/// literal, and first proves both tiers really contributed by checking that
+/// the merged `connected` payload carries symbols that exist on only one side.
+#[tokio::test]
+async fn hybrid_brain_context_merge_preserves_honesty_fields() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Server side: repo A. `sharedctxfn` is the seed both tiers can resolve;
+    // `serverctxfn` exists ONLY here.
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[(
+            "main.js",
+            "function serverctxfn(x) { return x; }\n\
+             function sharedctxfn(x) { return serverctxfn(x); }",
+        )],
+    );
+    index_repo(&server_repo, &db_server);
+
+    // Local side: repo B. `localctxfn` exists ONLY here.
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[(
+            "main.js",
+            "function localctxfn(x) { return x; }\n\
+             function sharedctxfn(x) { return localctxfn(x); }",
+        )],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start_with_config(&db_local, &cfg_path);
+
+    let local = connect_local(&db_local).await;
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    let resp = hybrid
+        .query(
+            "brain_context",
+            &json!({ "seeds": ["sharedctxfn"], "token_budget": 4000 }),
+        )
+        .await
+        .expect("hybrid brain_context merge query");
+
+    // Proof this is the STRUCTURED merge path and that both tiers contributed:
+    // the `connected` schema survived, and it carries a symbol from each side.
+    assert!(
+        resp.get("connected").and_then(Value::as_array).is_some(),
+        "brain_context merge must keep the structured `connected` schema; got {resp}"
+    );
+    let sources = meta_sources(&resp);
+    assert!(
+        sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
+        "structured merge must report both sources; got {sources:?} in {resp}"
+    );
+    let payload = resp["connected"].to_string();
+    assert!(
+        payload.contains("serverctxfn"),
+        "merged `connected` must contain the server-only symbol (proof the server \
+         tier contributed to the structured merge); got {resp}"
+    );
+    assert!(
+        payload.contains("localctxfn"),
+        "merged `connected` must contain the local-only symbol; got {resp}"
+    );
+
+    // The honesty fields themselves. Both tiers report them (the daemon's
+    // GetContext response and the local in-process dispatch both always emit
+    // both keys), so the merge must too — an ABSENT field on a merged response
+    // has to keep meaning "no tier reported it / older server", which is a
+    // different statement from `false`.
+    assert!(
+        resp.get("semantic_applied").is_some(),
+        "structured merge must carry `semantic_applied`; dropping it makes a merged \
+         brain_context indistinguishable from a server that never reports it; got {resp}"
+    );
+    assert!(
+        resp.get("degraded_components").is_some(),
+        "structured merge must carry `degraded_components`; got {resp}"
+    );
+
+    // Neither daemon has an embedding model available, so on both tiers the
+    // semantic leg was requested and could not run: each reports
+    // `semantic_applied: false` with `degraded_components: ["semantic"]`.
+    //
+    // That makes this the load-bearing case rather than a trivial one. The AND
+    // across tiers is `false`, and the union is `["semantic"]` — ONE entry, not
+    // two, which proves the merge deduplicates rather than concatenating, and
+    // proves a REAL degradation survives the rebuild of the envelope instead of
+    // being dropped. This is exactly what a caller loses when the structured
+    // merge drops these fields: the merged answer is lexically ranked, and it
+    // has to say so.
+    assert_eq!(
+        resp["semantic_applied"],
+        json!(false),
+        "neither tier applied a semantic leg, so the AND across tiers is false; got {resp}"
+    );
+    assert_eq!(
+        resp["degraded_components"],
+        json!(["semantic"]),
+        "both tiers degraded the semantic component; the merged answer must report it \
+         exactly once (deduplicated union, documented vocabulary); got {resp}"
+    );
+}
+
 /// ATTEMPT: two-tier `blast_radius`. The local daemon indexes a file under
 /// `local/`, the server a file under `server/`. With both paths in
 /// `changed_files`, the two-tier response must carry a populated `local_impact`

@@ -172,6 +172,13 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 /// without them re-creates exactly that ambiguity, so they are merged here
 /// rather than dropped.
 ///
+/// Used by BOTH federated merges: the flat `{ results: [...] }` envelope
+/// ([`merge_json_results`], serving `brain_search`) and the structured
+/// `connected` envelope ([`merge_structured_results`], serving `brain_context`
+/// and `project_context`). Both rebuild their response field by field, so both
+/// have to re-add these deliberately. The rules below are identical for the two
+/// callers; only their *reachability* differs, noted inline where it matters.
+///
 /// Merge rules, and why:
 ///
 /// - `semantic_applied` is **conjunctive (AND across contributing tiers)**. The
@@ -179,21 +186,33 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 ///   only be claimed for the whole answer if it holds for every tier that
 ///   contributed to it. If one tier ran a semantic leg and the other did not,
 ///   part of the merged ranking is purely lexical, and reporting `true` would
-///   overclaim on those rows. `false` is the honest, conservative answer. Today
-///   `brain_search` is keyword/BM25-only everywhere and both tiers report
-///   `false`, making the merge trivial — but the rule is written so it stays
-///   correct the moment a real semantic leg appears on one side.
+///   overclaim on those rows. `false` is the honest, conservative answer. For
+///   `brain_search` the merge is trivial — it is keyword/BM25-only everywhere,
+///   so both tiers report `false` — but for `brain_context` /
+///   `project_context` a real semantic leg exists and either tier can report
+///   `true` on its own.
 ///
 ///   **Known limitation, deliberately accepted:** this collapses two states a
 ///   caller might want to tell apart. "Neither tier ran a semantic leg" and
-///   "local ran one, the server did not" both emit
-///   `semantic_applied: false, degraded_components: []`. A single boolean
-///   cannot carry per-tier provenance, and inventing a vocabulary to encode it
-///   would put values into `degraded_components` that no consumer understands —
-///   the field's documented vocabulary is `"semantic"` (README, docs/server-mode.md)
-///   and agents are told it means retrieval fell back to lexical ranking. If
-///   the mixed case ever becomes reachable and callers need to distinguish it,
-///   it belongs in `_meta` as per-tier provenance, not smuggled into this list.
+///   "local ran one, the server did not" both emit `semantic_applied: false`.
+///   For `brain_search` that mixed state is hypothetical; on the structured
+///   path it is **reachable today** — two independently configured daemons can
+///   differ in whether an embedding model is loaded, so a merged
+///   `brain_context` can genuinely mix a semantically-ranked tier with a
+///   lexical one and will report `false`. The AND is still the correct answer
+///   (a union containing purely lexical rows cannot claim the property for the
+///   whole answer), it is simply less informative than the two-tier truth.
+///
+///   It is NOT encoded here. A single boolean cannot carry per-tier
+///   provenance, and inventing a vocabulary to encode it would put values into
+///   `degraded_components` that no consumer understands — the field's
+///   documented vocabulary is exactly `"semantic"` (README,
+///   docs/server-mode.md, `agent_guide`) and agents are told it means retrieval
+///   fell back to lexical ranking. Note the mixed case is also NOT a
+///   degradation: a tier that never requested a semantic leg did not fall back
+///   from one, so nothing may be added to `degraded_components` on its account.
+///   If callers ever need to distinguish it, it belongs in `_meta` as explicit
+///   per-tier provenance, not smuggled into this list.
 ///
 /// - `degraded_components` is a **deduplicated union**, in local-then-server
 ///   encounter order. Degradation is a property of the merged answer as a
@@ -217,7 +236,10 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 ///   is not reachable today for `brain_search`: both tiers go through
 ///   `dispatch::dispatch_typed_brain_search`, which always emits both keys, and
 ///   proto3 scalars mean an older server decodes to `false`/`[]` rather than to
-///   an absent field. It is defensive, not a supported detection mechanism.
+///   an absent field. The same holds on the structured path
+///   (`dispatch::dispatch_typed_brain_context` /
+///   `dispatch_typed_project_context` insert both keys unconditionally from the
+///   proto response). It is defensive, not a supported detection mechanism.
 ///
 /// - **If no tier reports either field, nothing is emitted.** Inventing
 ///   `semantic_applied: false` out of two silent tiers would destroy the very
@@ -486,6 +508,26 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                 result[key] = val.clone();
             }
         }
+        // This envelope is rebuilt key by key above, so anything not re-added
+        // here is silently dropped. `semantic_applied` / `degraded_components`
+        // are merged (not copied) under the same rules as `merge_json_results`
+        // — AND for the boolean, deduplicated union for the list, both omitted
+        // when no tier reported either. See `merge_honesty_fields`.
+        //
+        // Why it matters MORE here than on the `brain_search` path: these two
+        // tools have a real semantic leg, so the fields carry information
+        // rather than being trivially `false`/`[]`, and the mixed case (one
+        // tier ranked semantically, the other lexically — two daemons need not
+        // agree on whether an embedding model is loaded) is reachable in
+        // production. The AND rule collapses that mixed case into `false`,
+        // which is correct-but-lossy: correct because the merged rows include
+        // purely lexical ones, lossy because a caller cannot see which tier
+        // ranked how. Per-tier provenance is deliberately NOT encoded in
+        // `degraded_components` — that field's vocabulary is exactly
+        // `"semantic"` and means "fell back from a requested semantic leg",
+        // which is not what a mixed merge describes. If it is ever needed it
+        // belongs in `_meta`.
+        merge_honesty_fields(local, server, &mut result);
         inject_or_wrap_provenance(&mut result, &["local", "server"], &[]);
         result
     } else {
@@ -1817,6 +1859,117 @@ mod tests {
         let local = json!({"results": [{"uid": "a", "score": 0.9}]});
         let server = json!({"results": [{"uid": "b", "score": 0.8}]});
         let merged = merge_json_results(&local, &server);
+        assert!(merged.get("semantic_applied").is_none());
+        assert!(merged.get("degraded_components").is_none());
+    }
+
+    /// Shape of a `brain_context` / `project_context` response: the structured
+    /// `connected` envelope, which `merge_structured_results` rebuilds field by
+    /// field. Unlike `brain_search` these tools have a real semantic leg, so
+    /// `semantic_applied` can genuinely be `true` on either tier.
+    fn brain_context_tier(uid: &str, semantic_applied: bool, degraded: &[&str]) -> Value {
+        json!({
+            "seeds": [{"uid": format!("seed-{uid}"), "title": "seed"}],
+            "connected": [{"uid": uid, "title": uid, "score": 0.9}],
+            "seeds_expanded": 1,
+            "tokens_used": 100,
+            "token_budget": 4000,
+            "semantic_applied": semantic_applied,
+            "degraded_components": degraded,
+        })
+    }
+
+    #[test]
+    fn merge_structured_carries_honesty_fields() {
+        // The `connected`-schema path (brain_context / project_context) rebuilds
+        // its envelope key by key, so these have to be re-added deliberately —
+        // and they matter MORE here than on brain_search, because these tools
+        // actually have a semantic leg.
+        let merged = merge_structured_results(
+            &brain_context_tier("a", true, &[]),
+            &brain_context_tier("b", true, &[]),
+        );
+        assert_eq!(merged["connected"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            merged["semantic_applied"],
+            json!(true),
+            "both tiers applied a semantic leg, so the merged answer did"
+        );
+        assert_eq!(merged["degraded_components"], json!([]));
+    }
+
+    #[test]
+    fn merge_structured_semantic_applied_is_conjunctive() {
+        // Reachable in production on this path: two daemons need not agree on
+        // whether an embedding model is loaded. The merged `connected` array
+        // then contains purely lexical rows, so `true` would overclaim.
+        for (local_semantic, server_semantic) in [(true, false), (false, true)] {
+            let merged = merge_structured_results(
+                &brain_context_tier("a", local_semantic, &[]),
+                &brain_context_tier("b", server_semantic, &[]),
+            );
+            assert_eq!(
+                merged["semantic_applied"],
+                json!(false),
+                "a mixed merge ({local_semantic}/{server_semantic}) must not claim semantic ranking"
+            );
+            // The mixed case is a loss of resolution, NOT a degradation: a tier
+            // that never requested a semantic leg did not fall back from one.
+            // Manufacturing a marker here would put a value into a vocabulary
+            // whose only documented member is "semantic".
+            assert_eq!(
+                merged["degraded_components"],
+                json!([]),
+                "a mixed merge must not invent a degradation marker"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_structured_degraded_components_unions_and_dedupes() {
+        // "semantic" is the only value in the documented vocabulary, and it is
+        // genuinely reachable here: a tier that requested a semantic leg and
+        // could not run it reports it, and that degradation must remain visible
+        // in the merged answer even if the other tier was healthy.
+        let merged = merge_structured_results(
+            &brain_context_tier("a", false, &["semantic"]),
+            &brain_context_tier("b", false, &["semantic"]),
+        );
+        assert_eq!(
+            merged["degraded_components"],
+            json!(["semantic"]),
+            "deduplicated union, not a concatenation"
+        );
+
+        let one_sided = merge_structured_results(
+            &brain_context_tier("a", true, &[]),
+            &brain_context_tier("b", false, &["semantic"]),
+        );
+        assert_eq!(
+            one_sided["degraded_components"],
+            json!(["semantic"]),
+            "a server-side degradation must not be hidden behind a healthy local tier"
+        );
+        assert_eq!(one_sided["semantic_applied"], json!(false));
+    }
+
+    #[test]
+    fn merge_structured_omits_honesty_fields_when_no_tier_reported_them() {
+        // An older server (or a response predating the fields) must not be
+        // upgraded into a manufactured `false`: on a merged response, absence
+        // has to keep meaning "no tier reported".
+        let mut local = brain_context_tier("a", false, &[]);
+        let mut server = brain_context_tier("b", false, &[]);
+        for tier in [&mut local, &mut server] {
+            let obj = tier.as_object_mut().unwrap();
+            obj.remove("semantic_applied");
+            obj.remove("degraded_components");
+        }
+        let merged = merge_structured_results(&local, &server);
+        assert!(
+            merged.get("connected").is_some(),
+            "still a structured merge"
+        );
         assert!(merged.get("semantic_applied").is_none());
         assert!(merged.get("degraded_components").is_none());
     }

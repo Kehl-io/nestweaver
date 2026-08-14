@@ -500,11 +500,16 @@ A local backend is ready only when `selected_device` is `metal` or `cpu` and
 `fallback_used` is `false`; an external backend has no local selected device.
 When semantic retrieval was requested but unavailable, context responses keep
 the graph/PPR/BM25 result and report `"semantic"` in `degraded_components`
-(the only value in that vocabulary today). Caveat: the hybrid/federated merge
-for `brain_context` / `project_context` rebuilds the `connected` response shape
-and currently drops both `semantic_applied` and `degraded_components`, so a
-merged two-tier context answer does not carry them. The direct, daemon, and
-`brain_search` paths do.
+(the only value in that vocabulary today). Every path reports both fields: the
+direct, daemon and `brain_search` paths, and the hybrid/federated merges for
+`brain_search` and for `brain_context` / `project_context`. In a merge,
+`semantic_applied` is the AND across contributing tiers and
+`degraded_components` their deduplicated union; when no tier reports either
+field the merge omits both, so an absent field still means "not reported by any
+tier", never a synthesised `false`. Caveat: `semantic_applied` is one boolean,
+so a merge in which one tier ranked semantically and the other did not reports
+`false` — correct for the merged row set, which contains lexically ranked rows,
+but it does not say which tier was which.
 
 **Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM;
 heavier models trade speed for quality. Forward Push PPR replaces power
