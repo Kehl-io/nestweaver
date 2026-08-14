@@ -666,12 +666,6 @@ impl FileSystemIndexEpilogueIo {
     /// parent directory — is what makes the marker survive process death, and
     /// it must not be duplicated with drift.
     fn write_marker_payload(&self, path: &Path, reason: Option<&str>) -> Result<(), anyhow::Error> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("create index publication marker {}", path.display()))?;
         let marker = nestweaver_store::index_publication::format_marker_payload(
             std::process::id(),
             std::time::SystemTime::now()
@@ -680,11 +674,23 @@ impl FileSystemIndexEpilogueIo {
                 .as_nanos(),
             reason,
         );
-        file.write_all(marker.as_bytes())
-            .with_context(|| format!("write index publication marker {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync index publication marker {}", path.display()))?;
-        sync_sidecar_parent(path)
+        // Temp-file + rename, NOT truncate-in-place. A truncating rewrite makes
+        // the marker briefly zero-byte, and a reader landing in that window
+        // parses no pid and no timestamp — which the wedged predicate now reads
+        // as "unattributable, therefore WEDGED", telling an operator to run
+        // `repair --force` against a publication that is perfectly healthy and
+        // in flight. The window is microseconds and cannot cause data loss
+        // (lbug's write lock stops any forced repair from opening the store),
+        // but a rename removes it entirely: a reader sees the old payload or the
+        // new one, never a partial one.
+        //
+        // `atomic_replace_file` keeps the durability this marker depends on —
+        // it syncs the temp file and the parent directory, so the marker still
+        // survives process death, which is the whole reason it exists.
+        nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| {
+            file.write_all(marker.as_bytes())
+        })
+        .with_context(|| format!("publish index publication marker {}", path.display()))
     }
 
     fn stamp_marker_reason_impl(&self, path: &Path, reason: &str) -> Result<(), anyhow::Error> {
@@ -1227,11 +1233,26 @@ impl IndexPublicationRecovery {
 /// The ordering that function actually guarantees, stated precisely because it
 /// is easy to overclaim: the **stale `.pagerank.json` is removed** and
 /// `.generation` advanced and persisted BEFORE the marker is cleared; the fresh
-/// PageRank is computed and saved AFTER. So there is a window in which the
-/// publication reads clean with no PageRank sidecar on disk — which is safe,
-/// because an absent sidecar recomputes, whereas a stale one would be trusted.
-/// "Recomputed before the marker clears" would be false. Not duplicated here:
-/// the ordering is the entire point of the guard and lives in one place.
+/// PageRank is computed and saved AFTER. "Recomputed before the marker clears"
+/// would be false. Not duplicated here: the ordering is the entire point of the
+/// guard and lives in one place.
+///
+/// That leaves a real window — marker cleared, sidecar not yet written — and it
+/// is **not fully safe**, so do not read the ordering as if it were. Removing
+/// the stale sidecar first is strictly better than leaving it (a stale sidecar
+/// would be trusted; an absent one cannot serve wrong ranks). But a crash
+/// inside the window leaves `.pagerank.json` MISSING with the marker already
+/// gone, and nothing regenerates it: the lazy fallback
+/// (`ranking.rs`, `ensure_pagerank_loaded` → `compute_pagerank_warm_locked`)
+/// ranks `GraphScope::code_only()` and only in memory — it never re-persists,
+/// and on a brain database it never covers the note side at all. The publication
+/// then reports CLEAN, `brain_status` raises no warning, and queries answer from
+/// a code-only in-memory rank forever.
+///
+/// The window predates this recovery path (it is the finalizer's ordering, used
+/// by every publication) and is deliberately left alone here. Making the lazy
+/// path scope-aware and re-persisting is the real fix and is filed separately;
+/// recovery must not paper over it with a second, divergent recompute.
 ///
 /// `read_write` gates recovery exactly as it gates the orphaned-WAL arm of
 /// `open_lbug_with_recovery`: a read-only caller must report the condition, not
@@ -1427,11 +1448,22 @@ pub(crate) fn recover_abandoned_index_publication_with_io(
         );
     }
 
-    // SCOPE: `unified()`, never `code_only()`. `compute_pagerank` REPLACES the
-    // whole score map, and the canonical sidecar on a brain database is
-    // published unified (`BrainWatcher`), so recovering with a code-only scope
-    // would silently delete every Note/Section/Heading/Tag rank — turning a
-    // recovery into data loss. This also matches the recovered-owner arm in
+    // SCOPE: `unified()`, never `code_only()`.
+    //
+    // `compute_pagerank` REPLACES the whole score map rather than merging into
+    // it, so the scope chosen here decides which node kinds survive recovery.
+    //
+    // Which scope the canonical sidecar currently holds is NOT knowable from
+    // here, and it is not always unified: whichever publisher ran last wins.
+    // `nestweaver index` and the code watcher publish `code_only()`; the vault
+    // watcher publishes `unified()`. A fresh `index --repo` followed by
+    // `brain add` leaves a sym-only sidecar on disk.
+    //
+    // `unified()` is right precisely because it is a strict SUPERSET: it can
+    // only ever widen what was published, never narrow it. `code_only()` could
+    // narrow it, and on a database holding both a repo and a vault that means
+    // silently deleting every Note/Section/Heading/Tag rank — a recovery that
+    // destroys data. This matches the recovered-owner arm in
     // `index_with_reader_and_write_gate`, which heals "that unknown committed
     // graph as one unified publication" for the same reason: a recovering owner
     // cannot prove which slices of the graph the dead owner had touched.
@@ -6131,6 +6163,79 @@ mod tests {
         );
         assert!(outcome.describe().contains("--force"));
         assert!(!marker_path.exists());
+    }
+
+    /// A rewrite must never be observable as a partial payload.
+    ///
+    /// With truncate-in-place this fails: a reader stat-ing between `truncate`
+    /// and `write_all` sees a zero-byte marker, which parses to no pid and no
+    /// timestamp — and the wedged predicate reads that as "unattributable,
+    /// therefore WEDGED", telling an operator to force-repair a healthy
+    /// in-flight publication. With temp-file + rename the state is
+    /// unreachable, so a reader only ever sees the old payload or the new one.
+    #[test]
+    fn rewriting_the_marker_is_never_observable_as_a_partial_payload() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        FileSystemIndexEpilogueIo
+            .establish_marker(&marker_path)
+            .unwrap();
+
+        let stop = AtomicBool::new(false);
+        let observations = AtomicUsize::new(0);
+        let partials = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                while !stop.load(AtomicOrdering::Acquire) {
+                    let state = nestweaver_store::index_publication::read_marker(&db_path);
+                    if let Some(record) = state.record() {
+                        observations.fetch_add(1, AtomicOrdering::Relaxed);
+                        // A present marker written by this process always
+                        // carries a pid. No pid means a torn read.
+                        if record.writer_pid.is_none() {
+                            partials.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    }
+                }
+            });
+            for i in 0..300 {
+                if i % 2 == 0 {
+                    FileSystemIndexEpilogueIo
+                        .establish_marker(&marker_path)
+                        .unwrap();
+                } else {
+                    FileSystemIndexEpilogueIo
+                        .stamp_marker_reason(
+                            &marker_path,
+                            nestweaver_store::index_publication::MARKER_REASON_CANCELLED,
+                        )
+                        .unwrap();
+                }
+            }
+            stop.store(true, AtomicOrdering::Release);
+            reader.join().unwrap();
+        });
+
+        assert!(
+            observations.load(AtomicOrdering::Relaxed) > 0,
+            "the reader must actually have observed the marker"
+        );
+        assert_eq!(
+            partials.load(AtomicOrdering::Relaxed),
+            0,
+            "a marker rewrite must never be observable as a partial payload, or a \
+             healthy in-flight publication is reported WEDGED"
+        );
+        // And the marker is still valid and attributable afterwards.
+        let final_state = nestweaver_store::index_publication::read_marker(&db_path);
+        assert_eq!(
+            final_state.record().unwrap().writer_pid,
+            Some(std::process::id() as i32)
+        );
     }
 
     #[test]
