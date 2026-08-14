@@ -830,7 +830,12 @@ services:
         "--config", "/etc/nestweaver/instance.toml"
       ]
     restart: unless-stopped
-    stop_grace_period: 30s
+    # Must exceed the drain ceiling (NESTWEAVER_DRAIN_TIMEOUT_SECS, default
+    # 660s) or `docker compose stop` SIGKILLs the daemon mid-write, and should
+    # exceed `daemon stop`'s own ceiling + 30s window so the kill never lands
+    # while the CLI is still reporting. Docker enforces this deadline; the
+    # daemon cannot extend it. See docs/guide/daemon-shutdown.md.
+    stop_grace_period: 720s
 
 volumes:
   nestweaver-data:
