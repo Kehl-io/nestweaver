@@ -24,5 +24,11 @@ LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
 #
 # Note -DZSTD_DISABLE_ASM does NOT substitute for this: it disables the Huffman
 # assembly, which is 2 of lbug's 192 ZSTD_ symbols, not the 190 that collide.
+# mold is deliberately NOT set here: CI installs it, a contributor may not have
+# it, and a missing linker is a worse first experience than a slower one. CI
+# overrides both targets via CARGO_TARGET_<TRIPLE>_RUSTFLAGS to add it.
 [target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
