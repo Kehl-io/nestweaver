@@ -1373,13 +1373,124 @@ pub fn dispatch_cancellable(
 
     validate_tool_arguments(name, &args)?;
 
-    // F16: serve cacheable read tools from (or populate) the response cache.
-    // Correctness rests on the cache KEY — see `maybe_cached`.
-    if is_cacheable_tool(name) && !cache_bypassed(&args) {
-        return maybe_cached(store, tantivy, name, args, embed_model, cancel, visible);
+    // nw-C2: a query landing inside a normal index-publication window used to
+    // fail outright with an internal-looking assertion string. Wait it out
+    // first — the window is normally well under a second, so this converts the
+    // common case from a hard failure into a latency blip.
+    //
+    // `brain_status` is excluded on purpose: it is the diagnostic that REPORTS
+    // this condition, so it must answer immediately rather than block on it.
+    if name != "brain_status" {
+        wait_out_index_publication(store);
     }
 
-    dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+    // F16: serve cacheable read tools from (or populate) the response cache.
+    // Correctness rests on the cache KEY — see `maybe_cached`.
+    let result = if is_cacheable_tool(name) && !cache_bypassed(&args) {
+        maybe_cached(store, tantivy, name, args, embed_model, cancel, visible)
+    } else {
+        dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+    };
+
+    // Tools that do not consult PageRank still succeed during a dirty
+    // publication, so the classification is applied to the ERROR rather than
+    // used to fail early.
+    result.map_err(|error| classify_index_publication_error(store, error))
+}
+
+/// Bounded wait for `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` (default 3000,
+/// clamped to 30s) before letting a query meet a dirty publication.
+fn index_publication_wait() -> std::time::Duration {
+    std::time::Duration::from_millis(INDEX_PUBLICATION_WAIT_MS.with(|c| c.get()))
+}
+
+/// Poll the marker FILE until the publication is clean or the budget expires.
+///
+/// Two constraints, both deliberate:
+///
+/// * It polls `is_index_publication_dirty`, which is file-based and therefore
+///   genuinely cross-process. `index_publication_lease.available` is an
+///   **in-process** condvar and this reader is commonly in a different process
+///   from the indexing writer, so a condvar-based wait could never fire for it
+///   — and an in-process test of one would pass for the wrong reason.
+/// * It does NOT acquire the publication lease. Acquisition is exclusive and
+///   blocking, so a waiting reader would serialize every other reader behind
+///   the writer, turning a latency blip into a real outage.
+fn wait_out_index_publication(store: &GraphStore) {
+    if !store.is_index_publication_dirty() {
+        return;
+    }
+    let budget = index_publication_wait();
+    if budget.is_zero() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    if store.wait_until_index_publication_clean(budget) {
+        tracing::debug!(
+            "waited {}ms for an in-flight index publication to finish",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+/// Replace the verbatim `StoreError` string from a fail-closed ranked query
+/// with a message that says whether the condition is TRANSIENT or WEDGED, and
+/// — crucially — that "dirty" here means an index PUBLICATION, not a dirty git
+/// working tree. A user who hit this concluded that NestWeaver is useless while
+/// you work in a repo; that wrong conclusion is itself part of the bug.
+fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) -> anyhow::Error {
+    // Covers both fail-closed strings: "PageRank unavailable during dirty
+    // index publication" and "graph generation exhausted during index
+    // publication".
+    if !format!("{error:#}").contains("index publication") {
+        return error;
+    }
+    let Some(db_path) = store.db_path().map(std::path::Path::to_path_buf) else {
+        return error;
+    };
+    let status = nestweaver_engine::index_publication::status(&db_path);
+    if !status.dirty {
+        return error;
+    }
+    let writer = match (status.writer_pid, status.writer_alive) {
+        (Some(pid), Some(true)) => format!("writer pid {pid} is running"),
+        (Some(pid), _) => format!("writer pid {pid} is NOT running"),
+        _ => "no writer pid recorded in the marker".to_string(),
+    };
+    let age = status
+        .marker_age_s
+        .map(|s| format!("{s}s"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let waited_ms = index_publication_wait().as_millis();
+    let preamble = "This is an index PUBLICATION window, not a dirty git working tree — \
+                    editing files in a repo does not cause it.";
+    if status.is_wedged() {
+        let repair =
+            nestweaver_engine::index_publication::IndexPublicationStatus::repair_command(&db_path);
+        anyhow!(
+            "index publication WEDGED: ranked queries are failing closed because {} exists \
+             and {writer} (marker age {age}). {preamble} The PageRank and generation sidecars \
+             may predate the committed graph, so serving them would return wrong ranks. \
+             Recover with: {repair}{}",
+            status.marker_path,
+            if status.writer_reason.as_deref()
+                == Some(nestweaver_store::index_publication::MARKER_REASON_CANCELLED)
+            {
+                "  (that publication was left dirty by a run that committed after \
+                 cancellation, so the graph may also be incomplete — follow up with \
+                 `nestweaver index --repo <path> --force`)"
+            } else {
+                ""
+            }
+        )
+    } else {
+        anyhow!(
+            "index publication TRANSIENT: an index publication is in flight ({writer}, marker \
+             age {age}) and did not finish within the {waited_ms}ms wait, so ranked queries are \
+             failing closed. {preamble} Retry shortly; raise \
+             NESTWEAVER_INDEX_PUBLICATION_WAIT_MS to wait longer."
+        )
+    }
 }
 
 /// The actual tool dispatch table, after cache handling.
@@ -2816,7 +2927,7 @@ fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; run the `nestweaver repair` command named in the error, or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5364,7 +5475,7 @@ fn tool_brain_status(
             .or_default()
             .push(v);
     }
-    let warnings: Vec<Value> = root_to_rows
+    let mut warnings: Vec<Value> = root_to_rows
         .iter()
         .filter(|(_, rows)| rows.len() > 1)
         .map(|(root, rows)| {
@@ -5510,6 +5621,43 @@ fn tool_brain_status(
         db_path.as_deref().map(cache_stats).unwrap_or((0, 0, None));
     let cache_hit_rate_pct = cache_hit_rate.map(|r| (r * 100.0).round() as u64);
 
+    // nw-C2: index-publication state. Unlike the Wave A write-path fields
+    // (`write_queue_depth`, `write_holder`, the embedding `pass_*` set), which
+    // come from the daemon and are therefore absent on the direct
+    // `--no-daemon` and MCP-over-HTTP payloads, this is derived from the marker
+    // FILE and so populates with no daemon running. The user who reported the
+    // wedge was on exactly that direct path.
+    let index_publication = store
+        .db_path()
+        .map(nestweaver_engine::index_publication::status)
+        .map(|status| {
+            let wedged = status.is_wedged();
+            if wedged {
+                warnings.push(json!({
+                    "warning": if status.determinable {
+                        "index publication is wedged: ranked queries (brain_context, \
+                         project_context, investigate) fail closed until it is reconciled. \
+                         This is an index PUBLICATION marker, not a dirty git working tree."
+                    } else {
+                        "index publication marker state cannot be determined (permissions or \
+                         I/O error on the sidecar directory); ranked queries fail closed."
+                    },
+                    "action": nestweaver_engine::index_publication::IndexPublicationStatus
+                        ::repair_command(store.db_path().unwrap_or(std::path::Path::new("<db>"))),
+                }));
+            }
+            json!({
+                "dirty": status.dirty,
+                "determinable": status.determinable,
+                "marker_age_s": status.marker_age_s,
+                "writer_pid": status.writer_pid,
+                "writer_alive": status.writer_alive,
+                "writer_reason": status.writer_reason,
+                "wedged": wedged,
+                "marker_path": status.marker_path,
+            })
+        });
+
     Ok(json!({
         "vaults": vaults_json,
         "vault_count": vaults.len(),
@@ -5540,6 +5688,11 @@ fn tool_brain_status(
         // render an actionable warning without re-deriving it.
         "warnings": warnings,
         "staleness_warnings": staleness_warnings,
+        // File-derived index-publication state; present on the direct
+        // `--no-daemon` path too. `null` for in-memory stores, which have no
+        // marker. `dirty` means an index PUBLICATION is in flight or was
+        // abandoned — it has nothing to do with a dirty git working tree.
+        "index_publication": index_publication,
     }))
 }
 
@@ -7546,7 +7699,7 @@ fn tool_brain_diff(
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; run the `nestweaver repair` command named in the error, or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8883,6 +9036,29 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     // Counts cache misses since last flush; flush to disk every N misses.
     static FLUSH_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    // nw-C2: bounded wait budget for an in-flight index publication.
+    // Seeded from NESTWEAVER_INDEX_PUBLICATION_WAIT_MS on first use so the
+    // env var is read once per thread rather than per dispatch, and so tests
+    // can override it without racing on process-wide environment mutation.
+    static INDEX_PUBLICATION_WAIT_MS: std::cell::Cell<u64> =
+        std::cell::Cell::new(env_index_publication_wait_ms());
+}
+
+/// Default bounded wait, in milliseconds, from the environment.
+fn env_index_publication_wait_ms() -> u64 {
+    const DEFAULT_MS: u64 = 3_000;
+    const MAX_MS: u64 = 30_000;
+    std::env::var("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS)
+        .min(MAX_MS)
+}
+
+/// Override the bounded index-publication wait for this thread. `0` disables
+/// the wait entirely (the pre-nw-C2 behaviour).
+pub fn set_index_publication_wait_ms(ms: u64) {
+    INDEX_PUBLICATION_WAIT_MS.with(|c| c.set(ms.min(30_000)));
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
@@ -10575,6 +10751,11 @@ mod cache_dispatch_tests {
     #[test]
     fn dirty_publication_bypasses_response_cache() {
         reset_session();
+        // This test asserts CACHE behaviour with a permanently dirty marker.
+        // The nw-C2 bounded wait would otherwise spend its whole budget twice
+        // waiting for a publication that never completes; disabling it here
+        // preserves the exact pre-nw-C2 dispatch path the test was written for.
+        set_index_publication_wait_ms(0);
         let (_dir, db_path) = index_on_disk();
         set_current_db_path(db_path.clone());
         fs::write(
@@ -10597,6 +10778,195 @@ mod cache_dispatch_tests {
             RESPONSE_SHAPE_VERSION,
         );
         assert!(cache.is_empty(), "dirty responses must not be retained");
+    }
+
+    // ── nw-C2: index-publication wait, classification, and status ───────
+
+    /// A pid guaranteed not to name a live process: spawn a child and reap it.
+    fn reaped_child_pid() -> i32 {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        pid
+    }
+
+    fn write_marker(db_path: &std::path::Path, pid: u32, reason: Option<&str>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        fs::write(
+            nestweaver_engine::sidecar_path(db_path, ".index-dirty"),
+            nestweaver_store::index_publication::format_marker_payload(pid, nanos, reason),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_wedged_publication_error_names_the_marker_the_dead_pid_and_the_repair() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let dead = reaped_child_pid();
+        write_marker(&db_path, dead as u32, None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let classified = classify_index_publication_error(
+            &store,
+            anyhow!("query error: PageRank unavailable during dirty index publication"),
+        );
+        let message = format!("{classified:#}");
+        assert!(message.contains("WEDGED"), "{message}");
+        assert!(message.contains(&format!("{dead}")), "{message}");
+        assert!(message.contains(".index-dirty"), "{message}");
+        assert!(message.contains("nestweaver repair"), "{message}");
+        assert!(
+            message.contains("not a dirty git working tree"),
+            "the message must correct the wrong conclusion the reporter drew: {message}"
+        );
+    }
+
+    #[test]
+    fn a_live_publication_error_reads_as_transient_and_names_no_repair() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(
+                &store,
+                anyhow!("PageRank unavailable during dirty index publication"),
+            )
+        );
+        assert!(message.contains("TRANSIENT"), "{message}");
+        assert!(!message.contains("nestweaver repair"), "{message}");
+        assert!(
+            message.contains("not a dirty git working tree"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_wedged_cancelled_publication_also_names_index_force() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        write_marker(&db_path, reaped_child_pid() as u32, Some("cancelled"));
+        let store = GraphStore::open(&db_path).unwrap();
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(
+                &store,
+                anyhow!("PageRank unavailable during dirty index publication"),
+            )
+        );
+        assert!(message.contains("WEDGED"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+    }
+
+    #[test]
+    fn classification_leaves_unrelated_errors_untouched() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        write_marker(&db_path, reaped_child_pid() as u32, None);
+        let store = GraphStore::open(&db_path).unwrap();
+        let message = format!(
+            "{:#}",
+            classify_index_publication_error(&store, anyhow!("no such symbol: foo"))
+        );
+        assert_eq!(message, "no such symbol: foo");
+    }
+
+    #[test]
+    fn the_bounded_wait_lets_a_dispatch_through_when_the_marker_clears() {
+        reset_session();
+        set_index_publication_wait_ms(10_000);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let marker = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        write_marker(&db_path, std::process::id(), None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        // The clearer touches ONLY the marker file — it never acquires or
+        // releases the publication lease, so the in-process condvar is never
+        // notified. This is what an out-of-process writer looks like from
+        // here, and it is why the wait must poll the file.
+        let clearer = std::thread::spawn({
+            let marker = marker.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                fs::remove_file(&marker).unwrap();
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let value = dispatch(&store, None, "hub_nodes", json!({ "limit": 5 }), None).unwrap();
+        clearer.join().unwrap();
+
+        assert!(value.is_object() || value.is_array(), "{value}");
+        assert!(!store.is_index_publication_dirty());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "the dispatch must actually have waited"
+        );
+        assert_eq!(
+            store.index_publication_waiter_count(),
+            0,
+            "a reader must never acquire or queue on the publication lease"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    #[test]
+    fn brain_status_reports_a_wedged_index_publication_without_a_daemon() {
+        reset_session();
+        set_index_publication_wait_ms(0);
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let dead = reaped_child_pid();
+        write_marker(&db_path, dead as u32, None);
+        let store = GraphStore::open(&db_path).unwrap();
+
+        // No daemon anywhere in this test: the field is derived from the
+        // marker FILE, which is the whole point — the reporter was on the
+        // direct `--no-daemon` path.
+        let status = dispatch(&store, None, "brain_status", json!({}), None).unwrap();
+        let publication = &status["index_publication"];
+        assert_eq!(publication["dirty"], json!(true));
+        assert_eq!(publication["determinable"], json!(true));
+        assert_eq!(publication["writer_pid"], json!(dead));
+        assert_eq!(publication["writer_alive"], json!(false));
+        assert_eq!(publication["wedged"], json!(true));
+        assert!(
+            publication["marker_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(".index-dirty"),
+            "{publication}"
+        );
+        let warnings = status["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w["action"]
+                .as_str()
+                .is_some_and(|a| a.contains("nestweaver repair"))),
+            "a wedged publication must carry an actionable warning: {warnings:?}"
+        );
+        set_index_publication_wait_ms(env_index_publication_wait_ms());
+    }
+
+    #[test]
+    fn brain_status_reports_a_clean_index_publication() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let status = dispatch(&store, None, "brain_status", json!({}), None).unwrap();
+        assert_eq!(status["index_publication"]["dirty"], json!(false));
+        assert_eq!(status["index_publication"]["wedged"], json!(false));
     }
 
     #[test]

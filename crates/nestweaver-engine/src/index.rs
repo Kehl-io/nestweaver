@@ -635,6 +635,13 @@ fn finalize_code_graph_deletion_with_io(
 pub(crate) trait IndexEpilogueIo {
     fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
     fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
+    /// Rewrite an already-established marker with a reason field, so a
+    /// publication left dirty ON PURPOSE is distinguishable from one abandoned
+    /// by a crash. Defaulted so alternate `IndexEpilogueIo` implementations
+    /// (test doubles) inherit the behaviour of the one they wrap.
+    fn stamp_marker_reason(&self, path: &Path, reason: &str) -> Result<(), anyhow::Error> {
+        FileSystemIndexEpilogueIo.stamp_marker_reason_impl(path, reason)
+    }
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
     fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     fn save_generation(
@@ -653,27 +660,41 @@ pub(crate) trait IndexEpilogueIo {
 
 pub(crate) struct FileSystemIndexEpilogueIo;
 
-impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
-    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+impl FileSystemIndexEpilogueIo {
+    /// Durably (re)write the marker payload. Shared by `establish_marker` and
+    /// `stamp_marker_reason`: the ordering — write, `sync_all`, fsync the
+    /// parent directory — is what makes the marker survive process death, and
+    /// it must not be duplicated with drift.
+    fn write_marker_payload(&self, path: &Path, reason: Option<&str>) -> Result<(), anyhow::Error> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(path)
             .with_context(|| format!("create index publication marker {}", path.display()))?;
-        let marker = format!(
-            "{}:{}\n",
+        let marker = nestweaver_store::index_publication::format_marker_payload(
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .as_nanos(),
+            reason,
         );
         file.write_all(marker.as_bytes())
             .with_context(|| format!("write index publication marker {}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("sync index publication marker {}", path.display()))?;
         sync_sidecar_parent(path)
+    }
+
+    fn stamp_marker_reason_impl(&self, path: &Path, reason: &str) -> Result<(), anyhow::Error> {
+        self.write_marker_payload(path, Some(reason))
+    }
+}
+
+impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
+    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+        self.write_marker_payload(path, None)
     }
 
     fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
@@ -786,6 +807,22 @@ pub(crate) fn establish_index_publication_marker_with_io<'a>(
             }],
         )
     })?;
+    establish_index_publication_marker_on_lease(lease, db_path, operation, io)
+}
+
+/// The marker-establishment half of [`establish_index_publication_marker_with_io`],
+/// for callers that already hold the lease.
+///
+/// Abandoned-publication recovery acquires the lease NON-blockingly (a lease
+/// already owned in-process means the publication is not abandoned) and must
+/// repair a fail-closed generation base before preflight can succeed, so it
+/// cannot use the acquire-then-establish entry point.
+pub(crate) fn establish_index_publication_marker_on_lease<'a>(
+    lease: nestweaver_store::IndexPublicationLease<'a>,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+) -> Result<nestweaver_store::IndexPublicationLease<'a>, DeletionReconciliationError> {
     let Some(db_path) = db_path else {
         lease.preflight_transient_generation().map_err(|error| {
             DeletionReconciliationError::new(
@@ -858,6 +895,61 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
     let store = lease.store();
+
+    // ORDERING, deliberate: when this publication is being left dirty ON
+    // PURPOSE, record that in the marker payload BEFORE any other finalize
+    // I/O, and durably (`sync_all` + parent fsync). This is the earliest point
+    // in the shared finalizer, so the window in which a death leaves an
+    // unlabelled marker is as narrow as the code permits.
+    //
+    // THE WINDOW CANNOT BE CLOSED COMPLETELY, and that is not a defect to fix
+    // later: a run does not LEARN it was cancelled until it polls the flag,
+    // which happens after the commit. There is no earlier instant at which
+    // anything could be stamped, because before that poll the run has nothing
+    // to stamp.
+    //
+    // Why abandoned-publication recovery still auto-heals a deliberately-dirty
+    // publication, rather than refusing to touch anything that might have been
+    // cancelled (nw-C1 / the cancelled-index item's `publish_clean: false`
+    // path). Four points, the last decisive:
+    //
+    //   1. Recovery reconciles ONLY when the recorded writer process is dead,
+    //      so it can never act on a live run.
+    //   2. It asserts only that the SIDECARS NOW MATCH WHAT WAS COMMITTED. It
+    //      never claims the graph is complete. That assertion is equally true
+    //      of a crashed run and a cancelled one.
+    //   3. The stamp therefore changes the MESSAGE, not the ACTION. A run
+    //      killed inside the residual window is reported as a crash — which is
+    //      precisely what it is indistinguishable from at every layer,
+    //      including before this stamp existed.
+    //   4. Refusing to auto-heal "possibly cancelled" publications means
+    //      refusing to auto-heal ANY of them, because we cannot tell them
+    //      apart. That is exactly the wedge this work exists to end: one
+    //      abandoned marker failing every ranked query in the database
+    //      forever, with no way out.
+    //
+    // So the stamp buys honest reporting (a recovered cancelled run repeats
+    // the `index --force` guidance, because its graph really may be
+    // incomplete) without gating recovery on a distinction the system cannot
+    // reliably make.
+    //
+    // Best-effort by construction: a stamp failure leaves the ordinary
+    // `{pid}:{nanos}` payload, which still fails closed and is still
+    // recoverable. Turning a labelling failure into a publication failure
+    // would be strictly worse.
+    if !publish_clean && let Some(db_path) = db_path {
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+        if let Err(error) = io.stamp_marker_reason(
+            &marker_path,
+            nestweaver_store::index_publication::MARKER_REASON_CANCELLED,
+        ) {
+            tracing::warn!(
+                "could not record the cancellation reason in {}: {error:#}; \
+                 the publication stays dirty and recoverable regardless",
+                marker_path.display()
+            );
+        }
+    }
 
     store.invalidate_pagerank();
     let pagerank_safe = if let Some(db_path) = db_path {
@@ -1005,6 +1097,301 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         })
     } else {
         Err(DeletionReconciliationError::new(operation, failures))
+    }
+}
+
+// ── Abandoned-publication recovery (nw-C1) ──────────────────────────────────
+
+/// Why recovery did or did not run. Every "did not" arm names its reason: the
+/// operator escape hatch prints these verbatim, and a silent no-op is exactly
+/// the failure mode this work exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexPublicationRecovery {
+    /// No marker; nothing to do.
+    Clean,
+    /// The store is in-memory, so there is no marker to reconcile.
+    NotFileBacked,
+    /// The marker's state could not be determined (permissions, I/O error).
+    /// Fails closed: "cannot tell" is not "abandoned".
+    Undeterminable { detail: String },
+    /// The marker records a writer that is still alive. A live publication is
+    /// never recovered out from under its writer.
+    WriterAlive { pid: i32 },
+    /// The marker records no pid we can attribute (an older binary, a
+    /// truncated write, or a hand-created marker). Auto-heal declines; the
+    /// operator escape hatch can still be pointed at it explicitly.
+    WriterUnattributed,
+    /// A live in-process publisher holds the lease, so this publication is
+    /// in flight rather than abandoned.
+    LeaseHeld,
+    /// The publication IS abandoned, but this store is open read-only, so this
+    /// caller must report the condition rather than clear it.
+    ReadOnlyStore { abandoned_writer_pid: i32 },
+    /// Recovery completed: PageRank was recomputed against the committed
+    /// graph, `.pagerank.json` and `.generation` were persisted, and only then
+    /// was the marker cleared.
+    Recovered {
+        /// The pid of the writer that abandoned the publication.
+        abandoned_writer_pid: i32,
+        /// The canonical generation now persisted.
+        generation: u64,
+        /// True when the abandoned publication was left dirty deliberately by
+        /// a committed-after-cancellation run. The graph may be incomplete;
+        /// `nestweaver index --repo <path> --force` is the repair for that,
+        /// and it is a different question from this reconciliation.
+        was_cancelled_run: bool,
+    },
+}
+
+impl IndexPublicationRecovery {
+    /// True when the marker was cleared.
+    pub fn recovered(&self) -> bool {
+        matches!(self, IndexPublicationRecovery::Recovered { .. })
+    }
+
+    /// A single line suitable for a log or for `nestweaver repair` output.
+    pub fn describe(&self) -> String {
+        match self {
+            IndexPublicationRecovery::Clean => {
+                "index publication is clean; nothing to recover".to_string()
+            }
+            IndexPublicationRecovery::NotFileBacked => {
+                "in-memory store has no publication marker to recover".to_string()
+            }
+            IndexPublicationRecovery::Undeterminable { detail } => format!(
+                "index publication marker state could not be determined ({detail}); \
+                 failing closed rather than assuming it was abandoned"
+            ),
+            IndexPublicationRecovery::WriterAlive { pid } => format!(
+                "index publication is in flight; writer pid {pid} is alive — not recovering"
+            ),
+            IndexPublicationRecovery::WriterUnattributed => {
+                "index publication marker records no writer pid; not recovering automatically"
+                    .to_string()
+            }
+            IndexPublicationRecovery::LeaseHeld => {
+                "another publisher in this process holds the publication lease — not recovering"
+                    .to_string()
+            }
+            IndexPublicationRecovery::ReadOnlyStore {
+                abandoned_writer_pid,
+            } => format!(
+                "index publication was abandoned by dead writer pid {abandoned_writer_pid}, but \
+                 this store is open read-only; a writer must perform the repair"
+            ),
+            IndexPublicationRecovery::Recovered {
+                abandoned_writer_pid,
+                generation,
+                was_cancelled_run,
+            } => {
+                let base = format!(
+                    "recovered an abandoned index publication left by dead writer pid \
+                     {abandoned_writer_pid}: PageRank recomputed against the committed graph, \
+                     graph generation {generation} persisted, marker cleared"
+                );
+                if *was_cancelled_run {
+                    format!(
+                        "{base}. That publication was left dirty deliberately by a run that \
+                         committed AFTER cancellation, so the graph itself may be incomplete — \
+                         run `nestweaver index --repo <path> --force` to rebuild it"
+                    )
+                } else {
+                    base
+                }
+            }
+        }
+    }
+}
+
+/// Reconcile an abandoned index publication, in the WRITER only.
+///
+/// The `<db>.index-dirty` marker is durable by design so it survives process
+/// death, and while it exists ranked queries fail closed — correctly, since
+/// `.pagerank.json` and `.generation` may predate the committed graph. What was
+/// missing is the way out. `finalize_committed_index_for_scope_with_io` already
+/// documents the cancelled-commit path as leaving the publication dirty "so the
+/// next open reconciles it"; this function is that reconciliation.
+///
+/// It is a finalize **epilogue, not an `rm`**. Deleting the marker would make
+/// the stale sidecars authoritative again — precisely the silent-wrong-ranks
+/// outcome the guard exists to prevent. Instead it takes the publication lease,
+/// re-establishes ownership of the marker, and routes through
+/// `finalize_committed_index_for_scope_with_io`, so PageRank is recomputed
+/// against the *committed* graph and `.generation` advanced and persisted
+/// **before** the marker is cleared. That ordering is the entire point of the
+/// guard and is not duplicated here.
+///
+/// `read_write` gates recovery exactly as it gates the orphaned-WAL arm of
+/// `open_lbug_with_recovery`: a read-only caller must report the condition, not
+/// mutate the directory to clear it. This is concrete, not theoretical — the
+/// MCP server commonly runs as a separate process from the daemon and opens the
+/// store read-only, so it must never be the process performing repair.
+pub fn recover_abandoned_index_publication(
+    store: &GraphStore,
+    read_write: bool,
+) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
+    recover_abandoned_index_publication_with_io(store, read_write, &FileSystemIndexEpilogueIo)
+}
+
+pub(crate) fn recover_abandoned_index_publication_with_io(
+    store: &GraphStore,
+    read_write: bool,
+    io: &dyn IndexEpilogueIo,
+) -> Result<IndexPublicationRecovery, DeletionReconciliationError> {
+    const OPERATION: &str = "recover abandoned index publication";
+
+    let Some(db_path) = store.db_path().map(Path::to_path_buf) else {
+        return Ok(IndexPublicationRecovery::NotFileBacked);
+    };
+
+    // Cheap file-derived triage BEFORE touching the lease, so the common
+    // (clean) case costs one `read_to_string` and nothing else.
+    let state = nestweaver_store::index_publication::read_marker(&db_path);
+    match &state {
+        nestweaver_store::index_publication::MarkerState::Absent => {
+            return Ok(IndexPublicationRecovery::Clean);
+        }
+        nestweaver_store::index_publication::MarkerState::Undeterminable(detail) => {
+            return Ok(IndexPublicationRecovery::Undeterminable {
+                detail: detail.clone(),
+            });
+        }
+        nestweaver_store::index_publication::MarkerState::Present(_) => {}
+    }
+    let record = state.record().expect("present marker carries a record");
+    let was_cancelled_run = record.is_deliberately_dirty();
+    let Some(pid) = record.writer_pid else {
+        return Ok(IndexPublicationRecovery::WriterUnattributed);
+    };
+    if crate::index_publication::process_is_alive(pid) {
+        return Ok(IndexPublicationRecovery::WriterAlive { pid });
+    }
+    if !read_write {
+        // Report, never clear. Same rule, and the same reason, as the
+        // read-only arm of `open_lbug_with_recovery`: "a read-only caller
+        // quarantining a log out from under a live writer would be a genuine
+        // hazard". The MCP server opens the store read-only and can be a
+        // different process from the daemon, so it lands here.
+        return Ok(IndexPublicationRecovery::ReadOnlyStore {
+            abandoned_writer_pid: pid,
+        });
+    }
+
+    // Second half of the abandoned predicate: no in-process publisher owns the
+    // lease. Acquired non-blockingly — queueing behind a live publisher would
+    // mean the publication was never abandoned in the first place.
+    let lease = store
+        .try_acquire_index_publication_lease()
+        .map_err(|error| {
+            DeletionReconciliationError::new(
+                OPERATION,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::IndexPublicationMarker,
+                    repo_uid: None,
+                    message: format!("acquire exclusive index publication lease: {error:#}"),
+                }],
+            )
+        })?;
+    let Some(lease) = lease else {
+        return Ok(IndexPublicationRecovery::LeaseHeld);
+    };
+
+    // Re-read under the lease. Between the triage read and here, a fresh
+    // publisher in another process could have established a new marker with a
+    // live pid; recovering that would clear a marker out from under its writer.
+    let confirmed = nestweaver_store::index_publication::read_marker(&db_path);
+    match confirmed.record().and_then(|r| r.writer_pid) {
+        Some(current) if current != pid => {
+            return Ok(IndexPublicationRecovery::WriterAlive { pid: current });
+        }
+        Some(_) => {}
+        None => return Ok(IndexPublicationRecovery::WriterUnattributed),
+    }
+
+    // The `u64::MAX` arm. When `.generation` is missing or unparseable while
+    // the marker is present, the fail-closed load takes `canonical = u64::MAX`,
+    // so `checked_add(2)` overflows in preflight and the publication can NEVER
+    // complete — surfacing as `graph generation exhausted during index
+    // publication`, a DIFFERENT error string. Recovery that ignored this arm
+    // would appear to fix nothing. Re-derive instead of adding to `MAX`.
+    let generation_path = crate::sidecar_path(&db_path, ".generation");
+    if let Some(rederived) = lease
+        .rederive_unavailable_generation_base(&generation_path)
+        .map_err(|error| {
+            DeletionReconciliationError::new(
+                OPERATION,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::GenerationPersistence,
+                    repo_uid: None,
+                    message: format!("re-derive fail-closed generation base: {error:#}"),
+                }],
+            )
+        })?
+    {
+        tracing::warn!(
+            "index publication recovery re-derived an unavailable generation base to \
+             {rederived} because {} was missing or unparseable while the marker was set",
+            generation_path.display()
+        );
+    }
+
+    // Take ownership of the marker (it is rewritten with THIS process's pid and
+    // timestamp), then run the ordinary committed-index epilogue.
+    let lease = establish_index_publication_marker_on_lease(lease, Some(&db_path), OPERATION, io)?;
+    finalize_committed_index_for_scope_with_io(
+        lease,
+        Some(&db_path),
+        OPERATION,
+        io,
+        Some(&nestweaver_store::GraphScope::code_only()),
+        true,
+    )?;
+
+    Ok(IndexPublicationRecovery::Recovered {
+        abandoned_writer_pid: pid,
+        generation: store.graph_generation(),
+        was_cancelled_run,
+    })
+}
+
+/// Open a store READ-WRITE and reconcile any abandoned index publication
+/// before handing it back.
+///
+/// This is the writer-side funnel for auto-heal. Every production writer opens
+/// through it (`index_repo`, the incremental path, the code and vault
+/// watchers); the daemon reconciles separately at startup. Read-only openers —
+/// notably the MCP server, which commonly runs in a different process from the
+/// daemon — deliberately do NOT have an equivalent and must never repair.
+pub fn open_store_for_writing_with_recovery(db_path: &Path) -> Result<GraphStore, anyhow::Error> {
+    let store = GraphStore::open_or_create(db_path)
+        .with_context(|| format!("open/create store at {}", db_path.display()))?;
+    recover_abandoned_index_publication_best_effort(&store, true);
+    Ok(store)
+}
+
+/// Run [`recover_abandoned_index_publication`] and log the outcome, swallowing
+/// errors. For call sites (daemon startup, writer opens) where recovery is a
+/// best-effort improvement and must never be able to fail the caller.
+pub fn recover_abandoned_index_publication_best_effort(
+    store: &GraphStore,
+    read_write: bool,
+) -> Option<IndexPublicationRecovery> {
+    match recover_abandoned_index_publication(store, read_write) {
+        Ok(outcome) => {
+            if outcome.recovered() {
+                tracing::warn!("{}", outcome.describe());
+            } else if !matches!(
+                outcome,
+                IndexPublicationRecovery::Clean | IndexPublicationRecovery::NotFileBacked
+            ) {
+                tracing::info!("{}", outcome.describe());
+            }
+            Some(outcome)
+        }
+        Err(error) => {
+            tracing::warn!("index publication recovery failed: {error:#}");
+            None
+        }
     }
 }
 
@@ -1251,8 +1638,10 @@ pub fn index_directory_with_options(
     force: bool,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
-        .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
+    // nw-C1: reconcile an abandoned publication before indexing. A crashed
+    // predecessor's `.index-dirty` otherwise wedges every ranked query, and the
+    // fail-closed `u64::MAX` generation base can block this run's own preflight.
+    let store = open_store_for_writing_with_recovery(db_path)?;
     index_directory_with_store(
         &store,
         repo_path,
@@ -3975,8 +4364,11 @@ fn incremental_index_with_name_and_io(
     name: Option<&str>,
     epilogue_io: &dyn IndexEpilogueIo,
 ) -> Result<IncrementalResult, anyhow::Error> {
-    let store = nestweaver_store::GraphStore::open_or_create(db_path)
-        .with_context(|| format!("open/create store at {}", db_path.display()))?;
+    // nw-C1: reconcile BEFORE the `old_sha == new_sha` short-circuit below,
+    // which returns early without ever establishing a marker. Without this, an
+    // idle repo could never clear an abandoned publication however often it was
+    // re-indexed.
+    let store = open_store_for_writing_with_recovery(db_path)?;
 
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
 
@@ -5225,6 +5617,386 @@ mod tests {
                 evidence: Vec::new(),
             })
             .unwrap();
+    }
+
+    // ── nw-C1: abandoned-publication recovery ───────────────────────────
+
+    /// A pid that is guaranteed not to name a live process: spawn a child,
+    /// wait for it (which reaps the zombie), and return its now-free pid.
+    /// `kill(pid, 0)` then reports ESRCH deterministically.
+    fn reaped_child_pid() -> i32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as i32;
+        child.wait().expect("reap /bin/true");
+        assert!(
+            !crate::index_publication::process_is_alive(pid),
+            "a reaped child must not read as alive"
+        );
+        pid
+    }
+
+    fn write_marker_with_pid(marker_path: &Path, pid: i32, reason: Option<&str>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            marker_path,
+            nestweaver_store::index_publication::format_marker_payload(pid as u32, nanos, reason),
+        )
+        .unwrap();
+    }
+
+    /// Leave the database in exactly the state a SIGKILL between marker
+    /// establishment and finalize produces: graph committed, `.index-dirty`
+    /// present and naming a dead writer, `.pagerank.json` still holding
+    /// pre-crash scores, `.generation` still at the pre-crash canonical value.
+    fn abandon_publication_after_commit(db_path: &Path, publisher: &str) -> (i32, u64) {
+        let generation_path = crate::sidecar_path(db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+
+        let store = GraphStore::open_or_create(db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let canonical = store.graph_generation();
+        // A PageRank sidecar that predates the commit below. Serving it after
+        // the commit would be the silent-wrong-ranks outcome the guard exists
+        // to prevent, so recovery must overwrite rather than preserve it.
+        std::fs::write(&pagerank_path, r#"{"stale-precrash-score":1.0}"#).unwrap();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            Some(db_path),
+            "crashing publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, publisher);
+        // The process dies here: the lease is process-local and simply
+        // vanishes, while the marker and both sidecars are durable.
+        drop(lease);
+        drop(store);
+
+        let pid = reaped_child_pid();
+        write_marker_with_pid(&marker_path, pid, None);
+        (pid, canonical)
+    }
+
+    #[test]
+    fn abandoned_publication_recovers_on_read_write_open_with_no_manual_intervention() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+
+        let (dead_pid, canonical) = abandon_publication_after_commit(&db_path, "crashed");
+        assert!(marker_path.exists(), "the crash must leave the marker set");
+
+        // The whole point: an ordinary read-write open, nothing else.
+        let store = open_store_for_writing_with_recovery(&db_path).unwrap();
+
+        assert!(
+            !marker_path.exists(),
+            "recovery must retire the marker for pid {dead_pid}"
+        );
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(
+            store.graph_generation(),
+            canonical + 2,
+            "recovery publishes the clean N+2 successor"
+        );
+
+        // PageRank must reflect the COMMITTED graph, not the pre-crash sidecar.
+        let scores = store.pagerank_scores();
+        assert!(
+            !scores.contains_key("stale-precrash-score"),
+            "the pre-crash PageRank sidecar must not survive recovery: {scores:?}"
+        );
+        assert!(
+            scores.contains_key("sym:publisher-crashed:source"),
+            "recovered PageRank must cover the committed graph: {scores:?}"
+        );
+
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.is_index_publication_dirty());
+        assert_eq!(reopened.graph_generation(), canonical + 2);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            reopened
+                .pagerank_scores()
+                .contains_key("sym:publisher-crashed:source"),
+            "the persisted PageRank sidecar must reflect the committed graph"
+        );
+    }
+
+    #[test]
+    fn a_read_only_open_reports_the_abandoned_publication_and_never_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+
+        let (dead_pid, _) = abandon_publication_after_commit(&db_path, "readonly");
+
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, false).unwrap();
+        assert_eq!(
+            outcome,
+            IndexPublicationRecovery::ReadOnlyStore {
+                abandoned_writer_pid: dead_pid
+            },
+            "a read-only caller must report, never repair"
+        );
+        assert!(!outcome.recovered());
+        assert!(
+            marker_path.exists(),
+            "a read-only open must preserve the marker"
+        );
+        assert!(
+            store.is_index_publication_dirty(),
+            "a read-only open must keep failing closed"
+        );
+    }
+
+    #[test]
+    fn a_live_publication_is_never_recovered_out_from_under_its_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "live publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let dirty_generation = store.graph_generation();
+
+        // The marker names THIS process, which is alive: liveness alone must
+        // stop recovery, before the lease is even consulted.
+        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        assert_eq!(
+            outcome,
+            IndexPublicationRecovery::WriterAlive {
+                pid: std::process::id() as i32
+            }
+        );
+        assert!(marker_path.exists());
+        assert_eq!(store.graph_generation(), dirty_generation);
+
+        // And with a DEAD recorded pid but the lease still held in-process,
+        // the second half of the predicate must decline too.
+        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
+        assert_eq!(
+            recover_abandoned_index_publication(&store, true).unwrap(),
+            IndexPublicationRecovery::LeaseHeld,
+            "a held lease means the publication is in flight, not abandoned"
+        );
+        assert!(marker_path.exists());
+
+        // The live publisher still finishes normally.
+        insert_publication_graph(&store, "live");
+        finalize_committed_index_with_io(
+            lease,
+            Some(&db_path),
+            "live publisher",
+            &FileSystemIndexEpilogueIo,
+            true,
+        )
+        .unwrap();
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn an_undeterminable_marker_is_reported_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        {
+            let _ = GraphStore::open_or_create(&db_path).unwrap();
+        }
+        // A directory where the marker file belongs: `try_exists` succeeds but
+        // the read cannot. `is_index_publication_dirty` is
+        // `try_exists().unwrap_or(true)`, so this reads as permanently dirty by
+        // design — recovery must not mistake it for an abandoned publication.
+        std::fs::create_dir(&marker_path).unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        assert!(
+            matches!(outcome, IndexPublicationRecovery::Undeterminable { .. }),
+            "cannot tell is not abandoned: {outcome:?}"
+        );
+        assert!(marker_path.exists());
+        assert!(store.is_index_publication_dirty());
+    }
+
+    #[test]
+    fn an_unattributed_marker_is_not_auto_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        {
+            let _ = GraphStore::open_or_create(&db_path).unwrap();
+        }
+        // The pre-nw-C1 hand-created marker, and what an older binary's
+        // truncated write leaves behind.
+        std::fs::write(&marker_path, b"dirty").unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            recover_abandoned_index_publication(&store, true).unwrap(),
+            IndexPublicationRecovery::WriterUnattributed
+        );
+        assert!(marker_path.exists());
+    }
+
+    #[test]
+    fn a_dirty_marker_with_a_missing_generation_recovers_instead_of_exhausting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            insert_publication_graph(&store, "nogeneration");
+        }
+        // Marker present, `.generation` absent: the fail-closed load takes
+        // `canonical = u64::MAX`.
+        let dead_pid = reaped_child_pid();
+        write_marker_with_pid(&marker_path, dead_pid, None);
+        assert!(!generation_path.exists());
+
+        // Establish that the second wedge exists, so this test would catch a
+        // recovery that quietly ignored the `u64::MAX` arm.
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            assert_eq!(store.graph_generation(), u64::MAX);
+            let error = establish_index_publication_marker_with_io(
+                &store,
+                Some(&db_path),
+                "blocked publisher",
+                &FileSystemIndexEpilogueIo,
+            )
+            .expect_err("preflight must overflow while the base is u64::MAX");
+            assert!(
+                format!("{error}").contains("graph generation exhausted during index publication"),
+                "the second wedge surfaces as a DIFFERENT error string: {error}"
+            );
+        }
+
+        let store = open_store_for_writing_with_recovery(&db_path).unwrap();
+        assert!(
+            !marker_path.exists(),
+            "recovery must re-derive rather than add to u64::MAX"
+        );
+        assert!(!store.is_index_publication_dirty());
+        assert!(generation_path.exists());
+        assert_eq!(
+            store.graph_generation(),
+            2,
+            "re-derivation falls back to the same canonical 0 a clean open would use"
+        );
+        assert!(
+            store
+                .pagerank_scores()
+                .contains_key("sym:publisher-nogeneration:source")
+        );
+    }
+
+    #[test]
+    fn recovery_reports_a_deliberately_dirty_cancelled_publication_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "cancelled publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "cancelled");
+        // The committed-after-cancellation path: publish_clean = false.
+        finalize_committed_index_for_scope_with_io(
+            lease,
+            Some(&db_path),
+            "cancelled publisher",
+            &FileSystemIndexEpilogueIo,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            marker_path.exists(),
+            "a cancelled-but-committed run must stay dirty on purpose"
+        );
+        let state = nestweaver_store::index_publication::read_marker(&db_path);
+        assert!(
+            state.record().unwrap().is_deliberately_dirty(),
+            "the deliberate hold must be recorded in the marker payload"
+        );
+
+        // Still owned by a live process → never recovered.
+        assert_eq!(
+            recover_abandoned_index_publication(&store, true).unwrap(),
+            IndexPublicationRecovery::WriterAlive {
+                pid: std::process::id() as i32
+            }
+        );
+        drop(store);
+
+        // Once that writer is gone, the publication IS reconciled — the
+        // sidecars really do predate the commit either way — but the outcome
+        // says so, so the `index --force` guidance is not silently lost.
+        write_marker_with_pid(&marker_path, reaped_child_pid(), Some("cancelled"));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        assert!(outcome.recovered());
+        assert!(
+            matches!(
+                outcome,
+                IndexPublicationRecovery::Recovered {
+                    was_cancelled_run: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(outcome.describe().contains("--force"));
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn a_clean_store_reports_clean_and_an_in_memory_store_has_nothing_to_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            recover_abandoned_index_publication(&store, true).unwrap(),
+            IndexPublicationRecovery::Clean
+        );
+        let memory = GraphStore::in_memory().unwrap();
+        assert_eq!(
+            recover_abandoned_index_publication(&memory, true).unwrap(),
+            IndexPublicationRecovery::NotFileBacked
+        );
     }
 
     /// Liveness deadline for the cross-thread handoffs in the overlapping

@@ -3,6 +3,7 @@ pub mod db;
 pub mod durable_sidecar;
 pub mod error;
 pub mod generation;
+pub mod index_publication;
 pub mod ranking;
 pub mod read;
 pub mod regex;

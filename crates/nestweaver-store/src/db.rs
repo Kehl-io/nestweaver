@@ -127,6 +127,17 @@ impl IndexPublicationLease<'_> {
         Ok(reserved.generation)
     }
 
+    /// Re-derive an inherited publication base whose N+1/N+2 successors are
+    /// unavailable. See
+    /// [`GraphStore::rederive_unavailable_index_publication_base`].
+    pub fn rederive_unavailable_generation_base(
+        &self,
+        generation_path: &std::path::Path,
+    ) -> Result<Option<u64>, StoreError> {
+        self.store
+            .rederive_unavailable_index_publication_base(self.token, generation_path)
+    }
+
     /// Whether this owner inherited an already-dirty publication.
     pub fn is_recovered(&self) -> bool {
         self.reservation.get() == IndexPublicationReservationState::Recovered
@@ -871,6 +882,37 @@ impl GraphStore {
         })
     }
 
+    /// Acquire the publication lease only if it is free right now.
+    ///
+    /// [`Self::acquire_index_publication_lease`] blocks, which is correct for a
+    /// publisher that must run. Abandoned-publication recovery is opportunistic:
+    /// if a live in-process publisher already owns the lease then the
+    /// publication is by definition not abandoned, and recovery must decline
+    /// rather than queue behind it.
+    pub fn try_acquire_index_publication_lease(
+        &self,
+    ) -> Result<Option<IndexPublicationLease<'_>>, StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner.is_some() {
+            return Ok(None);
+        }
+        let token = state.next_token;
+        state.next_token = token.checked_add(1).ok_or_else(|| {
+            StoreError::Query("index publication ownership token exhausted".into())
+        })?;
+        state.owner = Some(token);
+        Ok(Some(IndexPublicationLease {
+            store: self,
+            token,
+            reservation: Cell::new(IndexPublicationReservationState::Unreserved),
+            released: false,
+        }))
+    }
+
     /// Current number of publishers or snapshot readers waiting for ownership.
     #[doc(hidden)]
     pub fn index_publication_waiter_count(&self) -> usize {
@@ -935,7 +977,7 @@ impl GraphStore {
     /// While a lease IS held, a live publication is mid-flight and the reservation
     /// must stay fail-closed. This is the live-vs-dead signal the admin path keys
     /// on so a crash can't wedge every future generation bump forever (nw-091).
-    fn index_publication_lease_is_unowned(&self) -> bool {
+    pub fn index_publication_lease_is_unowned(&self) -> bool {
         self.index_publication_lease
             .state
             .lock()
@@ -1042,6 +1084,58 @@ impl GraphStore {
             generation: reserved,
             recovered: false,
         })
+    }
+
+    /// Re-derive a fail-closed publication base whose successors are
+    /// unavailable, so an interrupted publication can be completed at all.
+    ///
+    /// When `.generation` is missing or unparseable *while* the marker is
+    /// present, `load_fail_closed_index_publication_generation` takes
+    /// `canonical = u64::MAX` — deliberately, so nothing can complete a
+    /// publication on top of an unknown canonical value. The cost is that
+    /// `checked_add(2)` then overflows in every preflight and reserve path, so
+    /// the publication can never complete and the user sees a *different*
+    /// error (`graph generation exhausted during index publication`) rather
+    /// than the dirty-publication one. Recovery that ignored this arm would
+    /// appear to fix nothing.
+    ///
+    /// The fix is to re-derive rather than to add to `MAX`. The note that
+    /// specified this work says "re-derive from the database"; there is no
+    /// generation column in the database — the counter's only durable home is
+    /// the `<db>.generation` sidecar — so re-derivation re-reads that sidecar
+    /// and, when it is still unreadable, falls back to `0`. `0` is not a new
+    /// risk: it is exactly what a *clean* open of a store with no `.generation`
+    /// sidecar already uses (`load_graph_generation` leaves the freshly-opened
+    /// `AtomicU64::new(0)` untouched), so recovery lands on the same canonical
+    /// value the clean path would have.
+    ///
+    /// Returns the canonical base in force after the call, or `None` when the
+    /// base did not need re-deriving.
+    fn rederive_unavailable_index_publication_base(
+        &self,
+        token: u64,
+        generation_path: &Path,
+    ) -> Result<Option<u64>, StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(canonical) = *base else {
+            return Ok(None);
+        };
+        if canonical.checked_add(2).is_some() {
+            return Ok(None);
+        }
+        let rederived = std::fs::read_to_string(generation_path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u64>().ok())
+            .filter(|value| value.checked_add(2).is_some())
+            .unwrap_or(0);
+        *base = Some(rederived);
+        self.graph_generation
+            .store(rederived.saturating_add(1), Ordering::Release);
+        Ok(Some(rederived))
     }
 
     /// Confirm that a lease acquired for backup/snapshot work did not inherit
@@ -1155,9 +1249,63 @@ impl GraphStore {
     }
 
     fn index_publication_marker_for(db_path: &Path) -> PathBuf {
-        let mut value = db_path.as_os_str().to_owned();
-        value.push(".index-dirty");
-        PathBuf::from(value)
+        crate::index_publication::marker_path(db_path)
+    }
+
+    /// Path of this store's durable publication marker, when it is file-backed.
+    /// In-memory stores have no marker (and nothing to reconcile on a later
+    /// open), so they return `None`.
+    pub fn index_publication_marker_path(&self) -> Option<PathBuf> {
+        self.db_path
+            .as_deref()
+            .map(Self::index_publication_marker_for)
+    }
+
+    /// Three-state read of this store's publication marker. Unlike
+    /// [`Self::is_index_publication_dirty`], which collapses "cannot tell" into
+    /// "dirty", this preserves the distinction recovery depends on.
+    pub fn index_publication_marker_state(&self) -> crate::index_publication::MarkerState {
+        match self.db_path.as_deref() {
+            Some(path) => crate::index_publication::read_marker(path),
+            None => crate::index_publication::MarkerState::Absent,
+        }
+    }
+
+    /// Poll the FILE-BACKED dirty check until the publication is clean or
+    /// `timeout` elapses. Returns true when the publication is clean.
+    ///
+    /// This deliberately polls [`Self::is_index_publication_dirty`] rather than
+    /// waiting on `index_publication_lease.available`. That condition variable
+    /// is **in-process**: the MCP reader commonly runs in a different process
+    /// from the indexing writer and opens the store read-only, so the condvar
+    /// can never fire for it and an in-process test of a condvar-based wait
+    /// would pass for the wrong reason. The marker file is genuinely
+    /// cross-process.
+    ///
+    /// It also deliberately does NOT acquire the publication lease. Acquisition
+    /// is exclusive and blocking, so a waiting reader would serialize every
+    /// other reader behind the writer — turning a latency blip into an outage.
+    pub fn wait_until_index_publication_clean(&self, timeout: std::time::Duration) -> bool {
+        if !self.is_index_publication_dirty() {
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut backoff = std::time::Duration::from_millis(5);
+        let max_backoff = std::time::Duration::from_millis(100);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return !self.is_index_publication_dirty();
+            }
+            std::thread::sleep(backoff.min(remaining));
+            if !self.is_index_publication_dirty() {
+                return true;
+            }
+            backoff = (backoff * 2).min(max_backoff);
+        }
     }
 
     /// Path to the `<db>.generation` sidecar. For in-memory stores (no
@@ -2281,6 +2429,13 @@ mod tests {
             !reopened.pagerank_scores().contains_key("stale"),
             "a dirty publication must not load canonical PageRank from before the graph commit"
         );
+        // nw-C1: the same marker is now READ BACK, not merely tested for
+        // existence. An unparseable payload is still `Present` — dirty, but
+        // carrying no writer to attribute the publication to.
+        let state = reopened.index_publication_marker_state();
+        assert!(state.is_dirty());
+        assert_eq!(state.record().unwrap().writer_pid, None);
+        assert!(!reopened.wait_until_index_publication_clean(std::time::Duration::from_millis(30)));
     }
 
     #[test]
@@ -2312,6 +2467,151 @@ mod tests {
             !reopened.pagerank_scores().contains_key("stale"),
             "an unreadable marker must make canonical PageRank non-authoritative"
         );
+        // nw-C1: "cannot tell" must stay distinguishable from "present".
+        // Recovery keys on this: an unreadable marker is never abandoned.
+        let state = reopened.index_publication_marker_state();
+        assert!(
+            matches!(
+                state,
+                crate::index_publication::MarkerState::Undeterminable(_)
+            ),
+            "an unreadable marker must not read as a present, attributable one: {state:?}"
+        );
+        assert!(state.is_dirty());
+        assert!(state.record().is_none());
+    }
+
+    #[test]
+    fn wait_until_index_publication_clean_is_immediate_when_already_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(store.wait_until_index_publication_clean(std::time::Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "a clean publication must not consume any of the wait budget"
+        );
+    }
+
+    #[test]
+    fn wait_until_index_publication_clean_times_out_on_a_persistent_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(crate::index_publication::marker_path(&db_path), b"1:1\n").unwrap();
+        let started = std::time::Instant::now();
+        assert!(!store.wait_until_index_publication_clean(std::time::Duration::from_millis(120)));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn wait_until_index_publication_clean_observes_marker_removal_without_the_condvar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker = crate::index_publication::marker_path(&db_path);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(&marker, b"1:1\n").unwrap();
+
+        // The remover touches ONLY the file. It never acquires or releases the
+        // publication lease, so `index_publication_lease.available` is never
+        // notified — which is precisely the situation of an out-of-process
+        // writer. A condvar-based wait could not wake here.
+        let remover = std::thread::spawn({
+            let marker = marker.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                std::fs::remove_file(&marker).unwrap();
+            }
+        });
+        assert!(
+            store.wait_until_index_publication_clean(std::time::Duration::from_secs(10)),
+            "the wait must observe a file-only clean transition"
+        );
+        assert_eq!(
+            store.index_publication_waiter_count(),
+            0,
+            "a waiting reader must never register as a publication-lease waiter"
+        );
+        remover.join().unwrap();
+    }
+
+    #[test]
+    fn try_acquire_index_publication_lease_declines_a_held_lease() {
+        let store = GraphStore::in_memory().unwrap();
+        let held = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            store
+                .try_acquire_index_publication_lease()
+                .unwrap()
+                .is_none(),
+            "a non-blocking acquire must decline rather than queue"
+        );
+        assert!(!store.index_publication_lease_is_unowned());
+        drop(held);
+        assert!(store.index_publication_lease_is_unowned());
+        assert!(
+            store
+                .try_acquire_index_publication_lease()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_unavailable_generation_base_is_rederived_rather_than_added_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        // Marker present with NO `.generation` sidecar: the fail-closed load
+        // takes `canonical = u64::MAX`, so `checked_add(2)` overflows and the
+        // publication could never complete.
+        std::fs::write(crate::index_publication::marker_path(&db_path), b"1:1\n").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(store.graph_generation(), u64::MAX);
+
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            lease.preflight_generation().is_err(),
+            "the u64::MAX arm must block publication before re-derivation"
+        );
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        assert_eq!(
+            lease
+                .rederive_unavailable_generation_base(&generation_path)
+                .unwrap(),
+            Some(0),
+            "an unreadable sidecar re-derives to the same canonical 0 a clean open uses"
+        );
+        assert_eq!(store.graph_generation(), 1);
+        lease.preflight_generation().unwrap();
+        assert_eq!(
+            lease
+                .rederive_unavailable_generation_base(&generation_path)
+                .unwrap(),
+            None,
+            "a usable base is left alone"
+        );
+    }
+
+    #[test]
+    fn rederivation_prefers_a_parseable_generation_sidecar_over_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        std::fs::write(crate::index_publication::marker_path(&db_path), b"1:1\n").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(store.graph_generation(), u64::MAX);
+        // The sidecar appears (or becomes readable) after the fail-closed open.
+        std::fs::write(&generation_path, b"41").unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert_eq!(
+            lease
+                .rederive_unavailable_generation_base(&generation_path)
+                .unwrap(),
+            Some(41)
+        );
+        assert_eq!(store.graph_generation(), 42);
+        assert_eq!(lease.clean_generation().unwrap(), 43);
     }
 
     #[test]
