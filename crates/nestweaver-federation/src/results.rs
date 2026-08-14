@@ -231,15 +231,41 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 ///   the safe direction (the alternative silently drops a real degradation), so
 ///   this is intentional, not an oversight.
 ///
+///   `semantic_applied` has the **identical** blind spot, in the same
+///   direction: it too is computed over tiers, not over surviving rows. A
+///   server that returns `connected: []` with `semantic_applied: false`, merged
+///   with a local tier that ranked semantically, yields a merged row set that
+///   is entirely local and entirely semantically ranked — reported as `false`.
+///   Under-claiming is the safe direction for a property (as over-reporting is
+///   for a degradation), so both are accepted rather than fixed by weighting
+///   the fields by surviving-row provenance.
+///
 /// - **A tier that omits `semantic_applied` forces the merged value to
-///   `false`** — we cannot claim a property we were not told about. Note this
-///   is not reachable today for `brain_search`: both tiers go through
-///   `dispatch::dispatch_typed_brain_search`, which always emits both keys, and
-///   proto3 scalars mean an older server decodes to `false`/`[]` rather than to
-///   an absent field. The same holds on the structured path
-///   (`dispatch::dispatch_typed_brain_context` /
-///   `dispatch_typed_project_context` insert both keys unconditionally from the
-///   proto response). It is defensive, not a supported detection mechanism.
+///   `false`** — we cannot claim a property we were not told about.
+///   Reachability differs per tool, and the difference is load-bearing:
+///
+///   - `brain_search` and `brain_context`: **not reachable.** Both go through
+///     `dispatch::dispatch_typed_brain_search` / `dispatch_typed_brain_context`,
+///     which insert both keys unconditionally, and both proto responses carry
+///     them as *typed* fields (`BrainSearchResponse`, `BrainContextResponse`),
+///     so proto3 scalar defaults decode an older server to `false`/`[]` rather
+///     than to an absent field. Here the branch is defensive only, and not a
+///     supported way to detect an old server.
+///
+///   - `project_context`: **reachable.** `ProjectContextResponse` is
+///     `{ string result_json = 1; }` — no typed honesty fields at all — and
+///     `dispatch_typed_project_context` returns the parsed `result_json`
+///     untouched, inserting nothing. Both fields therefore ride *inside* the
+///     JSON, and `tool_project_context` has an early-return envelope for a
+///     project with no members that emits `connected: []` and **neither**
+///     field. A federated `project_context` where one side's project is empty
+///     still enters the structured branch, so the AND below really can see a
+///     silent tier and force `false` even when every surviving row came from a
+///     tier that genuinely applied semantic ranking. That under-claims, which
+///     is the safe direction, but it is a real case and not a hypothetical.
+///     If BOTH tiers are empty projects, `any_reported` is false and neither
+///     field is emitted — worth knowing, because `agent_guide` tells agents
+///     `brain_context` / `project_context` always emit `degraded_components`.
 ///
 /// - **If no tier reports either field, nothing is emitted.** Inventing
 ///   `semantic_applied: false` out of two silent tiers would destroy the very
@@ -1951,6 +1977,42 @@ mod tests {
             "a server-side degradation must not be hidden behind a healthy local tier"
         );
         assert_eq!(one_sided["semantic_applied"], json!(false));
+
+        // Distinct per-tier values, so the assertion can actually tell a union
+        // apart from "whatever the local tier said". A single-element expected
+        // value cannot: it passes identically whether one tier or both reported.
+        //
+        // NOT VOCABULARY. `"reranker"` and `"expansion"` are deliberately
+        // chosen because nothing in this codebase emits them: the merge is a
+        // value-agnostic string union, and inputs no producer can generate are
+        // what prove that, where reusing `"semantic"` twice would not. The
+        // real, complete vocabulary is exactly one value, `"semantic"`, as
+        // stated in `agent_guide`, README.md and docs/server-mode.md — if you
+        // arrived here by grepping `degraded_components` for what values exist,
+        // these two are not among them. (Same convention as the `brain_search`
+        // sibling test `merge_degraded_components_unions_and_dedupes`, which
+        // has used these names since before the structured merge carried these
+        // fields; keeping them aligned beats two conventions in one file.)
+        let distinct = merge_structured_results(
+            &brain_context_tier("a", false, &["semantic"]),
+            &brain_context_tier("b", false, &["reranker"]),
+        );
+        assert_eq!(
+            distinct["degraded_components"],
+            json!(["semantic", "reranker"]),
+            "union of distinct per-tier values, in local-then-server order"
+        );
+
+        // Overlap plus a distinct value: dedup and order together.
+        let overlapping = merge_structured_results(
+            &brain_context_tier("a", false, &["semantic", "reranker"]),
+            &brain_context_tier("b", false, &["reranker", "expansion"]),
+        );
+        assert_eq!(
+            overlapping["degraded_components"],
+            json!(["semantic", "reranker", "expansion"]),
+            "deduplicated, first-seen order preserved across tiers"
+        );
     }
 
     #[test]

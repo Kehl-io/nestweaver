@@ -2501,13 +2501,20 @@ async fn hybrid_brain_context_merge_preserves_honesty_fields() {
     // semantic leg was requested and could not run: each reports
     // `semantic_applied: false` with `degraded_components: ["semantic"]`.
     //
-    // That makes this the load-bearing case rather than a trivial one. The AND
-    // across tiers is `false`, and the union is `["semantic"]` — ONE entry, not
-    // two, which proves the merge deduplicates rather than concatenating, and
-    // proves a REAL degradation survives the rebuild of the envelope instead of
-    // being dropped. This is exactly what a caller loses when the structured
-    // merge drops these fields: the merged answer is lexically ranked, and it
-    // has to say so.
+    // That makes this the load-bearing case rather than a trivial one: a REAL
+    // degradation, produced by two real daemons, has to survive the rebuild of
+    // the envelope instead of being dropped. This is exactly what a caller
+    // loses when the structured merge drops these fields — the merged answer is
+    // lexically ranked, and it has to say so.
+    //
+    // What this assertion does NOT prove: that the union deduplicates. A
+    // one-element `["semantic"]` is the expected output whether both tiers
+    // reported it (the case here, by construction — `weight_semantic` defaults
+    // non-zero and `semantic_requested` does not depend on the store holding
+    // vectors) or only one did. The dedup and union-ordering rules are proven
+    // in `merge_structured_degraded_components_unions_and_dedupes`
+    // (nestweaver-federation), which can drive distinct per-tier inputs
+    // directly; this test proves the fields survive the real federated path.
     assert_eq!(
         resp["semantic_applied"],
         json!(false),
