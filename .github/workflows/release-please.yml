@@ -127,10 +127,10 @@ jobs:
           cat >> .cargo/config.toml << 'EOF'
 
           [target.x86_64-unknown-linux-gnu]
-          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]
+          rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
           [target.aarch64-unknown-linux-gnu]
-          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]
+          rustflags = ["-C", "link-arg=-fuse-ld=mold"]
           EOF
       - uses: actions/setup-node@v7
         with:

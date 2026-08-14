@@ -5,3 +5,13 @@
 # cross-platform release builds reproducible. See 6768374, "fix(ci): eliminate
 # zstd link errors and skip daemon tests on Linux".
 LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
+
+# No linker workaround is needed here, and none should be added. liblbug.a
+# vendors zstd, exports its ZSTD_* symbols, and is linked +whole-archive, so
+# every binary already carries a complete libzstd; Rust code reaches that one
+# copy through `nestweaver_store::zstd`. Adding the `zstd` crate back would pull
+# in zstd-sys, compile a second copy, and make rust-lld reject every link with
+# duplicate symbols. The historical response was to tell the linker to tolerate
+# duplicates, which suppressed the error while leaving two sets of zstd state in
+# the process. `exactly_one_copy_of_zstd_is_linked` in tests/cli_test.rs guards
+# both halves.

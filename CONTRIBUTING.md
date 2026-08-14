@@ -93,25 +93,20 @@ initial native build can take several minutes. See
 [INSTALL.md](INSTALL.md#build-from-source) for CMake, C++, OpenSSL, zstd,
 `pkg-config`, and Protocol Buffers prerequisites.
 
-#### x86_64 Linux: extra linker flag required
+#### Only one copy of zstd may be linked
 
-The tracked `.cargo/config.toml` is **not sufficient on x86_64 Linux**.
-Building Ladybug from source and Tantivy in the same binary produces duplicate
-zstd symbols, so linking fails without
-`-Wl,--allow-multiple-definition`. CI appends the stanza to
-`.cargo/config.toml` before every Linux job rather than tracking it, so a clean
-clone cannot link test binaries until you do the same locally:
+`liblbug.a` vendors zstd, exports its symbols, and is linked `+whole-archive`,
+so every binary already contains a complete libzstd. Rust code reaches that copy
+through `nestweaver_store::zstd`.
 
-```sh
-cat >> .cargo/config.toml << 'EOF'
+Do not add the `zstd` crate as a dependency. It pulls in `zstd-sys`, which
+compiles a **second** complete copy, and `rust-lld` — the default linker on
+x86_64 Linux — then refuses to link anything, with dozens of duplicate `ZSTD_*`
+symbols. That is what `-Wl,--allow-multiple-definition` used to suppress; the
+flag never merged the copies, it only silenced the linker and left two sets of
+zstd state in one process.
 
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
-EOF
-```
-
-Do not commit that stanza. CI additionally passes
-`-C link-arg=-fuse-ld=mold` for speed; `mold` is optional locally.
+CI passes `-C link-arg=-fuse-ld=mold` for speed; `mold` is optional locally.
 
 ### Check suite
 

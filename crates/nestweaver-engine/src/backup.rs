@@ -239,7 +239,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
 /// and recomputes checksums for integrity verification.
 pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
     let file = std::fs::File::open(archive_path)?;
-    let decoder = zstd::Decoder::new(file)?;
+    let decoder = nestweaver_store::zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest: Option<BackupManifest> = None;
@@ -374,7 +374,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let temp_dir = tempfile::tempdir_in(parent)?;
 
     let file = std::fs::File::open(&config.snapshot_path)?;
-    let decoder = zstd::Decoder::new(file)?;
+    let decoder = nestweaver_store::zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(temp_dir.path())?;
 
@@ -631,7 +631,7 @@ fn package_tar_zstd(staging: &Path, output: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::File::create(output)?;
-    let encoder = zstd::Encoder::new(file, 3)?;
+    let encoder = nestweaver_store::zstd::Encoder::new(file, 3)?;
     let mut tar_builder = tar::Builder::new(encoder);
     tar_builder.append_dir_all(".", staging)?;
     let encoder = tar_builder.into_inner()?;
