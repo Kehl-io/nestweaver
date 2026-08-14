@@ -5,3 +5,30 @@
 # cross-platform release builds reproducible. See 6768374, "fix(ci): eliminate
 # zstd link errors and skip daemon tests on Linux".
 LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
+
+# WORKAROUND, not a fix. Two complete copies of zstd are linked into every
+# binary: liblbug.a statically vendors it and exports 192 ZSTD_ symbols, and
+# zstd-sys builds its own. rust-lld — the default linker here — refuses with 43
+# duplicate symbols, so a clean clone cannot link a single test binary without
+# this. CI appends the same flag in every Linux job; tracking it means a fresh
+# clone works the way CI does.
+#
+# This does NOT merge the two copies — the linker silently picks one. Two zstd
+# instances with independent state in one process is the same shape as the
+# double-free at process exit that 6768374 attributes to lbug's +whole-archive,
+# and which is why daemon_ tests are skipped on Linux. Removing the duplicate is
+# the real fix: `zstd` is a DIRECT dependency of nestweaver-engine and
+# nestweaver-store, so 6768374's removal of tantivy's columnar-zstd-compression
+# no longer keeps zstd-sys out of the tree. Drop that dependency or point both
+# consumers at a shared system zstd, then delete this block.
+#
+# Note -DZSTD_DISABLE_ASM does NOT substitute for this: it disables the Huffman
+# assembly, which is 2 of lbug's 192 ZSTD_ symbols, not the 190 that collide.
+# mold is deliberately NOT set here: CI installs it, a contributor may not have
+# it, and a missing linker is a worse first experience than a slower one. CI
+# overrides both targets via CARGO_TARGET_<TRIPLE>_RUSTFLAGS to add it.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
