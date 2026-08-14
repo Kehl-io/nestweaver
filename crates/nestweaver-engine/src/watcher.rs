@@ -241,10 +241,11 @@ impl BrainWatcher {
     /// Opens its own `GraphStore` from `self.db_path`. For sharing a store
     /// with the web server, use `run_with_store` instead.
     pub fn run(self) -> Result<(), anyhow::Error> {
-        let store = Arc::new(
-            GraphStore::open_or_create(&self.db_path)
-                .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?,
-        );
+        // nw-C1: this watcher is a writer, so it reconciles an abandoned
+        // publication left by a crashed indexer instead of inheriting the wedge.
+        let store = Arc::new(crate::index::open_store_for_writing_with_recovery(
+            &self.db_path,
+        )?);
         self.run_inner(store, None)
     }
 

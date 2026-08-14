@@ -538,7 +538,11 @@ alongside the returned rows:
   either field the merge omits both rather than inventing them — so on a merged
   response, absence means "no tier reported", not "`false`".
   `degraded_components` has exactly one value in the current vocabulary,
-  `"semantic"`.
+  `"semantic"`. The structured (`connected`-schema) merge used by
+  `brain_context` / `project_context` applies the same rules. Those tools do
+  have a semantic leg, so a merge there can mix a semantically ranked tier with
+  a lexical one; the AND then reports `false`, which is correct for the merged
+  row set but does not say which tier was which.
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
 server responses have valid, internally consistent exact-count metadata and

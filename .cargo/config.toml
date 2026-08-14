@@ -6,29 +6,16 @@
 # zstd link errors and skip daemon tests on Linux".
 LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
 
-# WORKAROUND, not a fix. Two complete copies of zstd are linked into every
-# binary: liblbug.a statically vendors it and exports 192 ZSTD_ symbols, and
-# zstd-sys builds its own. rust-lld — the default linker here — refuses with 43
-# duplicate symbols, so a clean clone cannot link a single test binary without
-# this. CI appends the same flag in every Linux job; tracking it means a fresh
-# clone works the way CI does.
+# No linker workaround is needed here, and none should be added. liblbug.a
+# vendors zstd, exports its ZSTD_* symbols, and is linked +whole-archive, so
+# every binary already carries a complete libzstd; Rust code reaches that one
+# copy through `nestweaver_store::zstd`. Adding the `zstd` crate back would pull
+# in zstd-sys, compile a second copy, and make rust-lld reject every link with
+# duplicate symbols. The historical response was to tell the linker to tolerate
+# duplicates, which suppressed the error without removing the second copy: the
+# linker silently picked one definition and the other stayed in the binary.
+# `exactly_one_copy_of_zstd_is_linked` in tests/cli_test.rs guards both halves.
 #
-# This does NOT merge the two copies — the linker silently picks one. Two zstd
-# instances with independent state in one process is the same shape as the
-# double-free at process exit that 6768374 attributes to lbug's +whole-archive,
-# and which is why daemon_ tests are skipped on Linux. Removing the duplicate is
-# the real fix: `zstd` is a DIRECT dependency of nestweaver-engine and
-# nestweaver-store, so 6768374's removal of tantivy's columnar-zstd-compression
-# no longer keeps zstd-sys out of the tree. Drop that dependency or point both
-# consumers at a shared system zstd, then delete this block.
-#
-# Note -DZSTD_DISABLE_ASM does NOT substitute for this: it disables the Huffman
-# assembly, which is 2 of lbug's 192 ZSTD_ symbols, not the 190 that collide.
 # mold is deliberately NOT set here: CI installs it, a contributor may not have
 # it, and a missing linker is a worse first experience than a slower one. CI
-# overrides both targets via CARGO_TARGET_<TRIPLE>_RUSTFLAGS to add it.
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+# adds it via CARGO_TARGET_<TRIPLE>_RUSTFLAGS.
