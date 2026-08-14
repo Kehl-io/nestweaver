@@ -484,10 +484,12 @@ that daemon first or, when the configured daemon backend is already ready, drop
 both direct-path flags.
 
 **Stopping.** `nestweaver daemon stop` drains in-flight writes with every
-listener still up, so reads keep working while it drains, and an idle daemon
-exits immediately. It never SIGKILLs on its own — if a write is still running it
-reports and leaves the daemon up; `daemon stop --force` or `kill -9` end it
-anyway, abandoning that write. Under a process supervisor (systemd
+listener still up, so reads keep working while it drains (individual reads can
+still stall for seconds while a write commits), and an idle daemon exits
+immediately. New writes are refused with `UNAVAILABLE` once shutdown starts, so
+the drain always finishes. It never SIGKILLs on its own — if a write is still
+running it reports what it observed and leaves the daemon up; `daemon stop
+--force` or `kill -9` end it anyway, abandoning that write. Under a process supervisor (systemd
 `TimeoutStopSec`, launchd `ExitTimeOut`, Docker `stop_grace_period`) the
 supervisor's own timer still applies. See the
 [Daemon Shutdown Guide](docs/guide/daemon-shutdown.md).

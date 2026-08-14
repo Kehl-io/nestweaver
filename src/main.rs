@@ -4484,7 +4484,7 @@ const FORCE_STOP_GRACE_SECS: u64 = 10;
 const STOP_WAIT_NOTICE_SECS: u64 = 60;
 
 /// What `daemon stop` prints when the grace expires with the daemon still
-/// draining — and, critically, still alive and still serving reads.
+/// draining — still alive, and, if `serving_reads`, still reachable.
 ///
 /// Kept as a function so its content is unit-testable without a live daemon:
 /// this message IS the contract change. Before it, the CLI silently escalated
@@ -4492,19 +4492,41 @@ const STOP_WAIT_NOTICE_SECS: u64 = 60;
 /// to perform (nw-126: a SIGKILLed daemon left a stale 42-byte WAL that made a
 /// live 5.6 GB database look absent). It must name what happened, that the
 /// daemon is still usable, and both explicit ways to end it.
-fn stop_still_draining_message(pid: i32, waited_secs: u64) -> String {
+///
+/// `serving_reads` is OBSERVED, not assumed — the caller re-probes the socket
+/// immediately before printing. The first version of this message asserted
+/// "still serving reads" unconditionally, which is false in the index-only
+/// drain: with `active_writes == 0 && indexing_active`, `run_shutdown_drain`
+/// breaks and BROADCASTS at the ceiling, closing every listener at 660s, while
+/// this command's grace is 690s — so at report time the daemon could have had
+/// no listeners for thirty seconds. That is exactly the overclaim class this
+/// change exists to remove, so it must not be reintroduced by the command
+/// announcing the fix.
+///
+/// The in-flight-write sentence is hedged for the same reason: in an index-only
+/// drain there is no write to be unable to abort.
+fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) -> String {
+    let state_line = if serving_reads {
+        "It is still running and still answering on its socket — reads are still served, \
+         though they can stall for seconds while a write commits. Work that cannot be \
+         aborted (`spawn_blocking` is not cancellable) has to finish."
+    } else {
+        "It is still running but is NO LONGER answering on its socket: the drain reached \
+         its ceiling with no in-flight write and broadcast shutdown, which closes every \
+         listener, and the process is now finishing unabortable work with nothing being \
+         served. Reads are DOWN."
+    };
     format!(
         "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
-         It is still running and still serving reads — an in-flight write cannot be \
-         aborted (`spawn_blocking` work is not cancellable), so it has to finish.\n\
+         {state_line}\n\
          Nothing was killed: the graph store is not crash-safe, and a SIGKILL here is \
          what left a stale WAL making a live database look absent (nw-126).\n\
          Options:\n  \
-           - wait: the daemon exits on its own when the write completes (no re-run needed; \
-         the SIGTERM drain is already in progress)\n  \
-           - end it now, abandoning that write: `nestweaver daemon stop --force`, or \
+           - wait: the daemon exits on its own when the work completes (no re-run needed; \
+         the SIGTERM drain is already in progress, and new writes are being refused)\n  \
+           - end it now, abandoning that work: `nestweaver daemon stop --force`, or \
          `kill -9 {pid}`\n\
-         Check the daemon log for the in-flight write count."
+         Check the daemon log for what it is waiting on."
     )
 }
 
@@ -13543,15 +13565,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         // Keep the operator informed during a long drain rather
                         // than showing a silent terminal for eleven minutes.
-                        // The daemon is still serving reads throughout; this
-                        // line is what makes that visible.
+                        // Says "still reachable" rather than "still serving
+                        // reads" because it is not re-probing the socket here —
+                        // the final report does, and only it makes a claim about
+                        // read service.
                         if !force
                             && waited_ms > 0
                             && waited_ms.is_multiple_of(STOP_WAIT_NOTICE_SECS * 1000)
                         {
                             eprintln!(
-                                "  still draining after {}s — the daemon is still serving \
-                                 reads; check its log for the in-flight count",
+                                "  still draining after {}s — new writes are being refused; \
+                                 check the daemon log for what it is waiting on",
                                 waited_ms / 1000
                             );
                         }
@@ -13580,7 +13604,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // state the identity cross-check above exists to
                         // prevent — and strand the clients that are still being
                         // served reads while the write drains.
-                        eprintln!("{}", stop_still_draining_message(pid, grace_secs));
+                        // OBSERVE whether reads are still being served rather
+                        // than asserting it. The index-only drain broadcasts at
+                        // the ceiling, which closes every listener 30s before
+                        // this grace expires — claiming "still serving reads"
+                        // there would be the same overclaim this change removes.
+                        // A socket that refuses connections, or one now owned by
+                        // a different PID, both mean "not this daemon's reads".
+                        let serving_reads = daemon_socket_reported_pid(&socket) == Some(pid);
+                        eprintln!(
+                            "{}",
+                            stop_still_draining_message(pid, grace_secs, serving_reads)
+                        );
                         return Ok((EXIT_ERROR, None));
                     }
 
@@ -22660,7 +22695,7 @@ mod stop_grace_tests {
     /// explicit escapes are named.
     #[test]
     fn still_draining_message_reports_instead_of_claiming_a_kill() {
-        let msg = stop_still_draining_message(4242, 690);
+        let msg = stop_still_draining_message(4242, 690, true);
 
         assert!(msg.contains("4242"), "{msg}");
         assert!(msg.contains("690s"), "{msg}");
@@ -22669,9 +22704,25 @@ mod stop_grace_tests {
             "the command must not imply success it did not achieve: {msg}"
         );
         assert!(
-            msg.contains("still serving reads"),
+            msg.contains("reads are still served"),
             "the reason waiting is now acceptable is that this is not an \
              outage — the message must say so: {msg}"
+        );
+        // Transcripts (and a control run with no shutdown at all) showed reads
+        // stalling for seconds around a write commit. "Reads are served" with no
+        // latency qualifier is an overclaim of exactly the kind this message
+        // exists to stop making.
+        assert!(
+            msg.contains("stall for seconds"),
+            "read service during a drain is not latency-free and the message \
+             must not imply it is: {msg}"
+        );
+        // The advice is "wait". That is only sound if the thing being waited on
+        // cannot be pushed back up by other clients.
+        assert!(
+            msg.contains("new writes are being refused"),
+            "telling an operator to wait requires telling them the drain is \
+             monotone: {msg}"
         );
         assert!(
             msg.contains("--force"),
@@ -22691,6 +22742,56 @@ mod stop_grace_tests {
         assert!(
             !msg.contains("sending SIGKILL"),
             "this path must not kill anything: {msg}"
+        );
+    }
+
+    /// The index-only drain is the case the first version of this message got
+    /// wrong. With `active_writes == 0 && indexing_active`, `run_shutdown_drain`
+    /// breaks and BROADCASTS at the ceiling — which closes every listener at
+    /// 660s, while this command's grace runs to 690s. So there is a real window
+    /// in which the daemon is alive, unreachable, and the command was announcing
+    /// "still serving reads" about it.
+    ///
+    /// The caller re-probes the socket and passes what it observed. Both
+    /// branches are asserted here because the honest branch is the whole point:
+    /// a message that could only ever say the reassuring thing would not be
+    /// reporting, it would be guessing.
+    #[test]
+    fn still_draining_message_does_not_claim_reads_when_the_socket_is_gone() {
+        let msg = stop_still_draining_message(4242, 690, false);
+
+        assert!(
+            msg.contains("NO LONGER answering on its socket") && msg.contains("Reads are DOWN"),
+            "when the listeners are gone the message must say so plainly: {msg}"
+        );
+        assert!(
+            !msg.contains("reads are still served"),
+            "this is the overclaim the branch exists to prevent: {msg}"
+        );
+        // Still not a kill, and still names both escapes — the reporting
+        // contract does not weaken just because the news is worse.
+        assert!(msg.contains("was NOT stopped"), "{msg}");
+        assert!(
+            msg.contains("--force") && msg.contains("kill -9 4242"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("sending SIGKILL"),
+            "this path must not kill anything: {msg}"
+        );
+        // The message must not diagnose a write that is not there. It may
+        // mention the absence of one (and does); what it must not do is assert
+        // one exists, which is what the original unconditional wording — "an
+        // in-flight write cannot be aborted ... so it has to finish" — did.
+        assert!(
+            !msg.contains("an in-flight write cannot be aborted"),
+            "an index-only drain has no in-flight write; diagnosing one would be \
+             a fabrication: {msg}"
+        );
+        assert!(
+            msg.contains("no in-flight write"),
+            "and it should say positively what it did observe, so the operator \
+             knows which drain branch they are in: {msg}"
         );
     }
 

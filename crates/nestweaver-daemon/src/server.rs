@@ -223,12 +223,52 @@ impl ConnectionGuard {
         }
     }
 
-    fn write(state: &DaemonState) -> Self {
+    /// Admit a write, or refuse it because shutdown has begun.
+    ///
+    /// THIS REFUSAL IS WHAT MAKES THE DRAIN TERMINATE. `active_writes` is the
+    /// drain's exit condition and this constructor is its ONLY incrementer (the
+    /// web admin crate holds the same `Arc` but never adds to it), so gating
+    /// here — and only here — makes the count monotonically non-increasing once
+    /// shutdown starts.
+    ///
+    /// Without it the drain is not merely slow, it is not guaranteed to
+    /// terminate at all. The old SIGTERM broadcast closed every listener, which
+    /// made new writes impossible as a side effect of the outage. Draining with
+    /// listeners UP removes that outage — and, without this gate, removes the
+    /// accidental protection with it: a webhook feed, a watcher, an MCP client
+    /// or an agent loop can start a NEW write eight minutes into a drain and
+    /// reset the exit condition. `daemon stop` would then wait its whole grace,
+    /// report, and exit non-zero; re-running it would do nothing (the once-guard
+    /// swallows the second trigger); and the only remaining way out would be
+    /// `--force` or `kill -9` — the exact nw-126 crash this whole change exists
+    /// to avoid. On a busy daemon that would have made the unsafe kill MORE
+    /// likely, not less.
+    ///
+    /// `UNAVAILABLE` is the correct code: the daemon is going away, the request
+    /// was not applied, and the operation is safe to retry against whatever
+    /// serves the database next. Clients already treat it as retryable.
+    ///
+    /// Reads are deliberately NOT gated. They neither hold the write gate nor
+    /// extend the drain, and continuing to serve them for the whole drain is
+    /// the point of this design.
+    fn write(state: &DaemonState) -> Result<Self, Status> {
+        // Ordering: this load pairs with the `swap` in `begin_shutdown_drain`.
+        // `Relaxed` matches every other access to this flag; the race window it
+        // leaves is one already-admitted write, which the drain then waits for
+        // exactly as it would have anyway. What must not happen — an unbounded
+        // stream of new writes — is closed regardless of ordering.
+        if state.shutdown_started.load(Ordering::Relaxed) {
+            return Err(Status::unavailable(
+                "daemon is shutting down and is not accepting new writes; it is \
+                 finishing the writes already in flight and still serving reads. \
+                 Retry against the daemon that starts next.",
+            ));
+        }
         state.active_writes.fetch_add(1, Ordering::Relaxed);
         state.idle_notify.notify_one();
-        Self {
+        Ok(Self {
             counter: Arc::clone(&state.active_writes),
-        }
+        })
     }
 }
 
@@ -1176,8 +1216,11 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
                 pid,
                 "drain ceiling ({ceiling}s) exceeded — still waiting on {writes} \
                  in-flight write(s){}; the daemon CANNOT abort them and is NOT \
-                 shutting down. Most reads are still served — `embed` and \
-                 `plan_embed` are not, they take the same write gate. This is \
+                 shutting down. NEW writes are already being refused with \
+                 UNAVAILABLE, so this count only falls. Most reads are still \
+                 served, though they can stall for seconds while a write \
+                 commits — `embed` and `plan_embed` are not served at all, they \
+                 take the same write gate. This is \
                  the same drain whether you sent SIGTERM (`nestweaver daemon \
                  stop`) or the Shutdown RPC (`nestweaver daemon restart`); \
                  neither escalates on its own. To end it now — abandoning the \
@@ -1301,6 +1344,51 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
     tokio::spawn(async move {
         run_shutdown_drain(state, nestweaver_schema::drain_ceiling_from_env()).await;
     });
+}
+
+/// The SIGTERM handler task: route every SIGTERM into [`begin_shutdown_drain`].
+///
+/// LOOPS DELIBERATELY. This used to `recv()` exactly once and return, which
+/// dropped the `Signal` registration — and because Tokio leaves its
+/// process-wide `sigaction` installed, later SIGTERMs were then neither
+/// delivered to anything nor allowed to default-terminate the process. The
+/// daemon went permanently DEAF to SIGTERM after the first one: a supervisor
+/// that re-sends got nothing, and `begin_shutdown_drain`'s "shutdown already in
+/// progress" branch — documented as the behaviour of a second `daemon stop` —
+/// was unreachable from a signal at all.
+///
+/// Looping restores it. The second and later signals are cheap: the once-guard
+/// inside `begin_shutdown_drain` refuses them and logs, so a supervisor's
+/// repeated SIGTERMs neither start a second drain nor cut the first one short.
+/// It does NOT close the late-watcher hole documented on `begin_shutdown_drain`:
+/// the once-guard returns before `stop_active_watcher` is reached, so a second
+/// signal still does not stop a watcher registered after the drain began. That
+/// hole stays closed where it already was, on the exit path.
+///
+/// Hoisted out of `run_server` so it can be unit-tested with a real signal —
+/// see `sigterm_does_not_broadcast_while_a_write_is_in_flight`.
+///
+/// SUPERVISORS: this only governs what THIS process does with the signal. A
+/// process supervisor that SIGKILLs on its own timer (systemd's
+/// `TimeoutStopSec`, default 90s; launchd's `ExitTimeOut`) still does so, and
+/// nothing here can prevent it. The unbounded-drain guarantee holds for
+/// interactive `daemon stop`; under a supervisor it holds only for as long as
+/// that supervisor's stop timeout allows.
+async fn watch_sigterm(state: Arc<DaemonState>) {
+    let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(sig) => sig,
+        Err(error) => {
+            // Previously `.expect(...)`, which panicked a spawned task — the
+            // panic is swallowed by the JoinHandle nobody awaits, so the daemon
+            // would have run on with no SIGTERM handling and no diagnostic.
+            tracing::error!(%error, "could not register SIGTERM handler — `daemon stop` will not drain");
+            return;
+        }
+    };
+    while sig.recv().await.is_some() {
+        tracing::info!("received SIGTERM — draining before shutdown");
+        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+    }
 }
 
 /// Register a watcher's shutdown handle, returning its registration id (the
@@ -3470,7 +3558,7 @@ impl NestWeaverDaemon for DaemonService {
         // lock on drop/panic — there is no persistent quiesce flag to leak.
         let staged = {
             let _write_lock = self.state.write_gate.lock("backup").await;
-            let _guard = ConnectionGuard::write(&self.state);
+            let _guard = ConnectionGuard::write(&self.state)?;
             let store = self.state.store.clone();
             let cfg = config.clone();
             tracing::info!("backup: staging under write lock");
@@ -3579,7 +3667,7 @@ impl NestWeaverDaemon for DaemonService {
             Err(e) => return Err(e),
         };
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
@@ -3672,7 +3760,7 @@ impl NestWeaverDaemon for DaemonService {
             Err(e) => return Err(e),
         };
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
@@ -4066,7 +4154,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
 
         // Cooperative cancellation for the otherwise-uncancelable spawn_blocking
@@ -4365,7 +4453,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock("index_vault");
@@ -4469,7 +4557,7 @@ impl NestWeaverDaemon for DaemonService {
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock("refresh_vault_since");
@@ -4575,7 +4663,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock("materialize_projects");
@@ -4658,7 +4746,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let _write_lock = self.state.write_gate.lock("remove_vault").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4684,7 +4772,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let _write_lock = self.state.write_gate.lock("remove_repo").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4722,7 +4810,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let _write_lock = self.state.write_gate.lock("remove_project").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -4754,7 +4842,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let _write_lock = self.state.write_gate.lock("prune_stale").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let _req = request.into_inner();
         let state = self.state.clone();
@@ -4797,7 +4885,7 @@ impl NestWeaverDaemon for DaemonService {
             ));
         }
         let _write_lock = self.state.write_gate.lock("merge_instance").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let state = self.state.clone();
 
@@ -4859,7 +4947,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
-        let guard = ConnectionGuard::write(&self.state);
+        let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock("purge_instance");
@@ -4941,7 +5029,7 @@ impl NestWeaverDaemon for DaemonService {
         // drain / idle timeout via `active_writes` — mirroring `prune_stale`
         // and `purge_instance`.
         let _write_lock = self.state.write_gate.lock("reindex_search").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let state = self.state.clone();
         #[allow(clippy::result_large_err)]
@@ -5788,7 +5876,7 @@ impl NestWeaverDaemon for DaemonService {
         // updates (last-writer-wins). This is the single gated write path: the
         // MCP `tool_set_extension` routes here rather than mutating directly.
         let _write_lock = self.state.write_gate.lock("set_extension").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
@@ -6367,7 +6455,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let _write_lock = self.state.write_gate.lock("embed").await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let _guard = ConnectionGuard::write(&self.state)?;
 
         #[cfg(not(feature = "embed"))]
         {
@@ -8922,29 +9010,7 @@ pub async fn run_server(
     }
 
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
-    //
-    // SIGTERM runs the SAME drain as the gRPC `Shutdown` RPC. It does not
-    // broadcast shutdown up front: listeners stay up and reads keep being
-    // served while writes drain, and the operator gets the drain's honest
-    // reporting. An idle daemon still exits immediately — the drain breaks on
-    // its first counter check. See [`begin_shutdown_drain`].
-    //
-    // SUPERVISORS: this only governs what THIS process does with the signal. A
-    // process supervisor that SIGKILLs on its own timer (systemd's
-    // `TimeoutStopSec`, default 90s; launchd's `ExitTimeOut`) still does so,
-    // and nothing here can prevent it. The unbounded-drain guarantee holds for
-    // interactive `daemon stop`; under a supervisor it holds only for as long
-    // as that supervisor's stop timeout allows.
-    {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("register SIGTERM handler");
-            sig.recv().await;
-            tracing::info!("received SIGTERM — draining before shutdown");
-            begin_shutdown_drain(state, "sigterm");
-        });
-    }
+    tokio::spawn(watch_sigterm(Arc::clone(&state)));
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
@@ -16466,6 +16532,25 @@ external_model = "unavailable-test-model"
             "the whole point of the unified drain is that no path auto-kills — \
              the line must say so: {text}"
         );
+        // Without the write gate this line would be inviting an operator to
+        // wait out a count that a webhook feed or agent loop can push back up
+        // indefinitely. The refusal is what makes "it only falls" true, and an
+        // operator deciding whether to wait or to `--force` needs to know it.
+        assert!(
+            text.contains("NEW writes are already being refused")
+                && text.contains("this count only falls"),
+            "the line tells the operator to wait; it must therefore say that the \
+             count is monotone, which is only true because new writes are \
+             refused: {text}"
+        );
+        // Transcript evidence (and the control run) showed reads stalling for
+        // seconds around a write commit. "Reads are served" without that
+        // qualifier is the same overclaim class this test family polices.
+        assert!(
+            text.contains("stall for seconds"),
+            "read service during a drain is not latency-free — a bare \"reads are \
+             served\" overclaims: {text}"
+        );
     }
 
     /// The fast path must stay fast. Routing SIGTERM through the drain would be
@@ -16565,6 +16650,149 @@ external_model = "unavailable-test-model"
             "the second trigger must be refused by the once-only guard: {text}"
         );
         state.active_writes.store(0, Ordering::Relaxed);
+    }
+
+    /// The drain must be MONOTONE, or it is not guaranteed to terminate.
+    ///
+    /// `active_writes` is the drain's exit condition. Draining with listeners up
+    /// means clients can still reach the daemon, so without a gate a webhook
+    /// feed, watcher, MCP client or agent loop can start a NEW write minutes
+    /// into a drain and push the count back up — indefinitely. The old SIGTERM
+    /// broadcast prevented that only as a side effect of the outage it caused;
+    /// removing the outage removes that accidental protection too.
+    ///
+    /// The consequence of getting this wrong is not a slow stop, it is the
+    /// unsafe one: stop waits its whole grace, reports, exits non-zero, a re-run
+    /// is swallowed by the once-guard, and the only remaining exit is `--force`
+    /// or `kill -9` — the nw-126 crash this change exists to avoid. On a busy
+    /// daemon that would make the unsafe kill MORE likely, not less.
+    #[tokio::test]
+    async fn writes_are_refused_once_shutdown_has_started() {
+        let state = test_state_with_writer();
+
+        // Before shutdown: admitted, and counted.
+        let guard = ConnectionGuard::write(&state).expect("writes are admitted normally");
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+
+        // A write in flight when shutdown begins, exactly as in the incident.
+        let in_flight = ConnectionGuard::write(&state).expect("writes are admitted normally");
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 1);
+        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+
+        let refused = ConnectionGuard::write(&state)
+            .err()
+            .expect("a NEW write must be refused once shutdown has started");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::Unavailable,
+            "the daemon is going away and the request was not applied, so this \
+             must be the retryable code clients already handle: {refused:?}"
+        );
+        assert!(
+            refused.message().contains("shutting down"),
+            "the refusal must say why, or a client cannot tell it from a real \
+             failure: {}",
+            refused.message()
+        );
+        assert_eq!(
+            state.active_writes.load(Ordering::Relaxed),
+            1,
+            "a REFUSED write must not increment the drain's exit condition — \
+             incrementing before refusing would be the same unbounded drain with \
+             extra steps"
+        );
+
+        // Reads are deliberately still admitted: they do not extend the drain,
+        // and serving them throughout is the point of the whole design.
+        let read = ConnectionGuard::read(&state);
+        assert_eq!(state.active_reads.load(Ordering::Relaxed), 1);
+        drop(read);
+
+        drop(in_flight);
+    }
+
+    /// The link nothing else covers: that a REAL SIGTERM routes into the drain
+    /// rather than broadcasting.
+    ///
+    /// Every other test here calls `begin_shutdown_drain` directly, so all of
+    /// them still pass if the signal handler is reverted to broadcasting — the
+    /// gap that was disclosed rather than closed. This raises an actual SIGTERM
+    /// at itself and asserts on the outcome.
+    ///
+    /// Also pins the loop: the handler used to `recv()` once and return, which
+    /// dropped the registration while leaving Tokio's `sigaction` installed, so
+    /// the process went permanently deaf to SIGTERM — later signals were neither
+    /// delivered nor able to default-terminate it.
+    #[tokio::test]
+    async fn sigterm_does_not_broadcast_while_a_write_is_in_flight() {
+        let state = test_state_with_writer();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        state.active_writes.store(1, Ordering::Relaxed);
+
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let handler = tokio::spawn(watch_sigterm(Arc::clone(&state)));
+        // Let the handler install its registration before signalling. Raising
+        // SIGTERM before `signal()` returns would, with Tokio's default
+        // disposition not yet replaced, terminate the test process.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        unsafe { libc::raise(libc::SIGTERM) };
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(2_000),
+                shutdown_rx.changed()
+            )
+            .await
+            .is_err(),
+            "SIGTERM must run the drain, not broadcast: the broadcast is what \
+             closes every UDS/TCP/MCP listener and is what took read service \
+             down the instant the signal landed"
+        );
+        assert!(
+            logs.text()
+                .contains("received SIGTERM — draining before shutdown"),
+            "the signal must actually have been delivered, or this test passes \
+             vacuously on a signal that never arrived: {}",
+            logs.text()
+        );
+
+        // Second signal: the handler must still be listening. Before the loop
+        // this was silently swallowed forever.
+        unsafe { libc::raise(libc::SIGTERM) };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            logs.text()
+                .matches("received SIGTERM — draining before shutdown")
+                .count(),
+            2,
+            "a second SIGTERM must still be received — the handler used to stop \
+             listening after the first, leaving supervisors that re-send with no \
+             effect at all: {}",
+            logs.text()
+        );
+        assert!(
+            logs.text().contains("shutdown already in progress"),
+            "and it must be refused by the once-guard rather than starting a \
+             second drain: {}",
+            logs.text()
+        );
+
+        // The write finishing still completes shutdown cleanly.
+        state.active_writes.store(0, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(10), shutdown_rx.changed())
+            .await
+            .expect("the drain must complete once the write finishes")
+            .expect("shutdown channel closed");
+        handler.abort();
     }
 
     /// `drained` is NOT shutdown-private: the same `Arc` is handed to

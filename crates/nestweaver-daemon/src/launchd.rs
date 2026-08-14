@@ -223,10 +223,20 @@ pub fn generate_plist(
     )
 }
 
-/// Buffer added to the drain ceiling to derive the plist's `ExitTimeOut`,
-/// mirroring `STOP_GRACE_BUFFER_SECS` in the CLI so launchd's SIGKILL deadline
-/// and `daemon stop`'s wait cannot drift apart.
-const LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS: u64 = 30;
+/// Buffer added to the drain ceiling to derive the plist's `ExitTimeOut`.
+///
+/// DELIBERATELY LARGER than the CLI's `STOP_GRACE_BUFFER_SECS` (30), and the
+/// gap is load-bearing rather than cosmetic. Both are derived from the same
+/// drain ceiling, so making them equal made the two deadlines land at the same
+/// instant: `daemon stop` would give up watching at ceiling+30 and print "it is
+/// still running and still serving reads" about a process launchd had SIGKILLed
+/// at ceiling+30. Keeping launchd's deadline strictly later means the CLI's
+/// report is about a process that is still alive whenever launchd is the
+/// supervisor.
+///
+/// It does not make the drain safe under launchd — a write still running at
+/// `ExitTimeOut` is still SIGKILLed. It makes the CLI stop lying about it.
+const LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS: u64 = 60;
 
 /// Render a per-instance launch agent, optionally forwarding an absolute
 /// instance configuration path to the foreground `daemon run` process.
@@ -243,6 +253,38 @@ pub fn generate_plist_with_config(
     config_path: Option<&Path>,
     start_at_login: bool,
 ) -> String {
+    // The ceiling is read from the environment exactly once, here, and passed
+    // down explicitly. Keeping the read out of the renderer is what lets the
+    // ceiling/ExitTimeOut/baked-env relationship be tested without a test
+    // mutating process-wide env — which would race the other plist tests under
+    // cargo's parallel execution.
+    render_plist(
+        instance_id,
+        binary_path,
+        db_path,
+        log_path,
+        index_cpu_percent,
+        config_path,
+        start_at_login,
+        nestweaver_schema::drain_ceiling_from_env(),
+        std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS").is_ok(),
+    )
+}
+
+/// Pure renderer. `drain_ceiling` and `ceiling_was_overridden` are supplied by
+/// the caller rather than read here — see `generate_plist_with_config`.
+#[allow(clippy::too_many_arguments)]
+fn render_plist(
+    instance_id: &str,
+    binary_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
+    index_cpu_percent: Option<&str>,
+    config_path: Option<&Path>,
+    start_at_login: bool,
+    drain_ceiling: u64,
+    ceiling_was_overridden: bool,
+) -> String {
     let label = xml_escape(&lifecycle::launchd_label(instance_id));
     let binary = xml_escape(&binary_path.display().to_string());
     let db = xml_escape(&db_path.display().to_string());
@@ -254,20 +296,9 @@ pub fn generate_plist_with_config(
         })
         .unwrap_or_default();
 
-    // launchd jobs don't inherit the invoking shell's environment, so the
-    // index CPU-throttle knob is baked into the plist when it was set (and
-    // validated) at install time. Value is validated numeric by the caller.
-    let env_block = match index_cpu_percent {
-        Some(v) => {
-            let value = xml_escape(v.trim());
-            format!(
-                "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>NESTWEAVER_INDEX_CPU_PERCENT</key>\n        <string>{value}</string>\n    </dict>\n"
-            )
-        }
-        None => String::new(),
-    };
-
-    // How long launchd waits after SIGTERM before SIGKILLing us.
+    // How long launchd waits after SIGTERM before SIGKILLing us. See
+    // `LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS` for why the buffer is larger than the
+    // CLI's.
     //
     // This key was previously ABSENT, so launchd applied its 20-second default
     // — a hard SIGKILL 20s into a drain that routinely runs for minutes. That
@@ -276,17 +307,53 @@ pub fn generate_plist_with_config(
     // what the daemon or `daemon stop` did, because it is launchd's timer and
     // not ours.
     //
-    // Pinned to the same budget `daemon stop` uses (drain ceiling + buffer) so
-    // the supervised macOS path and the interactive path cannot drift.
-    //
     // This does NOT make the drain guarantee absolute under launchd: a write
     // still running at `exit_timeout` is still SIGKILLed, by launchd, outside
-    // our control. It moves the deadline from "20s, always fires" to "the same
-    // deadline the operator already reasons about". launchd does treat `0` as
-    // infinity, but a job that can refuse to die forever is a wedged logout and
-    // a worse failure than a bounded one, so it is not used here.
-    let exit_timeout = nestweaver_schema::drain_ceiling_from_env()
-        .saturating_add(LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS);
+    // our control. It moves the deadline from "20s, always fires" to a bound
+    // derived from the ceiling the operator already reasons about. launchd does
+    // treat `0` as infinity, but a job that can refuse to die forever is a
+    // wedged logout and a worse failure than a bounded one, so it is not used.
+    let exit_timeout = drain_ceiling.saturating_add(LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS);
+
+    // launchd jobs don't inherit the invoking shell's environment, so anything
+    // the daemon needs at runtime has to be baked in here.
+    //
+    // NESTWEAVER_DRAIN_TIMEOUT_SECS is baked in for a specific reason:
+    // `exit_timeout` above is computed from the ceiling as seen by THIS
+    // process — the CLI running `daemon start`. Without baking it, the daemon
+    // launchd starts would not inherit it and would run the 660s default while
+    // the plist carried a deadline derived from whatever the installing shell
+    // happened to export. `NESTWEAVER_DRAIN_TIMEOUT_SECS=60 nestweaver daemon
+    // start` produced ExitTimeOut=120 against a daemon draining to 660s — a
+    // supervisor deadline SHORTER than the drain it is supposed to outlast,
+    // which is the original 20s bug in a new disguise. Baking it makes the
+    // plist internally consistent: the daemon and its `ExitTimeOut` read the
+    // same number.
+    //
+    // Baked ONLY when the var is actually set. When it is unset both this
+    // process and the daemon fall back to the same compiled default, so the
+    // plist stays byte-identical to the pre-`ExitTimeOut` output for the
+    // machines that never set it — the property `plist_omits_environment_...`
+    // guards. There is no divergence to fix in that case; the divergence only
+    // exists when someone exported a value that the daemon would not inherit.
+    let mut env_entries: Vec<(&str, String)> = Vec::new();
+    if ceiling_was_overridden {
+        env_entries.push(("NESTWEAVER_DRAIN_TIMEOUT_SECS", drain_ceiling.to_string()));
+    }
+    // Index CPU-throttle knob, baked when it was set (and validated) at install
+    // time. Value is validated numeric by the caller.
+    if let Some(v) = index_cpu_percent {
+        env_entries.push(("NESTWEAVER_INDEX_CPU_PERCENT", xml_escape(v.trim())));
+    }
+    let env_block = if env_entries.is_empty() {
+        String::new()
+    } else {
+        let entries = env_entries
+            .iter()
+            .map(|(k, v)| format!("        <key>{k}</key>\n        <string>{v}</string>\n"))
+            .collect::<String>();
+        format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}    </dict>\n")
+    };
 
     // Opt-in. Omitted entirely rather than emitted as `<false/>` so a plist
     // from a machine that never opted in is byte-identical to the old output.
@@ -509,6 +576,53 @@ mod tests {
         assert!(
             expected > 20,
             "the whole point is to beat launchd's 20s default"
+        );
+        // The CLI's own `STOP_GRACE_BUFFER_SECS` is 30 and lives in `src/main.rs`,
+        // which this crate cannot reference — so it is pinned by value here.
+        // These two were equal, which put both deadlines at the same instant and
+        // let `daemon stop` print "still running and still serving reads" about
+        // a process launchd had just SIGKILLed. The CLI must give up watching
+        // STRICTLY BEFORE launchd kills.
+        assert!(
+            LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS > 30,
+            "launchd's deadline must be strictly later than the CLI's stop grace \
+             (STOP_GRACE_BUFFER_SECS = 30 in src/main.rs), or the CLI reports on \
+             a process that is already dead"
+        );
+    }
+
+    /// `ExitTimeOut` is computed from the ceiling as seen by the CLI process
+    /// running `daemon start`, but launchd jobs inherit no shell environment —
+    /// so without baking the variable in, the daemon launchd starts runs a
+    /// DIFFERENT ceiling from the one its own SIGKILL deadline was derived
+    /// from. `NESTWEAVER_DRAIN_TIMEOUT_SECS=60` gave `ExitTimeOut=120` against a
+    /// daemon draining to 660s: a supervisor deadline shorter than the drain it
+    /// exists to outlast, which is the original 20s bug wearing a new hat.
+    #[test]
+    fn plist_bakes_the_drain_ceiling_it_derived_exit_timeout_from() {
+        let plist = render_plist(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+            None,
+            false,
+            60,
+            true,
+        );
+
+        assert!(
+            plist.contains("<key>NESTWEAVER_DRAIN_TIMEOUT_SECS</key>\n        <string>60</string>"),
+            "the ceiling ExitTimeOut was derived from must be baked in, or the \
+             daemon will not run it: {plist}"
+        );
+        assert!(
+            plist.contains(&format!(
+                "<key>ExitTimeOut</key>\n    <integer>{}</integer>",
+                60 + LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS
+            )),
+            "and the deadline must match that same ceiling: {plist}"
         );
     }
 
