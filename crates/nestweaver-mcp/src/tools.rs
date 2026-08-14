@@ -4072,29 +4072,27 @@ fn tool_brain_search(
         //   - `nestweaver-federation/src/results.rs::merge_json_results`,
         //     the hybrid/federated merge. It rebuilds the response from
         //     `wrap_merged_response`, so every field has to be re-added
-        //     deliberately; it now merges these two via
-        //     `merge_honesty_fields` (AND for `semantic_applied`, dedup
-        //     union for `degraded_components`). Honest today.
-        //
-        // Still outstanding, deliberately not changed with this one:
+        //     deliberately; it merges these two via `merge_honesty_fields`
+        //     (AND for `semantic_applied`, dedup union for
+        //     `degraded_components`). Honest today.
         //   - the STRUCTURED branch of `merge_structured_results` (the
         //     `connected`-schema path used by brain_context /
-        //     project_context) rebuilds its response the same way and still
-        //     drops both fields. Note the asymmetry this leaves: brain_search,
-        //     which has no semantic leg and whose fields are trivially
-        //     `false`/`[]`, now carries them through a merge, while the two
-        //     tools that DO have a semantic leg — where the ambiguity actually
-        //     costs the caller something — still lose them.
+        //     project_context), which rebuilds its envelope the same way and
+        //     now calls the SAME `merge_honesty_fields` with the same rules.
+        //     Honest today. It matters more there than here: those tools have
+        //     a real semantic leg, so the fields are not trivially
+        //     `false`/`[]`, and the mixed case (one tier ranked semantically,
+        //     the other lexically) is reachable — the AND rule reports `false`
+        //     for it, which is correct but coarser than the two-tier truth.
+        //     See `merge_honesty_fields` for why that is not encoded in
+        //     `degraded_components`.
         //
-        //     Deferred purely on scope: different tool family, different
-        //     response schema, its own tests. It is NOT blocked on caching.
-        //     `semantic_response_is_degraded` (above) has exactly two call
-        //     sites, both inside `maybe_cached`, reached only from
-        //     `dispatch_cancellable` — the local in-process dispatch, strictly
-        //     upstream of any federated merge. `hybrid.rs` has no response
-        //     cache and never writes merged output back, so nothing downstream
-        //     of the merge reads these values. Closing that gap would be a
-        //     pure reporting change too.
+        // None of this interacts with response caching:
+        // `semantic_response_is_degraded` (above) has exactly two call sites,
+        // both inside `maybe_cached`, reached only from `dispatch_cancellable`
+        // — the local in-process dispatch, strictly upstream of any federated
+        // merge. `hybrid.rs` has no response cache and never writes merged
+        // output back, so nothing downstream of the merge reads these values.
         "semantic_applied": false,
         "degraded_components": [],
     });
