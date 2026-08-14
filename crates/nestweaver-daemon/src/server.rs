@@ -8769,9 +8769,40 @@ pub async fn run_server(
     // hits the cache instead of spending ~350ms rebuilding from the DB.
     {
         let store = state.store.clone();
-        tokio::task::spawn_blocking(move || match store.warm_ppr_cache() {
-            Ok(()) => tracing::info!("PPR adjacency cache warmed"),
-            Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+        tokio::task::spawn_blocking(move || {
+            // nw-C1: a read-write daemon is a WRITER. If a prior indexer died
+            // between establishing `<db>.index-dirty` and finalizing, every
+            // ranked query in this database fails closed forever. Reconcile it
+            // here, before warming, so the warm below succeeds and the first
+            // PPR query does not meet the wedge. A live publication is left
+            // strictly alone (see `recover_abandoned_index_publication`).
+            //
+            // The gate must mirror how THIS daemon opened the store, exactly
+            // like the neighbouring reconcile passes: a snapshot-replica daemon
+            // opens read-only, and a read-only caller must report the condition
+            // rather than recompute PageRank, persist `.generation`, and delete
+            // the marker out from under whoever holds the write lock.
+            nestweaver_engine::index::recover_abandoned_index_publication_best_effort(
+                &store, !read_only,
+            );
+            match store.warm_ppr_cache() {
+                Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+                // nw-C2: this specific failure used to be swallowed as a
+                // generic warn, which is how a permanently wedged database
+                // produced no diagnostic anywhere. Name it.
+                Err(e) if format!("{e}").contains("dirty index publication") => {
+                    let status = store
+                        .db_path()
+                        .map(nestweaver_engine::index_publication::status);
+                    tracing::warn!(
+                        "PPR cache not warmed: an index publication is dirty, so every ranked \
+                         query (brain_context, project_context, investigate) will fail closed \
+                         until it is reconciled. This is an index PUBLICATION marker, not a \
+                         dirty git working tree. status={status:?} error={e}"
+                    );
+                }
+                Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+            }
         });
     }
 
