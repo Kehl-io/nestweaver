@@ -313,6 +313,46 @@ fn source_build_configuration_is_intact_and_reproducible() {
     );
 }
 
+/// Guards the single-copy-of-zstd invariant.
+///
+/// `liblbug.a` vendors zstd, exports its `ZSTD_*` symbols, and is linked
+/// `+whole-archive`, so every binary already contains a complete libzstd. Rust
+/// code reaches it through `nestweaver_store::zstd`.
+///
+/// Adding the `zstd` crate back pulls in `zstd-sys`, which compiles a second
+/// complete copy; `rust-lld` then fails every link with duplicate `ZSTD_*`
+/// symbols. The historical response was `-Wl,--allow-multiple-definition`,
+/// which suppressed the error without merging the copies — the linker picked
+/// one definition silently and the other stayed in the binary. Assert both
+/// halves here: no second copy in the tree, and no suppression flag anywhere.
+#[test]
+fn exactly_one_copy_of_zstd_is_linked() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let lockfile = std::fs::read_to_string(repo_root.join("Cargo.lock")).unwrap();
+    assert!(
+        !lockfile.contains("name = \"zstd-sys\""),
+        "zstd-sys is back in the dependency tree; it compiles a second complete \
+         libzstd alongside the one liblbug.a already exports. Use \
+         nestweaver_store::zstd instead of the `zstd` crate."
+    );
+
+    for relative_path in [
+        ".cargo/config.toml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release-please.yml",
+        "Dockerfile",
+    ] {
+        let contents = std::fs::read_to_string(repo_root.join(relative_path))
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        assert!(
+            !contents.contains("allow-multiple-definition"),
+            "{relative_path} still carries --allow-multiple-definition; it suppresses \
+             duplicate symbols rather than removing the duplicate"
+        );
+    }
+}
+
 #[test]
 fn embedding_docs_match_runtime_contract() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

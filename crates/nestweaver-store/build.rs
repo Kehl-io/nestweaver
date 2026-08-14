@@ -104,11 +104,11 @@ fn main() {
     // compiles AND links every one of these third_party libraries. Compiling them
     // here too duplicates each static global — e.g. antlr4's `COMPLETE_CHAR_SET`,
     // whose destructor then runs on a mismatched/duplicated allocation at exit and
-    // aborts the process (`double free or corruption` → SIGABRT) on glibc. It only
-    // works at all today because `--allow-multiple-definition` papers over the
-    // duplicate *symbols* at link time — but that can't prevent the runtime
-    // double-free. This build.rs is ONLY for satisfying the PREBUILT liblbug.a,
-    // which ships these as undefined externals; skip it entirely for source builds.
+    // aborts the process (`double free or corruption` → SIGABRT) on glibc. Note a
+    // linker flag could not have prevented that: tolerating duplicate *symbols*
+    // says nothing about duplicate runtime state. This build.rs is ONLY for
+    // satisfying the PREBUILT liblbug.a, which ships these as undefined
+    // externals; skip it entirely for source builds.
     if std::env::var("LBUG_BUILD_FROM_SOURCE").is_ok() {
         return;
     }

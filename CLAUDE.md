@@ -12,11 +12,12 @@ cargo fmt --all -- --check                                  # format check
 cargo fmt --all                                             # format in place
 ```
 
-On **x86_64 Linux a clean clone cannot link** (duplicate zstd symbols from
-building Ladybug from source alongside Tantivy). The tracked
-`.cargo/config.toml` does NOT carry the fix; CI appends it per job. Append it
-locally and do not commit it — see
-[CONTRIBUTING.md](CONTRIBUTING.md#x86_64-linux-extra-linker-flag-required).
+A clean clone links with no extra linker flags. Only one copy of zstd is in the
+binary: `liblbug.a` vendors it, and Rust code reaches that copy through
+`nestweaver_store::zstd` rather than the `zstd` crate. Do not add a `zstd`
+dependency back — that reintroduces `zstd-sys`, a second complete copy, and the
+duplicate-symbol link failure that `-Wl,--allow-multiple-definition` used to
+suppress.
 
 ## Daemon Architecture
 

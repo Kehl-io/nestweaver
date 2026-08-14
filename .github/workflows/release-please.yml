@@ -121,10 +121,10 @@ jobs:
               ;;
           esac
           echo "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" >> "$GITHUB_ENV"
-      - name: Add mold to the tracked linker flags (Linux)
+      - name: Use mold as the linker (Linux)
         if: runner.os == 'Linux'
         run: |
-          F="-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-fuse-ld=mold"
+          F="-C link-arg=-fuse-ld=mold"
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$F" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$F" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v7

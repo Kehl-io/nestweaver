@@ -226,7 +226,7 @@ impl ResponseCache {
             return None;
         }
         entry.last_access = now;
-        zstd::decode_all(entry.response.as_slice()).ok()
+        crate::zstd::decode_all(entry.response.as_slice()).ok()
     }
 
     /// Insert (or replace) a response for `key`. `response` is the raw
@@ -240,7 +240,7 @@ impl ResponseCache {
         generation: u64,
         scope_digest: u64,
     ) {
-        let compressed = match zstd::encode_all(response, ZSTD_LEVEL) {
+        let compressed = match crate::zstd::encode_all(response, ZSTD_LEVEL) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("response cache: zstd compress failed: {e}");
@@ -325,7 +325,7 @@ impl ResponseCache {
         };
         let msgpack = rmp_serde::to_vec(&doc)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let compressed = zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL)?;
+        let compressed = crate::zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL)?;
         let mut out = Vec::with_capacity(CACHE_MAGIC.len() + 1 + compressed.len());
         out.extend_from_slice(CACHE_MAGIC);
         out.push(CACHE_VERSION);
@@ -392,7 +392,7 @@ fn decode_cache_bytes(bytes: &[u8]) -> Result<CacheDoc, Box<dyn std::error::Erro
             );
         }
         let payload = &bytes[CACHE_MAGIC.len() + 1..];
-        let decompressed = zstd::decode_all(payload)?;
+        let decompressed = crate::zstd::decode_all(payload)?;
         let doc = rmp_serde::from_slice::<CacheDoc>(&decompressed)?;
         Ok(doc)
     } else {
@@ -690,7 +690,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("t.lbug");
         let key = ResponseCache::key("brain_search", &json!({"query": "q"}));
-        let payload = zstd::encode_all(&b"{\"query\":\"q\"}"[..], ZSTD_LEVEL).unwrap();
+        let payload = crate::zstd::encode_all(&b"{\"query\":\"q\"}"[..], ZSTD_LEVEL).unwrap();
 
         let doc = LegacyCacheDoc {
             entries: vec![LegacyCacheEntry {
@@ -705,7 +705,7 @@ mod tests {
         };
         // Exactly how the old binary encoded it: MessagePack → ZSTD → NWRC.
         let msgpack = rmp_serde::to_vec(&doc).unwrap();
-        let compressed = zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL).unwrap();
+        let compressed = crate::zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL).unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(CACHE_MAGIC);
         bytes.push(CACHE_VERSION);
