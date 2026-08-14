@@ -25,20 +25,43 @@ that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
 invocation and self-terminates after an idle timeout. The client auto-restarts
 the daemon on version mismatch.
 
-**Two different shutdown paths.** The graceful drain loop runs ONLY for the gRPC
-`Shutdown` RPC. `nestweaver daemon stop` sends SIGTERM, whose handler broadcasts
-shutdown immediately — no drain loop, no ceiling, no progress warnings — so
-`NESTWEAVER_DRAIN_TIMEOUT_SECS` does not govern `daemon stop` at all. It only
-derives that command's SIGKILL grace (see the table below). Because the
-broadcast closes every listener at once, reads are down for the entire stop
-grace, not just at the end of it.
+**One shutdown path.** Both operator-initiated routes — the gRPC `Shutdown` RPC
+(`daemon restart`) and SIGTERM (`daemon stop`) — go through
+`begin_shutdown_drain` in `crates/nestweaver-daemon/src/server.rs`, which runs
+the same drain loop and emits the same messages. Neither broadcasts shutdown up
+front, so **listeners stay up and reads keep being served while writes drain**.
+An idle daemon still exits immediately: the drain tests its counters before its
+first sleep. `NESTWEAVER_DRAIN_TIMEOUT_SECS` governs both routes.
 
-On the `Shutdown`-RPC path, `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) means
-two different things depending on what is still in flight. While a WRITE RPC is
-running it is a reporting threshold, not a kill switch — those run on
+**Nothing escalates automatically.** `daemon stop` waits up to the stop grace and
+then, if the daemon is still draining, **reports and stands down** — it leaves
+the daemon running and serving reads, and exits non-zero. It does not SIGKILL.
+Automatic escalation was the defect: nothing in the process can abort a
+`spawn_blocking` write, and the graph store is not crash-safe, so an automatic
+SIGKILL performed on a timer exactly the crash declined at the drain ceiling on
+nw-126 evidence (a SIGKILLed daemon left a stale 42-byte WAL that made a live
+5.6 GB database look absent). Ending an in-flight write is an explicit operator
+act: `nestweaver daemon stop --force`, or `kill -9 <pid>`.
+
+**Under a process supervisor none of that is a guarantee.** The unbounded drain
+describes what this process does with SIGTERM; a supervisor that SIGKILLs on its
+own timer still does, and nothing here can prevent it. The repo ships **no
+systemd unit** — on Linux `daemon start` spawns a bare detached process
+supervised by nothing, and that is the case this change fully fixes. The macOS
+launchd plist now sets `ExitTimeOut` to the drain ceiling + 30 (the key was
+absent, so launchd applied its 20s default), and `docker-compose.yml`'s
+`stop_grace_period` is raised to match — but both remain hard deadlines that
+SIGKILL a draining daemon. **The interactive case is fixed; the supervised case
+remains exposed until the graph store is crash-safe.** See
+`docs/guide/daemon-shutdown.md`.
+
+`NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) still means two different things
+depending on what is still in flight. While a WRITE RPC is running it is a
+reporting threshold, not a kill switch — those run on
 `spawn_blocking` threads that cannot be aborted, so past the ceiling the daemon
-keeps waiting, keeps serving reads, and logs what it is waiting on; SIGKILL is
-the only thing that ends a stuck write. While only an INDEX job is in flight it
+keeps waiting, keeps serving reads, and logs what it is waiting on; an operator
+SIGKILL (`daemon stop --force` or `kill -9`) is the only thing that ends a stuck
+write, and nothing does it automatically. While only an INDEX job is in flight it
 is a real deadline: the daemon signals shutdown at the ceiling — which closes
 every listener and STOPS READ SERVICE — because the worker's `indexing_active`
 flag cannot clear once the pool is drained with a non-empty queue, so waiting on
@@ -70,8 +93,8 @@ by an error message the tool can print, so they belong somewhere findable.
 |----------|---------|---------|
 | `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` | 30 | How long a client waits for the daemon to bind its socket. Raise it on a slow cold start; the boot-failure message names it. Boot phase timings (`boot_ms`, `store_open_ms`, `extension_reconcile_ms`, `unattributed_ms`) are logged at bind so a slow boot is diagnosable rather than guessed at. |
 | `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a non-terminal warning naming this variable. Cancellation is COOPERATIVE and only observed up to the pre-write boundary, so the final stream event says whether the run aborted before writing or committed anyway (committed-after-cancellation names `index --force` as the repair). |
-| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling for the gRPC `Shutdown` RPC — NOT for `daemon stop`, whose SIGTERM skips the drain entirely. With an in-flight write RPC it is NOT a deadline: the daemon cannot abort one, so past this point it keeps waiting, keeps serving most reads (`embed`/`plan_embed` excepted — they take the write gate), logs the in-flight count, and names SIGKILL as the only escape. With only an index job in flight it IS a deadline: the daemon signals shutdown at the ceiling, which stops read service, because `indexing_active` cannot clear once the worker pool is drained with a non-empty queue. Also derives `NESTWEAVER_STOP_GRACE_SECS` and the client's owner-release wait (ceiling + 5s). |
-| `NESTWEAVER_STOP_GRACE_SECS` | drain ceiling + 30 (690) | How long `daemon stop` waits after SIGTERM before escalating to SIGKILL. Unset, it is derived from `NESTWEAVER_DRAIN_TIMEOUT_SECS` + 30s rather than a fixed value a real index would blow past. Unlike the drain ceiling this IS a deadline: a write still running when it expires is SIGKILLed. SIGTERM closes every listener immediately, so reads are down for the whole window, not just at the end. |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling for BOTH shutdown routes — the gRPC `Shutdown` RPC (`daemon restart`) and SIGTERM (`daemon stop`), which share one drain. With an in-flight write it is NOT a deadline: the daemon cannot abort one, so past this point it keeps waiting, keeps serving most reads (`embed`/`plan_embed` excepted — they take the write gate), logs the in-flight count, and names `daemon stop --force` / `kill -9` as the escapes. With only an index job in flight it IS a deadline: the daemon signals shutdown at the ceiling, which stops read service, because `indexing_active` cannot clear once the worker pool is drained with a non-empty queue. Also derives `NESTWEAVER_STOP_GRACE_SECS`, the launchd plist's `ExitTimeOut` (ceiling + 30), and the client's owner-release wait (ceiling + 5s). |
+| `NESTWEAVER_STOP_GRACE_SECS` | drain ceiling + 30 (690) | How long `daemon stop` waits for the daemon to exit. This is NOT a kill deadline: when it expires with the daemon still draining, `daemon stop` reports what is happening, leaves the daemon running and serving reads, and exits non-zero. It does not SIGKILL — see the daemon-architecture section for why an automatic escalation was the defect. Listeners stay up for the whole window, so waiting is not an outage. `daemon stop --force` ignores this variable and uses a short fixed 10s window before SIGKILL, abandoning any in-flight write. |
 | `NESTWEAVER_INDEX_CPU_PERCENT` | 50 | Index CPU duty cycle, percent of one core (1–99; `0` or `>=100` disables). Also see the launchd note below. |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Opt-in required to honour `--no-daemon` / `NESTWEAVER_NO_DAEMON` outside CI. Without it the bypass is REFUSED, because it circumvents the single-writer lock. Not for normal use. |
 | `NESTWEAVER_LBUG_MAX_THREADS` | 1 | Engine thread-pool size. `1` closes the nw-073 eviction-vs-read race; raise only if you measure a query-latency cost. |

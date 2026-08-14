@@ -3331,24 +3331,40 @@ enum DaemonAction {
         #[arg(long, hide = true)]
         track_interactions: bool,
     },
-    /// Stop the running daemon.
+    /// Stop the running daemon, draining in-flight writes first.
     ///
-    /// Sends SIGTERM, which broadcasts shutdown IMMEDIATELY — every listener
-    /// closes at once, so read service stops right away rather than at the end
-    /// of a drain. This path does NOT run the graceful drain loop that the gRPC
-    /// Shutdown RPC uses; NESTWEAVER_DRAIN_TIMEOUT_SECS does not apply here. The
-    /// process lingers only until in-flight `spawn_blocking` writes finish,
-    /// during which it is unreachable.
+    /// Sends SIGTERM, which runs the SAME graceful drain as the gRPC Shutdown
+    /// RPC used by `daemon restart`: listeners stay UP, so reads keep being
+    /// served while writes drain (`embed`/`plan_embed` excepted — they take the
+    /// write gate). An idle daemon exits immediately.
     ///
-    /// Escalates to SIGKILL after the stop grace (NESTWEAVER_STOP_GRACE_SECS,
-    /// else NESTWEAVER_DRAIN_TIMEOUT_SECS + 30s; 690s by default), so a write
-    /// still running at that point IS killed.
+    /// Waits up to the stop grace (NESTWEAVER_STOP_GRACE_SECS, else
+    /// NESTWEAVER_DRAIN_TIMEOUT_SECS + 30s; 690s by default) for exit. If the
+    /// daemon is STILL draining then, this command does NOT kill it: it reports
+    /// what is in flight and exits non-zero, leaving the daemon serving reads.
+    /// Nothing in the process can abort a `spawn_blocking` write, and the graph
+    /// store is not crash-safe (nw-126), so abandoning one is an explicit
+    /// operator decision — `--force`, or `kill -9`.
+    ///
+    /// NOTE: under a process supervisor (systemd `TimeoutStopSec`, default 90s;
+    /// launchd `ExitTimeOut`) the supervisor's own timer still SIGKILLs
+    /// regardless of any of this. See docs/guide/daemon-shutdown.md.
     ///
     /// Refuses to signal a process that only holds the database write lock
     /// unless its /proc cmdline proves it is a daemon for this DB —
     /// `embed --local`, `index`, and `--no-daemon` runs hold the same lock.
     /// That cmdline recovery path is Linux-only.
-    Stop,
+    Stop {
+        /// Escalate to SIGKILL if the daemon has not exited shortly after
+        /// SIGTERM, abandoning any in-flight write.
+        ///
+        /// This is the known-unsafe act: a SIGKILLed daemon has left a stale
+        /// WAL that made a live 5.6 GB database look absent (nw-126). It exists
+        /// so an operator who has decided to accept that can say so explicitly,
+        /// rather than having the tool decide it for them on a timer.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show daemon status.
     ///
     /// Reports one of three states: running (reachable), not running, or
@@ -4447,29 +4463,76 @@ enum InteractionCommands {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Safety buffer added on top of the drain ceiling so the daemon has room to
-/// flush WAL and unwind after a drain that ran to the full ceiling, before the
-/// CLI escalates to SIGKILL.
+/// flush WAL and unwind after a drain that ran to the full ceiling, before
+/// `daemon stop` gives up watching and reports.
+///
+/// Mirrored by `LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS` in `nestweaver-daemon`, which
+/// derives the launchd plist's `ExitTimeOut` the same way. Unlike this one,
+/// that IS a kill deadline — launchd enforces it.
 const STOP_GRACE_BUFFER_SECS: u64 = 30;
 
-/// Resolve how long `daemon stop` waits after SIGTERM before escalating to
-/// SIGKILL.
+/// How long `daemon stop --force` waits for a clean exit before SIGKILL.
+///
+/// Deliberately short and NOT derived from the drain ceiling. `--force` is the
+/// operator saying "end it now, I accept losing the in-flight write"; making
+/// them wait the 690s default first would make the flag useless for the only
+/// case it exists to serve. Long enough that a daemon which was about to exit
+/// cleanly still gets to.
+const FORCE_STOP_GRACE_SECS: u64 = 10;
+
+/// How often `daemon stop` prints a "still draining" line while waiting.
+const STOP_WAIT_NOTICE_SECS: u64 = 60;
+
+/// What `daemon stop` prints when the grace expires with the daemon still
+/// draining — and, critically, still alive and still serving reads.
+///
+/// Kept as a function so its content is unit-testable without a live daemon:
+/// this message IS the contract change. Before it, the CLI silently escalated
+/// to SIGKILL here, performing the crash the drain ceiling deliberately refuses
+/// to perform (nw-126: a SIGKILLed daemon left a stale 42-byte WAL that made a
+/// live 5.6 GB database look absent). It must name what happened, that the
+/// daemon is still usable, and both explicit ways to end it.
+fn stop_still_draining_message(pid: i32, waited_secs: u64) -> String {
+    format!(
+        "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
+         It is still running and still serving reads — an in-flight write cannot be \
+         aborted (`spawn_blocking` work is not cancellable), so it has to finish.\n\
+         Nothing was killed: the graph store is not crash-safe, and a SIGKILL here is \
+         what left a stale WAL making a live database look absent (nw-126).\n\
+         Options:\n  \
+           - wait: the daemon exits on its own when the write completes (no re-run needed; \
+         the SIGTERM drain is already in progress)\n  \
+           - end it now, abandoning that write: `nestweaver daemon stop --force`, or \
+         `kill -9 {pid}`\n\
+         Check the daemon log for the in-flight write count."
+    )
+}
+
+/// Resolve how long `daemon stop` waits for the daemon to exit after SIGTERM.
 ///
 /// T6.2 reconciliation: a legitimate large in-flight index can run far longer
-/// than the old fixed 60s default, so a 60s grace could SIGKILL mid-write of a
-/// non-atomic sidecar. When `NESTWEAVER_STOP_GRACE_SECS` is unset we derive the
-/// grace from the drain ceiling (plus a small buffer) so the two can't drift.
-/// An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
+/// than the old fixed 60s default. When `NESTWEAVER_STOP_GRACE_SECS` is unset we
+/// derive the grace from the drain ceiling (plus a small buffer) so the two
+/// can't drift. An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
 ///
-/// A1 correction to that reconciliation: this grace is now a real DEADLINE, not
-/// a guarantee that stop never kills a legitimately draining daemon. The
-/// daemon's write drain is NOT bounded by `NESTWEAVER_DRAIN_TIMEOUT_SECS` —
-/// nothing can abort a `spawn_blocking` write, so past the ceiling the daemon
-/// keeps waiting and keeps serving reads rather than claiming a shutdown it
-/// cannot perform. A write still running when this grace expires WILL be
-/// SIGKILLed. That is the intended contract for an explicit `daemon stop`: the
-/// operator asked for the daemon to go away and the escalation is what makes
-/// that true. Operators who want to wait a stuck write out instead should leave
-/// the daemon alone (reads keep working) rather than raising this value.
+/// This is NOT a kill deadline. It used to be — the CLI SIGKILLed here — and
+/// that was the defect: nothing can abort a `spawn_blocking` write, the graph
+/// store is not crash-safe, and an automatic SIGKILL performed on a timer
+/// exactly the crash declined at the drain ceiling on nw-126 evidence. When this
+/// grace expires with a write still in flight, `daemon stop` now reports (see
+/// [`stop_still_draining_message`]), leaves the daemon running and serving
+/// reads, and exits non-zero. Killing it is the operator's explicit act:
+/// `daemon stop --force` (which uses [`FORCE_STOP_GRACE_SECS`] instead of this)
+/// or `kill -9`.
+///
+/// Since SIGTERM now runs the daemon's drain with every listener still UP,
+/// waiting out this grace is no longer an outage — which is what makes
+/// "report instead of kill" a usable default rather than a hang.
+///
+/// Raising this value only lengthens how long the command watches. It has no
+/// effect on a supervisor's own stop timeout (systemd `TimeoutStopSec`, launchd
+/// `ExitTimeOut`, Docker `stop_grace_period`), which still SIGKILLs on its own
+/// schedule — see docs/guide/daemon-shutdown.md.
 ///
 /// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
 /// unit-testable without touching process env).
@@ -13282,7 +13345,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
 
-                DaemonAction::Stop => {
+                DaemonAction::Stop { force } => {
                     // Try launchd first on macOS — but do NOT declare success
                     // yet: a detached auto-spawned daemon may still be serving
                     // this DB outside launchd's control (e.g. a stale launchd
@@ -13441,27 +13504,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         libc::kill(pid, libc::SIGTERM);
                     }
 
-                    // Poll for graceful exit. The daemon drains in-flight index
-                    // writes before exiting (a `spawn_blocking` write cannot be
-                    // aborted), which can take longer than a couple of seconds for
-                    // a large repo — so the grace window must exceed the max write
-                    // duration or `daemon stop` would SIGKILL mid-write. By
-                    // default we derive the grace from NESTWEAVER_DRAIN_TIMEOUT_SECS
-                    // (default 660s) rather than a fixed 60s that a real index
-                    // blows past. Override with NESTWEAVER_STOP_GRACE_SECS.
+                    // How long to wait for a clean exit before giving up.
                     //
-                    // A1: this is a deadline, not a promise. The daemon's write
-                    // drain is deliberately unbounded (a spawn_blocking write
-                    // cannot be aborted), so a write still running when the grace
-                    // expires IS SIGKILLed — see resolve_stop_grace_secs.
-                    let grace_secs = resolve_stop_grace_secs(
-                        std::env::var("NESTWEAVER_STOP_GRACE_SECS").ok().as_deref(),
-                        std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
-                            .ok()
-                            .as_deref(),
-                    );
+                    // SIGTERM now runs the daemon's graceful drain with every
+                    // listener still UP, so waiting here is not an outage: the
+                    // daemon keeps serving reads for the whole window. The
+                    // window still tracks the drain ceiling by default so the
+                    // two cannot drift — see resolve_stop_grace_secs.
+                    //
+                    // `--force` is the operator saying "end it now, I accept
+                    // losing the in-flight write". It still SIGTERMs first and
+                    // still prefers a clean exit, but only briefly: waiting the
+                    // full 690s would make the flag useless for the case it
+                    // exists to serve.
+                    let grace_secs = if force {
+                        FORCE_STOP_GRACE_SECS
+                    } else {
+                        resolve_stop_grace_secs(
+                            std::env::var("NESTWEAVER_STOP_GRACE_SECS").ok().as_deref(),
+                            std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
+                                .ok()
+                                .as_deref(),
+                        )
+                    };
+                    let mut waited_ms: u64 = 0;
                     for _ in 0..(grace_secs * 10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
+                        waited_ms += 100;
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
                             report_runtime_cleanup(&remove_unowned_daemon_runtime(
@@ -13472,11 +13541,56 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             ));
                             return Ok((EXIT_SUCCESS, None));
                         }
+                        // Keep the operator informed during a long drain rather
+                        // than showing a silent terminal for eleven minutes.
+                        // The daemon is still serving reads throughout; this
+                        // line is what makes that visible.
+                        if !force
+                            && waited_ms > 0
+                            && waited_ms.is_multiple_of(STOP_WAIT_NOTICE_SECS * 1000)
+                        {
+                            eprintln!(
+                                "  still draining after {}s — the daemon is still serving \
+                                 reads; check its log for the in-flight count",
+                                waited_ms / 1000
+                            );
+                        }
                     }
 
-                    // Force kill only after the full grace window elapses — the
-                    // daemon was still draining and did not exit in time.
-                    eprintln!("Daemon did not exit within {grace_secs}s; sending SIGKILL...");
+                    if !force {
+                        // The defect this replaced: an automatic SIGKILL here.
+                        //
+                        // That escalation performed, on a timer, exactly the act
+                        // investigated and DECLINED at the drain ceiling — a
+                        // SIGKILLed daemon left a stale 42-byte WAL that made a
+                        // live 5.6 GB database look absent (nw-126). The graph
+                        // store is not crash-safe, so the tool must not choose
+                        // that for the operator. It reports and stands down; the
+                        // daemon stays up and keeps serving reads.
+                        //
+                        // Non-zero exit: the operator asked for the daemon to
+                        // stop and it has not stopped. Reporting success here
+                        // would be the same class of overclaim.
+                        //
+                        // DELIBERATELY no `remove_unowned_daemon_runtime` here.
+                        // Every other exit from this arm runs it because the
+                        // daemon is gone; on this path it is ALIVE and still
+                        // owns its pidfile, socket and config binding. Sweeping
+                        // them would delete a live daemon's socket — the exact
+                        // state the identity cross-check above exists to
+                        // prevent — and strand the clients that are still being
+                        // served reads while the write drains.
+                        eprintln!("{}", stop_still_draining_message(pid, grace_secs));
+                        return Ok((EXIT_ERROR, None));
+                    }
+
+                    // --force only. The operator asked for this explicitly.
+                    eprintln!(
+                        "Daemon did not exit within {grace_secs}s; --force given, sending \
+                         SIGKILL. Any in-flight write is abandoned — if the database looks \
+                         empty or absent afterwards, that is nw-126 (stale WAL), not data \
+                         loss."
+                    );
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
@@ -22535,6 +22649,80 @@ mod server_status_tests {
 #[cfg(test)]
 mod stop_grace_tests {
     use super::*;
+
+    /// The contract change, stated as a test on the message that carries it.
+    ///
+    /// `daemon stop` used to SIGKILL here. That escalation performed on a timer
+    /// exactly the act declined at the drain ceiling on nw-126 evidence — a
+    /// SIGKILLed daemon left a stale WAL that made a live database look absent.
+    /// The command now reports and stands down, so the message has to carry the
+    /// whole truth: nothing was killed, the daemon is still usable, and both
+    /// explicit escapes are named.
+    #[test]
+    fn still_draining_message_reports_instead_of_claiming_a_kill() {
+        let msg = stop_still_draining_message(4242, 690);
+
+        assert!(msg.contains("4242"), "{msg}");
+        assert!(msg.contains("690s"), "{msg}");
+        assert!(
+            msg.contains("was NOT stopped"),
+            "the command must not imply success it did not achieve: {msg}"
+        );
+        assert!(
+            msg.contains("still serving reads"),
+            "the reason waiting is now acceptable is that this is not an \
+             outage — the message must say so: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "the supported explicit escape must be named: {msg}"
+        );
+        assert!(
+            msg.contains("kill -9 4242"),
+            "the escape hatch the daemon log already names must be repeated \
+             here, with the pid filled in: {msg}"
+        );
+        assert!(
+            msg.contains("nw-126"),
+            "the reason nothing was killed must be traceable: {msg}"
+        );
+        // The failure mode this replaced. If any future edit reintroduces an
+        // automatic kill, this message would have to change with it.
+        assert!(
+            !msg.contains("sending SIGKILL"),
+            "this path must not kill anything: {msg}"
+        );
+    }
+
+    /// `--force` must not inherit the 690s default. An operator reaching for it
+    /// has already accepted losing the in-flight write; making them wait eleven
+    /// minutes first would make the flag useless for its only purpose.
+    #[test]
+    fn force_grace_is_short_and_independent_of_the_drain_ceiling() {
+        // Both bounds are on a constant, so they are asserted at compile time —
+        // clippy::assertions_on_constants would otherwise reject a runtime
+        // `assert!` here, and a const block is the stronger form anyway: a
+        // future edit that widened `FORCE_STOP_GRACE_SECS` would fail to build
+        // rather than fail a test someone could ignore.
+        const {
+            assert!(
+                FORCE_STOP_GRACE_SECS < 60,
+                "--force must terminate promptly"
+            )
+        };
+        const {
+            assert!(
+                FORCE_STOP_GRACE_SECS > 0,
+                "a daemon that was about to exit cleanly should still get to"
+            )
+        };
+        // This one is genuinely runtime: `resolve_stop_grace_secs` reads the
+        // default drain ceiling, so the relationship it pins cannot be a const.
+        assert!(
+            FORCE_STOP_GRACE_SECS < resolve_stop_grace_secs(None, None),
+            "--force must be strictly faster than the patient path"
+        );
+    }
 
     /// An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins, regardless of the
     /// drain ceiling — operators keep a hard override.

@@ -223,6 +223,11 @@ pub fn generate_plist(
     )
 }
 
+/// Buffer added to the drain ceiling to derive the plist's `ExitTimeOut`,
+/// mirroring `STOP_GRACE_BUFFER_SECS` in the CLI so launchd's SIGKILL deadline
+/// and `daemon stop`'s wait cannot drift apart.
+const LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS: u64 = 30;
+
 /// Render a per-instance launch agent, optionally forwarding an absolute
 /// instance configuration path to the foreground `daemon run` process.
 ///
@@ -262,6 +267,27 @@ pub fn generate_plist_with_config(
         None => String::new(),
     };
 
+    // How long launchd waits after SIGTERM before SIGKILLing us.
+    //
+    // This key was previously ABSENT, so launchd applied its 20-second default
+    // — a hard SIGKILL 20s into a drain that routinely runs for minutes. That
+    // is the nw-126 crash (a SIGKILLed daemon left a stale WAL that made a live
+    // database look absent) on a 20-second fuse, and it fired regardless of
+    // what the daemon or `daemon stop` did, because it is launchd's timer and
+    // not ours.
+    //
+    // Pinned to the same budget `daemon stop` uses (drain ceiling + buffer) so
+    // the supervised macOS path and the interactive path cannot drift.
+    //
+    // This does NOT make the drain guarantee absolute under launchd: a write
+    // still running at `exit_timeout` is still SIGKILLed, by launchd, outside
+    // our control. It moves the deadline from "20s, always fires" to "the same
+    // deadline the operator already reasons about". launchd does treat `0` as
+    // infinity, but a job that can refuse to die forever is a wedged logout and
+    // a worse failure than a bounded one, so it is not used here.
+    let exit_timeout = nestweaver_schema::drain_ceiling_from_env()
+        .saturating_add(LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS);
+
     // Opt-in. Omitted entirely rather than emitted as `<false/>` so a plist
     // from a machine that never opted in is byte-identical to the old output.
     let run_at_load = if start_at_login {
@@ -297,6 +323,8 @@ pub fn generate_plist_with_config(
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>{exit_timeout}</integer>
     <key>LowPriorityIO</key>
     <true/>
     <key>ProcessType</key>
@@ -449,6 +477,39 @@ mod tests {
         );
         // No EnvironmentVariables block without the CPU knob.
         assert!(!plist.contains("EnvironmentVariables"), "{plist}");
+    }
+
+    /// Without this key launchd applied its own 20s default: a hard SIGKILL 20
+    /// seconds into a drain that routinely runs for minutes, on launchd's timer
+    /// rather than ours. That is the nw-126 crash on a short fuse, and it fired
+    /// no matter what `daemon stop` or the SIGTERM drain did.
+    ///
+    /// The value must track the drain ceiling so the supervised macOS path and
+    /// the interactive `daemon stop` path cannot drift apart. This does not
+    /// make the drain unbounded under launchd — a write still running at the
+    /// timeout is still SIGKILLed, by launchd, outside this process's control.
+    #[test]
+    fn plist_sets_exit_timeout_from_the_drain_ceiling() {
+        let plist = generate_plist(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+        );
+        let expected = nestweaver_schema::drain_ceiling_from_env()
+            .saturating_add(LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS);
+        assert!(
+            plist.contains(&format!(
+                "<key>ExitTimeOut</key>\n    <integer>{expected}</integer>"
+            )),
+            "ExitTimeOut must be present and derived from the drain ceiling, \
+             not left to launchd's 20s default: {plist}"
+        );
+        assert!(
+            expected > 20,
+            "the whole point is to beat launchd's 20s default"
+        );
     }
 
     #[test]

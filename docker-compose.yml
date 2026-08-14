@@ -45,7 +45,17 @@ services:
         "--config", "/etc/nestweaver/instance.toml"
       ]
     restart: unless-stopped
-    stop_grace_period: 30s
+    # Docker sends SIGTERM, which runs the daemon's graceful drain with every
+    # listener still up, then SIGKILLs at this deadline. 30s sat far below the
+    # 660s drain ceiling, so `docker compose stop` during a large index reliably
+    # SIGKILLed the daemon mid-write — the nw-126 stale-WAL crash, on a 30s fuse.
+    #
+    # Matched to the drain ceiling + 30s, the same budget `nestweaver daemon
+    # stop` uses. This is still a HARD DEADLINE that Docker enforces and the
+    # daemon cannot extend: a write running at 690s is SIGKILLed anyway. Raise
+    # it (and NESTWEAVER_DRAIN_TIMEOUT_SECS with it) if your indexes run longer.
+    # See docs/guide/daemon-shutdown.md.
+    stop_grace_period: 690s
 
 volumes:
   nestweaver-data:

@@ -1177,12 +1177,13 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
                 "drain ceiling ({ceiling}s) exceeded — still waiting on {writes} \
                  in-flight write(s){}; the daemon CANNOT abort them and is NOT \
                  shutting down. Most reads are still served — `embed` and \
-                 `plan_embed` are not, they take the same write gate. To end it \
-                 now: `kill -9 {pid}`, which abandons the in-flight write. Prefer \
-                 that over `nestweaver daemon stop`: its SIGTERM closes every \
-                 listener immediately, so reads stay down for the whole stop \
-                 grace (default: ceiling + 30s) before it escalates to SIGKILL \
-                 anyway",
+                 `plan_embed` are not, they take the same write gate. This is \
+                 the same drain whether you sent SIGTERM (`nestweaver daemon \
+                 stop`) or the Shutdown RPC (`nestweaver daemon restart`); \
+                 neither escalates on its own. To end it now — abandoning the \
+                 in-flight write, which the graph store may not survive cleanly \
+                 (nw-126) — run `nestweaver daemon stop --force` or `kill -9 \
+                 {pid}`",
                 // Hedged: `indexing_active` is a flag, not a proof of work. It
                 // can stay set after the worker pool is drained, so claiming a
                 // running index job here would be the same kind of overclaim
@@ -1217,6 +1218,89 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
     }
 
     let _ = state.shutdown_tx.send(true);
+}
+
+/// The ONE way a shutdown starts in this process.
+///
+/// Both operator-initiated shutdown routes go through here — the gRPC
+/// `Shutdown` RPC (`daemon restart`) and the SIGTERM handler (`daemon stop`) —
+/// so there is a single drain implementation and a single set of honest drain
+/// messages. Before this existed, SIGTERM broadcast shutdown immediately: every
+/// UDS/TCP/MCP listener closed at once, so read service died the instant the
+/// signal landed, while the in-flight `spawn_blocking` write it could not abort
+/// kept the process alive anyway. The outage bought nothing — reads do not take
+/// `write_mutex` (`embed`/`plan_embed` are the sole exceptions), so killing read
+/// service neither sped the write up nor protected anything — and the drain
+/// reporting written for the RPC path was unreachable from the command
+/// operators actually type.
+///
+/// The fast path is unchanged in cost: [`run_shutdown_drain`] tests the
+/// counters at the top of its first iteration and breaks immediately when
+/// nothing is in flight, so a SIGTERM on an idle daemon still broadcasts and
+/// exits without waiting.
+///
+/// This function deliberately does NOT terminate anything. Nothing here can
+/// abort a `spawn_blocking` write, and the graph store is not crash-safe (see
+/// nw-126: a SIGKILLed daemon left a stale 42-byte WAL that made a live 5.6 GB
+/// database look absent). Ending a genuinely in-flight write is the operator's
+/// explicit act — `nestweaver daemon stop --force`, or the `kill -9` the drain
+/// log names — never an automatic escalation.
+///
+/// `trigger` names the route for the log only; behaviour is identical either
+/// way, which is the point.
+fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
+    // T6.2: mark the pool drained BEFORE the drain wait loop so the worker
+    // stops claiming NEW jobs immediately and only finishes in-flight work.
+    // Without this the worker keeps claiming new jobs during the drain, so
+    // under continuous webhook enqueue `indexing_active` never clears and
+    // shutdown burns the full drain ceiling doing work it will abandon.
+    state.drained.store(true, Ordering::Relaxed);
+
+    // Once-only guard on the drain task. A second trigger (a Shutdown RPC after
+    // a SIGTERM, or two Shutdown RPCs) must not spawn a second
+    // `run_shutdown_drain`: the two would duplicate every drain warning for as
+    // long as the write runs — visible in the incident log as two interleaved
+    // 90%/ceiling report streams — and race the broadcast.
+    //
+    // This MUST NOT key off `drained`. That flag is shared with `AdminState`,
+    // and `POST /admin/api/drain` sets it as routine maintenance; keying the
+    // guard off it would make every Shutdown RPC after any admin drain a silent
+    // no-op that never stops the watcher, never drains and never broadcasts,
+    // leaving `daemon restart` unable to stop the daemon until someone found
+    // `POST /admin/api/resume`.
+    // SEMANTIC CHANGE, deliberate: SIGTERM used to take this path
+    // UNCONDITIONALLY — it stored `shutdown_started` without checking, stopped
+    // the watcher, and broadcast, even if a `Shutdown` RPC had already begun
+    // draining. Now a SIGTERM arriving behind an in-progress drain is a no-op
+    // and does NOT force a broadcast.
+    //
+    // That is the point: forcing the broadcast is precisely what tore down every
+    // listener mid-drain. An operator who runs `daemon restart` and then
+    // `daemon stop` now gets one drain that keeps serving reads, and the CLI
+    // reports honestly instead of the second signal cutting the first one short.
+    if state.shutdown_started.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            trigger,
+            "shutdown already in progress — not starting a second drain"
+        );
+        return;
+    }
+
+    // Stop any active watcher BEFORE the drain wait — an orphaned watcher's
+    // blocking thread would otherwise pin shutdown (Tokio's runtime drop waits
+    // for blocking threads) until someone kills the process.
+    //
+    // Consequence of the guard above: only the FIRST trigger stops the watcher,
+    // so a watcher registered after a drain began is not stopped here. That hole
+    // is closed on the exit path — the belt-and-suspenders `stop_active_watcher`
+    // after `uds_serve` returns runs before the worker await and before runtime
+    // drop, so such a watcher still cannot pin process exit. Verified by
+    // inspection of the call ordering, not by test.
+    stop_active_watcher(&state);
+
+    tokio::spawn(async move {
+        run_shutdown_drain(state, nestweaver_schema::drain_ceiling_from_env()).await;
+    });
 }
 
 /// Register a watcher's shutdown handle, returning its registration id (the
@@ -3342,39 +3426,10 @@ impl NestWeaverDaemon for DaemonService {
         }
         tracing::info!("shutdown requested via gRPC — draining active writes");
 
-        // T6.2: mark the pool drained BEFORE the drain wait loop so the worker
-        // stops claiming NEW jobs immediately and only finishes in-flight work.
-        // Without this the worker keeps claiming new jobs during the drain, so
-        // under continuous webhook enqueue `indexing_active` never clears and
-        // shutdown burns the full drain ceiling doing work it will abandon.
-        self.state.drained.store(true, Ordering::Relaxed);
-
-        // Once-only guard on the drain task. A second Shutdown must not spawn a
-        // second `run_shutdown_drain`: the two would duplicate every drain
-        // warning for as long as the write runs — visible in the incident log
-        // as two interleaved 90%/ceiling report streams — and race the
-        // broadcast.
-        //
-        // This MUST NOT key off `drained`. That flag is shared with
-        // `AdminState`, and `POST /admin/api/drain` sets it as routine
-        // maintenance; keying the guard off it would make every Shutdown RPC
-        // after any admin drain a silent no-op that never stops the watcher,
-        // never drains and never broadcasts, leaving `daemon restart` unable to
-        // stop the daemon until someone found `POST /admin/api/resume`.
-        if self.state.shutdown_started.swap(true, Ordering::Relaxed) {
-            tracing::info!("shutdown already in progress — not starting a second drain");
-            return Ok(Response::new(ShutdownResponse { ok: true }));
-        }
-
-        // Stop any active watcher BEFORE the drain wait — an orphaned
-        // watcher's blocking thread would otherwise pin shutdown until the
-        // client's SIGKILL.
-        stop_active_watcher(&self.state);
-
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            run_shutdown_drain(state, nestweaver_schema::drain_ceiling_from_env()).await;
-        });
+        // Same entry point SIGTERM uses — one drain, one message. See
+        // [`begin_shutdown_drain`] for the drained-flag ordering, the once-only
+        // guard, and why neither route escalates on its own.
+        begin_shutdown_drain(self.state.clone(), "grpc_shutdown");
 
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
@@ -8867,29 +8922,27 @@ pub async fn run_server(
     }
 
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
+    //
+    // SIGTERM runs the SAME drain as the gRPC `Shutdown` RPC. It does not
+    // broadcast shutdown up front: listeners stay up and reads keep being
+    // served while writes drain, and the operator gets the drain's honest
+    // reporting. An idle daemon still exits immediately — the drain breaks on
+    // its first counter check. See [`begin_shutdown_drain`].
+    //
+    // SUPERVISORS: this only governs what THIS process does with the signal. A
+    // process supervisor that SIGKILLs on its own timer (systemd's
+    // `TimeoutStopSec`, default 90s; launchd's `ExitTimeOut`) still does so,
+    // and nothing here can prevent it. The unbounded-drain guarantee holds for
+    // interactive `daemon stop`; under a supervisor it holds only for as long
+    // as that supervisor's stop timeout allows.
     {
-        let tx = shutdown_tx.clone();
-        let drained = Arc::clone(&state.drained);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("register SIGTERM handler");
             sig.recv().await;
-            tracing::info!("received SIGTERM — shutting down");
-            // T6.2: stop the worker claiming new jobs BEFORE broadcasting
-            // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
-            // still drain via the worker loop's JoinSet; only NEW claims stop.
-            drained.store(true, Ordering::Relaxed);
-            // SIGTERM broadcasts immediately below, so a Shutdown RPC arriving
-            // after it has nothing left to drain — claim the guard so it does
-            // not start a drain loop behind an already-broadcast shutdown.
-            state.shutdown_started.store(true, Ordering::Relaxed);
-            // Stop any active watcher too — its `spawn_blocking` thread
-            // would otherwise outlive the broadcast and pin process exit
-            // (Tokio's runtime drop waits for blocking threads) until the
-            // client's stop grace elapses and it SIGKILLs us.
-            stop_active_watcher(&state);
-            let _ = tx.send(true);
+            tracing::info!("received SIGTERM — draining before shutdown");
+            begin_shutdown_drain(state, "sigterm");
         });
     }
 
@@ -16361,11 +16414,157 @@ external_model = "unavailable-test-model"
              write gate and are exactly what an operator reaches for during an embed \
              incident, so the line must say so: {text}"
         );
+        // ── The assertion that used to live here ─────────────────────────
+        //
+        // Was:
+        //     assert!(text.contains("reads stay down"), ...)
+        //
+        // Its PURPOSE was disclosure: the ceiling line recommends `kill -9`, so
+        // it must not steer an operator away from `daemon stop` without naming
+        // what `daemon stop` costs. At the time that cost was real — SIGTERM
+        // broadcast shutdown immediately and ended read service for the whole
+        // stop grace.
+        //
+        // That cost no longer exists: SIGTERM now runs THIS drain with every
+        // listener up. Keeping the assertion literally would force the message
+        // to keep asserting a falsehood — the same overclaim this test family
+        // exists to prevent, merely inverted.
+        //
+        // So the PURPOSE is preserved and the premise is replaced. The four
+        // assertions below are deliberately not a weaker substitute for the one
+        // removed:
+        //
+        //  1. the negative guard is NEW coverage that did not exist before. It
+        //     couples the message to the SIGTERM implementation in both
+        //     directions: revert SIGTERM to broadcasting and leave the message
+        //     alone, or vice versa, and this fails.
+        //  2. the "same drain" assertion positively pins the unification claim,
+        //     so the block cannot pass vacuously on an empty or broken log
+        //     capture (and five other positive assertions above share `text`,
+        //     which fail first if capture breaks at all).
+        //  3./4. `--force` and "neither escalates" pin the new contract — the
+        //     supported escape and the no-auto-kill promise — which is the
+        //     direct analogue of the old "name the cost of the alternative".
         assert!(
-            text.contains("reads stay down"),
-            "the line must not recommend `daemon stop` without saying its SIGTERM \
-             closes every listener and ends read service for the stop grace: {text}"
+            !text.contains("reads stay down"),
+            "SIGTERM now runs this same drain with listeners up — the line must \
+             not still warn that `daemon stop` ends read service: {text}"
         );
+        assert!(
+            text.contains("the same drain whether you sent SIGTERM"),
+            "the line must positively state that both routes share this drain — \
+             that unification is the change, and a negative assertion alone \
+             could pass on an empty log: {text}"
+        );
+        assert!(
+            text.contains("--force"),
+            "the operator needs the supported explicit escape named, not only \
+             `kill -9`: {text}"
+        );
+        assert!(
+            text.contains("neither escalates on its own"),
+            "the whole point of the unified drain is that no path auto-kills — \
+             the line must say so: {text}"
+        );
+    }
+
+    /// The fast path must stay fast. Routing SIGTERM through the drain would be
+    /// a bad trade if it turned every ordinary stop into a slow one: the drain
+    /// tests its counters at the top of its FIRST iteration and breaks before
+    /// the first sleep, so an idle daemon still broadcasts essentially at once.
+    ///
+    /// The bound is deliberately tight (250ms against a 500ms poll interval):
+    /// anything that made the fast path take a poll cycle would fail this.
+    #[tokio::test]
+    async fn begin_shutdown_drain_broadcasts_at_once_when_nothing_is_in_flight() {
+        let state = test_state_with_writer();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+
+        let started = tokio::time::Instant::now();
+        begin_shutdown_drain(Arc::clone(&state), "test");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx.changed())
+            .await
+            .expect("an idle daemon must broadcast shutdown immediately")
+            .expect("shutdown channel closed");
+        assert!(*shutdown_rx.borrow());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "the idle fast path must not cost a drain poll cycle: took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            state.drained.load(Ordering::Relaxed),
+            "the worker must stop claiming new jobs on every shutdown route"
+        );
+    }
+
+    /// The contract change, at the unit level: a SIGTERM-triggered shutdown must
+    /// NOT broadcast while a write is in flight.
+    ///
+    /// The broadcast is what closes the UDS/TCP/MCP listeners. Before this,
+    /// SIGTERM broadcast up front, so read service died instantly while the
+    /// unabortable `spawn_blocking` write kept the process alive anyway — pure
+    /// cost, since reads do not take `write_mutex`. `begin_shutdown_drain` is
+    /// the shared entry point both SIGTERM and the `Shutdown` RPC now use, so
+    /// asserting on it asserts on both.
+    #[tokio::test]
+    async fn begin_shutdown_drain_keeps_listeners_up_until_the_write_finishes() {
+        let state = test_state_with_writer();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        state.active_writes.store(1, Ordering::Relaxed);
+
+        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+
+        // Long enough to cover several 500ms drain polls.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(2_000),
+                shutdown_rx.changed()
+            )
+            .await
+            .is_err(),
+            "shutdown must NOT be broadcast while a write is in flight — that \
+             broadcast is exactly what took read service down"
+        );
+
+        // ...and when the write does finish, shutdown still completes cleanly
+        // rather than leaving a half-dead process behind.
+        state.active_writes.store(0, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(10), shutdown_rx.changed())
+            .await
+            .expect("the drain must complete once the write finishes")
+            .expect("shutdown channel closed");
+        assert!(*shutdown_rx.borrow());
+    }
+
+    /// One drain, not two. SIGTERM and a `Shutdown` RPC racing (an operator who
+    /// runs `daemon stop` and then `daemon restart`, or a supervisor doing both)
+    /// must not produce two drain loops interleaving duplicate warnings and
+    /// racing the broadcast.
+    #[tokio::test]
+    async fn a_second_shutdown_trigger_does_not_start_a_second_drain() {
+        let state = test_state_with_writer();
+        state.active_writes.store(1, Ordering::Relaxed);
+
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+        begin_shutdown_drain(Arc::clone(&state), "grpc_shutdown");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let text = logs.text();
+        assert!(
+            text.contains("shutdown already in progress"),
+            "the second trigger must be refused by the once-only guard: {text}"
+        );
+        state.active_writes.store(0, Ordering::Relaxed);
     }
 
     /// `drained` is NOT shutdown-private: the same `Arc` is handed to
