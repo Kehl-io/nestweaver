@@ -43,6 +43,28 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [6.0.0](https://github.com/Kehl-io/nestweaver/compare/v5.0.0...v6.0.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **daemon:** for the whole drain window every write in the system hard-fails with `UNAVAILABLE` and no successor daemon starts, because autostart adopts the draining daemon on its held pidfile flock. "Retry against the daemon that starts next" therefore means polling until the current one exits — 21 minutes on a large index in review testing. This is the intended, honest behaviour, but it is a larger user-visible change than "new writes are refused" suggests: a CI job or agent loop that writes during a stop will fail for the entire drain rather than block or queue.
+* **daemon:** write RPCs now fail with `UNAVAILABLE` once the daemon has begun shutting down, instead of being accepted and extending the drain. A client that submits a write between `daemon stop` (or the Shutdown RPC) and the daemon's exit will see that error where it previously saw the write succeed. It is retryable against the daemon that starts next.
+* **daemon:** `nestweaver daemon stop` no longer SIGKILLs a daemon that is still draining when the stop grace expires. It reports what is in flight, leaves the daemon running and serving reads, and exits non-zero instead of exiting zero after a kill. Scripts that treated `daemon stop` as a guaranteed terminate — or that relied on its exit status being zero — must now pass `--force` (SIGTERM, 10s, then SIGKILL) or send `kill -9` themselves. `NESTWEAVER_STOP_GRACE_SECS` is no longer a kill deadline; it only bounds how long the command watches.
+
+### Bug Fixes
+
+* **build:** link one copy of zstd instead of suppressing the duplicate ([359571e](https://github.com/Kehl-io/nestweaver/commit/359571e60d6ba56f913905b3263ee3efe9fa035a))
+* **daemon:** drain on SIGTERM with listeners up, never SIGKILL on a timer ([fd1adf4](https://github.com/Kehl-io/nestweaver/commit/fd1adf402a435ea10f60994a3bd29d523501a1bf))
+* **daemon:** fail fast on refused writes and stop misreporting a clean stop ([cbdf70c](https://github.com/Kehl-io/nestweaver/commit/cbdf70c081c455ade9f1e422a888520fa844bf1f))
+* **daemon:** refuse new writes during the drain and keep listening for SIGTERM ([aa9126c](https://github.com/Kehl-io/nestweaver/commit/aa9126c4f064d7c4540d88a81fed306cd177d19d))
+* **federation:** carry honesty fields through the structured merge ([26d3979](https://github.com/Kehl-io/nestweaver/commit/26d3979b15bad5e34ba26031f6a26f55978f7ce6))
+* index-publication recovery, one copy of zstd, federated honesty fields ([62ca4c1](https://github.com/Kehl-io/nestweaver/commit/62ca4c125767d54d090d7121b43f6082147b4de9))
+* **index:** atomic marker rewrite; correct two overclaiming comments ([f29850c](https://github.com/Kehl-io/nestweaver/commit/f29850ce095d66deb4d88a598684831dc1bdffb4))
+* **index:** rank unified on recovery, add repair --force, stop waiting on wedges ([c42098f](https://github.com/Kehl-io/nestweaver/commit/c42098f5f5531e12bb670d50e0bfee86cbf993bf))
+* **index:** recover abandoned index publications and surface the condition ([c779c27](https://github.com/Kehl-io/nestweaver/commit/c779c271ce3df4065090f0ac24e9a400d4ccf269))
+* **store:** reject truncated zstd input instead of decoding it short ([eebbd44](https://github.com/Kehl-io/nestweaver/commit/eebbd4432632c478ad7a334351fa12a5e51347a6))
+
 ## [5.0.0](https://github.com/Kehl-io/nestweaver/compare/v4.1.2...v5.0.0) (2026-08-13)
 
 
