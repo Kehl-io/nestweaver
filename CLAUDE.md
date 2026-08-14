@@ -6,11 +6,34 @@
 cargo build                                                 # build all crates
 cargo build --release                                       # release binary
 cargo test                                                  # run all tests
-cargo test -p nestweaver-schema                             # test one crate
+just test-crate nestweaver-schema                           # test one crate — NOT `cargo test -p`
 cargo clippy --workspace --all-targets -- -D warnings       # lint (zero warnings)
 cargo fmt --all -- --check                                  # format check
 cargo fmt --all                                             # format in place
 ```
+
+**Use `just test-crate`, never a bare `cargo test -p <crate>`.** `-p` resolves
+features for that package alone, while a workspace run unifies them across
+dependents. Affected crates therefore run **fewer tests under `-p` and still
+report `ok`**. Measured on `5e9e0f0`, bare `-p` / `--all-features` / `--workspace`:
+
+| crate | `-p` | `--all-features` | `--workspace` |
+| --- | --- | --- | --- |
+| `nestweaver-daemon` | 238 | 264 | 264 |
+| `nestweaver-mcp` | 154 | 180 | 180 |
+
+The recipe uses `--all-features`, not a per-crate feature list, because every
+feature unification can activate on a package is one of that package's own
+features — so `--all-features` is provably a superset and can never cover less.
+Guessing the list is unreliable: `--features embed` looks right and leaves
+`nestweaver-mcp` at 154, since what it actually needs is `daemon`.
+
+Two packages are exempt and run plain: `nestweaver-embed` and the root
+`nestweaver`, whose `metal` feature pulls `objc2` and does not compile on Linux.
+
+Switching between `-p` and `--workspace` also re-resolves features, which
+re-fingerprints the build and forces a full `lbug` C++ rebuild. Pick one shape
+per working tree and keep it.
 
 A clean clone links with no extra linker flags. Only one copy of zstd is in the
 binary: `liblbug.a` vendors it, and Rust code reaches that copy through

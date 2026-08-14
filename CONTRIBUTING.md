@@ -85,6 +85,9 @@ cargo build
 # Install pre-commit hooks (requires pre-commit and Node.js for commitlint)
 pre-commit install
 pre-commit install --hook-type commit-msg
+
+# Task runner used by the recipes below (see `just --list`)
+cargo install just
 ```
 
 Keep `.cargo/config.toml` in place. It forces the Ladybug dependency to build
@@ -121,11 +124,11 @@ cargo fmt --all -- --check                                  # formatting
 ### Useful commands
 
 ```sh
-# Run tests for a single crate
-cargo test -p nestweaver-parser
+# Run tests for a single crate — use the recipe, not bare `cargo test -p`
+just test-crate nestweaver-parser
 
-# Run a specific test
-cargo test -p nestweaver-store -- ranking::tests::pagerank
+# Run a specific test (keep --all-features — see below)
+cargo test -p nestweaver-store --all-features -- ranking::tests::pagerank
 
 # Build release binary
 cargo build --release
@@ -143,6 +146,40 @@ nestweaver list-links --config ./nestweaver-instance.toml
 nestweaver list-features --config ./nestweaver-instance.toml
 nestweaver context --feature <name> --config ./nestweaver-instance.toml --db ./all.lbug
 ```
+
+#### Why `just test-crate` and not `cargo test -p`
+
+A bare `cargo test -p <crate>` resolves features for that package alone, while a
+workspace run unifies them across every dependent. The result is a per-crate run
+that covers less than you assume and still prints `ok`. Measured on `5e9e0f0`:
+
+| crate | `cargo test -p` | `-p --all-features` | `cargo test --workspace` |
+| --- | --- | --- | --- |
+| `nestweaver-daemon` | 238 | **264** | **264** |
+| `nestweaver-mcp` | 154 | **180** | **180** |
+
+This cost two implementers and a reviewer real time during PR #245, each briefly
+treating the gap as a discrepancy in the suite rather than a feature-set
+difference.
+
+`just test-crate` passes `--all-features`. That is deliberate, and not the same
+as naming the features by hand: every feature unification can activate on a
+package is one of that package's own features, so `--all-features` is provably a
+**superset** of the unified set and can never cover less. Hand-maintained lists
+are guesswork — `--features embed` is the obvious guess and leaves
+`nestweaver-mcp` at 154, because what it actually needs is `daemon`
+(`nestweaver-daemon` depends on it as `features = ["daemon"]`).
+
+Two packages are exempt and run plain: `nestweaver-embed` and the root
+`nestweaver`. Both reach `metal = ["candle-core/metal", …]`, which pulls `objc2`
+and fails to compile on Linux.
+
+Without `just` installed, the equivalent is `cargo test -p <crate>
+--all-features` for any crate other than those two.
+
+One consequence worth expecting either way: switching a working tree between
+`-p` and `--workspace` re-resolves features, which re-fingerprints the build and
+forces a full `lbug` C++ rebuild. Pick one shape per tree and stay with it.
 
 ### Code conventions
 

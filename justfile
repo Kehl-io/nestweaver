@@ -14,9 +14,38 @@ release:
 test:
     cargo test
 
-# Test a specific crate
+# Packages where `--all-features` does not build off macOS. `nestweaver-embed`
+# has `metal = ["candle-core/metal", ...]`, which pulls `objc2` and fails to
+# compile on Linux (measured on 5e9e0f0). The root `nestweaver` package forwards
+# the same feature via `metal = ["nestweaver-embed?/metal"]`, so it inherits the
+# hazard. These fall back to a plain per-crate run.
+no_all_features := "nestweaver nestweaver-embed"
+
+# Why `--all-features` rather than a hand-maintained per-crate feature list:
+# every feature a workspace run can activate on a package is, by definition, one
+# of that package's own features — so `--all-features` is always a SUPERSET of
+# the unified set and can never silently cover less. A hand-maintained list can,
+# and did: `--features embed` alone leaves `nestweaver-mcp` at 154 tests, because
+# what it actually needs is `daemon` (nestweaver-daemon depends on it as
+# `features = ["daemon"]`).
+#
+# Measured on 5e9e0f0 — bare `-p` / `--all-features` / `--workspace`:
+#   nestweaver-daemon   238 / 264 / 264
+#   nestweaver-mcp      154 / 180 / 180
+#
+# Keep the line below as the only comment directly above the recipe: `just
+# --list` uses the immediately-preceding comment as its description.
+
+# Test one crate with the features a workspace run would activate
 test-crate crate:
-    cargo test -p {{crate}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ " {{no_all_features}} " == *" {{crate}} "* ]]; then
+        echo "note: {{crate}} cannot take --all-features off macOS (metal/objc2) — running plain" >&2
+        cargo test -p {{crate}}
+    else
+        cargo test -p {{crate}} --all-features
+    fi
 
 # Lint with clippy (zero warnings)
 lint:
