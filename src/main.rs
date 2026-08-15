@@ -3619,12 +3619,13 @@ enum DaemonAction {
     /// EVERY platform, sweeps orphaned per-instance directories under exactly
     /// the three roots a daemon writes: the persistent state root
     /// (`~/.local/state/nestweaver`, daemon logs), the runtime root
-    /// (`$XDG_RUNTIME_DIR/nestweaver` — socket, pidfile, spawnlock; Linux
-    /// only, elsewhere it IS the state root), and the /tmp socket-fallback
-    /// root (`/tmp/nw-sock-<uid>`, used only when the runtime socket path
-    /// exceeds the 104-byte sun_path limit). Live instances are spared under
-    /// every root, and each ownership proof (database write lock, pidfile
-    /// lock) is reported as its own separate fact.
+    /// (`$XDG_RUNTIME_DIR/nestweaver` — socket, pidfile, spawnlock; a separate
+    /// root wherever XDG_RUNTIME_DIR is set, on any platform — where it is
+    /// not set, the runtime dir IS the state root), and the /tmp
+    /// socket-fallback root (`/tmp/nw-sock-<uid>`, used only when the runtime
+    /// socket path exceeds the 104-byte sun_path limit). Live instances are
+    /// spared under every root, and each ownership proof (database write
+    /// lock, pidfile lock) is reported as its own separate fact.
     Gc,
     /// Run daemon in foreground (used by launchd)
     Run {

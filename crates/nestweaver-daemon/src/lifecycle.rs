@@ -15,6 +15,14 @@ static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
 static LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Process-wide lock serializing every test that swaps OR durably reads the
+/// XDG/socket-fallback env vars. Defined at module level (not inside the
+/// test module) so `server.rs`'s in-process-daemon e2e tests — which resolve
+/// runtime/state paths for the daemon's whole lifetime — can serialize
+/// against the lifecycle unit tests that flip those vars.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn effective_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
     parent.join(format!(
         ".{EFFECTIVE_CONFIG_BINDING_FILE}.{}.{}.tmp",
@@ -1537,11 +1545,17 @@ pub fn is_temp_db_path(db_path: &Path) -> bool {
 /// across this daemon's shutdown and hands the locked file to the child,
 /// which refuses to start when the path it inherited is gone — so a held
 /// spawnlock passes every directory to the successor daemon untouched.
-/// Second, the residual race the spawnlock cannot cover: a successor that
-/// recreates the runtime dir in the microseconds between the caller's
-/// socket/pidfile unlinks and this removal can still lose its files — the
-/// same race those unlinks already have, accepted for the temp-database
-/// scope (test daemons), where an unreachable-daemon recovery path exists.
+/// Second, the residual race the spawnlock cannot cover — and the veto is a
+/// PROBE, not a hold, so it cannot close this: a client that acquires the
+/// spawnlock in the probe→removal gap hands its child a locked inode whose
+/// PATH this removal then deletes, and the child aborts the restart with
+/// "inherited parent spawnlock cannot be matched" — the exact client-visible
+/// failure the veto exists to prevent, shrunk to a microseconds window. A
+/// successor that simply recreates the runtime dir in that window can
+/// likewise lose its files — the same race the caller's socket/pidfile
+/// unlinks already have. Accepted for the temp-database scope (test
+/// daemons), where an unreachable-daemon recovery path exists and a failed
+/// autostart is retried.
 ///
 /// Callers must invoke this only on the clean-shutdown path, after the
 /// instance's socket and pidfile are unlinked and before the process exits,
@@ -1634,10 +1648,14 @@ pub fn daemon_gc_roots() -> DaemonGcRoots {
     let state = persistent_state_root();
     // Mirror runtime_dir()'s semantics exactly, including its UTF-8 `var`
     // (not `var_os`) read: when XDG_RUNTIME_DIR is unset the runtime dir IS
-    // the state root, and sweeping it twice would double-report.
+    // the state root. The same collapse applies when it points AT the state
+    // root — filter that too, or the same directory is swept under two root
+    // labels (the second pass reports NotFound, so nothing is double-deleted,
+    // but the roots must still be reported as one).
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
-        .map(|xdg| PathBuf::from(xdg).join("nestweaver"));
+        .map(|xdg| PathBuf::from(xdg).join("nestweaver"))
+        .filter(|root| *root != state);
     DaemonGcRoots {
         state,
         runtime,
@@ -1992,6 +2010,22 @@ fn collect_fallback_candidates(
 /// that cannot be resolved from `daemon.log` is reported as `unidentified`
 /// and left alone *before* the test runs, so there is no candidate whose
 /// deletion rests on an unprobed database.
+///
+/// One residual race, stated rather than hidden. The ownership probe and the
+/// deletion are not atomic, so a daemon BOOTING a temp or missing database
+/// between the two can lose directories mid-boot: a runtime-dir deletion
+/// landing between its pidfile claim and its socket bind unlinks the locked
+/// pidfile inode out from under it or fails the bind. The worst case is one
+/// retryable autostart failure — pidfile claim and socket bind recreate
+/// their directories, the database write lock is unaffected, and the client
+/// spawns again — and the same race existed for the state-only sweep before
+/// this change widened it to the runtime root. The pidfile flock narrows the
+/// window: the child claims it before opening the database or binding the
+/// socket, and a claimed flock spares the instance outright, so the
+/// uncovered span is only the client's pre-claim spawn phase (the sweep does
+/// not consult the client-side spawnlock — taking it here would serialize
+/// `daemon gc` against every in-flight spawn on the machine, a worse trade
+/// for a cleanup pass).
 pub fn gc_orphaned_daemon_dirs() -> std::io::Result<DaemonGcReport> {
     gc_orphaned_daemon_dirs_in(&daemon_gc_roots())
 }
@@ -2082,6 +2116,9 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
                 }
                 // A directory that vanished under us needs no reporting; anything
                 // else stays visible as still present rather than silently counted.
+                // A failure is recorded once per INSTANCE, not once per root —
+                // the dedup after the loop keeps a multi-root failure from
+                // reporting the same instance twice.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => report.kept.push(name.clone()),
             }
@@ -2090,6 +2127,7 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
 
     report.removed.sort();
     report.kept.sort();
+    report.kept.dedup();
     report.spared.sort();
     report.spared_database_write_lock.sort();
     report.spared_database_unreadable.sort();
@@ -2215,11 +2253,11 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Tests that mutate environment variables must hold this lock to avoid
     // racing with each other under `cargo test`'s default parallel execution.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Alias of the crate-wide lock — server.rs's e2e tests hold the same one.
+    use super::TEST_ENV_LOCK as ENV_LOCK;
 
     fn with_xdg_runtime<T>(root: &Path, test: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());

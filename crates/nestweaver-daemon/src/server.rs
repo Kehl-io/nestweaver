@@ -10358,9 +10358,13 @@ pub async fn run_server(
     // backstop for crashed daemons rather than the only reclaim path. Ordered
     // after the socket/pidfile unlinks above, while the instance flock is
     // still held (released only when `_pid_guard` drops at scope end, or at
-    // process exit for an inherited daemonize lock). A successor daemon that
-    // recreates the dir in the microseconds before process exit can still
-    // lose its files to this removal — the same race the socket/pidfile
+    // process exit for an inherited daemonize lock). The spawnlock veto
+    // inside is a PROBE, not a hold: a client that takes the spawnlock in the
+    // probe→removal gap hands its child a locked inode whose path the removal
+    // then deletes, and the child aborts the restart ("inherited parent
+    // spawnlock cannot be matched") — the client-visible worst case, shrunk
+    // to a microseconds window. A successor that recreates the dir in that
+    // window can likewise lose its files — the same race the socket/pidfile
     // unlinks above already have, accepted here for the temp-database scope
     // (test daemons), where an unreachable-daemon recovery path exists. A
     // real database's daemon keeps its logs and runtime records — the gate
@@ -17648,8 +17652,19 @@ mod watcher_e2e_tests {
     ///    scenario) blocks a plain re-watch but is adoptable with force;
     ///  - shutdown with an ACTIVE watcher completes promptly instead of
     ///    hanging on the watcher's blocking thread until the drain ceiling.
+    // Holding a std MutexGuard across await points is deliberate here: the
+    // guard only ever blocks sibling TEST threads that swap env vars (they
+    // take the same lock), never async tasks in this runtime — a tokio Mutex
+    // would buy nothing.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_e2e_pid_watch_force_and_shutdown() {
+        // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
+        // the daemon's whole lifetime under the same lock the lifecycle unit
+        // tests and the clean-shutdown e2e below hold while swapping XDG vars.
+        let _env_guard = lifecycle::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("brain.lbug");
         let repo = tmp.path().join("repo");
@@ -17750,11 +17765,42 @@ mod watcher_e2e_tests {
 
     /// A clean shutdown of a TEMP-database daemon leaves no state or runtime
     /// directory behind — the sweep is the backstop for crashed daemons, not
-    /// the only reclaim path. Uses the real per-user roots (like the e2e test
-    /// above): the instance id is a hash of this test's unique tempdir DB
+    /// the only reclaim path.
+    ///
+    /// Runs against SCRATCH roots: the daemon and these assertions resolve
+    /// env-dependent paths for the test's whole lifetime, so the test holds
+    /// `lifecycle::TEST_ENV_LOCK` from start to finish — a sibling unit test
+    /// flipping `XDG_RUNTIME_DIR` mid-boot (daemon binds under one root, the
+    /// assertions check another) is exactly the flake the lock exists to
+    /// prevent. The instance id is a hash of this test's unique tempdir DB
     /// path, so nothing else on the machine shares it.
+    // Holding a std MutexGuard across await points is deliberate here: the
+    // guard only ever blocks sibling TEST threads that swap env vars (they
+    // take the same lock), never async tasks in this runtime — a tokio Mutex
+    // would buy nothing.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_clean_shutdown_leaves_no_dirs_for_temp_db() {
+        let _env_guard = lifecycle::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let saved_env: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "NESTWEAVER_SOCK_FALLBACK_DIR",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state.path());
+            std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+            std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", fallback.path());
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("brain.lbug");
         assert!(lifecycle::is_temp_db_path(&db_path));
@@ -17808,5 +17854,14 @@ mod watcher_e2e_tests {
                 .exists(),
             "clean shutdown must not leave a socket-fallback dir behind"
         );
+
+        unsafe {
+            for (key, value) in saved_env {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }
