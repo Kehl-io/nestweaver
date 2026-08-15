@@ -1504,9 +1504,14 @@ fn state_dir_ownership(instance_id: &str, db_path: &Path) -> StateDirOwnership {
 
 /// Is a live daemon holding `instance_id`'s pidfile lock?
 ///
-/// The daemon opens the DB *before* taking the pidfile `flock(LOCK_EX)` and
-/// holds it for its whole lifetime, so a held lock means a healthy daemon.
-/// Fails toward `true` (spare) on any error we cannot interpret.
+/// The daemon takes the pidfile `flock(LOCK_EX)` BEFORE opening the database
+/// (`claim_instance_lock` precedes `GraphStore::open_or_create`), and releases
+/// it deterministically at the end of `serve()` while the database write lock
+/// — held by `Arc<GraphStore>` clones — can outlive it. A held lock therefore
+/// correlates with a live daemon only between those two edges: at startup the
+/// flock is held before the DB is open, and during shutdown it is released
+/// while the write lock is still held. Fails toward `true` (spare) on any
+/// error we cannot interpret.
 ///
 /// Corroborating evidence only — see [`state_dir_ownership`] for why this can never
 /// be the sole ownership test.

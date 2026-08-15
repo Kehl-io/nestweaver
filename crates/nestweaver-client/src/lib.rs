@@ -108,6 +108,10 @@ impl RestartConfig {
 pub struct PreparedRestart {
     config: RestartConfig,
     daemon_pid: u32,
+    /// The database whose write lock the replacement must be able to acquire.
+    /// Owner release waits only while this lock is `Held` — see
+    /// [`PreparedRestart::wait_for_owner_release`].
+    db_path: PathBuf,
     /// The exact inode whose held flock and contents were cross-checked with
     /// HealthCheck during PREPARE. COMMIT never reopens or rereads the path.
     pidfile: fs::File,
@@ -119,6 +123,41 @@ impl PreparedRestart {
         &self.config
     }
 
+    /// Wait until the previous owner is provably gone.
+    ///
+    /// "Gone" has exactly one definition on every restart path in this binary —
+    /// the same evidence daemon startup requires: the instance pidfile flock is
+    /// free (so the replacement can claim the instance) AND the database write
+    /// lock is not `Held` (so the replacement can open the store; the start
+    /// guard in `nestweaver-daemon/src/server.rs` hard-bails only on `Held`).
+    /// Like that guard, this wait PROCEEDS on `DbWriteLock::Unknown`: the
+    /// probe's inability to read the lock state is not evidence of a holder,
+    /// and the replacement's own `GraphStore::open_or_create` fails safely a
+    /// moment later if the lock really is held. That mirrors the one deliberate
+    /// exception to "treat `Unknown` as possibly-owned", documented at the
+    /// start guard — matching only `Held` — and keeps restart, auto-restart and
+    /// startup on one policy. The two locks are not released together: the
+    /// daemon's `_pid_guard` drops deterministically at the end of `serve()`,
+    /// while the write lock lives in `Arc<GraphStore>` clones that drop later
+    /// and nondeterministically — measured ~0.05–0.1s behind the pidfile
+    /// release on a clean teardown, and seconds when clones linger (observed
+    /// live during a drain). The pidfile lock alone is therefore a strictly
+    /// weaker signal, and gating on it let a restart spawn a replacement that
+    /// could not open the database, leaving the database with no daemon.
+    ///
+    /// Caller precondition: invoke this only after the incumbent has accepted a
+    /// shutdown. Both restart paths — manual `daemon restart` and the
+    /// version-mismatch auto-restart — call it from the post-shutdown COMMIT
+    /// step, and the phase-2 timeout message's "the incumbent was stopped"
+    /// relies on that ordering; it is not a property this wait establishes.
+    ///
+    /// The downstream health wait deliberately still treats a dead child as
+    /// terminal rather than re-spawning once on a write-lock conflict: after
+    /// this gate the only remaining conflict source is a third party outside
+    /// the spawn lock (e.g. a `--no-daemon` run) that holds the lock for its
+    /// whole lifetime, so an immediate re-spawn would hit the same lock — and
+    /// a dead child's exit status cannot distinguish a lock conflict from a
+    /// genuine boot failure.
     pub async fn wait_for_owner_release(&mut self) -> Result<()> {
         let ceiling = nestweaver_schema::drain_ceiling_from_env();
         self.wait_for_owner_release_for(std::time::Duration::from_secs(ceiling.saturating_add(5)))
@@ -126,20 +165,57 @@ impl PreparedRestart {
     }
 
     async fn wait_for_owner_release_for(&mut self, timeout: std::time::Duration) -> Result<()> {
+        // Phase 1: the pidfile flock, released deterministically at the end of
+        // the old owner's serve().
         let deadline = std::time::Instant::now() + timeout;
-
         while std::time::Instant::now() < deadline {
             if try_acquire_pidfile_lock(&self.pidfile)? {
                 self.owns_pidfile_lock = true;
-                return Ok(());
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        anyhow::bail!(
-            "daemon PID {} did not release its captured pidfile lock within {:.1}s; refusing to signal an uncertain PID or spawn a replacement. Stop the daemon manually, verify its identity, and retry",
-            self.daemon_pid,
-            timeout.as_secs_f64()
-        )
+        if !self.owns_pidfile_lock {
+            anyhow::bail!(
+                "daemon PID {} did not release its captured pidfile lock within {:.1}s; refusing to signal an uncertain PID or spawn a replacement. Stop the daemon manually, verify its identity, and retry",
+                self.daemon_pid,
+                timeout.as_secs_f64()
+            );
+        }
+
+        // Phase 2: the database write lock — the evidence daemon startup
+        // actually requires. It outlives the pidfile flock by the lifetime of
+        // the last `Arc<GraphStore>` clone, a delay bounded by process
+        // teardown rather than by the drain, so it gets its own full budget.
+        // Only `Held` blocks: `Unknown` proceeds immediately, exactly as the
+        // start guard does (the replacement's own DB open is the backstop), so
+        // a platform where the probe cannot read the lock state does not wait
+        // out the whole budget for nothing.
+        use nestweaver_daemon::lifecycle::DbWriteLock;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let state = nestweaver_daemon::lifecycle::db_write_lock(&self.db_path);
+            match state {
+                DbWriteLock::Held { .. } => {}
+                DbWriteLock::Free | DbWriteLock::Unknown => return Ok(()),
+            }
+            if std::time::Instant::now() >= deadline {
+                let detail = match state {
+                    DbWriteLock::Held { pid: Some(pid) } => format!("still held by PID {pid}"),
+                    _ => "still held by another process".to_string(),
+                };
+                anyhow::bail!(
+                    "daemon PID {} released its pidfile lock, but {:.1}s later the write lock on {} is {detail}. \
+                     The incumbent was stopped and no replacement was started — the database currently has no daemon. \
+                     Once the holder exits, bring one up with `nestweaver daemon --db {} start`",
+                    self.daemon_pid,
+                    timeout.as_secs_f64(),
+                    self.db_path.display(),
+                    self.db_path.display()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 
     /// Release the old owner's now-acquired pidfile lock immediately before a
@@ -296,6 +372,7 @@ pub fn prepare_restart(
         Ok(PreparedRestart {
             config,
             daemon_pid: health.pid,
+            db_path: db_path.to_path_buf(),
             pidfile,
             owns_pidfile_lock: false,
         })
@@ -594,8 +671,12 @@ impl DaemonClient {
                     // a successor.
                     prepared.wait_for_owner_release().await?;
 
-                    // The old owner is gone and we hold its inode lock. A
-                    // stale socket cannot belong to a successor because the
+                    // wait_for_owner_release returned, so the old owner's
+                    // pidfile flock is released AND the database write lock is
+                    // not Held — the same evidence daemon startup requires
+                    // (Unknown proceeds, exactly as the start guard's
+                    // deliberate exception does). We hold the inode lock, and
+                    // a stale socket cannot belong to a successor because the
                     // spawn lock has covered the whole transaction.
                     let stale_socket = nestweaver_daemon::lifecycle::socket_path(
                         &nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path),
@@ -853,9 +934,13 @@ impl DaemonClient {
                 && !autostart::is_process_alive(pid)
             {
                 anyhow::bail!(
-                    "daemon process {pid} exited before becoming healthy for {}. Check the daemon logs: {}",
+                    "daemon process {pid} exited before becoming healthy for {}. Check the daemon logs: {}. \
+                     If this was a restart replacement (e.g. it lost the database write lock to a third party \
+                     after the previous owner released it), the previous daemon is already stopped and the \
+                     database currently has no daemon — `nestweaver daemon --db {} start` brings one up",
                     db_path.display(),
-                    nestweaver_daemon::lifecycle::log_hint(&instance_id)
+                    nestweaver_daemon::lifecycle::log_hint(&instance_id),
+                    db_path.display()
                 );
             }
 
@@ -1499,6 +1584,7 @@ credential_method = "gh"
         let prepared = PreparedRestart {
             config: RestartConfig::CompiledDefaults,
             daemon_pid: std::process::id(),
+            db_path: PathBuf::from("/unused.lbug"),
             pidfile: file,
             owns_pidfile_lock: false,
         };
@@ -1545,6 +1631,7 @@ credential_method = "gh"
         let prepared = PreparedRestart {
             config: RestartConfig::CompiledDefaults,
             daemon_pid: child.id(),
+            db_path: dir.path().join("brain.lbug"),
             pidfile: observed,
             owns_pidfile_lock: false,
         };
@@ -1575,6 +1662,170 @@ credential_method = "gh"
         unsafe {
             libc::flock(owner.as_raw_fd(), libc::LOCK_UN);
         }
+    }
+
+    /// Fork a child that takes a POSIX write lock (`fcntl(F_SETLK, F_WRLCK)`)
+    /// on `path` and holds it until killed. A *separate process* is required:
+    /// POSIX record locks never conflict with the calling process, so an
+    /// in-process lock would be invisible to `F_GETLK`. The child touches only
+    /// async-signal-safe libc calls after `fork` (the path CString and the pipe
+    /// are prepared beforehand), which is what makes this safe from a
+    /// multi-threaded test harness.
+    fn fork_db_write_lock_holder(path: &Path) -> i32 {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(11);
+                }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as libc::c_short;
+                lock.l_whence = libc::SEEK_SET as libc::c_short;
+                if libc::fcntl(fd, libc::F_SETLK, &lock) != 0 {
+                    libc::_exit(12);
+                }
+                let ready = [1u8];
+                libc::write(fds[1], ready.as_ptr() as *const libc::c_void, 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut ready = [0u8; 1];
+        let read = unsafe { libc::read(fds[0], ready.as_mut_ptr() as *mut libc::c_void, 1) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(read, 1, "lock-holding child never signalled readiness");
+        pid
+    }
+
+    fn reap(pid: i32) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+
+    /// SIGKILL + reap the forked lock holder even when the test fails before
+    /// its explicit reap, so a failure mode never orphans a paused child
+    /// holding a POSIX lock.
+    struct ChildGuard(i32);
+
+    impl ChildGuard {
+        fn reap_now(mut self) {
+            reap(self.0);
+            self.0 = -1;
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                reap(self.0);
+            }
+        }
+    }
+
+    /// The defect behind the daemonless restart: the incumbent's pidfile guard
+    /// drops at the end of `serve()` while the database write lock — held by
+    /// `Arc<GraphStore>` clones — is released later and nondeterministically.
+    /// Owner-release evidence must therefore cover BOTH locks: the pidfile
+    /// flock being free says nothing about the write lock daemon startup
+    /// actually requires.
+    #[tokio::test]
+    async fn owner_release_with_free_pidfile_but_held_write_lock_is_not_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        fs::write(&pidfile, "1").unwrap();
+        let observed = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+
+        let db = dir.path().join("brain.lbug");
+        fs::write(&db, b"placeholder").unwrap();
+        let holder = ChildGuard(fork_db_write_lock_holder(&db));
+
+        let mut prepared = PreparedRestart {
+            config: RestartConfig::CompiledDefaults,
+            daemon_pid: holder.0 as u32,
+            db_path: db.clone(),
+            pidfile: observed,
+            owns_pidfile_lock: false,
+        };
+
+        let released = prepared
+            .wait_for_owner_release_for(std::time::Duration::from_millis(300))
+            .await;
+        let error = released.expect_err(
+            "pidfile lock free but database write lock still held — treating this as \
+             owner release spawns a replacement that cannot open the database and \
+             leaves it with no daemon",
+        );
+        assert!(
+            format!("{error:#}").contains("write lock"),
+            "unexpected error: {error:#}"
+        );
+
+        // Once the holder exits, the same wait must succeed promptly.
+        holder.reap_now();
+        prepared
+            .wait_for_owner_release_for(std::time::Duration::from_secs(5))
+            .await
+            .expect("write lock released — owner release is now provable");
+    }
+
+    /// The gate mirrors daemon startup's one deliberate exception to "treat
+    /// `Unknown` as possibly-owned": a lock state the probe cannot read is not
+    /// evidence of a holder, so the wait proceeds immediately rather than
+    /// burning its whole budget (the replacement's own DB open is the
+    /// backstop, exactly as it is for the start guard).
+    #[tokio::test]
+    async fn owner_release_proceeds_when_write_lock_state_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        fs::write(&pidfile, "1").unwrap();
+        let observed = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+
+        let db = dir.path().join("brain.lbug");
+        fs::write(&db, b"placeholder").unwrap();
+        // Unreadable database file: the probe's File::open fails, which is
+        // DbWriteLock::Unknown (as root the open succeeds instead and the
+        // probe reports Free — the wait proceeds promptly on either).
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut prepared = PreparedRestart {
+            config: RestartConfig::CompiledDefaults,
+            daemon_pid: std::process::id(),
+            db_path: db,
+            pidfile: observed,
+            owns_pidfile_lock: false,
+        };
+
+        let started = std::time::Instant::now();
+        prepared
+            .wait_for_owner_release_for(std::time::Duration::from_secs(5))
+            .await
+            .expect("Unknown is not evidence of a holder — the gate must proceed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the gate must proceed immediately on Unknown, not wait out its budget"
+        );
     }
 
     #[test]
