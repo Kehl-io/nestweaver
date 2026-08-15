@@ -703,6 +703,97 @@ fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
     }
 }
 
+/// PID of the process on the other end of a connected unix socket, as
+/// reported by the kernel. Unlike the pidfile (whose contents can be
+/// overwritten while the daemon still holds its flock), this cannot be faked
+/// by another process. Integration point: a future daemon self-reported-PID RPC
+/// can supersede this once it lands.
+#[cfg(target_os = "linux")]
+pub fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct UCred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    let mut cred = UCred {
+        pid: -1,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<UCred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut UCred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid)
+}
+
+/// Linux companion to [`unix_socket_peer_pid`] that also exposes the peer's
+/// uid: one `SO_PEERCRED` call fills one `UCred`, so the uid comes from the
+/// same kernel evidence. Adopting a pidfile-less daemon requires BOTH fields
+/// — a same-uid, PID-matching socket peer is corroboration an unlinked
+/// pidfile cannot erase. Linux-only because no other platform's peer-PID
+/// call reports a uid, and no new macOS-only surface may be added from this
+/// Linux tree.
+#[cfg(target_os = "linux")]
+pub fn unix_socket_peer_cred(stream: &std::os::unix::net::UnixStream) -> Option<(i32, u32)> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct UCred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    let mut cred = UCred {
+        pid: -1,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<UCred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut UCred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some((cred.pid, cred.uid))
+}
+
+/// macOS equivalent of Linux `SO_PEERCRED` — XNU's `LOCAL_PEERPID`.
+#[cfg(target_os = "macos")]
+pub fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    let mut pid: libc::pid_t = -1;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && pid > 0).then_some(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    None
+}
+
 fn persistent_state_root() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
@@ -1052,9 +1143,10 @@ pub fn read_effective_config_binding(
 }
 
 /// Read a binding and require its integer PID to match a daemon identity the
-/// caller has already verified through kernel socket/health evidence plus the
-/// held pidfile lock. This helper does not itself prove process liveness or
-/// ownership; PID equality alone is vulnerable to stale files and PID reuse.
+/// caller has already verified — through the held pidfile flock, or through
+/// kernel socket peer credentials when the pidfile was unlinked under a live
+/// daemon. This helper does not itself prove process liveness or ownership;
+/// PID equality alone is vulnerable to stale files and PID reuse.
 pub fn read_effective_config_binding_for_verified_pid(
     instance_id: &str,
     expected_pid: u32,
@@ -2954,6 +3046,29 @@ mod tests {
         assert_eq!(
             db_write_lock(&dir.path().join("never-created.lbug")),
             DbWriteLock::Free
+        );
+    }
+
+    /// The kernel names the process on the other end of a unix socket — the
+    /// unlink-proof evidence that backs both the socket-cleanup guard and the
+    /// pidfile-less daemon adoption.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_socket_peer_cred_reports_pid_and_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("peer.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+
+        assert_eq!(
+            unix_socket_peer_pid(&stream),
+            Some(std::process::id() as i32),
+            "SO_PEERCRED must name this process, the listener's owner"
+        );
+        assert_eq!(
+            unix_socket_peer_cred(&stream),
+            Some((std::process::id() as i32, unsafe { libc::geteuid() })),
+            "the cred variant must report the same PID plus the peer's uid"
         );
     }
 

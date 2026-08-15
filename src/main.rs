@@ -6064,7 +6064,7 @@ fn remove_unowned_daemon_runtime(
     //    possible evidence and it does not depend on any file's contents.
     if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
         return RuntimeCleanup::LiveSocketPeer {
-            pid: unix_socket_peer_pid(&stream),
+            pid: nestweaver_daemon::lifecycle::unix_socket_peer_pid(&stream),
         };
     }
 
@@ -6456,70 +6456,13 @@ fn unreachable_daemon_owner(
     pidfile_flock_held(pidfile).then_some(UnreachableOwner::PidfileLock)
 }
 
-/// PID of the process on the other end of a connected unix socket, as
-/// reported by the kernel. Unlike the pidfile (whose contents can be
-/// overwritten while the daemon still holds its flock), this cannot be faked
-/// by another process. Integration point: a future daemon self-reported-PID RPC
-/// can supersede this once it lands.
-#[cfg(target_os = "linux")]
-fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
-    use std::os::unix::io::AsRawFd;
-    #[repr(C)]
-    struct UCred {
-        pid: libc::pid_t,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-    }
-    let mut cred = UCred {
-        pid: -1,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<UCred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut UCred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    (rc == 0 && cred.pid > 0).then_some(cred.pid)
-}
-
-/// macOS equivalent of Linux `SO_PEERCRED` — XNU's `LOCAL_PEERPID`.
-#[cfg(target_os = "macos")]
-fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
-    use std::os::unix::io::AsRawFd;
-    const SOL_LOCAL: libc::c_int = 0;
-    const LOCAL_PEERPID: libc::c_int = 0x002;
-    let mut pid: libc::pid_t = -1;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            SOL_LOCAL,
-            LOCAL_PEERPID,
-            &mut pid as *mut libc::pid_t as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    (rc == 0 && pid > 0).then_some(pid)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<i32> {
-    None
-}
-
 /// The PID of the daemon serving `socket`, reported by the kernel at
 /// connect time. `None` when the socket is missing or refuses the connection
 /// — i.e. the daemon cannot confirm its identity and callers must refuse to
 /// signal the pidfile PID.
 fn daemon_socket_reported_pid(socket: &std::path::Path) -> Option<i32> {
     let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
-    unix_socket_peer_pid(&stream)
+    nestweaver_daemon::lifecycle::unix_socket_peer_pid(&stream)
 }
 
 /// Is the pidfile's PID verifiably our daemon? True when the process
