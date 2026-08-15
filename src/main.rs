@@ -5631,6 +5631,406 @@ fn daemon_process_running_for_db(db_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How often `nestweaver ui` polls the daemon that owns its listener.
+const UI_DAEMON_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Bound on one daemon health probe from the UI supervision loop, so a wedged
+/// socket cannot stall Ctrl-C handling on the client defaults (5s connect /
+/// 10s RPC).
+const UI_DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bound on one `serve_ui` RPC from the supervision loop. The RPC has no
+/// client-side deadline of its own, so a daemon that accepts but wedges
+/// would otherwise hang the loop (and Ctrl-C with it) — potentially with
+/// the degraded server already shut down.
+const UI_SERVE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound on the TCP connect that checks whether the UI port is serving.
+const UI_PORT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long the supervision loop waits for the degraded server to drain
+/// before aborting it; a slow-trickling client must not stall recovery
+/// (or Ctrl-C) forever.
+const DEGRADED_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A degraded "daemon is down" web server holding the UI port while the
+/// daemon is unreachable.
+struct DegradedUiServer {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl DegradedUiServer {
+    fn spawn(rt: &tokio::runtime::Runtime, port: u16) -> Self {
+        let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = rt.spawn(async move {
+            nestweaver_web::start_degraded_server(port, async move {
+                let _ = wait.await;
+            })
+            .await
+        });
+        Self { stop, task }
+    }
+
+    /// Stop serving and wait — bounded — for the listen socket to be
+    /// released, so the daemon can re-bind the port via `serve_ui`. If the
+    /// graceful drain outlasts [`DEGRADED_SHUTDOWN_TIMEOUT`] (a slow client
+    /// holding a connection open), the task is aborted to force the release.
+    fn shutdown(self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+        let _ = self.stop.send(());
+        let mut task = self.task;
+        match rt
+            .block_on(async { tokio::time::timeout(DEGRADED_SHUTDOWN_TIMEOUT, &mut task).await })
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_error)) => Err(anyhow::anyhow!(
+                "degraded UI server task failed: {join_error}"
+            )),
+            Err(_) => {
+                task.abort();
+                Err(anyhow::anyhow!(
+                    "degraded UI server did not stop within {DEGRADED_SHUTDOWN_TIMEOUT:?} — aborted"
+                ))
+            }
+        }
+    }
+}
+
+/// Probe the daemon that serves the UI. `Err` carries why the daemon is
+/// considered down (socket gone, connect failed, RPC failed, timed out).
+fn ui_daemon_health_probe(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    rt.block_on(async {
+        tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
+            let mut probe = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
+            probe.health_check().await?;
+            anyhow::Ok(())
+        })
+        .await
+        .context("daemon health probe timed out")?
+    })
+}
+
+/// Is anything accepting connections on the UI port? A healthy daemon does
+/// not prove the UI is served: `serve_ui` pre-checks the port with a
+/// throwaway bind, so the spawned server task can lose the real bind race
+/// with nothing but a daemon-side log to show for it.
+fn ui_port_serving(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        UI_PORT_PROBE_TIMEOUT,
+    )
+    .is_ok()
+}
+
+/// Issue `serve_ui` with a bounded wait (see [`UI_SERVE_RPC_TIMEOUT`]).
+/// `open_browser` is always false — a supervision retry must never pop
+/// windows. `watch`/`watch_repo_path` mirror the startup request.
+fn ui_serve_request(
+    rt: &tokio::runtime::Runtime,
+    client: &mut nestweaver_client::DaemonClient,
+    port: u16,
+    watch: bool,
+    watch_repo_path: &str,
+) -> anyhow::Result<nestweaver_proto::ServeUiResponse> {
+    rt.block_on(async {
+        tokio::time::timeout(
+            UI_SERVE_RPC_TIMEOUT,
+            client.serve_ui(port, false, watch, watch_repo_path, "default"),
+        )
+        .await
+        .context("serve_ui RPC timed out")?
+    })
+}
+
+/// Supervise the daemon-served web UI until Ctrl-C.
+///
+/// The UI's listening socket is owned by the daemon process (`serve_ui`
+/// spawns the axum server there), so a daemon death unbinds the port while
+/// this process would otherwise sit in `ctrlc_rx.recv()` — alive, silent,
+/// and serving nothing. While running, this polls the daemon; on loss it
+/// logs the cause at error level, takes over the port with a degraded
+/// "daemon is down" page, and keeps answering. On the daemon's return it
+/// re-resolves the connection (the startup client is never reused after an
+/// outage), hands the port back via a fresh `serve_ui`, and resumes full
+/// service — no app restart.
+///
+/// Two honesty rules beyond that happy path: recovery is only declared when
+/// the daemon serves OUR port (an "already running" response naming another
+/// port keeps the degraded page and is logged as-is), and while the daemon
+/// is up the port itself is probed — a daemon that outlives its UI task is
+/// re-issued `serve_ui`, never trusted silently.
+///
+/// `client` is replaced with the re-resolved client on recovery. Returns
+/// whether the daemon was up at exit, so the caller knows whether a
+/// `stop_ui` is meaningful.
+fn supervise_ui_daemon(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+    port: u16,
+    watch: bool,
+    watch_repo_path: &str,
+    ctrlc_rx: &std::sync::mpsc::Receiver<()>,
+    client: &mut nestweaver_client::DaemonClient,
+) -> bool {
+    let mut daemon_up = true;
+    let mut degraded: Option<DegradedUiServer> = None;
+    // Two consecutive probe failures before an outage is declared: a busy
+    // daemon can exceed the probe timeout without being down, and degrading
+    // against a LIVE daemon means grabbing (and failing to bind) a port it
+    // still owns.
+    let mut probe_failures = 0u32;
+    // Same two-strike rule for the port probe (the daemon's server task can
+    // take a moment to bind after a fresh serve_ui).
+    let mut port_failures = 0u32;
+    // The "daemon serves a different UI port" state is logged once per
+    // distinct port, not on every poll.
+    let mut mismatch_logged_for: Option<u16> = None;
+
+    loop {
+        match ctrlc_rx.recv_timeout(UI_DAEMON_POLL_INTERVAL) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        if daemon_up {
+            match ui_daemon_health_probe(rt, db_path) {
+                Ok(()) => {
+                    probe_failures = 0;
+                    // A healthy daemon does not prove the UI port is served
+                    // (its server task can have died independently), so probe
+                    // the port itself. The daemon still owns the port here,
+                    // so a dead port is repaired by re-issuing serve_ui —
+                    // never by binding the degraded server over a live daemon.
+                    if ui_port_serving(port) {
+                        port_failures = 0;
+                    } else {
+                        port_failures += 1;
+                        if port_failures >= 2 {
+                            port_failures = 0;
+                            tracing::error!(
+                                port,
+                                "daemon is healthy but the UI port is not serving — re-issuing serve_ui"
+                            );
+                            eprintln!(
+                                "Error: daemon is healthy but http://127.0.0.1:{port} is not serving — asking the daemon to re-serve it"
+                            );
+                            match ui_serve_request(rt, client, port, watch, watch_repo_path) {
+                                Ok(resp) if resp.ok => {
+                                    tracing::info!(port, "serve_ui re-issued: {}", resp.message)
+                                }
+                                Ok(resp) => tracing::error!(
+                                    port,
+                                    error = %resp.error,
+                                    "serve_ui re-issue refused: {}",
+                                    resp.message
+                                ),
+                                Err(error) => {
+                                    tracing::error!(port, "serve_ui re-issue failed: {error:#}")
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    probe_failures += 1;
+                    if probe_failures == 1 {
+                        tracing::warn!(
+                            port,
+                            "daemon health probe failed ({error:#}); probing again before declaring an outage"
+                        );
+                    } else {
+                        tracing::error!(
+                            port,
+                            "daemon lost ({error:#}); its UI listener died with it — \
+                             serving a degraded daemon-down page until the daemon returns"
+                        );
+                        eprintln!(
+                            "Error: daemon lost ({error:#}); the UI is degraded on http://127.0.0.1:{port} until the daemon returns"
+                        );
+                        probe_failures = 0;
+                        mismatch_logged_for = None;
+                        daemon_up = false;
+                    }
+                }
+            }
+        }
+
+        if !daemon_up {
+            // Reap a finished degraded server (e.g. a bind failure) so the
+            // failure is logged and serving is retried — never silent.
+            if degraded
+                .as_ref()
+                .is_some_and(|active| active.task.is_finished())
+                && let Some(active) = degraded.take()
+            {
+                match active.shutdown(rt) {
+                    Ok(()) => tracing::error!(
+                        port,
+                        "degraded UI server exited by itself while the daemon is down — restarting it"
+                    ),
+                    Err(error) => {
+                        tracing::error!(port, "degraded UI server failed: {error:#} — retrying")
+                    }
+                }
+            }
+
+            // Re-resolve the daemon connection; the startup client is dead.
+            if let Ok(mut candidate) =
+                rt.block_on(nestweaver_client::DaemonClient::connect_existing(db_path))
+                && rt.block_on(candidate.health_check()).is_ok()
+            {
+                // Ask BEFORE releasing the degraded port: while we hold it
+                // the daemon cannot bind, so ok:true here can only mean it
+                // ALREADY serves a UI — possibly a different port, if
+                // another `ui` command ran during the outage. Recovery is
+                // only declared when the daemon serves OUR port. watch=false
+                // on this probe: the "already running" arm would otherwise
+                // start a duplicate watcher on every poll.
+                match ui_serve_request(rt, &mut candidate, port, false, watch_repo_path) {
+                    Ok(resp)
+                        if resp.ok && resp.message.starts_with("UI server already running") =>
+                    {
+                        // Mirror the startup path: trust the ACTUAL port the
+                        // daemon reports, not the one we asked for.
+                        let actual_port = if resp.port != 0 {
+                            resp.port as u16
+                        } else {
+                            port
+                        };
+                        if actual_port == port {
+                            // The daemon already serves OUR port (the outage
+                            // was a false positive, or another ui bound it
+                            // while we were down).
+                            if let Some(active) = degraded.take()
+                                && let Err(error) = active.shutdown(rt)
+                            {
+                                tracing::warn!(
+                                    "degraded UI server did not shut down cleanly: {error:#}"
+                                );
+                            }
+                            tracing::info!(
+                                port,
+                                "daemon restored — full UI service resumed on :{port}"
+                            );
+                            eprintln!(
+                                "Daemon restored — full UI service resumed on http://127.0.0.1:{port}"
+                            );
+                            *client = candidate;
+                            mismatch_logged_for = None;
+                            daemon_up = true;
+                        } else if mismatch_logged_for != Some(actual_port) {
+                            // Honest state: the daemon took a different UI
+                            // request during the outage. Keep the degraded
+                            // page on OUR port rather than claiming a
+                            // recovery :port does not have.
+                            tracing::error!(
+                                port,
+                                actual_port,
+                                "daemon is back but serves the UI on :{actual_port}, not :{port} — keeping the degraded page"
+                            );
+                            eprintln!(
+                                "Error: daemon is back but serves the UI on http://127.0.0.1:{actual_port} — :{port} stays degraded"
+                            );
+                            mismatch_logged_for = Some(actual_port);
+                        }
+                    }
+                    Ok(resp) if !resp.ok && resp.error == "port_in_use" => {
+                        // Expected while our degraded server holds the port:
+                        // release it, then re-issue so the daemon binds
+                        // fresh (with the real watch setting).
+                        if let Some(active) = degraded.take()
+                            && let Err(error) = active.shutdown(rt)
+                        {
+                            tracing::warn!(
+                                "degraded UI server did not shut down cleanly: {error:#}"
+                            );
+                        }
+                        match ui_serve_request(rt, &mut candidate, port, watch, watch_repo_path) {
+                            Ok(resp) if resp.ok => {
+                                tracing::info!(
+                                    port,
+                                    "daemon restored — full UI service resumed on :{port}"
+                                );
+                                eprintln!(
+                                    "Daemon restored — full UI service resumed on http://127.0.0.1:{port}"
+                                );
+                                *client = candidate;
+                                mismatch_logged_for = None;
+                                daemon_up = true;
+                            }
+                            Ok(resp) => {
+                                tracing::error!(
+                                    port,
+                                    error = %resp.error,
+                                    "daemon is back but refused to resume the UI: {}",
+                                    resp.message
+                                );
+                                eprintln!(
+                                    "Error: daemon is back but could not resume the UI on :{port}: {}",
+                                    resp.message
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    port,
+                                    "daemon is back but serve_ui failed: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(resp) if resp.ok => {
+                        // A fresh-start claim while our degraded server still
+                        // holds the port — the daemon could not have bound
+                        // it. Hand over and let the port probe in the up
+                        // state verify; do NOT claim "resumed" on trust.
+                        if let Some(active) = degraded.take()
+                            && let Err(error) = active.shutdown(rt)
+                        {
+                            tracing::warn!(
+                                "degraded UI server did not shut down cleanly: {error:#}"
+                            );
+                        }
+                        tracing::warn!(
+                            port,
+                            "daemon claims the UI started on :{port} while the degraded server still held it — verifying via the port probe"
+                        );
+                        *client = candidate;
+                        mismatch_logged_for = None;
+                        daemon_up = true;
+                    }
+                    Ok(resp) => {
+                        tracing::error!(
+                            port,
+                            error = %resp.error,
+                            "daemon is back but refused to resume the UI: {}",
+                            resp.message
+                        );
+                        eprintln!(
+                            "Error: daemon is back but could not resume the UI on :{port}: {}",
+                            resp.message
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(port, "daemon is back but serve_ui failed: {error:#}");
+                    }
+                }
+            }
+
+            if !daemon_up && degraded.is_none() {
+                degraded = Some(DegradedUiServer::spawn(rt, port));
+            }
+        }
+    }
+
+    if let Some(active) = degraded.take() {
+        let _ = active.shutdown(rt);
+    }
+    daemon_up
+}
+
 /// Which PID, if any, `daemon stop` is allowed to signal.
 ///
 /// ONLY the pidfile PID and the socket peer are candidates. The database write
@@ -10419,14 +10819,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
                         });
-                        let _ = rx.recv();
+                        // The listener lives in the daemon process; supervise
+                        // it so a daemon outage degrades the UI instead of
+                        // leaving a healthy-looking shell with a dead port.
+                        let daemon_up_at_exit = supervise_ui_daemon(
+                            &rt,
+                            &db_path,
+                            port,
+                            watch,
+                            &watch_repo_path,
+                            &rx,
+                            &mut client,
+                        );
                         // Tell the daemon to stop serving so
                         // the listen port is released when the CLI exits.
-                        match rt.block_on(client.stop_ui()) {
-                            Ok(resp) if resp.ok => eprintln!("UI server stopped."),
-                            Ok(resp) => eprintln!("note: {}", resp.message),
-                            Err(e) => {
-                                eprintln!("warning: failed to stop UI server cleanly: {e:#}")
+                        // Meaningless while the daemon is down — the degraded
+                        // server was already shut down by supervise_ui_daemon.
+                        if daemon_up_at_exit {
+                            match rt.block_on(client.stop_ui()) {
+                                Ok(resp) if resp.ok => eprintln!("UI server stopped."),
+                                Ok(resp) => eprintln!("note: {}", resp.message),
+                                Err(e) => {
+                                    eprintln!("warning: failed to stop UI server cleanly: {e:#}")
+                                }
                             }
                         }
                     }
@@ -10471,7 +10886,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     });
                 }
 
+                // A returned serve future means the listener is gone; never
+                // survive that silently as a healthy-looking shell with a
+                // dead port. An Err propagates with its cause; a bare Ok is
+                // abnormal (no graceful shutdown is wired here) and is
+                // reported the same way — error log, non-zero exit.
                 rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
+                eprintln!(
+                    "Error: UI server on port {port} exited without an error — the port is no longer bound"
+                );
+                return Ok((EXIT_ERROR, None));
             }
 
             Ok((EXIT_SUCCESS, None))
