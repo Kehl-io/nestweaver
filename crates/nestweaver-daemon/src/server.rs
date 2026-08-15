@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -909,6 +909,12 @@ pub struct DaemonState {
     pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
     /// Number of pending + running jobs in the server-side job queue.
     pub indexing_queue_depth: Arc<AtomicU32>,
+    /// Brain-status documents served by this daemon process. A daemon-side
+    /// witness counter: a client that adopted this daemon after its pidfile
+    /// was unlinked proves the answer really came from the daemon (the
+    /// counter in the status `cache` block advances), not from the disclosed
+    /// read-only direct path, which has no such counter.
+    pub requests_served: AtomicU64,
     /// Per-tool query safeguards (timeouts, depth limits, result caps).
     pub safeguards: QuerySafeguards,
     /// Per-client rate limiters (token bucket via governor).
@@ -5616,14 +5622,20 @@ impl NestWeaverDaemon for DaemonService {
             .await?;
         // Inject server-side indexing status into the JSON response so
         // AI agents see it via the MCP tool path as well.
+        let served = self.state.requests_served.fetch_add(1, Ordering::Relaxed) + 1;
         let mut json_resp = resp.into_inner();
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["server_mode"] = serde_json::json!(self.state.server_mode);
             let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
             value["indexing_active"] = serde_json::json!(indexing_active);
-            if indexing_active {
-                value["indexing_repo"] = serde_json::json!(*self.state.indexing_repo.read().await);
-            }
+            // Always present (null when idle): the shared builder emits the
+            // key on every path, so the daemon must too, or key-set parity
+            // with the direct path breaks.
+            value["indexing_repo"] = if indexing_active {
+                serde_json::json!(*self.state.indexing_repo.read().await)
+            } else {
+                serde_json::Value::Null
+            };
             value["queue_depth"] =
                 serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
             // Write RPCs blocked on the daemon write lock are a different
@@ -5642,6 +5654,16 @@ impl NestWeaverDaemon for DaemonService {
             let embedding_status = self.state.embedding_runtime.status();
             value["embedding_status"] =
                 embedding_status_json(&embedding_status, &self.state.embed_progress.snapshot());
+            // Daemon-side witness counter in the `cache` block (the
+            // `hit_rate_pct` session-counter precedent): an adopted client
+            // proves the answer came from THIS daemon because the counter
+            // advances — the disclosed direct path has no such field.
+            if let Some(cache) = value
+                .get_mut("cache")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                cache.insert("requests_served".to_string(), serde_json::json!(served));
+            }
             if let Ok(s) = serde_json::to_string(&value) {
                 json_resp.result_json = s;
             }
@@ -8935,6 +8957,7 @@ pub async fn run_server(
         indexing_active: Arc::new(AtomicBool::new(false)),
         indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
         indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+        requests_served: AtomicU64::new(0),
         safeguards,
         rate_limiters: rate_limiters.clone(),
         drained: Arc::new(AtomicBool::new(false)),
@@ -15220,6 +15243,7 @@ mod startup_helper_tests {
             indexing_active: Arc::new(AtomicBool::new(false)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            requests_served: AtomicU64::new(0),
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
@@ -15299,6 +15323,7 @@ credential_method = "gh"
             indexing_active: Arc::new(AtomicBool::new(false)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            requests_served: AtomicU64::new(0),
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
