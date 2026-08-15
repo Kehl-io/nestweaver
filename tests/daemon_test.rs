@@ -1482,6 +1482,245 @@ fn daemon_crash_recovery() {
         .stdout(contains("running").and(contains("PID")));
 }
 
+/// Run `brain status --json` through the normal (daemon) path and return the
+/// parsed stdout document plus captured stderr.
+fn brain_status_json_via_daemon(db_path: &Path) -> (serde_json::Value, String) {
+    let output = daemon_cmd()
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "brain status --json failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("brain status stdout is not JSON: {error}\n{stdout}"));
+    (value, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// After `rm -f daemon.pid` under a live daemon, an ordinary read must still
+/// reach THAT daemon — proven by the daemon-side `requests_served` witness
+/// counter advancing, not by output equality — with no direct-path fallback
+/// warning on stderr.
+#[test]
+fn brain_status_adopts_the_incumbent_daemon_after_pidfile_unlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("adopt").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("pidfile should exist")
+        .trim()
+        .parse()
+        .expect("pidfile should contain a PID");
+
+    // The incident: the pidfile is unlinked under the live daemon.
+    std::fs::remove_file(&pidfile).unwrap();
+
+    let (first, first_stderr) = brain_status_json_via_daemon(&db_path);
+    let (second, second_stderr) = brain_status_json_via_daemon(&db_path);
+
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the incumbent daemon must still be alive after two reads"
+    );
+    for stderr in [&first_stderr, &second_stderr] {
+        assert!(
+            !stderr.contains("direct path"),
+            "the read must NOT fall back to the disclosed direct path:\n{stderr}"
+        );
+    }
+    let served_first = first["cache"]["requests_served"]
+        .as_u64()
+        .expect("a daemon-served status carries the requests_served witness counter");
+    let served_second = second["cache"]["requests_served"]
+        .as_u64()
+        .expect("a daemon-served status carries the requests_served witness counter");
+    assert!(
+        served_second > served_first,
+        "the daemon-side witness counter must advance across two reads \
+         ({served_first} -> {served_second}) — proof the answers came from the daemon"
+    );
+    assert!(
+        second["embedding_status"].is_object(),
+        "embedding_status must be a real object when the daemon answers: {second}"
+    );
+    assert_eq!(
+        second["degraded_components"],
+        serde_json::json!([]),
+        "an adopted answer is not degraded: {second}"
+    );
+}
+
+/// The other side of the anti-impersonation gate: a rogue process squatting
+/// on the instance socket with NO daemon behind it is never adopted — the
+/// read degrades to the direct path, disclosed both on stderr and in-band
+/// (`degraded_components`, a `daemon_bypassed` warning, null daemon-runtime
+/// fields). Stdout alone must carry the disclosure.
+#[test]
+fn brain_status_behind_a_rogue_socket_listener_degrades_with_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("rogue").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    // No daemon anywhere. A rogue listener squats on the instance socket.
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let runtime = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
+    std::fs::create_dir_all(&runtime).unwrap();
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    let rogue = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let output = daemon_cmd()
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "2")
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    drop(rogue);
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&runtime);
+
+    assert!(
+        output.status.success(),
+        "the disclosed direct fallback still answers with exit 0: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("brain status stdout is not JSON: {error}\n{stdout}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("answering from the read-only direct path"),
+        "the stderr disclosure must survive: {stderr}"
+    );
+    assert_eq!(
+        value["degraded_components"],
+        serde_json::json!(["daemon_runtime"]),
+        "the degraded marker must be in-band: {value}"
+    );
+    assert!(
+        value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["kind"] == "daemon_bypassed"),
+        "a daemon_bypassed warning must carry the disclosure: {value}"
+    );
+    for field in [
+        "embedding_status",
+        "indexing_active",
+        "indexing_repo",
+        "queue_depth",
+        "write_queue_depth",
+        "write_holder",
+        "write_holder_seconds",
+        "tantivy_available",
+        "tantivy_doc_count",
+    ] {
+        assert!(
+            value.get(field).is_some_and(|v| v.is_null()),
+            "{field} must be an explicit null on the direct path: {value}"
+        );
+    }
+    assert!(
+        value["index_publication"].is_object(),
+        "file-derived fields still populate on the direct path: {value}"
+    );
+}
+
+/// `brain status --json` must emit the SAME top-level schema whether the
+/// daemon or the disclosed direct path answers, so a `2>/dev/null` consumer
+/// cannot silently receive a different document.
+#[test]
+fn brain_status_json_schema_parity_between_daemon_and_direct_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("parity").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let (served, _) = brain_status_json_via_daemon(&db_path);
+
+    let output = no_daemon_cmd()
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "direct brain status --json failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let direct: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("direct brain status stdout is not JSON: {error}\n{stdout}")
+    });
+
+    let key_set = |value: &serde_json::Value| {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    let served_keys = key_set(&served);
+    let direct_keys = key_set(&direct);
+    assert_eq!(
+        served_keys,
+        direct_keys,
+        "top-level schema must be identical across paths\n  only in daemon: {:?}\n  only in direct: {:?}",
+        served_keys.difference(&direct_keys).collect::<Vec<_>>(),
+        direct_keys.difference(&served_keys).collect::<Vec<_>>(),
+    );
+
+    // The direct answer discloses the bypass and keeps file-derived fields.
+    assert_eq!(
+        direct["degraded_components"],
+        serde_json::json!(["daemon_runtime"])
+    );
+    assert!(direct["embedding_status"].is_null());
+    assert!(direct["index_publication"].is_object());
+    assert!(direct.get("warnings").is_some());
+    // The daemon answer is not degraded.
+    assert_eq!(served["degraded_components"], serde_json::json!([]));
+    assert!(served["embedding_status"].is_object());
+}
+
 /// A configless `daemon start` must REUSE the last configuration that reached
 /// readiness instead of silently resetting to compiled defaults.
 ///

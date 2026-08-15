@@ -348,6 +348,151 @@ fn open_verified_live_pidfile_at(path: &Path, health_pid: u32) -> Result<fs::Fil
     Ok(file)
 }
 
+/// The identity gate for an incumbent daemon that answered a HealthCheck:
+/// the pidfile-flock proof first, and — when that proof can no longer run
+/// because the pidfile was unlinked under a live daemon (its flock survives
+/// on an inode no path reaches) — corroboration by kernel-supplied socket
+/// peer credentials. Returns the opened pidfile when the flock gate ran,
+/// `None` when identity was established by peer credentials instead.
+///
+/// On refusal the error is the ORIGINAL pidfile-gate error with the
+/// peer-credential detail appended, so today's diagnostic string survives.
+fn verified_incumbent_identity(
+    db_path: &Path,
+    instance_id: &str,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<Option<fs::File>> {
+    match open_verified_live_pidfile(instance_id, health.pid) {
+        Ok(file) => Ok(Some(file)),
+        Err(pidfile_error) => {
+            adopt_pidfileless_incumbent(db_path, instance_id, health).map_err(|refusal| {
+                pidfile_error.context(format!(
+                    "socket peer-credential corroboration also failed: {refusal}"
+                ))
+            })?;
+            Ok(None)
+        }
+    }
+}
+
+/// Corroborate the HealthCheck identity of a daemon whose pidfile flock can
+/// no longer be verified — the signature state of `rm daemon.pid` under a
+/// live daemon. This gates ADOPTION of the incumbent for reads; it is an
+/// anti-impersonation control, so every check must hold, and all of the
+/// evidence is kernel-supplied — a process that merely created files in the
+/// runtime dir cannot forge any of it:
+///
+///  1. `health.instance_id` must match the requested instance — enforced by
+///     `verify_replacement_evidence` immediately after this returns, against
+///     the same health snapshot.
+///  2. The kernel-reported PID of the socket peer must equal `health.pid`
+///     (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS).
+///  3. On platforms reporting a peer uid (Linux), it must equal our euid —
+///     a different user's process cannot pose as our daemon.
+///  4. The database write lock must not contradict the identity — see
+///     [`adoption_lock_verdict`].
+///
+/// The `Err` payload is a human-readable refusal reason the caller appends
+/// to the original pidfile-gate error.
+fn adopt_pidfileless_incumbent(
+    db_path: &Path,
+    instance_id: &str,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> std::result::Result<(), String> {
+    let socket = nestweaver_daemon::lifecycle::socket_path(instance_id);
+    let stream = std::os::unix::net::UnixStream::connect(&socket).map_err(|error| {
+        format!(
+            "cannot connect to daemon socket {}: {error}",
+            socket.display()
+        )
+    })?;
+    socket_peer_matches_health(&stream, health.pid)?;
+    adoption_lock_verdict(
+        nestweaver_daemon::lifecycle::db_write_lock(db_path),
+        health.pid,
+    )?;
+    info!(
+        pid = health.pid,
+        "adopting the incumbent daemon whose pidfile was unlinked: \
+         socket peer credentials corroborate the HealthCheck identity"
+    );
+    Ok(())
+}
+
+/// Checks 2 (and 3 on Linux) of [`adopt_pidfileless_incumbent`]: the
+/// kernel-reported socket peer identity must match the HealthCheck PID, and
+/// where the platform reports a peer uid it must match our euid. A platform
+/// that cannot name the peer cannot corroborate and refuses.
+#[cfg(target_os = "linux")]
+fn socket_peer_matches_health(
+    stream: &std::os::unix::net::UnixStream,
+    health_pid: u32,
+) -> std::result::Result<(), String> {
+    let Some((pid, uid)) = nestweaver_daemon::lifecycle::unix_socket_peer_cred(stream) else {
+        return Err("kernel reported no peer credentials for the daemon socket".to_string());
+    };
+    if pid != health_pid as i32 {
+        return Err(format!(
+            "socket peer PID {pid} does not match HealthCheck PID {health_pid}"
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if uid != euid {
+        return Err(format!(
+            "socket peer uid {uid} does not match the client euid {euid}"
+        ));
+    }
+    Ok(())
+}
+
+/// Non-Linux platforms report a peer PID but no uid, so only check 2 runs.
+#[cfg(not(target_os = "linux"))]
+fn socket_peer_matches_health(
+    stream: &std::os::unix::net::UnixStream,
+    health_pid: u32,
+) -> std::result::Result<(), String> {
+    match nestweaver_daemon::lifecycle::unix_socket_peer_pid(stream) {
+        Some(pid) if pid == health_pid as i32 => Ok(()),
+        Some(pid) => Err(format!(
+            "socket peer PID {pid} does not match HealthCheck PID {health_pid}"
+        )),
+        None => Err("kernel reported no peer PID for the daemon socket".to_string()),
+    }
+}
+
+/// Check 4 of [`adoption_lock_verdict`](adopt_pidfileless_incumbent): the
+/// database write lock — the one ownership proof an operator's `rm` cannot
+/// erase — must not contradict the HealthCheck identity.
+///
+/// `Held` by a DIFFERENT pid refuses: someone else owns the database, so the
+/// socket peer is not its writer. An anonymous holder and an unreadable lock
+/// state (`Unknown`) also refuse — adoption has no net: unlike daemon
+/// startup's proceed-on-`Unknown` exception (whose own DB open is the
+/// backstop and fails safely), nothing downstream of adoption fails safely,
+/// so it must fail closed. `Free` accepts (a read-only snapshot replica
+/// never takes the write lock), and `Held` by the HealthCheck PID itself is
+/// the strongest case.
+fn adoption_lock_verdict(
+    lock: nestweaver_daemon::lifecycle::DbWriteLock,
+    health_pid: u32,
+) -> std::result::Result<(), String> {
+    use nestweaver_daemon::lifecycle::DbWriteLock;
+    match lock {
+        DbWriteLock::Held { pid: Some(holder) } if holder == health_pid as i32 => Ok(()),
+        DbWriteLock::Held { pid: Some(holder) } => Err(format!(
+            "database write lock is held by PID {holder}, not the HealthCheck PID {health_pid}"
+        )),
+        DbWriteLock::Held { pid: None } => {
+            Err("database write lock is held by a process the kernel does not name".to_string())
+        }
+        DbWriteLock::Unknown => Err(
+            "database write lock state is unreadable; adoption cannot rule out a different owner"
+                .to_string(),
+        ),
+        DbWriteLock::Free => Ok(()),
+    }
+}
+
 /// Capture trustworthy live daemon ownership and configuration before any
 /// shutdown request. Callers must not shut down when this returns an error.
 pub fn prepare_restart(
@@ -872,6 +1017,15 @@ impl DaemonClient {
     /// effective-config attestation all fit inside `timeout`. `ignore_pid` is
     /// the unowned pidfile value observed before spawn and must not be mistaken
     /// for the replacement dying before it has rewritten the pidfile.
+    ///
+    /// When the pidfile flock proof cannot run — the pidfile was unlinked
+    /// under a live daemon, so its lock survives only on the orphaned inode —
+    /// the incumbent is ADOPTED for reads on kernel-supplied socket peer
+    /// credentials instead (see [`verified_incumbent_identity`]). This scope
+    /// cut is deliberate: the restart/signaling paths ([`prepare_restart`],
+    /// [`connect_verified_replacement`], [`PreparedRestart::wait_for_owner_release`])
+    /// KEEP the strict pidfile-inode gate, so a pidfile-less daemon can be
+    /// adopted for reads but never auto-restarted or signaled.
     pub async fn wait_ready(
         db_path: &Path,
         timeout: std::time::Duration,
@@ -901,7 +1055,8 @@ impl DaemonClient {
                             if started.elapsed() >= timeout {
                                 break;
                             }
-                            let _owned = open_verified_live_pidfile(&instance_id, health.pid)?;
+                            let _owned =
+                                verified_incumbent_identity(db_path, &instance_id, &health)?;
                             let binding = nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
                                 &instance_id,
                                 health.pid,
@@ -1960,6 +2115,149 @@ credential_method = "gh"
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(400),
             "must poll for the full timeout, not fail on the first attempt"
+        );
+    }
+
+    // ── pidfile-less daemon adoption (verified_incumbent_identity) ────────
+
+    fn health_for(pid: u32, instance_id: &str) -> nestweaver_proto::HealthCheckResponse {
+        nestweaver_proto::HealthCheckResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            instance_id: instance_id.to_string(),
+            pid,
+            ..Default::default()
+        }
+    }
+
+    /// A temp database with its REAL per-instance runtime dir created, so
+    /// tests can bind listeners and forge pidfiles at the paths the client
+    /// actually probes. Cleans up the global runtime artifacts even on panic.
+    struct RuntimeDirFixture {
+        instance_id: String,
+        db: PathBuf,
+        socket: PathBuf,
+        pidfile: PathBuf,
+    }
+
+    impl RuntimeDirFixture {
+        fn new(dir: &tempfile::TempDir) -> Self {
+            let db = dir.path().join("brain.lbug");
+            fs::write(&db, b"placeholder").unwrap();
+            let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+            fs::create_dir_all(nestweaver_daemon::lifecycle::runtime_dir(&instance_id)).unwrap();
+            Self {
+                socket: nestweaver_daemon::lifecycle::socket_path(&instance_id),
+                pidfile: nestweaver_daemon::lifecycle::pidfile_path(&instance_id),
+                instance_id,
+                db,
+            }
+        }
+    }
+
+    impl Drop for RuntimeDirFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.socket);
+            let _ = fs::remove_file(&self.pidfile);
+            let _ =
+                fs::remove_dir_all(nestweaver_daemon::lifecycle::runtime_dir(&self.instance_id));
+        }
+    }
+
+    #[test]
+    fn adoption_lock_verdict_refuses_contradicting_unknown_and_anonymous_locks() {
+        use nestweaver_daemon::lifecycle::DbWriteLock;
+
+        // Held by the HealthCheck PID itself: the strongest case.
+        assert!(adoption_lock_verdict(DbWriteLock::Held { pid: Some(71) }, 71).is_ok());
+        // Free: the read-only snapshot-replica precedent.
+        assert!(adoption_lock_verdict(DbWriteLock::Free, 71).is_ok());
+
+        let held_elsewhere =
+            adoption_lock_verdict(DbWriteLock::Held { pid: Some(999) }, 71).unwrap_err();
+        assert!(
+            held_elsewhere.contains("held by PID 999"),
+            "{held_elsewhere}"
+        );
+        let anonymous = adoption_lock_verdict(DbWriteLock::Held { pid: None }, 71).unwrap_err();
+        assert!(anonymous.contains("does not name"), "{anonymous}");
+        // Unlike daemon startup's proceed-on-Unknown exception, adoption has
+        // no subsequent action that fails safely — Unknown refuses.
+        let unknown = adoption_lock_verdict(DbWriteLock::Unknown, 71).unwrap_err();
+        assert!(unknown.contains("unreadable"), "{unknown}");
+    }
+
+    /// A rogue listener squatting on the instance socket whose HealthCheck
+    /// claims a PID the kernel does not corroborate is REFUSED — the
+    /// anti-impersonation property the pidfile flock used to provide.
+    #[test]
+    fn adoption_refuses_a_rogue_listener_with_a_foreign_health_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = RuntimeDirFixture::new(&dir);
+        let _rogue = std::os::unix::net::UnixListener::bind(&fixture.socket).unwrap();
+
+        // The socket peer is THIS process; the HealthCheck claims another PID.
+        let health = health_for(std::process::id() + 1000, &fixture.instance_id);
+        let refusal = adopt_pidfileless_incumbent(&fixture.db, &fixture.instance_id, &health)
+            .expect_err("a peer-PID mismatch must refuse adoption");
+        assert!(
+            refusal.contains("does not match HealthCheck PID"),
+            "{refusal}"
+        );
+    }
+
+    /// An honest HealthCheck (the peer IS the claimed PID, same uid) is still
+    /// refused when the database write lock names a different owner.
+    #[test]
+    fn adoption_refuses_when_the_write_lock_is_held_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = RuntimeDirFixture::new(&dir);
+        let _listener = std::os::unix::net::UnixListener::bind(&fixture.socket).unwrap();
+        let _holder = ChildGuard(fork_db_write_lock_holder(&fixture.db));
+
+        let health = health_for(std::process::id(), &fixture.instance_id);
+        let refusal = adopt_pidfileless_incumbent(&fixture.db, &fixture.instance_id, &health)
+            .expect_err("a write lock held by another process must refuse adoption");
+        assert!(
+            refusal.contains("database write lock is held by PID"),
+            "{refusal}"
+        );
+    }
+
+    /// The accept case: peer PID and uid match the HealthCheck identity and
+    /// the write lock does not contradict it (`Free` — the read-only replica
+    /// precedent).
+    #[test]
+    fn adoption_accepts_the_honest_incumbent_on_peer_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = RuntimeDirFixture::new(&dir);
+        let _listener = std::os::unix::net::UnixListener::bind(&fixture.socket).unwrap();
+
+        let health = health_for(std::process::id(), &fixture.instance_id);
+        adopt_pidfileless_incumbent(&fixture.db, &fixture.instance_id, &health)
+            .expect("kernel-corroborated identity with a free write lock must adopt");
+    }
+
+    /// A forged pidfile whose flock is trivially free, with nothing serving
+    /// the socket, is refused — and the refusal keeps today's pidfile
+    /// diagnostic string with the peer-credential detail appended.
+    #[test]
+    fn forged_pidfile_without_a_served_socket_is_refused_with_the_pidfile_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = RuntimeDirFixture::new(&dir);
+        // Forge: our own PID in the pidfile, no flock held, no socket peer.
+        fs::write(&fixture.pidfile, format!("{}\n", std::process::id())).unwrap();
+
+        let health = health_for(std::process::id(), &fixture.instance_id);
+        let error = verified_incumbent_identity(&fixture.db, &fixture.instance_id, &health)
+            .expect_err("a forged pidfile without a served socket must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("daemon pidfile lock is not held"),
+            "the original pidfile diagnostic must survive: {message}"
+        );
+        assert!(
+            message.contains("socket peer-credential corroboration also failed"),
+            "the peer-credential detail must be appended: {message}"
         );
     }
 }
