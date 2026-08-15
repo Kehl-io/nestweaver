@@ -1528,6 +1528,24 @@ fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
     out
 }
 
+/// The one-line index-publication state for the `brain status` text body.
+///
+/// The "(see warning)" pointer is printed ONLY when a warning actually
+/// follows: `brain_status_warnings` pushes the `index_publication_wedged`
+/// entry only for a wedged publication, so a dirty-but-not-wedged state —
+/// routine during active indexing, when the writer is still alive — gets an
+/// informational line with no pointer and no overstatement.
+fn format_index_publication_line(dirty: bool, wedged: bool) -> Option<&'static str> {
+    if !dirty {
+        return None;
+    }
+    if wedged {
+        Some("  Index publication: wedged — ranked queries fail closed (see warning)")
+    } else {
+        Some("  Index publication: in flight — ranked queries fail closed until the writer commits")
+    }
+}
+
 #[cfg(test)]
 mod brain_status_warning_tests {
     use super::*;
@@ -1590,6 +1608,50 @@ mod brain_status_warning_tests {
         assert!(out.contains("keep a"), "{out:?}");
         assert!(
             out.contains("nestweaver instance merge --from b --to a"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn clean_publication_prints_no_status_line() {
+        assert_eq!(format_index_publication_line(false, false), None);
+    }
+
+    #[test]
+    fn in_flight_publication_line_does_not_point_at_a_warning() {
+        // Dirty-but-not-wedged is the ROUTINE state during active indexing
+        // (live writer). The warnings builder pushes nothing for it, so the
+        // line must not promise a "(see warning)" that never follows.
+        let line = format_index_publication_line(true, false)
+            .expect("a dirty publication gets a status line");
+        assert!(
+            !line.contains("(see warning)"),
+            "no warning follows an in-flight publication; the line must not point at one: {line:?}"
+        );
+        assert!(
+            !line.contains("wedged"),
+            "an in-flight publication must not be overstated as wedged: {line:?}"
+        );
+    }
+
+    #[test]
+    fn wedged_publication_line_points_at_a_warning_that_follows() {
+        // The wedged one-liner promises a warning — pin that the warning
+        // renderer really does emit the matching entry with its repair
+        // command, so the pointer can never dangle.
+        let line = format_index_publication_line(true, true)
+            .expect("a wedged publication gets a status line");
+        assert!(line.contains("wedged"), "{line:?}");
+        assert!(line.contains("(see warning)"), "{line:?}");
+        let warnings = vec![serde_json::json!({
+            "kind": "index_publication_wedged",
+            "warning": "index publication is wedged: ranked queries fail closed",
+            "action": "nestweaver repair --db /tmp/x.lbug --force",
+        })];
+        let out = format_brain_status_warnings(&warnings);
+        assert!(out.contains("index publication is wedged"), "{out:?}");
+        assert!(
+            out.contains("nestweaver repair --db /tmp/x.lbug --force"),
             "{out:?}"
         );
     }
@@ -15928,19 +15990,16 @@ fn run_brain(
                     println!("  Tags:      {tags}");
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
-                    // One-line publication state when dirty — the full
-                    // diagnosis and repair command ride in the warning below.
-                    if let Some(publication) = value.get("index_publication")
-                        && publication["dirty"].as_bool().unwrap_or(false)
-                    {
-                        let state = if publication["wedged"].as_bool().unwrap_or(false) {
-                            "wedged"
-                        } else {
-                            "dirty"
-                        };
-                        println!(
-                            "  Index publication: {state} — ranked queries fail closed (see warning)"
-                        );
+                    // One-line publication state when dirty — the "(see
+                    // warning)" pointer is only printed when a warning
+                    // actually follows (wedged), not for a routine in-flight
+                    // publication.
+                    if let Some(publication) = value.get("index_publication") {
+                        let dirty = publication["dirty"].as_bool().unwrap_or(false);
+                        let wedged = publication["wedged"].as_bool().unwrap_or(false);
+                        if let Some(line) = format_index_publication_line(dirty, wedged) {
+                            println!("{line}");
+                        }
                     }
                     if let Some(embedding) = value.get("embedding_status") {
                         println!("Embedding:");
@@ -16176,18 +16235,13 @@ fn run_brain(
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
                 // One-line publication state when dirty, mirroring the
-                // daemon-routed path — the full diagnosis and repair command
-                // ride in the warning forwarded below.
+                // daemon-routed path — the "(see warning)" pointer only when
+                // a warning actually follows (wedged).
                 let publication = nestweaver_engine::index_publication::status(db_path);
-                if publication.dirty {
-                    let state = if publication.is_wedged() {
-                        "wedged"
-                    } else {
-                        "dirty"
-                    };
-                    println!(
-                        "  Index publication: {state} — ranked queries fail closed (see warning)"
-                    );
+                if let Some(line) =
+                    format_index_publication_line(publication.dirty, publication.is_wedged())
+                {
+                    println!("{line}");
                 }
                 // nw-121: the daemon prints an `Embedding:` block here and this
                 // path printed nothing at all — same command, same database,
