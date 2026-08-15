@@ -5475,11 +5475,24 @@ fn tool_brain_status(
         })
         .collect();
 
+    // nw-C2: index-publication state, read ONCE from the store's own path
+    // and shared between the warnings builder and the `index_publication`
+    // block below, so the two can never disagree about which database they
+    // describe (thread-local vs store path) or race a marker cleared between
+    // two reads. Unlike the Wave A write-path fields (`write_queue_depth`,
+    // `write_holder`, the embedding `pass_*` set), which come from the daemon
+    // and are therefore absent on the direct `--no-daemon` and MCP-over-HTTP
+    // payloads, this is derived from the marker FILE and so populates with no
+    // daemon running. The user who reported the wedge was on exactly that
+    // direct path.
+    let publication_status = store
+        .db_path()
+        .map(nestweaver_engine::index_publication::status);
     // Structured warnings (duplicate-root collisions, wedged index
-    // publication) come from the shared helper so the CLI's direct
+    // publication) come from the shared builder so the CLI's direct
     // (`--no-daemon`) path forwards the SAME array instead of re-deriving a
     // subset locally.
-    let warnings = brain_status_warnings(store, db_path.as_deref());
+    let warnings = brain_status_warnings_for(store, store.db_path(), publication_status.as_ref());
     let repos_json: Vec<Value> = repos
         .iter()
         .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
@@ -5553,28 +5566,21 @@ fn tool_brain_status(
         db_path.as_deref().map(cache_stats).unwrap_or((0, 0, None));
     let cache_hit_rate_pct = cache_hit_rate.map(|r| (r * 100.0).round() as u64);
 
-    // nw-C2: index-publication state. Unlike the Wave A write-path fields
-    // (`write_queue_depth`, `write_holder`, the embedding `pass_*` set), which
-    // come from the daemon and are therefore absent on the direct
-    // `--no-daemon` and MCP-over-HTTP payloads, this is derived from the marker
-    // FILE and so populates with no daemon running. The user who reported the
-    // wedge was on exactly that direct path. The matching
-    // `index_publication_wedged` warning is pushed by `brain_status_warnings`.
-    let index_publication = store
-        .db_path()
-        .map(nestweaver_engine::index_publication::status)
-        .map(|status| {
-            json!({
-                "dirty": status.dirty,
-                "determinable": status.determinable,
-                "marker_age_s": status.marker_age_s,
-                "writer_pid": status.writer_pid,
-                "writer_alive": status.writer_alive,
-                "writer_reason": status.writer_reason,
-                "wedged": status.is_wedged(),
-                "marker_path": status.marker_path,
-            })
-        });
+    // The `index_publication` payload reuses the single status read taken
+    // above; the matching `index_publication_wedged` warning is pushed by
+    // `brain_status_warnings_for` from that same read.
+    let index_publication = publication_status.as_ref().map(|status| {
+        json!({
+            "dirty": status.dirty,
+            "determinable": status.determinable,
+            "marker_age_s": status.marker_age_s,
+            "writer_pid": status.writer_pid,
+            "writer_alive": status.writer_alive,
+            "writer_reason": status.writer_reason,
+            "wedged": status.is_wedged(),
+            "marker_path": status.marker_path,
+        })
+    });
 
     Ok(json!({
         "vaults": vaults_json,
@@ -5623,6 +5629,20 @@ fn tool_brain_status(
 /// a wedged publication at all. Every entry carries a `kind` so renderers
 /// can special-case a shape and still forward the rest generically.
 pub fn brain_status_warnings(store: &GraphStore, db_path: Option<&std::path::Path>) -> Vec<Value> {
+    let db_path = db_path.or_else(|| store.db_path());
+    let publication = db_path.map(nestweaver_engine::index_publication::status);
+    brain_status_warnings_for(store, db_path, publication.as_ref())
+}
+
+/// Core of [`brain_status_warnings`] with the index-publication status
+/// already read, so `tool_brain_status` can share ONE marker read — against
+/// ONE db path — between the wedge warning and its `index_publication`
+/// block. `db_path` and `publication` must describe the same database.
+fn brain_status_warnings_for(
+    store: &GraphStore,
+    db_path: Option<&std::path::Path>,
+    publication: Option<&nestweaver_engine::index_publication::IndexPublicationStatus>,
+) -> Vec<Value> {
     // Detect duplicate-root collisions. The CLI's local (non-daemon) path
     // emits these warnings to stderr; forward them through the JSON-RPC
     // response so daemon-routed callers and `--json` consumers see the
@@ -5711,23 +5731,21 @@ pub fn brain_status_warnings(store: &GraphStore, db_path: Option<&std::path::Pat
     // this populates with no daemon running — the user who reported the
     // wedge was on exactly that direct path. `kind` makes the entry
     // addressable for renderers that special-case warning shapes.
-    let publication_db_path = db_path.or_else(|| store.db_path());
-    if let Some(p) = publication_db_path {
-        let status = nestweaver_engine::index_publication::status(p);
-        if status.is_wedged() {
-            warnings.push(json!({
-                "kind": "index_publication_wedged",
-                "warning": if status.determinable {
-                    "index publication is wedged: ranked queries (brain_context, \
-                     project_context, investigate) fail closed until it is reconciled. \
-                     This is an index PUBLICATION marker, not a dirty git working tree."
-                } else {
-                    "index publication marker state cannot be determined (permissions or \
-                     I/O error on the sidecar directory); ranked queries fail closed."
-                },
-                "action": status.repair_command_for(p),
-            }));
-        }
+    if let (Some(p), Some(status)) = (db_path, publication)
+        && status.is_wedged()
+    {
+        warnings.push(json!({
+            "kind": "index_publication_wedged",
+            "warning": if status.determinable {
+                "index publication is wedged: ranked queries (brain_context, \
+                 project_context, investigate) fail closed until it is reconciled. \
+                 This is an index PUBLICATION marker, not a dirty git working tree."
+            } else {
+                "index publication marker state cannot be determined (permissions or \
+                 I/O error on the sidecar directory); ranked queries fail closed."
+            },
+            "action": status.repair_command_for(p),
+        }));
     }
 
     warnings
