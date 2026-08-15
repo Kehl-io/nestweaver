@@ -12,7 +12,7 @@ use axum::{
     extract::Request,
     http::{self, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{any, delete, get, post, put},
 };
 use rust_embed::RustEmbed;
 
@@ -305,11 +305,13 @@ async fn degraded_response(request: Request) -> Response {
         .into_response()
 }
 
-/// Router served while the daemon is unreachable: every route reports the
-/// outage. The status is `503`, not `200`, so health checks and supervisors
-/// see the truth; browsers still render the page body.
+/// Router served while the daemon is unreachable: every route, on every
+/// method, reports the outage. The status is `503`, not `200`, so health
+/// checks and supervisors see the truth; browsers still render the page
+/// body. `any` (not `get`) so the real UI's POST routes (/api/v1/context,
+/// /api/v1/llm/query, exports) get the same 503 instead of a bare 405.
 pub fn degraded_router() -> Router {
-    Router::new().fallback(get(degraded_response))
+    Router::new().fallback(any(degraded_response))
 }
 
 /// Serve [`degraded_router`] on `port` until `shutdown` resolves. Returning
@@ -451,6 +453,29 @@ mod degraded_tests {
             response.headers().get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("daemon_unavailable"), "body: {text}");
+    }
+
+    /// The real UI has POST routes (/api/v1/context, /api/v1/llm/query,
+    /// exports); in degraded mode those must get the same 503 outage
+    /// response, not a bare 405 from a GET-only fallback.
+    #[tokio::test]
+    async fn degraded_router_answers_non_get_methods() {
+        use tower::ServiceExt;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/context")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+
+        let response = degraded_router().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
