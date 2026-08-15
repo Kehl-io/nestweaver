@@ -1454,6 +1454,209 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
     }
 }
 
+/// Render `brain_status` warnings for the text output. Both the daemon-routed
+/// and the direct (`--no-daemon`) paths forward the tool's `warnings` array
+/// through this one renderer so the two cannot drift apart.
+///
+/// `duplicate_vault_root` keeps its rich rendering (per-entry instances plus
+/// remediation commands). Every OTHER kind is forwarded generically — the
+/// `warning` text, plus the `action` when present — because the previous
+/// renderer matched only that one kind and silently dropped everything else,
+/// which is how a wedged index publication produced no text output at all.
+fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for w in warnings {
+        let kind = w["kind"].as_str().unwrap_or("");
+        if kind == "duplicate_vault_root" {
+            let root = w["root_path"].as_str().unwrap_or("?");
+            let entries = w["entries"].as_array().cloned().unwrap_or_default();
+            out.push_str(&format!(
+                "Warning: {} vault entries share root path {}:\n",
+                entries.len(),
+                root
+            ));
+            for e in &entries {
+                let name = e["name"].as_str().unwrap_or("?");
+                let instance = e["instance_id"].as_str().unwrap_or("?");
+                let uid = e["uid"].as_str().unwrap_or("?");
+                let n = e["note_count"].as_u64().unwrap_or(0);
+                out.push_str(&format!(
+                    "    - {name} [instance: {instance}] uid={uid} ({n} notes)\n"
+                ));
+            }
+            out.push_str(
+                "  This usually means brain add was run with different --instance values.\n",
+            );
+            // Prefer the targeted remediation produced by tool_brain_status
+            // when present, fall back to the generic three-option guidance
+            // for older daemon binaries.
+            let cmds = w["remediation_commands"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let hint = w["remediation_hint"].as_str().unwrap_or("");
+            if !cmds.is_empty() {
+                if !hint.is_empty() {
+                    out.push_str(&format!("  {hint}\n"));
+                }
+                out.push_str("  Run:\n");
+                for c in &cmds {
+                    if let Some(s) = c.as_str() {
+                        out.push_str(&format!("      {s}\n"));
+                    }
+                }
+            } else {
+                out.push_str(&format!(
+                    "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                     Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>\n"
+                ));
+            }
+        } else {
+            // Generic forwarding: a warning kind this binary does not know —
+            // emitted by a newer daemon, or any future tool-side warning —
+            // must still reach the user verbatim rather than be dropped.
+            match w["warning"].as_str() {
+                Some(msg) => out.push_str(&format!("Warning: {msg}\n")),
+                None => out.push_str(&format!("Warning: {w}\n")),
+            }
+            if let Some(action) = w["action"].as_str() {
+                out.push_str(&format!("  Run: {action}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// The one-line index-publication state for the `brain status` text body.
+///
+/// The "(see warning)" pointer is printed ONLY when a warning actually
+/// follows: `brain_status_warnings` pushes the `index_publication_wedged`
+/// entry only for a wedged publication, so a dirty-but-not-wedged state —
+/// routine during active indexing, when the writer is still alive — gets an
+/// informational line with no pointer and no overstatement.
+fn format_index_publication_line(dirty: bool, wedged: bool) -> Option<&'static str> {
+    if !dirty {
+        return None;
+    }
+    if wedged {
+        Some("  Index publication: wedged — ranked queries fail closed (see warning)")
+    } else {
+        Some("  Index publication: in flight — ranked queries fail closed until the writer commits")
+    }
+}
+
+#[cfg(test)]
+mod brain_status_warning_tests {
+    use super::*;
+
+    #[test]
+    fn unrecognised_warning_kind_is_forwarded_not_dropped() {
+        // A synthetic kind no released binary renders specially: the generic
+        // path must still surface the warning text and action verbatim.
+        let warnings = vec![serde_json::json!({
+            "kind": "synthetic_future_kind",
+            "warning": "synthetic condition this CLI predates",
+            "action": "run `nestweaver synthetic-repair`",
+        })];
+        let out = format_brain_status_warnings(&warnings);
+        assert!(
+            out.contains("synthetic condition this CLI predates"),
+            "an unrecognised warning kind must still reach text output: {out:?}"
+        );
+        assert!(
+            out.contains("run `nestweaver synthetic-repair`"),
+            "the warning's action must be rendered too: {out:?}"
+        );
+    }
+
+    #[test]
+    fn warning_without_a_kind_field_is_forwarded() {
+        // The wedged-publication shape emitted by daemons predating the
+        // `kind` field: {"warning", "action"} only. It must still render,
+        // including the repair command.
+        let warnings = vec![serde_json::json!({
+            "warning": "index publication is wedged: ranked queries fail closed",
+            "action": "nestweaver repair --db /tmp/x.lbug --force",
+        })];
+        let out = format_brain_status_warnings(&warnings);
+        assert!(out.contains("index publication is wedged"), "{out:?}");
+        assert!(
+            out.contains("nestweaver repair --db /tmp/x.lbug --force"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_vault_root_keeps_its_rich_rendering() {
+        let warnings = vec![serde_json::json!({
+            "kind": "duplicate_vault_root",
+            "root_path": "/vault",
+            "entries": [
+                {"name": "v", "instance_id": "a", "uid": "u1", "note_count": 3},
+                {"name": "v", "instance_id": "b", "uid": "u2", "note_count": 0},
+            ],
+            "remediation_commands": ["nestweaver instance merge --from b --to a"],
+            "remediation_hint": "keep a",
+        })];
+        let out = format_brain_status_warnings(&warnings);
+        assert!(
+            out.contains("2 vault entries share root path /vault"),
+            "{out:?}"
+        );
+        assert!(out.contains("uid=u1"), "{out:?}");
+        assert!(out.contains("keep a"), "{out:?}");
+        assert!(
+            out.contains("nestweaver instance merge --from b --to a"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn clean_publication_prints_no_status_line() {
+        assert_eq!(format_index_publication_line(false, false), None);
+    }
+
+    #[test]
+    fn in_flight_publication_line_does_not_point_at_a_warning() {
+        // Dirty-but-not-wedged is the ROUTINE state during active indexing
+        // (live writer). The warnings builder pushes nothing for it, so the
+        // line must not promise a "(see warning)" that never follows.
+        let line = format_index_publication_line(true, false)
+            .expect("a dirty publication gets a status line");
+        assert!(
+            !line.contains("(see warning)"),
+            "no warning follows an in-flight publication; the line must not point at one: {line:?}"
+        );
+        assert!(
+            !line.contains("wedged"),
+            "an in-flight publication must not be overstated as wedged: {line:?}"
+        );
+    }
+
+    #[test]
+    fn wedged_publication_line_points_at_a_warning_that_follows() {
+        // The wedged one-liner promises a warning — pin that the warning
+        // renderer really does emit the matching entry with its repair
+        // command, so the pointer can never dangle.
+        let line = format_index_publication_line(true, true)
+            .expect("a wedged publication gets a status line");
+        assert!(line.contains("wedged"), "{line:?}");
+        assert!(line.contains("(see warning)"), "{line:?}");
+        let warnings = vec![serde_json::json!({
+            "kind": "index_publication_wedged",
+            "warning": "index publication is wedged: ranked queries fail closed",
+            "action": "nestweaver repair --db /tmp/x.lbug --force",
+        })];
+        let out = format_brain_status_warnings(&warnings);
+        assert!(out.contains("index publication is wedged"), "{out:?}");
+        assert!(
+            out.contains("nestweaver repair --db /tmp/x.lbug --force"),
+            "{out:?}"
+        );
+    }
+}
+
 fn format_effective_config(config: Option<&nestweaver_proto::EffectiveConfig>) -> String {
     use nestweaver_proto::effective_config::Source;
 
@@ -15787,6 +15990,17 @@ fn run_brain(
                     println!("  Tags:      {tags}");
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
+                    // One-line publication state when dirty — the "(see
+                    // warning)" pointer is only printed when a warning
+                    // actually follows (wedged), not for a routine in-flight
+                    // publication.
+                    if let Some(publication) = value.get("index_publication") {
+                        let dirty = publication["dirty"].as_bool().unwrap_or(false);
+                        let wedged = publication["wedged"].as_bool().unwrap_or(false);
+                        if let Some(line) = format_index_publication_line(dirty, wedged) {
+                            println!("{line}");
+                        }
+                    }
                     if let Some(embedding) = value.get("embedding_status") {
                         println!("Embedding:");
                         println!(
@@ -15817,59 +16031,11 @@ fn run_brain(
                         }
                     }
                     // Forward structured warnings from the MCP response —
-                    // e.g. duplicate-vault-root collisions. Previously these
-                    // were only emitted on the local (non-daemon) code path.
+                    // duplicate-vault-root collisions, a wedged index
+                    // publication, and any kind this binary predates —
+                    // through the shared renderer so nothing is dropped.
                     if let Some(warnings) = value.get("warnings").and_then(|v| v.as_array()) {
-                        for w in warnings {
-                            let kind = w["kind"].as_str().unwrap_or("");
-                            if kind == "duplicate_vault_root" {
-                                let root = w["root_path"].as_str().unwrap_or("?");
-                                let entries = w["entries"].as_array().cloned().unwrap_or_default();
-                                eprintln!(
-                                    "Warning: {} vault entries share root path {}:",
-                                    entries.len(),
-                                    root
-                                );
-                                for e in &entries {
-                                    let name = e["name"].as_str().unwrap_or("?");
-                                    let instance = e["instance_id"].as_str().unwrap_or("?");
-                                    let uid = e["uid"].as_str().unwrap_or("?");
-                                    let n = e["note_count"].as_u64().unwrap_or(0);
-                                    eprintln!(
-                                        "    - {name} [instance: {instance}] uid={uid} ({n} notes)"
-                                    );
-                                }
-                                eprintln!(
-                                    "  This usually means brain add was run with different --instance values."
-                                );
-                                // Prefer the targeted remediation produced
-                                // by tool_brain_status when present, fall
-                                // back to the generic three-option guidance
-                                // for older daemon binaries.
-                                let cmds = w["remediation_commands"]
-                                    .as_array()
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let hint = w["remediation_hint"].as_str().unwrap_or("");
-                                if !cmds.is_empty() {
-                                    if !hint.is_empty() {
-                                        eprintln!("  {hint}");
-                                    }
-                                    eprintln!("  Run:");
-                                    for c in &cmds {
-                                        if let Some(s) = c.as_str() {
-                                            eprintln!("      {s}");
-                                        }
-                                    }
-                                } else {
-                                    eprintln!(
-                                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
-                                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
-                                    );
-                                }
-                            }
-                        }
+                        eprint!("{}", format_brain_status_warnings(warnings));
                     }
                     // ── Upstream server info ─────────────────────────────
                     let upstream_configs = nestweaver_client::discovery::discover_upstreams(
@@ -16068,6 +16234,15 @@ fn run_brain(
                 println!("  Tags:      {tag_count}");
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
+                // One-line publication state when dirty, mirroring the
+                // daemon-routed path — the "(see warning)" pointer only when
+                // a warning actually follows (wedged).
+                let publication = nestweaver_engine::index_publication::status(db_path);
+                if let Some(line) =
+                    format_index_publication_line(publication.dirty, publication.is_wedged())
+                {
+                    println!("{line}");
+                }
                 // nw-121: the daemon prints an `Embedding:` block here and this
                 // path printed nothing at all — same command, same database,
                 // silently different answer. An omitted section reads as "no
@@ -16106,45 +16281,14 @@ fn run_brain(
                 }
             }
 
-            // Warn when multiple vault UIDs map to the same canonical root
-            // path — usually caused by brain add with mismatched --instance
-            // or missing --config. This produces phantom 0-note vault rows.
-            // Each entry surfaces name + instance_id + uid so the user can
-            // target `brain remove --instance <id>` precisely.
-            let mut root_to_vaults: std::collections::HashMap<
-                &str,
-                Vec<&nestweaver_schema::Vault>,
-            > = std::collections::HashMap::new();
-            for v in &vaults {
-                root_to_vaults
-                    .entry(v.root_path.as_str())
-                    .or_default()
-                    .push(v);
-            }
-            for (root, rows) in &root_to_vaults {
-                if rows.len() > 1 {
-                    eprintln!(
-                        "Warning: {} vault entries share root path {}:",
-                        rows.len(),
-                        root
-                    );
-                    for v in rows {
-                        let n = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
-                        eprintln!(
-                            "    - {} [instance: {}] uid={} ({} notes)",
-                            v.name, v.instance_id, v.uid, n
-                        );
-                    }
-                    eprintln!(
-                        "  This usually means brain add was run with different --instance values."
-                    );
-                    eprintln!(
-                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
-                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>",
-                    );
-                }
-            }
+            // Forward the SAME structured warnings the daemon-routed path
+            // renders — duplicate-vault-root collisions, a wedged index
+            // publication, and any kind this binary predates — through the
+            // shared builder + renderer. The previous locally-derived block
+            // only ever reported duplicate roots, so a wedged publication
+            // produced no text output on this path at all.
+            let warnings = nestweaver_mcp::tools::brain_status_warnings(&store, Some(db_path));
+            eprint!("{}", format_brain_status_warnings(&warnings));
 
             Ok((EXIT_SUCCESS, None))
         }
