@@ -5395,7 +5395,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nIn server mode, includes additional fields: server_mode, indexing_active, indexing_repo, queue_depth.\n\nWhen served by a daemon it also reports write-path liveness: `write_queue_depth` (write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs), `write_holder`, `write_holder_seconds`, and, inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` for an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". These write-path and pass fields come from the daemon, so the direct `--no-daemon` and MCP-over-HTTP payloads do not carry them.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer these fields honestly: they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -5417,11 +5417,16 @@ fn tool_brain_status(
 /// [`mark_brain_status_daemon_bypassed`].
 ///
 /// Fields only a live daemon can answer honestly — see
-/// [`DAEMON_RUNTIME_STATUS_FIELDS`] — are ALWAYS present, emitted as explicit
-/// nulls here so a `--json 2>/dev/null` consumer can never silently receive a
-/// different schema on the direct path. `degraded_components` follows the
-/// `brain_search` precedent: always present, empty unless a component was
-/// bypassed.
+/// [`DAEMON_RUNTIME_STATUS_FIELDS`] — are ALWAYS present, so a
+/// `--json 2>/dev/null` consumer can never silently receive a different
+/// schema on the direct path. The seven daemon-owned runtime fields are
+/// explicit nulls here (the daemon's gRPC handler overwrites them with live
+/// values); the two tantivy fields are derived from the builder's own
+/// `tantivy` argument, and the CLI's direct fallback re-nulls even those via
+/// [`mark_brain_status_daemon_bypassed`] — a process without the daemon's
+/// index open cannot claim `false`/`0` honestly. `degraded_components`
+/// follows the `brain_search` precedent: always present, empty unless a
+/// component was bypassed.
 pub fn brain_status_json(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,

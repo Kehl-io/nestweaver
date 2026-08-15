@@ -15417,12 +15417,21 @@ fn warn_daemon_bypassed(db_path: &std::path::Path, rpc_name: &str, cause: &str) 
     if WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // The in-band markers exist ONLY on the `brain status` direct path — do
+    // not claim them for other RPCs, or a `2>/dev/null` consumer will hunt
+    // stdout for markers that are not there and read their absence as "not
+    // degraded".
+    let marker_note = if rpc_name == "brain_status" {
+        " `--json` output marks the bypass in-band via `degraded_components` and a \
+         `daemon_bypassed` warning."
+    } else {
+        ""
+    };
     eprintln!(
         "Warning: the daemon could not serve `{rpc_name}` for {} — answering from the \
          read-only direct path instead.\n  cause: {cause}\n  \
          The direct answer carries no daemon-runtime state (embedding readiness, write/index \
-         queue depth); `--json` output marks it via `degraded_components` and a \
-         `daemon_bypassed` warning. `nestweaver daemon --db {} status` shows the daemon's \
+         queue depth).{marker_note} `nestweaver daemon --db {} status` shows the daemon's \
          side, and NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS covers a daemon that is merely slow \
          to boot.",
         db_path.display(),
