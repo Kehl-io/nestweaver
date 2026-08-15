@@ -280,6 +280,54 @@ pub async fn start_server(
     start_server_with_router(app, port, open_browser).await
 }
 
+/// Degraded-mode page served while the daemon that owns the graph is down.
+/// The UI process keeps its port bound across a daemon outage and answers
+/// every route with this, so a browser or the menubar app sees the outage
+/// instead of a dead socket.
+const DEGRADED_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>NestWeaver — daemon unavailable</title>\n</head>\n<body>\n<h1>The NestWeaver daemon is down</h1>\n<p>The graph daemon is unreachable, so the UI cannot serve graph data right now. The UI is still running and resumes full service automatically once the daemon returns — no restart needed.</p>\n</body>\n</html>\n";
+
+async fn degraded_response(request: Request) -> Response {
+    let path = request.uri().path();
+    // API routes stay machine-readable in degraded mode too.
+    if path == "/api" || path.starts_with("/api/") {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(http::header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"daemon_unavailable","message":"The NestWeaver daemon is down; the UI is serving a degraded page and resumes full service once the daemon returns."}"#,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DEGRADED_PAGE,
+    )
+        .into_response()
+}
+
+/// Router served while the daemon is unreachable: every route reports the
+/// outage. The status is `503`, not `200`, so health checks and supervisors
+/// see the truth; browsers still render the page body.
+pub fn degraded_router() -> Router {
+    Router::new().fallback(get(degraded_response))
+}
+
+/// Serve [`degraded_router`] on `port` until `shutdown` resolves. Returning
+/// `Ok` therefore always means a requested shutdown; a bind or serve failure
+/// is the `Err` case and carries the underlying cause.
+pub async fn start_degraded_server(
+    port: u16,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::warn!("nestweaver-web serving degraded daemon-down page on http://{addr}");
+    axum::serve(listener, degraded_router().into_make_service())
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
 /// Start the web UI server with a pre-built router.
 ///
 /// This allows callers (e.g. the daemon's `serve_ui` RPC) to customise the
@@ -359,5 +407,54 @@ mod frontend_assets_tests {
         let response = spa_fallback(request).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod degraded_tests {
+    use super::*;
+
+    /// The degraded page must plainly name the daemon outage and answer 503,
+    /// so a port probe never mistakes it for a healthy UI.
+    #[tokio::test]
+    async fn degraded_page_names_the_daemon_outage() {
+        let request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = degraded_response(request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("daemon is down"),
+            "degraded page must say the daemon is down: {text}"
+        );
+    }
+
+    /// API consumers get a machine-readable 503, not an HTML page.
+    #[tokio::test]
+    async fn degraded_api_response_is_machine_readable() {
+        let request = Request::builder()
+            .uri("/api/v1/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = degraded_response(request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("daemon_unavailable"), "body: {text}");
     }
 }

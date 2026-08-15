@@ -4074,10 +4074,14 @@ impl NestWeaverDaemon for DaemonService {
         // is tracked so `stop_ui` can abort it and release the listen port
         // (LOW: ui port leak).
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                nestweaver_web::start_server_with_router(web_router, port, open_browser).await
-            {
-                tracing::error!("UI server error: {e}");
+            match nestweaver_web::start_server_with_router(web_router, port, open_browser).await {
+                // No graceful shutdown is wired up here (stop_ui aborts the
+                // task), so a clean return means the listener is gone while
+                // the daemon looks healthy — never let that pass silently.
+                Ok(()) => tracing::error!(
+                    "UI server on port {port} exited without an error — the port is no longer bound"
+                ),
+                Err(e) => tracing::error!("UI server error: {e}"),
             }
         });
         {

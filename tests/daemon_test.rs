@@ -1435,6 +1435,160 @@ export function transportcountneedle_three() { return impacttarget(); }
     }
 }
 
+/// Minimal HTTP/1.0 GET against the loopback UI port. Returns the status
+/// code and the raw response text, or `None` when nothing is listening.
+fn ui_http_get(port: u16, path: &str) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = text.split_whitespace().nth(1)?.parse().ok()?;
+    Some((status, text))
+}
+
+/// Poll `probe` until it returns true or the deadline elapses.
+fn wait_until(deadline: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if probe() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Reproduction for the UI/daemon outage defect: a running `ui` must keep
+/// its port answering across a daemon outage — degraded while the daemon is
+/// down, full service again once the daemon returns, with no app restart —
+/// and must log the failure instead of surviving silently with a dead port.
+#[test]
+fn ui_survives_daemon_outage_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("ui-outage").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // A port nothing else holds.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    // Spawn `ui` as a long-running child, stderr captured for the log
+    // assertion (a silent failure is the defect's second half).
+    let ui_stderr = std::fs::File::create(dir.path().join("ui-stderr.log")).unwrap();
+    let ui = StdCommand::new(bin_path())
+        .args([
+            "ui",
+            "--no-open",
+            "--port",
+            &port.to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(ui_stderr))
+        .spawn()
+        .expect("failed to spawn nestweaver ui");
+
+    // Cleanup on any panic path: the UI child must not leak.
+    struct UiChildGuard(std::process::Child);
+    impl Drop for UiChildGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::kill(self.0.id() as i32, libc::SIGINT) };
+            for _ in 0..25 {
+                if self.0.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = self.0.kill();
+        }
+    }
+    let mut ui = UiChildGuard(ui);
+
+    // 1. Full service while the daemon is up.
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            matches!(ui_http_get(port, "/api/v1/health"), Some((200, _)))
+        }),
+        "UI never reached http=200 with the daemon up"
+    );
+
+    // 2. Kill the daemon with SIGKILL.
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("pidfile should exist")
+        .trim()
+        .parse()
+        .expect("pidfile should contain a PID");
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+
+    // 3. The port must keep answering with a degraded page that names the
+    //    daemon outage — never listening-dead-but-alive.
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            match ui_http_get(port, "/") {
+                Some((status, body)) => status == 503 && body.to_lowercase().contains("daemon"),
+                None => false,
+            }
+        }),
+        "after killing the daemon the UI port must serve a degraded page \
+         (503 naming the daemon outage), not a dead socket"
+    );
+    assert!(
+        ui.0.try_wait().ok().flatten().is_none(),
+        "the UI process must survive the daemon outage"
+    );
+
+    // 3b. The failure must be logged, not silent.
+    let stderr_log = std::fs::read_to_string(dir.path().join("ui-stderr.log")).unwrap();
+    assert!(
+        stderr_log.to_lowercase().contains("daemon")
+            && (stderr_log.contains("error")
+                || stderr_log.to_lowercase().contains("down")
+                || stderr_log.to_lowercase().contains("lost")),
+        "the daemon outage must be logged at error level with its cause; got:\n{stderr_log}"
+    );
+
+    // 4. Restore the daemon: full service must resume with no app restart.
+    start_daemon(&db_path);
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            matches!(ui_http_get(port, "/api/v1/health"), Some((200, _)))
+        }),
+        "restoring the daemon must restore full UI service without an app restart"
+    );
+    assert!(
+        ui.0.try_wait().ok().flatten().is_none(),
+        "the UI process must still be the original one (no restart)"
+    );
+}
+
 #[test]
 fn daemon_crash_recovery() {
     let dir = tempfile::tempdir().unwrap();
