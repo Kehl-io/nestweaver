@@ -10353,6 +10353,20 @@ pub async fn run_server(
     // released when `_pid_guard` drops at end of scope).
     let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));
 
+    // An ephemeral database's daemon leaves NOTHING behind: unlink its state,
+    // runtime, and socket-fallback dirs outright, so `daemon gc` is the
+    // backstop for crashed daemons rather than the only reclaim path. Ordered
+    // after the socket/pidfile unlinks above, while the instance flock is
+    // still held (released only when `_pid_guard` drops at scope end, or at
+    // process exit for an inherited daemonize lock). A successor daemon that
+    // recreates the dir in the microseconds before process exit can still
+    // lose its files to this removal — the same race the socket/pidfile
+    // unlinks above already have, accepted here for the temp-database scope
+    // (test daemons), where an unreachable-daemon recovery path exists. A
+    // real database's daemon keeps its logs and runtime records — the gate
+    // is inside.
+    lifecycle::remove_instance_dirs_for_temp_db(&db_path, &instance_id);
+
     Ok(())
 }
 
@@ -17724,9 +17738,75 @@ mod watcher_e2e_tests {
             .expect("server task panicked")
             .expect("run_server error");
 
-        // run_server writes its log under the real per-user state dir —
-        // clean up this instance's artifacts.
+        // run_server writes its log under the real per-user state dir. This
+        // daemon's database is a temp DB, so the shutdown path already
+        // unlinked the instance's state and runtime dirs itself (asserted by
+        // `daemon_clean_shutdown_leaves_no_dirs_for_temp_db` below); the
+        // removals here are the belt-and-suspenders version for anything the
+        // gate deliberately keeps.
         let _ = std::fs::remove_dir_all(lifecycle::log_dir(&instance_id));
         let _ = std::fs::remove_dir_all(lifecycle::runtime_dir(&instance_id));
+    }
+
+    /// A clean shutdown of a TEMP-database daemon leaves no state or runtime
+    /// directory behind — the sweep is the backstop for crashed daemons, not
+    /// the only reclaim path. Uses the real per-user roots (like the e2e test
+    /// above): the instance id is a hash of this test's unique tempdir DB
+    /// path, so nothing else on the machine shares it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn daemon_clean_shutdown_leaves_no_dirs_for_temp_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("brain.lbug");
+        assert!(lifecycle::is_temp_db_path(&db_path));
+
+        let db_for_server = db_path.clone();
+        let server =
+            tokio::spawn(async move { run_server(&db_for_server, None, None, None).await });
+
+        let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+        let sock = lifecycle::socket_path(&instance_id);
+
+        // Wait for the daemon's socket to accept connections.
+        let mut client = None;
+        for _ in 0..100 {
+            if sock.exists()
+                && let Ok(c) = connect_uds(&sock).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut client = client.expect("daemon socket did not come up within 10s");
+
+        // While the daemon is up, its directories exist.
+        assert!(lifecycle::runtime_dir(&instance_id).exists());
+        assert!(lifecycle::log_dir(&instance_id).exists());
+
+        client
+            .shutdown(nestweaver_proto::ShutdownRequest {})
+            .await
+            .expect("shutdown RPC");
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("daemon must exit promptly");
+        finished
+            .expect("server task panicked")
+            .expect("run_server error");
+
+        assert!(
+            !lifecycle::runtime_dir(&instance_id).exists(),
+            "clean shutdown of a temp-database daemon must unlink its runtime dir"
+        );
+        assert!(
+            !lifecycle::log_dir(&instance_id).exists(),
+            "clean shutdown of a temp-database daemon must unlink its state dir"
+        );
+        assert!(
+            !lifecycle::socket_fallback_root()
+                .join(&instance_id)
+                .exists(),
+            "clean shutdown must not leave a socket-fallback dir behind"
+        );
     }
 }
