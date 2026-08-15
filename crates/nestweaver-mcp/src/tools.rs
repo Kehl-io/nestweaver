@@ -5475,91 +5475,11 @@ fn tool_brain_status(
         })
         .collect();
 
-    // Detect duplicate-root collisions. The CLI's local (non-daemon) path
-    // emits these warnings to stderr; forward them through the JSON-RPC
-    // response so daemon-routed callers and `--json` consumers see the
-    // same diagnostic.
-    let mut root_to_rows: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
-        std::collections::HashMap::new();
-    for v in &vaults {
-        root_to_rows
-            .entry(v.root_path.as_str())
-            .or_default()
-            .push(v);
-    }
-    let mut warnings: Vec<Value> = root_to_rows
-        .iter()
-        .filter(|(_, rows)| rows.len() > 1)
-        .map(|(root, rows)| {
-            // Pair each row with its note count so we can both render the
-            // entries and pick the keeper for the remediation hint.
-            let rows_with_counts: Vec<(&&nestweaver_schema::Vault, usize)> = rows
-                .iter()
-                .map(|v| {
-                    (
-                        v,
-                        store.list_notes(Some(&v.uid)).unwrap_or_default().len(),
-                    )
-                })
-                .collect();
-            let entries: Vec<Value> = rows_with_counts
-                .iter()
-                .map(|(v, n)| {
-                    json!({
-                        "uid": v.uid,
-                        "instance_id": v.instance_id,
-                        "name": v.name,
-                        "note_count": n,
-                    })
-                })
-                .collect();
-
-            // Suggest a concrete merge command. The keeper is the row with
-            // the highest note_count (most data); ties break on the
-            // lexicographically smallest instance_id so the suggestion is
-            // deterministic. Emit one command per non-keeper row so callers
-            // collapse all ghosts into the canonical instance.
-            let keeper = rows_with_counts
-                .iter()
-                .max_by(|a, b| {
-                    a.1.cmp(&b.1)
-                        .then_with(|| b.0.instance_id.cmp(&a.0.instance_id))
-                })
-                .map(|(v, _)| v);
-            let (remediation_commands, remediation_hint) = match keeper {
-                Some(keeper_v) => {
-                    let cmds: Vec<String> = rows_with_counts
-                        .iter()
-                        .filter(|(v, _)| v.instance_id != keeper_v.instance_id)
-                        .map(|(v, _)| {
-                            format!(
-                                "nestweaver instance merge --from {} --to {}",
-                                v.instance_id, keeper_v.instance_id,
-                            )
-                        })
-                        .collect();
-                    let hint = format!(
-                        "Multiple instance_ids share this vault root. Keep '{}' (has the most data) and merge the others into it using the commands below. Take a snapshot of {} first.",
-                        keeper_v.instance_id,
-                        db_path
-                            .as_deref()
-                            .and_then(|p| p.to_str())
-                            .unwrap_or("the database"),
-                    );
-                    (cmds, hint)
-                }
-                None => (Vec::new(), String::new()),
-            };
-
-            json!({
-                "kind": "duplicate_vault_root",
-                "root_path": root,
-                "entries": entries,
-                "remediation_commands": remediation_commands,
-                "remediation_hint": remediation_hint,
-            })
-        })
-        .collect();
+    // Structured warnings (duplicate-root collisions, wedged index
+    // publication) come from the shared helper so the CLI's direct
+    // (`--no-daemon`) path forwards the SAME array instead of re-deriving a
+    // subset locally.
+    let warnings = brain_status_warnings(store, db_path.as_deref());
     let repos_json: Vec<Value> = repos
         .iter()
         .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
@@ -5638,26 +5558,12 @@ fn tool_brain_status(
     // come from the daemon and are therefore absent on the direct
     // `--no-daemon` and MCP-over-HTTP payloads, this is derived from the marker
     // FILE and so populates with no daemon running. The user who reported the
-    // wedge was on exactly that direct path.
+    // wedge was on exactly that direct path. The matching
+    // `index_publication_wedged` warning is pushed by `brain_status_warnings`.
     let index_publication = store
         .db_path()
         .map(nestweaver_engine::index_publication::status)
         .map(|status| {
-            let wedged = status.is_wedged();
-            if wedged {
-                warnings.push(json!({
-                    "warning": if status.determinable {
-                        "index publication is wedged: ranked queries (brain_context, \
-                         project_context, investigate) fail closed until it is reconciled. \
-                         This is an index PUBLICATION marker, not a dirty git working tree."
-                    } else {
-                        "index publication marker state cannot be determined (permissions or \
-                         I/O error on the sidecar directory); ranked queries fail closed."
-                    },
-                    "action": status.repair_command_for(
-                        store.db_path().unwrap_or(std::path::Path::new("<db>"))),
-                }));
-            }
             json!({
                 "dirty": status.dirty,
                 "determinable": status.determinable,
@@ -5665,7 +5571,7 @@ fn tool_brain_status(
                 "writer_pid": status.writer_pid,
                 "writer_alive": status.writer_alive,
                 "writer_reason": status.writer_reason,
-                "wedged": wedged,
+                "wedged": status.is_wedged(),
                 "marker_path": status.marker_path,
             })
         });
@@ -5706,6 +5612,125 @@ fn tool_brain_status(
         // abandoned — it has nothing to do with a dirty git working tree.
         "index_publication": index_publication,
     }))
+}
+
+/// Build the `warnings` array for `brain_status` from the store's current
+/// state: duplicate-vault-root collisions and a wedged index publication.
+///
+/// Shared by `tool_brain_status` and the CLI's direct (`--no-daemon`) text
+/// path so both forward the SAME warnings — the direct path previously
+/// re-derived only the duplicate-root subset locally and could never report
+/// a wedged publication at all. Every entry carries a `kind` so renderers
+/// can special-case a shape and still forward the rest generically.
+pub fn brain_status_warnings(store: &GraphStore, db_path: Option<&std::path::Path>) -> Vec<Value> {
+    // Detect duplicate-root collisions. The CLI's local (non-daemon) path
+    // emits these warnings to stderr; forward them through the JSON-RPC
+    // response so daemon-routed callers and `--json` consumers see the
+    // same diagnostic.
+    let vaults = store.list_vaults(None).unwrap_or_default();
+    let mut root_to_rows: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
+        std::collections::HashMap::new();
+    for v in &vaults {
+        root_to_rows
+            .entry(v.root_path.as_str())
+            .or_default()
+            .push(v);
+    }
+    let mut warnings: Vec<Value> = root_to_rows
+        .iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(root, rows)| {
+            // Pair each row with its note count so we can both render the
+            // entries and pick the keeper for the remediation hint.
+            let rows_with_counts: Vec<(&&nestweaver_schema::Vault, usize)> = rows
+                .iter()
+                .map(|v| {
+                    (
+                        v,
+                        store.list_notes(Some(&v.uid)).unwrap_or_default().len(),
+                    )
+                })
+                .collect();
+            let entries: Vec<Value> = rows_with_counts
+                .iter()
+                .map(|(v, n)| {
+                    json!({
+                        "uid": v.uid,
+                        "instance_id": v.instance_id,
+                        "name": v.name,
+                        "note_count": n,
+                    })
+                })
+                .collect();
+
+            // Suggest a concrete merge command. The keeper is the row with
+            // the highest note_count (most data); ties break on the
+            // lexicographically smallest instance_id so the suggestion is
+            // deterministic. Emit one command per non-keeper row so callers
+            // collapse all ghosts into the canonical instance.
+            let keeper = rows_with_counts
+                .iter()
+                .max_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| b.0.instance_id.cmp(&a.0.instance_id))
+                })
+                .map(|(v, _)| v);
+            let (remediation_commands, remediation_hint) = match keeper {
+                Some(keeper_v) => {
+                    let cmds: Vec<String> = rows_with_counts
+                        .iter()
+                        .filter(|(v, _)| v.instance_id != keeper_v.instance_id)
+                        .map(|(v, _)| {
+                            format!(
+                                "nestweaver instance merge --from {} --to {}",
+                                v.instance_id, keeper_v.instance_id,
+                            )
+                        })
+                        .collect();
+                    let hint = format!(
+                        "Multiple instance_ids share this vault root. Keep '{}' (has the most data) and merge the others into it using the commands below. Take a snapshot of {} first.",
+                        keeper_v.instance_id,
+                        db_path.and_then(|p| p.to_str()).unwrap_or("the database"),
+                    );
+                    (cmds, hint)
+                }
+                None => (Vec::new(), String::new()),
+            };
+
+            json!({
+                "kind": "duplicate_vault_root",
+                "root_path": root,
+                "entries": entries,
+                "remediation_commands": remediation_commands,
+                "remediation_hint": remediation_hint,
+            })
+        })
+        .collect();
+
+    // nw-C2: a wedged index publication. Derived from the marker FILE, so
+    // this populates with no daemon running — the user who reported the
+    // wedge was on exactly that direct path. `kind` makes the entry
+    // addressable for renderers that special-case warning shapes.
+    let publication_db_path = db_path.or_else(|| store.db_path());
+    if let Some(p) = publication_db_path {
+        let status = nestweaver_engine::index_publication::status(p);
+        if status.is_wedged() {
+            warnings.push(json!({
+                "kind": "index_publication_wedged",
+                "warning": if status.determinable {
+                    "index publication is wedged: ranked queries (brain_context, \
+                     project_context, investigate) fail closed until it is reconciled. \
+                     This is an index PUBLICATION marker, not a dirty git working tree."
+                } else {
+                    "index publication marker state cannot be determined (permissions or \
+                     I/O error on the sidecar directory); ranked queries fail closed."
+                },
+                "action": status.repair_command_for(p),
+            }));
+        }
+    }
+
+    warnings
 }
 
 // ── 6. brain_add_source ─────────────────────────────────────────────────────
@@ -10962,10 +10987,13 @@ mod cache_dispatch_tests {
         );
         let warnings = status["warnings"].as_array().unwrap();
         assert!(
-            warnings.iter().any(|w| w["action"]
-                .as_str()
-                .is_some_and(|a| a.contains("nestweaver repair"))),
-            "a wedged publication must carry an actionable warning: {warnings:?}"
+            warnings
+                .iter()
+                .any(|w| w["kind"] == "index_publication_wedged"
+                    && w["action"]
+                        .as_str()
+                        .is_some_and(|a| a.contains("nestweaver repair"))),
+            "a wedged publication must carry a `kind`-addressable, actionable warning: {warnings:?}"
         );
         set_index_publication_wait_ms(env_index_publication_wait_ms());
     }
