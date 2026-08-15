@@ -15456,28 +15456,53 @@ fn hybrid_source_label(value: &serde_json::Value) -> &'static str {
 /// doing the same thing unprompted whenever the daemon was slow or down.
 ///
 /// That matters beyond consistency: the direct path is not equivalent. It
-/// returns different rankings for `investigate` (nw-120), omits the embedding
-/// block from `brain status` (nw-121), and — the case that produced nw-126 —
-/// opens read-only, so it cannot replay a crashed daemon's WAL and converts a
-/// self-healing outage into a hard failure.
+/// returns different rankings for `investigate` (nw-120), answers `brain
+/// status` with every daemon-runtime field nulled (disclosed in-band via
+/// `degraded_components` and a `daemon_bypassed` warning), and — the case that
+/// produced nw-126 — opens read-only, so it cannot replay a crashed daemon's
+/// WAL and converts a self-healing outage into a hard failure.
 ///
 /// Warn once per process: a single command can route several RPCs through here,
-/// and repeating the paragraph per call would train the user to ignore it.
+/// and repeating the paragraph per call would train the user to ignore it. The
+/// cause is recorded on EVERY call (see [`last_daemon_bypass_cause`]) so the
+/// direct path's structured disclosure can carry it even when the print was
+/// suppressed.
 fn warn_daemon_bypassed(db_path: &std::path::Path, rpc_name: &str, cause: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
+    record_daemon_bypass_cause(cause);
     if WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!(
         "Warning: the daemon could not serve `{rpc_name}` for {} — answering from the \
-         direct path instead.\n  cause: {cause}\n  \
-         Results may differ from the daemon's, and writes are not protected by the \
-         daemon's single-writer lock. Start it with `nestweaver daemon --db {} start`, \
-         or raise NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS if it is simply slow to boot.",
+         read-only direct path instead.\n  cause: {cause}\n  \
+         The direct answer carries no daemon-runtime state (embedding readiness, write/index \
+         queue depth); `--json` output marks it via `degraded_components` and a \
+         `daemon_bypassed` warning. `nestweaver daemon --db {} status` shows the daemon's \
+         side, and NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS covers a daemon that is merely slow \
+         to boot.",
         db_path.display(),
         db_path.display()
     );
+}
+
+/// The cause passed to the most recent [`warn_daemon_bypassed`] call. The
+/// print is once-per-process, but the structured `daemon_bypassed` warning in
+/// a direct-path `--json` answer needs the cause every time, so it is stashed
+/// separately rather than recovered from the suppression flag.
+static LAST_DAEMON_BYPASS_CAUSE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn record_daemon_bypass_cause(cause: &str) {
+    if let Ok(mut slot) = LAST_DAEMON_BYPASS_CAUSE.lock() {
+        *slot = Some(cause.to_string());
+    }
+}
+
+/// The most recent daemon-bypass cause recorded by [`warn_daemon_bypassed`],
+/// for the direct path's in-band disclosure.
+fn last_daemon_bypass_cause() -> Option<String> {
+    LAST_DAEMON_BYPASS_CAUSE.lock().ok()?.clone()
 }
 
 /// Unwrap the `{ "results": [...], "_meta": {...} }` envelope that the hybrid
@@ -16133,64 +16158,26 @@ fn run_brain(
             }
 
             if json {
-                // Match the canonical schema emitted by `tool_brain_status`
-                // so daemon-routed and local (`--no-daemon`) callers parse
-                // identical shapes:
-                //   - `vaults` is an array of vault detail objects.
-                //   - `vault_count` is the total count.
-                //   - `repos` is an array of repo objects; `repo_count` the total.
-                // `vault_details` is preserved as an alias for `vaults` so
-                // scripts written against the previous local-only shape keep
-                // working through the deprecation window.
-                let vault_details: Vec<serde_json::Value> = vaults
-                    .iter()
-                    .map(|v| {
-                        let vault_note_count =
-                            store.list_notes(Some(&v.uid)).unwrap_or_default().len();
-                        let last_indexed = resolve_last_indexed(db_path, &v.uid, &store);
-                        serde_json::json!({
-                            "uid": v.uid,
-                            "instance_id": v.instance_id,
-                            "name": v.name,
-                            "root_path": v.root_path,
-                            "note_count": vault_note_count,
-                            "last_indexed": last_indexed,
-                        })
-                    })
-                    .collect();
-                let repo_details: Vec<serde_json::Value> = repos
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "url": r.url,
-                            "sha": r.indexed_sha,
-                            "instance_id": r.instance_id,
-                            "name": r.name,
-                        })
-                    })
-                    .collect();
-                let mut instance_ids: std::collections::BTreeSet<&str> =
-                    vaults.iter().map(|v| v.instance_id.as_str()).collect();
-                instance_ids.extend(repos.iter().map(|r| r.instance_id.as_str()));
-                let instance_ids_json: Vec<String> =
-                    instance_ids.into_iter().map(|s| s.to_string()).collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "db": db_path.display().to_string(),
-                        "vaults": vault_details,
-                        "vault_count": vaults.len(),
-                        "vault_details": vault_details,
-                        "notes": note_count,
-                        "headings": heading_count,
-                        "sections": section_count,
-                        "tags": tag_count,
-                        "wikilinks": wikilink_count,
-                        "repos": repo_details,
-                        "repo_count": repos.len(),
-                        "instance_ids": instance_ids_json,
-                    }))?
-                );
+                // ONE builder, ONE schema: the direct path serves the same
+                // top-level document the daemon serves, with the fields only
+                // a live daemon can answer honestly emitted as explicit nulls
+                // and the bypass disclosed in-band (`degraded_components` +
+                // a `daemon_bypassed` warning + a synthesized `_meta`) — a
+                // `--json 2>/dev/null` consumer can never silently receive a
+                // different document. The warnings are in-band here, so the
+                // stderr warnings block below serves text mode only.
+                nestweaver_mcp::tools::set_current_db_path(db_path.to_path_buf());
+                let mut value = nestweaver_mcp::tools::brain_status_json(&store, None)?;
+                let cause = if use_daemon {
+                    last_daemon_bypass_cause()
+                        .unwrap_or_else(|| "the daemon did not serve this request".to_string())
+                } else {
+                    "the daemon was explicitly bypassed (--no-daemon / NESTWEAVER_NO_DAEMON)"
+                        .to_string()
+                };
+                nestweaver_mcp::tools::mark_brain_status_daemon_bypassed(&mut value, &cause);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok((EXIT_SUCCESS, None));
             } else {
                 println!("Brain status:");
                 println!("  Database:  {}", db_path.display());

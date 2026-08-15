@@ -5407,6 +5407,25 @@ fn tool_brain_status(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
 ) -> Result<Value, anyhow::Error> {
+    brain_status_json(store, tantivy)
+}
+
+/// The ONE `brain_status` document builder, shared by every serving path:
+/// the daemon's gRPC surface (which overwrites the daemon-runtime fields with
+/// live values), the in-process MCP server, and the CLI's direct
+/// (daemon-bypassed) fallback, which marks the result with
+/// [`mark_brain_status_daemon_bypassed`].
+///
+/// Fields only a live daemon can answer honestly — see
+/// [`DAEMON_RUNTIME_STATUS_FIELDS`] — are ALWAYS present, emitted as explicit
+/// nulls here so a `--json 2>/dev/null` consumer can never silently receive a
+/// different schema on the direct path. `degraded_components` follows the
+/// `brain_search` precedent: always present, empty unless a component was
+/// bypassed.
+pub fn brain_status_json(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+) -> Result<Value, anyhow::Error> {
     let vaults = store
         .list_vaults(None)
         .map_err(|e| anyhow::anyhow!("brain_status: failed to list vaults: {e}"))?;
@@ -5479,12 +5498,12 @@ fn tool_brain_status(
     // and shared between the warnings builder and the `index_publication`
     // block below, so the two can never disagree about which database they
     // describe (thread-local vs store path) or race a marker cleared between
-    // two reads. Unlike the Wave A write-path fields (`write_queue_depth`,
-    // `write_holder`, the embedding `pass_*` set), which come from the daemon
-    // and are therefore absent on the direct `--no-daemon` and MCP-over-HTTP
-    // payloads, this is derived from the marker FILE and so populates with no
-    // daemon running. The user who reported the wedge was on exactly that
-    // direct path.
+    // two reads. Unlike the daemon-runtime fields (`write_queue_depth`,
+    // `write_holder`, the embedding `pass_*` set), which only a live daemon
+    // answers honestly — explicit nulls here, live values on the daemon's
+    // gRPC surface — this is derived from the marker FILE and so populates
+    // with no daemon running. The user who reported the wedge was on exactly
+    // that direct path.
     let publication_status = store
         .db_path()
         .map(nestweaver_engine::index_publication::status);
@@ -5497,6 +5516,14 @@ fn tool_brain_status(
         .iter()
         .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
         .collect();
+
+    // Every instance id present in this database, sorted for a stable
+    // document. Previously a direct-path-only key; the daemon path gains it
+    // additively so both serve the same top-level schema.
+    let mut instance_ids: std::collections::BTreeSet<&str> =
+        vaults.iter().map(|v| v.instance_id.as_str()).collect();
+    instance_ids.extend(repos.iter().map(|r| r.instance_id.as_str()));
+    let instance_ids_json: Vec<String> = instance_ids.into_iter().map(str::to_string).collect();
 
     // P0-3: Surface staleness warnings proactively.
     let mut staleness_warnings: Vec<Value> = Vec::new();
@@ -5583,7 +5610,14 @@ fn tool_brain_status(
     });
 
     Ok(json!({
+        // `db` and `instance_ids` were direct-path-only keys; the daemon
+        // path gains them additively so both paths serve one schema.
+        "db": db_path.as_ref().map(|p| p.display().to_string()),
+        "instance_ids": instance_ids_json,
         "vaults": vaults_json,
+        // Deprecated alias of `vaults`, kept through the deprecation window
+        // for scripts written against the old local-only shape.
+        "vault_details": vaults_json,
         "vault_count": vaults.len(),
         "notes": notes,
         "headings": headings,
@@ -5601,7 +5635,8 @@ fn tool_brain_status(
         // cache's correctness is key-based (persisted graph_generation +
         // filemeta scope digest), so results are consistent with the last
         // index — the same staleness as the graph. The hit-rate is unproven
-        // and should be measured in real usage.
+        // and should be measured in real usage. A serving daemon adds its
+        // `requests_served` witness counter to this block.
         "cache": {
             "size_bytes": cache_size,
             "entries": cache_entries,
@@ -5617,7 +5652,86 @@ fn tool_brain_status(
         // marker. `dirty` means an index PUBLICATION is in flight or was
         // abandoned — it has nothing to do with a dirty git working tree.
         "index_publication": index_publication,
+        // Daemon-runtime fields (see DAEMON_RUNTIME_STATUS_FIELDS). Only a
+        // live daemon can answer these honestly, so they are explicit nulls
+        // here; the daemon's gRPC handler overwrites every one with live
+        // values, and the CLI's direct fallback re-nulls the two tantivy
+        // fields (a process without the daemon's index open cannot claim
+        // `false`/`0` honestly) and marks the document degraded.
+        "embedding_status": Value::Null,
+        "indexing_active": Value::Null,
+        "indexing_repo": Value::Null,
+        "queue_depth": Value::Null,
+        "write_queue_depth": Value::Null,
+        "write_holder": Value::Null,
+        "write_holder_seconds": Value::Null,
+        // The `brain_search` precedent: always present, empty unless a
+        // component was bypassed. The direct fallback sets
+        // ["daemon_runtime"] via `mark_brain_status_daemon_bypassed`.
+        "degraded_components": Vec::<String>::new(),
     }))
+}
+
+/// Daemon-runtime fields of the `brain_status` document that only a live
+/// daemon can answer honestly. They are ALWAYS present in the document —
+/// live values when a daemon serves it, explicit nulls on the direct
+/// (daemon-bypassed) path — so a `--json 2>/dev/null` consumer can never
+/// silently receive a different schema.
+pub const DAEMON_RUNTIME_STATUS_FIELDS: &[&str] = &[
+    "embedding_status",
+    "indexing_active",
+    "indexing_repo",
+    "queue_depth",
+    "write_queue_depth",
+    "write_holder",
+    "write_holder_seconds",
+    "tantivy_available",
+    "tantivy_doc_count",
+];
+
+/// The `degraded_components` marker for a `brain_status` answer that carries
+/// no daemon-runtime state (the `brain_search` precedent).
+pub const DAEMON_RUNTIME_DEGRADED: &str = "daemon_runtime";
+
+/// Mark a [`brain_status_json`] document as answered by the direct,
+/// daemon-bypassed read-only path: every [`DAEMON_RUNTIME_STATUS_FIELDS`]
+/// entry becomes an explicit null (a process without the daemon's runtime
+/// cannot even claim `false`/`0` honestly), and the degradation is disclosed
+/// in THREE places so no consumer misses it — top-level
+/// `degraded_components`, a synthesized `_meta` mirroring it, and a
+/// `daemon_bypassed` entry in `warnings` carrying the bypass cause.
+pub fn mark_brain_status_daemon_bypassed(value: &mut Value, cause: &str) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for field in DAEMON_RUNTIME_STATUS_FIELDS {
+        obj.insert((*field).to_string(), Value::Null);
+    }
+    obj.insert(
+        "degraded_components".to_string(),
+        json!([DAEMON_RUNTIME_DEGRADED]),
+    );
+    obj.insert(
+        "_meta".to_string(),
+        json!({
+            "sources": ["direct"],
+            "stale_repos": [],
+            "scope": "direct",
+            "degraded_components": [DAEMON_RUNTIME_DEGRADED],
+        }),
+    );
+    if let Some(warnings) = obj
+        .entry("warnings".to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    {
+        warnings.push(json!({
+            "kind": "daemon_bypassed",
+            "warning": "answered by the read-only direct path; daemon-runtime fields \
+                        (embedding_status, write/index queue, tantivy stats) are null",
+            "cause": cause,
+        }));
+    }
 }
 
 /// Build the `warnings` array for `brain_status` from the store's current
@@ -11025,6 +11139,82 @@ mod cache_dispatch_tests {
         let status = dispatch(&store, None, "brain_status", json!({}), None).unwrap();
         assert_eq!(status["index_publication"]["dirty"], json!(false));
         assert_eq!(status["index_publication"]["wedged"], json!(false));
+    }
+
+    /// The shared builder serves ONE top-level schema on every path: the
+    /// former direct-only keys (`db`, `instance_ids`, `vault_details`) moved
+    /// in, and the daemon-runtime fields are always present — explicit nulls
+    /// here, live values only on the daemon's gRPC surface.
+    #[test]
+    fn brain_status_json_carries_one_schema_with_null_daemon_runtime_fields() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let status = brain_status_json(&store, None).unwrap();
+        assert_eq!(status["db"], json!(db_path.display().to_string()));
+        assert_eq!(status["vault_details"], status["vaults"]);
+        assert!(status["instance_ids"].is_array());
+        for field in DAEMON_RUNTIME_STATUS_FIELDS {
+            assert!(
+                status.get(*field).is_some(),
+                "{field} must always be present: {status}"
+            );
+        }
+        for field in DAEMON_RUNTIME_STATUS_FIELDS
+            .iter()
+            .filter(|f| !f.starts_with("tantivy_"))
+        {
+            assert!(
+                status[*field].is_null(),
+                "{field} must be an explicit null off the daemon: {status}"
+            );
+        }
+        // The tantivy fields are derived from the builder's own argument.
+        assert_eq!(status["tantivy_available"], json!(false));
+        assert_eq!(status["tantivy_doc_count"], json!(0));
+        assert_eq!(status["degraded_components"], json!([]));
+        assert!(
+            status.get("_meta").is_none(),
+            "provenance is added by the serving layer, not the builder: {status}"
+        );
+    }
+
+    /// The direct-path marker: every daemon-runtime field becomes an explicit
+    /// null and the bypass is disclosed in `degraded_components`, a
+    /// synthesized `_meta`, and a `daemon_bypassed` warning carrying the
+    /// cause — while file-derived fields (`index_publication`, `warnings`)
+    /// survive untouched.
+    #[test]
+    fn mark_brain_status_daemon_bypassed_discloses_the_degradation() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let mut status = brain_status_json(&store, None).unwrap();
+
+        mark_brain_status_daemon_bypassed(&mut status, "test bypass cause");
+
+        assert_eq!(status["degraded_components"], json!(["daemon_runtime"]));
+        assert_eq!(
+            status["_meta"]["degraded_components"],
+            json!(["daemon_runtime"])
+        );
+        assert_eq!(status["_meta"]["sources"], json!(["direct"]));
+        for field in DAEMON_RUNTIME_STATUS_FIELDS {
+            assert!(
+                status[*field].is_null(),
+                "{field} must be an explicit null on the direct path: {status}"
+            );
+        }
+        let warnings = status["warnings"].as_array().unwrap();
+        let bypass = warnings
+            .iter()
+            .find(|w| w["kind"] == "daemon_bypassed")
+            .expect("a daemon_bypassed warning must carry the disclosure");
+        assert_eq!(bypass["cause"], json!("test bypass cause"));
+        assert!(status["index_publication"].is_object());
     }
 
     #[test]
