@@ -1124,6 +1124,16 @@ impl GraphStore {
     /// persists ranks over the graph it just COMMITTED, which is what lets
     /// the sidecar land before the marker retires.
     ///
+    /// Fails closed on an empty cache. Compute and save are separate calls
+    /// under `pagerank_compute_lock`, and any reader touching the rank path
+    /// while the marker exists wipes the cache via
+    /// `invalidate_ranking_caches_locked` — so a `None` cache here means the
+    /// owner's fresh ranks were wiped mid-window (the compute itself always
+    /// leaves `Some`, even for an empty graph). Persisting nothing and
+    /// returning `Ok` would let the marker retire with no sidecar: the exact
+    /// clean-but-rankless state the ordering exists to prevent. The error
+    /// blocks retirement; the publication stays dirty and recovers next open.
+    ///
     /// [`IndexPublicationLease::save_pagerank`]: crate::db::IndexPublicationLease::save_pagerank
     pub(crate) fn save_pagerank_cache_for_publication_owner(
         &self,
@@ -1133,6 +1143,18 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+            .is_none()
+        {
+            return Err(StoreError::Query(
+                "PageRank cache wiped between the owner's compute and sidecar save; \
+                 refusing to publish clean without a persisted sidecar"
+                    .into(),
+            ));
+        }
         self.save_pagerank_cache_inner(path)
     }
 

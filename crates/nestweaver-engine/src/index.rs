@@ -1017,20 +1017,31 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
 
         publication_clean = db_path.is_none();
 
-        // ORDERING, deliberate: the fresh PageRank is computed and its sidecar
-        // persisted BEFORE the marker retires, gated on the same preconditions
-        // that gate retirement (generation durable, stale sidecar gone). A
-        // kill anywhere after this point then leaves either the marker still
-        // set — dirty, which the next open reconciles — or a clean publication
-        // WITH a sidecar matching the committed graph. The state that must
-        // never occur is marker retired + generation advanced + no sidecar:
-        // it reports CLEAN while the note side of the graph has no ranks, and
-        // the lazy fallback (`ranking.rs` `ensure_pagerank_loaded`) recomputes
-        // only `code_only()` and only in memory, so nothing would ever say so.
+        // ORDERING, deliberate: when a PageRank refresh is requested
+        // (`pagerank_scope.is_some()` — every production caller), the fresh
+        // PageRank is computed and its sidecar persisted BEFORE the marker
+        // retires, gated on the same preconditions that gate retirement
+        // (generation durable, stale sidecar gone). A kill anywhere after
+        // this point then leaves either the marker still set — dirty, which
+        // the next open reconciles — or a clean publication WITH a sidecar
+        // matching the committed graph. The state that must never occur is
+        // marker retired + generation advanced + no sidecar: it reports CLEAN
+        // while the note side of the graph has no ranks, and the lazy
+        // fallback (`ranking.rs` `ensure_pagerank_loaded`) recomputes only
+        // `code_only()` and only in memory, so nothing would ever say so.
         //
-        // A refresh failure therefore also blocks retirement: the publication
-        // stays dirty and recoverable instead of reporting clean without
-        // ranks. The failure is still returned to the caller either way.
+        // Scope of that guarantee: a refresh-LESS clean publish
+        // (`pagerank_scope: None`, `publish_clean: true`) still deletes the
+        // stale sidecar and retires the marker with no replacement. No
+        // production caller does this (only tests); if one ever does, the
+        // clean-without-sidecar state returns by intent, not by race.
+        //
+        // A refresh failure therefore also blocks retirement — including the
+        // owner save failing closed when a reader wiped the fresh cache
+        // mid-window (`ranking.rs` `save_pagerank_cache_for_publication_owner`):
+        // the publication stays dirty and recoverable instead of reporting
+        // clean without ranks. The failure is still returned to the caller
+        // either way.
         //
         // The cost is a longer dirty window: ranked queries fail closed for
         // the duration of the compute rather than resuming just before it,
@@ -1287,16 +1298,25 @@ impl IndexPublicationRecovery {
 /// `finalize_committed_index_for_scope_with_io`.
 ///
 /// The ordering that function actually guarantees, stated precisely because it
-/// is easy to overclaim: the **stale `.pagerank.json` is removed**, `.generation`
+/// is easy to overclaim: when a PageRank refresh is requested (recovery always
+/// requests `unified()`), the **stale `.pagerank.json` is removed**, `.generation`
 /// advanced and persisted, and the fresh PageRank computed and saved BEFORE the
-/// marker is cleared. A kill anywhere inside the finalizer therefore leaves
-/// either the marker still set — dirty, which the next open reconciles — or a
-/// clean publication WITH a sidecar matching the committed graph. Never clean
-/// with an advanced generation and no sidecar: that state reports CLEAN while
-/// the note side of the graph has no ranks, and the lazy fallback
-/// (`ranking.rs`, `ensure_pagerank_loaded` → `compute_pagerank_warm_locked`)
-/// ranks `GraphScope::code_only()` and only in memory — it never re-persists,
-/// and on a brain database it never covers the note side at all.
+/// marker is cleared — and the owner save fails closed rather than persist
+/// nothing if the fresh cache was wiped mid-window, so a failed or raced
+/// refresh blocks retirement instead of publishing clean without ranks. A kill
+/// anywhere inside such a finalize therefore leaves either the marker still
+/// set — dirty, which the next open reconciles — or a clean publication WITH a
+/// sidecar matching the committed graph. Never clean with an advanced
+/// generation and no sidecar: that state reports CLEAN while the note side of
+/// the graph has no ranks, and the lazy fallback (`ranking.rs`,
+/// `ensure_pagerank_loaded` → `compute_pagerank_warm_locked`) ranks
+/// `GraphScope::code_only()` and only in memory — it never re-persists, and on
+/// a brain database it never covers the note side at all.
+///
+/// The guarantee does NOT extend to a refresh-less clean publish
+/// (`pagerank_scope: None`, `publish_clean: true`), which deletes the stale
+/// sidecar and retires with no replacement by intent. No production caller
+/// does that today.
 ///
 /// The cost is a longer dirty window: ranked queries fail closed for the
 /// duration of the PageRank compute rather than resuming just before it, which
@@ -9206,6 +9226,10 @@ function hello(name) { return "Hello " + name; }
         // on-disk sidecars stay precisely as the crash instant left them.
         crash_after_clear_marker: bool,
         crash_after_save_pagerank: bool,
+        // A reader touching the rank path mid-window: pagerank_scores() fails
+        // closed while the marker exists and WIPES the owner's fresh cache.
+        // Applied between the compute and the save.
+        reader_touch_before_save: bool,
     }
 
     impl IndexEpilogueIo for InjectedIndexEpilogueIo {
@@ -9272,6 +9296,9 @@ function hello(name) { return "Hello " + name; }
         ) -> Result<(), anyhow::Error> {
             if self.fail_save {
                 anyhow::bail!("injected PageRank save failure");
+            }
+            if self.reader_touch_before_save {
+                let _ = lease.store().pagerank_scores();
             }
             FileSystemIndexEpilogueIo.save_pagerank(lease, path)?;
             if self.crash_after_save_pagerank {
@@ -9512,6 +9539,75 @@ function hello(name) { return "Hello " + name; }
         assert!(!reopened.is_index_publication_dirty());
         let persisted = persisted_pagerank(&db_path);
         assert_note_ranks(&persisted, "killsave");
+    }
+
+    // No crash at all: a reader touching the rank path BETWEEN the owner's
+    // compute and save (the marker is still set, so the read fails closed and
+    // wipes the fresh cache). The owner save must then FAIL — blocking marker
+    // retirement — rather than silently writing nothing and publishing clean
+    // with no sidecar.
+    #[test]
+    fn reader_in_refresh_window_cannot_leave_a_clean_rankless_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store
+            .save_graph_generation(&crate::sidecar_path(&db_path, ".generation"))
+            .unwrap();
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "raced publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "raced");
+        insert_publication_notes(&store, "raced");
+
+        let error = finalize_committed_index_for_scope_with_io(
+            publication,
+            Some(&db_path),
+            "raced publisher",
+            &InjectedIndexEpilogueIo {
+                reader_touch_before_save: true,
+                ..Default::default()
+            },
+            Some(&nestweaver_store::GraphScope::unified()),
+            true,
+        )
+        .expect_err("a wiped owner cache must fail the sidecar save, not publish clean without it");
+        assert!(
+            error
+                .failures
+                .iter()
+                .any(|f| f.stage == DeletionReconciliationStage::PageRankPersistence),
+            "the wipe must surface as a PageRank save failure: {error}"
+        );
+        assert!(
+            marker_path.exists(),
+            "the publication must stay dirty so the next open reconciles it"
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "no sidecar may be written from a wiped cache"
+        );
+        drop(store);
+
+        // And it recovers on the next open — with note ranks, not just code.
+        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let outcome = recover_abandoned_index_publication(&reopened, true).unwrap();
+        assert!(
+            outcome.recovered(),
+            "the dirty publication must reconcile: {}",
+            outcome.describe()
+        );
+        let persisted = persisted_pagerank(&db_path);
+        assert_note_ranks(&persisted, "raced");
     }
 
     #[test]
