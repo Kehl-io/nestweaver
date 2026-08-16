@@ -2584,6 +2584,59 @@ credential_method = "gh"
     assert!(status().contains(&format!("Config: {}", canonical_a.display())));
 }
 
+/// Restart's shared invariant on the failure side: when the start half cannot
+/// proceed after the stop (here the persisted-intent record was corrupted
+/// while the incumbent ran compiled defaults, so the configless replacement
+/// start fails closed on the unreadable record), the command must attempt to
+/// restore the previous configuration, must say the database currently has no
+/// daemon when that restore cannot proceed either, and must name a remedy that
+/// works from the state the user is actually in.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_restart_reports_daemonless_state_and_attempts_restore_when_start_half_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("restart-restore").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    // A compiled-defaults incumbent whose persisted-intent record is then
+    // corrupted: the bare replacement start fails closed on the record, and
+    // the restore attempt fails pre-spawn on the same record. Directory and
+    // file get the safe modes (0700/0600) so the failure is the corrupt
+    // contents, not the permission checks.
+    daemon_action_cmd(&db_path, "start").assert().success();
+    let record_path = nestweaver_daemon::lifecycle::last_successful_config_path(&db_path);
+    if let Some(parent) = record_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(&record_path, "{not-json").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // The fancy error renderer wraps lines, so assert short fragments that do
+    // not span a wrap point.
+    daemon_action_cmd(&db_path, "restart")
+        .assert()
+        .failure()
+        .stderr(
+            contains("previous daemon also failed")
+                .and(contains("no daemon"))
+                .and(contains("daemon --db")),
+        );
+
+    // The named remedy works from the state the user is actually in, once the
+    // independently-corrupt record is removed.
+    std::fs::remove_file(&record_path).unwrap();
+    daemon_action_cmd(&db_path, "start").assert().success();
+}
+
 #[test]
 fn daemon_concurrent_mcp() {
     let dir = tempfile::tempdir().unwrap();
