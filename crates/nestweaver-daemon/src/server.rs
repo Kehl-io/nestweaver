@@ -8567,6 +8567,44 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     }
 }
 
+/// Boot-time index-publication reconciliation, run on a blocking thread just
+/// before the PPR cache warm.
+///
+/// nw-C1: a read-write daemon is a WRITER. If a prior indexer died between
+/// establishing `<db>.index-dirty` and finalizing, every ranked query in this
+/// database fails closed forever. Reconcile it here, before warming, so the
+/// warm below succeeds and the first PPR query does not meet the wedge. A live
+/// publication is left strictly alone (see
+/// `recover_abandoned_index_publication`).
+///
+/// The gate must mirror how THIS daemon opened the store, exactly like the
+/// neighbouring reconcile passes: a snapshot-replica daemon opens read-only,
+/// and a read-only caller must report the condition rather than recompute
+/// PageRank, persist `.generation`, and delete the marker out from under
+/// whoever holds the write lock. This is pinned by
+/// `read_only_boot_reconciliation_leaves_the_publication_untouched_on_disk`.
+fn reconcile_index_publication_before_ppr_warm(store: &GraphStore, read_only: bool) {
+    nestweaver_engine::index::recover_abandoned_index_publication_best_effort(store, !read_only);
+    match store.warm_ppr_cache() {
+        Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+        // nw-C2: this specific failure used to be swallowed as a generic warn,
+        // which is how a permanently wedged database produced no diagnostic
+        // anywhere. Name it.
+        Err(e) if format!("{e}").contains("dirty index publication") => {
+            let status = store
+                .db_path()
+                .map(nestweaver_engine::index_publication::status);
+            tracing::warn!(
+                "PPR cache not warmed: an index publication is dirty, so every ranked \
+                 query (brain_context, project_context, investigate) will fail closed \
+                 until it is reconciled. This is an index PUBLICATION marker, not a \
+                 dirty git working tree. status={status:?} error={e}"
+            );
+        }
+        Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+    }
+}
+
 pub async fn run_server(
     db_path: &Path,
     mut idle_timeout: Option<Duration>,
@@ -9011,39 +9049,7 @@ pub async fn run_server(
     {
         let store = state.store.clone();
         tokio::task::spawn_blocking(move || {
-            // nw-C1: a read-write daemon is a WRITER. If a prior indexer died
-            // between establishing `<db>.index-dirty` and finalizing, every
-            // ranked query in this database fails closed forever. Reconcile it
-            // here, before warming, so the warm below succeeds and the first
-            // PPR query does not meet the wedge. A live publication is left
-            // strictly alone (see `recover_abandoned_index_publication`).
-            //
-            // The gate must mirror how THIS daemon opened the store, exactly
-            // like the neighbouring reconcile passes: a snapshot-replica daemon
-            // opens read-only, and a read-only caller must report the condition
-            // rather than recompute PageRank, persist `.generation`, and delete
-            // the marker out from under whoever holds the write lock.
-            nestweaver_engine::index::recover_abandoned_index_publication_best_effort(
-                &store, !read_only,
-            );
-            match store.warm_ppr_cache() {
-                Ok(()) => tracing::info!("PPR adjacency cache warmed"),
-                // nw-C2: this specific failure used to be swallowed as a
-                // generic warn, which is how a permanently wedged database
-                // produced no diagnostic anywhere. Name it.
-                Err(e) if format!("{e}").contains("dirty index publication") => {
-                    let status = store
-                        .db_path()
-                        .map(nestweaver_engine::index_publication::status);
-                    tracing::warn!(
-                        "PPR cache not warmed: an index publication is dirty, so every ranked \
-                         query (brain_context, project_context, investigate) will fail closed \
-                         until it is reconciled. This is an index PUBLICATION marker, not a \
-                         dirty git working tree. status={status:?} error={e}"
-                    );
-                }
-                Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
-            }
+            reconcile_index_publication_before_ppr_warm(&store, read_only)
         });
     }
 
@@ -17517,6 +17523,108 @@ external_model = "unavailable-test-model"
         assert!(!replica_mounts_admin_api(true, false));
         assert!(replica_mounts_admin_api(false, true));
         assert!(!replica_mounts_admin_api(false, false));
+    }
+}
+
+#[cfg(test)]
+mod boot_reconciliation_tests {
+    use super::*;
+
+    /// A pid guaranteed not to name a live process: spawn a child, wait for it
+    /// (reaping the zombie), and return its now-free pid, so `kill(pid, 0)`
+    /// reports ESRCH deterministically.
+    fn reaped_child_pid() -> i32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as i32;
+        child.wait().expect("reap /bin/true");
+        assert!(
+            !nestweaver_engine::index_publication::process_is_alive(pid),
+            "a reaped child must not read as alive"
+        );
+        pid
+    }
+
+    /// The daemon-level pin for the `!read_only` recovery gate (nw-C1): a
+    /// read-only replica's boot reconciliation must REPORT an abandoned
+    /// publication, never repair it. Asserted ON DISK: the marker,
+    /// `.generation`, and `.pagerank.json` are byte-for-byte untouched.
+    ///
+    /// Why this drives `reconcile_index_publication_before_ppr_warm` directly
+    /// rather than booting a full replica end to end: a replica's working copy
+    /// is rebuilt from the snapshot on every boot, and `materialize_snapshot`
+    /// relocates only the graph file and its known sidecars — any marker file
+    /// in the snapshot is discarded, so no marker can ride a snapshot into the
+    /// boot path deterministically. What CAN be pinned deterministically is
+    /// the exact boot path itself: the store here is opened exactly the way
+    /// the replica boot opens it (`GraphStore::open_read_only`), against a
+    /// database left in exactly the crash state (committed graph, dead-writer
+    /// marker, pre-crash sidecars), and the function under test is the exact
+    /// code the boot runs, passed the same `read_only` the boot computes.
+    /// Flipping the `!read_only` argument inside it to `true` fails this test;
+    /// the engine-level tests cannot see that flip, because they call the
+    /// engine function with an explicit literal.
+    #[test]
+    fn read_only_boot_reconciliation_leaves_the_publication_untouched_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.lbug");
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = nestweaver_engine::sidecar_path(&db_path, ".generation");
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+
+        // The state a SIGKILL between marker establishment and finalize
+        // leaves: a committed database with a durable generation, a PageRank
+        // sidecar that predates the last commit, and a marker naming a dead
+        // writer.
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store.bump_graph_generation();
+            store.save_graph_generation(&generation_path).unwrap();
+        }
+        std::fs::write(&pagerank_path, br#"{"stale-precrash-score":1.0}"#).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(
+            &marker_path,
+            nestweaver_store::index_publication::format_marker_payload(
+                reaped_child_pid() as u32,
+                nanos,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let before_marker = std::fs::read(&marker_path).unwrap();
+        let before_generation = std::fs::read(&generation_path).unwrap();
+        let before_pagerank = std::fs::read(&pagerank_path).unwrap();
+
+        // Open exactly as the snapshot-replica boot does, then run the boot
+        // reconciliation with the same `read_only` the boot computes.
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        reconcile_index_publication_before_ppr_warm(&store, true);
+
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            before_marker,
+            "a read-only boot must not rewrite or delete the marker"
+        );
+        assert_eq!(
+            std::fs::read(&generation_path).unwrap(),
+            before_generation,
+            "a read-only boot must not persist a recomputed .generation"
+        );
+        assert_eq!(
+            std::fs::read(&pagerank_path).unwrap(),
+            before_pagerank,
+            "a read-only boot must not rewrite the PageRank sidecar"
+        );
+        assert!(
+            store.is_index_publication_dirty(),
+            "a read-only boot must keep failing closed, not clear the condition"
+        );
     }
 }
 
