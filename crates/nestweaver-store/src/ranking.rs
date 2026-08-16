@@ -581,6 +581,43 @@ impl GraphStore {
                 "PageRank unavailable during dirty index publication".into(),
             ));
         }
+        self.compute_pagerank_warm_inner(damping, iterations, scope, warm_start, false)
+    }
+
+    /// Compute PageRank while the caller's OWN index publication is still
+    /// dirty. [`IndexPublicationLease::compute_pagerank`] is the only caller —
+    /// it token-validates ownership first, so this exemption cannot be reached
+    /// by an outsider. The guards this skips exist to stop readers from
+    /// ranking (or cache-publishing) state that predates an in-flight commit;
+    /// the owner ranks the graph it just COMMITTED, which is precisely the
+    /// state the fresh sidecar must hold before the marker may retire.
+    ///
+    /// [`IndexPublicationLease::compute_pagerank`]: crate::db::IndexPublicationLease::compute_pagerank
+    pub(crate) fn compute_pagerank_for_publication_owner(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+    ) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.compute_pagerank_warm_inner(damping, iterations, scope, None, true)
+    }
+
+    /// `for_publication_owner` skips the mid-compute dirty re-check: the
+    /// owner's own marker is present throughout, so the re-check would always
+    /// fire, and no other publication can begin while the owner holds the
+    /// lease. Outsider computes keep the re-check.
+    fn compute_pagerank_warm_inner(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+        warm_start: Option<&HashMap<String, f64>>,
+        for_publication_owner: bool,
+    ) -> Result<(), StoreError> {
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
@@ -658,7 +695,7 @@ impl GraphStore {
             }
         }
 
-        if self.is_index_publication_dirty() {
+        if !for_publication_owner && self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::Query(
                 "PageRank unavailable during dirty index publication".into(),
@@ -1077,6 +1114,51 @@ impl GraphStore {
             self.invalidate_ranking_caches_locked();
             return Ok(());
         }
+        self.save_pagerank_cache_inner(path)
+    }
+
+    /// Persist the PageRank sidecar while the caller's OWN index publication
+    /// is still dirty. [`IndexPublicationLease::save_pagerank`] is the only
+    /// caller and token-validates ownership first. The guarded public variant
+    /// refuses to persist mid-publication state for outsiders; the owner
+    /// persists ranks over the graph it just COMMITTED, which is what lets
+    /// the sidecar land before the marker retires.
+    ///
+    /// Fails closed on an empty cache. Compute and save are separate calls
+    /// under `pagerank_compute_lock`, and any reader touching the rank path
+    /// while the marker exists wipes the cache via
+    /// `invalidate_ranking_caches_locked` — so a `None` cache here means the
+    /// owner's fresh ranks were wiped mid-window (the compute itself always
+    /// leaves `Some`, even for an empty graph). Persisting nothing and
+    /// returning `Ok` would let the marker retire with no sidecar: the exact
+    /// clean-but-rankless state the ordering exists to prevent. The error
+    /// blocks retirement; the publication stays dirty and recovers next open.
+    ///
+    /// [`IndexPublicationLease::save_pagerank`]: crate::db::IndexPublicationLease::save_pagerank
+    pub(crate) fn save_pagerank_cache_for_publication_owner(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+            .is_none()
+        {
+            return Err(StoreError::Query(
+                "PageRank cache wiped between the owner's compute and sidecar save; \
+                 refusing to publish clean without a persisted sidecar"
+                    .into(),
+            ));
+        }
+        self.save_pagerank_cache_inner(path)
+    }
+
+    fn save_pagerank_cache_inner(&self, path: &std::path::Path) -> Result<(), StoreError> {
         let cache = self
             .pagerank_cache
             .lock()

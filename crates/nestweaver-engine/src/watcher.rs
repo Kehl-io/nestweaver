@@ -1141,14 +1141,18 @@ mod tests {
 
         fn compute_pagerank(
             &self,
-            store: &GraphStore,
+            lease: &nestweaver_store::IndexPublicationLease<'_>,
             scope: &GraphScope,
         ) -> Result<(), anyhow::Error> {
-            crate::index::FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+            crate::index::FileSystemIndexEpilogueIo.compute_pagerank(lease, scope)
         }
 
-        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
-            crate::index::FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        fn save_pagerank(
+            &self,
+            lease: &nestweaver_store::IndexPublicationLease<'_>,
+            path: &Path,
+        ) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.save_pagerank(lease, path)
         }
     }
 
