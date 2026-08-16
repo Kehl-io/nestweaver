@@ -7185,24 +7185,34 @@ async fn restart_verified_live_under_lock(
                 return Ok(());
             };
 
-            // Phase 1 of the owner-release wait times out only while the
-            // incumbent still holds its pidfile flock — and the flock is held
-            // for the process's whole life, so that failure means the
-            // incumbent is STILL RUNNING. Neither half of the shared template
-            // below is true then ("was stopped" / "no daemon"), and spawning
-            // a restore would fight the live incumbent — the db_write_lock
-            // preflight inside it would bail on the same holder anyway.
-            // Propagate with the truth instead; the gate's own message names
-            // the holder PID and the remedy (stop the daemon manually, verify
-            // its identity, retry).
+            // A held pidfile flock means a LIVE process owns this instance,
+            // but the probe cannot say WHICH one: in a phase-1 owner-release
+            // timeout it is the incumbent (the flock is held for a process's
+            // whole life, so it never stopped), while in a child-start
+            // failure the replacement daemon holds the flock from daemonize2
+            // onward and is left alive by the attestation-failure paths
+            // (incumbent stopped, replacement running but unverified).
+            // Either way neither half of the shared template below is safe to
+            // claim, and spawning a restore would fight the live holder — the
+            // db_write_lock preflight inside it would bail on that holder
+            // anyway. State only what the probe establishes and preserve the
+            // gate's message as the cause; it names the holder PID and the
+            // remedy (stop the daemon manually, verify its identity, retry).
+            //
+            // Edge: if the holder unlinked the pidfile path, the flock
+            // survives on the orphaned inode while this by-path probe reads
+            // FREE — the restore attempt below then runs and its preflight
+            // bails Held naming the holder, so the output stays truthful via
+            // that arm.
             let pidfile = nestweaver_daemon::pidfile_path(
                 &nestweaver_daemon::instance_id_from_db_path(db_path),
             );
             if pidfile_flock_held(&pidfile) {
                 return Err(commit_error.context(
-                    "the incumbent daemon was NOT stopped — it still holds its pidfile lock. \
-                     No replacement was spawned and no restore was attempted, because the \
-                     incumbent may still be running",
+                    "a process still holds this instance's pidfile lock — the incumbent that \
+                     never finished stopping, or a replacement that booted but could not be \
+                     verified. No restore was attempted because a daemon process may still \
+                     be running",
                 ));
             }
 
