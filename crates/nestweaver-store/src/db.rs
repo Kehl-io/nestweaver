@@ -2443,7 +2443,7 @@ mod tests {
         );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(
-            !reopened.pagerank_scores().contains_key("stale"),
+            reopened.pagerank_scores().is_err(),
             "a dirty publication must not load canonical PageRank from before the graph commit"
         );
         // nw-C1: the same marker is now READ BACK, not merely tested for
@@ -2481,7 +2481,7 @@ mod tests {
         );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(
-            !reopened.pagerank_scores().contains_key("stale"),
+            reopened.pagerank_scores().is_err(),
             "an unreadable marker must make canonical PageRank non-authoritative"
         );
         // nw-C1: "cannot tell" must stay distinguishable from "present".

@@ -221,7 +221,13 @@ fn overview_scope_data(
             let projects = state.store.list_projects()?;
             let repos = nestweaver_engine::list_repos(&state.store, None)?;
             let services = nestweaver_engine::list_services(&state.store, None)?;
-            let top_symbols = state.store.symbols_by_pagerank(Some(limit))?;
+            // A dirty index publication fails ranking closed: surface 503 so
+            // the UI says "ranking unavailable" instead of rendering an
+            // overview with an empty landmark list.
+            let top_symbols = state
+                .store
+                .symbols_by_pagerank(Some(limit))
+                .map_err(|e| ApiError::from_ranking(&state.store, e))?;
             let vaults = state.store.list_vaults(None)?;
             let notes = state.store.list_notes_lite(None)?;
             let counts = OverviewCounts {
@@ -420,4 +426,44 @@ fn repo_label(repo: &nestweaver_schema::Repo) -> String {
         .filter(|segment| !segment.is_empty())
         .unwrap_or(&repo.uid)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+
+    /// Same contract as the top-symbols route: a dirty index publication must
+    /// surface as 503 "ranking unavailable", not as a 200 overview with an
+    /// empty landmark list (the `ranking.rs` dirty-publication contract).
+    #[tokio::test]
+    async fn overview_reports_ranking_unavailable_during_dirty_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(format!("{}.index-dirty", db_path.display()), b"dirty").unwrap();
+        let state = AppState::new(store, None, db_path);
+
+        let error = match overview(
+            State(state),
+            Query(OverviewParams {
+                limit: None,
+                workspace: None,
+                scope: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("a dirty publication must not render a successful overview"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error.message.contains("ranking"),
+            "the error must name ranking as unavailable: {}",
+            error.message
+        );
+    }
 }

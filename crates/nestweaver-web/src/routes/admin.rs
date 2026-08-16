@@ -2000,7 +2000,12 @@ url = "https://github.com/example/existing"
             .next()
             .unwrap()
             .uid;
-        assert!(store.pagerank_scores().contains_key(&removed_symbol_uid));
+        assert!(
+            store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(&removed_symbol_uid)
+        );
         assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
         store.flush_embedding_index().unwrap();
 
@@ -2117,7 +2122,10 @@ url = "https://github.com/example/existing"
             "admin deletion must remove the persisted PageRank cache"
         );
         assert!(
-            !store.pagerank_scores().contains_key(&removed_symbol_uid),
+            !store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(&removed_symbol_uid),
             "admin deletion must invalidate the live PageRank cache"
         );
         assert!(
@@ -2240,7 +2248,7 @@ url = "https://github.com/example/existing"
                 .is_empty_for_repo(repo_uid)
         );
         assert!(!pagerank_path.exists());
-        assert!(!store.pagerank_scores().contains_key(&file_uid));
+        assert!(!store.pagerank_scores().unwrap().contains_key(&file_uid));
         assert!(
             !tantivy
                 .search("web_late_remove_search_sentinel", 10)

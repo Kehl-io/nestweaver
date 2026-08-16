@@ -10894,7 +10894,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 {
                     let store = state.store.clone();
                     rt.spawn_blocking(move || {
-                        store.ensure_pagerank_loaded();
+                        // Best-effort: a dirty index publication refuses the
+                        // warm (ranking queries fail closed until the
+                        // publication completes — see the ranking.rs module
+                        // contract).
+                        if let Err(error) = store.ensure_pagerank_loaded() {
+                            tracing::debug!("PageRank pre-warm skipped: {error}");
+                        }
                     });
                 }
 
@@ -15472,6 +15478,7 @@ fn run_ranking(
                 .map_err(|e| anyhow::anyhow!(e))?;
             let base_pagerank = store
                 .pagerank_scores()
+                .map_err(|e| anyhow::anyhow!(e))?
                 .get(&resolved)
                 .copied()
                 .unwrap_or(0.0);
