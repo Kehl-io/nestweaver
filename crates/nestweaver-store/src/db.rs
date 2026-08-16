@@ -171,6 +171,35 @@ impl IndexPublicationLease<'_> {
         self.store.complete_index_publication_generation(self.token)
     }
 
+    /// Compute PageRank over `scope` while this owner's publication is still
+    /// dirty, so the fresh sidecar can land BEFORE the marker retires. The
+    /// fail-closed guards on [`GraphStore::compute_pagerank`] stop outsiders
+    /// from ranking mid-publication state; the publication owner ranks the
+    /// graph it just committed, which is exactly the state the marker's
+    /// retirement then vouches for. Token-validated like every other lease
+    /// method.
+    pub fn compute_pagerank(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &crate::ranking::GraphScope,
+    ) -> Result<(), StoreError> {
+        self.store.validate_index_publication_owner(self.token)?;
+        self.store
+            .compute_pagerank_for_publication_owner(damping, iterations, scope)
+    }
+
+    /// Persist the freshly computed PageRank sidecar during this owner's dirty
+    /// publication window. Same exemption as [`Self::compute_pagerank`]: the
+    /// guarded [`GraphStore::save_pagerank_cache`] refuses to persist
+    /// mid-publication state for outsiders, but the owner must persist before
+    /// the marker retires or a crash in between leaves a clean-reporting
+    /// publication with no ranks.
+    pub fn save_pagerank(&self, path: &Path) -> Result<(), StoreError> {
+        self.store.validate_index_publication_owner(self.token)?;
+        self.store.save_pagerank_cache_for_publication_owner(path)
+    }
+
     /// Restore the prior canonical generation when no graph mutation occurred.
     pub fn cancel_generation(&self) -> Result<(), StoreError> {
         if self.reservation.get() != IndexPublicationReservationState::Fresh {
