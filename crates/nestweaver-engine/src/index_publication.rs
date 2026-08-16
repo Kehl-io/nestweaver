@@ -122,8 +122,15 @@ impl IndexPublicationStatus {
     /// True when the wedge can only be cleared by an explicit operator
     /// override — the marker is present but carries no writer we can prove
     /// dead, so the automatic predicate must decline.
+    ///
+    /// The [`is_wedged`](Self::is_wedged) gate is INTRINSIC, not something each
+    /// call site must remember: a young, timestamped, pid-less marker is a
+    /// publication in flight, not a wedge, and it does not need repair at all —
+    /// so it must never produce a `repair --force` suggestion, even for a
+    /// caller that reaches for [`repair_command_for`](Self::repair_command_for)
+    /// without checking `is_wedged()` first.
     pub fn needs_forced_repair(&self) -> bool {
-        self.dirty && (!self.determinable || self.writer_pid.is_none())
+        self.is_wedged() && (!self.determinable || self.writer_pid.is_none())
     }
 
     /// The operator escape hatch to name in a wedged-state message.
@@ -411,6 +418,53 @@ mod tests {
         assert_eq!(status.writer_pid, None);
         assert!(status.marker_age_s.is_some());
         assert!(!status.is_wedged(), "a young marker is transient");
+    }
+
+    #[test]
+    fn a_transient_publication_is_never_told_to_force_repair() {
+        // The third-consumer trap: a caller of `repair_command_for` that does
+        // NOT gate on `is_wedged()` first must still never print `--force` at
+        // a publication that is simply in flight — here a young, timestamped,
+        // pid-less marker, which `is_wedged()` classifies as transient.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::write(marker_path(&db_path), format!("x:{now}\n")).unwrap();
+        let status = status(&db_path);
+        assert_eq!(status.writer_pid, None);
+        assert!(status.marker_age_s.is_some());
+        assert!(!status.is_wedged(), "a young marker is transient");
+        assert!(
+            !status.needs_forced_repair(),
+            "a transient publication does not need repair at all, forced or otherwise"
+        );
+        assert!(
+            !status.repair_command_for(&db_path).ends_with("--force"),
+            "an ungated consumer must not be handed --force for a transient publication"
+        );
+    }
+
+    #[test]
+    fn an_aged_out_pidless_marker_still_needs_forced_repair() {
+        // The narrowing must not go too far: once the same pid-less marker is
+        // older than WEDGED_MARKER_AGE it IS wedged, and the explicit override
+        // remains the only thing that resolves it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            - (WEDGED_MARKER_AGE + Duration::from_secs(60)).as_nanos();
+        std::fs::write(marker_path(&db_path), format!("x:{old}\n")).unwrap();
+        let status = status(&db_path);
+        assert_eq!(status.writer_pid, None);
+        assert!(status.is_wedged(), "an aged-out pid-less marker is wedged");
+        assert!(status.needs_forced_repair());
+        assert!(status.repair_command_for(&db_path).ends_with("--force"));
     }
 
     #[test]

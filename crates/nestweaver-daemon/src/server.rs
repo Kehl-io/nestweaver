@@ -8420,6 +8420,49 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     }
 }
 
+/// Boot-time index-publication reconciliation, run on a blocking thread just
+/// before the PPR cache warm.
+///
+/// nw-C1: a read-write daemon is a WRITER. If a prior indexer died between
+/// establishing `<db>.index-dirty` and finalizing, every ranked query in this
+/// database fails closed forever. Reconcile it here, before warming, so the
+/// warm below succeeds and the first PPR query does not meet the wedge. A live
+/// publication is left strictly alone (see
+/// `recover_abandoned_index_publication`).
+///
+/// The gate must mirror how THIS daemon opened the store, exactly like the
+/// neighbouring reconcile passes: a snapshot-replica daemon opens read-only,
+/// and a read-only caller must report the condition rather than recompute
+/// PageRank, persist `.generation`, and delete the marker out from under
+/// whoever holds the write lock. Both directions of the gate are pinned:
+/// `read_only_boot_reconciliation_leaves_the_publication_untouched_on_disk`
+/// (must NOT recover on a read-only boot) and
+/// `read_write_boot_reconciliation_recovers_the_abandoned_publication` (MUST
+/// recover on a read-write boot), with
+/// `read_write_daemon_boot_recovers_the_abandoned_publication` pinning the
+/// call-site binding end to end.
+fn reconcile_index_publication_before_ppr_warm(store: &GraphStore, read_only: bool) {
+    nestweaver_engine::index::recover_abandoned_index_publication_best_effort(store, !read_only);
+    match store.warm_ppr_cache() {
+        Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+        // nw-C2: this specific failure used to be swallowed as a generic warn,
+        // which is how a permanently wedged database produced no diagnostic
+        // anywhere. Name it.
+        Err(e) if format!("{e}").contains("dirty index publication") => {
+            let status = store
+                .db_path()
+                .map(nestweaver_engine::index_publication::status);
+            tracing::warn!(
+                "PPR cache not warmed: an index publication is dirty, so every ranked \
+                 query (brain_context, project_context, investigate) will fail closed \
+                 until it is reconciled. This is an index PUBLICATION marker, not a \
+                 dirty git working tree. status={status:?} error={e}"
+            );
+        }
+        Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+    }
+}
+
 pub async fn run_server(
     db_path: &Path,
     mut idle_timeout: Option<Duration>,
@@ -8865,39 +8908,7 @@ pub async fn run_server(
     {
         let store = state.store.clone();
         tokio::task::spawn_blocking(move || {
-            // nw-C1: a read-write daemon is a WRITER. If a prior indexer died
-            // between establishing `<db>.index-dirty` and finalizing, every
-            // ranked query in this database fails closed forever. Reconcile it
-            // here, before warming, so the warm below succeeds and the first
-            // PPR query does not meet the wedge. A live publication is left
-            // strictly alone (see `recover_abandoned_index_publication`).
-            //
-            // The gate must mirror how THIS daemon opened the store, exactly
-            // like the neighbouring reconcile passes: a snapshot-replica daemon
-            // opens read-only, and a read-only caller must report the condition
-            // rather than recompute PageRank, persist `.generation`, and delete
-            // the marker out from under whoever holds the write lock.
-            nestweaver_engine::index::recover_abandoned_index_publication_best_effort(
-                &store, !read_only,
-            );
-            match store.warm_ppr_cache() {
-                Ok(()) => tracing::info!("PPR adjacency cache warmed"),
-                // nw-C2: this specific failure used to be swallowed as a
-                // generic warn, which is how a permanently wedged database
-                // produced no diagnostic anywhere. Name it.
-                Err(e) if format!("{e}").contains("dirty index publication") => {
-                    let status = store
-                        .db_path()
-                        .map(nestweaver_engine::index_publication::status);
-                    tracing::warn!(
-                        "PPR cache not warmed: an index publication is dirty, so every ranked \
-                         query (brain_context, project_context, investigate) will fail closed \
-                         until it is reconciled. This is an index PUBLICATION marker, not a \
-                         dirty git working tree. status={status:?} error={e}"
-                    );
-                }
-                Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
-            }
+            reconcile_index_publication_before_ppr_warm(&store, read_only)
         });
     }
 
@@ -17374,6 +17385,347 @@ external_model = "unavailable-test-model"
         assert!(!replica_mounts_admin_api(true, false));
         assert!(replica_mounts_admin_api(false, true));
         assert!(!replica_mounts_admin_api(false, false));
+    }
+}
+
+#[cfg(test)]
+mod boot_reconciliation_tests {
+    use super::*;
+
+    /// A pid guaranteed not to name a live process: spawn a child, wait for it
+    /// (reaping the zombie), and return its now-free pid, so `kill(pid, 0)`
+    /// reports ESRCH deterministically.
+    fn reaped_child_pid() -> i32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as i32;
+        child.wait().expect("reap /bin/true");
+        assert!(
+            !nestweaver_engine::index_publication::process_is_alive(pid),
+            "a reaped child must not read as alive"
+        );
+        pid
+    }
+
+    /// A minimal code graph, so a recovery's PageRank recompute has
+    /// observable content (mirrors the engine fixture's shape).
+    fn insert_publication_graph(store: &GraphStore) {
+        let repo_uid = "repo:boot".to_string();
+        let file_uid = "file:boot".to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.clone(),
+                url: "https://example.test/boot".into(),
+                indexed_sha: "boot".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/boot.rs".into(),
+                repo_uid: repo_uid.clone(),
+                content_hash: "hash-boot".into(),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&repo_uid, &file_uid).unwrap();
+        for (uid, name) in [
+            ("sym:boot:source", "boot_source"),
+            ("sym:boot:target", "boot_target"),
+        ] {
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: uid.into(),
+                    name: name.into(),
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: repo_uid.clone(),
+                    file_path: "src/boot.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: "fn boot()".into(),
+                    summary: None,
+                    content_hash: format!("hash-{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            store.insert_file_symbol_edge(&file_uid, uid).unwrap();
+        }
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid: "sym:boot:source".into(),
+                target_uid: "sym:boot:target".into(),
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    /// Leave `db_path` in exactly the state a SIGKILL between marker
+    /// establishment and finalize produces: graph committed, `.index-dirty`
+    /// present and naming a dead writer, `.pagerank.json` still holding
+    /// pre-crash scores, `.generation` still at the pre-crash canonical value.
+    /// Returns the dead writer's pid and the canonical generation.
+    fn abandoned_publication_fixture(db_path: &std::path::Path) -> (i32, u64) {
+        let generation_path = nestweaver_engine::sidecar_path(db_path, ".generation");
+        let pagerank_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
+        let marker_path = nestweaver_engine::sidecar_path(db_path, ".index-dirty");
+
+        let canonical = {
+            let store = GraphStore::open_or_create(db_path).unwrap();
+            store.bump_graph_generation();
+            store.save_graph_generation(&generation_path).unwrap();
+            let canonical = store.graph_generation();
+            insert_publication_graph(&store);
+            canonical
+        };
+        std::fs::write(&pagerank_path, br#"{"stale-precrash-score":1.0}"#).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dead_pid = reaped_child_pid();
+        std::fs::write(
+            &marker_path,
+            nestweaver_store::index_publication::format_marker_payload(
+                dead_pid as u32,
+                nanos,
+                None,
+            ),
+        )
+        .unwrap();
+        (dead_pid, canonical)
+    }
+
+    /// The daemon-level pin for the `!read_only` recovery gate (nw-C1): a
+    /// read-only replica's boot reconciliation must REPORT an abandoned
+    /// publication, never repair it. Asserted ON DISK: the marker,
+    /// `.generation`, and `.pagerank.json` are byte-for-byte untouched.
+    ///
+    /// Why this drives `reconcile_index_publication_before_ppr_warm` directly
+    /// rather than booting a full replica end to end: a replica's working copy
+    /// is rebuilt from the snapshot on every boot, and `materialize_snapshot`
+    /// relocates only the graph file and its known sidecars — any marker file
+    /// in the snapshot is discarded, so no marker can ride a snapshot into the
+    /// boot path deterministically. What CAN be pinned deterministically is
+    /// the exact boot path itself: the store here is opened exactly the way
+    /// the replica boot opens it (`GraphStore::open_read_only`), against a
+    /// database left in exactly the crash state (committed graph, dead-writer
+    /// marker, pre-crash sidecars), and the function under test is the exact
+    /// code the boot runs, passed the same `read_only` the boot computes.
+    /// Flipping the `!read_only` argument inside it to `true` fails this test;
+    /// the engine-level tests cannot see that flip, because they call the
+    /// engine function with an explicit literal.
+    #[test]
+    fn read_only_boot_reconciliation_leaves_the_publication_untouched_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.lbug");
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = nestweaver_engine::sidecar_path(&db_path, ".generation");
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+        abandoned_publication_fixture(&db_path);
+
+        let before_marker = std::fs::read(&marker_path).unwrap();
+        let before_generation = std::fs::read(&generation_path).unwrap();
+        let before_pagerank = std::fs::read(&pagerank_path).unwrap();
+
+        // Open exactly as the snapshot-replica boot does, then run the boot
+        // reconciliation with the same `read_only` the boot computes.
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        reconcile_index_publication_before_ppr_warm(&store, true);
+
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            before_marker,
+            "a read-only boot must not rewrite or delete the marker"
+        );
+        assert_eq!(
+            std::fs::read(&generation_path).unwrap(),
+            before_generation,
+            "a read-only boot must not persist a recomputed .generation"
+        );
+        assert_eq!(
+            std::fs::read(&pagerank_path).unwrap(),
+            before_pagerank,
+            "a read-only boot must not rewrite the PageRank sidecar"
+        );
+        assert!(
+            store.is_index_publication_dirty(),
+            "a read-only boot must keep failing closed, not clear the condition"
+        );
+    }
+
+    /// The other half of the gate (nw-C1): a READ-WRITE daemon's boot
+    /// reconciliation must actually recover — a gate pinned only in the
+    /// "decline" direction could be flipped to never recover at all
+    /// (`!read_only` → `false`) with no test failing. Asserted against the
+    /// recovery contract: the marker is retired, the clean N+2 generation is
+    /// published, and the recomputed ranks cover the committed graph.
+    #[test]
+    fn read_write_boot_reconciliation_recovers_the_abandoned_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("writer.lbug");
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+        let (_dead_pid, canonical) = abandoned_publication_fixture(&db_path);
+
+        // Open exactly as the read-write boot does, then run the boot
+        // reconciliation with the same `read_only` the boot computes.
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        reconcile_index_publication_before_ppr_warm(&store, false);
+
+        assert!(
+            !marker_path.exists(),
+            "a read-write boot must retire the abandoned marker"
+        );
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(
+            store.graph_generation(),
+            canonical + 2,
+            "recovery publishes the clean N+2 successor"
+        );
+        let scores = store.pagerank_scores();
+        assert!(
+            scores.contains_key("sym:boot:source") && scores.contains_key("sym:boot:target"),
+            "recovered PageRank must cover the committed graph: {scores:?}"
+        );
+        assert!(
+            !std::fs::read_to_string(&pagerank_path)
+                .unwrap()
+                .contains("stale-precrash-score"),
+            "recovery must rewrite the pre-crash PageRank sidecar"
+        );
+    }
+
+    /// The end-to-end pin for the CALL SITE (nw-C1): a full read-write daemon
+    /// boot on a database carrying the crash state must recover the abandoned
+    /// publication with no RPC and no operator action. The two function-level
+    /// tests above call `reconcile_index_publication_before_ppr_warm` with
+    /// literal arguments, so neither can see a flipped binding at the boot
+    /// call site (`read_only` → `!read_only` there passes `true` on a
+    /// read-write boot, silently disabling writer-boot recovery); this test
+    /// boots the real server and observes the marker's retirement on disk.
+    // Holding a std MutexGuard across await points is deliberate here: the
+    // guard only ever blocks sibling TEST threads that swap env vars (they
+    // take the same lock), never async tasks in this runtime — a tokio Mutex
+    // would buy nothing.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_write_daemon_boot_recovers_the_abandoned_publication() {
+        // Resolve env-dependent paths (socket, pidfile, log/runtime dirs) for
+        // the daemon's whole lifetime under the same lock the sibling e2e
+        // tests hold while swapping XDG vars.
+        let _env_guard = lifecycle::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("brain.lbug");
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+        let (_dead_pid, canonical) = abandoned_publication_fixture(&db_path);
+
+        let db_for_server = db_path.clone();
+        let server =
+            tokio::spawn(async move { run_server(&db_for_server, None, None, None).await });
+
+        let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+        let sock = lifecycle::socket_path(&instance_id);
+
+        // Wait for the daemon's socket to accept connections.
+        let mut client = None;
+        for _ in 0..100 {
+            if sock.exists()
+                && let Ok(c) = connect_uds(&sock).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut client = client.expect("daemon socket did not come up within 10s");
+
+        // The boot reconciliation needs no RPC: it runs on a blocking thread
+        // during startup and must retire the marker on its own.
+        let mut retired = false;
+        for _ in 0..300 {
+            if !marker_path.exists() {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            retired,
+            "a read-write daemon boot must recover the abandoned publication \
+             (retire the marker) within 30s of startup"
+        );
+
+        client
+            .shutdown(nestweaver_proto::ShutdownRequest {})
+            .await
+            .expect("shutdown RPC");
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("daemon must exit promptly");
+        finished
+            .expect("server task panicked")
+            .expect("run_server error");
+
+        // The recovery contract, verified against the reopened database.
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(
+            store.graph_generation(),
+            canonical + 2,
+            "recovery publishes the clean N+2 successor"
+        );
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let scores = store.pagerank_scores();
+        assert!(
+            scores.contains_key("sym:boot:source") && scores.contains_key("sym:boot:target"),
+            "persisted ranks must cover the committed graph: {scores:?}"
+        );
+        drop(store);
+
+        // Belt-and-suspenders cleanup; a temp-DB daemon sweeps these itself.
+        let _ = std::fs::remove_dir_all(lifecycle::log_dir(&instance_id));
+        let _ = std::fs::remove_dir_all(lifecycle::runtime_dir(&instance_id));
+    }
+
+    async fn connect_uds(
+        sock: &std::path::Path,
+    ) -> Result<
+        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<
+            tonic::transport::Channel,
+        >,
+        (),
+    > {
+        let path = sock.to_path_buf();
+        let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+            .map_err(|_| ())?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            }))
+            .await
+            .map_err(|_| ())?;
+        Ok(nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel))
     }
 }
 
