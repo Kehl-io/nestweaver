@@ -9351,7 +9351,13 @@ function hello(name) { return "Hello " + name; }
             error.failures[0].stage,
             DeletionReconciliationStage::PageRankCompute
         );
-        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
+        // The rank path now fails CLOSED while the publication is dirty —
+        // Err(RankingUnavailable), and the failed read itself invalidates the
+        // stale cache. Observing ranks requires reconciling first.
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(nestweaver_store::StoreError::RankingUnavailable)
+        ));
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
         // The failed refresh BLOCKS marker retirement: the publication stays
@@ -9370,6 +9376,17 @@ function hello(name) { return "Hello " + name; }
                 .unwrap()
                 > generation_before
         );
+
+        // After reconciliation the healed ranks must not contain the stale score.
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
+        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        assert!(
+            outcome.recovered(),
+            "the dirty publication must reconcile: {}",
+            outcome.describe()
+        );
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
     }
 
     #[test]
@@ -9405,9 +9422,29 @@ function hello(name) { return "Hello " + name; }
             error.failures[0].stage,
             DeletionReconciliationStage::PageRankPersistence
         );
-        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
+        // Same contract as the compute-failure sibling: dirty reads fail
+        // closed, the marker survives, and reconciling the publication must
+        // not restore the stale score.
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(nestweaver_store::StoreError::RankingUnavailable)
+        ));
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
+
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        assert!(
+            marker_path.exists(),
+            "a failed PageRank refresh must leave the publication dirty"
+        );
+        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
+        let outcome = recover_abandoned_index_publication(&store, true).unwrap();
+        assert!(
+            outcome.recovered(),
+            "the dirty publication must reconcile: {}",
+            outcome.describe()
+        );
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
     }
 
     /// Leave the database in exactly the state a SIGKILL inside the finalizer
@@ -10031,13 +10068,18 @@ function hello(name) { return "Hello " + name; }
                     "the stale PageRank sidecar must be retired before the write gate is released"
                 );
                 assert!(self.store.graph_generation() > self.generation_before);
-                assert_eq!(
-                    fs::read_to_string(&self.generation_path)
-                        .unwrap()
-                        .trim()
-                        .parse::<u64>()
-                        .unwrap(),
-                    self.store.graph_generation(),
+                // A failed refresh blocks marker retirement, so the in-memory
+                // generation stays at the dirty reservation while the durable
+                // file already holds the clean successor. What this guard pins
+                // is that the generation is DURABLE and advanced before the
+                // write gate is released — not that the two agree.
+                let persisted = fs::read_to_string(&self.generation_path)
+                    .unwrap()
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap();
+                assert!(
+                    persisted > self.generation_before,
                     "the graph generation must be durable before the write gate is released"
                 );
                 self.dropped.store(true, Ordering::SeqCst);
@@ -10096,7 +10138,13 @@ function hello(name) { return "Hello " + name; }
             store.symbols_in_file("old.js").unwrap().is_empty(),
             "the server replacement transaction must commit before PageRank fails"
         );
-        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
+        // The publication stays dirty after the failed refresh, so the rank
+        // path fails closed — and the failed read itself invalidates the live
+        // stale cache.
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(nestweaver_store::StoreError::RankingUnavailable)
+        ));
         assert!(dropped.load(Ordering::SeqCst));
     }
 
