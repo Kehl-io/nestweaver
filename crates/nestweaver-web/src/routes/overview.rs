@@ -227,7 +227,7 @@ fn overview_scope_data(
             let top_symbols = state
                 .store
                 .symbols_by_pagerank(Some(limit))
-                .map_err(|e| ApiError::from_ranking(&state.store, e))?;
+                .map_err(|e| ApiError::from_ranking(e.into()))?;
             let vaults = state.store.list_vaults(None)?;
             let notes = state.store.list_notes_lite(None)?;
             let counts = OverviewCounts {

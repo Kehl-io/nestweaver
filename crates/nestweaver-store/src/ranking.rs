@@ -11,14 +11,15 @@
 //!
 //! - **Query paths fail closed.** `compute_pagerank`, `personalized_pagerank*`,
 //!   `symbols_by_pagerank`, `pagerank_scores`, `ensure_pagerank_loaded`, and
-//!   `warm_ppr_cache` return
-//!   `Err(StoreError::Query("PageRank unavailable during dirty index publication"))`.
-//!   A publication window must never be mistaken for an empty graph, so no
-//!   query path answers with a successful-looking empty result.
+//!   `warm_ppr_cache` return `Err(StoreError::RankingUnavailable)` ("PageRank
+//!   unavailable during dirty index publication"). A publication window must
+//!   never be mistaken for an empty graph, so no query path answers with a
+//!   successful-looking empty result.
 //! - **Sidecar load/save no-op.** `save_pagerank_cache` and
-//!   `load_pagerank_cache` return `Ok(())` without touching the cache or the
-//!   disk: refusing to persist or load during the window is a no-op by
-//!   nature, not a degraded answer.
+//!   `load_pagerank_cache` return `Ok(())` without reading or writing sidecar
+//!   data (the caches are still invalidated, as at every guard site):
+//!   refusing to persist or load during the window is a no-op by nature, not
+//!   a degraded answer.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -599,9 +600,7 @@ impl GraphStore {
     ) -> Result<(), StoreError> {
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
@@ -682,9 +681,7 @@ impl GraphStore {
 
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
 
         // 5. Store scores in the in-memory cache (no DB write-back needed).
@@ -886,9 +883,7 @@ impl GraphStore {
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         let effective_damping = intent.map_or(damping, |i| i.damping());
 
@@ -1027,9 +1022,7 @@ impl GraphStore {
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         self.ensure_pagerank_loaded_locked()?;
         let scores = self
@@ -1157,9 +1150,7 @@ impl GraphStore {
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         self.ensure_pagerank_loaded_locked()?;
         Ok(self
@@ -1188,9 +1179,7 @@ impl GraphStore {
     fn ensure_pagerank_loaded_locked(&self) -> Result<(), StoreError> {
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         let loaded = |cache: &std::sync::Mutex<Option<HashMap<String, f64>>>| {
             cache.lock().map(|c| c.is_some()).unwrap_or(false)
@@ -1220,9 +1209,7 @@ impl GraphStore {
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
             self.invalidate_ranking_caches_locked();
-            return Err(StoreError::Query(
-                "PageRank unavailable during dirty index publication".into(),
-            ));
+            return Err(StoreError::RankingUnavailable);
         }
         let scope = GraphScope::unified();
         self.load_ppr_graph(&scope, None)?;
@@ -1357,7 +1344,7 @@ mod tests {
         // during the window — none may answer with a successful-looking
         // empty result that a caller could mistake for an empty graph.
         assert!(
-            store.pagerank_scores().is_err(),
+            matches!(store.pagerank_scores(), Err(StoreError::RankingUnavailable)),
             "dirty publication must not serve ranks computed while clean"
         );
         assert!(

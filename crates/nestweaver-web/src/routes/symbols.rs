@@ -82,7 +82,7 @@ pub async fn symbols_top(
         let symbols = state2
             .store
             .symbols_by_pagerank(Some(limit))
-            .map_err(|e| ApiError::from_ranking(&state2.store, e))?;
+            .map_err(|e| ApiError::from_ranking(e.into()))?;
         let json = serde_json::to_value(&symbols)?;
         Ok(Json(json).into_response())
     })
