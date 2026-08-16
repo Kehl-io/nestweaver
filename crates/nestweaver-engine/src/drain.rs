@@ -15,6 +15,22 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// The counters and the shutdown channel the drain loop reads. Every field is
 /// a shared handle: the daemon clones its own `Arc`s in, so the loop observes
 /// the same values the RPC handlers and the worker pool mutate.
+///
+/// CONSUMER CONTRACT. This loop only OBSERVES and reports; the guarantees its
+/// log messages assert belong to the consumer, and [`run_drain`] cannot
+/// enforce them:
+///
+///  - "NEW writes are already being refused with UNAVAILABLE" — the consumer
+///    must refuse new writes before and for the whole drain (the daemon does
+///    this via `ConnectionGuard::write`, and `begin_shutdown_drain` sets
+///    `drained` before spawning this loop). Without that, fresh work can
+///    extend the wait indefinitely while the log claims it cannot.
+///  - The `embed` / `plan_embed` write-gate behaviour the write-branch report
+///    describes is the daemon's RPC-gating design, not something this loop
+///    does.
+///  - The operator commands named in the messages (`nestweaver daemon stop
+///    [--force]`, `kill -9`) are the daemon's CLI; a different consumer must
+///    substitute its own escalation path rather than inherit these strings.
 pub struct DrainSignals {
     /// In-flight write RPCs. A write holds the DB write lock on an
     /// unabortable `spawn_blocking` thread, so while any are running the wait

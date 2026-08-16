@@ -95,10 +95,14 @@ command's grace runs to 690s. In that window the daemon is alive but
 unreachable, and the message says:
 
 ```
-It is still running but is NO LONGER answering on its socket: the drain reached
-its ceiling with no in-flight write and broadcast shutdown, which closes every
-listener, and the process is now finishing unabortable work with nothing being
-served. Reads are DOWN.
+It is still running, but its socket did not answer just now, so reads may be
+DOWN. The likeliest cause is a stuck-flag index drain: with nothing in the
+write queue and the worker pool idle, the daemon broadcasts at the drain
+ceiling, which closes every listener (a genuinely running index job keeps
+them up, like a write — the broadcast is only for a flag that outlived its
+work). This probe cannot tell that apart from a socket already cleaned up,
+a refused connection during exit, or a local file-descriptor limit — check
+the daemon log before concluding.
 ```
 
 Exit status is non-zero in both cases: the operator asked for the daemon to stop
