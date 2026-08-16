@@ -1058,6 +1058,15 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                         match io.save_pagerank(&lease, &pagerank_path) {
                             Ok(()) => {}
                             Err(error) => {
+                                // Known residual: under sustained ranked-query
+                                // traffic a reader blocked on
+                                // `pagerank_compute_lock` during the compute
+                                // typically acquires it in the compute→save gap
+                                // and wipes the fresh cache, so this fail-closed
+                                // save can fail on every retry and keep the
+                                // publication dirty (queries error) until
+                                // traffic pauses or a restart heals it via
+                                // recovery.
                                 push_reconciliation_failure(
                                     &mut failures,
                                     DeletionReconciliationStage::PageRankPersistence,
