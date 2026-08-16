@@ -15,6 +15,14 @@ static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
 static LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Process-wide lock serializing every test that swaps OR durably reads the
+/// XDG/socket-fallback env vars. Defined at module level (not inside the
+/// test module) so `server.rs`'s in-process-daemon e2e tests — which resolve
+/// runtime/state paths for the daemon's whole lifetime — can serialize
+/// against the lifecycle unit tests that flip those vars.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn effective_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
     parent.join(format!(
         ".{EFFECTIVE_CONFIG_BINDING_FILE}.{}.{}.tmp",
@@ -472,6 +480,24 @@ enum FallbackDirStatus {
     ModeTightened,
 }
 
+/// Root of the `/tmp` socket-fallback tree: `/tmp/nw-sock-<uid>`.
+///
+/// `NESTWEAVER_SOCK_FALLBACK_DIR` overrides the whole root. It exists so
+/// tests can point the daemon, the client, AND `daemon gc` at one scratch
+/// directory: the real root belongs to the operator's daemons, and a test
+/// that swept it could delete a live daemon's fallback socket. Every process
+/// that must agree on the socket location reads the same variable, exactly
+/// like `XDG_RUNTIME_DIR`.
+pub fn socket_fallback_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("NESTWEAVER_SOCK_FALLBACK_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from("/tmp").join(format!("nw-sock-{uid}"))
+}
+
 /// Create or verify the `/tmp/nw-sock-<uid>` fallback socket dir.
 ///
 /// Anyone can create paths in `/tmp`, so a pre-existing dir owned by ANOTHER
@@ -528,7 +554,7 @@ pub fn socket_path(instance_id: &str) -> PathBuf {
         return default;
     }
     let uid = unsafe { libc::getuid() };
-    let fallback_dir = PathBuf::from("/tmp").join(format!("nw-sock-{uid}"));
+    let fallback_dir = socket_fallback_root();
     if let Err(e) = secure_fallback_sock_dir(&fallback_dir, uid) {
         tracing::error!(
             error = %e,
@@ -1500,20 +1526,160 @@ pub fn is_temp_db_path(db_path: &Path) -> bool {
     bases.iter().any(|b| db_path.starts_with(b))
 }
 
-/// Outcome of a [`gc_orphaned_state_dirs`] pass.
+/// Unlink every per-instance directory a TEMP-database daemon created, on its
+/// clean shutdown: the runtime dir (socket, pidfile, spawnlock, live binding),
+/// the state dir (daemon logs), and the `/tmp` socket-fallback dir when one
+/// was used. Temp databases (tests, throwaway repros — see [`is_temp_db_path`])
+/// spawn daemons by the thousand and each one used to leave all three behind
+/// for `daemon gc` to find; the sweep stays as the backstop for SIGKILLed
+/// daemons, but a clean shutdown of an ephemeral daemon should leave nothing
+/// to sweep.
+///
+/// The gate is the same [`is_temp_db_path`] predicate the sweep and launchd
+/// use, so the three can never disagree about what is ephemeral. A daemon
+/// serving a REAL database returns immediately: its logs and runtime records
+/// are operator diagnostics, not litter.
+///
+/// Two vetoes, both checked inside. First, a held `daemon.spawnlock`: a
+/// client mid-respawn (`daemon restart`, autostart) holds the spawnlock
+/// across this daemon's shutdown and hands the locked file to the child,
+/// which refuses to start when the path it inherited is gone — so a held
+/// spawnlock passes every directory to the successor daemon untouched.
+/// Second, the residual race the spawnlock cannot cover — and the veto is a
+/// PROBE, not a hold, so it cannot close this: a client that acquires the
+/// spawnlock in the probe→removal gap hands its child a locked inode whose
+/// PATH this removal then deletes, and the child aborts the restart with
+/// "inherited parent spawnlock cannot be matched" — the exact client-visible
+/// failure the veto exists to prevent, shrunk to a microseconds window. A
+/// successor that simply recreates the runtime dir in that window can
+/// likewise lose its files — the same race the caller's socket/pidfile
+/// unlinks already have. Accepted for the temp-database scope (test
+/// daemons), where an unreachable-daemon recovery path exists and a failed
+/// autostart is retried.
+///
+/// Callers must invoke this only on the clean-shutdown path, after the
+/// instance's socket and pidfile are unlinked and before the process exits,
+/// while the instance flock is still held.
+pub fn remove_instance_dirs_for_temp_db(db_path: &Path, instance_id: &str) {
+    if !is_temp_db_path(db_path) {
+        return;
+    }
+    let runtime = runtime_dir(instance_id);
+    // A client mid-respawn (`daemon restart`, autostart) holds the instance's
+    // spawnlock ACROSS this daemon's shutdown and hands the locked file to the
+    // child, which refuses to start when the path it inherited is gone.
+    // Unlinking the runtime dir under that handshake kills the respawn, so a
+    // held spawnlock vetoes every removal below and the dirs pass to the
+    // successor daemon instead. (The pre-change restart test caught exactly
+    // this: "inherited parent spawnlock cannot be matched".)
+    if pidfile_lock_held_at(&runtime.join("daemon.spawnlock")) {
+        tracing::info!(
+            instance = instance_id,
+            "spawnlock held — a client is mid-spawn; leaving the instance dirs \
+             for the successor daemon"
+        );
+        return;
+    }
+    for dir in [
+        runtime,
+        socket_fallback_root().join(instance_id),
+        log_dir(instance_id),
+    ] {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            // The fallback dir exists only when the sun_path fallback was
+            // used, and on macOS the runtime dir IS the state dir.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                dir = %dir.display(),
+                error = %error,
+                "temp-database shutdown could not remove a directory — daemon gc \
+                 remains the backstop"
+            ),
+        }
+    }
+}
+
+/// One of the three roots a daemon writes per-instance directories under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GcRoot {
+    /// `~/.local/state/nestweaver/<instance>` (or `$XDG_STATE_HOME`) — daemon
+    /// logs. Also the identification source for every root: the boot line in
+    /// `daemon.log` is the only record tying an instance id back to its
+    /// database path.
+    PersistentState,
+    /// `$XDG_RUNTIME_DIR/nestweaver/<instance>` — socket, pidfile, spawnlock,
+    /// live config binding. Distinct from the state root only where
+    /// `XDG_RUNTIME_DIR` is set; elsewhere [`runtime_dir`] falls back to the
+    /// state root and there is no second root to sweep.
+    RuntimeDir,
+    /// `/tmp/nw-sock-<uid>/<instance>` — sun_path fallback sockets, created
+    /// only when the runtime-dir socket path would exceed 104 bytes.
+    SocketFallback,
+}
+
+/// The roots [`gc_orphaned_daemon_dirs`] sweeps, resolved once so a test can
+/// point every one of them at a scratch directory. Sweeping the operator's
+/// real roots is `daemon gc`'s job and no test's.
+#[derive(Debug, Clone)]
+pub struct DaemonGcRoots {
+    /// `persistent_state_root()` — daemon logs, and the identification source
+    /// (`daemon.log`) for entries found under the other two roots.
+    pub state: PathBuf,
+    /// The runtime root when it differs from the state root
+    /// (`XDG_RUNTIME_DIR` set); `None` where [`runtime_dir`] falls back to
+    /// the state root.
+    pub runtime: Option<PathBuf>,
+    /// `socket_fallback_root()` — the `/tmp/nw-sock-<uid>` tree.
+    pub socket_fallback: PathBuf,
+}
+
+impl DaemonGcRoots {
+    /// Where an instance's pidfile lives: the runtime root when distinct,
+    /// else the state root — mirroring [`pidfile_path`].
+    fn pidfile_root(&self) -> &Path {
+        self.runtime.as_deref().unwrap_or(&self.state)
+    }
+}
+
+/// Resolve the sweep roots from this process's environment — what the real
+/// `daemon gc` runs against.
+pub fn daemon_gc_roots() -> DaemonGcRoots {
+    let state = persistent_state_root();
+    // Mirror runtime_dir()'s semantics exactly, including its UTF-8 `var`
+    // (not `var_os`) read: when XDG_RUNTIME_DIR is unset the runtime dir IS
+    // the state root. The same collapse applies when it points AT the state
+    // root — filter that too, or the same directory is swept under two root
+    // labels (the second pass reports NotFound, so nothing is double-deleted,
+    // but the roots must still be reported as one).
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|xdg| PathBuf::from(xdg).join("nestweaver"))
+        .filter(|root| *root != state);
+    DaemonGcRoots {
+        state,
+        runtime,
+        socket_fallback: socket_fallback_root(),
+    }
+}
+
+/// Outcome of a [`gc_orphaned_daemon_dirs`] pass.
 #[derive(Debug, Default)]
-pub struct StateDirGcReport {
-    /// Instance directories deleted (database gone or under a temp dir).
-    pub removed: Vec<String>,
+pub struct DaemonGcReport {
+    /// Instance directories deleted (database gone or under a temp dir), as
+    /// (root, instance) pairs — an instance reclaimed from two roots appears
+    /// once per root.
+    pub removed: Vec<(GcRoot, String)>,
     /// Bytes reclaimed by those deletions.
     pub reclaimed_bytes: u64,
-    /// Directories whose database still exists.
+    /// Instances whose database still exists.
     pub kept: Vec<String>,
-    /// Directories spared because something still owns the instance: the
+    /// Instances spared because something still owns them: the
     /// database write lock, an unreadable database lock state, or the pidfile
     /// flock. The union of the three lists below, deduplicated — a healthy
     /// daemon appears in two of them, because two independent facts are true of
-    /// it at once.
+    /// it at once. Sparing applies to EVERY root the instance occupies: a
+    /// live daemon's runtime files are never reclaimed.
     pub spared: Vec<String>,
     /// Instances whose database write lock the kernel reports as HELD, with the
     /// holder PID when the platform named one. Proof an `rm -f daemon.pid`
@@ -1521,7 +1687,7 @@ pub struct StateDirGcReport {
     pub spared_database_write_lock: Vec<(String, Option<i32>)>,
     /// Instances whose database lock state could not be READ. This is not
     /// evidence of ownership; it is a refusal to guess. Reported apart from
-    /// [`StateDirGcReport::spared_database_write_lock`] because "a process holds
+    /// [`DaemonGcReport::spared_database_write_lock`] because "a process holds
     /// this database" and "we could not tell" are different facts and must
     /// never share a sentence.
     pub spared_database_unreadable: Vec<String>,
@@ -1529,9 +1695,16 @@ pub struct StateDirGcReport {
     /// case, and forgeable by unlinking the pidfile — which is why it is
     /// reported alongside the database answer rather than instead of it.
     pub spared_pidfile_lock: Vec<String>,
-    /// Directories left alone because their database could not be identified.
-    /// Not an error: unidentifiable means undeletable, by design.
+    /// Instances left alone because their database could not be identified —
+    /// in every root they occupy. Not an error: unidentifiable means
+    /// undeletable, by design.
     pub unidentified: Vec<String>,
+    /// The socket-fallback root was skipped because it is not a real
+    /// directory owned by this user — the squat shape
+    /// [`secure_fallback_sock_dir`] refuses at daemon startup. A
+    /// foreign-owned dir in sticky `/tmp` can be neither repaired nor removed
+    /// by us, so the whole root is left for its owner or root to clear.
+    pub socket_fallback_root_untrusted: bool,
 }
 
 /// Everything known about who still owns a state directory's instance.
@@ -1587,14 +1760,14 @@ impl StateDirOwnership {
 /// would fail closed for every candidate (see [`db_write_lock`]) and the sweep
 /// would spare everything. `daemon gc` runs in a CLI process that opens no
 /// store.
-fn state_dir_ownership(instance_id: &str, db_path: &Path) -> StateDirOwnership {
+fn state_dir_ownership(pidfile: &Path, db_path: &Path) -> StateDirOwnership {
     StateDirOwnership {
         database: db_write_lock(db_path),
-        pidfile_lock_held: instance_pidfile_lock_held(instance_id),
+        pidfile_lock_held: pidfile_lock_held_at(pidfile),
     }
 }
 
-/// Is a live daemon holding `instance_id`'s pidfile lock?
+/// Is a live daemon holding the lock on the pidfile at `pidfile`?
 ///
 /// The daemon takes the pidfile `flock(LOCK_EX)` BEFORE opening the database
 /// (`claim_instance_lock` precedes `GraphStore::open_or_create`), and releases
@@ -1608,12 +1781,11 @@ fn state_dir_ownership(instance_id: &str, db_path: &Path) -> StateDirOwnership {
 /// Corroborating evidence only — see [`state_dir_ownership`] for why this can never
 /// be the sole ownership test.
 #[cfg(unix)]
-fn instance_pidfile_lock_held(instance_id: &str) -> bool {
-    let pidfile = pidfile_path(instance_id);
+fn pidfile_lock_held_at(pidfile: &Path) -> bool {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&pidfile)
+        .open(pidfile)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
@@ -1631,7 +1803,7 @@ fn instance_pidfile_lock_held(instance_id: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn instance_pidfile_lock_held(_instance_id: &str) -> bool {
+fn pidfile_lock_held_at(_pidfile: &Path) -> bool {
     true
 }
 
@@ -1693,109 +1865,269 @@ fn directory_size_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Reclaim daemon state directories whose database is gone or was temporary.
+/// Gather sweep candidates from one root into `candidates`.
 ///
-/// The state directory is keyed by a hash of `--db` and created whenever a
-/// daemon auto-spawns. Because writes are daemon-routed, nearly any write-path
-/// test spawns one against its temp database, and nothing removed the directory
-/// when that database went away — 8,525 directories / 547 MB accumulated on one
-/// machine in about a month, exactly one of them live, while `daemon gc`
-/// reported "clean".
-///
-/// Fail-closed at every step. A directory is deleted only when its name matches
-/// the instance-id shape, its database was positively identified, that database
-/// is temporary or missing, and nothing still owns the instance — neither the
-/// database write lock nor the pidfile flock (see [`state_dir_ownership`]).
-/// Anything unreadable, unparseable, or ambiguous is kept.
-///
-/// Every directory that reaches the ownership test has a database path: one
-/// that cannot be resolved from `daemon.log` is reported as `unidentified` and
-/// left alone *before* the test runs, so there is no candidate whose deletion
-/// rests on an unprobed database.
-pub fn gc_orphaned_state_dirs() -> std::io::Result<StateDirGcReport> {
-    let root = persistent_state_root();
-    let mut report = StateDirGcReport::default();
-
-    let entries = match std::fs::read_dir(&root) {
+/// Shared shape filter for every root: the instance-id allowlist first,
+/// before reading anything inside, then `symlink_metadata` — never follow a
+/// symlink out of a swept root. A root that was never created is a clean
+/// machine, not a failure.
+fn collect_gc_candidates(
+    root_kind: GcRoot,
+    root: &Path,
+    candidates: &mut std::collections::BTreeMap<String, Vec<(GcRoot, PathBuf)>>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        // No state root yet is a clean machine, not a failure.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // Allowlist first, before reading anything inside.
         if !is_instance_dir_name(name) {
             continue;
         }
-        // symlink_metadata: never follow a symlink out of the state root.
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_dir() => {}
             _ => continue,
         }
+        candidates
+            .entry(name.to_string())
+            .or_default()
+            .push((root_kind, path));
+    }
+    Ok(())
+}
 
-        let log = std::fs::read_to_string(path.join("daemon.log")).unwrap_or_default();
+/// Gather candidates from the `/tmp` socket-fallback root. Returns `false`
+/// when the root is not a real directory owned by `expected_uid`.
+///
+/// Anyone can create paths in `/tmp`, so this root gets an ownership check
+/// BEFORE anything inside it is read — the same judgment
+/// [`secure_fallback_sock_dir`] makes at daemon startup. A root owned by
+/// another uid is a squat: a sweep must neither trust its contents nor "help"
+/// by deleting it (a foreign-owned dir in sticky `/tmp` can be neither
+/// repaired nor removed by us), so the whole root is skipped and reported.
+///
+/// Per entry, only directories owned by `expected_uid` become deletion
+/// candidates. Deleting a foreign-owned entry is exactly the over-eager sweep
+/// the squatting threat model warns about — and the ownership proof below
+/// runs before any deletion regardless, so a live daemon's fallback socket is
+/// never reclaimed.
+///
+/// `expected_uid` is a parameter (like [`secure_fallback_sock_dir`]'s) so the
+/// refusal is unit-testable without chown.
+#[cfg(unix)]
+fn collect_fallback_candidates(
+    root: &Path,
+    expected_uid: u32,
+    candidates: &mut std::collections::BTreeMap<String, Vec<(GcRoot, PathBuf)>>,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        // No fallback root yet is a clean machine, not a failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !root_meta.file_type().is_dir()
+        || root_meta.file_type().is_symlink()
+        || root_meta.uid() != expected_uid
+    {
+        tracing::warn!(
+            dir = %root.display(),
+            owner = root_meta.uid(),
+            expected = expected_uid,
+            "skipping untrusted /tmp socket fallback root — not a directory owned by \
+             this user (the squat shape daemon startup refuses); left for its owner"
+        );
+        return Ok(false);
+    }
+
+    let entries = std::fs::read_dir(root)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_instance_dir_name(name) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
+                if meta.uid() != expected_uid {
+                    tracing::warn!(
+                        dir = %path.display(),
+                        owner = meta.uid(),
+                        expected = expected_uid,
+                        "leaving a foreign-owned entry in the socket fallback root \
+                         for its owner"
+                    );
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+        candidates
+            .entry(name.to_string())
+            .or_default()
+            .push((GcRoot::SocketFallback, path));
+    }
+    Ok(true)
+}
+
+/// Reclaim orphaned per-instance daemon directories under ALL THREE roots a
+/// daemon writes: the persistent state root (`~/.local/state/nestweaver`,
+/// daemon logs), the runtime root (`$XDG_RUNTIME_DIR/nestweaver` — socket,
+/// pidfile, spawnlock, live binding), and the `/tmp/nw-sock-<uid>` socket
+/// fallback.
+///
+/// Each directory is keyed by a hash of `--db` and created whenever a daemon
+/// auto-spawns. Because writes are daemon-routed, nearly any write-path test
+/// spawns one against its temp database, and nothing removed the directories
+/// when that database went away. The state sweep alone left the other two
+/// roots to grow without bound: in three days on one machine, 2,695 runtime
+/// dirs (1,682 holding a `daemon.spawnlock`) and 264 socket-fallback dirs
+/// accumulated beside 1,885 state dirs, while `daemon gc` reported "clean".
+///
+/// Identification is resolved ONCE per instance, from the state root's
+/// `daemon.log`, BEFORE anything is deleted — deleting an instance's state
+/// dir first would destroy the only record tying its runtime and fallback
+/// dirs back to their database.
+///
+/// Fail-closed at every step, under every root. A directory is deleted only
+/// when its name matches the instance-id shape, its database was positively
+/// identified, that database is temporary or missing, and nothing still owns
+/// the instance — neither the database write lock nor the pidfile flock (see
+/// [`state_dir_ownership`]). Anything unreadable, unparseable, ambiguous, or
+/// foreign-owned is kept. A live daemon's files are never reclaimed, in any
+/// root.
+///
+/// Every instance that reaches the ownership test has a database path: one
+/// that cannot be resolved from `daemon.log` is reported as `unidentified`
+/// and left alone *before* the test runs, so there is no candidate whose
+/// deletion rests on an unprobed database.
+///
+/// One residual race, stated rather than hidden. The ownership probe and the
+/// deletion are not atomic, so a daemon BOOTING a temp or missing database
+/// between the two can lose directories mid-boot: a runtime-dir deletion
+/// landing between its pidfile claim and its socket bind unlinks the locked
+/// pidfile inode out from under it or fails the bind. The worst case is one
+/// retryable autostart failure — pidfile claim and socket bind recreate
+/// their directories, the database write lock is unaffected, and the client
+/// spawns again — and the same race existed for the state-only sweep before
+/// this change widened it to the runtime root. The pidfile flock narrows the
+/// window: the child claims it before opening the database or binding the
+/// socket, and a claimed flock spares the instance outright, so the
+/// uncovered span is only the client's pre-claim spawn phase (the sweep does
+/// not consult the client-side spawnlock — taking it here would serialize
+/// `daemon gc` against every in-flight spawn on the machine, a worse trade
+/// for a cleanup pass).
+pub fn gc_orphaned_daemon_dirs() -> std::io::Result<DaemonGcReport> {
+    gc_orphaned_daemon_dirs_in(&daemon_gc_roots())
+}
+
+/// [`gc_orphaned_daemon_dirs`] against explicit roots — the seam that keeps
+/// every test on scratch directories and off the operator's real roots.
+fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGcReport> {
+    let mut report = DaemonGcReport::default();
+
+    // Phase 1: gather candidates from every root BEFORE any deletion, keyed
+    // by instance id, so one identification + one ownership test governs all
+    // of an instance's directories at once.
+    let mut candidates: std::collections::BTreeMap<String, Vec<(GcRoot, PathBuf)>> =
+        Default::default();
+    collect_gc_candidates(GcRoot::PersistentState, &roots.state, &mut candidates)?;
+    if let Some(runtime) = &roots.runtime {
+        collect_gc_candidates(GcRoot::RuntimeDir, runtime, &mut candidates)?;
+    }
+    #[cfg(unix)]
+    {
+        let trusted = collect_fallback_candidates(
+            &roots.socket_fallback,
+            unsafe { libc::geteuid() },
+            &mut candidates,
+        )?;
+        report.socket_fallback_root_untrusted = !trusted;
+    }
+    #[cfg(not(unix))]
+    collect_gc_candidates(
+        GcRoot::SocketFallback,
+        &roots.socket_fallback,
+        &mut candidates,
+    )?;
+
+    // Phase 2: identify, test ownership, then reap from every root at once.
+    for (name, locations) in candidates {
+        // The boot line lives in the state root's daemon.log, wherever the
+        // candidate itself was found.
+        let log =
+            std::fs::read_to_string(roots.state.join(&name).join("daemon.log")).unwrap_or_default();
         let Some(db_path) = db_path_from_daemon_log(&log) else {
-            report.unidentified.push(name.to_string());
+            report.unidentified.push(name);
             continue;
         };
 
-        let ownership = state_dir_ownership(name, &db_path);
+        let pidfile = roots.pidfile_root().join(&name).join("daemon.pid");
+        let ownership = state_dir_ownership(&pidfile, &db_path);
         if ownership.is_owned() {
             // Record every fact that is true, not just the first one found.
             match ownership.database {
                 DbWriteLock::Held { pid } => {
                     tracing::info!(
-                        instance = name,
+                        instance = name.as_str(),
                         db = %db_path.display(),
                         holder = ?pid,
-                        "sparing a state directory whose database is still held"
+                        "sparing an instance whose database is still held"
                     );
-                    report
-                        .spared_database_write_lock
-                        .push((name.to_string(), pid));
+                    report.spared_database_write_lock.push((name.clone(), pid));
                 }
                 DbWriteLock::Unknown => {
                     tracing::info!(
-                        instance = name,
+                        instance = name.as_str(),
                         db = %db_path.display(),
-                        "sparing a state directory whose database lock state could not be read"
+                        "sparing an instance whose database lock state could not be read"
                     );
-                    report.spared_database_unreadable.push(name.to_string());
+                    report.spared_database_unreadable.push(name.clone());
                 }
                 DbWriteLock::Free => {}
             }
             if ownership.pidfile_lock_held {
-                report.spared_pidfile_lock.push(name.to_string());
+                report.spared_pidfile_lock.push(name.clone());
             }
-            report.spared.push(name.to_string());
+            report.spared.push(name);
             continue;
         }
 
         if !(is_temp_db_path(&db_path) || !db_path.exists()) {
-            report.kept.push(name.to_string());
+            report.kept.push(name);
             continue;
         }
 
-        let size = directory_size_bytes(&path);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => {
-                report.reclaimed_bytes += size;
-                report.removed.push(name.to_string());
+        for (root_kind, path) in locations {
+            let size = directory_size_bytes(&path);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    report.reclaimed_bytes += size;
+                    report.removed.push((root_kind, name.clone()));
+                }
+                // A directory that vanished under us needs no reporting; anything
+                // else stays visible as still present rather than silently counted.
+                // A failure is recorded once per INSTANCE, not once per root —
+                // the dedup after the loop keeps a multi-root failure from
+                // reporting the same instance twice.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.kept.push(name.clone()),
             }
-            // A directory that vanished under us needs no reporting; anything
-            // else stays visible as still present rather than silently counted.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => report.kept.push(name.to_string()),
         }
     }
 
     report.removed.sort();
     report.kept.sort();
+    report.kept.dedup();
     report.spared.sort();
     report.spared_database_write_lock.sort();
     report.spared_database_unreadable.sort();
@@ -1921,11 +2253,11 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Tests that mutate environment variables must hold this lock to avoid
     // racing with each other under `cargo test`'s default parallel execution.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Alias of the crate-wide lock — server.rs's e2e tests hold the same one.
+    use super::TEST_ENV_LOCK as ENV_LOCK;
 
     fn with_xdg_runtime<T>(root: &Path, test: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -2686,6 +3018,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Write a runtime directory as a real daemon boot would leave it
+    /// (pidfile + a leftover spawnlock), returning its path.
+    fn seed_runtime_dir(instance: &str) -> PathBuf {
+        let dir = runtime_dir(instance);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon.pid"), b"12345\n").unwrap();
+        std::fs::write(dir.join("daemon.spawnlock"), b"").unwrap();
+        dir
+    }
+
+    /// Write a socket-fallback directory as the sun_path fallback would leave
+    /// it (the socket file itself is unlinked at shutdown; the dir survives).
+    fn seed_fallback_dir(fallback_root: &Path, instance: &str) -> PathBuf {
+        let dir = fallback_root.join(instance);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Sweep roots agreeing with the `with_xdg_state_and_runtime` overrides,
+    /// with a SCRATCH socket-fallback root. Tests must never run the sweep
+    /// against the operator's real `/tmp/nw-sock-<uid>`.
+    fn scratch_gc_roots(state: &Path, runtime: &Path, fallback: &Path) -> DaemonGcRoots {
+        DaemonGcRoots {
+            state: state.join("nestweaver"),
+            runtime: Some(runtime.join("nestweaver")),
+            socket_fallback: fallback.to_path_buf(),
+        }
+    }
+
     #[test]
     fn instance_dir_allowlist_admits_only_the_instance_id_shape() {
         assert!(is_instance_dir_name("05c1b2b6"));
@@ -2745,6 +3106,7 @@ mod tests {
     fn gc_state_dirs_never_touches_config_intent() {
         let state = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
         with_xdg_state_and_runtime(state.path(), runtime.path(), || {
             let db = PathBuf::from("/tmp/gone-forever-12345/test.lbug");
             let intent_dir = last_successful_config_dir(&db);
@@ -2756,9 +3118,17 @@ mod tests {
             // a test that deletes nothing would "protect" config-intent trivially.
             seed_state_dir("05c1b2b6", "/tmp/gone-forever-12345/test.lbug");
 
-            let report = gc_orphaned_state_dirs().unwrap();
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
 
-            assert_eq!(report.removed, vec!["05c1b2b6".to_string()]);
+            assert_eq!(
+                report.removed,
+                vec![(GcRoot::PersistentState, "05c1b2b6".to_string())]
+            );
             assert!(
                 intent_file.exists(),
                 "config-intent must survive gc — deleting it reproduces the \
@@ -2771,15 +3141,26 @@ mod tests {
         });
     }
 
+    /// THE acceptance test for the three-root sweep: orphans are reclaimed
+    /// under persistent state, `$XDG_RUNTIME_DIR`, AND the /tmp socket
+    /// fallback — including an instance's `daemon.spawnlock` — while live
+    /// databases and unidentifiable instances keep every directory they have.
     #[test]
-    fn gc_state_dirs_reaps_orphans_keeps_live_databases_and_reports_unidentified() {
+    fn gc_reaps_orphans_under_all_three_roots_keeps_live_and_unidentified() {
         let state = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
         with_xdg_state_and_runtime(state.path(), runtime.path(), || {
-            // Reaped: database path is gone.
+            // Reaped from ALL THREE roots: database path is gone. This is the
+            // exact shape that accumulated 2,695 runtime dirs / 1,682
+            // spawnlocks / 264 fallback dirs on the maintainer's machine.
             seed_state_dir("aaaaaaaa", "/nonexistent-root-98765/brain.lbug");
+            let rt_a = seed_runtime_dir("aaaaaaaa");
+            let fb_a = seed_fallback_dir(fallback.path(), "aaaaaaaa");
             // Reaped: temp database, whether or not it still exists.
             seed_state_dir("bbbbbbbb", "/tmp/ephemeral-54321/test.lbug");
+            let rt_b = seed_runtime_dir("bbbbbbbb");
+            let fb_b = seed_fallback_dir(fallback.path(), "bbbbbbbb");
             // Kept: the database still exists at a NON-temp path. It must be
             // outside any tempdir — a `tempfile::tempdir()` lives under /tmp, so
             // the temp rule would reap it and this case would prove nothing.
@@ -2787,16 +3168,36 @@ mod tests {
             let live_db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
             assert!(live_db.exists() && !is_temp_db_path(&live_db));
             seed_state_dir("cccccccc", live_db.to_str().unwrap());
-            // Kept and REPORTED: no boot line, so the database cannot be named.
+            let rt_c = seed_runtime_dir("cccccccc");
+            let fb_c = seed_fallback_dir(fallback.path(), "cccccccc");
+            // Kept and REPORTED: no boot line, so the database cannot be
+            // named — in EVERY root it occupies. A runtime/fallback entry
+            // whose state dir (and daemon.log) was already swept is exactly
+            // this case: unidentifiable means undeletable, forever.
             let unknown = log_dir("dddddddd");
             std::fs::create_dir_all(&unknown).unwrap();
             std::fs::write(unknown.join("daemon.log"), "rotated away\n").unwrap();
+            let rt_d = seed_runtime_dir("dddddddd");
+            let fb_d = seed_fallback_dir(fallback.path(), "dddddddd");
 
-            let report = gc_orphaned_state_dirs().unwrap();
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
 
             assert_eq!(
                 report.removed,
-                vec!["aaaaaaaa".to_string(), "bbbbbbbb".to_string()]
+                // Sorted: root kind first (declaration order), then instance.
+                vec![
+                    (GcRoot::PersistentState, "aaaaaaaa".to_string()),
+                    (GcRoot::PersistentState, "bbbbbbbb".to_string()),
+                    (GcRoot::RuntimeDir, "aaaaaaaa".to_string()),
+                    (GcRoot::RuntimeDir, "bbbbbbbb".to_string()),
+                    (GcRoot::SocketFallback, "aaaaaaaa".to_string()),
+                    (GcRoot::SocketFallback, "bbbbbbbb".to_string()),
+                ]
             );
             assert_eq!(report.kept, vec!["cccccccc".to_string()]);
             assert_eq!(report.unidentified, vec!["dddddddd".to_string()]);
@@ -2804,13 +3205,31 @@ mod tests {
                 report.reclaimed_bytes > 0,
                 "reclaimed bytes must be reported"
             );
-            assert!(!log_dir("aaaaaaaa").exists());
-            assert!(!log_dir("bbbbbbbb").exists());
-            assert!(
-                log_dir("cccccccc").exists(),
-                "a live database keeps its logs"
-            );
-            assert!(unknown.exists(), "unidentifiable means undeletable");
+            assert!(!report.socket_fallback_root_untrusted);
+            for gone in [
+                log_dir("aaaaaaaa"),
+                rt_a,
+                fb_a,
+                log_dir("bbbbbbbb"),
+                rt_b,
+                fb_b,
+            ] {
+                assert!(!gone.exists(), "{} must be reclaimed", gone.display());
+            }
+            for kept_dir in [log_dir("cccccccc"), rt_c, fb_c] {
+                assert!(
+                    kept_dir.exists(),
+                    "a live database keeps its dirs: {}",
+                    kept_dir.display()
+                );
+            }
+            for unknown_dir in [unknown, rt_d, fb_d] {
+                assert!(
+                    unknown_dir.exists(),
+                    "unidentifiable means undeletable: {}",
+                    unknown_dir.display()
+                );
+            }
         });
     }
 
@@ -2822,6 +3241,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let state = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
         with_xdg_state_and_runtime(state.path(), runtime.path(), || {
             seed_state_dir("eeeeeeee", "/nonexistent-root-24680/brain.lbug");
             let pidfile = pidfile_path("eeeeeeee");
@@ -2836,7 +3256,12 @@ mod tests {
             // genuinely contends the way another process would.
             assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-            let report = gc_orphaned_state_dirs().unwrap();
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
 
             assert_eq!(report.spared, vec!["eeeeeeee".to_string()]);
             assert_eq!(report.spared_pidfile_lock, vec!["eeeeeeee".to_string()]);
@@ -2858,12 +3283,15 @@ mod tests {
     /// daemon serving a temp database — the shape `gc` exists to reap. The
     /// pidfile flock is gone with the inode, so the pidfile-only test says
     /// "orphan" and the sweep deletes a LIVE instance's logs. The database
-    /// write lock still names the holder, and must veto the deletion.
+    /// write lock still names the holder, and must veto the deletion — under
+    /// EVERY root, including the /tmp socket fallback, where deleting a live
+    /// daemon's fallback socket would cut off its clients.
     #[cfg(unix)]
     #[test]
     fn gc_state_dirs_spares_a_live_database_holder_after_the_pidfile_is_removed() {
         let state = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
         let db_dir = tempfile::tempdir().unwrap();
         // Under /tmp, so the temp-database rule makes this a reap candidate —
         // exactly the class `gc` sweeps by the thousand.
@@ -2874,13 +3302,25 @@ mod tests {
         let holder = fork_write_lock_holder(&db);
         let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
             seed_state_dir("ffffffff", db.to_str().unwrap());
+            // A live fallback socket under the scratch fallback root.
+            let fb = seed_fallback_dir(fallback.path(), "ffffffff");
+            std::fs::write(fb.join("daemon.sock"), b"").unwrap();
             // No pidfile at all: the strongest form of the forgery, and what an
             // operator's `rm -f daemon.pid` leaves behind.
             assert!(!pidfile_path("ffffffff").exists());
-            let report = gc_orphaned_state_dirs().unwrap();
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
             assert!(
                 log_dir("ffffffff").exists(),
                 "a live database holder must keep its logs"
+            );
+            assert!(
+                fb.join("daemon.sock").exists(),
+                "a live database holder must keep its fallback socket"
             );
             report
         });
@@ -2912,6 +3352,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let state = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
         let db_dir = tempfile::tempdir().unwrap();
         let db = db_dir.path().join("brain.lbug");
         std::fs::write(&db, b"not really a database").unwrap();
@@ -2928,7 +3369,12 @@ mod tests {
                 .open(&pidfile)
                 .unwrap();
             assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
-            let report = gc_orphaned_state_dirs().unwrap();
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
             unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
             report
         });
@@ -2960,12 +3406,12 @@ mod tests {
         with_xdg_state_and_runtime(state.path(), runtime.path(), || {
             let missing = PathBuf::from("/nonexistent-root-13579/brain.lbug");
             assert_eq!(db_write_lock(&missing), DbWriteLock::Free);
-            let unowned = state_dir_ownership("aaaabbbb", &missing);
+            let pidfile = pidfile_path("aaaabbbb");
+            let unowned = state_dir_ownership(&pidfile, &missing);
             assert!(!unowned.is_owned());
             assert_eq!(unowned.database, DbWriteLock::Free);
             assert!(!unowned.pidfile_lock_held);
 
-            let pidfile = pidfile_path("aaaabbbb");
             std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
             std::fs::write(&pidfile, "12345\n").unwrap();
             let held = std::fs::OpenOptions::new()
@@ -2975,7 +3421,7 @@ mod tests {
                 .unwrap();
             assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-            let owned = state_dir_ownership("aaaabbbb", &missing);
+            let owned = state_dir_ownership(&pidfile, &missing);
             assert!(owned.is_owned());
             assert_eq!(
                 owned.database,
@@ -3196,5 +3642,255 @@ mod tests {
 
         unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_UN) };
         reap(holder);
+    }
+
+    /// A fallback root that does not exist is a clean machine, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fallback_root_absent_is_clean() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let absent = fallback.path().join("never-created");
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            let roots = DaemonGcRoots {
+                state: state.path().join("nestweaver"),
+                runtime: Some(runtime.path().join("nestweaver")),
+                socket_fallback: absent,
+            };
+            let report = gc_orphaned_daemon_dirs_in(&roots).unwrap();
+            assert!(report.removed.is_empty());
+            assert!(
+                !report.socket_fallback_root_untrusted,
+                "an absent fallback root is clean, not untrusted"
+            );
+        });
+    }
+
+    /// The squatting threat model, at unit scale: a fallback root that is not
+    /// a real directory owned by the expected uid is NEVER swept — no entry
+    /// inside it is even read for deletion. Tested by VALUE with a foreign
+    /// expected uid (the same seam `secure_fallback_sock_dir` uses), because
+    /// the test process cannot chown.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fallback_root_foreign_or_symlinked_is_never_swept() {
+        let mut candidates = Default::default();
+        let our_uid = unsafe { libc::geteuid() };
+
+        // A root owned by someone else (simulated: expected uid is not ours).
+        let root = tempfile::tempdir().unwrap();
+        let instance = seed_fallback_dir(root.path(), "aaaabbbb");
+        let trusted =
+            collect_fallback_candidates(root.path(), our_uid + 1, &mut candidates).unwrap();
+        assert!(!trusted, "a foreign-owned fallback root must be refused");
+        assert!(candidates.is_empty());
+        assert!(
+            instance.exists(),
+            "a refused root's contents are left untouched"
+        );
+
+        // A symlinked root is never followed out of /tmp either.
+        let target = tempfile::tempdir().unwrap();
+        let behind_symlink = seed_fallback_dir(target.path(), "aaaabbbb");
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("nw-sock-link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        let trusted = collect_fallback_candidates(&link, our_uid, &mut candidates).unwrap();
+        assert!(!trusted, "a symlinked fallback root must be refused");
+        assert!(candidates.is_empty());
+        assert!(behind_symlink.exists());
+    }
+
+    /// A squatted fallback root skips ONLY that root: the state and runtime
+    /// sweeps still run, and the report says the fallback was not checked.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reports_and_skips_a_squatted_fallback_root() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        // A symlink stands in for the squat (cannot chown in a test).
+        let target = tempfile::tempdir().unwrap();
+        let behind_symlink = seed_fallback_dir(target.path(), "aaaabbbb");
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("fallback");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("aaaabbbb", "/nonexistent-root-98765/brain.lbug");
+            let rt = seed_runtime_dir("aaaabbbb");
+            let roots = DaemonGcRoots {
+                state: state.path().join("nestweaver"),
+                runtime: Some(runtime.path().join("nestweaver")),
+                socket_fallback: link,
+            };
+
+            let report = gc_orphaned_daemon_dirs_in(&roots).unwrap();
+
+            assert!(report.socket_fallback_root_untrusted);
+            assert_eq!(
+                report.removed,
+                vec![
+                    (GcRoot::PersistentState, "aaaabbbb".to_string()),
+                    (GcRoot::RuntimeDir, "aaaabbbb".to_string()),
+                ]
+            );
+            assert!(!rt.exists());
+            assert!(
+                behind_symlink.exists(),
+                "the untrusted root's contents must survive"
+            );
+        });
+    }
+
+    /// `NESTWEAVER_SOCK_FALLBACK_DIR` relocates the whole fallback root, so
+    /// tests (and only tests) keep the sweep off the operator's real
+    /// `/tmp/nw-sock-<uid>`.
+    #[test]
+    fn socket_fallback_root_honors_the_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("NESTWEAVER_SOCK_FALLBACK_DIR");
+        unsafe {
+            std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", "/scratch/nw-sock-test");
+        }
+        let overridden = socket_fallback_root();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", value),
+                None => std::env::remove_var("NESTWEAVER_SOCK_FALLBACK_DIR"),
+            }
+        }
+        assert_eq!(overridden, PathBuf::from("/scratch/nw-sock-test"));
+    }
+
+    /// Set all three env roots under one ENV_LOCK acquisition (the lock is a
+    /// plain std Mutex and is not reentrant — no nesting).
+    fn with_state_runtime_and_fallback<T>(
+        state: &Path,
+        runtime: &Path,
+        fallback: &Path,
+        test: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let previous_fallback = std::env::var_os("NESTWEAVER_SOCK_FALLBACK_DIR");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state);
+            std::env::set_var("XDG_RUNTIME_DIR", runtime);
+            std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", fallback);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match previous_runtime {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match previous_fallback {
+                Some(value) => std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", value),
+                None => std::env::remove_var("NESTWEAVER_SOCK_FALLBACK_DIR"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// A clean shutdown of a TEMP-database daemon unlinks all three of its
+    /// per-instance directories, so counts stop growing between sweeps.
+    #[test]
+    fn temp_db_shutdown_unlinks_state_runtime_and_fallback_dirs() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        with_state_runtime_and_fallback(state.path(), runtime.path(), fallback.path(), || {
+            let db = db_dir.path().join("brain.lbug");
+            std::fs::write(&db, b"not really a database").unwrap();
+            assert!(is_temp_db_path(&db));
+            seed_state_dir("aaaabbbb", db.to_str().unwrap());
+            let rt = seed_runtime_dir("aaaabbbb");
+            let fb = seed_fallback_dir(fallback.path(), "aaaabbbb");
+
+            remove_instance_dirs_for_temp_db(&db, "aaaabbbb");
+
+            assert!(!log_dir("aaaabbbb").exists(), "state dir must go");
+            assert!(!rt.exists(), "runtime dir (with spawnlock) must go");
+            assert!(!fb.exists(), "socket-fallback dir must go");
+            // The fallback ROOT is not the daemon's to remove.
+            assert!(fallback.path().exists());
+        });
+    }
+
+    /// The spawnlock veto: a client mid-respawn holds `daemon.spawnlock`
+    /// across the old daemon's shutdown and hands the locked file to the
+    /// child, which refuses to start when the path it inherited is gone
+    /// ("inherited parent spawnlock cannot be matched" — the failure the
+    /// pre-change restart test produced). A held spawnlock must pass every
+    /// directory to the successor untouched.
+    #[cfg(unix)]
+    #[test]
+    fn temp_db_shutdown_keeps_every_directory_while_the_spawnlock_is_held() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        with_state_runtime_and_fallback(state.path(), runtime.path(), fallback.path(), || {
+            let db = db_dir.path().join("brain.lbug");
+            std::fs::write(&db, b"not really a database").unwrap();
+            assert!(is_temp_db_path(&db));
+            seed_state_dir("bbbbcccc", db.to_str().unwrap());
+            let rt = seed_runtime_dir("bbbbcccc");
+            let fb = seed_fallback_dir(fallback.path(), "bbbbcccc");
+            // Hold the spawnlock the way a respawning client does.
+            let spawnlock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(rt.join("daemon.spawnlock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(spawnlock.as_raw_fd(), libc::LOCK_EX) },
+                0
+            );
+
+            remove_instance_dirs_for_temp_db(&db, "bbbbcccc");
+
+            assert!(
+                log_dir("bbbbcccc").exists(),
+                "state dir passes to the successor"
+            );
+            assert!(rt.exists(), "runtime dir passes to the successor");
+            assert!(fb.exists(), "fallback dir passes to the successor");
+
+            unsafe { libc::flock(spawnlock.as_raw_fd(), libc::LOCK_UN) };
+        });
+    }
+
+    /// The gate: a daemon serving a REAL database must never delete its state
+    /// dir on shutdown. Same predicate the sweep and launchd use.
+    #[test]
+    fn real_db_shutdown_keeps_every_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        with_state_runtime_and_fallback(state.path(), runtime.path(), fallback.path(), || {
+            // Any stable path outside the temp roots serves as a real database.
+            let db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            assert!(db.exists() && !is_temp_db_path(&db));
+            seed_state_dir("ccccdddd", db.to_str().unwrap());
+            let rt = seed_runtime_dir("ccccdddd");
+            let fb = seed_fallback_dir(fallback.path(), "ccccdddd");
+
+            remove_instance_dirs_for_temp_db(&db, "ccccdddd");
+
+            assert!(log_dir("ccccdddd").exists());
+            assert!(rt.exists());
+            assert!(fb.exists());
+        });
     }
 }

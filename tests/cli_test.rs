@@ -2218,6 +2218,21 @@ fn cli_daemon_run_server_help() {
         .stdout(predicates::str::contains("--idle-timeout").not());
 }
 
+/// The help text used to advertise "orphaned daemon state directories" on
+/// every platform without saying WHICH root — reading as broader coverage
+/// than the sweep had (it touched only the persistent state root). It must
+/// name exactly the three roots it sweeps.
+#[test]
+fn cli_daemon_gc_help_names_exactly_the_roots_it_sweeps() {
+    nestweaver_cmd()
+        .args(["daemon", "gc", "--help"])
+        .assert()
+        .success()
+        .stdout(contains(".local/state/nestweaver"))
+        .stdout(contains("XDG_RUNTIME_DIR"))
+        .stdout(contains("/tmp/nw-sock-<uid>"));
+}
+
 #[test]
 fn cli_connect_help() {
     nestweaver_cmd()

@@ -5003,3 +5003,115 @@ fn brain_refresh_since_uses_daemon_owned_writer_and_updates_search() {
         .success()
         .stdout(contains("Beta Sentinel"));
 }
+
+/// THE acceptance test for the runtime-leftovers sweep, end to end over real
+/// child processes against SCRATCH roots (never the operator's):
+///
+///  1. `daemon gc` reclaims orphaned entries under all three roots —
+///     persistent state, `$XDG_RUNTIME_DIR`, and the `/tmp` socket fallback
+///     (exercised for real: the scratch runtime root is deep enough to push
+///     the socket path past the 104-byte `sun_path` limit);
+///  2. a RUNNING daemon's files are spared under every root — the gc child
+///     is a separate process, so the kernel-attested database write lock
+///     genuinely names the daemon — and its socket still answers afterwards;
+///  3. a clean `daemon stop` of the temp-database daemon then leaves no
+///     state or runtime directory behind.
+#[test]
+fn gc_spares_running_daemon_reaps_orphans_and_stop_leaves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("brain.lbug");
+    let state = tmp.path().join("state");
+    // Deep enough that runtime/nestweaver/<id>/daemon.sock exceeds 104 bytes,
+    // forcing the sun_path fallback branch for real.
+    let runtime = tmp
+        .path()
+        .join("runtime-with-deliberately-deep-nesting")
+        .join("of-directories-pushing-the-socket-path")
+        .join("past-the-104-byte-sun-path-limit");
+    let fallback = tmp.path().join("fallback");
+
+    let scratch_cmd = |action: &str| {
+        let mut cmd = daemon_cmd();
+        cmd.env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", &fallback)
+            .args(["daemon", "--db", &db_path.display().to_string(), action]);
+        cmd
+    };
+
+    scratch_cmd("start").assert().success();
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let runtime_sock = runtime
+        .join("nestweaver")
+        .join(&instance_id)
+        .join("daemon.sock");
+    assert!(
+        runtime_sock.as_os_str().len() >= 104,
+        "the test requires the fallback branch, but {} fits sun_path",
+        runtime_sock.display()
+    );
+    let sock = fallback.join(&instance_id).join("daemon.sock");
+    let readiness = wait_for_daemon_readiness(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || std::os::unix::net::UnixStream::connect(&sock).map(drop),
+        || {
+            let _ = scratch_cmd("stop").ok();
+        },
+    );
+    assert!(
+        readiness.is_ok(),
+        "daemon socket {} never came up: {readiness:?}",
+        sock.display()
+    );
+
+    // Seed an unambiguous orphan (database path gone) under every root.
+    let orphan = "0011aabb";
+    let orphan_state = state.join("nestweaver").join(orphan);
+    std::fs::create_dir_all(&orphan_state).unwrap();
+    std::fs::write(
+        orphan_state.join("daemon.log"),
+        "[daemon] starting for /nonexistent-gc-test-root/brain.lbug (instance x-0011aabb)\n",
+    )
+    .unwrap();
+    let orphan_runtime = runtime.join("nestweaver").join(orphan);
+    std::fs::create_dir_all(&orphan_runtime).unwrap();
+    std::fs::write(orphan_runtime.join("daemon.spawnlock"), b"").unwrap();
+    let orphan_fallback = fallback.join(orphan);
+    std::fs::create_dir_all(&orphan_fallback).unwrap();
+
+    scratch_cmd("gc")
+        .assert()
+        .success()
+        .stdout(contains("Removed 3 orphaned daemon director"))
+        .stdout(contains("spared (database write lock held): 1"))
+        .stdout(contains("spared (pidfile lock held): 1"));
+
+    // The orphan is reclaimed under all three roots.
+    assert!(!orphan_state.exists(), "orphaned state dir must go");
+    assert!(!orphan_runtime.exists(), "orphaned runtime dir must go");
+    assert!(!orphan_fallback.exists(), "orphaned fallback dir must go");
+
+    // The live daemon's files survive under every root...
+    assert!(state.join("nestweaver").join(&instance_id).exists());
+    assert!(runtime.join("nestweaver").join(&instance_id).exists());
+    assert!(fallback.join(&instance_id).exists());
+    // ...and its socket still answers.
+    std::os::unix::net::UnixStream::connect(&sock)
+        .expect("the live daemon's socket must still answer after gc");
+
+    // A clean shutdown of the temp-database daemon leaves nothing behind.
+    scratch_cmd("stop").assert().success();
+    assert!(
+        !state.join("nestweaver").join(&instance_id).exists(),
+        "clean stop must unlink the state dir"
+    );
+    assert!(
+        !runtime.join("nestweaver").join(&instance_id).exists(),
+        "clean stop must unlink the runtime dir"
+    );
+    assert!(
+        !fallback.join(&instance_id).exists(),
+        "clean stop must unlink the socket-fallback dir"
+    );
+}
