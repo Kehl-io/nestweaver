@@ -6938,6 +6938,113 @@ fn verify_explicit_config_before_start_success(
     ))
 }
 
+/// Whether an explicit `start --config` may displace the incumbent it found.
+/// The macOS launchd branch computes this from three raw signals so the
+/// decision itself is unit-testable off-platform; the wiring there only
+/// gathers the signals.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncumbentDisplacement {
+    /// A live incumbent attests compiled-defaults provenance — the bad state
+    /// the self-heal displacement exists to replace.
+    DisplaceCompiledDefaults,
+    /// No live daemon exists. A still-registered launchd job is not a live
+    /// incumbent (registration outlives the process), and pidfile CONTENTS are
+    /// never ownership evidence — a 0-byte or stale `daemon.pid` holds no
+    /// flock. Proceed as a cold start; final attestation below still protects
+    /// a concurrent winner. This is also the restart start half's own state:
+    /// the incumbent was verified during PREPARE, before the stop, so there is
+    /// no foreign incumbent whose provenance could be re-derived here.
+    NoLiveIncumbent,
+    /// A live incumbent exists but is configured for something else, or its
+    /// provenance is unreadable — including a pidfile flock owner that never
+    /// answered health. Fail closed; never stop it implicitly.
+    RefuseForeignIncumbent,
+}
+
+/// Decide from raw ownership signals. Failing closed remains correct only for
+/// a genuinely live incumbent: "cannot verify because nothing is running"
+/// ([`IncumbentDisplacement::NoLiveIncumbent`]) is not "cannot verify because
+/// provenance is unreadable" ([`IncumbentDisplacement::RefuseForeignIncumbent`]).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn incumbent_displacement_verdict(
+    live_health_pid: Option<u32>,
+    provenance: Option<&nestweaver_daemon::lifecycle::EffectiveConfigBindingSource>,
+    pidfile_lock_held: bool,
+) -> IncumbentDisplacement {
+    use nestweaver_daemon::lifecycle::EffectiveConfigBindingSource;
+    match live_health_pid {
+        Some(_) => match provenance {
+            Some(EffectiveConfigBindingSource::CompiledDefaults) => {
+                IncumbentDisplacement::DisplaceCompiledDefaults
+            }
+            _ => IncumbentDisplacement::RefuseForeignIncumbent,
+        },
+        // A flock owner that never became healthy is a live process with
+        // unreadable provenance, not "nothing running".
+        None if pidfile_lock_held => IncumbentDisplacement::RefuseForeignIncumbent,
+        None => IncumbentDisplacement::NoLiveIncumbent,
+    }
+}
+
+/// What to bring back when a restart's start half failed after the stop: the
+/// incumbent's own captured config when PREPARE could read it, else the
+/// standard cold-start resolution (persisted intent, then compiled defaults).
+fn restore_config_for_failed_restart(
+    db_path: &std::path::Path,
+    incumbent_config: Option<&nestweaver_client::RestartConfig>,
+) -> anyhow::Result<nestweaver_client::RestartConfig> {
+    match incumbent_config {
+        Some(config @ nestweaver_client::RestartConfig::Configured(_)) => Ok(config.clone()),
+        _ => nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, None),
+    }
+}
+
+/// Best-effort restoration of the incumbent after a restart's post-shutdown
+/// commit failed — the shared restart invariant: never leave the database
+/// daemonless without attempting to bring what was running back. Spawns a
+/// plain `daemon start` (bare, or with the incumbent's captured `--config`)
+/// and waits for health; the child's own final attestation verifies the
+/// booted daemon.
+async fn restore_incumbent_after_failed_restart(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    incumbent_config: Option<&nestweaver_client::RestartConfig>,
+) -> anyhow::Result<()> {
+    // A restored daemon cannot open the database while a third party holds
+    // the write lock — the owner-release gate's `Held` bail is deliberate
+    // (fix/restart-write-lock-gate), so refuse early and say why instead of
+    // spawning a child whose store open fails opaquely. `Free` and
+    // `Unknown` proceed, matching that gate's policy; the child's own
+    // `GraphStore::open_or_create` is the backstop on `Unknown`.
+    if let nestweaver_daemon::lifecycle::DbWriteLock::Held { pid } =
+        nestweaver_daemon::lifecycle::db_write_lock(db_path)
+    {
+        anyhow::bail!(
+            "the database write lock is still held{}; a restored daemon could not open the \
+             database until the holder exits",
+            pid.map(|pid| format!(" by PID {pid}")).unwrap_or_default(),
+        );
+    }
+    let restore_config = restore_config_for_failed_restart(db_path, incumbent_config)?;
+    let spawn_lock = nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
+    let executable = std::env::current_exe().context("cannot determine binary path")?;
+    let start_args = daemon_restart_start_args(db_path, idle_timeout, &restore_config);
+    let mut command = daemon_restart_command(executable, start_args);
+    spawn_lock.configure_child_handoff(&mut command)?;
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .context("daemon restore command task failed")?
+        .context("failed to execute daemon start")?;
+    anyhow::ensure!(
+        status.success(),
+        "daemon restore start failed with {status}"
+    );
+    nestweaver_client::DaemonClient::wait_healthy(db_path, std::time::Duration::from_secs(60))
+        .await?;
+    Ok(())
+}
+
 fn acquire_daemon_start_spawn_lock(
     db_path: &std::path::Path,
     inherited_fd: Option<std::ffi::OsString>,
@@ -7018,6 +7125,27 @@ async fn restart_verified_live_under_lock(
         });
     drop(original);
 
+    // Capture the incumbent's OWN effective config while it is still live, so
+    // a start half that fails after the stop can restore what was running
+    // instead of leaving the database daemonless. Best-effort: unreadable
+    // provenance must not block the restart — the restore attempt then falls
+    // back to persisted-intent resolution.
+    let incumbent_restore_config =
+        nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
+            &nestweaver_daemon::instance_id_from_db_path(db_path),
+            locked_health.pid,
+        )
+        .ok()
+        .and_then(|binding| match binding.effective_config {
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured { path } => {
+                nestweaver_client::RestartConfig::for_cold_start(Some(std::path::Path::new(&path)))
+                    .ok()
+            }
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults => {
+                Some(nestweaver_client::RestartConfig::CompiledDefaults)
+            }
+        });
+
     // PREPARE includes every fallible local decision needed to launch. In
     // particular, a broken current_exe lookup must leave the live daemon
     // untouched rather than discovering the failure after Shutdown.
@@ -7036,16 +7164,112 @@ async fn restart_verified_live_under_lock(
             Ok(response.ok)
         },
         |mut prepared| async move {
-            prepared.wait_for_owner_release().await?;
-            prepared.release_pidfile_lock();
-            start_and_verify_restarted_daemon(
+            // The restore wiring wraps the WHOLE post-shutdown body: whether
+            // the owner-release gate times out or the replacement fails to
+            // come up, a plain error return would leave the database with no
+            // daemon — with one exception, handled below.
+            let commit_result: anyhow::Result<()> = async {
+                prepared.wait_for_owner_release().await?;
+                prepared.release_pidfile_lock();
+                start_and_verify_restarted_daemon(
+                    db_path,
+                    executable,
+                    start_args,
+                    prepared.config(),
+                    spawn_lock,
+                )
+                .await
+            }
+            .await;
+            let Err(commit_error) = commit_result else {
+                return Ok(());
+            };
+
+            // A held pidfile flock means a LIVE process owns this instance,
+            // but the probe cannot say WHICH one: in a phase-1 owner-release
+            // timeout it is the incumbent (the flock is held for a process's
+            // whole life, so it never stopped), while in a child-start
+            // failure the replacement daemon holds the flock from daemonize2
+            // onward and is left alive by the attestation-failure paths
+            // (incumbent stopped, replacement running but unverified).
+            // Either way neither half of the shared template below is safe to
+            // claim, and spawning a restore would fight the live holder — the
+            // db_write_lock preflight inside it would bail on that holder
+            // anyway. State only what the probe establishes and preserve the
+            // gate's message as the cause; it names the holder PID and the
+            // remedy (stop the daemon manually, verify its identity, retry).
+            //
+            // Edge: if the holder unlinked the pidfile path, the flock
+            // survives on the orphaned inode while this by-path probe reads
+            // FREE — the restore attempt below then runs and its preflight
+            // bails Held naming the holder, so the output stays truthful via
+            // that arm.
+            let pidfile = nestweaver_daemon::pidfile_path(
+                &nestweaver_daemon::instance_id_from_db_path(db_path),
+            );
+            if pidfile_flock_held(&pidfile) {
+                return Err(commit_error.context(
+                    "a process still holds this instance's pidfile lock — the incumbent that \
+                     never finished stopping, or a replacement that booted but could not be \
+                     verified. No restore was attempted because a daemon process may still \
+                     be running",
+                ));
+            }
+
+            // The incumbent is genuinely gone (phase-2 write-lock timeout or
+            // a failed replacement): attempt to bring a daemon back before
+            // reporting the failure.
+            match restore_incumbent_after_failed_restart(
                 db_path,
-                executable,
-                start_args,
-                prepared.config(),
-                spawn_lock,
+                idle_timeout,
+                incumbent_restore_config.as_ref(),
             )
             .await
+            {
+                Ok(()) => {
+                    // Name the config SOURCE honestly: the incumbent's own
+                    // captured config when PREPARE could read it, the standard
+                    // startup-intent resolution when it could not. "Is back
+                    // up", not "was restored": between the commit failure and
+                    // the restore spawn a concurrent start may have won, in
+                    // which case the child `daemon start` reports
+                    // already-running and the healthy daemon is not one this
+                    // command started.
+                    let restoration = match incumbent_restore_config.as_ref() {
+                        Some(nestweaver_client::RestartConfig::Configured(path)) => format!(
+                            "a daemon running the incumbent's captured configuration ({}) \
+                             is back up",
+                            path.display()
+                        ),
+                        Some(nestweaver_client::RestartConfig::CompiledDefaults) | None => {
+                            "a daemon is back up from the persisted startup intent (or \
+                             compiled defaults when none is recorded)"
+                                .to_string()
+                        }
+                    };
+                    Err(commit_error.context(format!(
+                        "restart failed after the incumbent daemon was stopped; {restoration}. \
+                         Resolve the cause above, then retry `nestweaver daemon --db {} restart{}`",
+                        db_path.display(),
+                        explicit_config
+                            .map(|config| format!(" --config {}", config.display()))
+                            .unwrap_or_default(),
+                    )))
+                }
+                // Bare `daemon start` fails closed on unreadable persisted
+                // intent, so the headline remedy names the forms that succeed
+                // from this state: an explicit config, or --reset (which
+                // discards the record before spawning).
+                Err(restore_error) => Err(commit_error.context(format!(
+                    "restart failed after the incumbent daemon was stopped, and restoring the \
+                     previous daemon also failed: {restore_error:#}. The database currently \
+                     has no daemon — bring one up with `nestweaver daemon --db {0} start \
+                     --config <path>` or `nestweaver daemon --db {0} start --reset` (compiled \
+                     defaults); `nestweaver daemon --db {0} stop` first clears any half-started \
+                     leftover",
+                    db_path.display(),
+                ))),
+            }
         },
     )
     .await
@@ -13489,44 +13713,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             if config_abs.is_none() && (launchd_owned || live_pidfile) {
                                 let rt = tokio::runtime::Runtime::new()
                                     .context("failed to create tokio runtime")?;
-                                let health =
-                                    rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
-                                        &db_path_abs,
-                                        nestweaver_client::autostart::daemon_boot_timeout(),
-                                    ))?;
-                                // A retry after a slow configless launchd boot
-                                // is allowed to finish the pending reset, but
-                                // only when the live binding for the healthy
-                                // PID attests compiled-default provenance. A
-                                // configured incumbent remains a no-op and
-                                // retains its durable intent. Missing,
-                                // malformed, stale, or PID-mismatched bindings
-                                // fail closed instead of clearing intent.
-                                let binding = nestweaver_daemon::lifecycle::
-                                    read_effective_config_binding_for_verified_pid(
-                                        &instance_id,
-                                        health.pid,
-                                    )
-                                    .context(
-                                        "cannot attest the already-running daemon's effective configuration",
-                                    )?;
-                                if matches!(
-                                    binding.effective_config,
-                                    nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
-                                ) {
-                                    finish_manual_default_reset(&db_path_abs, parent_driven_start, &requested_start_config)?;
+                                match rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                                    &db_path_abs,
+                                    nestweaver_client::autostart::daemon_boot_timeout(),
+                                )) {
+                                    Ok(health) => {
+                                        // A retry after a slow configless launchd boot
+                                        // is allowed to finish the pending reset, but
+                                        // only when the live binding for the healthy
+                                        // PID attests compiled-default provenance. A
+                                        // configured incumbent remains a no-op and
+                                        // retains its durable intent. Missing,
+                                        // malformed, stale, or PID-mismatched bindings
+                                        // fail closed instead of clearing intent.
+                                        let binding = nestweaver_daemon::lifecycle::
+                                            read_effective_config_binding_for_verified_pid(
+                                                &instance_id,
+                                                health.pid,
+                                            )
+                                            .context(
+                                                "cannot attest the already-running daemon's effective configuration",
+                                            )?;
+                                        if matches!(
+                                            binding.effective_config,
+                                            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+                                        ) {
+                                            finish_manual_default_reset(&db_path_abs, parent_driven_start, &requested_start_config)?;
+                                        }
+                                        eprintln!("Daemon already running.");
+                                        return Ok((EXIT_SUCCESS, None));
+                                    }
+                                    Err(health_error) => {
+                                        // A process still holds the pidfile flock
+                                        // but never answered: something alive owns
+                                        // the instance and cannot be verified —
+                                        // fail closed, exactly as before.
+                                        if live_pidfile {
+                                            return Err(health_error);
+                                        }
+                                        // A loaded-but-dead launchd job (e.g. left
+                                        // behind by a failed restart) or a stale,
+                                        // empty pidfile is NOT a live incumbent —
+                                        // see incumbent_displacement_verdict. Fall
+                                        // through to the bootout/reinstall below,
+                                        // which is exactly the recovery, instead
+                                        // of wedging every later start. Final
+                                        // attestation still protects a concurrent
+                                        // winner.
+                                    }
                                 }
-                                eprintln!("Daemon already running.");
-                                return Ok((EXIT_SUCCESS, None));
                             }
 
                             // An explicit start against a live incumbent is an
                             // assertion about that daemon, not permission to
                             // replace it. Attest before bootout or SIGTERM so a
                             // mismatch, old wire, or missing provenance leaves
-                            // the incumbent untouched. A stale launchd job or
-                            // live pidfile with no healthy RPC is likewise not
-                            // safe to mutate implicitly.
+                            // the incumbent untouched. A LIVE pidfile flock
+                            // owner with no healthy RPC is likewise not safe to
+                            // mutate implicitly — but a dead launchd
+                            // registration or an unowned pidfile is not an
+                            // incumbent at all (see incumbent_displacement_verdict).
                             if let Some(requested_config) = config_abs.as_deref() {
                                 // The held flock, not a numeric PID plus
                                 // kill(0), is the ownership proof. The latter
@@ -13547,43 +13793,88 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         // recovery needed a manual `daemon stop`
                                         // first. Displace it instead.
                                         //
-                                        // Everything else still refuses. A
-                                        // configured incumbent is someone else's
-                                        // deliberate state, and provenance we
-                                        // cannot read is not permission to kill
-                                        // — both fail closed, so any error or
-                                        // missing binding leaves it untouched.
-                                        let incumbent_is_compiled_defaults = (|| {
-                                            let rt = tokio::runtime::Runtime::new().ok()?;
-                                            let health = rt
-                                                .block_on(
+                                        // A launchd registration outlives its
+                                        // process, so `launchd_owned` alone does
+                                        // not prove anything is running — after
+                                        // a restart's stop half (whose PREPARE
+                                        // already verified the incumbent before
+                                        // stopping it) or a crash, the job is
+                                        // loaded but the daemon is dead, and
+                                        // re-deriving provenance from a stopped
+                                        // daemon can only fail. Nothing-running
+                                        // proceeds; only a genuinely LIVE
+                                        // incumbent whose provenance is
+                                        // unreadable or configured for something
+                                        // else still fails closed.
+                                        let live_health_pid = tokio::runtime::Runtime::new()
+                                            .ok()
+                                            .and_then(|rt| {
+                                                rt.block_on(
                                                     nestweaver_client::DaemonClient::wait_healthy(
                                                         &db_path_abs,
                                                         nestweaver_client::autostart::daemon_boot_timeout(),
                                                     ),
                                                 )
-                                                .ok()?;
-                                            let binding = nestweaver_daemon::lifecycle::
+                                                .ok()
+                                            })
+                                            .map(|health| health.pid);
+                                        let provenance = live_health_pid.and_then(|pid| {
+                                            nestweaver_daemon::lifecycle::
                                                 read_effective_config_binding_for_verified_pid(
                                                     &instance_id,
-                                                    health.pid,
+                                                    pid,
                                                 )
-                                                .ok()?;
-                                            Some(matches!(
-                                                binding.effective_config,
-                                                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
-                                            ))
-                                        })()
-                                        .unwrap_or(false);
-
-                                        if !incumbent_is_compiled_defaults {
-                                            return Err(error).context(
-                                                "refusing to stop a launchd/pidfile-owned incumbent before explicit --config provenance is verified",
-                                            );
+                                                .ok()
+                                                .map(|binding| binding.effective_config)
+                                        });
+                                        match incumbent_displacement_verdict(
+                                            live_health_pid,
+                                            provenance.as_ref(),
+                                            live_pidfile,
+                                        ) {
+                                            IncumbentDisplacement::DisplaceCompiledDefaults => {
+                                                eprintln!(
+                                                    "Replacing a compiled-defaults daemon with the requested configuration."
+                                                );
+                                            }
+                                            IncumbentDisplacement::NoLiveIncumbent => {
+                                                // Conscious fail-open window:
+                                                // a foreign process that is
+                                                // alive but has neither taken
+                                                // the pidfile flock nor
+                                                // answered health for the
+                                                // whole boot timeout would be
+                                                // displaced here, where the
+                                                // old code refused. That
+                                                // occupant is not realistic —
+                                                // a daemon takes the flock at
+                                                // the very start of its boot,
+                                                // long before it can answer
+                                                // health, so anything past
+                                                // the timeout without the
+                                                // flock is not a daemon of
+                                                // this instance. What remains
+                                                // is a dead registration or a
+                                                // stale/empty pidfile; the
+                                                // bootout/reinstall below
+                                                // reclaims it, and final
+                                                // attestation still protects
+                                                // a concurrent winner.
+                                                eprintln!(
+                                                    "No live daemon owns this instance; replacing the stale launchd/pidfile registration."
+                                                );
+                                            }
+                                            IncumbentDisplacement::RefuseForeignIncumbent => {
+                                                return Err(error).context(format!(
+                                                    "refusing to stop a live launchd/pidfile-owned incumbent whose explicit --config provenance could not be verified. \
+                                                     Stop it first with `nestweaver daemon --db {} stop`, then apply the configuration with \
+                                                     `nestweaver daemon --db {} start --config {}`",
+                                                    db_path.display(),
+                                                    db_path.display(),
+                                                    requested_config.display(),
+                                                ));
+                                            }
                                         }
-                                        eprintln!(
-                                            "Replacing a compiled-defaults daemon with the requested configuration."
-                                        );
                                     }
                                     Err(_) => {
                                         // No live ownership evidence: this is
@@ -22373,6 +22664,112 @@ mod abs_for_daemon_tests {
         assert!(!daemon_identity_verified(
             our_pid, bogus_db, &pidfile, &socket
         ));
+    }
+}
+
+#[cfg(test)]
+mod incumbent_displacement_tests {
+    use super::*;
+    use nestweaver_daemon::lifecycle::EffectiveConfigBindingSource;
+
+    fn configured() -> EffectiveConfigBindingSource {
+        EffectiveConfigBindingSource::Configured {
+            path: "/cfg/instance.toml".to_string(),
+        }
+    }
+
+    /// The restart start half's own state — and the wedged `start --config`
+    /// state from the backlog item: the incumbent this command already
+    /// verified and stopped is GONE. A still-registered launchd job is not a
+    /// live incumbent, and pidfile CONTENTS are never ownership evidence — a
+    /// 0-byte or stale `daemon.pid` carries no usable PID and holds no flock.
+    /// Ownership is the flock, so neither a dead registration nor a truncated
+    /// pidfile can wedge a later `start --config`: both must proceed.
+    #[test]
+    fn nothing_running_is_not_a_foreign_incumbent() {
+        assert_eq!(
+            incumbent_displacement_verdict(None, None, false),
+            IncumbentDisplacement::NoLiveIncumbent
+        );
+    }
+
+    /// The self-heal case that justified displacing at all: a LIVE incumbent
+    /// attesting compiled-defaults provenance is the bad state being fixed.
+    #[test]
+    fn a_live_compiled_defaults_incumbent_is_displaced() {
+        assert_eq!(
+            incumbent_displacement_verdict(
+                Some(4242),
+                Some(&EffectiveConfigBindingSource::CompiledDefaults),
+                true
+            ),
+            IncumbentDisplacement::DisplaceCompiledDefaults
+        );
+    }
+
+    /// A live incumbent configured for something else is someone else's
+    /// deliberate state — fail closed.
+    #[test]
+    fn a_live_configured_incumbent_is_foreign() {
+        assert_eq!(
+            incumbent_displacement_verdict(Some(4242), Some(&configured()), true),
+            IncumbentDisplacement::RefuseForeignIncumbent
+        );
+    }
+
+    /// A live incumbent whose provenance cannot be read is not permission to
+    /// kill — only "nothing is running" downgrades to a cold start.
+    #[test]
+    fn a_live_incumbent_with_unreadable_provenance_fails_closed() {
+        assert_eq!(
+            incumbent_displacement_verdict(Some(4242), None, true),
+            IncumbentDisplacement::RefuseForeignIncumbent
+        );
+    }
+
+    /// A process holding the pidfile flock that never answered health is a
+    /// live owner with unreadable provenance, not "nothing running".
+    #[test]
+    fn a_pidfile_owner_that_never_answered_fails_closed() {
+        assert_eq!(
+            incumbent_displacement_verdict(None, None, true),
+            IncumbentDisplacement::RefuseForeignIncumbent
+        );
+    }
+
+    /// Restore prefers the incumbent's own captured config over any persisted
+    /// record: what was running is what comes back.
+    #[test]
+    fn restore_config_prefers_the_incumbents_captured_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let incumbent =
+            nestweaver_client::RestartConfig::Configured(PathBuf::from("/cfg/old.toml"));
+        assert_eq!(
+            restore_config_for_failed_restart(&db, Some(&incumbent)).unwrap(),
+            incumbent
+        );
+    }
+
+    /// With no captured incumbent config (or a compiled-defaults one), restore
+    /// falls back to the standard cold-start resolution — persisted intent,
+    /// else compiled defaults. No record on disk means defaults here.
+    #[test]
+    fn restore_config_resolves_persisted_intent_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert_eq!(
+            restore_config_for_failed_restart(&db, None).unwrap(),
+            nestweaver_client::RestartConfig::CompiledDefaults
+        );
+        assert_eq!(
+            restore_config_for_failed_restart(
+                &db,
+                Some(&nestweaver_client::RestartConfig::CompiledDefaults)
+            )
+            .unwrap(),
+            nestweaver_client::RestartConfig::CompiledDefaults
+        );
     }
 }
 
