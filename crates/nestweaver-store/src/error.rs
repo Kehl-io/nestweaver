@@ -29,6 +29,14 @@ pub enum StoreError {
     Database(String),
     #[error("query error: {0}")]
     Query(String),
+    /// A ranking query was refused while an index publication is in flight:
+    /// the ranking caches may describe a graph that no longer exists, so the
+    /// query fails closed rather than answering with a successful-looking
+    /// empty result (see the `ranking` module-header contract). Transient —
+    /// callers should surface it as "temporarily unavailable", never as an
+    /// empty graph.
+    #[error("PageRank unavailable during dirty index publication")]
+    RankingUnavailable,
     #[error("not found")]
     NotFound,
     #[error("presentation limit {limit} exceeds maximum {max}")]
@@ -57,6 +65,7 @@ impl StoreError {
                     || lower.contains("constraint")
             }
             StoreError::NotFound
+            | StoreError::RankingUnavailable
             | StoreError::PresentationLimitExceeded { .. }
             | StoreError::Cancelled(_)
             | StoreError::CorruptValue { .. } => false,

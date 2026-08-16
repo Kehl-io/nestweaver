@@ -65,8 +65,11 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
         }
     }
 
-    // Read PageRank scores from the in-memory cache.
-    let pr_scores: HashMap<String, f64> = store.pagerank_scores();
+    // Read PageRank scores from the in-memory cache. Fails closed during a
+    // dirty index publication (the ranking.rs module contract): hub ranking
+    // must not silently treat every symbol as score 0.
+    let pr_scores: HashMap<String, f64> =
+        store.pagerank_scores().map_err(|e| anyhow::anyhow!(e))?;
 
     // Feature F12: when git-activity recency scores are loaded, demote dormant
     // code at read time. We apply the same clamped multiplier the store uses in

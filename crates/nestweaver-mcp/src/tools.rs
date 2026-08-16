@@ -10938,10 +10938,14 @@ mod cache_dispatch_tests {
         )
         .unwrap();
         let store = GraphStore::open(&db_path).unwrap();
-        let args = json!({ "limit": 5 });
+        // Dispatch a cacheable NON-ranking tool: hub_nodes (this test's
+        // original dispatch) now fails closed during a dirty window under
+        // the ranking.rs fail-closed contract, while the response-cache
+        // bypass this test exists to pin applies to every cacheable tool.
+        let args = json!({ "pattern": "fn" });
 
-        let _ = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
-        let _ = dispatch(&store, None, "hub_nodes", args, None).unwrap();
+        let _ = dispatch(&store, None, "regex_search", args.clone(), None).unwrap();
+        let _ = dispatch(&store, None, "regex_search", args, None).unwrap();
         flush_response_cache();
 
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
@@ -10987,7 +10991,7 @@ mod cache_dispatch_tests {
 
         let classified = classify_index_publication_error(
             &store,
-            anyhow!("query error: PageRank unavailable during dirty index publication"),
+            anyhow!("PageRank unavailable during dirty index publication"),
         );
         let message = format!("{classified:#}");
         assert!(message.contains("WEDGED"), "{message}");

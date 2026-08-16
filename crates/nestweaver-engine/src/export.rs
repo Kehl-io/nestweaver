@@ -88,7 +88,9 @@ pub fn export_cypher(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Resu
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // The `pagerank_score` column is never populated; the real scores
     // live in the store's PageRank cache (same source `hubs` reads).
-    let pagerank = store.pagerank_scores();
+    let pagerank = store
+        .pagerank_scores()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     for sym in &symbols {
         let pr = pagerank
             .get(&sym.uid)
@@ -242,7 +244,9 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // The `pagerank_score` column is never populated; the real scores
     // live in the store's PageRank cache (same source `hubs` reads).
-    let pagerank = store.pagerank_scores();
+    let pagerank = store
+        .pagerank_scores()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     for sym in &symbols {
         let pr = pagerank
             .get(&sym.uid)
@@ -336,7 +340,9 @@ pub fn export_mermaid(
     // column is never populated; rank by the store's PageRank cache (the same
     // source `hubs` reads), falling back to the column for stores without a
     // computed cache.
-    let pagerank = store.pagerank_scores();
+    let pagerank = store
+        .pagerank_scores()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut ranked = symbols;
     ranked.sort_by(|a, b| {
         let pa = pagerank
@@ -601,7 +607,7 @@ mod tests {
         // The `pagerank_score` column is never populated in production;
         // export must carry the store's computed PageRank cache values.
         let store = ranked_store();
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(
             scores.contains_key("sym-b"),
             "cache should compute scores on demand"
@@ -636,7 +642,7 @@ mod tests {
         // but sym-b has two inbound CALLS edges, so the computed PageRank
         // must rank it first.
         let store = ranked_store();
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(
             scores["sym-b"] > scores["sym-a"],
             "callee must outrank caller: {scores:?}"

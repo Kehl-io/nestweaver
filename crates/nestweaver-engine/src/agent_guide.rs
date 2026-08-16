@@ -107,8 +107,19 @@ pub fn generate_guide_with_tools(
             out.push_str(&map);
             out.push_str("\n```\n\n");
         }
-        Err(_) => {
-            out.push_str("No symbols indexed yet.\n\n");
+        Err(error) => {
+            // A dirty index publication fails the map closed (the ranking.rs
+            // module contract): say so instead of the affirmative-but-false
+            // "No symbols indexed yet." Any other failure keeps that wording.
+            if let Some(nestweaver_store::StoreError::RankingUnavailable) =
+                error.downcast_ref::<nestweaver_store::StoreError>()
+            {
+                out.push_str(
+                    "Repo map temporarily unavailable — index publication in progress.\n\n",
+                );
+            } else {
+                out.push_str("No symbols indexed yet.\n\n");
+            }
         }
     }
 
@@ -1026,6 +1037,29 @@ pub fn generate_agents_md_with_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dirty index publication fails `generate_repo_map` closed (the
+    /// ranking.rs module contract): the guide must say the map is temporarily
+    /// unavailable, not claim "No symbols indexed yet." — an affirmative
+    /// false statement about the graph.
+    #[test]
+    fn guide_repo_map_reports_unavailable_during_dirty_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(format!("{}.index-dirty", db_path.display()), b"dirty").unwrap();
+
+        let guide = generate_guide(&store, None).unwrap();
+
+        assert!(
+            guide.contains("Repo map temporarily unavailable"),
+            "the dirty window must read as transient, not empty: {guide}"
+        );
+        assert!(
+            !guide.contains("No symbols indexed yet."),
+            "a dirty window must not claim the graph is empty: {guide}"
+        );
+    }
 
     #[test]
     fn generate_guide_produces_valid_markdown() {

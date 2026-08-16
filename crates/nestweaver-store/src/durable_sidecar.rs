@@ -517,7 +517,7 @@ mod tests {
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert_eq!(reopened.pagerank_scores().get("old"), Some(&1.0));
+        assert_eq!(reopened.pagerank_scores().unwrap().get("old"), Some(&1.0));
     }
 
     #[test]
@@ -557,14 +557,14 @@ mod tests {
             let store = GraphStore::open_or_create(&db_path).unwrap();
             std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
             store.load_pagerank_cache(&pagerank_path).unwrap();
-            assert!(store.pagerank_scores().contains_key("stale"));
+            assert!(store.pagerank_scores().unwrap().contains_key("stale"));
         }
 
         assert!(remove_file_durable_if_exists(&pagerank_path).unwrap());
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key("stale"));
+        assert!(!reopened.pagerank_scores().unwrap().contains_key("stale"));
         assert!(!pagerank_path.exists());
     }
 }

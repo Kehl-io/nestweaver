@@ -497,9 +497,14 @@ pub fn analyze_blast_radius(
     // high-centrality threshold in Step 4; 0 means no cache was available.
     let mut ranks_len: usize = 0;
     if !changed_symbols.is_empty() {
-        store.ensure_pagerank_loaded();
-        let ranks = store.pagerank_scores();
-        if !ranks.is_empty() {
+        // Ranking fails closed during a dirty index publication (the
+        // ranking.rs module contract); the centrality risk boost is advisory,
+        // so an unavailable cache degrades to no boost rather than failing
+        // the analysis.
+        let _ = store.ensure_pagerank_loaded();
+        if let Ok(ranks) = store.pagerank_scores()
+            && !ranks.is_empty()
+        {
             ranks_len = ranks.len();
             for cs in &mut changed_symbols {
                 if let Some(r) = ranks.get(&cs.uid) {
@@ -2871,7 +2876,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        store.ensure_pagerank_loaded();
+        store.ensure_pagerank_loaded().unwrap();
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/hub.rs")],

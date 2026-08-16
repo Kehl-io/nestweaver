@@ -77,9 +77,44 @@ pub async fn symbols_top(
     // so run it off the async runtime and emit `pagerank:recomputed` if it fired.
     let state2 = state.clone();
     with_rank_event(&state, move || {
-        let symbols = state2.store.symbols_by_pagerank(Some(limit))?;
+        // A dirty index publication fails ranking closed: surface 503 so the
+        // UI says "ranking unavailable" instead of rendering an empty list.
+        let symbols = state2
+            .store
+            .symbols_by_pagerank(Some(limit))
+            .map_err(|e| ApiError::from_ranking(e.into()))?;
         let json = serde_json::to_value(&symbols)?;
         Ok(Json(json).into_response())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// During a dirty index publication the top-symbols route must say
+    /// "ranking unavailable" (503), never answer 200 with an empty list — an
+    /// empty list is indistinguishable from a graph with no ranked symbols
+    /// (the `ranking.rs` dirty-publication contract).
+    #[tokio::test]
+    async fn symbols_top_reports_ranking_unavailable_during_dirty_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(format!("{}.index-dirty", db_path.display()), b"dirty").unwrap();
+        let state = AppState::new(store, None, db_path);
+
+        let error = match symbols_top(State(state), Query(TopParams { limit: None })).await {
+            Ok(_) => panic!("a dirty publication must not render a successful top-symbols list"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error.message.contains("ranking"),
+            "the error must name ranking as unavailable: {}",
+            error.message
+        );
+    }
 }

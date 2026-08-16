@@ -5952,7 +5952,7 @@ mod tests {
         );
 
         // PageRank must reflect the COMMITTED graph, not the pre-crash sidecar.
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(
             !scores.contains_key("stale-precrash-score"),
             "the pre-crash PageRank sidecar must not survive recovery: {scores:?}"
@@ -5981,7 +5981,7 @@ mod tests {
         assert!(!reopened.is_index_publication_dirty());
         assert_eq!(reopened.graph_generation(), canonical + 2);
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        let persisted = reopened.pagerank_scores();
+        let persisted = reopened.pagerank_scores().unwrap();
         assert!(
             persisted.contains_key("sym:publisher-crashed:source"),
             "the persisted PageRank sidecar must reflect the committed graph"
@@ -6170,6 +6170,7 @@ mod tests {
         assert!(
             store
                 .pagerank_scores()
+                .unwrap()
                 .contains_key("sym:publisher-nogeneration:source")
         );
     }
@@ -6351,7 +6352,7 @@ mod tests {
         );
         assert!(!marker_path.exists());
         assert!(!store.is_index_publication_dirty());
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(scores.contains_key("sym:publisher-forced:source"));
         assert!(scores.contains_key("note:forced:one"));
     }
@@ -6532,7 +6533,7 @@ mod tests {
             store.graph_generation()
         );
         assert!(pagerank_path.exists());
-        let expected_scores = store.pagerank_scores();
+        let expected_scores = store.pagerank_scores().unwrap();
         assert_eq!(expected_scores.len(), 4);
         for uid in [
             "sym:publisher-a:source",
@@ -6583,7 +6584,7 @@ mod tests {
             vec!["sym:publisher-b:target".to_string()]
         );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert_eq!(reopened.pagerank_scores(), expected_scores);
+        assert_eq!(reopened.pagerank_scores().unwrap(), expected_scores);
         assert_eq!(reopened.graph_generation(), generation_after_a + 2);
     }
 
@@ -6707,7 +6708,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(reopened.pagerank_scores().is_empty());
+        assert!(reopened.pagerank_scores().is_err());
     }
 
     #[test]
@@ -6752,7 +6753,7 @@ mod tests {
 
         assert!(!marker_path.exists());
         assert_eq!(store.graph_generation(), canonical_generation + 2);
-        let expected_scores = store.pagerank_scores();
+        let expected_scores = store.pagerank_scores().unwrap();
         assert_eq!(expected_scores.len(), 2);
         drop(store);
 
@@ -6764,7 +6765,7 @@ mod tests {
                 .is_ok()
         );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert_eq!(reopened.pagerank_scores(), expected_scores);
+        assert_eq!(reopened.pagerank_scores().unwrap(), expected_scores);
     }
 
     #[test]
@@ -9072,7 +9073,7 @@ function hello(name) { return "Hello " + name; }
             "persisted PageRank invalidation must run after earlier failures"
         );
         assert!(
-            !store.pagerank_scores().contains_key("deleted"),
+            !store.pagerank_scores().unwrap().contains_key("deleted"),
             "live PageRank invalidation must discard the primed stale score"
         );
         assert!(store.pagerank_generation() > pagerank_generation);
@@ -9196,7 +9197,7 @@ function hello(name) { return "Hello " + name; }
             "precondition: the replacement graph transaction must commit before filemeta fails"
         );
         assert!(
-            !store.pagerank_scores().contains_key("stale"),
+            !store.pagerank_scores().unwrap().contains_key("stale"),
             "the committed graph must invalidate the live stale PageRank cache"
         );
         let persisted: HashMap<String, f64> =
@@ -9350,7 +9351,7 @@ function hello(name) { return "Hello " + name; }
             error.failures[0].stage,
             DeletionReconciliationStage::PageRankCompute
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
         // The failed refresh BLOCKS marker retirement: the publication stays
@@ -9404,7 +9405,7 @@ function hello(name) { return "Hello " + name; }
             error.failures[0].stage,
             DeletionReconciliationStage::PageRankPersistence
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
     }
@@ -9652,7 +9653,7 @@ function hello(name) { return "Hello " + name; }
             error.failures[0].stage,
             DeletionReconciliationStage::PersistedPageRank
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(!pagerank_path.exists());
         assert!(quarantine_path(&pagerank_path).exists());
         assert!(store.graph_generation() > generation_before);
@@ -9720,7 +9721,7 @@ function hello(name) { return "Hello " + name; }
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert_ne!(reopened.graph_generation(), canonical_generation);
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key("stale"));
+        assert!(reopened.pagerank_scores().is_err());
     }
 
     #[test]
@@ -9769,7 +9770,7 @@ function hello(name) { return "Hello " + name; }
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert_ne!(reopened.graph_generation(), stale_generation);
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key("stale"));
+        assert!(reopened.pagerank_scores().is_err());
     }
 
     #[test]
@@ -9812,7 +9813,7 @@ function hello(name) { return "Hello " + name; }
             "dirty recovery must reserve canonical generation 7's successor"
         );
         recovering.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!recovering.pagerank_scores().contains_key("stale"));
+        assert!(recovering.pagerank_scores().is_err());
         let mut cache =
             nestweaver_store::cache::ResponseCache::open(&db_path, 1, RESPONSE_SHAPE_FIXTURE);
         assert!(
@@ -9858,7 +9859,7 @@ function hello(name) { return "Hello " + name; }
         assert_eq!(clean.graph_generation(), 9);
         assert!(clean.graph_generation() > 8);
         clean.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!clean.pagerank_scores().contains_key("stale"));
+        assert!(!clean.pagerank_scores().unwrap().contains_key("stale"));
         let mut cache =
             nestweaver_store::cache::ResponseCache::open(&db_path, 1, RESPONSE_SHAPE_FIXTURE);
         assert!(
@@ -9969,7 +9970,7 @@ function hello(name) { return "Hello " + name; }
             .next()
             .unwrap()
             .uid;
-        assert!(store.pagerank_scores().contains_key(&removed_uid));
+        assert!(store.pagerank_scores().unwrap().contains_key(&removed_uid));
 
         let reader = EmptyReader {
             root: dir.path().join("empty-reader"),
@@ -9988,7 +9989,7 @@ function hello(name) { return "Hello " + name; }
 
         assert_eq!(result.files_deleted, 1);
         assert!(
-            !store.pagerank_scores().contains_key(&removed_uid),
+            !store.pagerank_scores().unwrap().contains_key(&removed_uid),
             "the live server store must not serve the deleted symbol's stale score"
         );
         let persisted: HashMap<String, f64> =
@@ -10000,7 +10001,10 @@ function hello(name) { return "Hello " + name; }
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(
-            !reopened.pagerank_scores().contains_key(&removed_uid),
+            !reopened
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(&removed_uid),
             "a reopened store must not reload the deleted symbol's stale score"
         );
     }
@@ -10092,7 +10096,7 @@ function hello(name) { return "Hello " + name; }
             store.symbols_in_file("old.js").unwrap().is_empty(),
             "the server replacement transaction must commit before PageRank fails"
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(dropped.load(Ordering::SeqCst));
     }
 
@@ -10776,7 +10780,7 @@ function hello(name) { return "Hello " + name; }
                 .any(|symbol| symbol.name == "after"),
             "the incremental transaction must be committed before PageRank fails"
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(store.pagerank_scores().is_err());
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
     }
@@ -10847,7 +10851,7 @@ function hello(name) { return "Hello " + name; }
                 .any(|symbol| symbol.name == "replacement"),
             "the forced fallback must atomically install the replacement graph"
         );
-        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(store.pagerank_scores().is_err());
         assert!(!pagerank_path.exists());
         assert!(store.graph_generation() > generation_before);
     }

@@ -3847,7 +3847,12 @@ impl NestWeaverDaemon for DaemonService {
         {
             let store = state.store.clone();
             tokio::task::spawn_blocking(move || {
-                store.ensure_pagerank_loaded();
+                // Best-effort: a dirty index publication refuses the warm
+                // (ranking queries fail closed until the publication
+                // completes — see the ranking.rs module contract).
+                if let Err(error) = store.ensure_pagerank_loaded() {
+                    tracing::debug!("PageRank pre-warm skipped: {error}");
+                }
             });
         }
 
@@ -12716,7 +12721,7 @@ mod startup_helper_tests {
             "deleted repo sidecar slice survived merge error"
         );
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
-        let scores_after = state.store.pagerank_scores();
+        let scores_after = state.store.pagerank_scores().unwrap();
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert!(
             !scores_after.contains_key("repo:old:first"),
@@ -12774,7 +12779,13 @@ mod startup_helper_tests {
         assert_eq!(error.code(), tonic::Code::Internal);
         assert!(state.store.graph_generation() > graph_generation);
         assert!(!pagerank_path.exists());
-        assert!(!state.store.pagerank_scores().contains_key("rank-sentinel"));
+        assert!(
+            !state
+                .store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key("rank-sentinel")
+        );
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert_eq!(
             reconciliations, 0,
@@ -13005,7 +13016,7 @@ mod startup_helper_tests {
         );
         assert!(state.store.graph_generation() > graph_generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
-        let scores_after = state.store.pagerank_scores();
+        let scores_after = state.store.pagerank_scores().unwrap();
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert!(!scores_after.contains_key(repo_uid));
         assert_eq!(
@@ -13052,7 +13063,7 @@ mod startup_helper_tests {
         );
         assert!(state.store.graph_generation() > graph_generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
-        let scores_after = state.store.pagerank_scores();
+        let scores_after = state.store.pagerank_scores().unwrap();
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert!(!scores_after.contains_key(repo_uid));
         assert_eq!(
@@ -13075,7 +13086,7 @@ mod startup_helper_tests {
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
         std::fs::write(&pagerank_path, r#"{"repo:test:pagerank":1.0}"#).unwrap();
         state.store.load_pagerank_cache(&pagerank_path).unwrap();
-        let before_scores = state.store.pagerank_scores();
+        let before_scores = state.store.pagerank_scores().unwrap();
         let before_generation = state.store.pagerank_generation();
         assert!(
             before_scores.contains_key("repo:test:pagerank"),
@@ -13089,7 +13100,7 @@ mod startup_helper_tests {
             .unwrap();
         delete_repo_cascade(&state.store, &repo).unwrap();
         finalize_code_graph_deletion(&state, &[repo.uid]);
-        let after_scores = state.store.pagerank_scores();
+        let after_scores = state.store.pagerank_scores().unwrap();
 
         assert!(state.store.pagerank_generation() > before_generation);
         assert!(!after_scores.contains_key("repo:test:pagerank"));
@@ -13237,7 +13248,7 @@ mod startup_helper_tests {
             u64::MAX.to_string()
         );
         assert!(!pagerank_path.exists());
-        assert!(state.store.pagerank_scores().is_empty());
+        assert!(state.store.pagerank_scores().unwrap().is_empty());
         assert!(state.store.pagerank_generation() > pagerank_generation);
     }
 
@@ -13278,7 +13289,13 @@ mod startup_helper_tests {
         assert_eq!(response.project_name, "Durable remove");
         assert!(state.store.graph_generation() > generation_before);
         assert!(!pagerank_path.exists());
-        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(
+            !state
+                .store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(project_uid)
+        );
         assert!(!state.store.has_embedding(project_uid));
         let extensions = nestweaver_engine::load_extensions(&state.db_path);
         assert!(
@@ -13305,7 +13322,12 @@ mod startup_helper_tests {
         assert_eq!(reopened.graph_generation(), expected_generation);
         assert!(!reopened.has_embedding(project_uid));
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+        assert!(
+            !reopened
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(project_uid)
+        );
     }
 
     #[test]
@@ -13396,7 +13418,13 @@ mod startup_helper_tests {
         assert!(!state.store.project_exists(project_uid).unwrap());
         assert!(state.store.graph_generation() > generation_before);
         assert!(!pagerank_path.exists());
-        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(
+            !state
+                .store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(project_uid)
+        );
         assert!(!state.store.has_embedding(project_uid));
         assert!(
             nestweaver_engine::get_all_properties(
@@ -13425,7 +13453,12 @@ mod startup_helper_tests {
         assert_eq!(reopened.graph_generation(), expected_generation);
         assert!(!reopened.has_embedding(project_uid));
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+        assert!(
+            !reopened
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(project_uid)
+        );
         assert!(
             nestweaver_engine::get_all_properties(
                 &nestweaver_engine::load_extensions(&db_path),
@@ -14001,7 +14034,13 @@ mod startup_helper_tests {
                 .is_empty_for_repo(repo_uid)
         );
         assert!(!pagerank_path.exists());
-        assert!(!state.store.pagerank_scores().contains_key(&file_uid));
+        assert!(
+            !state
+                .store
+                .pagerank_scores()
+                .unwrap()
+                .contains_key(&file_uid)
+        );
         assert!(
             !tantivy
                 .search("late_remove_search_sentinel", 10)
@@ -17596,7 +17635,7 @@ mod boot_reconciliation_tests {
             canonical + 2,
             "recovery publishes the clean N+2 successor"
         );
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(
             scores.contains_key("sym:boot:source") && scores.contains_key("sym:boot:target"),
             "recovered PageRank must cover the committed graph: {scores:?}"
@@ -17692,7 +17731,7 @@ mod boot_reconciliation_tests {
             "recovery publishes the clean N+2 successor"
         );
         store.load_pagerank_cache(&pagerank_path).unwrap();
-        let scores = store.pagerank_scores();
+        let scores = store.pagerank_scores().unwrap();
         assert!(
             scores.contains_key("sym:boot:source") && scores.contains_key("sym:boot:target"),
             "persisted ranks must cover the committed graph: {scores:?}"

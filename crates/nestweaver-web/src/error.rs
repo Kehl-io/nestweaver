@@ -28,6 +28,32 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
+    }
+
+    /// Classify a failed ranking query. A dirty-publication refusal
+    /// (`StoreError::RankingUnavailable` — the store fails ranking closed;
+    /// see the `nestweaver-store` ranking module contract) is transient, so
+    /// it maps to 503 "ranking unavailable" — never to a successful-looking
+    /// empty result. Any other error maps to 500 as usual. The error itself
+    /// is classified (not a re-check of the dirty flag), so an unrelated
+    /// failure during a publication window is still reported as 500.
+    pub fn from_ranking(err: anyhow::Error) -> Self {
+        if let Some(nestweaver_store::StoreError::RankingUnavailable) =
+            err.downcast_ref::<nestweaver_store::StoreError>()
+        {
+            tracing::info!(error = %err, "ranking query refused: index publication in flight");
+            return Self::unavailable(
+                "ranking temporarily unavailable — index publication in progress",
+            );
+        }
+        Self::from(err)
+    }
 }
 
 impl IntoResponse for ApiError {

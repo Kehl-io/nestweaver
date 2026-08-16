@@ -37,7 +37,10 @@ pub async fn repo_map(
     // if a (re)compute fired.
     let state2 = state.clone();
     with_rank_event(&state, move || {
-        let map = nestweaver_engine::generate_repo_map(&state2.store, budget)?;
+        // Same contract as the ranked routes: a dirty index publication fails
+        // the repo map closed — surface 503 "ranking unavailable", not a 500.
+        let map = nestweaver_engine::generate_repo_map(&state2.store, budget)
+            .map_err(ApiError::from_ranking)?;
         Ok(Json(json!({ "map": map })).into_response())
     })
     .await
@@ -65,6 +68,30 @@ pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repo-map route follows the same contract as the ranked routes: a
+    /// dirty index publication surfaces as 503 "ranking unavailable", not a
+    /// 500 and not a successful empty map.
+    #[tokio::test]
+    async fn repo_map_reports_ranking_unavailable_during_dirty_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        std::fs::write(format!("{}.index-dirty", db_path.display()), b"dirty").unwrap();
+        let state = AppState::new(store, None, db_path);
+
+        let error = match repo_map(State(state), Query(RepoMapParams { budget: None })).await {
+            Ok(_) => panic!("a dirty publication must not render a successful repo map"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error.message.contains("ranking"),
+            "the error must name ranking as unavailable: {}",
+            error.message
+        );
+    }
 
     #[tokio::test]
     async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {

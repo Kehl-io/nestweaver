@@ -922,7 +922,7 @@ mod tests {
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert_ne!(reopened.graph_generation(), stale_generation);
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().contains_key("stale"));
+        assert!(reopened.pagerank_scores().is_err());
     }
 
     #[test]
