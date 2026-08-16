@@ -7164,10 +7164,10 @@ async fn restart_verified_live_under_lock(
             Ok(response.ok)
         },
         |mut prepared| async move {
-            // The restore wiring wraps the WHOLE post-shutdown body: the
-            // incumbent is already gone whether the owner-release gate times
-            // out or the replacement fails to come up, and a plain error
-            // return would leave the database with no daemon either way.
+            // The restore wiring wraps the WHOLE post-shutdown body: whether
+            // the owner-release gate times out or the replacement fails to
+            // come up, a plain error return would leave the database with no
+            // daemon — with one exception, handled below.
             let commit_result: anyhow::Result<()> = async {
                 prepared.wait_for_owner_release().await?;
                 prepared.release_pidfile_lock();
@@ -7184,6 +7184,31 @@ async fn restart_verified_live_under_lock(
             let Err(commit_error) = commit_result else {
                 return Ok(());
             };
+
+            // Phase 1 of the owner-release wait times out only while the
+            // incumbent still holds its pidfile flock — and the flock is held
+            // for the process's whole life, so that failure means the
+            // incumbent is STILL RUNNING. Neither half of the shared template
+            // below is true then ("was stopped" / "no daemon"), and spawning
+            // a restore would fight the live incumbent — the db_write_lock
+            // preflight inside it would bail on the same holder anyway.
+            // Propagate with the truth instead; the gate's own message names
+            // the holder PID and the remedy (stop the daemon manually, verify
+            // its identity, retry).
+            let pidfile = nestweaver_daemon::pidfile_path(
+                &nestweaver_daemon::instance_id_from_db_path(db_path),
+            );
+            if pidfile_flock_held(&pidfile) {
+                return Err(commit_error.context(
+                    "the incumbent daemon was NOT stopped — it still holds its pidfile lock. \
+                     No replacement was spawned and no restore was attempted, because the \
+                     incumbent may still be running",
+                ));
+            }
+
+            // The incumbent is genuinely gone (phase-2 write-lock timeout or
+            // a failed replacement): attempt to bring a daemon back before
+            // reporting the failure.
             match restore_incumbent_after_failed_restart(
                 db_path,
                 idle_timeout,
@@ -7194,16 +7219,21 @@ async fn restart_verified_live_under_lock(
                 Ok(()) => {
                     // Name the config SOURCE honestly: the incumbent's own
                     // captured config when PREPARE could read it, the standard
-                    // startup-intent resolution when it could not.
+                    // startup-intent resolution when it could not. "Is back
+                    // up", not "was restored": between the commit failure and
+                    // the restore spawn a concurrent start may have won, in
+                    // which case the child `daemon start` reports
+                    // already-running and the healthy daemon is not one this
+                    // command started.
                     let restoration = match incumbent_restore_config.as_ref() {
                         Some(nestweaver_client::RestartConfig::Configured(path)) => format!(
                             "a daemon running the incumbent's captured configuration ({}) \
-                             was restored and is running",
+                             is back up",
                             path.display()
                         ),
                         Some(nestweaver_client::RestartConfig::CompiledDefaults) | None => {
-                            "a daemon was restored from the persisted startup intent (or \
-                             compiled defaults when none is recorded) and is running"
+                            "a daemon is back up from the persisted startup intent (or \
+                             compiled defaults when none is recorded)"
                                 .to_string()
                         }
                     };
