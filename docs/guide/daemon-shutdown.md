@@ -87,10 +87,12 @@ Check the daemon log for what it is waiting on.
 ```
 
 The command **re-probes the socket** immediately before printing, and says so
-honestly when the answer is bad. In the index-only drain (`active_writes == 0`
-with `indexing_active` set) the daemon broadcasts at the ceiling — 660s — which
-closes every listener, while this command's grace runs to 690s. In that window
-the daemon is alive but unreachable, and the message says:
+honestly when the answer is bad. In a stuck-flag index drain (`active_writes ==
+0` with `indexing_active` set but no worker job actually in flight — the flag
+cannot clear once the pool is drained with a non-empty queue) the daemon
+broadcasts at the ceiling — 660s — which closes every listener, while this
+command's grace runs to 690s. In that window the daemon is alive but
+unreachable, and the message says:
 
 ```
 It is still running but is NO LONGER answering on its socket: the drain reached
@@ -122,7 +124,7 @@ short version above for why that refusal is what makes the drain terminate.
 
 | Knob | Default | What it is |
 |---|---|---|
-| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling. With a write in flight this is a **reporting** threshold, not a deadline. With only an index job in flight it **is** a deadline (see CLAUDE.md for why). |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling. With a write in flight — or a genuinely running index job (the drain reads the worker pool's own in-flight counter) — this is a **reporting** threshold, not a deadline. With only a stuck `indexing_active` flag (no job in flight) it **is** a deadline (see CLAUDE.md for why). |
 | `NESTWEAVER_STOP_GRACE_SECS` | ceiling + 30 (690) | How long `daemon stop` waits before reporting and standing down. **Not** a kill deadline. Deliberately shorter than the launchd `ExitTimeOut` below, so the CLI reports before launchd kills rather than after. |
 | `daemon stop --force` | 10s, fixed | SIGTERM, brief wait for a clean exit, then SIGKILL. Ignores the two variables above — an operator using `--force` should not have to wait 11 minutes first. |
 

@@ -224,6 +224,7 @@ pub mod cpu_throttle;
 pub mod cross_domain;
 pub mod dead_code;
 pub mod diff_impact;
+pub mod drain;
 pub mod embedding;
 pub mod eval;
 pub mod export;
