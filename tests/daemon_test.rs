@@ -2621,20 +2621,25 @@ fn daemon_restart_reports_daemonless_state_and_attempts_restore_when_start_half_
     }
 
     // The fancy error renderer wraps lines, so assert short fragments that do
-    // not span a wrap point.
+    // not span a wrap point. The remedy must name a command that succeeds
+    // from this state — bare `daemon start` fails closed on the corrupt
+    // record, so the headline names `start --config <path>` / `start --reset`.
     daemon_action_cmd(&db_path, "restart")
         .assert()
         .failure()
         .stderr(
             contains("previous daemon also failed")
                 .and(contains("no daemon"))
-                .and(contains("daemon --db")),
+                .and(contains("daemon --db"))
+                .and(contains("start --reset")),
         );
 
-    // The named remedy works from the state the user is actually in, once the
-    // independently-corrupt record is removed.
-    std::fs::remove_file(&record_path).unwrap();
-    daemon_action_cmd(&db_path, "start").assert().success();
+    // Execute the printed remedy: `--reset` discards the corrupt record
+    // before spawning, so it succeeds from exactly this state.
+    daemon_action_cmd(&db_path, "start")
+        .arg("--reset")
+        .assert()
+        .success();
 }
 
 #[test]

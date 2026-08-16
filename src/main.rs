@@ -7000,17 +7000,32 @@ fn restore_config_for_failed_restart(
     }
 }
 
-/// Best-effort restoration of the incumbent after a restart's start half
-/// failed post-shutdown — the shared restart invariant: never leave the
-/// database daemonless without attempting to bring what was running back.
-/// Spawns a plain `daemon start` (bare, or with the incumbent's captured
-/// `--config`) and waits for health; the child's own final attestation
-/// verifies the booted daemon.
+/// Best-effort restoration of the incumbent after a restart's post-shutdown
+/// commit failed — the shared restart invariant: never leave the database
+/// daemonless without attempting to bring what was running back. Spawns a
+/// plain `daemon start` (bare, or with the incumbent's captured `--config`)
+/// and waits for health; the child's own final attestation verifies the
+/// booted daemon.
 async fn restore_incumbent_after_failed_restart(
     db_path: &std::path::Path,
     idle_timeout: u64,
     incumbent_config: Option<&nestweaver_client::RestartConfig>,
 ) -> anyhow::Result<()> {
+    // A restored daemon cannot open the database while a third party holds
+    // the write lock — the owner-release gate's `Held` bail is deliberate
+    // (fix/restart-write-lock-gate), so refuse early and say why instead of
+    // spawning a child whose store open fails opaquely. `Free` and
+    // `Unknown` proceed, matching that gate's policy; the child's own
+    // `GraphStore::open_or_create` is the backstop on `Unknown`.
+    if let nestweaver_daemon::lifecycle::DbWriteLock::Held { pid } =
+        nestweaver_daemon::lifecycle::db_write_lock(db_path)
+    {
+        anyhow::bail!(
+            "the database write lock is still held{}; a restored daemon could not open the \
+             database until the holder exits",
+            pid.map(|pid| format!(" by PID {pid}")).unwrap_or_default(),
+        );
+    }
     let restore_config = restore_config_for_failed_restart(db_path, incumbent_config)?;
     let spawn_lock = nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
     let executable = std::env::current_exe().context("cannot determine binary path")?;
@@ -7149,22 +7164,26 @@ async fn restart_verified_live_under_lock(
             Ok(response.ok)
         },
         |mut prepared| async move {
-            prepared.wait_for_owner_release().await?;
-            prepared.release_pidfile_lock();
-            let start_result = start_and_verify_restarted_daemon(
-                db_path,
-                executable,
-                start_args,
-                prepared.config(),
-                spawn_lock,
-            )
+            // The restore wiring wraps the WHOLE post-shutdown body: the
+            // incumbent is already gone whether the owner-release gate times
+            // out or the replacement fails to come up, and a plain error
+            // return would leave the database with no daemon either way.
+            let commit_result: anyhow::Result<()> = async {
+                prepared.wait_for_owner_release().await?;
+                prepared.release_pidfile_lock();
+                start_and_verify_restarted_daemon(
+                    db_path,
+                    executable,
+                    start_args,
+                    prepared.config(),
+                    spawn_lock,
+                )
+                .await
+            }
             .await;
-            let Err(start_error) = start_result else {
+            let Err(commit_error) = commit_result else {
                 return Ok(());
             };
-            // The incumbent is already stopped, so a plain error return would
-            // leave the database with no daemon. Attempt to bring the previous
-            // configuration back before reporting the failure.
             match restore_incumbent_after_failed_restart(
                 db_path,
                 idle_timeout,
@@ -7172,19 +7191,42 @@ async fn restart_verified_live_under_lock(
             )
             .await
             {
-                Ok(()) => Err(start_error.context(format!(
-                    "the restart's replacement daemon did not come up; the previous daemon \
-                     configuration was restored and is running. Resolve the cause above, then \
-                     retry `nestweaver daemon --db {} restart{}`",
-                    db_path.display(),
-                    explicit_config
-                        .map(|config| format!(" --config {}", config.display()))
-                        .unwrap_or_default(),
-                ))),
-                Err(restore_error) => Err(start_error.context(format!(
-                    "the restart's replacement daemon did not come up, and restoring the \
+                Ok(()) => {
+                    // Name the config SOURCE honestly: the incumbent's own
+                    // captured config when PREPARE could read it, the standard
+                    // startup-intent resolution when it could not.
+                    let restoration = match incumbent_restore_config.as_ref() {
+                        Some(nestweaver_client::RestartConfig::Configured(path)) => format!(
+                            "a daemon running the incumbent's captured configuration ({}) \
+                             was restored and is running",
+                            path.display()
+                        ),
+                        Some(nestweaver_client::RestartConfig::CompiledDefaults) | None => {
+                            "a daemon was restored from the persisted startup intent (or \
+                             compiled defaults when none is recorded) and is running"
+                                .to_string()
+                        }
+                    };
+                    Err(commit_error.context(format!(
+                        "restart failed after the incumbent daemon was stopped; {restoration}. \
+                         Resolve the cause above, then retry `nestweaver daemon --db {} restart{}`",
+                        db_path.display(),
+                        explicit_config
+                            .map(|config| format!(" --config {}", config.display()))
+                            .unwrap_or_default(),
+                    )))
+                }
+                // Bare `daemon start` fails closed on unreadable persisted
+                // intent, so the headline remedy names the forms that succeed
+                // from this state: an explicit config, or --reset (which
+                // discards the record before spawning).
+                Err(restore_error) => Err(commit_error.context(format!(
+                    "restart failed after the incumbent daemon was stopped, and restoring the \
                      previous daemon also failed: {restore_error:#}. The database currently \
-                     has no daemon — bring one up with `nestweaver daemon --db {} start`",
+                     has no daemon — bring one up with `nestweaver daemon --db {0} start \
+                     --config <path>` or `nestweaver daemon --db {0} start --reset` (compiled \
+                     defaults); `nestweaver daemon --db {0} stop` first clears any half-started \
+                     leftover",
                     db_path.display(),
                 ))),
             }
@@ -13750,6 +13792,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                                 );
                                             }
                                             IncumbentDisplacement::NoLiveIncumbent => {
+                                                // Conscious fail-open window:
+                                                // a foreign process that is
+                                                // alive but has neither taken
+                                                // the pidfile flock nor
+                                                // answered health for the
+                                                // whole boot timeout would be
+                                                // displaced here, where the
+                                                // old code refused. That
+                                                // occupant is not realistic —
+                                                // a daemon takes the flock at
+                                                // the very start of its boot,
+                                                // long before it can answer
+                                                // health, so anything past
+                                                // the timeout without the
+                                                // flock is not a daemon of
+                                                // this instance. What remains
+                                                // is a dead registration or a
+                                                // stale/empty pidfile; the
+                                                // bootout/reinstall below
+                                                // reclaims it, and final
+                                                // attestation still protects
+                                                // a concurrent winner.
                                                 eprintln!(
                                                     "No live daemon owns this instance; replacing the stale launchd/pidfile registration."
                                                 );
