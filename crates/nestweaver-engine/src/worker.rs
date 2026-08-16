@@ -51,16 +51,21 @@ impl IndexingStatus {
     }
 
     /// Create from existing Arc fields (e.g. shared with DaemonState).
+    ///
+    /// `in_flight` must be the caller's own handle too — the daemon's shutdown
+    /// drain reads it to tell a genuinely running index job from a stuck
+    /// `active` flag, so a fresh counter here would hide real work from it.
     pub fn from_arcs(
         active: Arc<AtomicBool>,
         current_repo: Arc<tokio::sync::RwLock<String>>,
         queue_depth: Arc<AtomicU32>,
+        in_flight: Arc<AtomicU32>,
     ) -> Self {
         Self {
             active,
             current_repo,
             queue_depth,
-            in_flight: Arc::new(AtomicU32::new(0)),
+            in_flight,
         }
     }
 }

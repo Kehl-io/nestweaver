@@ -4747,16 +4747,19 @@ const STOP_WAIT_NOTICE_SECS: u64 = 60;
 ///
 /// `serving_reads` is OBSERVED, not assumed — the caller re-probes the socket
 /// immediately before printing. The first version of this message asserted
-/// "still serving reads" unconditionally, which is false in the index-only
-/// drain: with `active_writes == 0 && indexing_active`, `run_shutdown_drain`
-/// breaks and BROADCASTS at the ceiling, closing every listener at 660s, while
-/// this command's grace is 690s — so at report time the daemon could have had
-/// no listeners for thirty seconds. That is exactly the overclaim class this
-/// change exists to remove, so it must not be reintroduced by the command
-/// announcing the fix.
+/// "still serving reads" unconditionally, which is false in the stuck-flag
+/// index drain: with `active_writes == 0`, `indexing_active` set, and the
+/// worker pool reporting ZERO jobs in flight (the flag cannot clear once the
+/// pool is drained with a non-empty queue), the drain breaks and BROADCASTS at
+/// the ceiling, closing every listener at 660s, while this command's grace is
+/// 690s — so at report time the daemon could have had no listeners for thirty
+/// seconds. A GENUINELY RUNNING index job is not this case: like an in-flight
+/// write, it keeps the listeners up past the ceiling, so reads stay served.
+/// That is exactly the overclaim class this change exists to remove, so it
+/// must not be reintroduced by the command announcing the fix.
 ///
 /// THE NEGATIVE BRANCH REPORTS THE OBSERVATION, NOT A CAUSE. All the caller
-/// knows is that one `connect()` did not answer. The index-only ceiling
+/// knows is that one `connect()` did not answer. The stuck-flag ceiling
 /// broadcast is the *likely* explanation and is named as such, but it is not
 /// the only one: ECONNREFUSED while the process is mid-exit, `EMFILE`/`ENFILE`
 /// in this CLI process, a socket already swept by `daemon gc`, or a full listen
@@ -4772,11 +4775,13 @@ fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) 
          aborted (`spawn_blocking` is not cancellable) has to finish."
     } else {
         "It is still running, but its socket did not answer just now, so reads may be \
-         DOWN. The likeliest cause is the index-only drain: with nothing in the write \
-         queue the daemon broadcasts at the drain ceiling, which closes every listener \
-         while the process keeps finishing unabortable work. This probe cannot tell that \
-         apart from a socket already cleaned up, a refused connection during exit, or a \
-         local file-descriptor limit — check the daemon log before concluding."
+         DOWN. The likeliest cause is a stuck-flag index drain: with nothing in the \
+         write queue and the worker pool idle, the daemon broadcasts at the drain \
+         ceiling, which closes every listener (a genuinely running index job keeps \
+         them up, like a write — the broadcast is only for a flag that outlived its \
+         work). This probe cannot tell that apart from a socket already cleaned up, \
+         a refused connection during exit, or a local file-descriptor limit — check \
+         the daemon log before concluding."
     };
     format!(
         "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
@@ -14426,10 +14431,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
 
                         // OBSERVE whether the socket answers; do NOT infer why.
-                        // The index-only drain broadcasts at the ceiling, which
-                        // closes every listener 30s before this grace expires,
-                        // so "still serving reads" cannot be asserted — but a
-                        // failed connect does not prove that particular cause
+                        // A stuck-flag index drain (`indexing_active` set with
+                        // the worker pool reporting zero jobs in flight)
+                        // broadcasts at the ceiling, which closes every
+                        // listener 30s before this grace expires, so "still
+                        // serving reads" cannot be asserted — but a failed
+                        // connect does not prove that particular cause
                         // either (ECONNREFUSED mid-exit, EMFILE in this process,
                         // a socket swept by `daemon gc`, a full listen backlog).
                         // The message therefore reports the observation and
@@ -23523,12 +23530,15 @@ mod stop_grace_tests {
         );
     }
 
-    /// The index-only drain is the case the first version of this message got
-    /// wrong. With `active_writes == 0 && indexing_active`, `run_shutdown_drain`
-    /// breaks and BROADCASTS at the ceiling — which closes every listener at
-    /// 660s, while this command's grace runs to 690s. So there is a real window
-    /// in which the daemon is alive, unreachable, and the command was announcing
-    /// "still serving reads" about it.
+    /// The stuck-flag index drain is the case the first version of this message
+    /// got wrong. With `active_writes == 0`, `indexing_active` set, and the
+    /// worker pool reporting zero jobs in flight, the drain breaks and
+    /// BROADCASTS at the ceiling — which closes every listener at 660s, while
+    /// this command's grace runs to 690s. So there is a real window in which
+    /// the daemon is alive, unreachable, and the command was announcing "still
+    /// serving reads" about it. (A genuinely running index job keeps the
+    /// listeners up past the ceiling, so the broadcast case is provably a
+    /// stuck flag.)
     ///
     /// The caller re-probes the socket and passes what it observed. Both
     /// branches are asserted here because the honest branch is the whole point:

@@ -909,6 +909,13 @@ pub struct DaemonState {
     pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
     /// Number of pending + running jobs in the server-side job queue.
     pub indexing_queue_depth: Arc<AtomicU32>,
+    /// The worker pool's own count of index jobs still running (claimed, not
+    /// yet finished). Shared into the worker's `IndexingStatus` so the WORKER
+    /// — not the `indexing_active` flag — is the authority on whether a job
+    /// genuinely exists; the shutdown drain reads it to tell a running job
+    /// (unbounded wait, reads stay served) from a stuck flag (bounded by the
+    /// drain ceiling).
+    pub indexing_in_flight: Arc<AtomicU32>,
     /// Brain-status documents served by this daemon process. A daemon-side
     /// witness counter: a client that adopted this daemon after its pidfile
     /// was unlinked proves the answer really came from the daemon (the
@@ -1095,180 +1102,26 @@ fn stop_active_watcher(state: &DaemonState) {
     }
 }
 
-/// Minimum spacing between repeats of the over-ceiling drain warning. The
-/// ceiling itself sets the cadence; this floor stops a tiny
-/// `NESTWEAVER_DRAIN_TIMEOUT_SECS` from turning the log into a spinner.
-const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
-
 /// Wait for in-flight writes and indexing to finish, then broadcast shutdown.
 ///
-/// `ceiling` (`NESTWEAVER_DRAIN_TIMEOUT_SECS`) is a REPORTING threshold, not a
-/// kill switch, and this function must not pretend otherwise. Nothing in this
-/// process can abort an in-flight write: daemon writes run on `spawn_blocking`
-/// threads Tokio cannot cancel (see the "`spawn_blocking` work cannot be
-/// aborted" note on the exit path), and the shutdown broadcast this function
-/// ends with only stops listeners ACCEPTING — it cannot preempt work already
-/// running.
-///
-/// So the loop keeps waiting past the ceiling and says so. It used to log
-/// "drain timeout reached — forcing shutdown" and break, which was false twice
-/// over:
-///
-///  - nothing was forced. The broadcast does not abort the write, the process
-///    stayed alive holding the DB write lock, and only an operator's SIGKILL
-///    ever ended it; and
-///  - broadcasting shutdown there tore down every listener while the process
-///    lived on, which is how a stuck WRITE drain also took READS down. Almost
-///    no read needs the write gate (`ConnectionGuard::read` does not take
-///    `write_mutex`), so they were not blocked by the drain itself — they died
-///    because the UDS/TCP/MCP acceptors had already been shut down by that
-///    premature broadcast, and every new `daemon status` / MCP / CLI read
-///    connection was refused for as long as the write ran.
-///
-/// Waiting instead keeps the daemon readable until the operator escalates —
-/// and if the write does finish, shutdown still completes cleanly rather than
-/// leaving a half-dead process behind. "Readable" is not absolute: `embed` and
-/// `plan_embed` take `write_mutex` themselves, so they stay blocked for the
-/// duration of the stuck write, and the ceiling message says so.
-///
-/// The unbounded wait applies to in-flight WRITES ONLY. `indexing_active` on
-/// its own stays bounded by the ceiling — see the comment on that branch for
-/// why waiting on it forever would be a hang rather than a safeguard.
+/// The loop itself is [`nestweaver_engine::drain::run_drain`], fed with the
+/// daemon's shared counters; it lives next to the worker pool so the drain's
+/// indexing behaviour can be tested against a real worker-pool index, which
+/// this crate's tests cannot drive (they link the engine without its
+/// `cfg(test)` `file://` clone allowance). The doc comment on `run_drain`
+/// covers why the ceiling is a reporting threshold for in-flight writes and a
+/// real deadline for a stuck `indexing_active` flag.
 async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
-    let ceiling_at = std::time::Duration::from_secs(ceiling);
-    let half = std::time::Duration::from_secs(ceiling / 2);
-    let ninety = std::time::Duration::from_secs(ceiling * 9 / 10);
-    let repeat_every =
-        std::time::Duration::from_secs(ceiling.max(DRAIN_OVER_CEILING_REPORT_FLOOR_SECS));
-    let start = tokio::time::Instant::now();
-    let mut warned_half = false;
-    let mut warned_ninety = false;
-    // When the next over-ceiling report is due: first at the ceiling itself,
-    // then every `repeat_every` after that.
-    let mut next_over_ceiling_report = ceiling_at;
-
-    loop {
-        let writes = state.active_writes.load(Ordering::Relaxed);
-        // Index jobs bump `indexing_active`, not `active_writes`, so the
-        // drain must wait on both — otherwise a shutdown could proceed
-        // while the worker is mid-write.
-        let indexing = state.indexing_active.load(Ordering::Relaxed);
-        if writes == 0 && !indexing {
-            tracing::info!("no active writes or indexing — shutting down");
-            break;
-        }
-
-        let elapsed = start.elapsed();
-
-        if writes == 0 {
-            // Indexing-only wait: BOUNDED, deliberately.
-            //
-            // Only an in-flight write earns an unbounded wait — it holds the DB
-            // write lock, runs on a `spawn_blocking` thread nothing can cancel,
-            // and abandoning it is the operator's call. `indexing_active` is
-            // different: waiting on it forever is a hang, not a safeguard.
-            //
-            // `indexing_active` is cleared in exactly two places in
-            // `nestweaver-engine`'s worker loop, and with `drained` set (which
-            // the Shutdown handler does before this runs) BOTH are unreachable
-            // while the job queue is non-empty: the idle branch is skipped
-            // because the drained check `continue`s before a job is ever
-            // claimed, and the post-job branch clears only when pending +
-            // running + in-flight all reach zero. A server-mode daemon told to
-            // shut down with work still queued — the "continuous webhook
-            // enqueue" case the Shutdown handler already calls out — would
-            // never exit at all.
-            //
-            // The broadcast below is precisely what unblocks it: the worker
-            // loop observes shutdown and breaks. That is the pre-existing,
-            // working behaviour for this path, so it is kept intact.
-            //
-            // This branch DOES have a cost, and the message says so rather than
-            // letting the daemon do the dishonest thing quietly. Broadcasting
-            // stops every listener accepting, so read service ends here — and
-            // worker-pool index jobs bump `indexing_active` rather than
-            // `active_writes`, so if the flag is set because a job really is
-            // running, that unabortable `spawn_blocking` write keeps the process
-            // alive with nothing being served. That is the original incident,
-            // surviving in the server-mode index path. It is not a regression
-            // (`main` behaves identically) and it cannot be fixed from here: the
-            // worker's `in_flight` counter lives inside `IndexingStatus` and is
-            // never shared into `DaemonState`, so this loop cannot tell a stuck
-            // flag from a running job. Tracked as a follow-up alongside the
-            // SIGTERM broadcast; both come from the same root cause, that the
-            // broadcast is the only shutdown primitive and it is all-or-nothing.
-            if elapsed >= ceiling_at {
-                tracing::warn!(
-                    indexing_active = indexing,
-                    waited_secs = elapsed.as_secs(),
-                    "drain ceiling ({ceiling}s) reached with no in-flight writes — \
-                     signalling shutdown. The index worker stops after its current \
-                     job; anything still queued is left for the next start. NOTE: \
-                     this closes every listener, so reads stop being served now — \
-                     and if an index job is genuinely still running, it cannot be \
-                     aborted, so the process may stay alive without serving \
-                     anything until it finishes. `kill -9` ends it sooner, \
-                     abandoning that job's write"
-                );
-                break;
-            }
-        } else if elapsed >= next_over_ceiling_report {
-            next_over_ceiling_report = elapsed + repeat_every;
-            let pid = std::process::id();
-            tracing::warn!(
-                active_writes = writes,
-                indexing_active = indexing,
-                waited_secs = elapsed.as_secs(),
-                pid,
-                "drain ceiling ({ceiling}s) exceeded — still waiting on {writes} \
-                 in-flight write(s){}; the daemon CANNOT abort them and is NOT \
-                 shutting down. NEW writes are already being refused with \
-                 UNAVAILABLE, so this count only falls. Most reads are still \
-                 served, though they can stall for seconds while a write \
-                 commits. `embed` takes the write gate AND the write guard, so \
-                 it is refused outright; `plan_embed` takes the gate but counts \
-                 as a read, so it is not refused — it BLOCKS until the \
-                 in-flight write releases the gate. This is \
-                 the same drain whether you sent SIGTERM (`nestweaver daemon \
-                 stop`) or the Shutdown RPC (`nestweaver daemon restart`); \
-                 neither escalates on its own. To end it now — abandoning the \
-                 in-flight write, which the graph store may not survive cleanly \
-                 (nw-126) — run `nestweaver daemon stop --force` or `kill -9 \
-                 {pid}`",
-                // Hedged: `indexing_active` is a flag, not a proof of work. It
-                // can stay set after the worker pool is drained, so claiming a
-                // running index job here would be the same kind of overclaim
-                // this line exists to stop making.
-                if indexing {
-                    " (indexing_active is also set)"
-                } else {
-                    ""
-                },
-            );
-        }
-
-        // Past the ceiling these are noise — the reports above have taken over.
-        if elapsed < ceiling_at {
-            if !warned_half && elapsed >= half {
-                tracing::warn!(
-                    active_writes = writes,
-                    "drain at 50% of ceiling ({ceiling}s)"
-                );
-                warned_half = true;
-            }
-            if !warned_ninety && elapsed >= ninety {
-                tracing::warn!(
-                    active_writes = writes,
-                    "drain at 90% of ceiling ({ceiling}s)"
-                );
-                warned_ninety = true;
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    let _ = state.shutdown_tx.send(true);
+    nestweaver_engine::drain::run_drain(
+        nestweaver_engine::drain::DrainSignals {
+            active_writes: Arc::clone(&state.active_writes),
+            indexing_active: Arc::clone(&state.indexing_active),
+            indexing_in_flight: Arc::clone(&state.indexing_in_flight),
+            shutdown_tx: state.shutdown_tx.clone(),
+        },
+        ceiling,
+    )
+    .await;
 }
 
 /// The ONE way a shutdown starts in this process.
@@ -8961,6 +8814,7 @@ pub async fn run_server(
         indexing_active: Arc::new(AtomicBool::new(false)),
         indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
         indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+        indexing_in_flight: Arc::new(AtomicU32::new(0)),
         requests_served: AtomicU64::new(0),
         safeguards,
         rate_limiters: rate_limiters.clone(),
@@ -9897,6 +9751,7 @@ pub async fn run_server(
                 Arc::clone(&state.indexing_active),
                 state.indexing_repo.clone(),
                 Arc::clone(&state.indexing_queue_depth),
+                Arc::clone(&state.indexing_in_flight),
             );
             // Map each declared repo to its index strategy so vault repos index
             // as markdown instead of code. Keyed by the same canonical repo id
@@ -15265,6 +15120,7 @@ mod startup_helper_tests {
             indexing_active: Arc::new(AtomicBool::new(false)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            indexing_in_flight: Arc::new(AtomicU32::new(0)),
             requests_served: AtomicU64::new(0),
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
@@ -15345,6 +15201,7 @@ credential_method = "gh"
             indexing_active: Arc::new(AtomicBool::new(false)),
             indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            indexing_in_flight: Arc::new(AtomicU32::new(0)),
             requests_served: AtomicU64::new(0),
             safeguards: QuerySafeguards::default_server(),
             rate_limiters: None,
