@@ -43,6 +43,49 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [6.1.0](https://github.com/Kehl-io/nestweaver/compare/v6.0.0...v6.1.0) (2026-08-16)
+
+
+### Features
+
+* **daemon:** count served brain status documents in a witness counter ([5a5d952](https://github.com/Kehl-io/nestweaver/commit/5a5d9524b105b028e568a1a59071efb2a996cdb7))
+
+
+### Bug Fixes
+
+* **cli:** align the still-draining message and drain docs with live-index semantics ([631a7ae](https://github.com/Kehl-io/nestweaver/commit/631a7aee9261361a556d5bf232f691d7011954d2))
+* **cli:** cover the owner-release gate in restart restore, honest restore remedies ([892620e](https://github.com/Kehl-io/nestweaver/commit/892620eb87faf9509ca2e7499da13b1b8cbca834))
+* **cli:** do not claim the incumbent was stopped when its flock is still held ([f27eeb0](https://github.com/Kehl-io/nestweaver/commit/f27eeb0e0fab4555bf08c194457ce965d090f656))
+* **client:** adopt a pidfile-less daemon on socket peer credentials ([78acdde](https://github.com/Kehl-io/nestweaver/commit/78acddeb27896d6a8570fda76f1df9588cc54186))
+* **client:** adopt a pidfile-less daemon on socket peer credentials ([eb98284](https://github.com/Kehl-io/nestweaver/commit/eb982843859f9a4a59d143cf73fe60d731e95b29))
+* **cli:** forward every brain status warning to text output ([99d92b6](https://github.com/Kehl-io/nestweaver/commit/99d92b6dc2556a1c48a439c18f7890f4179ba6a9))
+* **cli:** forward every brain status warning to text output ([352fc56](https://github.com/Kehl-io/nestweaver/commit/352fc564add453c863abbfa72c97319c6ddecce4))
+* **cli:** keep the UI port answering across a daemon outage ([4acee26](https://github.com/Kehl-io/nestweaver/commit/4acee262bb8f9c89baa09c00bead48ab5df7ef00))
+* **cli:** keep the UI port answering across a daemon outage ([9ad09e3](https://github.com/Kehl-io/nestweaver/commit/9ad09e308995132405bfdc2cedb1490c2cec91a3))
+* **cli:** no dangling "see warning" pointer for an in-flight publication ([b1d0872](https://github.com/Kehl-io/nestweaver/commit/b1d0872c7e4c1c3b59218cff982d7e3c47f36b73))
+* **cli:** say only what the pidfile-flock probe establishes after a failed restart ([01c11fe](https://github.com/Kehl-io/nestweaver/commit/01c11fe772d420ed6d702053d021451223f74f09))
+* **cli:** scope the bypass warning's in-band marker claim to brain status ([5fd954e](https://github.com/Kehl-io/nestweaver/commit/5fd954ee1f88d0c9caf924d5b725da644c7c0b3d))
+* **cli:** serve the daemon brain status schema on the direct path ([49cbecb](https://github.com/Kehl-io/nestweaver/commit/49cbecb33d7b6c58ae1e15ccb396803a506bd080))
+* **cli:** un-wedge restart/start --config behind a dead launchd incumbent ([981ed16](https://github.com/Kehl-io/nestweaver/commit/981ed163bb64499f54f5e7f216de50a885ffc9b5))
+* **cli:** un-wedge restart/start --config behind a dead launchd incumbent ([f5df1c4](https://github.com/Kehl-io/nestweaver/commit/f5df1c492a5dba14f4b3ff8215204012c3da629d))
+* **cli:** verify the daemon's UI port before claiming recovery ([2757e00](https://github.com/Kehl-io/nestweaver/commit/2757e00103ffd040f2cdd8338780381a0cb5a727))
+* **daemon:** correct gc help text and race docs, dedupe sweep roots ([c826d62](https://github.com/Kehl-io/nestweaver/commit/c826d6240a645b7819d37e770b8d3ef930138ad7))
+* **daemon:** distinguish a live index job from a stuck flag in the drain ([8b22ecc](https://github.com/Kehl-io/nestweaver/commit/8b22eccd3c7ab6f857287898d0e38d8b1290bb58))
+* **daemon:** distinguish a live index job from a stuck flag in the drain ([471f61b](https://github.com/Kehl-io/nestweaver/commit/471f61b1880f9afc48159e1703d806e0d16d864f))
+* **daemon:** gate daemon restart on the database write lock, not the pidfile lock ([0236c6e](https://github.com/Kehl-io/nestweaver/commit/0236c6eed5d3d8b75ba5d00ba83688e53eaa45b0))
+* **daemon:** gate daemon restart on the database write lock, not the pidfile lock ([54ff6e1](https://github.com/Kehl-io/nestweaver/commit/54ff6e197aaf8d7441b8b77b96f70110bb9d6d6c))
+* **daemon:** reclaim orphaned runtime and socket-fallback dirs ([0c77622](https://github.com/Kehl-io/nestweaver/commit/0c776220241237a8a15a4d7b52f774c7ed8f85bd))
+* **daemon:** reclaim orphaned runtime and socket-fallback dirs ([97015f8](https://github.com/Kehl-io/nestweaver/commit/97015f80ca48c4534507a9b3f093cadca4ee583d))
+* **engine:** fail closed when the owner PageRank cache is wiped before sidecar save ([56dfa59](https://github.com/Kehl-io/nestweaver/commit/56dfa5928d2983f5528eb1a2e5019d00ace9632a))
+* **engine:** fold the is_wedged gate into needs_forced_repair ([1e099aa](https://github.com/Kehl-io/nestweaver/commit/1e099aa9617c8878d6074d9036b485e20b382030))
+* **engine:** fold the is_wedged gate into needs_forced_repair + pin the read-only boot gate ([242a65e](https://github.com/Kehl-io/nestweaver/commit/242a65ed00f69650c14c093102ae374fc8c89d33))
+* **engine:** publish the fresh PageRank sidecar before retiring the dirty marker ([29a6129](https://github.com/Kehl-io/nestweaver/commit/29a6129e0266379f43ce55ef03926613e3540353))
+* **engine:** publish the fresh PageRank sidecar before retiring the dirty marker ([fd7e918](https://github.com/Kehl-io/nestweaver/commit/fd7e91844dabba393bc10fd6c3ef480f9e2dd980))
+* **mcp:** derive brain_status warnings and publication from one path, one read ([f2c0976](https://github.com/Kehl-io/nestweaver/commit/f2c0976a877cc4d7d839bd4e8a954cf61a11fccd))
+* **mcp:** give the wedged-publication warning a kind and share the builder ([66f698e](https://github.com/Kehl-io/nestweaver/commit/66f698e30d78ebccc75d524f9ed17880e6c079d1))
+* **store:** fail ranking queries closed during dirty index publication ([98978e4](https://github.com/Kehl-io/nestweaver/commit/98978e4e5d82a14cd650bef4b415338317e610ce))
+* **store:** name the ranking-unavailable refusal as a StoreError variant ([8e232d5](https://github.com/Kehl-io/nestweaver/commit/8e232d5981468b8ae5e0917b9703c5bcc709c92c))
+
 ## [6.0.0](https://github.com/Kehl-io/nestweaver/compare/v5.0.0...v6.0.0) (2026-08-14)
 
 
