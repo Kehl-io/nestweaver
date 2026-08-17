@@ -3,6 +3,8 @@
 #   nestweaver config validate examples/minimal-instance.toml
 
 instance_id = "minimal-example"
+# Optional: lets `--config` select the database.
+# db = "./nestweaver.lbug"
 
 [snapshot_storage]
 backend = "local"
