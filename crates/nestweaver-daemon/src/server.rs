@@ -278,6 +278,27 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Compose shutdown admission and the process-wide writer gate in the only
+/// safe order. Long-lived services receive this factory and acquire a lease at
+/// their actual mutation boundary instead of pinning the daemon while idle or
+/// performing remote/read-only planning.
+fn daemon_mutation_lease_factory(
+    state: Arc<DaemonState>,
+) -> nestweaver_engine::WatchMutationLeaseFactory {
+    Arc::new(move |label| {
+        let guard = ConnectionGuard::write(&state).map_err(|status| {
+            if status.code() == tonic::Code::Unavailable {
+                anyhow::Error::new(nestweaver_engine::WatchMutationRefused)
+                    .context(status.message().to_string())
+            } else {
+                anyhow::anyhow!(status.to_string())
+            }
+        })?;
+        let write = state.write_gate.blocking_lock(label);
+        Ok(Box::new((guard, write)))
+    })
+}
+
 /// The process-wide write gate. Homed in `nestweaver-engine` because the
 /// daemon is not the only writer: the worker pool and the web admin API take
 /// the same lock, and every one of them must stamp the holder so
@@ -1657,23 +1678,21 @@ impl DaemonService {
     /// watcher batch.  Returns `None` when the `embed` feature is disabled or
     /// the model is not yet loaded.
     ///
-    /// The embed writes run **inline** on the watcher thread. That thread holds
-    /// `write_mutex` + a `ConnectionGuard::write` for the watcher's whole run
-    /// (see `watch_vault`/`watch_code` wiring) and invokes this callback within
-    /// that hold, so executing the `add_embedding`/`flush_embedding_index`
-    /// writes here keeps them under the same write gate every other daemon
-    /// mutation uses:
+    /// The embed writes run **inline** on the watcher thread. The engine keeps
+    /// the batch's mutation lease live through this callback, so executing the
+    /// `add_embedding`/`flush_embedding_index` writes here keeps them under the
+    /// same write gate every other daemon mutation uses:
     ///  - **backup-safe:** the write runs while the watcher holds `write_mutex`,
     ///    so a backup's `.embeddings` sidecar copy (which also takes
     ///    `write_mutex` in `stage_backup_from_store`) cannot run concurrently,
     ///    and no detached task outlives the lock to race the copy;
     ///  - **drain-visible:** the write completes before the watcher thread drops
-    ///    its `ConnectionGuard::write`, so `active_writes` stays > 0 until the
+    ///    its batch `ConnectionGuard::write`, so `active_writes` stays > 0 until the
     ///    embed finishes and the shutdown drain waits for it.
     ///
     /// It must NOT be moved to a detached `spawn_blocking` task: that escapes
     /// both guarantees. It also must NOT re-acquire `write_mutex` itself — the
-    /// watcher thread already holds it for the whole run, so a fresh
+    /// watcher thread already holds it for the batch, so a fresh
     /// `blocking_lock()` here would deadlock. Inheriting the existing hold is
     /// the correct single-writer discipline.
     #[cfg(feature = "embed")]
@@ -3537,7 +3556,7 @@ impl NestWeaverDaemon for DaemonService {
         // daemon holding a shutdown handle for a `BrainWatcher` dropped on the
         // very next line, on behalf of a request that was rejected: state
         // mutated by a refused RPC.
-        let guard = ConnectionGuard::write(&self.state)?;
+        let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         let watcher_id = match register_watcher(&self.state, shutdown_handle, false) {
@@ -3551,8 +3570,12 @@ impl NestWeaverDaemon for DaemonService {
             }
             Err(e) => return Err(e),
         };
-        let write_lock = self.state.write_gate.clone();
+        // Registration is admitted as one short mutation. The endless service
+        // must not remain an active write while it is merely waiting for files.
+        drop(admission_guard);
         let state = self.state.clone();
+        let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
+        watcher = watcher.with_mutation_lease_factory(mutation_factory);
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
             self.state.embedding_runtime.clone(),
@@ -3560,8 +3583,6 @@ impl NestWeaverDaemon for DaemonService {
         );
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("watch_vault");
-            let _guard = guard;
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3623,7 +3644,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let db_path = self.state.db_path.clone();
 
-        let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
+        let mut watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
         let shutdown_handle = watcher.shutdown_handle();
 
         // Refuse BEFORE registering — and here the ordering matters more than in
@@ -3633,7 +3654,7 @@ impl NestWeaverDaemon for DaemonService {
         // it, leaving no watcher at all plus a registration pointing at a
         // dropped `CodeWatcher`. Destroying live state on behalf of a rejected
         // request is not something a refusal is allowed to do.
-        let guard = ConnectionGuard::write(&self.state)?;
+        let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         // With `force`, an already-running watcher (e.g. orphaned by a
@@ -3651,8 +3672,10 @@ impl NestWeaverDaemon for DaemonService {
             }
             Err(e) => return Err(e),
         };
-        let write_lock = self.state.write_gate.clone();
+        drop(admission_guard);
         let state = self.state.clone();
+        let mutation_factory = daemon_mutation_lease_factory(self.state.clone());
+        watcher = watcher.with_mutation_lease_factory(mutation_factory);
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
             self.state.embedding_runtime.clone(),
@@ -3660,8 +3683,6 @@ impl NestWeaverDaemon for DaemonService {
         );
 
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("watch_code");
-            let _guard = guard;
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4558,50 +4579,53 @@ impl NestWeaverDaemon for DaemonService {
         let config_path = PathBuf::from(&req.config_path);
         let instance_id =
             resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
+        // Configuration I/O and parsing do not mutate the graph and must not
+        // occupy the sole writer while a slow filesystem is being read.
+        let instance_config =
+            nestweaver_engine::InstanceConfig::from_file(&config_path).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "failed to load instance config {}: {error:#}",
+                    config_path.display()
+                ))
+            })?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
-        let guard = ConnectionGuard::write(&self.state)?;
-        let write_lock = self.state.write_gate.clone();
+        let base_mutation_factory = daemon_mutation_lease_factory(self.state.clone());
+        let writing_tx = tx.clone();
+        let project_total = instance_config.projects.len() as u64;
+        let mutation_factory: nestweaver_engine::WatchMutationLeaseFactory =
+            Arc::new(move |label| {
+                let lease = base_mutation_factory(label)?;
+                let _ = writing_tx.blocking_send(Ok(IndexProgress {
+                    phase: Phase::Writing as i32,
+                    message: "Applying the planned project graph in one transaction".to_string(),
+                    files_processed: 0,
+                    files_total: project_total,
+                    symbols_found: 0,
+                }));
+                Ok(lease)
+            });
         tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock.blocking_lock("materialize_projects");
-            let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
-                message: format!("Loading instance config from {}", config_path.display()),
+                message: format!(
+                    "Loaded {} configured project(s) from {}",
+                    instance_config.projects.len(),
+                    config_path.display()
+                ),
                 files_processed: 0,
-                files_total: 0,
+                files_total: instance_config.projects.len() as u64,
                 symbols_found: 0,
             }));
 
-            let instance_config = match nestweaver_engine::InstanceConfig::from_file(&config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Error as i32,
-                        message: format!("Failed to load instance config: {e:#}"),
-                        files_processed: 0,
-                        files_total: 0,
-                        symbols_found: 0,
-                    }));
-                    return;
-                }
-            };
-
-            let _ = tx.blocking_send(Ok(IndexProgress {
-                phase: Phase::Writing as i32,
-                message: format!("Materializing projects for instance {}", instance_id),
-                files_processed: 0,
-                files_total: 0,
-                symbols_found: 0,
-            }));
-
-            match nestweaver_engine::materialize_projects(
+            match nestweaver_engine::materialize_projects_with_lease(
                 &state.store,
                 &instance_config,
                 &instance_id,
                 &state.db_path,
+                Some(mutation_factory),
             ) {
                 Ok(result) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -4623,7 +4647,7 @@ impl NestWeaverDaemon for DaemonService {
                         phase: Phase::Error as i32,
                         message: format!("MaterializeProjects failed: {e:#}"),
                         files_processed: 0,
-                        files_total: 0,
+                        files_total: instance_config.projects.len() as u64,
                         symbols_found: 0,
                     }));
                 }
@@ -14727,14 +14751,14 @@ mod startup_helper_tests {
     }
 
     /// The watcher's embed-on-change callback must perform its `add_embedding`
-    /// writes under the write gate the watcher thread holds (`write_mutex` +
+    /// writes under the current batch lease (`write_mutex` +
     /// `ConnectionGuard::write`), not on a detached fire-and-forget task that
-    /// escapes it. Escaping the gate (a) races a backup's sidecar copy and
+    /// escapes it. Escaping the lease (a) races a backup's sidecar copy and
     /// (b) is invisible to the shutdown drain (`active_writes`).
     ///
-    /// This mirrors the `watch_vault`/`watch_code` wiring (server.rs ~863-872):
-    /// the watcher thread takes `write_mutex.blocking_lock()` + a write guard
-    /// for its whole run and calls the callback inline within that hold.
+    /// This mirrors the `watch_vault`/`watch_code` wiring: the engine acquires
+    /// one composite lease for a mutation batch and calls the callback inline
+    /// before dropping it. An idle watcher owns no lease.
     #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_embed_holds_write_gate() {
@@ -14787,15 +14811,27 @@ mod startup_helper_tests {
         let cb = DaemonService::make_embed_on_change(embedding_runtime, store.clone())
             .expect("embed callback should be present when a model is loaded");
 
-        // Mirror the watcher thread: hold write_mutex + bump active_writes for
-        // the callback's whole run, exactly as watch_vault/watch_code do.
-        let wm = write_mutex.clone();
+        struct ActiveWriteProbe(Arc<AtomicU32>);
+        impl Drop for ActiveWriteProbe {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        // Mirror the batch factory: admission/counting first, then the gate,
+        // returned as one opaque RAII value.
+        let gate = WriteGate::from_mutex(write_mutex.clone());
         let aw = active_writes.clone();
+        let factory: nestweaver_engine::WatchMutationLeaseFactory = Arc::new(move |label| {
+            aw.fetch_add(1, Ordering::Relaxed);
+            let guard = ActiveWriteProbe(aw.clone());
+            let write = gate.blocking_lock(label);
+            Ok(Box::new((guard, write)))
+        });
         let handle = tokio::task::spawn_blocking(move || {
-            let _write_lock = wm.blocking_lock();
-            aw.fetch_add(1, Ordering::Relaxed); // == ConnectionGuard::write
+            let lease = factory("watch_vault_batch").unwrap();
             cb();
-            aw.fetch_sub(1, Ordering::Relaxed); // == guard drop on watcher exit
+            drop(lease);
         });
 
         // Wait for the embed write to run (or fail the test if it never does).
@@ -14817,6 +14853,15 @@ mod startup_helper_tests {
         assert!(
             store.has_embedding(&sym_uid),
             "callback should have embedded the pending symbol"
+        );
+        assert_eq!(
+            active_writes.load(Ordering::Relaxed),
+            0,
+            "the batch lease must release active_writes after the callback"
+        );
+        assert!(
+            write_mutex.try_lock().is_ok(),
+            "the batch lease must release the writer gate while the watcher is idle"
         );
     }
 
@@ -16839,6 +16884,64 @@ external_model = "unavailable-test-model"
         state.active_writes.store(0, Ordering::Relaxed);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_vault_watcher_releases_the_write_lease() {
+        let state = test_state_with_writer();
+        let service = DaemonService {
+            state: Arc::clone(&state),
+        };
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("seed.md"), "# Seed\n").unwrap();
+
+        let response = service
+            .watch_vault(tonic::Request::new(nestweaver_proto::WatchVaultRequest {
+                vault_path: vault.path().to_string_lossy().into_owned(),
+                vault_name: "test-vault".to_string(),
+                instance_id: String::new(),
+                extra_ignore_patterns: Vec::new(),
+            }))
+            .await
+            .expect("WatchVault RPC")
+            .into_inner();
+        assert!(response.ok, "watcher failed to start: {}", response.message);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.active_writes.load(Ordering::Relaxed) == 0
+                    && state.write_gate.holder_snapshot().is_none()
+                    && !state.store.list_vaults(None).unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("WatchVault must release its startup batch lease while idle");
+
+        let independent = ConnectionGuard::write(&state).expect("independent write admission");
+        let gate = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.write_gate.lock("idle_watcher_probe"),
+        )
+        .await
+        .expect("independent write must not block behind idle WatchVault");
+        drop(gate);
+        drop(independent);
+
+        stop_active_watcher(&state);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state.watcher_stop.lock().unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stopped WatchVault must clear its registration");
+    }
+
     /// The link nothing else covers: that a REAL SIGTERM routes into the drain
     /// rather than broadcasting.
     ///
@@ -17964,6 +18067,38 @@ mod watcher_e2e_tests {
             .expect("watch_code")
             .into_inner();
         assert!(r1.ok, "first watch must start: {}", r1.message);
+
+        // Wait for the cold snapshot to finish, then prove the long-lived idle
+        // service owns neither the writer gate nor a queued write. Before the
+        // batch-lease fix this permanently reported `watch_code` here.
+        let idle_status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let status = client
+                    .brain_status(nestweaver_proto::BrainStatusRequest {})
+                    .await
+                    .expect("brain status while watcher is idle")
+                    .into_inner();
+                if status.repo_count > 0 && status.write_holder.is_empty() {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("watcher must release the writer gate after its initial batch");
+        assert_eq!(idle_status.write_queue_depth, 0);
+
+        // A second mutation must reach the server and finish while the watcher
+        // is idle, rather than queueing behind the watcher session forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                repo_uid: "repo:does-not-exist".to_string(),
+            }),
+        )
+        .await
+        .expect("an independent write must not block behind an idle watcher")
+        .expect("remove_repo RPC should return a normal response");
 
         // Simulated orphan: the first "CLI" never calls StopWatch.
         let r2 = client
