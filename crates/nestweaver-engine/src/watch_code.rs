@@ -20,12 +20,14 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use nestweaver_parser::detect_language;
 use nestweaver_store::{GraphScope, GraphStore};
-use notify::RecursiveMode;
-use notify_debouncer_mini::{DebouncedEvent, new_debouncer};
+use notify::{Event, RecursiveMode, Watcher};
 
 use crate::content_reader::ContentReader;
 use crate::index::{is_minified_or_bundled, path_in_skip_dir};
-use crate::watcher::ShutdownHandle;
+use crate::watcher::{
+    RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
+    WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
+};
 
 /// Live file-watcher for a code repository. Construct via `new`, then
 /// call `run` — it blocks until `stop()` is signalled or the watcher
@@ -35,6 +37,10 @@ pub struct CodeWatcher {
     repo_root: PathBuf,
     instance_id: String,
     stop_flag: Arc<AtomicBool>,
+    mutation_lease_factory: Option<WatchMutationLeaseFactory>,
+    debounce: Duration,
+    #[cfg(test)]
+    ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
 
 #[derive(Debug)]
@@ -92,7 +98,40 @@ impl CodeWatcher {
             repo_root,
             instance_id: instance_id.into(),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            mutation_lease_factory: None,
+            debounce: Duration::from_secs(2),
+            #[cfg(test)]
+            ready_signal: None,
         }
+    }
+
+    /// Install an external RAII lease acquired once around each published
+    /// mutation batch, including the inline after-change callback.
+    pub fn with_mutation_lease_factory(mut self, factory: WatchMutationLeaseFactory) -> Self {
+        self.mutation_lease_factory = Some(factory);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
+        self.debounce = Duration::from_millis(debounce_ms);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
+        self.ready_signal = Some(ready);
+        self
+    }
+
+    fn acquire_mutation_lease(
+        &self,
+        label: &'static str,
+    ) -> Result<Option<Box<dyn WatchMutationLease>>, anyhow::Error> {
+        self.mutation_lease_factory
+            .as_ref()
+            .map(|factory| factory(label))
+            .transpose()
     }
 
     /// Returns a handle that can request graceful shutdown from another
@@ -136,18 +175,25 @@ impl CodeWatcher {
         // Register before inspecting or cold-indexing the tree. Events that
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
-        let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
-        let mut debouncer = new_debouncer(
-            Duration::from_secs(2),
-            move |res: Result<Vec<DebouncedEvent>, notify::Error>| {
-                let _ = tx.send(res);
-            },
-        )
-        .context("init code debouncer")?;
-        debouncer
-            .watcher()
+        let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
+        let mut watcher =
+            notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+                Ok(event) if event_kind_can_mutate(&event.kind) => {
+                    let _ = tx.send(Ok(event.paths));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
+            })
+            .context("init code filesystem watcher")?;
+        watcher
             .watch(&self.repo_root, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", self.repo_root.display()))?;
+        #[cfg(test)]
+        if let Some(ready) = &self.ready_signal {
+            let _ = ready.send(());
+        }
 
         // Identity decision (see `resolve_watch_identity`): adopt an existing
         // `file://` graph rather than re-identifying+pruning, so a watch-first
@@ -170,6 +216,21 @@ impl CodeWatcher {
                     .filter(|path| !path_in_skip_dir(path))
                     .filter(|path| !is_minified_or_bundled(path))
                     .collect();
+                let _mutation_lease = match self.acquire_mutation_lease("watch_code_initial") {
+                    Ok(lease) => lease,
+                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                        tracing::info!("CodeWatcher startup refused during shutdown; exiting");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(error.context("acquire code watcher startup lease"));
+                    }
+                };
+                // Another admitted writer may have completed the authoritative
+                // snapshot while this watcher waited for the gate.
+                if store.lookup_repo(&r_uid)?.is_some() {
+                    break;
+                }
                 match self.process_batch_and_notify(
                     &store,
                     &r_uid,
@@ -224,9 +285,9 @@ impl CodeWatcher {
             let batch = if !replay_batch.is_empty() {
                 std::mem::take(&mut replay_batch)
             } else {
-                match rx.recv_timeout(Duration::from_millis(250)) {
-                    Ok(Ok(events)) => events,
-                    Ok(Err(err)) => {
+                match receive_debounced_paths(&rx, self.debounce, &self.stop_flag) {
+                    WatchReceive::Batch(paths) => paths,
+                    WatchReceive::NotifyError(err) => {
                         if !self.repo_root.exists() {
                             tracing::error!(
                                 repo = %self.repo_root.display(),
@@ -240,7 +301,7 @@ impl CodeWatcher {
                         tracing::warn!("notify error: {err}");
                         continue;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    WatchReceive::Timeout => {
                         if !self.repo_root.exists() {
                             tracing::error!(
                                 repo = %self.repo_root.display(),
@@ -253,8 +314,12 @@ impl CodeWatcher {
                         }
                         continue;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    WatchReceive::Disconnected => {
                         tracing::warn!("code debouncer disconnected; exiting");
+                        return Ok(());
+                    }
+                    WatchReceive::Stop => {
+                        tracing::info!("CodeWatcher stop requested; exiting");
                         return Ok(());
                     }
                 }
@@ -263,8 +328,8 @@ impl CodeWatcher {
             // Deduplicate paths within the batch — the debouncer may
             // fire multiple events for the same file.
             let mut unique_paths: HashSet<PathBuf> = HashSet::new();
-            for event in &batch {
-                unique_paths.insert(event.path.clone());
+            for path in batch {
+                unique_paths.insert(path);
             }
 
             // Contract specs are first-class watcher inputs even though they
@@ -282,6 +347,14 @@ impl CodeWatcher {
                 continue;
             }
 
+            let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
+                Ok(lease) => lease,
+                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                    tracing::info!("CodeWatcher batch refused during shutdown; exiting");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.context("acquire code watcher batch lease")),
+            };
             let start = Instant::now();
             let outcome = self.process_batch_and_notify(
                 &store,
@@ -568,10 +641,7 @@ impl CodeWatcher {
     }
 }
 
-/// The debouncer callback type.
-type DebounceResult = Result<Vec<DebouncedEvent>, notify::Error>;
-
-fn drain_queued_events(rx: &std::sync::mpsc::Receiver<DebounceResult>) -> Vec<DebouncedEvent> {
+fn drain_queued_events(rx: &std::sync::mpsc::Receiver<RawWatchResult>) -> Vec<PathBuf> {
     let mut events = Vec::new();
     loop {
         match rx.try_recv() {
@@ -938,20 +1008,13 @@ mod tests {
     #[test]
     fn startup_event_drain_replays_every_queued_batch() {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(vec![DebouncedEvent::new(
-            PathBuf::from("openapi.yaml"),
-            notify_debouncer_mini::DebouncedEventKind::Any,
-        )]))
-        .unwrap();
-        tx.send(Ok(vec![DebouncedEvent::new(
-            PathBuf::from("ItemsController.java"),
-            notify_debouncer_mini::DebouncedEventKind::Any,
-        )]))
-        .unwrap();
+        tx.send(Ok(vec![PathBuf::from("openapi.yaml")])).unwrap();
+        tx.send(Ok(vec![PathBuf::from("ItemsController.java")]))
+            .unwrap();
         let replay = drain_queued_events(&rx);
         assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].path, PathBuf::from("openapi.yaml"));
-        assert_eq!(replay[1].path, PathBuf::from("ItemsController.java"));
+        assert_eq!(replay[0], PathBuf::from("openapi.yaml"));
+        assert_eq!(replay[1], PathBuf::from("ItemsController.java"));
     }
 
     /// Index a small JS fixture repo (a.js ← b.js ← c.js) into an in-memory
@@ -1569,6 +1632,63 @@ mod tests {
         assert!(is_minified_or_bundled(Path::new("main.chunk.js")));
         assert!(!is_minified_or_bundled(Path::new("app.js")));
         assert!(!is_minified_or_bundled(Path::new("src/main.rs")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_code_edit_settles_after_one_hot_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let source_path = repo_root.join("service.js");
+        std::fs::write(&source_path, "export function alpha() { return 1; }\n").unwrap();
+        let root = std::fs::canonicalize(repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let db_path = dir.path().join("watch.lbug");
+        crate::index::index_directory(&root, &db_path, "test", &repo_url, "sha-1").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let callback_count = notifications.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(&db_path, &root, "test")
+            .with_debounce_ms(100)
+            .with_ready_signal(ready_tx);
+        let stop = watcher.shutdown_handle();
+        let handle = thread::spawn(move || {
+            watcher.run_with_store(
+                store,
+                Some(Box::new(move || {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("code watcher should start");
+        thread::sleep(Duration::from_millis(100));
+
+        std::fs::write(&source_path, "export function alpha() { return 2; }\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while notifications.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            1,
+            "the real edit must publish one code batch"
+        );
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            1,
+            "parser reads must not feed another code watcher batch"
+        );
+
+        stop.stop();
+        handle.join().unwrap().unwrap();
     }
 
     /// Regression (data loss on watch-first over a legacy DB): a repo whose

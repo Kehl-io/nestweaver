@@ -64,6 +64,18 @@ pub fn materialize_projects(
     instance_id: &str,
     db_path: &Path,
 ) -> Result<ProjectMaterializationResult, anyhow::Error> {
+    materialize_projects_with_lease(store, config, instance_id, db_path, None)
+}
+
+/// Materialize configured projects, acquiring an optional external writer
+/// lease only after remote wiki sources have been fetched and validated.
+pub fn materialize_projects_with_lease(
+    store: &GraphStore,
+    config: &InstanceConfig,
+    instance_id: &str,
+    db_path: &Path,
+    mutation_lease_factory: Option<crate::watcher::WatchMutationLeaseFactory>,
+) -> Result<ProjectMaterializationResult, anyhow::Error> {
     let mut ext_store = load_extensions(db_path);
 
     // Reject duplicate project names up front: two entries with the same name
@@ -79,119 +91,229 @@ pub fn materialize_projects(
         }
     }
 
-    // Clean existing project edges before re-materializing (idempotent).
-    for project_config in &config.projects {
-        let uid = project_uid(instance_id, &project_config.name);
-        store.delete_project_edges(&uid)?;
+    // Remote MCP calls are planning, not graph mutation. Fetch every source
+    // before acquiring the daemon's sole-writer lease so a slow or wedged wiki
+    // server cannot block unrelated writes.
+    let mut prepared_wiki_results = HashMap::new();
+    let mut mcp_clients: HashMap<String, Option<McpClient>> = HashMap::new();
+    let mut total_wiki_fetch_errors = 0usize;
+    for project_cfg in &config.projects {
+        for ws in &project_cfg.wiki_sources {
+            let Some(server_config) = config
+                .mcp_servers
+                .iter()
+                .find(|server| server.name == ws.mcp_server)
+            else {
+                tracing::warn!(
+                    project = project_cfg.name,
+                    mcp_server = ws.mcp_server,
+                    "MCP server not found in config, skipping wiki source"
+                );
+                continue;
+            };
+            let timeout = std::time::Duration::from_secs(server_config.timeout_secs.unwrap_or(30));
+            let client_slot = mcp_clients.entry(ws.mcp_server.clone()).or_insert_with(|| {
+                match McpClient::spawn_with_timeout(
+                    &server_config.command,
+                    &server_config.args,
+                    &server_config.env,
+                    timeout,
+                ) {
+                    Ok(client) => Some(client),
+                    Err(error) => {
+                        tracing::warn!(
+                            mcp_server = ws.mcp_server,
+                            error = %error,
+                            "failed to spawn MCP server, skipping wiki sources for this server"
+                        );
+                        None
+                    }
+                }
+            });
+            let Some(client) = client_slot.as_mut() else {
+                continue;
+            };
+            if client.is_poisoned() {
+                tracing::debug!(label = ws.label, "skipping — MCP client is poisoned");
+                total_wiki_fetch_errors += 1;
+                continue;
+            }
+            match client.call_tool(&ws.tool, serde_json::json!(ws.args)) {
+                Ok(result) => {
+                    prepared_wiki_results.insert(
+                        (
+                            project_cfg.name.clone(),
+                            ws.mcp_server.clone(),
+                            ws.tool.clone(),
+                            ws.label.clone(),
+                        ),
+                        result,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        label = ws.label,
+                        tool = ws.tool,
+                        error = %error,
+                        "MCP tool call failed, skipping wiki source"
+                    );
+                    total_wiki_fetch_errors += 1;
+                }
+            }
+        }
+    }
+    drop(mcp_clients);
+
+    let mut prepared_wiki_contents = HashMap::new();
+    for (key, result) in prepared_wiki_results {
+        let content = result.content;
+        if content.is_empty() {
+            tracing::warn!(label = key.3, "MCP tool returned empty content");
+            total_wiki_fetch_errors += 1;
+            continue;
+        }
+        if result.is_error || looks_like_fetch_error(&content) {
+            let preview: String = content.chars().take(120).collect();
+            tracing::warn!(label = key.3, "wiki fetch failed: {preview}");
+            total_wiki_fetch_errors += 1;
+            continue;
+        }
+        prepared_wiki_contents.insert(key, maybe_convert_html_to_markdown(&content));
     }
 
-    let mut projects_created = 0usize;
-    let mut total_note_edges = 0usize;
-    let mut total_symbol_edges = 0usize;
-    let mut total_component_edges = 0usize;
-    let mut total_wiki_notes_ingested = 0usize;
-    let mut total_wiki_fetch_errors = 0usize;
+    let _mutation_lease = mutation_lease_factory
+        .as_ref()
+        .map(|factory| factory("materialize_projects"))
+        .transpose()?;
+
+    // Plan every local graph relationship before deleting anything. Repository
+    // and note inventories are stable for this materialization pass and are
+    // intentionally loaded once rather than once per project/repo.
+    let all_notes = store.list_notes(None)?;
+    let all_repos = store.list_repos(None)?;
+    let mut symbols_by_repo: HashMap<String, Vec<String>> = HashMap::new();
+    let mut projects = Vec::with_capacity(config.projects.len());
+    let mut note_edges: Vec<(String, String)> = Vec::new();
+    let mut symbol_edges: Vec<(String, String)> = Vec::new();
+    let mut component_edges: Vec<(String, String)> = Vec::new();
+    let mut parent_edges: Vec<(String, String)> = Vec::new();
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
-
-        // 1. Create the Project node.
-        let project = Project {
+        projects.push(Project {
             uid: uid.clone(),
             name: project_cfg.name.clone(),
             summary: project_cfg.description.clone(),
             instance_id: instance_id.to_string(),
-        };
-        store.upsert_project(&project)?;
-        projects_created += 1;
+        });
 
-        // 2. Vault-folder → note edges.
         if let Some(folder) = &project_cfg.vault_folder {
-            let all_notes = store.list_notes(None)?;
             let prefix = if folder.ends_with('/') {
                 folder.clone()
             } else {
                 format!("{folder}/")
             };
-            let edges: Vec<(&str, &str)> = all_notes
-                .iter()
-                .filter(|n| n.file_path.starts_with(&prefix) || n.file_path == *folder)
-                .map(|n| (uid.as_str(), n.uid.as_str()))
-                .collect();
-            let count = edges.len();
-            if !edges.is_empty() {
-                store.batch_insert_project_note_edges(&edges)?;
-            }
-            total_note_edges += count;
+            note_edges.extend(
+                all_notes
+                    .iter()
+                    .filter(|note| note.file_path.starts_with(&prefix) || note.file_path == *folder)
+                    .map(|note| (uid.clone(), note.uid.clone())),
+            );
         }
 
-        // 3. Repo names → symbol edges.
-        if !project_cfg.repos.is_empty() {
-            let all_repos = store.list_repos(None)?;
-            let mut symbol_uids: Vec<String> = Vec::new();
-
-            for repo_name in &project_cfg.repos {
-                // Resolve the project's declared repo name to one or more DB
-                // repos. Match order:
-                //   a) DB Repo.name override matches (e.g. `--name redrock`),
-                //   b) URL-derived display name matches,
-                //   c) an `[[repos]]` config entry whose `name = repo_name`
-                //      points at a URL that an indexed repo carries — covers
-                //      the case where the repo was indexed under its URL
-                //      basename but the config aliases it to a friendlier
-                //      name (e.g. redrock ↔ web-application),
-                //   d) URL substring match (legacy fallback).
-                let cfg_url_for_name: Option<&str> = config
-                    .repos
-                    .iter()
-                    .find(|rc| rc.name.as_deref() == Some(repo_name.as_str()))
-                    .map(|rc| rc.url.as_str());
-
-                let matched: Vec<_> = all_repos
-                    .iter()
-                    .filter(|r| {
-                        repo_display_name(r) == *repo_name
-                            || cfg_url_for_name.is_some_and(|u| {
-                                r.url.trim_end_matches('/') == u.trim_end_matches('/')
-                            })
-                            || r.url.contains(repo_name.as_str())
-                    })
-                    .collect();
-
-                for repo in matched {
-                    let syms = store.symbol_lite_by_repo(&repo.uid)?;
-                    symbol_uids.extend(syms.into_iter().map(|(sym_uid, _, _)| sym_uid));
+        // A transient wiki fetch failure must not erase the last successfully
+        // materialized membership. Successful sources are re-linked after
+        // their Note replacement below; failed sources preserve an existing
+        // Note edge if that Note is still present.
+        for ws in &project_cfg.wiki_sources {
+            let key = (
+                project_cfg.name.clone(),
+                ws.mcp_server.clone(),
+                ws.tool.clone(),
+                ws.label.clone(),
+            );
+            if !prepared_wiki_contents.contains_key(&key) {
+                let wiki_note_uid = note_uid(
+                    &format!("wiki:{}", ws.mcp_server),
+                    &format!("{}/{}", ws.tool, ws.label),
+                );
+                if all_notes.iter().any(|note| note.uid == wiki_note_uid) {
+                    note_edges.push((uid.clone(), wiki_note_uid));
                 }
             }
-
-            // Deduplicate — a project may declare two aliases that resolve to
-            // the same DB repo, and (s)-[:PROJECT_INCLUDES_SYMBOL]->(p)
-            // tolerates only one edge per pair.
-            symbol_uids.sort();
-            symbol_uids.dedup();
-
-            let count = symbol_uids.len();
-            if !symbol_uids.is_empty() {
-                store.batch_insert_project_symbol_edges(&uid, &symbol_uids, 1.0)?;
-            }
-            total_symbol_edges += count;
         }
 
-        // 4. Component edges (parent → child + child → parent).
+        let mut project_symbol_uids = Vec::new();
+        for repo_name in &project_cfg.repos {
+            let cfg_url_for_name = config
+                .repos
+                .iter()
+                .find(|repo| repo.name.as_deref() == Some(repo_name.as_str()))
+                .map(|repo| repo.url.as_str());
+            for repo in all_repos.iter().filter(|repo| {
+                repo_display_name(repo) == *repo_name
+                    || cfg_url_for_name.is_some_and(|url| {
+                        repo.url.trim_end_matches('/') == url.trim_end_matches('/')
+                    })
+                    || repo.url.contains(repo_name.as_str())
+            }) {
+                let repo_symbols = match symbols_by_repo.get(&repo.uid) {
+                    Some(symbols) => symbols,
+                    None => {
+                        let symbols = store
+                            .symbol_lite_by_repo(&repo.uid)?
+                            .into_iter()
+                            .map(|(symbol_uid, _, _)| symbol_uid)
+                            .collect();
+                        symbols_by_repo.insert(repo.uid.clone(), symbols);
+                        symbols_by_repo
+                            .get(&repo.uid)
+                            .expect("just inserted repository symbol inventory")
+                    }
+                };
+                project_symbol_uids.extend(repo_symbols.iter().cloned());
+            }
+        }
+        project_symbol_uids.sort();
+        project_symbol_uids.dedup();
+        symbol_edges.extend(
+            project_symbol_uids
+                .into_iter()
+                .map(|symbol_uid| (uid.clone(), symbol_uid)),
+        );
+
         for component_name in &project_cfg.components {
             let child_uid = project_uid(instance_id, component_name);
-            store.insert_project_component_edge(&uid, &child_uid, 1.0)?;
-            store.insert_project_parent_edge(&child_uid, &uid, 1.0)?;
-            total_component_edges += 1;
+            component_edges.push((uid.clone(), child_uid.clone()));
+            parent_edges.push((child_uid, uid.clone()));
         }
-
-        // 4b. Parent declaration (symmetric with components, declared from child side).
         if let Some(parent_name) = &project_cfg.parent {
             let parent_uid = project_uid(instance_id, parent_name);
-            store.insert_project_component_edge(&parent_uid, &uid, 1.0)?;
-            store.insert_project_parent_edge(&uid, &parent_uid, 1.0)?;
-            total_component_edges += 1;
+            component_edges.push((parent_uid.clone(), uid.clone()));
+            parent_edges.push((uid.clone(), parent_uid));
         }
+    }
+
+    // One transaction replaces the complete configured Project subgraph.
+    // Relationship COPY turns the 139k-edge hot path from one execute per edge
+    // into four bounded bulk loads, and rollback preserves the old graph if
+    // any replacement step fails.
+    store.replace_materialized_projects(
+        &projects,
+        &note_edges,
+        &symbol_edges,
+        &component_edges,
+        &parent_edges,
+    )?;
+
+    let projects_created = projects.len();
+    let total_note_edges = note_edges.len();
+    let total_symbol_edges = symbol_edges.len();
+    let total_component_edges = component_edges.len();
+    let mut total_wiki_notes_ingested = 0usize;
+
+    for project_cfg in &config.projects {
+        let uid = project_uid(instance_id, &project_cfg.name);
 
         // 5. Store external_refs in the extension sidecar.
         if !project_cfg.external_refs.is_empty() {
@@ -233,227 +355,151 @@ pub fn materialize_projects(
             );
         }
 
-        // 7. Process wiki sources via MCP client calls.
-        //    Reuse clients across sources from the same MCP server to avoid
-        //    spawning/killing the server process for every wiki page.
-        let mut mcp_clients: HashMap<String, Option<McpClient>> = HashMap::new();
-
+        // 7. Apply the wiki content fetched before the mutation lease.
         for ws in &project_cfg.wiki_sources {
-            let server_config = config.mcp_servers.iter().find(|s| s.name == ws.mcp_server);
-
-            let Some(server_config) = server_config else {
-                tracing::warn!(
-                    project = project_cfg.name,
-                    mcp_server = ws.mcp_server,
-                    "MCP server not found in config, skipping wiki source"
-                );
+            let key = (
+                project_cfg.name.clone(),
+                ws.mcp_server.clone(),
+                ws.tool.clone(),
+                ws.label.clone(),
+            );
+            let Some(content) = prepared_wiki_contents.remove(&key) else {
                 continue;
             };
-
-            // Get or spawn client for this MCP server.
-            let timeout = std::time::Duration::from_secs(server_config.timeout_secs.unwrap_or(30));
-            let client_slot = mcp_clients.entry(ws.mcp_server.clone()).or_insert_with(|| {
-                match McpClient::spawn_with_timeout(
-                    &server_config.command,
-                    &server_config.args,
-                    &server_config.env,
-                    timeout,
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!(
-                            mcp_server = ws.mcp_server,
-                            error = %e,
-                            "failed to spawn MCP server, skipping wiki sources for this server"
-                        );
-                        None
-                    }
-                }
-            });
-
-            let Some(client) = client_slot.as_mut() else {
-                continue; // Server failed to spawn — skip all sources for it
-            };
-
-            if client.is_poisoned() {
-                tracing::debug!(label = ws.label, "skipping — MCP client is poisoned");
-                total_wiki_fetch_errors += 1;
-                continue;
-            }
-
             {
-                match client.call_tool(&ws.tool, serde_json::json!(ws.args)) {
-                    Ok(tool_result) => {
-                        let content = tool_result.content;
+                // Create a Note from the wiki content.
+                let wiki_note_uid = note_uid(
+                    &format!("wiki:{}", ws.mcp_server),
+                    &format!("{}/{}", ws.tool, ws.label),
+                );
 
-                        if content.is_empty() {
-                            tracing::warn!(label = ws.label, "MCP tool returned empty content");
-                            continue;
-                        }
+                let note = Note {
+                    uid: wiki_note_uid.clone(),
+                    vault_uid: format!("wiki:{}", ws.mcp_server),
+                    file_path: format!("{}/{}", ws.tool, ws.label),
+                    title: ws.label.clone(),
+                    note_kind: NoteKind::General,
+                    word_count: content.split_whitespace().count() as u32,
+                    content_hash: truncated_hash(&content),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                };
 
-                        // Detect error responses: either the MCP server
-                        // flagged `isError: true`, or the content looks like
-                        // an error message (e.g. TLS/certificate failures).
-                        if tool_result.is_error || looks_like_fetch_error(&content) {
-                            let preview: String = content.chars().take(120).collect();
-                            tracing::warn!(label = ws.label, "wiki fetch failed: {preview}");
-                            total_wiki_fetch_errors += 1;
-                            continue;
-                        }
+                if let Err(e) = store.upsert_note(&note) {
+                    tracing::warn!(
+                        label = ws.label,
+                        error = %e,
+                        "failed to upsert wiki note"
+                    );
+                    continue;
+                }
 
-                        // Wiki PRDs from Confluence arrive as HTML storage
-                        // format. Convert to markdown so comrak produces
-                        // proper Heading / Section nodes instead of a single
-                        // plaintext blob.
-                        let content = maybe_convert_html_to_markdown(&content);
+                // Decompose the wiki note into headings and sections.
+                if let Ok(parsed) = nestweaver_parser::parse_markdown(
+                    &format!("{}/{}", ws.tool, ws.label),
+                    &content,
+                ) {
+                    // Build heading UIDs so sections can reference them.
+                    let heading_uids: Vec<String> = parsed
+                        .headings
+                        .iter()
+                        .map(|h| heading_uid(&wiki_note_uid, &h.slug, h.start_line))
+                        .collect();
 
-                        // Create a Note from the wiki content.
-                        let wiki_note_uid = note_uid(
-                            &format!("wiki:{}", ws.mcp_server),
-                            &format!("{}/{}", ws.tool, ws.label),
-                        );
-
-                        let note = Note {
-                            uid: wiki_note_uid.clone(),
-                            vault_uid: format!("wiki:{}", ws.mcp_server),
-                            file_path: format!("{}/{}", ws.tool, ws.label),
-                            title: ws.label.clone(),
-                            note_kind: NoteKind::General,
-                            word_count: content.split_whitespace().count() as u32,
-                            content_hash: truncated_hash(&content),
-                            frontmatter: None,
-                            created_at: None,
-                            modified_at: None,
-                            pagerank_score: None,
+                    let headings: Vec<Heading> = parsed
+                        .headings
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, h)| Heading {
+                            uid: heading_uids[idx].clone(),
+                            note_uid: wiki_note_uid.clone(),
+                            level: h.level,
+                            text: h.text.clone(),
+                            slug: h.slug.clone(),
+                            start_line: h.start_line,
+                            end_line: h.end_line,
+                            content_hash: truncated_hash(&h.text),
                             embedding: None,
-                        };
+                        })
+                        .collect();
 
-                        if let Err(e) = store.upsert_note(&note) {
+                    if !headings.is_empty() {
+                        if let Err(e) = store.batch_insert_headings(&headings) {
                             tracing::warn!(
                                 label = ws.label,
                                 error = %e,
-                                "failed to upsert wiki note"
+                                "failed to insert wiki note headings"
                             );
-                            continue;
-                        }
-
-                        // Decompose the wiki note into headings and sections.
-                        if let Ok(parsed) = nestweaver_parser::parse_markdown(
-                            &format!("{}/{}", ws.tool, ws.label),
-                            &content,
-                        ) {
-                            // Build heading UIDs so sections can reference them.
-                            let heading_uids: Vec<String> = parsed
-                                .headings
+                        } else {
+                            let nh_edges: Vec<(&str, &str)> = heading_uids
                                 .iter()
-                                .map(|h| heading_uid(&wiki_note_uid, &h.slug, h.start_line))
+                                .map(|h| (wiki_note_uid.as_str(), h.as_str()))
                                 .collect();
-
-                            let headings: Vec<Heading> = parsed
-                                .headings
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, h)| Heading {
-                                    uid: heading_uids[idx].clone(),
-                                    note_uid: wiki_note_uid.clone(),
-                                    level: h.level,
-                                    text: h.text.clone(),
-                                    slug: h.slug.clone(),
-                                    start_line: h.start_line,
-                                    end_line: h.end_line,
-                                    content_hash: truncated_hash(&h.text),
-                                    embedding: None,
-                                })
-                                .collect();
-
-                            if !headings.is_empty() {
-                                if let Err(e) = store.batch_insert_headings(&headings) {
-                                    tracing::warn!(
-                                        label = ws.label,
-                                        error = %e,
-                                        "failed to insert wiki note headings"
-                                    );
-                                } else {
-                                    let nh_edges: Vec<(&str, &str)> = heading_uids
-                                        .iter()
-                                        .map(|h| (wiki_note_uid.as_str(), h.as_str()))
-                                        .collect();
-                                    let _ = store.batch_insert_note_heading_edges(&nh_edges);
-                                }
-                            }
-
-                            let sections: Vec<Section> = parsed
-                                .sections
-                                .iter()
-                                .map(|sec| {
-                                    let text_hash = truncated_hash(&sec.text);
-                                    let s_uid =
-                                        section_uid(&wiki_note_uid, sec.start_line, &text_hash);
-                                    let heading_link =
-                                        sec.heading_idx.and_then(|i| heading_uids.get(i)).cloned();
-                                    let word_count =
-                                        u32::try_from(sec.text.split_whitespace().count())
-                                            .unwrap_or(u32::MAX);
-                                    Section {
-                                        uid: s_uid,
-                                        note_uid: wiki_note_uid.clone(),
-                                        heading_uid: heading_link,
-                                        start_line: sec.start_line,
-                                        end_line: sec.end_line,
-                                        text_hash,
-                                        text_content: sec.text.clone(),
-                                        word_count,
-                                        pagerank_score: None,
-                                    }
-                                })
-                                .collect();
-
-                            if !sections.is_empty() {
-                                if let Err(e) = store.batch_upsert_sections(&sections) {
-                                    tracing::warn!(
-                                        label = ws.label,
-                                        error = %e,
-                                        "failed to upsert wiki note sections"
-                                    );
-                                } else {
-                                    let ns_edges: Vec<(&str, &str)> = sections
-                                        .iter()
-                                        .map(|s| (wiki_note_uid.as_str(), s.uid.as_str()))
-                                        .collect();
-                                    let _ = store.batch_insert_note_section_edges(&ns_edges);
-                                }
-                            }
+                            let _ = store.batch_insert_note_heading_edges(&nh_edges);
                         }
-
-                        let edge = (uid.as_str(), wiki_note_uid.as_str());
-                        if let Err(e) = store.batch_insert_project_note_edges(&[edge]) {
-                            tracing::warn!(
-                                label = ws.label,
-                                error = %e,
-                                "failed to link wiki note to project"
-                            );
-                        }
-
-                        total_wiki_notes_ingested += 1;
-                        tracing::info!(
-                            label = ws.label,
-                            project = project_cfg.name,
-                            "ingested wiki source"
-                        );
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            label = ws.label,
-                            tool = ws.tool,
-                            error = %e,
-                            "MCP tool call failed, skipping wiki source"
-                        );
-                        total_wiki_fetch_errors += 1;
+
+                    let sections: Vec<Section> = parsed
+                        .sections
+                        .iter()
+                        .map(|sec| {
+                            let text_hash = truncated_hash(&sec.text);
+                            let s_uid = section_uid(&wiki_note_uid, sec.start_line, &text_hash);
+                            let heading_link =
+                                sec.heading_idx.and_then(|i| heading_uids.get(i)).cloned();
+                            let word_count = u32::try_from(sec.text.split_whitespace().count())
+                                .unwrap_or(u32::MAX);
+                            Section {
+                                uid: s_uid,
+                                note_uid: wiki_note_uid.clone(),
+                                heading_uid: heading_link,
+                                start_line: sec.start_line,
+                                end_line: sec.end_line,
+                                text_hash,
+                                text_content: sec.text.clone(),
+                                word_count,
+                                pagerank_score: None,
+                            }
+                        })
+                        .collect();
+
+                    if !sections.is_empty() {
+                        if let Err(e) = store.batch_upsert_sections(&sections) {
+                            tracing::warn!(
+                                label = ws.label,
+                                error = %e,
+                                "failed to upsert wiki note sections"
+                            );
+                        } else {
+                            let ns_edges: Vec<(&str, &str)> = sections
+                                .iter()
+                                .map(|s| (wiki_note_uid.as_str(), s.uid.as_str()))
+                                .collect();
+                            let _ = store.batch_insert_note_section_edges(&ns_edges);
+                        }
                     }
                 }
+
+                let edge = (uid.as_str(), wiki_note_uid.as_str());
+                if let Err(e) = store.batch_insert_project_note_edges(&[edge]) {
+                    tracing::warn!(
+                        label = ws.label,
+                        error = %e,
+                        "failed to link wiki note to project"
+                    );
+                }
+
+                total_wiki_notes_ingested += 1;
+                tracing::info!(
+                    label = ws.label,
+                    project = project_cfg.name,
+                    "ingested wiki source"
+                );
             }
         }
-        // MCP clients are dropped here when mcp_clients goes out of scope.
     }
 
     // Persist the extension sidecar once after all projects are processed.
@@ -593,6 +639,86 @@ components = ["child-b"]
         assert!(
             err.to_string().contains("\"dup\""),
             "error must name the duplicate project, got: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_wiki_fetch_preserves_the_last_materialized_membership() {
+        use nestweaver_schema::{Note, NoteKind, Project, note_uid, project_uid};
+
+        let toml = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "stable"
+
+[[projects.wiki_sources]]
+label = "Architecture"
+mcp_server = "missing-server"
+tool = "get_page"
+args = { page = "123" }
+"#;
+        let config = crate::config::InstanceConfig::from_toml_str(toml).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let project_uid = project_uid("test-instance", "stable");
+        let wiki_note_uid = note_uid("wiki:missing-server", "get_page/Architecture");
+        store
+            .insert_project(&Project {
+                uid: project_uid.clone(),
+                name: "stable".to_string(),
+                summary: None,
+                instance_id: "test-instance".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: wiki_note_uid.clone(),
+                vault_uid: "wiki:missing-server".to_string(),
+                file_path: "get_page/Architecture".to_string(),
+                title: "Architecture".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "last-good".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[(&project_uid, &wiki_note_uid)])
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        super::materialize_projects(
+            &store,
+            &config,
+            "test-instance",
+            &dir.path().join("brain.lbug"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.list_project_note_uids(&project_uid).unwrap(),
+            vec![wiki_note_uid],
+            "a transient remote failure must preserve the last good wiki membership"
         );
     }
 
