@@ -43,6 +43,17 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [6.1.1](https://github.com/Kehl-io/nestweaver/compare/v6.1.0...v6.1.1) (2026-08-17)
+
+
+### Bug Fixes
+
+* **cli:** honor configured database across commands ([ad0619f](https://github.com/Kehl-io/nestweaver/commit/ad0619fb0e50e65253b52ea74d99f2969f65fbf2))
+* **daemon:** scope writer leases to mutation batches ([dcef9a7](https://github.com/Kehl-io/nestweaver/commit/dcef9a770189c228bc297932bc76fcad5e9eb9bf))
+* **engine:** settle watchers and preserve project state ([6066b75](https://github.com/Kehl-io/nestweaver/commit/6066b7586b13fe29a779a4c696033c006b4195ea))
+* harden database routing, watchers, and graph replacement ([9bf9ba8](https://github.com/Kehl-io/nestweaver/commit/9bf9ba88128bc999994ecd4bec623423668f788c))
+* **store:** make bulk graph replacement failure-safe ([598d0c1](https://github.com/Kehl-io/nestweaver/commit/598d0c1787fdcbfff1738ff72f1357926fcd2f23))
+
 ## [6.1.0](https://github.com/Kehl-io/nestweaver/compare/v6.0.0...v6.1.0) (2026-08-16)
 
 
