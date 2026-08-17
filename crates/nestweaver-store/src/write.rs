@@ -32,6 +32,37 @@ use crate::error::StoreError;
 /// this module must use it.
 const COPY_CSV_OPTS: &str = "(PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"', HEADER=false)";
 
+fn unique_uid_set<'a>(
+    entity: &str,
+    uids: impl IntoIterator<Item = &'a str>,
+) -> Result<std::collections::HashSet<&'a str>, StoreError> {
+    let mut unique = std::collections::HashSet::new();
+    for uid in uids {
+        if !unique.insert(uid) {
+            return Err(StoreError::Query(format!(
+                "duplicate {entity} uid in replacement input: {uid}"
+            )));
+        }
+    }
+    Ok(unique)
+}
+
+fn validate_edge_pairs(
+    relationship: &str,
+    edges: &[(&str, &str)],
+    valid_sources: &std::collections::HashSet<&str>,
+    valid_targets: &std::collections::HashSet<&str>,
+) -> Result<(), StoreError> {
+    for (source, target) in edges {
+        if !valid_sources.contains(*source) || !valid_targets.contains(*target) {
+            return Err(StoreError::Query(format!(
+                "{relationship} endpoint is outside replacement input: {source} -> {target}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `Meta.key` prefix for the per-repo contract-derivation failure marker.
 ///
 /// The full key is `<prefix><repo_uid>`. Contract derivation is best-effort at
@@ -593,6 +624,25 @@ fn write_edge_pair_csv(edges: &[(&str, &str)], path: &Path) -> Result<(), StoreE
     }
     wtr.flush()
         .map_err(|e| StoreError::Query(format!("flush edge csv: {e}")))?;
+    Ok(())
+}
+
+/// Write relationship rows `(from_pk, to_pk, confidence)` to a CSV file.
+fn write_project_edge_csv(
+    edges: &[(String, String)],
+    confidence: f32,
+    path: &Path,
+) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create project edge csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    let confidence = confidence.to_string();
+    for (from_pk, to_pk) in edges {
+        wtr.write_record([from_pk, to_pk, &confidence])
+            .map_err(|e| StoreError::Query(format!("write project edge row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush project edge csv: {e}")))?;
     Ok(())
 }
 
@@ -1202,6 +1252,15 @@ impl GraphStore {
         services: &[Service],
         service_symbol_edges: &[(&str, &str)],
     ) -> Result<(usize, usize), StoreError> {
+        Self::validate_bulk_reindex_input(
+            repo_uid,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+        )?;
         let conn = self.begin_transaction()?;
 
         // Delete old data within the transaction.
@@ -1221,6 +1280,71 @@ impl GraphStore {
 
         self.commit_transaction(&conn)?;
         Ok(counts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_bulk_reindex_input(
+        repo_uid: &str,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
+        let file_uids = unique_uid_set("File", files.iter().map(|file| file.uid.as_str()))?;
+        let symbol_uids =
+            unique_uid_set("Symbol", symbols.iter().map(|symbol| symbol.uid.as_str()))?;
+        let service_uids = unique_uid_set(
+            "Service",
+            services.iter().map(|service| service.uid.as_str()),
+        )?;
+        for file in files {
+            if file.repo_uid != repo_uid {
+                return Err(StoreError::Query(format!(
+                    "File {} belongs to {}, expected {repo_uid}",
+                    file.uid, file.repo_uid
+                )));
+            }
+        }
+        for symbol in symbols {
+            if symbol.repo_uid != repo_uid {
+                return Err(StoreError::Query(format!(
+                    "Symbol {} belongs to {}, expected {repo_uid}",
+                    symbol.uid, symbol.repo_uid
+                )));
+            }
+        }
+        for service in services {
+            if service.repo_uid != repo_uid {
+                return Err(StoreError::Query(format!(
+                    "Service {} belongs to {}, expected {repo_uid}",
+                    service.uid, service.repo_uid
+                )));
+            }
+        }
+        for (source, target) in repo_file_edges {
+            if *source != repo_uid || !file_uids.contains(*target) {
+                return Err(StoreError::Query(format!(
+                    "REPO_HAS_FILE endpoint is outside replacement input: {source} -> {target}"
+                )));
+            }
+        }
+        for (source, target) in file_symbol_edges {
+            if !file_uids.contains(*source) || !symbol_uids.contains(*target) {
+                return Err(StoreError::Query(format!(
+                    "FILE_HAS_SYMBOL endpoint is outside replacement input: {source} -> {target}"
+                )));
+            }
+        }
+        for (source, target) in service_symbol_edges {
+            if !service_uids.contains(*source) || !symbol_uids.contains(*target) {
+                return Err(StoreError::Query(format!(
+                    "SERVICE_HAS_SYMBOL endpoint is outside replacement input: {source} -> {target}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Wrap all markdown vault inserts in a single transaction.
@@ -1345,6 +1469,22 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
+        Self::validate_bulk_vault_reindex_input(
+            vault,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+        )?;
         // Project membership is derived outside the vault hierarchy, but the
         // authoritative vault replacement DETACH-deletes every old Note.
         // Preserve membership for stable note UIDs that survive the refresh;
@@ -1407,6 +1547,117 @@ impl GraphStore {
 
         self.commit_transaction(&conn)?;
         Ok(deleted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_bulk_vault_reindex_input(
+        vault: &Vault,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
+    ) -> Result<(), StoreError> {
+        let note_uids = unique_uid_set("Note", notes.iter().map(|note| note.uid.as_str()))?;
+        let heading_uids = unique_uid_set(
+            "Heading",
+            headings.iter().map(|heading| heading.uid.as_str()),
+        )?;
+        let section_uids = unique_uid_set(
+            "Section",
+            sections.iter().map(|section| section.uid.as_str()),
+        )?;
+        let tag_uids = unique_uid_set("Tag", tags.iter().map(|tag| tag.uid.as_str()))?;
+        for note in notes {
+            if note.vault_uid != vault.uid {
+                return Err(StoreError::Query(format!(
+                    "Note {} belongs to {}, expected {}",
+                    note.uid, note.vault_uid, vault.uid
+                )));
+            }
+        }
+        for heading in headings {
+            if !note_uids.contains(heading.note_uid.as_str()) {
+                return Err(StoreError::Query(format!(
+                    "Heading {} references Note {} outside replacement input",
+                    heading.uid, heading.note_uid
+                )));
+            }
+        }
+        for section in sections {
+            if !note_uids.contains(section.note_uid.as_str())
+                || section
+                    .heading_uid
+                    .as_deref()
+                    .is_some_and(|uid| !heading_uids.contains(uid))
+            {
+                return Err(StoreError::Query(format!(
+                    "Section {} references an endpoint outside replacement input",
+                    section.uid
+                )));
+            }
+        }
+        for (source, target) in vault_note_edges {
+            if *source != vault.uid || !note_uids.contains(*target) {
+                return Err(StoreError::Query(format!(
+                    "VAULT_HAS_NOTE endpoint is outside replacement input: {source} -> {target}"
+                )));
+            }
+        }
+        validate_edge_pairs(
+            "NOTE_HAS_HEADING",
+            note_heading_edges,
+            &note_uids,
+            &heading_uids,
+        )?;
+        validate_edge_pairs(
+            "NOTE_HAS_SECTION",
+            note_section_edges,
+            &note_uids,
+            &section_uids,
+        )?;
+        validate_edge_pairs(
+            "HEADING_HAS_SECTION",
+            heading_section_edges,
+            &heading_uids,
+            &section_uids,
+        )?;
+        validate_edge_pairs(
+            "HEADING_PARENT",
+            heading_parent_edges,
+            &heading_uids,
+            &heading_uids,
+        )?;
+        validate_edge_pairs("NOTE_TAGGED_WITH", note_tag_edges, &note_uids, &tag_uids)?;
+        validate_edge_pairs(
+            "SECTION_TAGGED_WITH",
+            section_tag_edges,
+            &section_uids,
+            &tag_uids,
+        )?;
+        for (source, _, _, _, _) in wikilink_to_note_edges {
+            if !section_uids.contains(*source) {
+                return Err(StoreError::Query(format!(
+                    "WIKILINK_TO_NOTE source Section is outside replacement input: {source}"
+                )));
+            }
+        }
+        for (source, _, _, _, _) in wikilink_to_heading_edges {
+            if !section_uids.contains(*source) {
+                return Err(StoreError::Query(format!(
+                    "WIKILINK_TO_HEADING source Section is outside replacement input: {source}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
@@ -1986,9 +2237,30 @@ impl GraphStore {
 
     pub fn insert_project(&self, project: &Project) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_project_on(&conn, project)
+    }
+
+    fn insert_project_on(conn: &lbug::Connection<'_>, project: &Project) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "CREATE (:Project {uid: $uid, name: $name, summary: $summary, instance_id: $iid})",
+            vec![
+                ("uid", lbug::Value::String(project.uid.clone())),
+                ("name", lbug::Value::String(project.name.clone())),
+                (
+                    "summary",
+                    lbug::Value::String(project.summary.clone().unwrap_or_default()),
+                ),
+                ("iid", lbug::Value::String(project.instance_id.clone())),
+            ],
+        )
+    }
+
+    fn merge_project_on(conn: &lbug::Connection<'_>, project: &Project) -> Result<(), StoreError> {
+        exec_params(
+            conn,
+            "MERGE (p:Project {uid: $uid}) \
+             SET p.name = $name, p.summary = $summary, p.instance_id = $iid",
             vec![
                 ("uid", lbug::Value::String(project.uid.clone())),
                 ("name", lbug::Value::String(project.name.clone())),
@@ -4654,23 +4926,11 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
-        let mut stmt = conn
-            .prepare(
-                "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
-                 CREATE (p)-[:PROJECT_INCLUDES_NOTE {confidence: 1.0}]->(n)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (project_uid, note_uid) in edges {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("pid", lbug::Value::String(project_uid.to_string())),
-                    ("nid", lbug::Value::String(note_uid.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        }
-        Ok(())
+        let owned = edges
+            .iter()
+            .map(|(from, to)| ((*from).to_string(), (*to).to_string()))
+            .collect::<Vec<_>>();
+        Self::copy_project_edges_on(conn, "PROJECT_INCLUDES_NOTE", &owned, 1.0)
     }
 
     pub fn batch_insert_project_symbol_edges(
@@ -4680,22 +4940,353 @@ impl GraphStore {
         confidence: f32,
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (p:Project {uid: $pid}), (s:Symbol {uid: $sid}) \
-                 CREATE (p)-[:PROJECT_INCLUDES_SYMBOL {confidence: $conf}]->(s)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for sym_uid in symbol_uids {
-            conn.execute(
-                &mut stmt,
+        let edges = symbol_uids
+            .iter()
+            .map(|symbol_uid| (project_uid.to_string(), symbol_uid.clone()))
+            .collect::<Vec<_>>();
+        Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &edges, confidence)
+    }
+
+    fn copy_project_edges_on(
+        conn: &lbug::Connection<'_>,
+        relationship: &'static str,
+        edges: &[(String, String)],
+        confidence: f32,
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join(format!("{relationship}.csv"));
+        write_project_edge_csv(edges, confidence, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        conn.query(&format!(
+            "COPY {relationship} FROM '{csv_str}' {COPY_CSV_OPTS}"
+        ))
+        .map_err(|e| StoreError::Query(format!("COPY {relationship}: {e}")))?;
+        Ok(())
+    }
+
+    /// Atomically replace all explicitly configured Project nodes and their
+    /// membership relationships. Planning is deliberately performed by the
+    /// engine before this call, so a lookup or remote-source failure cannot
+    /// erase the previously published project graph.
+    pub fn replace_materialized_projects(
+        &self,
+        projects: &[Project],
+        note_edges: &[(String, String)],
+        symbol_edges: &[(String, String)],
+        component_edges: &[(String, String)],
+        parent_edges: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        let target_uids = projects
+            .iter()
+            .map(|project| project.uid.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for (relationship, edges) in [
+            ("PROJECT_INCLUDES_NOTE", note_edges),
+            ("PROJECT_INCLUDES_SYMBOL", symbol_edges),
+        ] {
+            if let Some((source, _)) = edges
+                .iter()
+                .find(|(source, _)| !target_uids.contains(source.as_str()))
+            {
+                return Err(StoreError::Query(format!(
+                    "{relationship} source Project {source} is not configured"
+                )));
+            }
+        }
+        for (relationship, edges) in [
+            ("PROJECT_HAS_COMPONENT", component_edges),
+            ("PROJECT_HAS_PARENT", parent_edges),
+        ] {
+            if let Some((source, _)) = edges
+                .iter()
+                .find(|(source, _)| !target_uids.contains(source.as_str()))
+            {
+                return Err(StoreError::Query(format!(
+                    "{relationship} source Project {source} is not configured"
+                )));
+            }
+            if let Some((_, target)) = edges
+                .iter()
+                .find(|(_, target)| !target_uids.contains(target.as_str()))
+            {
+                return Err(StoreError::Query(format!(
+                    "{relationship} target Project {target} is not configured"
+                )));
+            }
+        }
+
+        let existing = self.list_projects()?;
+        let target_names = projects
+            .iter()
+            .map(|project| project.name.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let stale_uids = existing
+            .iter()
+            .filter(|project| {
+                target_names.contains(&project.name.to_lowercase())
+                    && !target_uids.contains(project.uid.as_str())
+            })
+            .map(|project| project.uid.clone())
+            .collect::<Vec<_>>();
+
+        self.replace_materialized_projects_transaction(
+            projects,
+            note_edges,
+            symbol_edges,
+            component_edges,
+            parent_edges,
+            &stale_uids,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_materialized_projects_transaction(
+        &self,
+        projects: &[Project],
+        note_edges: &[(String, String)],
+        symbol_edges: &[(String, String)],
+        component_edges: &[(String, String)],
+        parent_edges: &[(String, String)],
+        stale_uids: &[String],
+        recover_on_failure: bool,
+    ) -> Result<(), StoreError> {
+        let existing_note_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_NOTE")?;
+        let existing_symbol_edges = self.list_project_edge_pairs("PROJECT_INCLUDES_SYMBOL")?;
+        let existing_component_edges = self.list_project_edge_pairs("PROJECT_HAS_COMPONENT")?;
+        let existing_parent_edges = self.list_project_edge_pairs("PROJECT_HAS_PARENT")?;
+        let desired_note_edges = note_edges
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let desired_symbol_edges = symbol_edges
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let desired_component_edges = component_edges
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let desired_parent_edges = parent_edges
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let affected_sources = projects
+            .iter()
+            .map(|project| project.uid.as_str())
+            .chain(stale_uids.iter().map(String::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        let stale_targets = stale_uids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let existing_projects = self.list_projects()?;
+        let existing_project_uids = existing_projects
+            .iter()
+            .map(|project| project.uid.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        let note_additions = desired_note_edges
+            .difference(&existing_note_edges)
+            .cloned()
+            .collect::<Vec<_>>();
+        let symbol_additions = desired_symbol_edges
+            .difference(&existing_symbol_edges)
+            .cloned()
+            .collect::<Vec<_>>();
+        let component_additions = desired_component_edges
+            .difference(&existing_component_edges)
+            .cloned()
+            .collect::<Vec<_>>();
+        let parent_additions = desired_parent_edges
+            .difference(&existing_parent_edges)
+            .cloned()
+            .collect::<Vec<_>>();
+        let obsolete_note_edges = existing_note_edges
+            .iter()
+            .filter(|edge| {
+                affected_sources.contains(edge.0.as_str()) && !desired_note_edges.contains(*edge)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let obsolete_symbol_edges = existing_symbol_edges
+            .iter()
+            .filter(|edge| {
+                affected_sources.contains(edge.0.as_str()) && !desired_symbol_edges.contains(*edge)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let obsolete_component_edges = existing_component_edges
+            .iter()
+            .filter(|edge| {
+                (affected_sources.contains(edge.0.as_str())
+                    || stale_targets.contains(edge.1.as_str()))
+                    && !desired_component_edges.contains(*edge)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let obsolete_parent_edges = existing_parent_edges
+            .iter()
+            .filter(|edge| {
+                (affected_sources.contains(edge.0.as_str())
+                    || stale_targets.contains(edge.1.as_str()))
+                    && !desired_parent_edges.contains(*edge)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let conn = self.begin_transaction()?;
+        let mutation = (|| {
+            for project in projects
+                .iter()
+                .filter(|project| !existing_project_uids.contains(&project.uid))
+            {
+                Self::insert_project_on(&conn, project)?;
+            }
+            // Create every missing edge before deleting any old edge. A COPY
+            // endpoint failure therefore rolls back only additive work; it
+            // never relies on LadybugDB to resurrect detached relationships.
+            Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_NOTE", &note_additions, 1.0)?;
+            Self::copy_project_edges_on(&conn, "PROJECT_INCLUDES_SYMBOL", &symbol_additions, 1.0)?;
+            Self::copy_project_edges_on(&conn, "PROJECT_HAS_COMPONENT", &component_additions, 1.0)?;
+            Self::copy_project_edges_on(&conn, "PROJECT_HAS_PARENT", &parent_additions, 1.0)?;
+            for project in projects
+                .iter()
+                .filter(|project| existing_project_uids.contains(&project.uid))
+            {
+                Self::merge_project_on(&conn, project)?;
+            }
+            Self::delete_project_edge_pairs_on(
+                &conn,
+                "PROJECT_INCLUDES_NOTE",
+                "Note",
+                &obsolete_note_edges,
+            )?;
+            Self::delete_project_edge_pairs_on(
+                &conn,
+                "PROJECT_INCLUDES_SYMBOL",
+                "Symbol",
+                &obsolete_symbol_edges,
+            )?;
+            Self::delete_project_edge_pairs_on(
+                &conn,
+                "PROJECT_HAS_COMPONENT",
+                "Project",
+                &obsolete_component_edges,
+            )?;
+            Self::delete_project_edge_pairs_on(
+                &conn,
+                "PROJECT_HAS_PARENT",
+                "Project",
+                &obsolete_parent_edges,
+            )?;
+            for uid in stale_uids {
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid}) DELETE p",
+                    vec![("uid", lbug::Value::String(uid.clone()))],
+                )?;
+            }
+            Ok(())
+        })();
+        let publication = match mutation {
+            Ok(()) => self.commit_transaction(&conn).map_err(|error| {
+                StoreError::Query(format!("Project materialization commit: {error}"))
+            }),
+            Err(error) => Err(error),
+        };
+        let Err(error) = publication else {
+            return Ok(());
+        };
+        let primary = Self::rollback_project_transaction(&conn, error, "Project materialization");
+        if !recover_on_failure {
+            return Err(primary);
+        }
+
+        let snapshot_note_edges = existing_note_edges.into_iter().collect::<Vec<_>>();
+        let snapshot_symbol_edges = existing_symbol_edges.into_iter().collect::<Vec<_>>();
+        let snapshot_component_edges = existing_component_edges.into_iter().collect::<Vec<_>>();
+        let snapshot_parent_edges = existing_parent_edges.into_iter().collect::<Vec<_>>();
+        let snapshot_uids = existing_projects
+            .iter()
+            .map(|project| project.uid.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let introduced_uids = self
+            .list_projects()?
+            .into_iter()
+            .filter(|project| !snapshot_uids.contains(project.uid.as_str()))
+            .map(|project| project.uid)
+            .collect::<Vec<_>>();
+        match self.replace_materialized_projects_transaction(
+            &existing_projects,
+            &snapshot_note_edges,
+            &snapshot_symbol_edges,
+            &snapshot_component_edges,
+            &snapshot_parent_edges,
+            &introduced_uids,
+            false,
+        ) {
+            Ok(()) => Err(primary),
+            Err(recovery) => Err(StoreError::Query(format!(
+                "{primary}; Project materialization recovery failed: {recovery}"
+            ))),
+        }
+    }
+
+    fn list_project_edge_pairs(
+        &self,
+        relationship: &'static str,
+    ) -> Result<std::collections::HashSet<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query(&format!(
+                "MATCH (p:Project)-[:{relationship}]->(target) RETURN p.uid, target.uid"
+            ))
+            .map_err(|error| StoreError::Query(format!("list {relationship}: {error}")))?;
+        rows.map(|row| {
+            let source = match row.first() {
+                Some(lbug::Value::String(value)) => value.clone(),
+                _ => {
+                    return Err(StoreError::Query(format!(
+                        "list {relationship}: malformed source uid"
+                    )));
+                }
+            };
+            let target = match row.get(1) {
+                Some(lbug::Value::String(value)) => value.clone(),
+                _ => {
+                    return Err(StoreError::Query(format!(
+                        "list {relationship}: malformed target uid"
+                    )));
+                }
+            };
+            Ok((source, target))
+        })
+        .collect()
+    }
+
+    fn delete_project_edge_pairs_on(
+        conn: &lbug::Connection<'_>,
+        relationship: &'static str,
+        target_label: &'static str,
+        edges: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        for (source, target) in edges {
+            exec_params(
+                conn,
+                &format!(
+                    "MATCH (p:Project {{uid: $source}})-[r:{relationship}]->\
+                     (target:{target_label} {{uid: $target}}) DELETE r"
+                ),
                 vec![
-                    ("pid", lbug::Value::String(project_uid.to_string())),
-                    ("sid", lbug::Value::String(sym_uid.clone())),
-                    ("conf", lbug::Value::Double(confidence as f64)),
+                    ("source", lbug::Value::String(source.clone())),
+                    ("target", lbug::Value::String(target.clone())),
                 ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            )?;
         }
         Ok(())
     }
@@ -5211,6 +5802,16 @@ impl GraphStore {
     ) -> StoreError {
         match conn.query("ROLLBACK") {
             Ok(_) => error,
+            Err(rollback_error)
+                if rollback_error
+                    .to_string()
+                    .contains("No active transaction for ROLLBACK") =>
+            {
+                // LadybugDB automatically rolls back and clears a manual
+                // transaction when a statement throws. The explicit rollback
+                // is therefore idempotent from NestWeaver's perspective.
+                error
+            }
             Err(rollback_error) => StoreError::Query(format!(
                 "{error}; {operation} rollback failed: {rollback_error}"
             )),
@@ -8993,5 +9594,462 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn materialized_project_replacement_bulk_loads_every_relationship_kind() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let store = GraphStore::in_memory().unwrap();
+        let projects = vec![
+            Project {
+                uid: "proj:test:parent".to_string(),
+                name: "parent".to_string(),
+                summary: Some("new parent".to_string()),
+                instance_id: "test".to_string(),
+            },
+            Project {
+                uid: "proj:test:child".to_string(),
+                name: "child".to_string(),
+                summary: None,
+                instance_id: "test".to_string(),
+            },
+        ];
+        store
+            .insert_note(&Note {
+                uid: "note:project-bulk".to_string(),
+                vault_uid: "vault:test".to_string(),
+                file_path: "Projects/parent.md".to_string(),
+                title: "Parent".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let symbol_uid = "sym:project-bulk".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid.clone(),
+                name: "project_bulk".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:project-bulk".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn project_bulk()".to_string(),
+                summary: None,
+                content_hash: "symbol-hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        store
+            .replace_materialized_projects(
+                &projects,
+                &[(
+                    "proj:test:parent".to_string(),
+                    "note:project-bulk".to_string(),
+                )],
+                &[("proj:test:parent".to_string(), symbol_uid)],
+                &[(
+                    "proj:test:parent".to_string(),
+                    "proj:test:child".to_string(),
+                )],
+                &[(
+                    "proj:test:child".to_string(),
+                    "proj:test:parent".to_string(),
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.list_project_note_uids("proj:test:parent").unwrap(),
+            vec!["note:project-bulk".to_string()]
+        );
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:test:parent")
+                .unwrap(),
+            vec!["proj:test:child".to_string()]
+        );
+        let conn = store.conn().unwrap();
+        for relationship in ["PROJECT_INCLUDES_SYMBOL", "PROJECT_HAS_PARENT"] {
+            let count = conn
+                .query(&format!("MATCH ()-[r:{relationship}]->() RETURN count(r)"))
+                .unwrap()
+                .filter_map(|row| match row.first() {
+                    Some(lbug::Value::Int64(value)) => Some(*value),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_default();
+            assert_eq!(count, 1, "{relationship} bulk COPY lost an edge");
+        }
+    }
+
+    #[test]
+    fn disk_backed_late_project_copy_failure_restores_previous_graph() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("project-rollback.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let old = Project {
+            uid: "proj:test:stable".to_string(),
+            name: "stable".to_string(),
+            summary: Some("old summary".to_string()),
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&old).unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:stable".to_string(),
+                vault_uid: "vault:test".to_string(),
+                file_path: "stable.md".to_string(),
+                title: "Stable".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "stable".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:new".to_string(),
+                vault_uid: "vault:test".to_string(),
+                file_path: "new.md".to_string(),
+                title: "New".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "new".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let symbol_uid = "sym:project-rollback".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid.clone(),
+                name: "project_rollback".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:project-rollback".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn project_rollback()".to_string(),
+                summary: None,
+                content_hash: "symbol-hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
+            .unwrap();
+
+        let mut replacement = old.clone();
+        replacement.summary = Some("new summary".to_string());
+        let result = store.replace_materialized_projects_transaction(
+            &[replacement],
+            &[("proj:test:stable".to_string(), "note:new".to_string())],
+            &[("proj:test:stable".to_string(), symbol_uid)],
+            &[(
+                "proj:test:stable".to_string(),
+                "proj:test:missing".to_string(),
+            )],
+            &[],
+            &[],
+            true,
+        );
+        let error = result.expect_err("the late component COPY must fail");
+        assert!(error.to_string().contains("PROJECT_HAS_COMPONENT"));
+        assert!(
+            !error.to_string().contains("rollback failed"),
+            "automatic rollback should not be misreported: {error}"
+        );
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let restored = reopened
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.uid == old.uid)
+            .expect("rollback must restore the previous Project node");
+        assert_eq!(restored.summary, old.summary);
+        assert_eq!(
+            reopened.list_project_note_uids(&old.uid).unwrap(),
+            vec!["note:stable".to_string()],
+            "disk-backed rollback must restore previous membership and remove partial replacement"
+        );
+    }
+
+    #[test]
+    fn undeclared_project_endpoint_fails_before_materialization_mutates() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let store = GraphStore::in_memory().unwrap();
+        let project = Project {
+            uid: "proj:test:stable".to_string(),
+            name: "stable".to_string(),
+            summary: Some("old summary".to_string()),
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&project).unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:stable".to_string(),
+                vault_uid: "vault:test".to_string(),
+                file_path: "stable.md".to_string(),
+                title: "Stable".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "stable".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:test:stable", "note:stable")])
+            .unwrap();
+
+        let error = store
+            .replace_materialized_projects(
+                std::slice::from_ref(&project),
+                &[],
+                &[],
+                &[(project.uid.clone(), "proj:test:not-configured".to_string())],
+                &[],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("is not configured"));
+        assert_eq!(
+            store.list_project_note_uids(&project.uid).unwrap(),
+            vec!["note:stable".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_repo_input_fails_before_previous_graph_is_deleted() {
+        use nestweaver_schema::{File, Repo, Service, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repo-rollback.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:rollback";
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: "file:///repo-rollback".to_string(),
+                indexed_sha: "old".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some("rollback".to_string()),
+                root_path: Some("/repo-rollback".to_string()),
+            })
+            .unwrap();
+        let old_file = File {
+            uid: "file:repo-rollback:old".to_string(),
+            path: "src/old.rs".to_string(),
+            repo_uid: repo_uid.to_string(),
+            content_hash: "old-file".to_string(),
+        };
+        let old_symbol = Symbol {
+            uid: "sym:repo-rollback:old".to_string(),
+            name: "old_symbol".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: old_file.path.clone(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn old_symbol()".to_string(),
+            summary: None,
+            content_hash: "old-symbol".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .bulk_index_write(
+                std::slice::from_ref(&old_file),
+                std::slice::from_ref(&old_symbol),
+                &[(repo_uid, old_file.uid.as_str())],
+                &[(old_file.uid.as_str(), old_symbol.uid.as_str())],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let new_file = File {
+            uid: "file:repo-rollback:new".to_string(),
+            path: "src/new.rs".to_string(),
+            repo_uid: repo_uid.to_string(),
+            content_hash: "new-file".to_string(),
+        };
+        let new_symbol = Symbol {
+            uid: "sym:repo-rollback:new".to_string(),
+            name: "new_symbol".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: new_file.path.clone(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn new_symbol()".to_string(),
+            summary: None,
+            content_hash: "new-symbol".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let duplicate_service = Service {
+            uid: "svc:repo-rollback:duplicate".to_string(),
+            name: "duplicate".to_string(),
+            repo_uid: repo_uid.to_string(),
+            summary: None,
+            summary_hash: None,
+            embedding: None,
+        };
+        let result = store.bulk_reindex_write(
+            repo_uid,
+            std::slice::from_ref(&new_file),
+            std::slice::from_ref(&new_symbol),
+            &[(repo_uid, new_file.uid.as_str())],
+            &[(new_file.uid.as_str(), new_symbol.uid.as_str())],
+            &[duplicate_service.clone(), duplicate_service],
+            &[],
+        );
+        let error = result.expect_err("duplicate Service uid must fail preflight");
+        assert!(error.to_string().contains("duplicate Service uid"));
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let count = conn
+            .query(&format!(
+                "MATCH (f:File {{uid: '{}'}})-[:FILE_HAS_SYMBOL]->\
+                 (s:Symbol {{uid: '{}'}}) RETURN count(s)",
+                old_file.uid, old_symbol.uid
+            ))
+            .unwrap()
+            .filter_map(|row| match row.first() {
+                Some(lbug::Value::Int64(value)) => Some(*value),
+                _ => None,
+            })
+            .next()
+            .unwrap_or_default();
+        assert_eq!(count, 1, "failed repo reindex must preserve the old graph");
+    }
+
+    #[test]
+    fn malformed_vault_replacement_fails_before_previous_graph_is_deleted() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vault-preflight.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let vault = Vault {
+            uid: "vault:test:preflight".to_string(),
+            name: "preflight".to_string(),
+            root_path: "/vault-preflight".to_string(),
+            instance_id: "test".to_string(),
+        };
+        let old_note = Note {
+            uid: "note:vault-preflight:old".to_string(),
+            vault_uid: vault.uid.clone(),
+            file_path: "old.md".to_string(),
+            title: "Old".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "old".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store.insert_vault(&vault).unwrap();
+        store.insert_note(&old_note).unwrap();
+        store
+            .insert_vault_note_edge(&vault.uid, &old_note.uid)
+            .unwrap();
+
+        let mut replacement = old_note.clone();
+        replacement.title = "Replacement".to_string();
+        let error = store
+            .bulk_vault_reindex_write(
+                &vault,
+                true,
+                &[replacement.clone(), replacement],
+                &[],
+                &[],
+                &[(vault.uid.as_str(), old_note.uid.as_str())],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate Note uid"));
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let count = conn
+            .query(&format!(
+                "MATCH (v:Vault {{uid: '{}'}})-[:VAULT_HAS_NOTE]->\
+                 (n:Note {{uid: '{}'}}) RETURN count(n)",
+                vault.uid, old_note.uid
+            ))
+            .unwrap()
+            .filter_map(|row| match row.first() {
+                Some(lbug::Value::Int64(value)) => Some(*value),
+                _ => None,
+            })
+            .next()
+            .unwrap_or_default();
+        assert_eq!(count, 1, "vault preflight failure must preserve old graph");
     }
 }
