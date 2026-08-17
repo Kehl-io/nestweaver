@@ -59,6 +59,18 @@ A unique name for this instance. Used in UIDs and registry.
 instance_id = "my-project"
 ```
 
+#### `db` (optional)
+
+Selects the graph database for commands invoked with `--config`, so callers do
+not also need `--db`.
+
+```toml
+db = "/path/to/brain.lbug"
+```
+
+An explicit `--db` takes precedence. When `db` is absent, NestWeaver uses
+`NESTWEAVER_DB` and then `./nestweaver.lbug`.
+
 #### `[snapshot_storage]`
 
 Where snapshots are stored for distribution.

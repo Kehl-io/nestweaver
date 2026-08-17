@@ -218,6 +218,214 @@ url = "{}"
 }
 
 #[test]
+fn commands_honor_database_declared_by_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("configured.lbug");
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    store
+        .insert_project(&nestweaver_schema::Project {
+            uid: "proj:config-db:configured-project".to_string(),
+            name: "configured-project".to_string(),
+            summary: None,
+            instance_id: "config-db".to_string(),
+        })
+        .unwrap();
+    drop(store);
+
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"instance_id = "config-db"
+db = "{}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/config-db/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/config-db/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            toml_basic_string(&db_path),
+        ),
+    )
+    .unwrap();
+
+    // Run away from both the configured DB and the repository so the default
+    // `./nestweaver.lbug` cannot accidentally make either assertion pass.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+
+    for args in [
+        &["list-repos", "--json"][..],
+        &["search", "configured-project", "--json"][..],
+        &["regex-search", "configured-project", "--json"][..],
+        &["count-patterns", "configured-project", "--json"][..],
+        &["suggest-links", "--json"][..],
+        &["generate-guide", "--format", "agents-md"][..],
+        &["hubs", "--json"][..],
+        &["bridges", "--json"][..],
+        &["clusters", "--json"][..],
+        &["brain", "status", "--json"][..],
+    ] {
+        nestweaver_cmd()
+            .current_dir(&unrelated_cwd)
+            .env_remove("NESTWEAVER_DB")
+            .args(args)
+            .arg("--config")
+            .arg(&config_path)
+            .assert()
+            .success();
+    }
+
+    for args in [
+        &["context", "definitely-not-present"][..],
+        &["impact", "definitely-not-present"][..],
+        &["read-symbols", "definitely-not-present"][..],
+    ] {
+        nestweaver_cmd()
+            .current_dir(&unrelated_cwd)
+            .env_remove("NESTWEAVER_DB")
+            .args(args)
+            .arg("--config")
+            .arg(&config_path)
+            .assert()
+            .code(2)
+            .stderr(contains("Database not found").not());
+    }
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["mcp", "--config"])
+        .arg(&config_path)
+        .write_stdin("")
+        .assert()
+        .success();
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["list-projects", "--config"])
+        .arg(&config_path)
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(contains("configured-project"));
+
+    let env_db_path = dir.path().join("environment.lbug");
+    let env_store = nestweaver_store::GraphStore::open_or_create(&env_db_path).unwrap();
+    env_store
+        .insert_project(&nestweaver_schema::Project {
+            uid: "proj:config-db:environment-project".to_string(),
+            name: "environment-project".to_string(),
+            summary: None,
+            instance_id: "config-db".to_string(),
+        })
+        .unwrap();
+    drop(env_store);
+    let explicit_db_path = dir.path().join("explicit.lbug");
+    let explicit_store = nestweaver_store::GraphStore::open_or_create(&explicit_db_path).unwrap();
+    explicit_store
+        .insert_project(&nestweaver_schema::Project {
+            uid: "proj:config-db:explicit-project".to_string(),
+            name: "explicit-project".to_string(),
+            summary: None,
+            instance_id: "config-db".to_string(),
+        })
+        .unwrap();
+    drop(explicit_store);
+
+    // --db > config.db > NESTWEAVER_DB > fallback.
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_DB", &env_db_path)
+        .args(["list-projects", "--config"])
+        .arg(&config_path)
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(contains("configured-project"))
+        .stdout(contains("environment-project").not());
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_DB", &env_db_path)
+        .args(["list-projects", "--db"])
+        .arg(&explicit_db_path)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(contains("explicit-project"))
+        .stdout(contains("configured-project").not());
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_DB", &env_db_path)
+        .args(["list-projects", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("environment-project"));
+
+    let invalid_config = dir.path().join("invalid.toml");
+    std::fs::write(&invalid_config, "this is not valid = [toml").unwrap();
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env("NESTWEAVER_DB", &env_db_path)
+        .args(["list-projects", "--config"])
+        .arg(&invalid_config)
+        .arg("--json")
+        .assert()
+        .failure()
+        .stderr(contains("loading --config"));
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["project-context", "configured-project", "--config"])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(contains("has no associated notes or symbols"));
+
+    // Repository-scoped commands have a different final fallback
+    // (`<repo>/nestweaver.lbug`), so cover their shared resolver explicitly.
+    // `index` is finite; code `watch` uses the same resolver before entering
+    // its long-running service loop.
+    let repo = unrelated_cwd.join("configured-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "export function configuredDb() {}\n").unwrap();
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success();
+    assert!(
+        !repo.join("nestweaver.lbug").exists(),
+        "index must not create its repository-local fallback when config.db is set"
+    );
+    let configured = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(
+        !configured.list_repos(None).unwrap().is_empty(),
+        "the indexed repository must land in config.db"
+    );
+}
+
+#[test]
 fn installation_docs_only_claim_live_channels() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut docs = vec![

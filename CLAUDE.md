@@ -227,7 +227,7 @@ nestweaver export --format msgpack       # graph snapshot for WASM engine
 
 # Markdown brain (`.brainignore` for glob exclusion patterns; `--ignore` flag for ad-hoc)
 nestweaver brain add ~/Documents/Obsidian/MyVault
-nestweaver brain add ~/vault --config ./instance.toml  # uses config's instance_id and db_path
+nestweaver brain add ~/vault --config ./instance.toml  # uses config's instance_id and db field
 nestweaver brain search "architecture"   # searches code symbols AND vault notes
 nestweaver brain context "MyProject"     # unified code + notes context
 nestweaver brain status                  # vault counts, per-vault staleness

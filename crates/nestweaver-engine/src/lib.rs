@@ -395,7 +395,10 @@ pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,
 };
-pub use project::{ProjectMaterializationResult, detect_implicit_projects, materialize_projects};
+pub use project::{
+    ProjectMaterializationResult, detect_implicit_projects, materialize_projects,
+    materialize_projects_with_lease,
+};
 pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, EmbedModelProvider,
@@ -426,7 +429,10 @@ pub use summaries::{
     merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;
-pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
+pub use watcher::{
+    BrainWatcher, ShutdownHandle, UpdateOutcome, WatchMutationLease, WatchMutationLeaseFactory,
+    WatchMutationRefused,
+};
 pub use write_gate::{WriteGate, WriteLease};
 
 #[cfg(test)]

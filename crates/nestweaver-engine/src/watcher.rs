@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use globset::GlobSet;
@@ -26,8 +26,26 @@ use nestweaver_schema::{
     Heading, Note, Section, Tag, Vault, heading_uid, note_uid, section_uid, tag_uid, vault_uid,
 };
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
-use notify::RecursiveMode;
-use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind, new_debouncer};
+use notify::event::{MetadataKind, ModifyKind};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+/// Opaque caller-owned protection held for one watcher mutation window.
+///
+/// Daemon callers use this to compose their shutdown admission guard and
+/// single-writer gate. Direct callers omit the factory because opening the
+/// store already gives them exclusive writer ownership.
+pub trait WatchMutationLease: Send {}
+
+impl<T: Send> WatchMutationLease for T {}
+
+pub type WatchMutationLeaseFactory =
+    Arc<dyn Fn(&'static str) -> Result<Box<dyn WatchMutationLease>, anyhow::Error> + Send + Sync>;
+
+/// A batch was refused because daemon shutdown has begun. Watchers treat this
+/// as a normal stop, not as graph corruption or a retryable filesystem error.
+#[derive(Debug, thiserror::Error)]
+#[error("watcher mutation refused because daemon shutdown has started")]
+pub struct WatchMutationRefused;
 
 /// Manifest filenames whose changes should trigger a manifest cache refresh.
 const MANIFEST_FILES: &[&str] = &[
@@ -101,13 +119,13 @@ pub struct BrainWatcher {
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
+    mutation_lease_factory: Option<WatchMutationLeaseFactory>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl BrainWatcher {
-    fn event_targets_graph(&self, event: &DebouncedEvent) -> bool {
-        let path = &event.path;
+    fn event_targets_graph(&self, path: &Path) -> bool {
         if !is_markdown(path) || path_in_skip_dir(path) {
             return false;
         }
@@ -174,6 +192,7 @@ impl BrainWatcher {
             debounce_ms: 200,
             ignore_set,
             external_tantivy: None,
+            mutation_lease_factory: None,
             #[cfg(test)]
             ready_signal: None,
         }
@@ -202,6 +221,32 @@ impl BrainWatcher {
     pub fn with_external_tantivy(mut self, tantivy: Arc<TantivyIndex>) -> Self {
         self.external_tantivy = Some(tantivy);
         self
+    }
+
+    /// Install an external RAII lease acquired once around each mutation
+    /// window. The returned object remains live through the inline callback.
+    pub fn with_mutation_lease_factory(mut self, factory: WatchMutationLeaseFactory) -> Self {
+        self.mutation_lease_factory = Some(factory);
+        self
+    }
+
+    fn acquire_mutation_lease(
+        &self,
+        label: &'static str,
+    ) -> Result<Option<Box<dyn WatchMutationLease>>, anyhow::Error> {
+        self.mutation_lease_factory
+            .as_ref()
+            .map(|factory| factory(label))
+            .transpose()
+    }
+
+    fn event_targets_manifest(&self, path: &Path) -> bool {
+        self.manifests_path.is_some()
+            && path.exists()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| MANIFEST_FILES.contains(&name))
     }
 
     /// Set the debounce interval for filesystem events.
@@ -290,6 +335,14 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
+        let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
+            Ok(lease) => lease,
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                tracing::info!("BrainWatcher startup refused during shutdown; exiting");
+                return Ok(());
+            }
+            Err(error) => return Err(error.context("acquire brain watcher startup lease")),
+        };
         let initial_publication = self.establish_graph_publication_with_io(
             &store,
             &crate::index::FileSystemIndexEpilogueIo,
@@ -319,18 +372,22 @@ impl BrainWatcher {
                 )));
             }
         }
+        drop(_initial_mutation_lease);
 
         // Channel from the debouncer into our loop.
-        let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
-        let mut debouncer = new_debouncer(
-            Duration::from_millis(self.debounce_ms),
-            move |res: Result<Vec<DebouncedEvent>, notify::Error>| {
-                let _ = tx.send(res);
-            },
-        )
-        .with_context(|| "init debouncer")?;
-        debouncer
-            .watcher()
+        let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
+        let mut watcher =
+            notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+                Ok(event) if event_kind_can_mutate(&event.kind) => {
+                    let _ = tx.send(Ok(event.paths));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
+            })
+            .with_context(|| "init filesystem watcher")?;
+        watcher
             .watch(&self.vault_root, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", self.vault_root.display()))?;
         #[cfg(test)]
@@ -351,9 +408,13 @@ impl BrainWatcher {
                 tracing::info!("BrainWatcher stop requested; exiting");
                 return Ok(());
             }
-            let batch = match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(Ok(events)) => events,
-                Ok(Err(err)) => {
+            let batch = match receive_debounced_paths(
+                &rx,
+                Duration::from_millis(self.debounce_ms),
+                &self.stop_flag,
+            ) {
+                WatchReceive::Batch(paths) => paths,
+                WatchReceive::NotifyError(err) => {
                     if !self.vault_root.exists() {
                         tracing::error!(
                             vault = %self.vault_root.display(),
@@ -367,7 +428,7 @@ impl BrainWatcher {
                     tracing::warn!("notify error: {err}");
                     continue;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                WatchReceive::Timeout => {
                     // Periodic liveness check: detect vault directory
                     // disappearance even when `notify` is silent (e.g.
                     // when the directory's inode is replaced via a
@@ -385,13 +446,38 @@ impl BrainWatcher {
                     }
                     continue;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                WatchReceive::Disconnected => {
                     tracing::warn!("debouncer disconnected; exiting");
+                    return Ok(());
+                }
+                WatchReceive::Stop => {
+                    tracing::info!("BrainWatcher stop requested; exiting");
                     return Ok(());
                 }
             };
 
-            let graph_batch = batch.iter().any(|event| self.event_targets_graph(event));
+            let mut unique_paths = batch;
+            unique_paths.sort();
+            unique_paths.dedup();
+            let graph_batch = unique_paths
+                .iter()
+                .any(|path| self.event_targets_graph(path));
+            let mutation_batch = graph_batch
+                || unique_paths
+                    .iter()
+                    .any(|path| self.event_targets_manifest(path));
+            let _mutation_lease = if mutation_batch {
+                match self.acquire_mutation_lease("watch_vault_batch") {
+                    Ok(lease) => lease,
+                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                        tracing::info!("BrainWatcher batch refused during shutdown; exiting");
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.context("acquire brain watcher batch lease")),
+                }
+            } else {
+                None
+            };
             let publication = if graph_batch {
                 // Establish the fail-closed marker before handle_event can
                 // cascade-delete a note and then fail during read or parse.
@@ -423,12 +509,12 @@ impl BrainWatcher {
             }
 
             let mut batch_failures = Vec::new();
-            for event in batch {
+            for path in unique_paths {
                 match self.handle_event(
                     &store,
                     tantivy.as_deref(),
                     &v_uid,
-                    event,
+                    path,
                     symbol_index.as_ref(),
                     &mut title_forward,
                     &mut title_reverse,
@@ -486,13 +572,11 @@ impl BrainWatcher {
         store: &GraphStore,
         tantivy: Option<&TantivyIndex>,
         v_uid: &str,
-        event: DebouncedEvent,
+        path: PathBuf,
         symbol_index: Option<&crate::cross_domain::SymbolIndex>,
         title_forward: &mut HashMap<String, Vec<String>>,
         title_reverse: &mut HashMap<String, String>,
     ) -> Result<UpdateOutcome, anyhow::Error> {
-        let path = event.path;
-
         // Check for manifest file changes and refresh the sidecar cache.
         // This check runs before the markdown filter so manifest files are
         // never silently dropped as "not markdown".
@@ -600,8 +684,8 @@ impl BrainWatcher {
         }
 
         // Inspect the filesystem to distinguish modify/create vs delete.
-        // notify-debouncer-mini collapses related events into a single
-        // DebouncedEvent of kind Any; we always re-stat the path.
+        // Raw notify event kinds were filtered before debouncing; re-stat the
+        // path because rename/remove delivery varies by backend.
         let file_exists = path.exists();
 
         // Step 1: always cascade-delete the existing graph data for this
@@ -631,7 +715,6 @@ impl BrainWatcher {
             &path,
             &rel_path,
             &parsed,
-            event.kind,
             title_forward,
         )?;
 
@@ -737,8 +820,74 @@ impl ShutdownHandle {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// The debouncer's callback receives `Result<Vec<DebouncedEvent>, notify::Error>`.
-type DebounceResult = Result<Vec<DebouncedEvent>, notify::Error>;
+/// Raw watcher messages preserve notify's event classification. Access-only
+/// events are discarded in the callback before they can extend a debounce
+/// window, acquire a daemon writer lease, or feed back from parser reads.
+pub(crate) type RawWatchResult = Result<Vec<PathBuf>, notify::Error>;
+
+pub(crate) enum WatchReceive {
+    Batch(Vec<PathBuf>),
+    NotifyError(notify::Error),
+    Timeout,
+    Disconnected,
+    Stop,
+}
+
+pub(crate) fn event_kind_can_mutate(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+            | MetadataKind::Permissions
+            | MetadataKind::Ownership
+            | MetadataKind::Extended,
+        )) => false,
+        EventKind::Any
+        | EventKind::Create(_)
+        | EventKind::Modify(_)
+        | EventKind::Remove(_)
+        | EventKind::Other => true,
+    }
+}
+
+pub(crate) fn receive_debounced_paths(
+    rx: &std::sync::mpsc::Receiver<RawWatchResult>,
+    quiet_period: Duration,
+    stop_flag: &AtomicBool,
+) -> WatchReceive {
+    let mut paths = match rx.recv_timeout(Duration::from_millis(250)) {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(error)) => return WatchReceive::NotifyError(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return WatchReceive::Timeout,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return WatchReceive::Disconnected;
+        }
+    };
+    let mut quiet_deadline = Instant::now() + quiet_period;
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return WatchReceive::Stop;
+        }
+        let now = Instant::now();
+        if now >= quiet_deadline {
+            return WatchReceive::Batch(paths);
+        }
+        let wait = quiet_deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(250));
+        match rx.recv_timeout(wait) {
+            Ok(Ok(mut more_paths)) => {
+                paths.append(&mut more_paths);
+                quiet_deadline = Instant::now() + quiet_period;
+            }
+            Ok(Err(error)) => return WatchReceive::NotifyError(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return WatchReceive::Disconnected;
+            }
+        }
+    }
+}
 
 fn log_outcome(outcome: &UpdateOutcome) {
     match outcome {
@@ -807,7 +956,6 @@ fn reinsert_note(
     path: &Path,
     rel_path: &str,
     parsed: &ParsedNote,
-    _event_kind: DebouncedEventKind,
     title_lookup: &HashMap<String, Vec<String>>,
 ) -> Result<(usize, usize, usize, usize), anyhow::Error> {
     // ── Note + VAULT_HAS_NOTE ───────────────────────────────────────────
@@ -1210,7 +1358,7 @@ mod tests {
                 &store,
                 None,
                 "vlt:test",
-                DebouncedEvent::new(root.join("package.json"), DebouncedEventKind::Any),
+                root.join("package.json"),
                 None,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -1235,6 +1383,81 @@ mod tests {
         assert!(path_in_skip_dir(p));
         let p = Path::new("/x/vault/notes/regular.md");
         assert!(!path_in_skip_dir(p));
+    }
+
+    #[test]
+    fn raw_event_filter_rejects_access_and_non_content_metadata() {
+        use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind, RenameMode};
+
+        assert!(!event_kind_can_mutate(&EventKind::Access(AccessKind::Read)));
+        assert!(!event_kind_can_mutate(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+        assert!(!event_kind_can_mutate(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Permissions)
+        )));
+        assert!(event_kind_can_mutate(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        assert!(event_kind_can_mutate(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(event_kind_can_mutate(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        assert!(event_kind_can_mutate(&EventKind::Any));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_vault_edit_settles_after_one_hot_batch() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
+
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("note.md", "# Original\n\nbody\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let callback_count = notifications.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "default", "test").with_ready_signal(ready_tx);
+        let stop = watcher.shutdown_handle();
+        let handle = thread::spawn(move || {
+            watcher.run_with_store(
+                store,
+                Some(Box::new(move || {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should start");
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+
+        fs::write(root.join("note.md"), "# Updated\n\nchanged once\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while notifications.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            2,
+            "the real edit must publish one hot batch"
+        );
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            2,
+            "parser reads must not feed another watcher batch"
+        );
+
+        stop.stop();
+        handle.join().unwrap().unwrap();
     }
 
     // Integration-style tests below exercise the live event loop. They

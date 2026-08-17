@@ -3888,7 +3888,7 @@ enum BrainCommands {
         db: Option<PathBuf>,
         #[arg(
             long,
-            help = "Path to instance config (TOML) — uses its instance_id and db_path"
+            help = "Path to instance config (TOML) — uses its instance_id and db field"
         )]
         config: Option<PathBuf>,
         #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
@@ -3973,7 +3973,7 @@ enum BrainCommands {
         db: Option<PathBuf>,
         #[arg(
             long,
-            help = "Path to instance config (TOML) — uses its instance_id and db_path"
+            help = "Path to instance config (TOML) — uses its instance_id and db field"
         )]
         config: Option<PathBuf>,
         #[arg(
@@ -4845,7 +4845,7 @@ fn default_db_path() -> PathBuf {
     }
 }
 
-/// Resolve the DB path for a read command, honoring `--config`.
+/// Resolve the DB path for a command that accepts `--config`.
 ///
 /// Precedence: an explicit `--db` always wins; otherwise the instance
 /// config's `db` field (when `--config` is given and declares one); otherwise
@@ -5398,14 +5398,31 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
     Ok(EXIT_SUCCESS)
 }
 
-fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
+/// Resolve the DB path for repository-scoped commands (`index` and code
+/// `watch`) while preserving their repository-local final fallback.
+///
+/// Precedence intentionally matches [`resolve_db_with_config`]: an explicit
+/// `--db`, then the explicit config's `db`, then `NESTWEAVER_DB`, and finally
+/// `<repo>/nestweaver.lbug`.
+fn resolve_index_db_path(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+    repo_root: &Path,
+) -> anyhow::Result<PathBuf> {
     if let Some(explicit) = db {
-        return explicit;
+        return Ok(explicit);
+    }
+    if let Some(cfg_path) = config {
+        let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)
+            .with_context(|| format!("loading --config {}", cfg_path.display()))?;
+        if let Some(db) = cfg.db_path() {
+            return Ok(db);
+        }
     }
     if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        return PathBuf::from(env_db);
+        return Ok(PathBuf::from(env_db));
     }
-    repo_root.join("nestweaver.lbug")
+    Ok(repo_root.join("nestweaver.lbug"))
 }
 
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
@@ -8062,7 +8079,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             // nw-087: read-only command — fail `db_not_found` on a
             // missing --db before any daemon/store connect could create one.
-            let db_path = db.clone().unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
             require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -8105,7 +8122,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let repos = list_repos(&store, instance.as_deref())?;
 
             if json {
@@ -8729,6 +8746,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             let parsed_intent: Option<QueryIntent> = intent
                 .as_deref()
                 .map(|s| s.parse())
@@ -8749,8 +8767,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .as_ref()
                         .and_then(|fs| fs.iter().find(|f| f.name == *feature_name))
                     {
-                        let db_default = default_db_path();
-                        let db_path = db.as_deref().unwrap_or(&db_default);
                         let hybrid_args = serde_json::json!({
                             "seeds": fc.entry_points,
                             "token_budget": token_budget.unwrap_or(0),
@@ -8760,7 +8776,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         });
                         if let Some(result_json) = try_hybrid_json_rpc_checked(
                             use_daemon,
-                            db_path,
+                            &db_path,
                             config.as_deref(),
                             "brain_context",
                             hybrid_args,
@@ -8788,7 +8804,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
 
-                let store = open_store(db.as_deref())?;
+                let store = open_store(Some(&db_path))?;
                 let instance_config = nestweaver_engine::InstanceConfig::from_file(config_path)?;
                 let feature_config = instance_config
                     .features
@@ -8846,8 +8862,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // pattern.
             let effective_limit = limit.unwrap_or(30);
             if use_daemon {
-                let db_default = default_db_path();
-                let db_path = db.as_deref().unwrap_or(&db_default);
                 let hybrid_args = serde_json::json!({
                     "seeds": seeds.clone(),
                     "token_budget": token_budget.unwrap_or(0),
@@ -8856,7 +8870,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 });
                 if let Some(result_json) = try_hybrid_json_rpc_checked(
                     use_daemon,
-                    db_path,
+                    &db_path,
                     config.as_deref(),
                     "brain_context",
                     hybrid_args,
@@ -8883,7 +8897,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── Local fallback (daemon unavailable) ──────────────────
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
                 Ok(mut result) => {
                     if let Some(budget) = token_budget {
@@ -8979,9 +8993,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             config: config_opt,
         } => {
+            let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
@@ -9074,11 +9088,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let db_default = default_db_path();
-            let db_path = db.as_deref().unwrap_or(&db_default);
-            let store = open_store(Some(db_path))?;
+            let store = open_store(Some(&db_path))?;
             let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(db_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&db_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
             if json {
@@ -9153,7 +9165,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             format,
             rules_from,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             // ── daemon guard (JSON pass-through) ─────────────────
             // Try the daemon first regardless of --output / --rules-from
@@ -9322,7 +9334,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
 
             // ── hybrid guard (routes through local + upstream) ────
@@ -9426,7 +9438,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config: config_opt,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -9649,7 +9661,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config: config_opt,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
 
             // ── daemon guard ──────────────────────────────────────
             // The daemon `clusters` tool truncates each community's
@@ -10708,7 +10720,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
                 return Ok((EXIT_ERROR, None));
             }
-            let db_path = resolve_index_db_path(db, &repo_path);
+            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
             // nw-019: --instance flag > config's instance_id > "default"
             // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
             // with no --instance stamps symbols under "default" even with the
@@ -10903,7 +10915,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                      remove it from your MCP config"
                 );
             }
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
@@ -10967,7 +10979,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             no_open,
             watch,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             let daemon_connection = if use_daemon {
                 match tokio::runtime::Runtime::new() {
@@ -11150,12 +11162,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 10);
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "query": query, "limit": limit });
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
@@ -11196,7 +11208,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let candidates = search_symbols(&store, &query, limit)?;
 
             if json {
@@ -11228,9 +11240,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({ "pattern": pattern });
                 if let Some(ref pp) = path_prefix {
                     args["path_prefix"] = serde_json::json!(pp);
@@ -11304,7 +11316,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let res = store
                 .regex_search(
                     &pattern,
@@ -11362,9 +11374,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({ "patterns": patterns });
                 if let Some(ref pp) = path_prefix {
                     args["path_prefix"] = serde_json::json!(pp);
@@ -11415,7 +11427,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let counts = store
                 .count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref())
                 .context("count_patterns")?;
@@ -11450,9 +11462,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config,
         } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args =
                     read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
                 if let Some(value) = try_hybrid_json_rpc_checked(
@@ -11467,7 +11479,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
             let res = nestweaver_engine::read_symbols::read_symbols(
@@ -12189,6 +12201,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: config_opt,
             ..
         } => {
+            let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
             // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
             // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
@@ -12200,8 +12213,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // honored and surfaced. Same for a non-default --confidence: the daemon tool
             // hardcodes 0.0, so an explicit filter must take the direct path or it would be
             // silently ignored.
+            // Keep the daemon eligibility guard separate from the RPC result:
+            // collapsing them would reindent this large response-rendering block
+            // and obscure the small database-resolution change in this patch.
+            #[allow(clippy::collapsible_if)]
             if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -12350,9 +12366,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let total = value.get("total").and_then(|v| v.as_u64());
                             if !out.quiet {
                                 match total {
-                                    Some(t) if t > count as u64 => println!(
-                                        "Impact of '{name_or_uid}' ({count} of {t} nodes):"
-                                    ),
+                                    Some(t) if t > count as u64 => {
+                                        println!(
+                                            "Impact of '{name_or_uid}' ({count} of {t} nodes):"
+                                        )
+                                    }
                                     _ => println!("Impact of '{name_or_uid}' ({count} nodes):"),
                                 }
                             }
@@ -12399,7 +12417,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
 
             // Resolve the symbol UID first (may be a name).
             match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
@@ -12556,28 +12574,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // defined" — and the text path suggested adding [[projects]] to a
             // config, an actively wrong remedy. 17 of 18 comparable commands
             // already exit 1 here; this was the outlier.
-            let resolved_db = db.clone().unwrap_or_else(default_db_path);
+            let resolved_db = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&resolved_db)?;
 
             // ── daemon guard ──────────────────────────────────────
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
-                try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)?
-                    .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
-                    .unwrap_or_else(|| {
-                        // Daemon unreachable / RPC failed — fall back to a direct read, but
-                        // never panic on a bad --db path; warn and return empty on error.
-                        match open_store(db.as_deref()) {
-                            Ok(store) => store.list_projects().unwrap_or_default(),
-                            Err(e) => {
-                                eprintln!("Warning: could not open store: {e}");
-                                Vec::new()
-                            }
+                try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "list_projects",
+                    args,
+                )?
+                .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
+                .unwrap_or_else(|| {
+                    // Daemon unreachable / RPC failed — fall back to a direct read, but
+                    // never panic on a bad --db path; warn and return empty on error.
+                    match open_store(Some(&resolved_db)) {
+                        Ok(store) => store.list_projects().unwrap_or_default(),
+                        Err(e) => {
+                            eprintln!("Warning: could not open store: {e}");
+                            Vec::new()
                         }
-                    })
+                    }
+                })
             } else {
-                let store = open_store(db.as_deref())?;
+                let store = open_store(Some(&resolved_db))?;
                 store.list_projects().map_err(|e| anyhow::anyhow!(e))?
             };
 
@@ -12662,7 +12686,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // server-mode-remainder-decisions); --detailed opts into the full record.
             let response_format = if detailed { "detailed" } else { "concise" };
             let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
@@ -13162,7 +13186,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let instance_config = nestweaver_engine::InstanceConfig::from_file(config_path)
                 .with_context(|| format!("failed to load config from {}", config_path.display()))?;
             let instance_id = &instance_config.instance_id;
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, Some(config_path))?;
 
             if cli.no_daemon {
                 eprintln!(
@@ -13275,7 +13299,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Failing fast here also turns a typo'd/nonexistent path into a clear error
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
-            let db_path = resolve_index_db_path(db, &repo_path);
+            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
             // Create-operation: a --db in a not-yet-existing directory must
             // not fail with a bare OS error on either the daemon or the
             // direct path — create the parent directories up front.
@@ -17236,7 +17260,7 @@ fn run_brain(
                 eprintln!("Error: --refresh-wiki-hours requires --config");
                 return Ok((EXIT_ERROR, None));
             }
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
                 return Ok((EXIT_ERROR, None));
@@ -19501,6 +19525,83 @@ mod cli_help_contract_tests {
     #[test]
     fn cli_definition_is_internally_consistent() {
         on_big_stack(|| Cli::command().debug_assert());
+    }
+
+    /// Keep the database-binding surface executable. Any new command exposing
+    /// both flags must extend the behavioral config-DB matrix rather than
+    /// silently inheriting an unrelated fallback.
+    #[test]
+    fn config_aware_database_command_inventory_is_explicit() {
+        let paths = on_big_stack(|| {
+            let root = Cli::command();
+            let mut found = Vec::new();
+            let mut queue = vec![(&root, String::new())];
+            while let Some((command, parent)) = queue.pop() {
+                let path = if parent.is_empty() {
+                    command.get_name().to_string()
+                } else {
+                    format!("{parent} {}", command.get_name())
+                };
+                let has_db = command.get_arguments().any(|arg| arg.get_id() == "db");
+                let has_config = command.get_arguments().any(|arg| arg.get_id() == "config");
+                if has_db && has_config {
+                    found.push(path.clone());
+                }
+                queue.extend(command.get_subcommands().map(|child| (child, path.clone())));
+            }
+            found.sort();
+            found
+        });
+
+        let expected = [
+            "nestweaver backup save",
+            "nestweaver blast-radius",
+            "nestweaver brain add",
+            "nestweaver brain broken-links",
+            "nestweaver brain context",
+            "nestweaver brain doc-stats",
+            "nestweaver brain orphans",
+            "nestweaver brain refresh",
+            "nestweaver brain search",
+            "nestweaver brain status",
+            "nestweaver brain tag-graph",
+            "nestweaver brain topic-clusters",
+            "nestweaver brain watch",
+            "nestweaver bridges",
+            "nestweaver clusters",
+            "nestweaver context",
+            "nestweaver count-patterns",
+            "nestweaver flow-trace",
+            "nestweaver generate-guide",
+            "nestweaver hubs",
+            "nestweaver impact",
+            "nestweaver index",
+            "nestweaver list-links",
+            "nestweaver list-projects",
+            "nestweaver list-repos",
+            "nestweaver materialize-projects",
+            "nestweaver mcp",
+            "nestweaver memory consolidate",
+            "nestweaver memory lint",
+            "nestweaver memory related",
+            "nestweaver project-context",
+            "nestweaver ranking explain",
+            "nestweaver ranking rank",
+            "nestweaver read-symbols",
+            "nestweaver regex-search",
+            "nestweaver search",
+            "nestweaver server backup save",
+            "nestweaver snapshot build",
+            "nestweaver suggest-links",
+            "nestweaver ui",
+            "nestweaver watch",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(
+            paths, expected,
+            "the --db + --config command inventory changed; update the config-DB behavior matrix"
+        );
     }
 }
 
