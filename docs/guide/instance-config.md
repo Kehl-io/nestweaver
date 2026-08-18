@@ -410,6 +410,27 @@ redefine core properties).
 extra_node_properties = { Symbol = { team_owner = "string", deprecated = "bool" } }
 ```
 
+### `[indexing]` (optional)
+
+Source code and Markdown notes have independent size policies. Source files
+default to 2 MiB and can be raised for repositories with unusually large,
+legitimate files:
+
+```toml
+[indexing]
+max_source_file_bytes = 8388608 # 8 MiB
+```
+
+The accepted range is 1 KiB through a fixed 64 MiB safety ceiling; invalid
+values fail config loading rather than being clamped. Markdown notes retain
+their separate 1 MiB policy. Every policy skip is reported by `nestweaver
+index`; use `--json` for a typed terminal result or `--fail-on-skip` when CI
+must reject degraded coverage.
+
+`index --with-trigrams` incrementally refreshes only changed repository/vault
+scopes. Use `--rebuild-trigrams` with it for a one-time full v2 migration or
+repair.
+
 ## Manifest Parsing (automatic)
 
 When you run `nestweaver index`, NestWeaver automatically reads the manifest

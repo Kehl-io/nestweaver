@@ -4174,6 +4174,7 @@ dependencies = [
  "nestweaver-embed",
  "nestweaver-engine",
  "nestweaver-mcp",
+ "nestweaver-parser",
  "nestweaver-proto",
  "nestweaver-schema",
  "nestweaver-store",
@@ -4424,6 +4425,7 @@ name = "nestweaver-store"
 version = "6.1.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "cc",
  "csv",
  "lbug",

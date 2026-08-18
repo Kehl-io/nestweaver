@@ -219,6 +219,10 @@ pub struct InstanceConfig {
     /// Default pagination limits for tool responses (`[limits]`).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Source-code indexing policy (`[indexing]`). Kept separate from
+    /// `[server.indexing]`, which controls worker/poll scheduling.
+    #[serde(default)]
+    pub indexing: SourceIndexingConfig,
     /// Server-mode configuration (`[server]`).
     #[serde(default)]
     pub server: ServerConfig,
@@ -244,6 +248,33 @@ pub struct InstanceConfig {
     /// heuristic. See [`PrImpactConfig`].
     #[serde(default)]
     pub pr_impact: Option<PrImpactConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SourceIndexingConfig {
+    #[serde(default = "default_max_source_file_bytes")]
+    pub max_source_file_bytes: u64,
+}
+
+fn default_max_source_file_bytes() -> u64 {
+    crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES
+}
+
+impl Default for SourceIndexingConfig {
+    fn default() -> Self {
+        Self {
+            max_source_file_bytes: default_max_source_file_bytes(),
+        }
+    }
+}
+
+impl SourceIndexingConfig {
+    pub fn limits(&self) -> crate::index_limits::IndexLimits {
+        // InstanceConfig validates this during construction, so downstream
+        // code never has to handle an invalid value.
+        crate::index_limits::IndexLimits::new(self.max_source_file_bytes)
+            .expect("validated source indexing limit")
+    }
 }
 
 /// Pre-push / CI strict-gate policy (`[pr_impact]`).
@@ -863,6 +894,7 @@ impl InstanceConfig {
         // `sym:repo:<instance>:<hash>:…` uids where a colon is ambiguous for
         // any split-on-colon consumer.
         validate_instance_id(&config.instance_id)?;
+        crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         // Feature F6: clamp ranking-prior multipliers into bounds on load so
         // downstream code can trust the values without re-validating.
         config.ranking.clamp_multipliers();
@@ -1193,6 +1225,29 @@ url = "https://github.com/example/repo"
         ))
         .expect("[daemon] start_at_login must be an accepted key");
         assert!(opted_in.daemon.start_at_login);
+    }
+
+    #[test]
+    fn source_indexing_limit_defaults_and_validates_bounds() {
+        let default = InstanceConfig::from_toml_str(MINIMAL_TOML).unwrap();
+        assert_eq!(
+            default.indexing.max_source_file_bytes,
+            crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES
+        );
+
+        let configured = InstanceConfig::from_toml_str(&format!(
+            "{MINIMAL_TOML}\n[indexing]\nmax_source_file_bytes = 8388608\n"
+        ))
+        .unwrap();
+        assert_eq!(configured.indexing.max_source_file_bytes, 8 * 1024 * 1024);
+
+        for invalid in [0, 512, crate::index_limits::HARD_MAX_SOURCE_FILE_BYTES + 1] {
+            let error = InstanceConfig::from_toml_str(&format!(
+                "{MINIMAL_TOML}\n[indexing]\nmax_source_file_bytes = {invalid}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("max_source_file_bytes"));
+        }
     }
 
     #[test]

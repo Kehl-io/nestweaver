@@ -242,7 +242,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
 | `read-symbols` | Read a symbol's source span |
-| `regex-search` | Regex search over indexed text (trigram pre-filter; falls back to a full scan with `stale_index: true` when the trigram index is stale — re-run `index --with-trigrams`) |
+| `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh with `index --with-trigrams`) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
 | `investigate-expand` | Drill into investigate bundle entries — full body plus immediate neighbours |

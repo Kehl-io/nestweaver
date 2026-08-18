@@ -12,7 +12,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::git_cmd::{apply_git_isolation, git_net_timeout, run_git_with_timeout};
-use crate::index_md::MAX_FILE_SIZE_BYTES;
+use crate::index_limits::{DEFAULT_MAX_SOURCE_FILE_BYTES, IndexLimits};
+
+/// A source was rejected from metadata/object headers before allocation.
+#[derive(Debug, thiserror::Error)]
+#[error("source {path} is too large ({observed_bytes} bytes exceeds the {limit_bytes}-byte limit)")]
+pub struct SourceTooLarge {
+    pub path: String,
+    pub observed_bytes: u64,
+    pub limit_bytes: u64,
+}
 
 /// Maximum time to wait for a single `git cat-file --batch` response.
 ///
@@ -54,17 +63,31 @@ pub trait ContentReader: Send + Sync {
 
     /// An identifier for the content version (HEAD SHA for git, "local" for filesystem).
     fn version_id(&self) -> &str;
+
+    /// Validated source-code input ceiling for this reader.
+    fn max_source_file_bytes(&self) -> u64 {
+        DEFAULT_MAX_SOURCE_FILE_BYTES
+    }
 }
 
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
 pub struct FilesystemReader {
     repo_path: PathBuf,
+    limits: IndexLimits,
 }
 
 impl FilesystemReader {
     pub fn new(repo_path: &Path) -> Self {
         Self {
             repo_path: repo_path.to_path_buf(),
+            limits: IndexLimits::default(),
+        }
+    }
+
+    pub fn with_limits(repo_path: &Path, limits: IndexLimits) -> Self {
+        Self {
+            repo_path: repo_path.to_path_buf(),
+            limits,
         }
     }
 }
@@ -72,7 +95,35 @@ impl FilesystemReader {
 impl ContentReader for FilesystemReader {
     fn read_file(&self, rel_path: &Path) -> Result<String> {
         let abs = self.repo_path.join(rel_path);
-        std::fs::read_to_string(&abs).map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))
+        let observed_bytes = std::fs::metadata(&abs)
+            .map_err(|e| anyhow::anyhow!("stat {}: {e}", abs.display()))?
+            .len();
+        if observed_bytes > self.limits.max_source_file_bytes() {
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes,
+                limit_bytes: self.limits.max_source_file_bytes(),
+            }
+            .into());
+        }
+        // Bound the actual read as well as the metadata preflight so a file
+        // that grows between stat and read cannot force an unbounded allocation.
+        let file = std::fs::File::open(&abs)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", abs.display()))?;
+        let mut bounded = file.take(self.limits.max_source_file_bytes() + 1);
+        let mut source = String::new();
+        bounded
+            .read_to_string(&mut source)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))?;
+        if source.len() as u64 > self.limits.max_source_file_bytes() {
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes: observed_bytes.max(source.len() as u64),
+                limit_bytes: self.limits.max_source_file_bytes(),
+            }
+            .into());
+        }
+        Ok(source)
     }
 
     fn list_files(&self) -> Result<Vec<PathBuf>> {
@@ -132,6 +183,10 @@ impl ContentReader for FilesystemReader {
     fn version_id(&self) -> &str {
         "local"
     }
+
+    fn max_source_file_bytes(&self) -> u64 {
+        self.limits.max_source_file_bytes()
+    }
 }
 
 /// One object resolved from the `git cat-file --batch` stream.
@@ -140,10 +195,10 @@ enum BatchObject {
     Found(Vec<u8>),
     /// Git reported `<spec> missing` — no such object/path at this revision.
     Missing,
-    /// The object's git-reported size exceeded [`MAX_FILE_SIZE_BYTES`]. Its bytes
+    /// The object's git-reported size exceeded the reader's source limit. Its bytes
     /// were read-and-discarded (never materialized) to keep the stream framed;
     /// the caller skips the file, mirroring the filesystem oversized-file guard.
-    TooLarge,
+    TooLarge(u64),
 }
 
 /// Read and discard exactly `n` bytes from `r` using a small fixed buffer, so an
@@ -181,7 +236,7 @@ struct CatFileBatch {
 impl CatFileBatch {
     /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout, plus
     /// a dedicated reader thread that owns stdout and parses framed responses.
-    fn spawn(bare_path: &Path) -> Result<Self> {
+    fn spawn(bare_path: &Path, max_source_file_bytes: u64) -> Result<Self> {
         // The pooled batch process is long-lived with an interactive stdin/stdout
         // protocol, so it can't go through `run_git_with_timeout` (which nulls
         // stdin and drains stdout to EOF). Its read deadline is enforced per
@@ -216,7 +271,7 @@ impl CatFileBatch {
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::Builder::new()
             .name("cat-file-batch-reader".to_string())
-            .spawn(move || read_loop(BufReader::new(stdout), tx))
+            .spawn(move || read_loop(BufReader::new(stdout), tx, max_source_file_bytes))
             .context("failed to spawn cat-file --batch reader thread")?;
 
         Ok(Self {
@@ -274,9 +329,13 @@ impl CatFileBatch {
 /// Reader-thread loop: parse framed `cat-file --batch` responses from `stdout`
 /// and forward each to `tx` in request order. Stops on the first parse/I/O error
 /// (the stream is then desynced or closed) or once the receiver is dropped.
-fn read_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<Result<BatchObject>>) {
+fn read_loop(
+    mut stdout: BufReader<ChildStdout>,
+    tx: mpsc::Sender<Result<BatchObject>>,
+    max_source_file_bytes: u64,
+) {
     loop {
-        let result = read_one(&mut stdout);
+        let result = read_one(&mut stdout, max_source_file_bytes);
         let is_err = result.is_err();
         if tx.send(result).is_err() {
             // Receiver gone (the batch was discarded) — nothing left to do.
@@ -291,9 +350,12 @@ fn read_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<Result<BatchOb
 
 /// Parse exactly one framed response: `<oid> <type> <size>\n` then `<size>`
 /// content bytes and a trailing newline, or `<spec> missing\n`. Blobs over
-/// [`MAX_FILE_SIZE_BYTES`] are read-and-discarded (not allocated) and reported
+/// `max_source_file_bytes` are read-and-discarded (not allocated) and reported
 /// as [`BatchObject::TooLarge`].
-fn read_one(stdout: &mut BufReader<ChildStdout>) -> Result<BatchObject> {
+fn read_one(
+    stdout: &mut BufReader<ChildStdout>,
+    max_source_file_bytes: u64,
+) -> Result<BatchObject> {
     // Read the header: "<oid> <type> <size>\n" or "<spec> missing\n".
     let mut header = String::new();
     let n = stdout
@@ -319,9 +381,9 @@ fn read_one(stdout: &mut BufReader<ChildStdout>) -> Result<BatchObject> {
     // accident- or attacker-sized blob would be allocated whole via vec![0u8;
     // size]. Discard exactly `size` bytes plus the trailing newline to keep the
     // stream framed, but never materialize the blob.
-    if size as u64 > MAX_FILE_SIZE_BYTES {
+    if size as u64 > max_source_file_bytes {
         discard_exact(stdout, size + 1).context("discard oversized cat-file --batch object")?;
-        return Ok(BatchObject::TooLarge);
+        return Ok(BatchObject::TooLarge(size as u64));
     }
 
     // Read exactly `size` bytes of content, then consume the trailing newline.
@@ -360,6 +422,7 @@ impl Drop for CatFileBatch {
 pub struct GitBareReader {
     bare_path: PathBuf,
     sha: String,
+    limits: IndexLimits,
     /// Lazily-spawned pooled `cat-file --batch` process. `None` until the first
     /// read; reset to `None` if the process dies so the next read re-spawns.
     batch: Mutex<Option<CatFileBatch>>,
@@ -370,12 +433,27 @@ impl GitBareReader {
         Self {
             bare_path: bare_path.to_path_buf(),
             sha: sha.to_string(),
+            limits: IndexLimits::default(),
+            batch: Mutex::new(None),
+        }
+    }
+
+    pub fn with_limits(bare_path: &Path, sha: &str, limits: IndexLimits) -> Self {
+        Self {
+            bare_path: bare_path.to_path_buf(),
+            sha: sha.to_string(),
+            limits,
             batch: Mutex::new(None),
         }
     }
 
     /// Resolve HEAD of the bare repo to a full SHA.
     pub fn from_head(bare_path: &Path) -> Result<Self> {
+        Self::from_head_with_limits(bare_path, IndexLimits::default())
+    }
+
+    /// Resolve HEAD while applying the configured source-file limit.
+    pub fn from_head_with_limits(bare_path: &Path, limits: IndexLimits) -> Result<Self> {
         let mut cmd = Command::new("git");
         cmd.args(["-C", &bare_path.display().to_string(), "rev-parse", "HEAD"]);
         let output = run_git_with_timeout(cmd, git_net_timeout())
@@ -390,7 +468,7 @@ impl GitBareReader {
             .context("non-utf8 SHA")?
             .trim()
             .to_string();
-        Ok(Self::new(bare_path, &sha))
+        Ok(Self::with_limits(bare_path, &sha, limits))
     }
 
     /// One-shot fallback read used when the pooled `cat-file --batch` process is
@@ -410,21 +488,31 @@ impl GitBareReader {
             "-s",
             &spec,
         ]);
-        if let Ok(out) = run_git_with_timeout(size_cmd, git_net_timeout())
-            && out.status.success()
-            && let Ok(size) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>()
-            && size > MAX_FILE_SIZE_BYTES
-        {
+        let size_output = run_git_with_timeout(size_cmd, git_net_timeout())
+            .with_context(|| format!("failed to preflight object size for {spec}"))?;
+        if !size_output.status.success() {
+            anyhow::bail!(
+                "git cat-file -s {} failed: {}",
+                spec,
+                String::from_utf8_lossy(&size_output.stderr).trim()
+            );
+        }
+        let size = String::from_utf8_lossy(&size_output.stdout)
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid git object size for {spec}"))?;
+        if size > self.limits.max_source_file_bytes() {
             tracing::warn!(
                 "skipping oversized blob {} (exceeds {} bytes) via git show",
                 rel_path.display(),
-                MAX_FILE_SIZE_BYTES
+                self.limits.max_source_file_bytes()
             );
-            anyhow::bail!(
-                "blob too large, skipped: {} exceeds {} bytes",
-                rel_path.display(),
-                MAX_FILE_SIZE_BYTES
-            );
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes: size,
+                limit_bytes: self.limits.max_source_file_bytes(),
+            }
+            .into());
         }
         let mut cmd = Command::new("git");
         cmd.args(["-C", &self.bare_path.display().to_string(), "show", &spec]);
@@ -448,7 +536,7 @@ impl ContentReader for GitBareReader {
 
         // Lazily spawn the pooled batch process on the first read.
         if guard.is_none() {
-            match CatFileBatch::spawn(&self.bare_path) {
+            match CatFileBatch::spawn(&self.bare_path, self.limits.max_source_file_bytes()) {
                 Ok(batch) => *guard = Some(batch),
                 Err(err) => {
                     tracing::warn!(
@@ -470,7 +558,7 @@ impl ContentReader for GitBareReader {
                 self.sha,
                 self.bare_path.display()
             ),
-            Ok(BatchObject::TooLarge) => {
+            Ok(BatchObject::TooLarge(observed_bytes)) => {
                 // Mirror the filesystem oversized-file skip: the blob was already
                 // read-and-discarded (never materialized) so the stream stays
                 // framed. Do NOT fall back to `git show` — that would re-read the
@@ -479,13 +567,14 @@ impl ContentReader for GitBareReader {
                 tracing::warn!(
                     "skipping oversized blob {} (exceeds {} bytes)",
                     rel_path.display(),
-                    MAX_FILE_SIZE_BYTES
+                    self.limits.max_source_file_bytes()
                 );
-                anyhow::bail!(
-                    "blob too large, skipped: {} exceeds {} bytes",
-                    rel_path.display(),
-                    MAX_FILE_SIZE_BYTES
-                )
+                Err(SourceTooLarge {
+                    path: rel_path.display().to_string(),
+                    observed_bytes,
+                    limit_bytes: self.limits.max_source_file_bytes(),
+                }
+                .into())
             }
             Err(err) => {
                 // The batch process likely died — discard it (so the next read
@@ -563,6 +652,10 @@ impl ContentReader for GitBareReader {
     fn version_id(&self) -> &str {
         &self.sha
     }
+
+    fn max_source_file_bytes(&self) -> u64 {
+        self.limits.max_source_file_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +677,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let reader = FilesystemReader::new(dir.path());
         assert!(reader.read_file(Path::new("nope.rs")).is_err());
+    }
+
+    #[test]
+    fn filesystem_reader_enforces_configured_source_limit_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let limit = crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES;
+        std::fs::write(dir.path().join("below.rs"), vec![b'x'; limit as usize - 1]).unwrap();
+        std::fs::write(dir.path().join("at.rs"), vec![b'x'; limit as usize]).unwrap();
+        std::fs::write(dir.path().join("above.rs"), vec![b'x'; limit as usize + 1]).unwrap();
+        let reader = FilesystemReader::with_limits(dir.path(), IndexLimits::new(limit).unwrap());
+        assert!(reader.read_file(Path::new("below.rs")).is_ok());
+        assert!(reader.read_file(Path::new("at.rs")).is_ok());
+        let error = reader.read_file(Path::new("above.rs")).unwrap_err();
+        let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
+        assert_eq!(oversized.observed_bytes, limit + 1);
+        assert_eq!(oversized.limit_bytes, limit);
     }
 
     #[test]
@@ -1102,13 +1211,14 @@ mod tests {
 
     // ---------- FIX 2: oversized blob cap on bare clones ----------
 
-    /// A blob whose git-reported size exceeds MAX_FILE_SIZE_BYTES must be skipped
+    /// A blob whose git-reported size exceeds the configured source limit must be skipped
     /// without being materialized, and the batch stream must stay framed so later
     /// valid reads through the same reader still succeed.
     #[test]
     fn git_bare_reader_skips_oversized_blob_and_keeps_stream_usable() {
         // Just over the cap; setup_bare_repo borrows &str so build it first.
-        let big = "x".repeat(MAX_FILE_SIZE_BYTES as usize + 1_000);
+        let limit = DEFAULT_MAX_SOURCE_FILE_BYTES;
+        let big = "x".repeat(limit as usize + 1_000);
         let (_tmp, bare, sha) = setup_bare_repo(&[
             ("small.txt", "tiny"),
             ("big.txt", big.as_str()),
@@ -1140,5 +1250,21 @@ mod tests {
             "still here"
         );
         assert_eq!(reader.read_file(Path::new("small.txt")).unwrap(), "tiny");
+    }
+
+    #[test]
+    fn git_show_fallback_enforces_the_same_object_size_limit() {
+        let limit = crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES;
+        let big = "x".repeat(limit as usize + 1);
+        let (_tmp, bare, sha) = setup_bare_repo(&[("big.rs", big.as_str())]);
+        let reader = GitBareReader::with_limits(
+            &bare,
+            &sha,
+            IndexLimits::new(limit).expect("test limit is valid"),
+        );
+        let error = reader.read_file_via_show(Path::new("big.rs")).unwrap_err();
+        let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
+        assert_eq!(oversized.observed_bytes, limit + 1);
+        assert_eq!(oversized.limit_bytes, limit);
     }
 }

@@ -33,6 +33,7 @@ pub use read::{
 };
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
+    TrigramRefreshStats,
 };
 pub use search::{
     EMBED_CHECKPOINT_INTERVAL, EmbeddingFlushCheckpoint, EmbeddingIndex, SearchResult,

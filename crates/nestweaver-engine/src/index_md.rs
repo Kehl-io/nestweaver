@@ -14,7 +14,8 @@ use anyhow::Context;
 use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{
-    ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
+    ParsedNote, RawTag, RawWikilink, SkipReasonCode, SkippedFile, TagSource, is_markdown,
+    parse_markdown,
 };
 use nestweaver_schema::{
     EdgeType, Heading, Note, Repo, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid,
@@ -47,7 +48,7 @@ pub struct MarkdownRefreshResult {
 
 /// Canonical full-refresh summary shared by direct CLI and daemon progress.
 pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String {
-    format!(
+    let mut summary = format!(
         "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
          {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
         result.index.vault_name,
@@ -58,7 +59,14 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
         result.index.tags_count,
         result.index.wikilinks_resolved,
         result.index.wikilinks_unresolved,
-    )
+    );
+    if !result.index.skipped.is_empty() {
+        summary.push_str(&format!(
+            " Coverage DEGRADED: {} note file(s) skipped.",
+            result.index.skipped.len()
+        ));
+    }
+    summary
 }
 
 /// Directory names skipped when walking a vault. Includes `.obsidian` (config),
@@ -97,7 +105,12 @@ fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
 /// logged warning. Architecture doc §9.7 specifies 1 MB; multi-MB markdown
 /// is almost always machine-generated (pasted logs, exported data dumps)
 /// and parsing them takes seconds while tanking ranking quality.
-pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
+pub(crate) const MAX_NOTE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+fn note_reader_limits() -> crate::index_limits::IndexLimits {
+    crate::index_limits::IndexLimits::new(MAX_NOTE_SIZE_BYTES)
+        .expect("note size policy is within source-reader safety bounds")
+}
 
 /// Index a markdown vault into a persistent `GraphStore` at `db_path`.
 ///
@@ -187,7 +200,8 @@ pub fn index_markdown_directory_with_store_and_deletion_count(
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
-    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let reader =
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
@@ -235,7 +249,8 @@ pub fn index_markdown_directory_in_memory(
 ) -> Result<(MarkdownIndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("create in-memory GraphStore")?;
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
-    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let reader =
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
     let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result.index, store))
@@ -418,7 +433,8 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
-    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let reader =
+        crate::content_reader::FilesystemReader::with_limits(&canonical, note_reader_limits());
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
@@ -480,7 +496,7 @@ fn index_markdown_since_with_reader(
         // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta(&rel_path) {
             Ok(Some((mtime_secs, file_size))) => {
-                if file_size > MAX_FILE_SIZE_BYTES {
+                if file_size > MAX_NOTE_SIZE_BYTES {
                     if existing_note_uids.contains(&n_uid) {
                         return Err(anyhow::anyhow!(
                             "cannot safely rebuild wikilinks for oversized indexed note {rel_path_str}"
@@ -1380,20 +1396,24 @@ where
         let rel_str = rel_path.to_string_lossy();
         if crate::brainignore::is_ignored(&rel_str, ignore_set) {
             tracing::debug!("brainignore: skipping {}", rel_str);
-            skipped.push(SkippedFile {
-                path: rel_str.into_owned(),
-                reason: "matched .brainignore pattern".to_string(),
-            });
+            skipped.push(SkippedFile::new(
+                rel_str.into_owned(),
+                SkipReasonCode::Ignored,
+                "matched .brainignore pattern",
+            ));
             continue;
         }
 
         // Size guard.
         if let Ok(Some((_, size))) = reader.file_meta(&rel_path)
-            && size > MAX_FILE_SIZE_BYTES
+            && size > MAX_NOTE_SIZE_BYTES
         {
             skipped.push(SkippedFile {
                 path: rel_str.into_owned(),
-                reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
+                reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
+                reason_code: SkipReasonCode::Oversized,
+                observed_bytes: Some(size),
+                limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
             });
             continue;
         }
@@ -1456,21 +1476,46 @@ where
             Ok(s) => s,
             Err(err) => {
                 parse_pb.inc(1);
-                return NoteOutcome::Skipped(SkippedFile {
-                    path: rel_path,
-                    reason: format!("read error: {err}"),
-                });
+                if let Some(oversized) = err.downcast_ref::<crate::content_reader::SourceTooLarge>()
+                {
+                    return NoteOutcome::Skipped(SkippedFile {
+                        path: rel_path,
+                        reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
+                        reason_code: SkipReasonCode::Oversized,
+                        observed_bytes: Some(oversized.observed_bytes),
+                        limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
+                    });
+                }
+                return NoteOutcome::Skipped(SkippedFile::new(
+                    rel_path,
+                    SkipReasonCode::ReadError,
+                    format!("read error: {err}"),
+                ));
             }
         };
+        // `file_meta` is unavailable for bare Git readers. Enforce the note
+        // policy again on the returned content so any reader implementation
+        // remains policy-correct even when it cannot preflight metadata.
+        if source.len() as u64 > MAX_NOTE_SIZE_BYTES {
+            parse_pb.inc(1);
+            return NoteOutcome::Skipped(SkippedFile {
+                path: rel_path,
+                reason: format!("file exceeds {} bytes", MAX_NOTE_SIZE_BYTES),
+                reason_code: SkipReasonCode::Oversized,
+                observed_bytes: Some(source.len() as u64),
+                limit_bytes: Some(MAX_NOTE_SIZE_BYTES),
+            });
+        }
 
         let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
             Ok(p) => p,
             Err(err) => {
                 parse_pb.inc(1);
-                return NoteOutcome::Skipped(SkippedFile {
-                    path: rel_path.clone(),
-                    reason: err.to_string(),
-                });
+                return NoteOutcome::Skipped(SkippedFile::new(
+                    rel_path.clone(),
+                    SkipReasonCode::ParseError,
+                    err.to_string(),
+                ));
             }
         };
 
@@ -2687,6 +2732,33 @@ sub b body
 
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "x").unwrap();
         assert_eq!(result.notes_count, 1);
+    }
+
+    #[test]
+    fn note_size_policy_remains_one_mib_at_exact_boundaries() {
+        let note = |title: &str, size: usize| {
+            let prefix = format!("# {title}\n\n");
+            format!("{prefix}{}", "x".repeat(size - prefix.len()))
+        };
+        let below = note("Below", MAX_NOTE_SIZE_BYTES as usize - 1);
+        let at = note("At", MAX_NOTE_SIZE_BYTES as usize);
+        let above = note("Above", MAX_NOTE_SIZE_BYTES as usize + 1);
+        let (_dir, root) = make_vault(&[
+            ("below.md", below.as_str()),
+            ("at.md", at.as_str()),
+            ("above.md", above.as_str()),
+        ]);
+
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "limits").unwrap();
+        assert_eq!(result.notes_count, 2, "limit - 1 and limit are indexed");
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].path, "above.md");
+        assert_eq!(result.skipped[0].reason_code, SkipReasonCode::Oversized);
+        assert_eq!(
+            result.skipped[0].observed_bytes,
+            Some(MAX_NOTE_SIZE_BYTES + 1)
+        );
+        assert_eq!(result.skipped[0].limit_bytes, Some(MAX_NOTE_SIZE_BYTES));
     }
 
     #[test]

@@ -88,6 +88,7 @@ pub struct WorkerPool {
     /// Populated from the instance config by the daemon; empty by default, so
     /// an unconfigured pool indexes everything as code (the prior behaviour).
     repo_types: Arc<HashMap<String, RepoType>>,
+    index_limits: crate::index_limits::IndexLimits,
     /// Tracks successful incremental code updates so server mode can
     /// periodically force a full refresh and bound graph drift.
     reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
@@ -99,6 +100,7 @@ impl WorkerPool {
             concurrency,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             repo_types: Arc::new(HashMap::new()),
+            index_limits: crate::index_limits::IndexLimits::default(),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
     }
@@ -110,6 +112,12 @@ impl WorkerPool {
     /// supplying the full set is also fine.
     pub fn with_repo_types(mut self, repo_types: HashMap<String, RepoType>) -> Self {
         self.repo_types = Arc::new(repo_types);
+        self
+    }
+
+    /// Apply the configured source-file safety limit to bare-repository reads.
+    pub fn with_index_limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
+        self.index_limits = limits;
         self
     }
 
@@ -171,6 +179,7 @@ impl WorkerPool {
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
+        let index_limits = self.index_limits;
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -340,11 +349,12 @@ impl WorkerPool {
                                 false
                             };
 
-                            let outcome = commit_prepared_job_with_reindex_decision(
+                            let outcome = commit_prepared_job_with_reindex_decision_and_limits(
                                 &prepared,
                                 &store,
                                 &instance_id,
                                 force_full_reindex,
+                                index_limits,
                                 move || {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
@@ -630,6 +640,31 @@ enum ReindexOutcome {
     Incremental,
 }
 
+fn report_degraded_worker_coverage(
+    repo_url: &str,
+    skipped_files: &[nestweaver_parser::SkippedFile],
+) {
+    if skipped_files.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        repo = %repo_url,
+        skipped_count = skipped_files.len(),
+        "server worker published degraded source coverage"
+    );
+    for skipped in skipped_files {
+        tracing::warn!(
+            repo = %repo_url,
+            path = %skipped.path,
+            reason = ?skipped.reason_code,
+            observed_bytes = skipped.observed_bytes,
+            limit_bytes = skipped.limit_bytes,
+            detail = %skipped.reason,
+            "server worker policy-skipped an eligible source file"
+        );
+    }
+}
+
 fn current_file_count(
     store: &nestweaver_store::GraphStore,
     instance_id: &str,
@@ -691,11 +726,33 @@ fn persist_reindex_outcome(
     }
 }
 
+#[cfg(test)]
 fn commit_prepared_job_with_reindex_decision<G, F>(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,
     instance_id: &str,
     force_full_reindex: bool,
+    acquire_write_guard: F,
+) -> Result<ReindexOutcome, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    commit_prepared_job_with_reindex_decision_and_limits(
+        prepared,
+        store,
+        instance_id,
+        force_full_reindex,
+        crate::index_limits::IndexLimits::default(),
+        acquire_write_guard,
+    )
+}
+
+fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
+    prepared: &PreparedIndexJob,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    force_full_reindex: bool,
+    limits: crate::index_limits::IndexLimits,
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
@@ -732,8 +789,17 @@ where
     }
 
     // Build a reader over the bare clone at the new SHA.
-    let reader =
-        crate::content_reader::GitBareReader::new(&prepared.bare_path, &prepared.remote_sha);
+    let reader_limits = if prepared.repo_type == RepoType::Vault {
+        crate::index_limits::IndexLimits::new(crate::index_md::MAX_NOTE_SIZE_BYTES)
+            .expect("note size policy is within source-reader safety bounds")
+    } else {
+        limits
+    };
+    let reader = crate::content_reader::GitBareReader::with_limits(
+        &prepared.bare_path,
+        &prepared.remote_sha,
+        reader_limits,
+    );
 
     match prepared.repo_type {
         RepoType::Vault => {
@@ -799,6 +865,7 @@ where
                     &prepared.remote_sha,
                     acquire_write_guard,
                 )?;
+                report_degraded_worker_coverage(&prepared.repo_url, &result.skipped_files);
                 if result.fell_back_to_full {
                     Ok(ReindexOutcome::Full)
                 } else {
@@ -815,7 +882,7 @@ where
                 // self-committing delete before the parse phase re-opens the
                 // empty-repo window (a concurrent reader or Backup RPC would see
                 // zero symbols for the whole scan+parse span).
-                crate::index_with_reader_and_write_gate(
+                let result = crate::index_with_reader_and_write_gate(
                     &reader,
                     store,
                     instance_id,
@@ -825,6 +892,7 @@ where
                     None,
                     acquire_write_guard,
                 )?;
+                report_degraded_worker_coverage(&prepared.repo_url, &result.skipped_files);
                 Ok(ReindexOutcome::Full)
             }
         }

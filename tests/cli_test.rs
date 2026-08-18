@@ -2831,6 +2831,79 @@ credential_method = "gh"
     config_path
 }
 
+#[test]
+fn index_json_reports_degraded_source_coverage_and_fail_on_skip_is_strict() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mut source = String::from("pub fn oversized_marker() {}\n");
+    source.push_str(&"// padding\n".repeat(200));
+    assert!(source.len() > 1024);
+    std::fs::write(repo.join("main.rs"), source).unwrap();
+
+    let config = nw047_valid_config(dir.path(), "coverage-test");
+    let mut config_body = std::fs::read_to_string(&config).unwrap();
+    config_body.push_str("\n[indexing]\nmax_source_file_bytes = 1024\n");
+    std::fs::write(&config, config_body).unwrap();
+
+    let run = |db: &std::path::Path, fail_on_skip: bool| {
+        let mut command = nestweaver_cmd();
+        command
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(db)
+            .arg("--config")
+            .arg(&config)
+            .args(["--force", "--json"]);
+        if fail_on_skip {
+            command.arg("--fail-on-skip");
+        }
+        command.output().unwrap()
+    };
+
+    let best_effort = run(&dir.path().join("best-effort.lbug"), false);
+    assert!(best_effort.status.success(), "{best_effort:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&best_effort.stdout).unwrap();
+    assert_eq!(payload["coverage_status"], "degraded");
+    assert_eq!(payload["skipped_count"], 1);
+    assert_eq!(payload["skipped_files"][0]["path"], "main.rs");
+    assert_eq!(payload["skipped_files"][0]["reason_code"], "oversized");
+    assert_eq!(payload["skipped_files"][0]["limit_bytes"], 1024);
+
+    let strict = run(&dir.path().join("strict.lbug"), true);
+    assert!(!strict.status.success());
+    let strict_payload: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(strict_payload["coverage_status"], "degraded");
+    assert_eq!(strict_payload["skipped_count"], 1);
+}
+
+#[test]
+fn invalid_source_limit_fails_before_database_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.rs"), "pub fn marker() {}\n").unwrap();
+    let config = nw047_valid_config(dir.path(), "invalid-limit");
+    let mut config_body = std::fs::read_to_string(&config).unwrap();
+    config_body.push_str("\n[indexing]\nmax_source_file_bytes = 512\n");
+    std::fs::write(&config, config_body).unwrap();
+    let db = dir.path().join("must-not-exist").join("brain.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(contains("max_source_file_bytes"));
+    assert!(!db.exists());
+    assert!(!db.parent().unwrap().exists());
+}
+
 fn nw047_repo_instances(db_path: &std::path::Path) -> Vec<String> {
     let output = nestweaver_cmd()
         .args(["list-repos", "--json", "--db"])

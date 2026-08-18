@@ -34,6 +34,10 @@ message IndexRepoRequest {
   bool with_trigrams = 4;
   bool with_git_activity = 5;
   string instance_id = 6;  // nw-019: logical instance for the indexed data. Empty = daemon decides (config name, else runtime hash).
+  bool rebuild_trigrams = 7;
+  // Validated client policy. Zero asks the daemon to use its configured/default
+  // value; non-zero must remain within the daemon's hard safety bounds.
+  uint64 max_source_file_bytes = 8;
 }
 
 message IndexVaultRequest {
@@ -110,6 +114,36 @@ message IndexProgress {
   uint64 files_processed = 3;
   uint64 files_total = 4;
   uint64 symbols_found = 5;
+  uint64 skipped_count = 6;
+  repeated IndexSkipDetail skipped_files = 7;
+  CoverageStatus coverage_status = 8;
+  TrigramRefreshDetail trigram_refresh = 9;
+}
+
+enum CoverageStatus {
+  COVERAGE_STATUS_UNSPECIFIED = 0;
+  COMPLETE = 1;
+  DEGRADED = 2;
+}
+
+message IndexSkipDetail {
+  string path = 1;
+  string reason_code = 2;
+  string detail = 3;
+  optional uint64 observed_bytes = 4;
+  optional uint64 limit_bytes = 5;
+}
+
+message TrigramRefreshDetail {
+  uint64 scopes_refreshed = 1;
+  uint64 scopes_unchanged = 2;
+  uint64 nodes_added = 3;
+  uint64 nodes_changed = 4;
+  uint64 nodes_deleted = 5;
+  uint64 postings_added = 6;
+  uint64 postings_deleted = 7;
+  bool migrated_legacy_index = 8;
+  uint64 elapsed_ms = 9;
 }
 
 // ─── Write RPCs ─────────────────────────────────────────────────────

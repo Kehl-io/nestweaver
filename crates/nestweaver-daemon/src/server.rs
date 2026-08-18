@@ -1063,6 +1063,7 @@ fn index_done_message(
     edges_count: usize,
     repo_path: &std::path::Path,
     cancelled: bool,
+    skipped_count: usize,
 ) -> String {
     if cancelled {
         format!(
@@ -1075,11 +1076,46 @@ fn index_done_message(
             edges_count,
             repo_path.display()
         )
+    } else if skipped_count > 0 {
+        format!(
+            "Done — DEGRADED — {} files, {} symbols, {} edges; {} eligible file(s) skipped",
+            files_count, symbols_count, edges_count, skipped_count
+        )
     } else {
         format!(
             "Done — {} files, {} symbols, {} edges",
             files_count, symbols_count, edges_count
         )
+    }
+}
+
+fn index_skip_details(skipped: &[nestweaver_parser::SkippedFile]) -> Vec<IndexSkipDetail> {
+    skipped
+        .iter()
+        .map(|file| IndexSkipDetail {
+            path: file.path.clone(),
+            reason_code: serde_json::to_value(file.reason_code)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "other".to_string()),
+            detail: file.reason.clone(),
+            observed_bytes: file.observed_bytes,
+            limit_bytes: file.limit_bytes,
+        })
+        .collect()
+}
+
+fn trigram_refresh_detail(stats: &nestweaver_store::TrigramRefreshStats) -> TrigramRefreshDetail {
+    TrigramRefreshDetail {
+        scopes_refreshed: stats.scopes_refreshed as u64,
+        scopes_unchanged: stats.scopes_unchanged as u64,
+        nodes_added: stats.nodes_added as u64,
+        nodes_changed: stats.nodes_changed as u64,
+        nodes_deleted: stats.nodes_deleted as u64,
+        postings_added: stats.postings_added as u64,
+        postings_deleted: stats.postings_deleted as u64,
+        migrated_legacy_index: stats.migrated_legacy_index,
+        elapsed_ms: stats.elapsed_ms,
     }
 }
 
@@ -1089,7 +1125,7 @@ mod index_done_message_tests {
 
     #[test]
     fn cancelled_variant_reports_commit_and_names_repair() {
-        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), true);
+        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), true, 0);
         assert!(message.contains("COMMITTED"), "{message}");
         assert!(
             message.contains("nestweaver index --repo /tmp/repo --force"),
@@ -1102,8 +1138,17 @@ mod index_done_message_tests {
 
     #[test]
     fn uncancelled_variant_is_the_plain_done_line() {
-        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), false);
+        let message =
+            index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), false, 0);
         assert_eq!(message, "Done — 12 files, 340 symbols, 1500 edges");
+    }
+
+    #[test]
+    fn skipped_files_make_done_explicitly_degraded() {
+        let message =
+            index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), false, 2);
+        assert!(message.contains("DEGRADED"), "{message}");
+        assert!(message.contains("2 eligible file(s) skipped"), "{message}");
     }
 }
 
@@ -3644,7 +3689,14 @@ impl NestWeaverDaemon for DaemonService {
 
         let db_path = self.state.db_path.clone();
 
-        let mut watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
+        let limits = self
+            .state
+            .instance_cfg
+            .as_ref()
+            .map(|config| config.indexing.limits())
+            .unwrap_or_default();
+        let mut watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id)
+            .with_limits(limits);
         let shutdown_handle = watcher.shutdown_handle();
 
         // Refuse BEFORE registering — and here the ordering matters more than in
@@ -3900,13 +3952,19 @@ impl NestWeaverDaemon for DaemonService {
                     let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
                     let watch_store = state.store.clone();
                     let watch_instance = watch_instance.clone();
+                    let watch_limits = state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|config| config.indexing.limits())
+                        .unwrap_or_default();
 
                     tokio::task::spawn_blocking(move || {
                         let watcher = nestweaver_engine::CodeWatcher::new(
                             &watch_db,
                             &watch_repo,
                             &watch_instance,
-                        );
+                        )
+                        .with_limits(watch_limits);
                         if let Err(e) = watcher.run_with_store(watch_store, None) {
                             tracing::error!("CodeWatcher failed: {e}");
                         }
@@ -3983,10 +4041,16 @@ impl NestWeaverDaemon for DaemonService {
             let watch_db = state.db_path.clone();
             let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
             let watch_store = state.store.clone();
+            let watch_limits = state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.indexing.limits())
+                .unwrap_or_default();
 
             tokio::task::spawn_blocking(move || {
                 let watcher =
-                    nestweaver_engine::CodeWatcher::new(&watch_db, &watch_repo, &watch_instance);
+                    nestweaver_engine::CodeWatcher::new(&watch_db, &watch_repo, &watch_instance)
+                        .with_limits(watch_limits);
                 if let Err(e) = watcher.run_with_store(watch_store, None) {
                     tracing::error!("CodeWatcher failed: {e}");
                 }
@@ -4063,6 +4127,7 @@ impl NestWeaverDaemon for DaemonService {
         let state = self.state.clone();
         let force = req.force;
         let with_trigrams = req.with_trigrams;
+        let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
             None
@@ -4071,6 +4136,16 @@ impl NestWeaverDaemon for DaemonService {
         };
         let effective_instance =
             resolve_effective_instance_id(&req.instance_id, &state.data_instance_id)?;
+        let index_limits = if req.max_source_file_bytes == 0 {
+            state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.indexing.limits())
+                .unwrap_or_default()
+        } else {
+            nestweaver_engine::index_limits::IndexLimits::new(req.max_source_file_bytes)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
@@ -4178,9 +4253,10 @@ impl NestWeaverDaemon for DaemonService {
                 files_processed: 0,
                 files_total: 0,
                 symbols_found: 0,
+                ..Default::default()
             }));
 
-            match nestweaver_engine::index_directory_with_store_cancellable(
+            match nestweaver_engine::index::index_directory_with_store_cancellable_and_limits(
                 &state.store,
                 &repo_path,
                 &state.db_path,
@@ -4192,8 +4268,16 @@ impl NestWeaverDaemon for DaemonService {
                 force,
                 name.as_deref(),
                 &cancel_for_index,
+                index_limits,
             ) {
                 Ok(result) => {
+                    let skipped_count = result.skipped_files.len();
+                    let skipped_files = index_skip_details(&result.skipped_files);
+                    let coverage_status = if skipped_count == 0 {
+                        CoverageStatus::Complete as i32
+                    } else {
+                        CoverageStatus::Degraded as i32
+                    };
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Writing as i32,
                         message: format!(
@@ -4203,6 +4287,10 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
                         symbols_found: result.symbols_count as u64,
+                        skipped_count: skipped_count as u64,
+                        skipped_files: skipped_files.clone(),
+                        coverage_status,
+                        trigram_refresh: None,
                     }));
 
                     // PageRank is deferred to first query (lazy evaluation
@@ -4230,10 +4318,15 @@ impl NestWeaverDaemon for DaemonService {
                                 result.edges_count,
                                 &repo_path,
                                 true,
+                                skipped_count,
                             ),
                             files_processed: result.files_count as u64,
                             files_total: result.files_count as u64,
                             symbols_found: result.symbols_count as u64,
+                            skipped_count: skipped_count as u64,
+                            skipped_files: skipped_files.clone(),
+                            coverage_status,
+                            trigram_refresh: None,
                         }));
                         return;
                     }
@@ -4300,20 +4393,45 @@ impl NestWeaverDaemon for DaemonService {
                     }
 
                     // Trigram index.
+                    let mut trigram_refresh = None;
                     if with_trigrams {
                         let _ = tx.blocking_send(Ok(IndexProgress {
-                            message: "Building trigram index...".to_string(),
+                            message: "Refreshing trigram index...".to_string(),
                             ..Default::default()
                         }));
-                        match state.store.build_trigram_index() {
-                            Ok(postings) => {
-                                tracing::info!(postings, "trigram index built");
+                        let refresh = if rebuild_trigrams {
+                            state.store.rebuild_trigram_index()
+                        } else {
+                            state.store.refresh_trigram_index(false)
+                        };
+                        match refresh {
+                            Ok(stats) => {
+                                tracing::info!(?stats, "trigram index refreshed");
+                                trigram_refresh = Some(trigram_refresh_detail(&stats));
                                 let _ = tx.blocking_send(Ok(IndexProgress {
-                                    message: format!("Trigram index built ({postings} postings)."),
+                                    message: format!(
+                                        "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) changed; {} posting(s) added, {} deleted in {} ms{}.",
+                                        stats.scopes_refreshed,
+                                        stats.scopes_unchanged,
+                                        stats.nodes_added + stats.nodes_changed + stats.nodes_deleted,
+                                        stats.postings_added,
+                                        stats.postings_deleted,
+                                        stats.elapsed_ms,
+                                        if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
+                                    ),
                                     ..Default::default()
                                 }));
                             }
-                            Err(e) => tracing::warn!("trigram index build failed: {e}"),
+                            Err(e) => {
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    phase: Phase::Error as i32,
+                                    message: format!(
+                                        "Code index committed, but requested trigram refresh failed: {e}"
+                                    ),
+                                    ..Default::default()
+                                }));
+                                return;
+                            }
                         }
                     }
 
@@ -4329,10 +4447,15 @@ impl NestWeaverDaemon for DaemonService {
                             result.edges_count,
                             &repo_path,
                             cancel_for_index.load(std::sync::atomic::Ordering::Acquire),
+                            skipped_count,
                         ),
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
                         symbols_found: result.symbols_count as u64,
+                        skipped_count: skipped_count as u64,
+                        skipped_files,
+                        coverage_status,
+                        trigram_refresh,
                     }));
                 }
                 Err(e) => {
@@ -4342,6 +4465,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
+                        ..Default::default()
                     }));
                 }
             }
@@ -4384,6 +4508,7 @@ impl NestWeaverDaemon for DaemonService {
                 files_processed: 0,
                 files_total: 0,
                 symbols_found: 0,
+                ..Default::default()
             }));
 
             let index_result =
@@ -4398,6 +4523,13 @@ impl NestWeaverDaemon for DaemonService {
 
             match index_result {
                 Ok(result) => {
+                    let skipped_files = index_skip_details(&result.index.skipped);
+                    let skipped_count = skipped_files.len();
+                    let coverage_status = if skipped_count == 0 {
+                        CoverageStatus::Complete as i32
+                    } else {
+                        CoverageStatus::Degraded as i32
+                    };
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Writing as i32,
                         message: format!(
@@ -4409,6 +4541,10 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: result.index.notes_count as u64,
                         files_total: result.index.notes_count as u64,
                         symbols_found: result.index.headings_count as u64,
+                        skipped_count: skipped_count as u64,
+                        skipped_files: skipped_files.clone(),
+                        coverage_status,
+                        trigram_refresh: None,
                     }));
 
                     // Rebuild Tantivy search index so BM25 search reflects
@@ -4435,6 +4571,10 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: result.index.notes_count as u64,
                         files_total: result.index.notes_count as u64,
                         symbols_found: result.index.headings_count as u64,
+                        skipped_count: skipped_count as u64,
+                        skipped_files,
+                        coverage_status,
+                        trigram_refresh: None,
                     }));
                 }
                 Err(e) => {
@@ -4444,6 +4584,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
+                        ..Default::default()
                     }));
                 }
             }
@@ -4492,6 +4633,7 @@ impl NestWeaverDaemon for DaemonService {
                 files_processed: 0,
                 files_total: 0,
                 symbols_found: 0,
+                ..Default::default()
             }));
 
             match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore(
@@ -4515,6 +4657,7 @@ impl NestWeaverDaemon for DaemonService {
                                 files_processed: result.files_checked as u64,
                                 files_total: result.files_checked as u64,
                                 symbols_found: result.headings_count as u64,
+                                ..Default::default()
                             }));
                         return;
                     }
@@ -4545,6 +4688,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: result.files_checked as u64,
                         files_total: result.files_checked as u64,
                         symbols_found: result.headings_count as u64,
+                        ..Default::default()
                     }));
                 }
                 Err(error) => {
@@ -4554,6 +4698,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
+                        ..Default::default()
                     }));
                 }
             }
@@ -4604,6 +4749,7 @@ impl NestWeaverDaemon for DaemonService {
                     files_processed: 0,
                     files_total: project_total,
                     symbols_found: 0,
+                    ..Default::default()
                 }));
                 Ok(lease)
             });
@@ -4618,6 +4764,7 @@ impl NestWeaverDaemon for DaemonService {
                 files_processed: 0,
                 files_total: instance_config.projects.len() as u64,
                 symbols_found: 0,
+                ..Default::default()
             }));
 
             match nestweaver_engine::materialize_projects_with_lease(
@@ -4640,6 +4787,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: result.projects_created as u64,
                         files_total: result.projects_created as u64,
                         symbols_found: result.symbol_edges as u64,
+                        ..Default::default()
                     }));
                 }
                 Err(e) => {
@@ -4649,6 +4797,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: 0,
                         files_total: instance_config.projects.len() as u64,
                         symbols_found: 0,
+                        ..Default::default()
                     }));
                 }
             }
@@ -4906,6 +5055,7 @@ impl NestWeaverDaemon for DaemonService {
                 files_processed: 0,
                 files_total: 0,
                 symbols_found: 0,
+                ..Default::default()
             }));
 
             match run_purge_instance_with(
@@ -4934,6 +5084,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: (result.repos + result.vaults) as u64,
                         files_total: (result.repos + result.vaults) as u64,
                         symbols_found: result.symbols as u64,
+                        ..Default::default()
                     }));
                 }
                 Err(e) => {
@@ -4943,6 +5094,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
+                        ..Default::default()
                     }));
                 }
             }
@@ -9801,6 +9953,11 @@ pub async fn run_server(
                 .as_ref()
                 .map(|c| build_repo_types(&c.repos))
                 .unwrap_or_default();
+            let worker_index_limits = state
+                .instance_cfg
+                .as_ref()
+                .map(|config| config.indexing.limits())
+                .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -9825,7 +9982,8 @@ pub async fn run_server(
                         }
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
-                    .with_repo_types(worker_repo_types);
+                    .with_repo_types(worker_repo_types)
+                    .with_index_limits(worker_index_limits);
                 pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),

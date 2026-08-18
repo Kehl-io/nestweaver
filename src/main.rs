@@ -101,8 +101,7 @@ use nestweaver_engine::{
     export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
-    generate_summaries, get_last_indexed_at, incremental_index_with_name,
-    index_directory_with_options, index_markdown_directory_since_with_ignore,
+    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
     index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
     list_repos, list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
@@ -2449,10 +2448,16 @@ enum Commands {
         name: Option<String>,
         #[arg(
             long = "with-trigrams",
-            help = "Build a trigram posting table over indexed text to accelerate `regex-search` \
-                    (opt-in storage cost)"
+            help = "Incrementally refresh trigram postings for changed repo/vault scopes to \
+                    accelerate `regex-search` (opt-in storage cost)"
         )]
         with_trigrams: bool,
+        #[arg(
+            long = "rebuild-trigrams",
+            requires = "with_trigrams",
+            help = "Force a full v2 trigram rebuild instead of refreshing changed scopes"
+        )]
+        rebuild_trigrams: bool,
         #[arg(
             long = "with-git-activity",
             help = "Feature F12: mine git history and write a <db>.gitactivity.json recency \
@@ -2465,6 +2470,12 @@ enum Commands {
                     opt-out for --with-git-activity"
         )]
         config: Option<PathBuf>,
+        /// Emit one terminal machine-readable result on stdout; progress remains on stderr.
+        #[arg(long)]
+        json: bool,
+        /// Return a non-zero exit status when eligible files were policy-skipped.
+        #[arg(long)]
+        fail_on_skip: bool,
         /// Configure detected AI tool integrations at the indexed repo root after
         /// indexing (bypasses the TTY/cwd auto-setup gate).
         #[arg(long)]
@@ -10721,6 +10732,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_ERROR, None));
             }
             let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let index_limits = match config.as_deref() {
+                Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
+                    .with_context(|| format!("failed to load config from {}", path.display()))?
+                    .indexing
+                    .limits(),
+                None => nestweaver_engine::index_limits::IndexLimits::default(),
+            };
             // nw-019: --instance flag > config's instance_id > "default"
             // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
             // with no --instance stamps symbols under "default" even with the
@@ -10812,7 +10830,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Fallback: run watcher directly.
-            let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
+            let watcher =
+                CodeWatcher::new(&db_path, &repo_path, &instance_id).with_limits(index_limits);
             let stop = watcher.shutdown_handle();
 
             let lock_path = {
@@ -11272,6 +11291,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 truncated: false,
                                 scanned_fallback: false,
                                 stale_index: false,
+                                ready_scopes: 0,
+                                dirty_scopes: 0,
+                                scanned_candidates: 0,
                                 note: None,
                             }
                         });
@@ -11481,7 +11503,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(Some(&db_path))?;
             let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+            let limits = match config.as_deref() {
+                Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
+                    .with_context(|| format!("failed to load config from {}", path.display()))?
+                    .indexing
+                    .limits(),
+                None => nestweaver_engine::index_limits::IndexLimits::default(),
+            };
+            let reader =
+                nestweaver_engine::content_reader::FilesystemReader::with_limits(&root, limits);
             let res = nestweaver_engine::read_symbols::read_symbols(
                 &store,
                 &targets,
@@ -13285,8 +13315,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             name,
             with_trigrams,
+            rebuild_trigrams,
             with_git_activity,
             config,
+            json,
+            fail_on_skip,
             setup,
         } => {
             let repo_path = match repo {
@@ -13300,6 +13333,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
             let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let index_limits = match config.as_deref() {
+                Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
+                    .with_context(|| format!("failed to load config from {}", path.display()))?
+                    .indexing
+                    .limits(),
+                None => nestweaver_engine::index_limits::IndexLimits::default(),
+            };
             // Create-operation: a --db in a not-yet-existing directory must
             // not fail with a bare OS error on either the daemon or the
             // direct path — create the parent directories up front.
@@ -13328,12 +13368,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     force,
                     with_trigrams,
                     with_git_activity,
+                    rebuild_trigrams,
+                    // Zero preserves an already-running daemon's configured
+                    // policy when this invocation did not name a config.
+                    max_source_file_bytes: if config.is_some() {
+                        index_limits.max_source_file_bytes()
+                    } else {
+                        0
+                    },
                     // nw-019: thread an explicit `--instance` through the RPC so it
                     // overrides the daemon's default; empty lets the daemon decide.
                     instance_id: instance.clone().unwrap_or_default(),
                 };
 
                 let index_result = rt.block_on(async {
+                    let mut terminal_progress = None;
                     // A3: `index_repo` serialises behind the daemon write lock.
                     // Blocked behind a long embed it used to print nothing at
                     // all, which read as a hang. This adds a periodic notice
@@ -13347,7 +13396,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         },
                     );
                     let stream = client.inner_mut().index_repo(req).await?.into_inner();
-                    consume_cli_index_progress(stream, |progress| {
+                    let message = consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
                             1 => "Parsing",
@@ -13359,21 +13408,95 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
+                        if progress.phase == nestweaver_proto::Phase::Done as i32 {
+                            terminal_progress = Some(progress.clone());
+                        }
                     })
-                    .await
+                    .await?;
+                    Ok::<_, anyhow::Error>((message, terminal_progress))
                 });
 
                 // Logical failures arrive in-band. Empty, truncated, malformed,
                 // and transport-failed streams must also skip auto-setup.
-                if let Err(error) = index_result {
-                    out.status(&format!("Index failed: {error}"));
-                    return Ok((EXIT_ERROR, None));
+                let (_message, terminal) = match index_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        out.status(&format!("Index failed: {error}"));
+                        return Ok((EXIT_ERROR, None));
+                    }
+                };
+                let terminal = terminal.ok_or_else(|| {
+                    anyhow::anyhow!("index completed without a terminal progress payload")
+                })?;
+                if json {
+                    let skipped: Vec<_> = terminal
+                        .skipped_files
+                        .iter()
+                        .map(|file| {
+                            serde_json::json!({
+                                "path": file.path,
+                                "reason_code": file.reason_code,
+                                "detail": file.detail,
+                                "observed_bytes": file.observed_bytes,
+                                "limit_bytes": file.limit_bytes,
+                            })
+                        })
+                        .collect();
+                    let trigram_refresh = terminal.trigram_refresh.as_ref().map(|stats| {
+                        serde_json::json!({
+                            "scopes_refreshed": stats.scopes_refreshed,
+                            "scopes_unchanged": stats.scopes_unchanged,
+                            "nodes_added": stats.nodes_added,
+                            "nodes_changed": stats.nodes_changed,
+                            "nodes_deleted": stats.nodes_deleted,
+                            "postings_added": stats.postings_added,
+                            "postings_deleted": stats.postings_deleted,
+                            "migrated_legacy_index": stats.migrated_legacy_index,
+                            "elapsed_ms": stats.elapsed_ms,
+                        })
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "coverage_status": if terminal.coverage_status
+                                == nestweaver_proto::CoverageStatus::Degraded as i32
+                            {
+                                "degraded"
+                            } else {
+                                "complete"
+                            },
+                            "files_processed": terminal.files_processed,
+                            "symbols_found": terminal.symbols_found,
+                            "skipped_count": terminal.skipped_count,
+                            "skipped_files": skipped,
+                            "trigram_refresh": trigram_refresh,
+                            "message": terminal.message,
+                        }))?
+                    );
+                } else if terminal.skipped_count > 0 {
+                    out.status(&format!(
+                        "Skipped {} eligible file(s):",
+                        terminal.skipped_count
+                    ));
+                    for file in &terminal.skipped_files {
+                        out.status(&format!(
+                            "  {} — {}: {}",
+                            file.path, file.reason_code, file.detail
+                        ));
+                    }
                 }
 
                 // nw-023: setup is client-side (config files + marker, no DB access); give
                 // daemon-mode users the same gated first-index convenience as the direct path.
                 maybe_run_auto_setup(&db_path, &repo_path, out, setup);
-                return Ok((EXIT_SUCCESS, None));
+                return Ok((
+                    if fail_on_skip && terminal.skipped_count > 0 {
+                        EXIT_ERROR
+                    } else {
+                        EXIT_SUCCESS
+                    },
+                    None,
+                ));
             }
 
             // nw-047: resolve `--instance` > config `instance_id` > "default"
@@ -13413,10 +13536,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .unwrap_or_else(|| "local".to_string());
 
             let (files_count, symbols_count, edges_count);
+            let skipped_files;
 
             if force {
                 // Full re-index requested explicitly.
-                let result = index_directory_with_options(
+                let result = nestweaver_engine::index::index_directory_with_options_and_limits(
                     &repo_path,
                     &db_path,
                     &instance_id,
@@ -13424,6 +13548,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &indexed_sha,
                     true,
                     name.as_deref(),
+                    index_limits,
                 )
                 .context("index_directory")?;
 
@@ -13431,31 +13556,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 symbols_count = result.symbols_count;
                 edges_count = result.edges_count;
 
-                println!(
-                    "Indexed {} file(s), {} symbol(s), {} edge(s).",
-                    files_count, symbols_count, edges_count
-                );
-
-                if !result.skipped_files.is_empty() {
-                    out.status(&format!("Skipped {} file(s):", result.skipped_files.len()));
-                    for sf in &result.skipped_files {
-                        out.status(&format!("  {} — {}", sf.path, sf.reason));
-                    }
+                if !json {
+                    println!(
+                        "Indexed {} file(s), {} symbol(s), {} edge(s).",
+                        files_count, symbols_count, edges_count
+                    );
                 }
+
+                skipped_files = result.skipped_files;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = incremental_index_with_name(
+                let inc = nestweaver_engine::index::incremental_index_with_name_and_limits(
                     &repo_path,
                     &db_path,
                     &instance_id,
                     &repo_url,
                     name.as_deref(),
+                    index_limits,
                 )
                 .context("incremental_index")?;
 
                 files_count = inc.files_added + inc.files_modified;
                 symbols_count = inc.symbols_added;
                 edges_count = 0; // not tracked separately in incremental
+                skipped_files = inc.skipped_files.clone();
 
                 if inc.fell_back_to_full {
                     out.status(
@@ -13473,6 +13597,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     out.status(&format!(
                         "Incremental: {} symbol(s) added, {} symbol(s) removed.",
                         inc.symbols_added, inc.symbols_removed,
+                    ));
+                }
+            }
+
+            if !json && !skipped_files.is_empty() {
+                out.status(&format!(
+                    "Done — DEGRADED — skipped {} eligible file(s):",
+                    skipped_files.len()
+                ));
+                for file in &skipped_files {
+                    out.status(&format!(
+                        "  {} — {:?}: {}",
+                        file.path, file.reason_code, file.reason
                     ));
                 }
             }
@@ -13538,20 +13675,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            let mut trigram_refresh_stats = None;
             if with_trigrams {
-                out.status("Building trigram index...");
+                out.status("Refreshing trigram index...");
                 let store = GraphStore::open(&db_path)
                     .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-                let postings = store
-                    .build_trigram_index()
-                    .with_context(|| "build_trigram_index")?;
-                out.status(&format!("Trigram index built ({postings} postings)."));
+                let stats = if rebuild_trigrams {
+                    store.rebuild_trigram_index()
+                } else {
+                    store.refresh_trigram_index(false)
+                }
+                .with_context(|| "refresh_trigram_index")?;
+                out.status(&format!(
+                    "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) added, {} changed, {} deleted; {} posting(s) added, {} deleted in {} ms{}.",
+                    stats.scopes_refreshed,
+                    stats.scopes_unchanged,
+                    stats.nodes_added,
+                    stats.nodes_changed,
+                    stats.nodes_deleted,
+                    stats.postings_added,
+                    stats.postings_deleted,
+                    stats.elapsed_ms,
+                    if stats.migrated_legacy_index { "; migrated legacy v1 index" } else { "" },
+                ));
+                trigram_refresh_stats = Some(stats);
             }
 
             // Auto-setup AI tool integrations on first index of this repo.
             // Uses a marker sidecar so it only fires once per db, not on every
             // incremental re-index. Non-fatal — a failure here never aborts the index.
             maybe_run_auto_setup(&db_path, &repo_path, out, setup);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "coverage_status": if skipped_files.is_empty() { "complete" } else { "degraded" },
+                        "files_processed": files_count,
+                        "symbols_found": symbols_count,
+                        "edges_found": edges_count,
+                        "skipped_count": skipped_files.len(),
+                        "skipped_files": skipped_files,
+                        "trigram_refresh": trigram_refresh_stats,
+                    }))?
+                );
+            }
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
@@ -13561,7 +13729,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 format_elapsed(t0.elapsed())
             );
 
-            Ok((EXIT_SUCCESS, Some(stats)))
+            Ok((
+                if fail_on_skip && !skipped_files.is_empty() {
+                    EXIT_ERROR
+                } else {
+                    EXIT_SUCCESS
+                },
+                Some(stats),
+            ))
         }
 
         Commands::Daemon { action, db } => {
@@ -16298,6 +16473,18 @@ fn pattern_count_from_tool_json(
             .get("stale_index")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        ready_scopes: c
+            .get("ready_scopes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        dirty_scopes: c
+            .get("dirty_scopes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        scanned_candidates: c
+            .get("scanned_candidates")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
     })
 }
 
@@ -16306,7 +16493,7 @@ fn pattern_count_from_tool_json(
 /// the signal in-band via the `stale_index` field instead.
 fn print_stale_index_note() {
     println!(
-        "(trigram index is stale — results came from a full scan; reindex with `index --with-trigrams`)"
+        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with `index --with-trigrams`)"
     );
 }
 
@@ -23550,7 +23737,7 @@ credential_method = "gh"
     }
 
     /// A `count_patterns` tool payload entry rebuilds into the direct
-    /// path's `PatternCount` — field order byte-identical, `stale_index`
+    /// path's `PatternCount` — field order byte-identical, compatibility fields
     /// defaulted for pre-field daemons.
     #[test]
     fn pattern_count_from_tool_json_rebuilds_direct_struct() {
@@ -23567,6 +23754,9 @@ credential_method = "gh"
         assert_eq!(c.total_matches, 4);
         assert_eq!(c.files_matched, 2);
         assert!(c.stale_index);
+        assert_eq!(c.ready_scopes, 0);
+        assert_eq!(c.dirty_scopes, 0);
+        assert_eq!(c.scanned_candidates, 0);
         assert_eq!(c.top_files.len(), 2);
         assert_eq!(c.top_files[0].path, "src/a.rs");
         assert_eq!(c.top_files[0].count, 3);
@@ -23575,7 +23765,7 @@ credential_method = "gh"
         let serialized = serde_json::to_string(&c).unwrap();
         assert_eq!(
             serialized,
-            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true}"#
+            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"scanned_candidates":0}"#
         );
 
         // A pre-`stale_index` daemon payload still rebuilds (default false).
@@ -23587,6 +23777,9 @@ credential_method = "gh"
         });
         let c = pattern_count_from_tool_json(&old).expect("old payload must rebuild");
         assert!(!c.stale_index);
+        assert_eq!(c.ready_scopes, 0);
+        assert_eq!(c.dirty_scopes, 0);
+        assert_eq!(c.scanned_candidates, 0);
 
         // Malformed entries are skipped (None), not panicked on.
         assert!(pattern_count_from_tool_json(&serde_json::json!({"pattern": 1})).is_none());
