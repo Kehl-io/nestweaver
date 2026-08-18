@@ -6,7 +6,8 @@ use std::time::Instant;
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{
-    AstTypeBinding, RawReference, RawSymbol, SkippedFile, detect_language, parse_source,
+    AstTypeBinding, RawReference, RawSymbol, SkipReasonCode, SkippedFile, detect_language,
+    parse_source,
 };
 use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
 use nestweaver_schema::{
@@ -24,6 +25,7 @@ type ContractDerivationInputs = (
     Vec<PathBuf>,
     Vec<HandlerFileData>,
     Vec<nestweaver_schema::Symbol>,
+    Vec<SkippedFile>,
 );
 pub(crate) type PreparedFileData = HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>;
 
@@ -1678,6 +1680,19 @@ fn tiered_change_check(
     cache: &FileMetaCache,
 ) -> Result<ChangeVerdict, anyhow::Error> {
     let rel = Path::new(rel_path);
+    let enforce_actual_size = |source: String| -> Result<String, anyhow::Error> {
+        let observed_bytes = source.len() as u64;
+        let limit_bytes = reader.max_source_file_bytes();
+        if observed_bytes > limit_bytes {
+            return Err(crate::content_reader::SourceTooLarge {
+                path: rel_path.to_string(),
+                observed_bytes,
+                limit_bytes,
+            }
+            .into());
+        }
+        Ok(source)
+    };
 
     // file_meta returns None for bare-repo readers (no mtime available).
     // In that case, always fall through to read + hash.
@@ -1687,9 +1702,11 @@ fn tiered_change_check(
             // No filesystem metadata (e.g. GitBareReader) — read and hash. The
             // bare-clone reader enforces the size cap inside its own read_file
             // (oversized blobs return Err), so a huge file is skipped there.
-            let source = reader
-                .read_file(rel)
-                .with_context(|| format!("read {rel_path}"))?;
+            let source = enforce_actual_size(
+                reader
+                    .read_file(rel)
+                    .with_context(|| format!("read {rel_path}"))?,
+            )?;
             let content_hash = content_hash_hex(&source);
             if let Some(cached) = cache.get(rel_path)
                 && content_hash == cached.content_hash
@@ -1714,11 +1731,14 @@ fn tiered_change_check(
     // generated bundle that minified-detection misses) was read whole and handed
     // to tree-sitter, exhausting memory. `size_bytes` is already in hand from
     // file_meta, so the guard is free; the caller turns this Err into a skip.
-    if size_bytes > crate::index_md::MAX_FILE_SIZE_BYTES {
-        anyhow::bail!(
-            "file exceeds size limit ({size_bytes} > {} bytes), skipping",
-            crate::index_md::MAX_FILE_SIZE_BYTES
-        );
+    let max_source_file_bytes = reader.max_source_file_bytes();
+    if size_bytes > max_source_file_bytes {
+        return Err(crate::content_reader::SourceTooLarge {
+            path: rel_path.to_string(),
+            observed_bytes: size_bytes,
+            limit_bytes: max_source_file_bytes,
+        }
+        .into());
     }
 
     if let Some(cached) = cache.get(rel_path) {
@@ -1731,9 +1751,11 @@ fn tiered_change_check(
         // Same-size edits are common, so we cannot skip based on size alone.
 
         // Tier 3: mtime differs → read file, compute hash, compare.
-        let source = reader
-            .read_file(rel)
-            .with_context(|| format!("read {rel_path}"))?;
+        let source = enforce_actual_size(
+            reader
+                .read_file(rel)
+                .with_context(|| format!("read {rel_path}"))?,
+        )?;
         let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
             // Content identical despite mtime/size change — unchanged for the
@@ -1752,9 +1774,11 @@ fn tiered_change_check(
         })
     } else {
         // No cache entry → file is new, read and hash it.
-        let source = reader
-            .read_file(rel)
-            .with_context(|| format!("read {rel_path}"))?;
+        let source = enforce_actual_size(
+            reader
+                .read_file(rel)
+                .with_context(|| format!("read {rel_path}"))?,
+        )?;
         let content_hash = content_hash_hex(&source);
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
@@ -1845,11 +1869,35 @@ pub fn index_directory_with_options(
     force: bool,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_options_and_limits(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+        crate::index_limits::IndexLimits::default(),
+    )
+}
+
+/// Index a directory with an explicit validated source-input ceiling.
+#[allow(clippy::too_many_arguments)]
+pub fn index_directory_with_options_and_limits(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+) -> Result<IndexResult, anyhow::Error> {
     // nw-C1: reconcile an abandoned publication before indexing. A crashed
     // predecessor's `.index-dirty` otherwise wedges every ranked query, and the
     // fail-closed `u64::MAX` generation base can block this run's own preflight.
     let store = open_store_for_writing_with_recovery(db_path)?;
-    index_directory_with_store(
+    index_directory_with_store_and_limits(
         &store,
         repo_path,
         db_path,
@@ -1858,6 +1906,7 @@ pub fn index_directory_with_options(
         indexed_sha,
         force,
         name,
+        limits,
     )
 }
 
@@ -1875,6 +1924,31 @@ pub fn index_directory_with_store(
     force: bool,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_store_and_limits(
+        store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+        crate::index_limits::IndexLimits::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn index_directory_with_store_and_limits(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+) -> Result<IndexResult, anyhow::Error> {
     index_directory_with_store_inner(
         store,
         repo_path,
@@ -1884,6 +1958,7 @@ pub fn index_directory_with_store(
         indexed_sha,
         force,
         name,
+        limits,
         None,
     )
 }
@@ -1906,6 +1981,33 @@ pub fn index_directory_with_store_cancellable(
     name: Option<&str>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_store_cancellable_and_limits(
+        store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+        cancel,
+        crate::index_limits::IndexLimits::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn index_directory_with_store_cancellable_and_limits(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    limits: crate::index_limits::IndexLimits,
+) -> Result<IndexResult, anyhow::Error> {
     index_directory_with_store_inner(
         store,
         repo_path,
@@ -1915,6 +2017,7 @@ pub fn index_directory_with_store_cancellable(
         indexed_sha,
         force,
         name,
+        limits,
         Some(cancel),
     )
 }
@@ -1929,6 +2032,7 @@ fn index_directory_with_store_inner(
     indexed_sha: &str,
     force: bool,
     name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<IndexResult, anyhow::Error> {
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
@@ -1942,7 +2046,7 @@ fn index_directory_with_store_inner(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
-    let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
     // Local filesystem index: the working tree location is `repo_path`.
     // Persisted as `root_path` on the Repo node so consumers never derive
     // a disk path from the identity `url`.
@@ -2438,6 +2542,7 @@ where
     scan_pb.set_message("Scanning files...");
 
     let mut file_entries: Vec<(PathBuf, Language)> = Vec::new();
+    let mut scan_skipped_files: Vec<SkippedFile> = Vec::new();
     // F2.1: spec files (OpenAPI/Swagger/proto/GraphQL) collected separately —
     // most have no detected source language so they fall outside `file_entries`.
     let mut spec_files: Vec<PathBuf> = Vec::new();
@@ -2463,6 +2568,11 @@ where
 
         // Skip minified/bundled files — they produce noise in the graph.
         if is_minified_or_bundled(&path) {
+            scan_skipped_files.push(SkippedFile::new(
+                rel_path.to_string_lossy().into_owned(),
+                SkipReasonCode::Ignored,
+                "minified or generated bundle policy",
+            ));
             continue;
         }
 
@@ -2505,6 +2615,10 @@ where
             rel_path: String,
         },
         Skipped(SkippedFile),
+        /// Transient I/O/parser failure. The full publication must abort;
+        /// treating this as a policy skip could replace a complete incumbent
+        /// graph with an incomplete one.
+        Failed(String),
         Parsed {
             rel_path: String,
             lang: Language,
@@ -2560,10 +2674,11 @@ where
         // `index --force` as the repair.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             parse_pb.inc(1);
-            return ParseOutcome::Skipped(SkippedFile {
-                path: display_name,
-                reason: "index cancelled".to_string(),
-            });
+            return ParseOutcome::Skipped(SkippedFile::new(
+                display_name,
+                SkipReasonCode::Cancelled,
+                "index cancelled",
+            ));
         }
 
         // Tiered change detection.
@@ -2596,10 +2711,16 @@ where
                 }) => (source, content_hash, meta),
                 Err(err) => {
                     parse_pb.inc(1);
-                    return ParseOutcome::Skipped(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: format!("stat/read error: {err}"),
-                    });
+                    if let Some(oversized) =
+                        err.downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    {
+                        return ParseOutcome::Skipped(SkippedFile::oversized(
+                            display_name,
+                            oversized.observed_bytes,
+                            oversized.limit_bytes,
+                        ));
+                    }
+                    return ParseOutcome::Failed(format!("stat/read {}: {err}", path.display()));
                 }
             };
 
@@ -2636,10 +2757,7 @@ where
             }
             Err(err) => {
                 parse_pb.inc(1);
-                ParseOutcome::Skipped(SkippedFile {
-                    path: path.to_string_lossy().into_owned(),
-                    reason: err.to_string(),
-                })
+                ParseOutcome::Failed(format!("parse {}: {err}", path.display()))
             }
         }
     };
@@ -2666,6 +2784,12 @@ where
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("index cancelled");
     }
+    if let Some(error) = outcomes.iter().find_map(|outcome| match outcome {
+        ParseOutcome::Failed(error) => Some(error),
+        _ => None,
+    }) {
+        anyhow::bail!("source indexing failed before publication: {error}");
+    }
 
     // ── Sequential collection of parallel results ────────────────────────
     let _phase_collect_span = tracing::info_span!("index_phase_collect").entered();
@@ -2685,7 +2809,7 @@ where
     let mut files_deleted = 0usize;
     let mut symbols_deleted = 0usize;
     let mut symbols_count = 0usize;
-    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    let mut skipped_files: Vec<SkippedFile> = scan_skipped_files;
     let mut actually_changed_files: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Every file still present in the working tree this index, regardless of
@@ -2733,6 +2857,7 @@ where
             ParseOutcome::Skipped(sf) => {
                 skipped_files.push(sf);
             }
+            ParseOutcome::Failed(_) => unreachable!("failures are rejected before collection"),
             ParseOutcome::Parsed {
                 rel_path,
                 lang,
@@ -2950,6 +3075,14 @@ where
             return Err(error).context("prepare strict contract derivation");
         }
     };
+    skipped_files.extend(contract_plan.skipped_files.iter().cloned());
+    skipped_files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    skipped_files
+        .dedup_by(|left, right| left.path == right.path && left.reason_code == right.reason_code);
 
     // Last cancellation observation point. Bailing in this window needs no
     // teardown: the marker call below is what creates `.index-dirty` and
@@ -3867,6 +4000,7 @@ fn collect_contract_derivation_inputs(
     let mut spec_files = Vec::new();
     let mut handler_files = Vec::new();
     let mut all_symbols = Vec::new();
+    let mut skipped_files = Vec::new();
     let repo_path = reader.root();
     let discovered_files = reader
         .list_files()
@@ -3910,13 +4044,39 @@ fn collect_contract_derivation_inputs(
         if reader
             .file_meta(&rel_path)
             .context("read contract input metadata")?
-            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+            .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
             tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
+            let observed_bytes = reader
+                .file_meta(&rel_path)
+                .ok()
+                .flatten()
+                .map(|(_, size)| size)
+                .unwrap_or(reader.max_source_file_bytes() + 1);
+            skipped_files.push(SkippedFile::oversized(
+                rel_path.to_string_lossy().into_owned(),
+                observed_bytes,
+                reader.max_source_file_bytes(),
+            ));
             continue;
         }
         let source = match reader.read_file(&rel_path) {
             Ok(source) => source,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    .is_some() =>
+            {
+                let oversized = error
+                    .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    .expect("guarded above");
+                skipped_files.push(SkippedFile::oversized(
+                    rel_path.to_string_lossy().into_owned(),
+                    oversized.observed_bytes,
+                    oversized.limit_bytes,
+                ));
+                continue;
+            }
             Err(error) if strict => {
                 return Err(error).with_context(|| {
                     format!("read contract handler candidate {}", rel_path.display())
@@ -3927,8 +4087,13 @@ fn collect_contract_derivation_inputs(
                 continue;
             }
         };
-        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+        if source.len() as u64 > reader.max_source_file_bytes() {
             tracing::debug!(path = %rel_path.display(), "skip oversized contract input");
+            skipped_files.push(SkippedFile::oversized(
+                rel_path.to_string_lossy().into_owned(),
+                source.len() as u64,
+                reader.max_source_file_bytes(),
+            ));
             continue;
         }
         let controller_candidate = match lang {
@@ -4052,7 +4217,7 @@ fn collect_contract_derivation_inputs(
 
     spec_files.sort();
     handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok((spec_files, handler_files, all_symbols))
+    Ok((spec_files, handler_files, all_symbols, skipped_files))
 }
 
 fn prepare_incremental_contract_derivation(
@@ -4060,16 +4225,18 @@ fn prepare_incremental_contract_derivation(
     r_uid: &str,
     repo_url: &str,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
-    let (spec_files, handler_files, all_symbols) =
+    let (spec_files, handler_files, all_symbols, skipped_files) =
         collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
-    prepare_contract_derivation(
+    let mut plan = prepare_contract_derivation(
         reader,
         r_uid,
         &spec_files,
         &handler_files,
         &all_symbols,
         true,
-    )
+    )?;
+    plan.skipped_files.extend(skipped_files);
+    Ok(plan)
 }
 
 pub(crate) fn prepare_watcher_contract_derivation(
@@ -4107,14 +4274,14 @@ pub(crate) fn watcher_contract_input_snapshot(
         if reader
             .file_meta(&rel_path)
             .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
-            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+            .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
             continue;
         }
         let source = reader
             .read_file(&rel_path)
             .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
-        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+        if source.len() as u64 > reader.max_source_file_bytes() {
             continue;
         }
         let candidate = if is_spec {
@@ -4154,7 +4321,7 @@ where
     let before = watcher_contract_input_snapshot(reader)?;
     before_plan();
     let observed = watcher_contract_input_snapshot(reader)?;
-    let (spec_files, handler_files, all_symbols) =
+    let (spec_files, handler_files, all_symbols, skipped_files) =
         collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
     let mut plan = prepare_contract_derivation(
         reader,
@@ -4164,6 +4331,7 @@ where
         &all_symbols,
         true,
     )?;
+    plan.skipped_files.extend(skipped_files);
     after_plan();
     let after = watcher_contract_input_snapshot(reader)?;
     let plan_reads_match_observed = plan
@@ -4212,6 +4380,7 @@ pub(crate) struct ContractDerivationPlan {
     edges: Vec<nestweaver_schema::ResolvedEdge>,
     pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
     pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
+    pub(crate) skipped_files: Vec<SkippedFile>,
 }
 
 /// Prepare contract rows and implementation edges without mutating the graph.
@@ -4229,6 +4398,7 @@ fn prepare_contract_derivation(
     // 1. Declared contracts from specs.
     let mut all_contracts = ContractSet::new();
     let mut input_hashes = std::collections::BTreeMap::new();
+    let mut skipped_files = Vec::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -4240,6 +4410,21 @@ fn prepare_contract_derivation(
             .into_owned();
         let source = match reader.read_file(Path::new(&rel)) {
             Ok(s) => s,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    .is_some() =>
+            {
+                let oversized = error
+                    .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                    .expect("guarded above");
+                skipped_files.push(SkippedFile::oversized(
+                    rel,
+                    oversized.observed_bytes,
+                    oversized.limit_bytes,
+                ));
+                continue;
+            }
             Err(error) if strict => {
                 return Err(error).with_context(|| format!("read watched contract spec {rel}"));
             }
@@ -4248,6 +4433,14 @@ fn prepare_contract_derivation(
                 continue;
             }
         };
+        if source.len() as u64 > reader.max_source_file_bytes() {
+            skipped_files.push(SkippedFile::oversized(
+                rel,
+                source.len() as u64,
+                reader.max_source_file_bytes(),
+            ));
+            continue;
+        }
         let parsed_specs = if strict {
             input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
             crate::contracts::parse_spec_file_strict(&rel, &source)
@@ -4410,6 +4603,7 @@ fn prepare_contract_derivation(
         edges,
         input_hashes,
         observed_input_hashes: std::collections::BTreeMap::new(),
+        skipped_files,
     })
 }
 
@@ -4520,9 +4714,36 @@ pub struct IncrementalResult {
     pub files_deleted: usize,
     pub files_renamed: usize,
     pub files_skipped: usize,
+    pub skipped_files: Vec<SkippedFile>,
     pub symbols_added: usize,
     pub symbols_removed: usize,
     pub fell_back_to_full: bool,
+}
+
+enum IncrementalFileOutcome {
+    Indexed(usize),
+    PolicySkipped(SkippedFile),
+}
+
+fn record_incremental_file_outcome(
+    result: &mut IncrementalResult,
+    outcome: IncrementalFileOutcome,
+) -> bool {
+    match outcome {
+        IncrementalFileOutcome::Indexed(symbols) => {
+            result.symbols_added += symbols;
+            true
+        }
+        IncrementalFileOutcome::PolicySkipped(skipped) => {
+            if !result.skipped_files.iter().any(|existing| {
+                existing.path == skipped.path && existing.reason_code == skipped.reason_code
+            }) {
+                result.files_skipped += 1;
+                result.skipped_files.push(skipped);
+            }
+            false
+        }
+    }
 }
 
 /// Incrementally re-index a repository using git diff.
@@ -4553,12 +4774,31 @@ pub fn incremental_index_with_name(
     repo_url: &str,
     name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_name_and_limits(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        crate::index_limits::IndexLimits::default(),
+    )
+}
+
+pub fn incremental_index_with_name_and_limits(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+) -> Result<IncrementalResult, anyhow::Error> {
     incremental_index_with_name_and_io(
         repo_path,
         db_path,
         instance_id,
         repo_url,
         name,
+        limits,
         &FileSystemIndexEpilogueIo,
     )
 }
@@ -4569,6 +4809,7 @@ fn incremental_index_with_name_and_io(
     instance_id: &str,
     repo_url: &str,
     name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
     epilogue_io: &dyn IndexEpilogueIo,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // nw-C1: reconcile BEFORE the `old_sha == new_sha` short-circuit below,
@@ -4598,6 +4839,7 @@ fn incremental_index_with_name_and_io(
                     new_sha: "local",
                     name,
                     force: false,
+                    limits,
                     epilogue_io,
                 },
             );
@@ -4618,6 +4860,7 @@ fn incremental_index_with_name_and_io(
                     new_sha: &new_sha,
                     name,
                     force: false,
+                    limits,
                     epilogue_io,
                 },
             );
@@ -4653,6 +4896,7 @@ fn incremental_index_with_name_and_io(
                 // Force the core path so bulk_reindex_write deletes the old
                 // graph and installs its replacement in one transaction.
                 force: true,
+                limits,
                 epilogue_io,
             },
         );
@@ -4677,6 +4921,7 @@ fn incremental_index_with_name_and_io(
                 // Force the core path so bulk_reindex_write deletes the old
                 // graph and installs its replacement in one transaction.
                 force: true,
+                limits,
                 epilogue_io,
             },
         );
@@ -4699,7 +4944,7 @@ fn incremental_index_with_name_and_io(
         "processing incremental changes"
     );
 
-    let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
     let mut result = IncrementalResult::default();
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
@@ -4717,6 +4962,12 @@ fn incremental_index_with_name_and_io(
             return Err(error).context("prepare incremental contract derivation");
         }
     };
+    result
+        .skipped_files
+        .extend(contract_plan.skipped_files.iter().cloned());
+    result.files_skipped += contract_plan.skipped_files.len();
+    let prepared_files =
+        prepare_incremental_files(&reader, &changes).context("prepare incremental source files")?;
 
     let publication = establish_index_publication_marker_with_io(
         &store,
@@ -4737,33 +4988,61 @@ fn incremental_index_with_name_and_io(
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
                 if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
-                    result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file_txn(
-                    &reader, rel_path, &r_uid, repo_url, &store, &txn,
-                )?;
-                result.symbols_added += added;
-                result.files_added += 1;
+                match prepared_files
+                    .get(rel_path.to_string_lossy().as_ref())
+                    .expect("parseable added file was prepared")
+                {
+                    PreparedIncrementalOutcome::Ready(prepared) => {
+                        let outcome = write_prepared_incremental_file_txn(
+                            &reader, prepared, &r_uid, repo_url, &store, &txn,
+                        )?;
+                        if record_incremental_file_outcome(&mut result, outcome) {
+                            result.files_added += 1;
+                        }
+                    }
+                    PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                        record_incremental_file_outcome(
+                            &mut result,
+                            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                        );
+                    }
+                }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
                 if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
-                    result.files_skipped += 1;
                     continue;
                 }
-                // Remove old symbols first.
+                let prepared = prepared_files
+                    .get(rel_path.to_string_lossy().as_ref())
+                    .expect("parseable modified file was prepared");
+                // A policy exclusion intentionally removes stale incumbent
+                // coverage. Transient failures never reach this transaction.
                 let rel_str = rel_path.to_string_lossy();
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
-
-                // Re-parse and insert.
-                let added = process_added_or_modified_file_txn(
-                    &reader, rel_path, &r_uid, repo_url, &store, &txn,
-                )?;
-                result.symbols_added += added;
-                result.files_modified += 1;
+                match prepared {
+                    PreparedIncrementalOutcome::Ready(prepared) => {
+                        let outcome = write_prepared_incremental_file_txn(
+                            &reader, prepared, &r_uid, repo_url, &store, &txn,
+                        )?;
+                        if record_incremental_file_outcome(&mut result, outcome) {
+                            result.files_modified += 1;
+                        }
+                    }
+                    PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                        let file_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
+                        nestweaver_store::GraphStore::delete_file_node_on(&txn, &file_uid)
+                            .with_context(|| format!("delete policy-skipped file {rel_str}"))?;
+                        record_incremental_file_outcome(
+                            &mut result,
+                            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                        );
+                    }
+                }
             }
             crate::git_diff::FileChange::Deleted(rel_path) => {
                 let rel_str = rel_path.to_string_lossy();
@@ -4811,10 +5090,23 @@ fn incremental_index_with_name_and_io(
                     .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file_txn(
-                        &reader, to, &r_uid, repo_url, &store, &txn,
-                    )?;
-                    result.symbols_added += added;
+                    match prepared_files
+                        .get(to_str.as_ref())
+                        .expect("parseable renamed file was prepared")
+                    {
+                        PreparedIncrementalOutcome::Ready(prepared) => {
+                            let outcome = write_prepared_incremental_file_txn(
+                                &reader, prepared, &r_uid, repo_url, &store, &txn,
+                            )?;
+                            record_incremental_file_outcome(&mut result, outcome);
+                        }
+                        PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            record_incremental_file_outcome(
+                                &mut result,
+                                IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                            );
+                        }
+                    }
                 }
 
                 result.files_renamed += 1;
@@ -4919,6 +5211,8 @@ where
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
+    let prepared_files = prepare_incremental_files(reader, &changes)
+        .context("prepare server incremental source files")?;
 
     let _write_guard = acquire_write_guard()?;
     let contract_plan = match contract_plan_result {
@@ -4942,36 +5236,69 @@ where
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
     let mut result = IncrementalResult::default();
+    result
+        .skipped_files
+        .extend(contract_plan.skipped_files.iter().cloned());
+    result.files_skipped += contract_plan.skipped_files.len();
 
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
                 if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
-                    result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file_txn(
-                    reader, rel_path, &r_uid, repo_url, store, &txn,
-                )?;
-                result.symbols_added += added;
-                result.files_added += 1;
+                match prepared_files
+                    .get(rel_path.to_string_lossy().as_ref())
+                    .expect("parseable added file was prepared")
+                {
+                    PreparedIncrementalOutcome::Ready(prepared) => {
+                        let outcome = write_prepared_incremental_file_txn(
+                            reader, prepared, &r_uid, repo_url, store, &txn,
+                        )?;
+                        if record_incremental_file_outcome(&mut result, outcome) {
+                            result.files_added += 1;
+                        }
+                    }
+                    PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                        record_incremental_file_outcome(
+                            &mut result,
+                            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                        );
+                    }
+                }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
                 if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
-                    result.files_skipped += 1;
                     continue;
                 }
+                let prepared = prepared_files
+                    .get(rel_path.to_string_lossy().as_ref())
+                    .expect("parseable modified file was prepared");
                 let rel_str = rel_path.to_string_lossy();
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
 
-                let added = process_added_or_modified_file_txn(
-                    reader, rel_path, &r_uid, repo_url, store, &txn,
-                )?;
-                result.symbols_added += added;
-                result.files_modified += 1;
+                match prepared {
+                    PreparedIncrementalOutcome::Ready(prepared) => {
+                        let outcome = write_prepared_incremental_file_txn(
+                            reader, prepared, &r_uid, repo_url, store, &txn,
+                        )?;
+                        if record_incremental_file_outcome(&mut result, outcome) {
+                            result.files_modified += 1;
+                        }
+                    }
+                    PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                        let file_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
+                        nestweaver_store::GraphStore::delete_file_node_on(&txn, &file_uid)
+                            .with_context(|| format!("delete policy-skipped file {rel_str}"))?;
+                        record_incremental_file_outcome(
+                            &mut result,
+                            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                        );
+                    }
+                }
             }
             crate::git_diff::FileChange::Deleted(rel_path) => {
                 let rel_str = rel_path.to_string_lossy();
@@ -5015,10 +5342,23 @@ where
                     .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file_txn(
-                        reader, to, &r_uid, repo_url, store, &txn,
-                    )?;
-                    result.symbols_added += added;
+                    match prepared_files
+                        .get(to_str.as_ref())
+                        .expect("parseable renamed file was prepared")
+                    {
+                        PreparedIncrementalOutcome::Ready(prepared) => {
+                            let outcome = write_prepared_incremental_file_txn(
+                                reader, prepared, &r_uid, repo_url, store, &txn,
+                            )?;
+                            record_incremental_file_outcome(&mut result, outcome);
+                        }
+                        PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                            record_incremental_file_outcome(
+                                &mut result,
+                                IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                            );
+                        }
+                    }
                 }
 
                 result.files_renamed += 1;
@@ -5068,41 +5408,114 @@ where
     Ok(result)
 }
 
-/// Like [`process_added_or_modified_file`] but uses an externally-provided
-/// transaction connection for all store writes, ensuring atomicity.
-fn process_added_or_modified_file_txn(
+struct PreparedIncrementalFile {
+    abs_path: std::path::PathBuf,
+    rel_str: String,
+    source: String,
+    parsed: nestweaver_parser::ParsedFile,
+}
+
+enum PreparedIncrementalOutcome {
+    Ready(PreparedIncrementalFile),
+    PolicySkipped(SkippedFile),
+}
+
+/// Read and parse before opening the write transaction. This ordering is the
+/// rollback guarantee: a transient read/parser failure cannot occur after an
+/// incumbent file's nodes or relationships have been detached.
+fn prepare_incremental_file(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
+) -> Result<PreparedIncrementalOutcome, anyhow::Error> {
+    let abs_path = reader.root().join(rel_path);
+    let rel_str = rel_path.to_string_lossy().into_owned();
+
+    if is_minified_or_bundled(&abs_path) {
+        return Ok(PreparedIncrementalOutcome::PolicySkipped(SkippedFile::new(
+            rel_str,
+            SkipReasonCode::Ignored,
+            "minified or generated bundle policy",
+        )));
+    }
+
+    if let Some((_, observed_bytes)) = reader
+        .file_meta(rel_path)
+        .with_context(|| format!("stat {}", abs_path.display()))?
+        && observed_bytes > reader.max_source_file_bytes()
+    {
+        return Ok(PreparedIncrementalOutcome::PolicySkipped(
+            SkippedFile::oversized(rel_str, observed_bytes, reader.max_source_file_bytes()),
+        ));
+    }
+    let source = match reader.read_file(rel_path) {
+        Ok(source) => source,
+        Err(error) => {
+            if let Some(oversized) = error.downcast_ref::<crate::content_reader::SourceTooLarge>() {
+                return Ok(PreparedIncrementalOutcome::PolicySkipped(
+                    SkippedFile::oversized(
+                        rel_str,
+                        oversized.observed_bytes,
+                        oversized.limit_bytes,
+                    ),
+                ));
+            }
+            return Err(error).with_context(|| format!("read {}", abs_path.display()));
+        }
+    };
+    let parsed = nestweaver_parser::parse_source(&abs_path, &source)
+        .with_context(|| format!("parse {}", abs_path.display()))?;
+    Ok(PreparedIncrementalOutcome::Ready(PreparedIncrementalFile {
+        abs_path,
+        rel_str,
+        source,
+        parsed,
+    }))
+}
+
+fn prepare_incremental_files(
+    reader: &dyn crate::content_reader::ContentReader,
+    changes: &[crate::git_diff::FileChange],
+) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
+    let mut prepared = HashMap::new();
+    for change in changes {
+        let path = match change {
+            crate::git_diff::FileChange::Added(path)
+            | crate::git_diff::FileChange::Modified(path) => Some(path),
+            crate::git_diff::FileChange::Renamed { to, .. } => Some(to),
+            crate::git_diff::FileChange::Deleted(_) => None,
+        };
+        let Some(path) = path else { continue };
+        if path_in_skip_dir(path) || !is_parseable(path) {
+            continue;
+        }
+        prepared.insert(
+            path.to_string_lossy().into_owned(),
+            prepare_incremental_file(reader, path)?,
+        );
+    }
+    Ok(prepared)
+}
+
+/// Write one already-read and parsed file through the shared transaction.
+fn write_prepared_incremental_file_txn(
+    reader: &dyn crate::content_reader::ContentReader,
+    prepared: &PreparedIncrementalFile,
     r_uid: &str,
     repo_url: &str,
     _store: &nestweaver_store::GraphStore,
     conn: &nestweaver_store::DbConnection<'_>,
-) -> Result<usize, anyhow::Error> {
+) -> Result<IncrementalFileOutcome, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
     use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
-    let abs_path = reader.root().join(rel_path);
-    let rel_str = rel_path.to_string_lossy().into_owned();
+    let abs_path = &prepared.abs_path;
+    let rel_str = &prepared.rel_str;
+    let source = &prepared.source;
+    let parsed = &prepared.parsed;
 
-    let source = match reader.read_file(rel_path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "read error: {e}; skipping");
-            return Ok(0);
-        }
-    };
-
-    let parsed = match nestweaver_parser::parse_source(&abs_path, &source) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "parse error: {e}; skipping");
-            return Ok(0);
-        }
-    };
-
-    let content_hash = content_hash_hex(&source);
-    let f_uid = file_uid(r_uid, &rel_str);
+    let content_hash = content_hash_hex(source);
+    let f_uid = file_uid(r_uid, rel_str);
 
     // Insert the File node via the transaction connection.
     let file = File {
@@ -5120,9 +5533,9 @@ fn process_added_or_modified_file_txn(
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
 
     for raw_sym in &parsed.symbols {
-        let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
+        let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
         let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
+        let canonical = canonical_symbol_id(repo_url, rel_str, &raw_sym.name, scope_str);
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -5160,7 +5573,7 @@ fn process_added_or_modified_file_txn(
         .with_context(|| format!("batch_insert_file_symbol_edges {}", rel_str))?;
 
     // Resolve cross-file edges within this file only (single-file scope).
-    let lang = nestweaver_parser::detect_language(&abs_path)
+    let lang = nestweaver_parser::detect_language(abs_path)
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
     let workspace_ctx = if matches!(
@@ -5196,7 +5609,7 @@ fn process_added_or_modified_file_txn(
             .with_context(|| format!("batch_insert_edges {}", rel_str))?;
     }
 
-    Ok(sym_count)
+    Ok(IncrementalFileOutcome::Indexed(sym_count))
 }
 
 /// Split a set of file changes into the parseable files that still exist after
@@ -5627,6 +6040,7 @@ struct FullIndexFallback<'a> {
     new_sha: &'a str,
     name: Option<&'a str>,
     force: bool,
+    limits: crate::index_limits::IndexLimits,
     epilogue_io: &'a dyn IndexEpilogueIo,
 }
 
@@ -5642,6 +6056,7 @@ fn full_index_fallback(
         new_sha,
         name,
         force,
+        limits,
         epilogue_io,
     } = request;
     // Load filemeta sidecar for tiered change detection even in fallback.
@@ -5663,7 +6078,7 @@ fn full_index_fallback(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
-    let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
     let local_root = repo_path.display().to_string();
     // nw-022: capture a re-identified legacy file:// uid so its filemeta
     // slice is dropped below, mirroring index_directory_with_store_inner.
@@ -5729,6 +6144,9 @@ fn full_index_fallback(
     // surviving nodes' ranks even though files_count is zero.
     Ok(IncrementalResult {
         fell_back_to_full: true,
+        files_added: result.files_count,
+        files_skipped: result.skipped_files.len(),
+        skipped_files: result.skipped_files,
         symbols_added: result.symbols_count,
         files_deleted: result.files_deleted,
         symbols_removed: result.symbols_deleted,
@@ -5752,6 +6170,113 @@ mod tests {
     /// works; these tests hold it fixed so shape versioning is not the variable
     /// under test.
     const RESPONSE_SHAPE_FIXTURE: u64 = 0xE1691E;
+
+    #[test]
+    fn default_source_limit_indexes_nestweaver_sized_rust_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let mut source = String::from("pub fn large_file_marker() -> usize { 42 }\n");
+        source.push_str(&"// representative source padding\n".repeat(40_000));
+        assert!(source.len() > 1_048_576 && source.len() < 2_097_152);
+        fs::write(repo.join("src/main.rs"), source).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            "https://example.test/large-rust",
+            "fixture",
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            result.skipped_files.is_empty(),
+            "{:?}",
+            result.skipped_files
+        );
+        assert!(result.symbols_count >= 1);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(
+            store
+                .list_all_symbols()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "large_file_marker")
+        );
+    }
+
+    #[test]
+    fn sparse_generated_file_is_policy_skipped_by_metadata_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let file = fs::File::create(repo.join("bundle.js")).unwrap();
+        file.set_len(200 * 1024 * 1024).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            "https://example.test/sparse",
+            "fixture",
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Oversized
+        );
+        assert_eq!(
+            result.skipped_files[0].observed_bytes,
+            Some(200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn metadata_free_reader_cannot_bypass_the_actual_source_size_limit() {
+        struct MetadataFreeReader {
+            root: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for MetadataFreeReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                Ok("x".repeat(1025))
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("large.rs")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "metadata-free"
+            }
+            fn max_source_file_bytes(&self) -> u64 {
+                1024
+            }
+        }
+
+        let reader = MetadataFreeReader {
+            root: PathBuf::from("/unused"),
+        };
+        let error = match tiered_change_check(&reader, "large.rs", &FileMetaCache::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("metadata-free oversized content must be rejected"),
+        };
+        let oversized = error
+            .downcast_ref::<crate::content_reader::SourceTooLarge>()
+            .expect("actual returned content must be bounded even without metadata");
+        assert_eq!(oversized.observed_bytes, 1025);
+        assert_eq!(oversized.limit_bytes, 1024);
+    }
 
     fn owned_contract_uid(repo_uid: &str, bare_shape: &str) -> String {
         format!(
@@ -7346,6 +7871,7 @@ function hello(name) { return "Hello " + name; }
             edges: Vec::new(),
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
+            skipped_files: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         apply_contract_derivation_on(&transaction, repo_a, &plan).unwrap();
@@ -7374,7 +7900,10 @@ function hello(name) { return "Hello " + name; }
                 Ok(vec![PathBuf::from("HugeController.java")])
             }
             fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
-                Ok(Some((0, crate::index_md::MAX_FILE_SIZE_BYTES + 1)))
+                Ok(Some((
+                    0,
+                    crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES + 1,
+                )))
             }
             fn root(&self) -> &Path {
                 &self.root
@@ -7387,7 +7916,7 @@ function hello(name) { return "Hello " + name; }
         let reader = OversizeReader {
             root: PathBuf::from("/unused"),
         };
-        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+        let (specs, handlers, symbols, skipped) = collect_contract_derivation_inputs(
             &reader,
             "repo:test:oversize",
             "https://example.com/oversize",
@@ -7397,6 +7926,7 @@ function hello(name) { return "Hello " + name; }
         assert!(specs.is_empty());
         assert!(handlers.is_empty());
         assert!(symbols.is_empty());
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -7425,7 +7955,7 @@ function hello(name) { return "Hello " + name; }
         let reader = IrrelevantReader {
             root: PathBuf::from("/unused"),
         };
-        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+        let (specs, handlers, symbols, skipped) = collect_contract_derivation_inputs(
             &reader,
             "repo:test:irrelevant",
             "https://example.com/irrelevant",
@@ -7435,6 +7965,7 @@ function hello(name) { return "Hello " + name; }
         assert!(specs.is_empty());
         assert!(handlers.is_empty());
         assert!(symbols.is_empty());
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -7942,6 +8473,7 @@ function hello(name) { return "Hello " + name; }
             edges: Vec::new(),
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
+            skipped_files: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         let err = apply_contract_derivation_on(&transaction, &repo_uid, &invalid_plan)
@@ -10704,6 +11236,170 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
+    #[test]
+    fn incremental_policy_skip_removes_stale_symbols_and_reports_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "pub fn incumbent() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.rs"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/policy-crossing";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        let oversized = format!("pub fn replacement() {{}}\n{}", "// pad\n".repeat(200));
+        assert!(oversized.len() > crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES as usize);
+        fs::write(repo.join("main.rs"), oversized).unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-q", "-m", "grow"]);
+        let new_sha = git(&["rev-parse", "HEAD"]);
+
+        let result = incremental_index_with_name_and_limits(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::new(crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::Oversized
+        );
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(store.symbols_in_file("main.rs").unwrap().is_empty());
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        assert_eq!(
+            store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
+            new_sha
+        );
+    }
+
+    #[test]
+    fn incremental_unsupported_file_change_is_not_degraded_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "pub fn covered() {}\n").unwrap();
+        fs::write(repo.join("README.md"), "first\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/unsupported-change";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::write(repo.join("README.md"), "second\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "docs"]);
+        let result = incremental_index_with_name_and_limits(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(result.skipped_files.is_empty());
+        assert_eq!(result.files_skipped, 0);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store
+                .symbols_in_file("main.rs")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "covered")
+        );
+    }
+
+    #[test]
+    fn incremental_transient_read_failure_preserves_graph_and_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "pub fn incumbent() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.rs"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/transient-read";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::write(repo.join("main.rs"), [0xff, 0xfe, 0xfd]).unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-q", "-m", "invalid-utf8"]);
+        let error = incremental_index_with_name_and_limits(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prepare incremental source files")
+        );
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store
+                .symbols_in_file("main.rs")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "incumbent")
+        );
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        assert_eq!(
+            store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
+            old_sha
+        );
+    }
+
     /// An empty indexed_sha (Repo row created but SHA never committed) must
     /// explicitly take the full-index path rather than relying on
     /// `is_ancestor("")` returning false downstream.
@@ -10805,6 +11501,7 @@ function hello(name) { return "Hello " + name; }
             "test",
             repo_url,
             None,
+            crate::index_limits::IndexLimits::default(),
             &InjectedIndexEpilogueIo {
                 fail_generation: true,
                 fail_compute: true,
@@ -10875,6 +11572,7 @@ function hello(name) { return "Hello " + name; }
             "test",
             repo_url,
             None,
+            crate::index_limits::IndexLimits::default(),
             &InjectedIndexEpilogueIo {
                 fail_generation: true,
                 fail_compute: true,

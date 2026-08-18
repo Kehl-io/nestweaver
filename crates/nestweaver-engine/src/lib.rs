@@ -239,6 +239,7 @@ pub mod hash;
 pub mod html_to_md;
 pub mod hubs;
 pub mod index;
+pub mod index_limits;
 pub mod index_md;
 pub mod index_publication;
 pub mod interactions;

@@ -179,10 +179,67 @@ pub struct ParsedFile {
     pub type_bindings: Vec<AstTypeBinding>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReasonCode {
+    Ignored,
+    Unsupported,
+    Oversized,
+    ReadError,
+    ParseError,
+    Cancelled,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedFile {
     pub path: String,
     pub reason: String,
+    #[serde(default)]
+    pub reason_code: SkipReasonCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+}
+
+impl SkippedFile {
+    pub fn new(
+        path: impl Into<String>,
+        reason_code: SkipReasonCode,
+        reason: impl Into<String>,
+    ) -> Self {
+        let mut reason = reason.into();
+        const MAX_SKIP_DETAIL_BYTES: usize = 1024;
+        if reason.len() > MAX_SKIP_DETAIL_BYTES {
+            let mut end = MAX_SKIP_DETAIL_BYTES;
+            while end > 0 && !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+            reason.push('…');
+        }
+        Self {
+            path: path.into(),
+            reason,
+            reason_code,
+            observed_bytes: None,
+            limit_bytes: None,
+        }
+    }
+
+    pub fn oversized(path: impl Into<String>, observed_bytes: u64, limit_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            reason: format!(
+                "file exceeds source size limit ({observed_bytes} > {limit_bytes} bytes)"
+            ),
+            reason_code: SkipReasonCode::Oversized,
+            observed_bytes: Some(observed_bytes),
+            limit_bytes: Some(limit_bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1399,10 +1456,11 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
             Err(e) => {
                 let path_str = path.to_string_lossy().into_owned();
                 tracing::warn!(path = %path_str, error = %e, "skipping file due to parse error");
-                result.skipped.push(SkippedFile {
-                    path: path_str,
-                    reason: e.to_string(),
-                });
+                result.skipped.push(SkippedFile::new(
+                    path_str,
+                    SkipReasonCode::ParseError,
+                    e.to_string(),
+                ));
             }
         }
     }

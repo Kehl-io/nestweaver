@@ -39,6 +39,7 @@ pub struct CodeWatcher {
     stop_flag: Arc<AtomicBool>,
     mutation_lease_factory: Option<WatchMutationLeaseFactory>,
     debounce: Duration,
+    limits: crate::index_limits::IndexLimits,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -100,9 +101,15 @@ impl CodeWatcher {
             stop_flag: Arc::new(AtomicBool::new(false)),
             mutation_lease_factory: None,
             debounce: Duration::from_secs(2),
+            limits: crate::index_limits::IndexLimits::default(),
             #[cfg(test)]
             ready_signal: None,
         }
+    }
+
+    pub fn with_limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Install an external RAII lease acquired once around each published
@@ -206,7 +213,10 @@ impl CodeWatcher {
         // contract snapshot through the exact same atomic batch seam.
         if store.lookup_repo(&r_uid)?.is_none() {
             loop {
-                let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
+                let reader = crate::content_reader::FilesystemReader::with_limits(
+                    &self.repo_root,
+                    self.limits,
+                );
                 let initial_paths: Vec<PathBuf> = reader
                     .list_files()
                     .context("list files for initial watcher snapshot")?
@@ -214,7 +224,6 @@ impl CodeWatcher {
                     .map(|path| self.repo_root.join(path))
                     .filter(|path| is_watcher_input(path))
                     .filter(|path| !path_in_skip_dir(path))
-                    .filter(|path| !is_minified_or_bundled(path))
                     .collect();
                 let _mutation_lease = match self.acquire_mutation_lease("watch_code_initial") {
                     Ok(lease) => lease,
@@ -340,7 +349,6 @@ impl CodeWatcher {
                 .into_iter()
                 .filter(|p| !path_in_skip_dir(p))
                 .filter(|p| is_watcher_input(p))
-                .filter(|p| !is_minified_or_bundled(p))
                 .collect();
 
             if relevant.is_empty() {
@@ -421,12 +429,21 @@ impl CodeWatcher {
         F: FnOnce(),
     {
         let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
-        let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
+        let reader =
+            crate::content_reader::FilesystemReader::with_limits(&self.repo_root, self.limits);
         let contract_plan =
             match crate::index::prepare_watcher_contract_derivation(&reader, r_uid, repo_url) {
                 Ok(plan) => plan,
                 Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
             };
+        for skipped in &contract_plan.skipped_files {
+            tracing::warn!(
+                path = %skipped.path,
+                reason = ?skipped.reason_code,
+                detail = %skipped.reason,
+                "watcher published degraded coverage for a policy-skipped contract input"
+            );
+        }
         after_plan();
         let mut prepared_paths = Vec::new();
         let mut changed: HashSet<String> = HashSet::new();
@@ -443,13 +460,35 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
+            if is_minified_or_bundled(path) {
+                tracing::warn!(
+                    path = %rel_path.display(),
+                    "watched source is policy-skipped as minified/generated; removing stale graph coverage"
+                );
+                removed.insert(rel_str.clone());
+                prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
+                continue;
+            }
             match std::fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => {
-                    let prepared =
-                        match prepare_code_file(&self.repo_root, rel_path, r_uid, repo_url) {
-                            Ok(prepared) => prepared,
-                            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
-                        };
+                    let prepared = match prepare_code_file(&reader, rel_path, r_uid, repo_url) {
+                        Ok(prepared) => prepared,
+                        Err(reason)
+                            if reason
+                                .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                                .is_some() =>
+                        {
+                            tracing::warn!(
+                                path = %rel_path.display(),
+                                %reason,
+                                "watched source is policy-skipped; removing stale graph coverage"
+                            );
+                            removed.insert(rel_str.clone());
+                            prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
+                            continue;
+                        }
+                        Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+                    };
                     if contract_plan
                         .input_hashes
                         .get(&rel_str)
@@ -726,7 +765,7 @@ struct PreparedCodeFile {
 /// the read/delete/re-read race that could otherwise erase a transiently
 /// malformed half-save.
 fn prepare_code_file(
-    repo_root: &Path,
+    reader: &crate::content_reader::FilesystemReader,
     rel_path: &Path,
     r_uid: &str,
     repo_url: &str,
@@ -735,10 +774,11 @@ fn prepare_code_file(
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
-    let abs_path = repo_root.join(rel_path);
+    let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
-    let source = std::fs::read_to_string(&abs_path)
+    let source = reader
+        .read_file(rel_path)
         .with_context(|| format!("read watched source {}", abs_path.display()))?;
     let parsed = parse_source(&abs_path, &source)
         .with_context(|| format!("parse watched source {}", abs_path.display()))?;
@@ -838,7 +878,7 @@ fn prepare_code_file(
             | nestweaver_schema::Language::Svelte
             | nestweaver_schema::Language::Astro
     ) {
-        discover_workspace_context(repo_root)
+        discover_workspace_context(reader.root())
     } else {
         Default::default()
     };
@@ -1095,6 +1135,33 @@ mod tests {
                 &crate::index::FileSystemIndexEpilogueIo,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn watch_rename_into_minified_policy_removes_stale_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
+        let old_path = canonical_root.join("src/a.js");
+        let minified_path = canonical_root.join("src/a.min.js");
+        std::fs::rename(&old_path, &minified_path).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &canonical_root, "test");
+
+        let outcome = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &canonical_root,
+            &[old_path, minified_path],
+        );
+        assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+        assert!(
+            store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .all(|symbol| symbol.name != "helper"),
+            "a policy-excluded rename must not leave stale source coverage"
+        );
     }
 
     /// Regression (CRITICAL — edge loss across watch reindex): a watcher

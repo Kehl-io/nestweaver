@@ -11,6 +11,7 @@ nestweaver-proto = { workspace = true }
 nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
+nestweaver-parser = { workspace = true }
 nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
 nestweaver-embed = { workspace = true, optional = true }

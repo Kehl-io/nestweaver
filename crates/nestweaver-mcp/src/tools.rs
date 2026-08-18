@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source and set_extension write directly using
 // these primitives; in daemon builds those writes route through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_directory, index_markdown_directory, save_extensions, set_property};
+use nestweaver_engine::{index_markdown_directory, save_extensions, set_property};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -2132,7 +2132,10 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         match bare_result {
             Some(res) => serde_json::to_value(res)?,
             None => {
-                let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+                let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
+                    &root,
+                    configured_index_limits(),
+                );
                 let res = nestweaver_engine::read_symbols::read_symbols(
                     store,
                     &targets,
@@ -2144,7 +2147,10 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             }
         }
     } else {
-        let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+        let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
+            &root,
+            configured_index_limits(),
+        );
         let res = nestweaver_engine::read_symbols::read_symbols(
             store,
             &targets,
@@ -2300,6 +2306,9 @@ fn bare_reader_for_repo(
     workspace_root: &std::path::Path,
     repo_uid: &str,
 ) -> Option<nestweaver_engine::content_reader::GitBareReader> {
+    let limits = current_instance_config()
+        .map(|config| config.indexing.limits())
+        .unwrap_or_default();
     let repo = store.lookup_repo(repo_uid).ok().flatten()?;
     // The bare clone is named solely from the URL by `ensure_clone` (it never
     // sees the explicit repo name), so resolve the on-disk dir the same way —
@@ -2314,12 +2323,16 @@ fn bare_reader_for_repo(
     // fetched past it. Fall back to HEAD only when no server sha is recorded
     // (local repos store "local" or an empty sha).
     if repo.indexed_sha.is_empty() || repo.indexed_sha == "local" {
-        nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()
+        nestweaver_engine::content_reader::GitBareReader::from_head_with_limits(&bare_path, limits)
+            .ok()
     } else {
-        Some(nestweaver_engine::content_reader::GitBareReader::new(
-            &bare_path,
-            &repo.indexed_sha,
-        ))
+        Some(
+            nestweaver_engine::content_reader::GitBareReader::with_limits(
+                &bare_path,
+                &repo.indexed_sha,
+                limits,
+            ),
+        )
     }
 }
 
@@ -6017,7 +6030,9 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "tags": result.tags_count,
                 "wikilinks_resolved": result.wikilinks_resolved,
                 "wikilinks_unresolved": result.wikilinks_unresolved,
+                "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped.len(),
+                "skipped_files": result.skipped,
             }));
         }
 
@@ -6028,15 +6043,26 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             // file:// URL. The engine persists the disk location as
             // `root_path` on the Repo node.
             let url = nestweaver_engine::mint_repo_identity(path);
-            let result =
-                index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
+            let result = nestweaver_engine::index::index_directory_with_options_and_limits(
+                path,
+                &db_path,
+                "default",
+                &url,
+                "local",
+                false,
+                None,
+                configured_index_limits(),
+            )
+            .context("index repo")?;
             return Ok(json!({
                 "kind": "repo",
                 "url": url,
                 "files": result.files_count,
                 "symbols": result.symbols_count,
                 "edges": result.edges_count,
+                "coverage_status": if result.skipped_files.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped_files.len(),
+                "skipped_files": result.skipped_files,
             }));
         }
 
@@ -9262,6 +9288,12 @@ fn configured_result_limit() -> usize {
         .unwrap_or(DEFAULT_RESULT_LIMIT)
 }
 
+fn configured_index_limits() -> nestweaver_engine::index_limits::IndexLimits {
+    current_instance_config()
+        .map(|config| config.indexing.limits())
+        .unwrap_or_default()
+}
+
 /// Read the configured `[response]` settings, falling back to defaults if no
 /// instance config is installed for this dispatch context.
 fn configured_response() -> nestweaver_engine::ResponseConfig {
@@ -9854,7 +9886,7 @@ impl DaemonIndexSource {
     }
 }
 
-#[cfg(feature = "daemon")]
+#[cfg(all(test, feature = "daemon"))]
 async fn consume_daemon_index_progress<S>(
     source: DaemonIndexSource,
     mut stream: S,
@@ -9862,9 +9894,28 @@ async fn consume_daemon_index_progress<S>(
 where
     S: tokio_stream::Stream<Item = Result<nestweaver_proto::IndexProgress, tonic::Status>> + Unpin,
 {
-    nestweaver_proto::consume_index_progress(&mut stream, |_| {})
-        .await
-        .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))
+    Ok(consume_daemon_index_progress_detailed(source, &mut stream)
+        .await?
+        .0)
+}
+
+#[cfg(feature = "daemon")]
+async fn consume_daemon_index_progress_detailed<S>(
+    source: DaemonIndexSource,
+    mut stream: S,
+) -> Result<(String, Option<nestweaver_proto::IndexProgress>), anyhow::Error>
+where
+    S: tokio_stream::Stream<Item = Result<nestweaver_proto::IndexProgress, tonic::Status>> + Unpin,
+{
+    let mut terminal = None;
+    let message = nestweaver_proto::consume_index_progress(&mut stream, |progress| {
+        if progress.phase == nestweaver_proto::Phase::Done as i32 {
+            terminal = Some(progress.clone());
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))?;
+    Ok((message, terminal))
 }
 
 /// Heuristic vault detector for `brain_add_source`: true when markdown files are
@@ -9997,12 +10048,22 @@ fn dispatch_add_source_via_daemon(
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Vault, stream).await?;
+            let (last_msg, terminal) =
+                consume_daemon_index_progress_detailed(DaemonIndexSource::Vault, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
                 "type": "vault",
                 "message": last_msg,
+                "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
+                "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
+                "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
+                    "path": file.path,
+                    "reason_code": file.reason_code,
+                    "detail": file.detail,
+                    "observed_bytes": file.observed_bytes,
+                    "limit_bytes": file.limit_bytes,
+                })).collect::<Vec<_>>()).unwrap_or_default(),
             }))
         } else {
             let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
@@ -10014,6 +10075,10 @@ fn dispatch_add_source_via_daemon(
                 force: false,
                 with_trigrams: false,
                 with_git_activity: false,
+                rebuild_trigrams: false,
+                max_source_file_bytes: current_instance_config()
+                    .map(|config| config.indexing.limits().max_source_file_bytes())
+                    .unwrap_or(0),
                 // nw-019: no explicit instance here — let the daemon decide
                 // (config's logical name, else runtime hash).
                 instance_id: String::new(),
@@ -10023,12 +10088,22 @@ fn dispatch_add_source_via_daemon(
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Repo, stream).await?;
+            let (last_msg, terminal) =
+                consume_daemon_index_progress_detailed(DaemonIndexSource::Repo, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
                 "type": "repo",
                 "message": last_msg,
+                "coverage_status": terminal.as_ref().map(|progress| if progress.coverage_status == nestweaver_proto::CoverageStatus::Degraded as i32 { "degraded" } else { "complete" }),
+                "skipped_count": terminal.as_ref().map_or(0, |progress| progress.skipped_count),
+                "skipped_files": terminal.as_ref().map(|progress| progress.skipped_files.iter().map(|file| serde_json::json!({
+                    "path": file.path,
+                    "reason_code": file.reason_code,
+                    "detail": file.detail,
+                    "observed_bytes": file.observed_bytes,
+                    "limit_bytes": file.limit_bytes,
+                })).collect::<Vec<_>>()).unwrap_or_default(),
             }))
         }
     })

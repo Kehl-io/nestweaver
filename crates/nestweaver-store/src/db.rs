@@ -250,6 +250,10 @@ pub struct GraphStore {
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
+    /// Generation/digest-keyed trigram scope trust verdict. The digest keeps
+    /// raw/import mutations that do not bump the in-process generation from
+    /// reusing a narrower stale verdict.
+    pub(crate) trigram_scope_cache: Mutex<Option<crate::regex::TrigramScopeCache>>,
     /// Last canonical generation while an index publication is dirty. A
     /// present value means `graph_generation` is either its dirty N+1
     /// reservation or the prepared clean N+2 publication. Keeping this
@@ -505,6 +509,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -537,6 +542,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -570,6 +576,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -626,6 +633,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -2120,6 +2128,29 @@ impl GraphStore {
                 uid STRING, \
                 trigram STRING, \
                 node_uid STRING, \
+                scope_uid STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        // Forward migration for posting tables created before scoped trigram
+        // maintenance. Legacy rows retain the empty default and are replaced
+        // by the first v2 refresh.
+        let _ = conn.query("ALTER TABLE TrigramPosting ADD scope_uid STRING DEFAULT ''");
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS TrigramDocument(\
+                uid STRING, \
+                scope_uid STRING, \
+                text_hash STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS TrigramScope(\
+                uid STRING, \
+                status STRING, \
+                candidate_count INT64, \
+                candidate_digest STRING, \
+                indexed_generation INT64, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;

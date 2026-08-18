@@ -164,6 +164,11 @@ components = ["device-onboarding", "user-auth"]
 stoplist_extend = ["Platform", "Service", "Manager"]
 min_symbol_name_length = 4
 
+# Source-code parser safety limit. Markdown notes keep their independent 1 MiB
+# policy. Values must be between 1 KiB and the fixed 64 MiB hard ceiling.
+[indexing]
+max_source_file_bytes = 2097152
+
 # ── MCP servers (for wiki source ingestion) ──────────────────────────────
 #
 # Declare external MCP servers that NestWeaver can call to fetch content
