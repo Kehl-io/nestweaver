@@ -313,6 +313,49 @@ pub struct GraphStore {
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
 }
 
+/// Persistent identity of one NestWeaver brain and its current publication
+/// slot. These IDs describe the data, not the configured instance name or the
+/// database path used for daemon runtime files.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationIdentity {
+    pub brain_uuid: String,
+    pub publication_uuid: String,
+}
+
+impl PublicationIdentity {
+    fn generate() -> Self {
+        Self {
+            brain_uuid: uuid::Uuid::new_v4().to_string(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        let parse = |name: &str, value: &str| {
+            let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
+                StoreError::Query(format!("invalid {name} metadata '{value}': {error}"))
+            })?;
+            if parsed.is_nil() {
+                return Err(StoreError::Query(format!(
+                    "invalid {name} metadata: nil UUID is not a data identity"
+                )));
+            }
+            Ok(parsed)
+        };
+        let brain_uuid = parse("brain_uuid", &self.brain_uuid)?;
+        let publication_uuid = parse("publication_uuid", &self.publication_uuid)?;
+        if brain_uuid == publication_uuid {
+            return Err(StoreError::Query(
+                "brain_uuid and publication_uuid must be distinct".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const BRAIN_UUID_META_KEY: &str = "publication.brain_uuid";
+const PUBLICATION_UUID_META_KEY: &str = "publication.publication_uuid";
+
 /// Authoritative embedding state captured while the in-memory embedding mutex
 /// remained held for the complete flush/metadata/count/stage operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +569,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
         Ok(store)
@@ -559,6 +603,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
         Ok(store)
@@ -650,6 +695,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
         store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
@@ -1699,6 +1745,132 @@ impl GraphStore {
         Ok(lbug::Connection::new(&self.db)?)
     }
 
+    fn publication_meta_value_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) RETURN m.value")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("key", lbug::Value::String(key.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("read publication identity: {error}")))?;
+        rows.next()
+            .map(|row| crate::read::extract_string(&row, 0))
+            .transpose()
+    }
+
+    fn create_publication_meta_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        let mut statement = conn
+            .prepare("CREATE (:Meta {key: $key, value: $value})")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(key.to_string())),
+                ("value", lbug::Value::String(value.to_string())),
+            ],
+        )
+        .map_err(|error| StoreError::Query(format!("write publication identity: {error}")))?;
+        Ok(())
+    }
+
+    /// Read the database-bound identity. A legacy read-only database may have
+    /// neither key and returns `None`; a partial or malformed identity is an
+    /// error because silently inventing the missing half could attach foreign
+    /// artifacts to this graph.
+    pub fn publication_identity(&self) -> Result<Option<PublicationIdentity>, StoreError> {
+        let conn = self.conn()?;
+        let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
+        let publication_uuid = Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+        match (brain_uuid, publication_uuid) {
+            (None, None) => Ok(None),
+            (Some(brain_uuid), Some(publication_uuid)) => {
+                let identity = PublicationIdentity {
+                    brain_uuid,
+                    publication_uuid,
+                };
+                identity.validate()?;
+                Ok(Some(identity))
+            }
+            (brain_uuid, publication_uuid) => Err(StoreError::Query(format!(
+                "incomplete publication identity: brain_uuid={}, publication_uuid={}; repair or rebuild the database",
+                brain_uuid.is_some(),
+                publication_uuid.is_some()
+            ))),
+        }
+    }
+
+    /// Initialize identity for a new or legacy writable database exactly once.
+    /// Both keys are committed in one LadybugDB transaction. Existing identity
+    /// is validated and returned unchanged.
+    pub fn ensure_publication_identity(&self) -> Result<PublicationIdentity, StoreError> {
+        if let Some(identity) = self.publication_identity()? {
+            return Ok(identity);
+        }
+
+        let identity = PublicationIdentity::generate();
+        identity.validate()?;
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|error| StoreError::Query(format!("begin publication identity: {error}")))?;
+        let result = (|| {
+            // Re-check under the write transaction so two openers cannot each
+            // publish a different identity for the same legacy database.
+            let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
+            let publication_uuid =
+                Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+            match (brain_uuid, publication_uuid) {
+                (None, None) => {
+                    Self::create_publication_meta_on(
+                        &conn,
+                        BRAIN_UUID_META_KEY,
+                        &identity.brain_uuid,
+                    )?;
+                    Self::create_publication_meta_on(
+                        &conn,
+                        PUBLICATION_UUID_META_KEY,
+                        &identity.publication_uuid,
+                    )?;
+                    Ok(identity.clone())
+                }
+                (Some(brain_uuid), Some(publication_uuid)) => {
+                    let existing = PublicationIdentity {
+                        brain_uuid,
+                        publication_uuid,
+                    };
+                    existing.validate()?;
+                    Ok(existing)
+                }
+                (brain_uuid, publication_uuid) => Err(StoreError::Query(format!(
+                    "incomplete publication identity: brain_uuid={}, publication_uuid={}; repair or rebuild the database",
+                    brain_uuid.is_some(),
+                    publication_uuid.is_some()
+                ))),
+            }
+        })();
+
+        match result {
+            Ok(identity) => {
+                conn.query("COMMIT").map_err(|error| {
+                    StoreError::Query(format!("commit publication identity: {error}"))
+                })?;
+                Ok(identity)
+            }
+            Err(error) => {
+                let _ = conn.query("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     /// Begin an explicit write transaction. All subsequent writes on the
     /// returned connection are grouped into a single transaction until
     /// `commit_transaction` is called, avoiding per-statement WAL flushes.
@@ -2194,6 +2366,105 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_identity_is_created_once_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.lbug");
+        let created = GraphStore::create(&path).unwrap();
+        let first = created.publication_identity().unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(&first.brain_uuid).is_ok());
+        assert!(uuid::Uuid::parse_str(&first.publication_uuid).is_ok());
+        assert_ne!(first.brain_uuid, first.publication_uuid);
+        drop(created);
+
+        let reopened = GraphStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(first.clone())
+        );
+        drop(reopened);
+
+        let read_only = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(read_only.publication_identity().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn partial_publication_identity_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) DETACH DELETE m")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![(
+                "key",
+                lbug::Value::String(PUBLICATION_UUID_META_KEY.to_string()),
+            )],
+        )
+        .unwrap();
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("incomplete publication identity"), "{error}");
+        let error = store.ensure_publication_identity().unwrap_err().to_string();
+        assert!(error.contains("incomplete publication identity"), "{error}");
+    }
+
+    #[test]
+    fn malformed_publication_identity_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(BRAIN_UUID_META_KEY.to_string())),
+                ("value", lbug::Value::String("not-a-uuid".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("invalid brain_uuid metadata"), "{error}");
+        let error = store.ensure_publication_identity().unwrap_err().to_string();
+        assert!(error.contains("invalid brain_uuid metadata"), "{error}");
+    }
+
+    #[test]
+    fn equivalent_publication_identity_uuid_encodings_cannot_bypass_distinctness() {
+        let store = GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let publication_uuid = uuid::Uuid::parse_str(&identity.publication_uuid).unwrap();
+        let conn = store.conn().unwrap();
+        for (key, value) in [
+            (
+                BRAIN_UUID_META_KEY,
+                publication_uuid.simple().to_string().to_uppercase(),
+            ),
+            (
+                PUBLICATION_UUID_META_KEY,
+                publication_uuid.hyphenated().to_string(),
+            ),
+        ] {
+            let mut statement = conn
+                .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+                .unwrap();
+            conn.execute(
+                &mut statement,
+                vec![
+                    ("key", lbug::Value::String(key.to_string())),
+                    ("value", lbug::Value::String(value)),
+                ],
+            )
+            .unwrap();
+        }
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+    }
 
     #[test]
     fn index_publication_lease_is_send_without_a_held_mutex_guard() {

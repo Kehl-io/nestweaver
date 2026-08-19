@@ -15,7 +15,7 @@ pub mod zstd;
 
 pub use db::{
     EmbeddingIndexReconciliation, EmbeddingSnapshotLease, EmbeddingSnapshotState, GraphStore,
-    IndexPublicationLease,
+    IndexPublicationLease, PublicationIdentity,
 };
 pub use error::{CancelReason, StoreError};
 

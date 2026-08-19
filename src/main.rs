@@ -22232,6 +22232,11 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                 format_version: nestweaver_engine::SNAPSHOT_FORMAT_VERSION,
                 capabilities: vec![nestweaver_engine::SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()],
                 instance_id: instance_id.clone(),
+                // `build_snapshot_from_store` replaces these placeholders
+                // with the database-owned values captured under the
+                // publication lease. CLI/config identity is not authoritative.
+                brain_uuid: String::new(),
+                publication_uuid: String::new(),
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
                 min_compatible_engine: nestweaver_engine::MIN_SNAPSHOT_READER_VERSION.to_string(),
                 schema_hash_core: core_hash,

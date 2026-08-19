@@ -10,14 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// releases that don't touch the snapshot wire format should leave this alone.
 /// Snapshot-format capability level implemented by this reader.
 ///
-/// Format v2 makes the embedding sidecar part of the authoritative snapshot
-/// state.  The first shipped reader did not understand that invariant, so v2
-/// writers must fence it out even while this development tree still reports
-/// the older package version.  New readers compare against this capability
-/// level; old readers compare against their package version and reject v2.
-pub const MIN_SNAPSHOT_READER_VERSION: &str = "4.1.1";
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Format v2 made the embedding sidecar part of the authoritative snapshot.
+/// Format v3 additionally binds the stamp to the graph's durable brain and
+/// publication identities. Writers fence out older readers that cannot enforce
+/// those invariants. The explicit capability version lets this development
+/// tree read snapshots it writes before the package version is raised.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "6.3.0";
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 pub const SNAPSHOT_CAPABILITY_EMBEDDINGS: &str = "embedding-sidecar-v1";
+pub const SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY: &str = "publication-identity-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
@@ -26,6 +27,13 @@ pub struct Stamp {
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub instance_id: String,
+    /// Stable identity of the brain data. This is deliberately independent of
+    /// the configured `instance_id` and the database's filesystem path.
+    #[serde(default)]
+    pub brain_uuid: String,
+    /// Identity of the complete publication slot captured by this snapshot.
+    #[serde(default)]
+    pub publication_uuid: String,
     pub engine_version: String,
     pub min_compatible_engine: String,
     pub schema_hash_core: String,
@@ -295,8 +303,19 @@ pub fn build_snapshot_from_store(
 
         let mut authoritative_stamp = stamp.clone();
         let embedding = embedding_lease.state();
+        let publication_identity = store
+            .publication_identity()
+            .map_err(|error| anyhow::anyhow!("failed to read publication identity: {error}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "database has no publication identity; reopen it writable to initialize identity before snapshotting"
+                )
+            })?;
         authoritative_stamp.format_version = SNAPSHOT_FORMAT_VERSION;
-        authoritative_stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        authoritative_stamp.capabilities = vec![
+            SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string(),
+            SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY.to_string(),
+        ];
         if !semver_ge(
             &authoritative_stamp.min_compatible_engine,
             MIN_SNAPSHOT_READER_VERSION,
@@ -306,7 +325,12 @@ pub fn build_snapshot_from_store(
         authoritative_stamp.embedding_model_id = embedding.model_id.clone();
         authoritative_stamp.embedding_dimension = embedding.dimension;
         authoritative_stamp.embedding_count = embedding.count;
+        authoritative_stamp.brain_uuid = publication_identity.brain_uuid;
+        authoritative_stamp.publication_uuid = publication_identity.publication_uuid;
         build_snapshot_files(&staging, &authoritative_stamp, manifest, db_path)?;
+        verify_snapshot(&staging).map_err(|error| {
+            anyhow::anyhow!("staged snapshot failed publication validation: {error}")
+        })?;
         sync_directory_tree(&staging)?;
         std::fs::rename(&staging, output_dir).map_err(|error| {
             anyhow::anyhow!(
@@ -437,7 +461,7 @@ fn build_snapshot_files(
 ///
 /// Supports both the new per-file checksum format and the legacy single-hash
 /// format for backwards compatibility.
-pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
+fn verify_snapshot_envelope(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
     verify_checksums(snapshot_dir)?;
 
     let stamp_json = std::fs::read_to_string(snapshot_dir.join(STAMP_FILE))
@@ -449,6 +473,32 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
             "snapshot format {} is newer than this engine supports ({SNAPSHOT_FORMAT_VERSION})",
             stamp.format_version
         );
+    }
+    if stamp.format_version >= 3 {
+        if !stamp
+            .capabilities
+            .iter()
+            .any(|capability| capability == SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY)
+        {
+            anyhow::bail!(
+                "snapshot format {} does not declare publication-identity capability",
+                stamp.format_version
+            );
+        }
+        let parse_identity = |name: &str, value: &str| {
+            let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
+                anyhow::anyhow!("snapshot has invalid {name} '{value}': {error}")
+            })?;
+            if parsed.is_nil() {
+                anyhow::bail!("snapshot has invalid {name}: nil UUID is not a data identity");
+            }
+            Ok(parsed)
+        };
+        let brain_uuid = parse_identity("brain_uuid", &stamp.brain_uuid)?;
+        let publication_uuid = parse_identity("publication_uuid", &stamp.publication_uuid)?;
+        if brain_uuid == publication_uuid {
+            anyhow::bail!("snapshot brain_uuid and publication_uuid must be distinct");
+        }
     }
     let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if stamp.format_version == 0 {
@@ -487,6 +537,32 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
             }
         }
     }
+    Ok(stamp)
+}
+
+fn verify_snapshot_artifacts(snapshot_dir: &Path, stamp: &Stamp) -> Result<(), anyhow::Error> {
+    if stamp.format_version >= 3 {
+        let graph_path = snapshot_dir.join(GRAPH_FILE);
+        let graph = nestweaver_store::GraphStore::open_read_only(&graph_path)
+            .map_err(|error| anyhow::anyhow!("open snapshot graph for identity check: {error}"))?;
+        let graph_identity = graph
+            .publication_identity()
+            .map_err(|error| anyhow::anyhow!("read snapshot graph identity: {error}"))?
+            .ok_or_else(|| anyhow::anyhow!("snapshot graph has no publication identity"))?;
+        if graph_identity.brain_uuid != stamp.brain_uuid
+            || graph_identity.publication_uuid != stamp.publication_uuid
+        {
+            anyhow::bail!(
+                "snapshot publication identity mismatch: stamp brain/publication={}/{}, graph={}/{}",
+                stamp.brain_uuid,
+                stamp.publication_uuid,
+                graph_identity.brain_uuid,
+                graph_identity.publication_uuid
+            );
+        }
+    }
+
+    let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if embedding_path.exists() {
         let embeddings = nestweaver_store::EmbeddingIndex::load_binary(&embedding_path)
             .map_err(|error| anyhow::anyhow!("invalid snapshot embedding artifact: {error}"))?;
@@ -503,6 +579,14 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
         }
     }
 
+    Ok(())
+}
+
+/// Verify a snapshot's checksummed envelope and then reopen its typed
+/// artifacts to confirm that their embedded metadata agrees with the stamp.
+pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
+    let stamp = verify_snapshot_envelope(snapshot_dir)?;
+    verify_snapshot_artifacts(snapshot_dir, &stamp)?;
     Ok(stamp)
 }
 
@@ -522,11 +606,12 @@ fn semver_ge(a: &str, b: &str) -> bool {
 /// Load a snapshot, validating compatibility against the running engine.
 ///
 /// Steps:
-/// 1. `verify_snapshot()` — integrity check.
+/// 1. Verify the checksummed envelope without opening artifact payloads.
 /// 2. Check `stamp.min_compatible_engine <= engine_version` (stamp requires at least that version).
 /// 3. Check `stamp.schema_hash_effective == expected_schema_hash`.
 /// 4. Check `stamp.embedding_model_id == expected_embedding_model`.
-/// 5. Return `(stamp, path to graph.lbug)`.
+/// 5. Open and validate compatible artifact payloads.
+/// 6. Return `(stamp, path to graph.lbug)`.
 pub fn load_snapshot(
     snapshot_dir: &Path,
     engine_version: &str,
@@ -551,14 +636,14 @@ pub fn load_snapshot_with_config(
     expected_schema_hash: Option<&str>,
     expected_embedding_model: Option<&str>,
 ) -> Result<(Stamp, PathBuf), anyhow::Error> {
-    let stamp = verify_snapshot(snapshot_dir)?;
+    let stamp = verify_snapshot_envelope(snapshot_dir)?;
 
     // The snapshot requires at least min_compatible_engine to load it.
     // If the running engine_version < min_compatible_engine, reject.
-    // `engine_version` remains the application compatibility input.  For v2,
+    // `engine_version` remains the application compatibility input. For v3,
     // this source tree has a reader capability newer than its package version;
     // using the explicit capability lets it read snapshots it writes while the
-    // raised stamp still makes every pre-v2 reader fail closed.
+    // raised stamp still makes every pre-v3 reader fail closed.
     let reader_version = if engine_version == env!("CARGO_PKG_VERSION")
         && stamp.format_version >= 2
         && semver_ge(MIN_SNAPSHOT_READER_VERSION, &stamp.min_compatible_engine)
@@ -610,6 +695,11 @@ pub fn load_snapshot_with_config(
             expected_embedding_model
         );
     }
+
+    // Only compatible artifacts are opened. This prevents an older reader
+    // from asking LadybugDB or the embedding decoder to parse a payload whose
+    // declared engine/schema contract it cannot understand.
+    verify_snapshot_artifacts(snapshot_dir, &stamp)?;
 
     Ok((stamp, snapshot_dir.join(GRAPH_FILE)))
 }
@@ -807,11 +897,11 @@ pub fn schema_hashes(cfg: Option<&crate::config::InstanceConfig>) -> (String, St
 mod tests {
     use super::*;
 
-    /// The last engine release before the v2 snapshot floor was raised. A
-    /// historical fact, so it is correctly a literal — unlike the *current*
-    /// reader, which must track `MIN_SNAPSHOT_READER_VERSION` or these tests
-    /// break at every release that raises the floor.
-    const PRE_V2_READER: &str = "4.1.0";
+    /// A representative numeric reader version below the v3 capability floor.
+    /// It must not equal this development tree's package version: matching the
+    /// package version deliberately activates the source reader's newer
+    /// capability override before the release version itself is raised.
+    const PRE_V3_READER: &str = "6.2.999";
 
     fn make_stamp(
         engine_version: &str,
@@ -823,6 +913,8 @@ mod tests {
             format_version: 0,
             capabilities: Vec::new(),
             instance_id: "test-instance".to_string(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
             engine_version: engine_version.to_string(),
             min_compatible_engine: min_compatible.to_string(),
             schema_hash_core: nestweaver_schema::core_schema_hash(),
@@ -870,7 +962,7 @@ mod tests {
         );
         let manifest = make_manifest();
 
-        build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
+        let built = build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
 
         assert!(snap_dir.join(GRAPH_FILE).exists(), "graph.lbug missing");
         assert!(
@@ -881,6 +973,19 @@ mod tests {
         assert!(
             snap_dir.join(CHECKSUM_FILE).exists(),
             "checksum.blake3 missing"
+        );
+        let source_identity = nestweaver_store::GraphStore::open_read_only(&db)
+            .unwrap()
+            .publication_identity()
+            .unwrap()
+            .unwrap();
+        assert_eq!(built.brain_uuid, source_identity.brain_uuid);
+        assert_eq!(built.publication_uuid, source_identity.publication_uuid);
+        assert!(
+            built
+                .capabilities
+                .iter()
+                .any(|capability| capability == SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY)
         );
     }
 
@@ -1029,6 +1134,104 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_stamp_identity_that_does_not_match_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.publication_uuid = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(error.contains("publication identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn verify_rejects_equivalent_identity_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.brain_uuid = uuid::Uuid::parse_str(&stamp.publication_uuid)
+            .unwrap()
+            .simple()
+            .to_string()
+            .to_uppercase();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+    }
+
+    #[test]
+    fn reader_remains_compatible_with_v2_snapshots_without_identity_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("6.2.0", "4.1.1", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        // Model a snapshot emitted by the v2 writer: identity was neither a
+        // declared capability nor part of the serialized stamp contract.
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.format_version = 2;
+        stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        stamp.brain_uuid.clear();
+        stamp.publication_uuid.clear();
+        stamp.min_compatible_engine = "4.1.1".to_string();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let verified = verify_snapshot(&snap_dir).unwrap();
+        assert_eq!(verified.format_version, 2);
+        assert!(verified.brain_uuid.is_empty());
+        assert!(verified.publication_uuid.is_empty());
+        load_snapshot_with_config(&snap_dir, "6.2.0", None, None)
+            .expect("the v3 reader must retain v2 read compatibility");
+    }
+
+    #[test]
     fn load_rejects_incompatible_engine() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
@@ -1057,6 +1260,36 @@ mod tests {
             msg.contains("engine") && (msg.contains("rebuild") || msg.contains("requires")),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn compatibility_gate_precedes_artifact_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("99.0.0", "99.0.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        // Keep the envelope internally checksummed while making the graph
+        // payload impossible to open. An incompatible reader must reject on
+        // the declared engine contract before LadybugDB sees these bytes.
+        std::fs::write(snap_dir.join(GRAPH_FILE), b"not a database").unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_snapshot_with_config(&snap_dir, "6.3.0", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires engine >= 99.0.0"), "{error}");
+        assert!(!error.contains("open snapshot graph"), "{error}");
     }
 
     #[test]
@@ -1190,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshot_fences_old_reader_but_current_reader_accepts_its_output() {
+    fn v3_snapshot_fences_old_reader_but_current_reader_accepts_its_output() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
@@ -1206,16 +1439,16 @@ mod tests {
         assert_eq!(stamp.format_version, SNAPSHOT_FORMAT_VERSION);
         assert_eq!(stamp.min_compatible_engine, MIN_SNAPSHOT_READER_VERSION);
         assert!(
-            !semver_ge(PRE_V2_READER, &stamp.min_compatible_engine),
-            "the last pre-v2 reader must sit below the raised compatibility floor"
+            !semver_ge(PRE_V3_READER, &stamp.min_compatible_engine),
+            "the last pre-v3 reader must sit below the raised compatibility floor"
         );
         // Assert the fence actually FENCES. Previously this test only checked
         // the semver relation and then expected the same old reader to load,
         // which is self-contradictory the moment the floor rises past it.
-        load_snapshot_with_config(&snap_dir, PRE_V2_READER, None, None)
-            .expect_err("a pre-v2 reader must be refused by the raised floor");
+        load_snapshot_with_config(&snap_dir, PRE_V3_READER, None, None)
+            .expect_err("a pre-v3 reader must be refused by the raised floor");
         load_snapshot_with_config(&snap_dir, MIN_SNAPSHOT_READER_VERSION, None, None)
-            .expect("the v2-capable reader must accept the v2 snapshot it wrote");
+            .expect("the v3-capable reader must accept the v3 snapshot it wrote");
     }
 
     #[test]
