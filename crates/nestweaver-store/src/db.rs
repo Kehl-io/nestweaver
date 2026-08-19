@@ -291,6 +291,11 @@ pub struct GraphStore {
     /// sidecar so `graph_generation` can be loaded on open and persisted on
     /// mutation without callers having to thread the path through.
     pub(crate) db_path: Option<PathBuf>,
+    /// Private filesystem namespace for rebuildable sidecars owned by an
+    /// in-memory graph. Keeping the TempDir alive makes in-memory stores use
+    /// the same regex-v3 implementation as persistent stores without creating
+    /// graph-resident postings.
+    regex_ephemeral_root: Option<tempfile::TempDir>,
     /// Cached PPR adjacency graph. Holds the last-built `(uids, uid_to_idx,
     /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
@@ -584,6 +589,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -635,6 +641,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -670,6 +677,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -706,6 +714,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -750,6 +759,10 @@ impl GraphStore {
     /// Create an in-memory database and initialise schema tables.
     pub fn in_memory() -> Result<Self, StoreError> {
         let db = lbug::Database::in_memory(lbug::SystemConfig::default())?;
+        let regex_ephemeral_root = tempfile::Builder::new()
+            .prefix("nestweaver-regex-v3-memory-")
+            .tempdir()
+            .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -764,6 +777,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
+            regex_ephemeral_root: Some(regex_ephemeral_root),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -1565,6 +1579,22 @@ impl GraphStore {
         self.db_path
             .as_ref()
             .map(|p| Self::embedding_sidecar_binary_for(p))
+    }
+
+    /// Return the dedicated per-scope regex-v3 sidecar root.
+    pub fn regex_sidecar_root(&self) -> Option<std::path::PathBuf> {
+        self.db_path
+            .as_ref()
+            .map(|path| {
+                let mut value = path.as_os_str().to_owned();
+                value.push(".regex-v3");
+                std::path::PathBuf::from(value)
+            })
+            .or_else(|| {
+                self.regex_ephemeral_root
+                    .as_ref()
+                    .map(|root| root.path().join("regex-v3"))
+            })
     }
 
     /// Add an embedding to the in-memory index without saving to disk.
@@ -2427,42 +2457,9 @@ impl GraphStore {
         .map_err(|e| StoreError::Query(e.to_string()))?;
         let _ = conn.query("ALTER TABLE IMPLEMENTS_CONTRACT ADD evidence STRING DEFAULT ''");
 
-        // ── Trigram posting table (F3/F4) ───────────────────────────────────
-        // Maps a lowercased 3-gram to a node UID whose indexed text contains
-        // it. Built opt-in via `index --with-trigrams`; used to pre-filter
-        // candidate nodes before running the real regex. Correctness never
-        // depends on its presence — see crate::regex.
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramPosting(\
-                uid STRING, \
-                trigram STRING, \
-                node_uid STRING, \
-                scope_uid STRING, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-        // Forward migration for posting tables created before scoped trigram
-        // maintenance. Legacy rows retain the empty default and are replaced
-        // by the first v2 refresh.
-        let _ = conn.query("ALTER TABLE TrigramPosting ADD scope_uid STRING DEFAULT ''");
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramDocument(\
-                uid STRING, \
-                scope_uid STRING, \
-                text_hash STRING, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramScope(\
-                uid STRING, \
-                status STRING, \
-                candidate_count INT64, \
-                candidate_digest STRING, \
-                indexed_generation INT64, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
+        // Regex v3 stores postings in disposable per-scope Tantivy shards.
+        // Fresh graphs intentionally create no graph-resident posting tables;
+        // older tables may remain until the mandatory fresh-reindex cutover.
 
         // ── Unresolved wikilink table (broken-links) ────────────────────────
         // A `[[Target]]` whose text matches no note in the vault produces NO

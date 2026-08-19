@@ -90,6 +90,7 @@ pub enum ArtifactKind {
     Ranking,
     RepoManifest,
     Bm25,
+    Regex,
     Embeddings,
     ParsedCache,
     ResolutionDependencies,

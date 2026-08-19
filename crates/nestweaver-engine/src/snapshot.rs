@@ -84,6 +84,7 @@ const PUBLICATION_FILE: &str = crate::publication::PUBLICATION_MANIFEST_FILE;
 const SIDECAR_PAGERANK: &str = "pagerank.json";
 const SIDECAR_MANIFESTS: &str = "manifests.json";
 const SIDECAR_TANTIVY_DIR: &str = "tantivy";
+const SIDECAR_REGEX_DIR: &str = "regex-v3";
 const SIDECAR_EMBEDDINGS: &str = "embeddings.bin";
 
 /// Core files that MUST be present and checksummed in every snapshot.
@@ -119,12 +120,15 @@ fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
         let hash = crate::hash::blake3_hex_bytes(&bytes);
         lines.push(format!("{hash}  {PUBLICATION_FILE}"));
     }
-    // Hash tantivy directory contents if present (hash each file, sorted)
-    let tantivy_dir = snapshot_dir.join(SIDECAR_TANTIVY_DIR);
-    if tantivy_dir.is_dir() {
-        let mut tantivy_files = collect_files_recursive(&tantivy_dir, SIDECAR_TANTIVY_DIR)?;
-        tantivy_files.sort();
-        for (rel_path, abs_path) in tantivy_files {
+    // Hash directory sidecars file-by-file in deterministic path order.
+    for sidecar_dir in [SIDECAR_TANTIVY_DIR, SIDECAR_REGEX_DIR] {
+        let directory = snapshot_dir.join(sidecar_dir);
+        if !directory.is_dir() {
+            continue;
+        }
+        let mut files = collect_files_recursive(&directory, sidecar_dir)?;
+        files.sort();
+        for (rel_path, abs_path) in files {
             let bytes = std::fs::read(&abs_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {rel_path} for checksum: {e}"))?;
             let hash = crate::hash::blake3_hex_bytes(&bytes);
@@ -467,6 +471,21 @@ fn build_snapshot_files(
         );
     }
 
+    let regex_src = crate::sidecar_path(db_path, ".regex-v3");
+    if regex_src.is_dir() {
+        copy_dir_all(&regex_src, &output_dir.join(SIDECAR_REGEX_DIR)).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to copy regex-v3 directory {}: {error}",
+                regex_src.display()
+            )
+        })?;
+    } else {
+        tracing::debug!(
+            src = %regex_src.display(),
+            "build_snapshot: regex-v3 index directory not found, skipping"
+        );
+    }
+
     write_publication_bundle(output_dir, stamp, source_graph_generation)?;
 
     // ── Checksums (after all files are in place) ────────────────────────────
@@ -511,6 +530,15 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
             ArtifactKind::Bm25,
             1,
             "nestweaver-tantivy-bm25-v1".to_string(),
+        ),
+        path if path.starts_with(&format!("{SIDECAR_REGEX_DIR}/")) => (
+            ArtifactKind::Regex,
+            nestweaver_store::REGEX_INDEX_SCHEMA_VERSION,
+            format!(
+                "regex-v{}:{}",
+                nestweaver_store::REGEX_INDEX_SCHEMA_VERSION,
+                nestweaver_store::REGEX_TOKENIZER_FINGERPRINT
+            ),
         ),
         _ => anyhow::bail!("unclassified publication artifact: {path}"),
     };
@@ -1128,6 +1156,12 @@ fn materialize_snapshot_with_config_and_hook(
             let tantivy_dst = crate::sidecar_path(&db_path, ".tantivy");
             std::fs::rename(&tantivy_src, &tantivy_dst)
                 .map_err(|e| anyhow::anyhow!("failed to stage verified tantivy index: {e}"))?;
+        }
+        let regex_src = verified_snapshot.join(SIDECAR_REGEX_DIR);
+        if regex_src.is_dir() {
+            let regex_dst = crate::sidecar_path(&db_path, ".regex-v3");
+            std::fs::rename(&regex_src, &regex_dst)
+                .map_err(|e| anyhow::anyhow!("failed to stage verified regex-v3 index: {e}"))?;
         }
         std::fs::remove_dir_all(&verified_snapshot)?;
         sync_directory_tree(&staging)?;

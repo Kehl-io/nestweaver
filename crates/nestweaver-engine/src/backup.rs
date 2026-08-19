@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 /// Known sidecar suffixes to include in backups.
 const SIDECAR_SUFFIXES: &[&str] = &[
     ".tantivy",
+    ".regex-v3",
     ".pagerank.json",
     ".parsed_cache.bin",
     ".resolution_deps.bin",
@@ -764,6 +765,12 @@ fn backup_artifact_contract(
         (ArtifactKind::WorkspaceClone, 1, "git-object-store-v1")
     } else if path.starts_with(&format!("{db_filename}.tantivy/")) {
         (ArtifactKind::Bm25, 1, "nestweaver-tantivy-bm25-v1")
+    } else if path.starts_with(&format!("{db_filename}.regex-v3/")) {
+        (
+            ArtifactKind::Regex,
+            nestweaver_store::REGEX_INDEX_SCHEMA_VERSION,
+            "nestweaver-regex-v3-unicode-scalar-trigrams-v1",
+        )
     } else {
         match suffix {
             Some(".parsed_cache.bin") => {
