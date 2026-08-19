@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,46 @@ fn finish_top(heap: BinaryHeap<Reverse<RankedEmbedding>>) -> Vec<(String, f64)> 
         .collect()
 }
 
+fn merge_top(
+    mut left: BinaryHeap<Reverse<RankedEmbedding>>,
+    right: BinaryHeap<Reverse<RankedEmbedding>>,
+    limit: usize,
+) -> BinaryHeap<Reverse<RankedEmbedding>> {
+    for Reverse(candidate) in right {
+        retain_top(&mut left, candidate, limit);
+    }
+    left
+}
+
+fn embedding_similarity(
+    embedding: &[f32],
+    query: &[f32],
+    query_norm: f64,
+    similarity: &nestweaver_schema::EmbeddingSimilarity,
+) -> f64 {
+    let (dot, vector_norm_squared) = embedding.iter().zip(query).fold(
+        (0.0_f64, 0.0_f64),
+        |(dot, norm), (embedding_value, query_value)| {
+            let embedding_value = f64::from(*embedding_value);
+            (
+                dot + embedding_value * f64::from(*query_value),
+                norm + embedding_value * embedding_value,
+            )
+        },
+    );
+    match similarity {
+        nestweaver_schema::EmbeddingSimilarity::Cosine => {
+            let denominator = query_norm * vector_norm_squared.sqrt();
+            if denominator == 0.0 {
+                0.0
+            } else {
+                dot / denominator
+            }
+        }
+        nestweaver_schema::EmbeddingSimilarity::DotProduct => dot,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EmbeddingIndex
 // ---------------------------------------------------------------------------
@@ -81,8 +122,89 @@ fn finish_top(heap: BinaryHeap<Reverse<RankedEmbedding>>) -> Vec<(String, f64)> 
 /// [vectors: count * dimension * 4 bytes]
 ///   Contiguous f32 LE array, one vector per row
 /// ```
+enum EmbeddingBaseBytes {
+    Mapped(memmap2::Mmap),
+    Owned(Arc<[u8]>),
+}
+
+impl AsRef<[u8]> for EmbeddingBaseBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapped) => mapped,
+            Self::Owned(owned) => owned,
+        }
+    }
+}
+
+struct EmbeddingBaseRow {
+    uid: String,
+    vector_offset: usize,
+}
+
+struct EmbeddingBase {
+    bytes: EmbeddingBaseBytes,
+    rows: Vec<EmbeddingBaseRow>,
+    row_by_uid: HashMap<String, usize>,
+    dimension: usize,
+}
+
+impl EmbeddingBase {
+    fn contains(&self, uid: &str) -> bool {
+        self.row_by_uid.contains_key(uid)
+    }
+
+    fn vector_at(&self, row: usize) -> Vec<f32> {
+        let row = &self.rows[row];
+        let bytes = self.bytes.as_ref();
+        (0..self.dimension)
+            .map(|column| {
+                let offset = row.vector_offset + column * 4;
+                f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    fn score_at(
+        &self,
+        row: usize,
+        query: &[f32],
+        query_norm: f64,
+        similarity: &nestweaver_schema::EmbeddingSimilarity,
+    ) -> f64 {
+        let row = &self.rows[row];
+        let bytes = self.bytes.as_ref();
+        let (dot, vector_norm_squared) = query.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(dot, norm), (column, query_value)| {
+                let offset = row.vector_offset + column * 4;
+                let value = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                let value = f64::from(value);
+                (dot + value * f64::from(*query_value), norm + value * value)
+            },
+        );
+        match similarity {
+            nestweaver_schema::EmbeddingSimilarity::Cosine => {
+                let denominator = query_norm * vector_norm_squared.sqrt();
+                if denominator == 0.0 {
+                    0.0
+                } else {
+                    dot / denominator
+                }
+            }
+            nestweaver_schema::EmbeddingSimilarity::DotProduct => dot,
+        }
+    }
+}
+
 pub struct EmbeddingIndex {
-    embeddings: HashMap<String, Vec<f32>>, // uid -> embedding vector
+    /// Vectors created or replaced since the mapped base generation.
+    embeddings: HashMap<String, Vec<f32>>,
+    /// Immutable v2 base. File loads map its vector matrix instead of copying
+    /// every vector into Rust heap allocations.
+    base: Option<EmbeddingBase>,
+    /// Base rows hidden by journal deletions. Overlay upserts shadow base rows
+    /// with the same UID without adding them here.
+    deleted_base_uids: HashSet<String>,
     /// Whether a `force` add has already cleared this index for a dimension
     /// switch. A model switch flips the dimension exactly once; a second flip
     /// in the same run means the embedding source is emitting mixed dimensions
@@ -98,6 +220,7 @@ pub struct EmbeddingIndex {
     /// and unknown always allows the write: the dimension guard still applies.
     recorded_model_id: Option<String>,
     recorded_pipeline_fingerprint: Option<String>,
+    similarity: nestweaver_schema::EmbeddingSimilarity,
     artifact_envelope: Option<EmbeddingArtifactEnvelopeV2>,
     pending_deltas: Vec<EmbeddingDelta>,
     journal_sequence: u64,
@@ -170,9 +293,12 @@ impl EmbeddingIndex {
     pub fn new() -> Self {
         Self {
             embeddings: HashMap::new(),
+            base: None,
+            deleted_base_uids: HashSet::new(),
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
             journal_sequence: 0,
@@ -191,6 +317,10 @@ impl EmbeddingIndex {
 
     pub fn set_recorded_pipeline_fingerprint(&mut self, fingerprint: Option<String>) {
         self.recorded_pipeline_fingerprint = fingerprint;
+    }
+
+    pub fn set_similarity(&mut self, similarity: nestweaver_schema::EmbeddingSimilarity) {
+        self.similarity = similarity;
     }
 
     pub fn artifact_envelope(&self) -> Option<&EmbeddingArtifactEnvelopeV2> {
@@ -226,6 +356,8 @@ impl EmbeddingIndex {
             }
             if !self.force_cleared {
                 self.embeddings.clear();
+                self.base = None;
+                self.deleted_base_uids.clear();
                 self.pending_deltas.push(EmbeddingDelta::Clear);
                 self.force_cleared = true;
             } else {
@@ -242,6 +374,7 @@ impl EmbeddingIndex {
         if accepted {
             self.recorded_pipeline_fingerprint = Some(incoming);
             self.recorded_model_id = Some(pipeline.model_id.clone());
+            self.similarity = pipeline.similarity.clone();
         }
         accepted
     }
@@ -295,23 +428,25 @@ impl EmbeddingIndex {
             );
             return false;
         }
-        if let Some(existing) = self.embeddings.values().next()
-            && embedding.len() != existing.len()
+        if let Some(existing_dimension) = self.dimension()
+            && embedding.len() != existing_dimension
         {
             if force && !self.force_cleared {
                 tracing::info!(
-                    old_dim = existing.len(),
+                    old_dim = existing_dimension,
                     new_dim = embedding.len(),
                     "dimension change detected with --force; clearing index for model switch"
                 );
                 self.embeddings.clear();
+                self.base = None;
+                self.deleted_base_uids.clear();
                 self.pending_deltas.push(EmbeddingDelta::Clear);
                 self.force_cleared = true;
             } else if force {
                 tracing::warn!(
                     uid,
                     got = embedding.len(),
-                    expected = existing.len(),
+                    expected = existing_dimension,
                     "rejecting embedding: index was already force-cleared once this run; \
                      the embedding source is emitting mixed dimensions"
                 );
@@ -320,12 +455,13 @@ impl EmbeddingIndex {
                 tracing::warn!(
                     uid,
                     got = embedding.len(),
-                    expected = existing.len(),
+                    expected = existing_dimension,
                     "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
                 );
                 return false;
             }
         }
+        self.deleted_base_uids.remove(uid);
         self.embeddings.insert(uid.to_string(), embedding);
         self.pending_deltas.push(EmbeddingDelta::Upsert {
             uid: uid.to_string(),
@@ -342,12 +478,19 @@ impl EmbeddingIndex {
 
     pub(crate) fn clear(&mut self) {
         self.embeddings.clear();
+        self.base = None;
+        self.deleted_base_uids.clear();
         self.artifact_envelope = None;
         self.pending_deltas.clear();
     }
 
     pub fn save(&self, path: &Path) -> Result<(), anyhow::Error> {
-        let json = serde_json::to_string(&self.embeddings)?;
+        let embeddings: HashMap<_, _> = self
+            .all_uids()
+            .into_iter()
+            .filter_map(|uid| self.get(&uid).map(|vector| (uid, vector)))
+            .collect();
+        let json = serde_json::to_string(&embeddings)?;
         std::fs::write(path, json)?;
         Ok(())
     }
@@ -357,9 +500,12 @@ impl EmbeddingIndex {
         let embeddings: HashMap<String, Vec<f32>> = serde_json::from_str(&json)?;
         Ok(Self {
             embeddings,
+            base: None,
+            deleted_base_uids: HashSet::new(),
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
             journal_sequence: 0,
@@ -373,7 +519,13 @@ impl EmbeddingIndex {
     pub fn save_binary(&self, path: &Path) -> Result<(), anyhow::Error> {
         use std::io::Write;
         let dim = self.dimension().unwrap_or(0);
-        let count = self.embeddings.len() as u32;
+        let mut entries: Vec<(String, Vec<f32>)> = self
+            .all_uids()
+            .into_iter()
+            .filter_map(|uid| self.get(&uid).map(|vector| (uid, vector)))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let count = entries.len() as u32;
 
         atomic_replace_file(path, |raw_file| {
             let mut file = std::io::BufWriter::new(raw_file);
@@ -383,10 +535,6 @@ impl EmbeddingIndex {
             file.write_all(&1u32.to_le_bytes())?; // version
             file.write_all(&(dim as u32).to_le_bytes())?;
             file.write_all(&count.to_le_bytes())?;
-
-            // Collect keys in deterministic order
-            let mut entries: Vec<(&String, &Vec<f32>)> = self.embeddings.iter().collect();
-            entries.sort_by_key(|(k, _)| k.as_str());
 
             // UID table
             for (uid, _) in &entries {
@@ -459,9 +607,12 @@ impl EmbeddingIndex {
 
         Ok(Self {
             embeddings,
+            base: None,
+            deleted_base_uids: HashSet::new(),
             force_cleared: false,
             recorded_model_id: None,
             recorded_pipeline_fingerprint: None,
+            similarity: nestweaver_schema::EmbeddingSimilarity::Cosine,
             artifact_envelope: None,
             pending_deltas: Vec::new(),
             journal_sequence: 0,
@@ -486,22 +637,33 @@ impl EmbeddingIndex {
             "embedding pipeline dimension {} does not match vector dimension {dimension}",
             pipeline.produced_dimension
         );
-        let mut entries: Vec<_> = self.embeddings.iter().collect();
-        entries.sort_by(|left, right| left.0.cmp(right.0));
+        let mut entries = self.all_uids();
+        entries.sort();
         let mut uid_table = Vec::new();
-        let mut vectors = Vec::with_capacity(entries.len() * dimension * 4);
-        for (uid, vector) in &entries {
+        for uid in &entries {
+            let vector = self
+                .get(uid)
+                .ok_or_else(|| anyhow::anyhow!("embedding UID disappeared during save"))?;
             anyhow::ensure!(uid.len() <= u16::MAX as usize, "embedding UID is too long");
             anyhow::ensure!(vector.len() == dimension, "embedding dimensions are mixed");
             uid_table.extend_from_slice(&(uid.len() as u16).to_le_bytes());
             uid_table.extend_from_slice(uid.as_bytes());
-            for value in vector.iter() {
-                vectors.extend_from_slice(&value.to_le_bytes());
+        }
+        let vector_bytes = entries
+            .len()
+            .checked_mul(dimension)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("embedding vector payload size overflow"))?;
+        let mut payload_hasher = blake3::Hasher::new();
+        payload_hasher.update(&uid_table);
+        for uid in &entries {
+            let vector = self
+                .get(uid)
+                .ok_or_else(|| anyhow::anyhow!("embedding UID disappeared during hash"))?;
+            for value in &vector {
+                payload_hasher.update(&value.to_le_bytes());
             }
         }
-        let mut payload = Vec::with_capacity(uid_table.len() + vectors.len());
-        payload.extend_from_slice(&uid_table);
-        payload.extend_from_slice(&vectors);
         let envelope = EmbeddingArtifactEnvelopeV2 {
             schema_version: 2,
             brain_uuid: identity.brain_uuid.clone(),
@@ -512,8 +674,8 @@ impl EmbeddingIndex {
             count: entries.len() as u64,
             dimension: dimension as u32,
             uid_table_bytes: uid_table.len() as u64,
-            vector_bytes: vectors.len() as u64,
-            payload_blake3: blake3::hash(&payload).to_hex().to_string(),
+            vector_bytes: vector_bytes as u64,
+            payload_blake3: payload_hasher.finalize().to_hex().to_string(),
         };
         let encoded = serde_json::to_vec(&envelope)?;
         atomic_replace_file(path, |raw| {
@@ -522,18 +684,36 @@ impl EmbeddingIndex {
             file.write_all(&2_u32.to_le_bytes())?;
             file.write_all(&(encoded.len() as u64).to_le_bytes())?;
             file.write_all(&encoded)?;
-            file.write_all(&payload)?;
+            file.write_all(&uid_table)?;
+            for uid in &entries {
+                let vector = self.get(uid).ok_or_else(|| {
+                    std::io::Error::other("embedding UID disappeared during write")
+                })?;
+                for value in &vector {
+                    file.write_all(&value.to_le_bytes())?;
+                }
+            }
             file.flush()
         })?;
         Ok(envelope)
     }
 
     pub fn load_binary_v2(path: &Path) -> Result<Self, anyhow::Error> {
-        let data = std::fs::read(path)?;
-        Self::load_binary_v2_bytes(&data)
+        let file = std::fs::File::open(path)?;
+        // SAFETY: the mapping is read-only and retained by the returned index.
+        // Canonical base replacement always uses rename, so an existing map
+        // continues to reference its immutable generation rather than bytes
+        // being changed underneath it.
+        let mapped = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Self::load_binary_v2_storage(EmbeddingBaseBytes::Mapped(mapped))
     }
 
     pub fn load_binary_v2_bytes(data: &[u8]) -> Result<Self, anyhow::Error> {
+        Self::load_binary_v2_storage(EmbeddingBaseBytes::Owned(Arc::from(data)))
+    }
+
+    fn load_binary_v2_storage(storage: EmbeddingBaseBytes) -> Result<Self, anyhow::Error> {
+        let data = storage.as_ref();
         anyhow::ensure!(data.len() >= 16, "embedding v2 file too small");
         anyhow::ensure!(
             &data[0..4] == b"NWE2",
@@ -583,30 +763,36 @@ impl EmbeddingIndex {
             envelope.vector_bytes as usize == uids.len() * dimension * 4,
             "embedding vector byte count mismatch"
         );
-        let vectors = &payload[uid_end..];
-        let mut embeddings = HashMap::with_capacity(uids.len());
+        let vector_start = 16 + envelope_len + uid_end;
+        let mut rows = Vec::with_capacity(uids.len());
+        let mut row_by_uid = HashMap::with_capacity(uids.len());
         for (row, uid) in uids.into_iter().enumerate() {
-            let start = row * dimension * 4;
-            let vector = (0..dimension)
-                .map(|column| {
-                    let position = start + column * 4;
-                    f32::from_le_bytes(vectors[position..position + 4].try_into().unwrap())
-                })
-                .collect();
             anyhow::ensure!(
-                embeddings.insert(uid, vector).is_none(),
+                row_by_uid.insert(uid.clone(), row).is_none(),
                 "duplicate embedding UID"
             );
+            rows.push(EmbeddingBaseRow {
+                uid,
+                vector_offset: vector_start + row * dimension * 4,
+            });
         }
         let fingerprint = envelope
             .pipeline
             .fingerprint()
             .map_err(anyhow::Error::msg)?;
         Ok(Self {
-            embeddings,
+            embeddings: HashMap::new(),
+            base: Some(EmbeddingBase {
+                bytes: storage,
+                rows,
+                row_by_uid,
+                dimension,
+            }),
+            deleted_base_uids: HashSet::new(),
             force_cleared: false,
             recorded_model_id: Some(envelope.pipeline.model_id.clone()),
             recorded_pipeline_fingerprint: Some(fingerprint),
+            similarity: envelope.pipeline.similarity.clone(),
             artifact_envelope: Some(envelope),
             pending_deltas: Vec::new(),
             journal_sequence: 0,
@@ -662,16 +848,24 @@ impl EmbeddingIndex {
                 "embedding journal identity or pipeline mismatch"
             );
             match record.payload.delta {
-                EmbeddingJournalDelta::Clear => self.embeddings.clear(),
+                EmbeddingJournalDelta::Clear => {
+                    self.embeddings.clear();
+                    self.base = None;
+                    self.deleted_base_uids.clear();
+                }
                 EmbeddingJournalDelta::Upsert { uid, vector } => {
                     anyhow::ensure!(
                         vector.len() == pipeline.produced_dimension as usize,
                         "embedding journal vector dimension mismatch"
                     );
+                    self.deleted_base_uids.remove(&uid);
                     self.embeddings.insert(uid, vector);
                 }
                 EmbeddingJournalDelta::Delete { uid } => {
                     self.embeddings.remove(&uid);
+                    if self.base.as_ref().is_some_and(|base| base.contains(&uid)) {
+                        self.deleted_base_uids.insert(uid);
+                    }
                 }
             }
             previous_sequence = record.payload.sequence;
@@ -716,7 +910,7 @@ impl EmbeddingIndex {
             let delta = match delta {
                 EmbeddingDelta::Clear => EmbeddingJournalDelta::Clear,
                 EmbeddingDelta::Upsert { uid } => {
-                    let vector = self.embeddings.get(uid).cloned().ok_or_else(|| {
+                    let vector = self.get(uid).ok_or_else(|| {
                         anyhow::anyhow!("pending embedding upsert {uid} has no vector")
                     })?;
                     EmbeddingJournalDelta::Upsert {
@@ -771,6 +965,24 @@ impl EmbeddingIndex {
         self.journal_valid_bytes = None;
     }
 
+    /// Reopen a newly compacted base as the live immutable mapping. This drops
+    /// overlay vectors and tombstones only after the complete replacement has
+    /// been validated, keeping steady-state heap usage proportional to UID
+    /// metadata plus the bounded journal rather than corpus vector bytes.
+    pub fn adopt_binary_v2(&mut self, path: &Path) -> Result<(), anyhow::Error> {
+        let loaded = Self::load_binary_v2(path)?;
+        self.embeddings = loaded.embeddings;
+        self.base = loaded.base;
+        self.deleted_base_uids = loaded.deleted_base_uids;
+        self.recorded_model_id = loaded.recorded_model_id;
+        self.recorded_pipeline_fingerprint = loaded.recorded_pipeline_fingerprint;
+        self.similarity = loaded.similarity;
+        self.artifact_envelope = loaded.artifact_envelope;
+        self.force_cleared = false;
+        self.mark_base_persisted();
+        Ok(())
+    }
+
     /// Return the top-`limit` (uid, similarity) pairs sorted descending.
     ///
     /// Uses rayon for parallel iteration and assumes stored embeddings are
@@ -806,7 +1018,7 @@ impl EmbeddingIndex {
             return Ok(Vec::new());
         }
 
-        let heap = self
+        let overlay_heap = self
             .embeddings
             .par_iter()
             .filter_map(|(uid, emb)| {
@@ -821,13 +1033,7 @@ impl EmbeddingIndex {
                 if emb.len() != query_vec.len() {
                     return None;
                 }
-                // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
-                let dot: f64 = emb
-                    .iter()
-                    .zip(query_vec.iter())
-                    .map(|(a, b)| (*a as f64) * (*b as f64))
-                    .sum();
-                let sim = dot / query_norm;
+                let sim = embedding_similarity(emb, query_vec, query_norm, &self.similarity);
                 Some(RankedEmbedding {
                     uid: uid.clone(),
                     score: sim,
@@ -837,12 +1043,42 @@ impl EmbeddingIndex {
                 retain_top(&mut heap, candidate, limit);
                 heap
             })
-            .reduce(BinaryHeap::new, |mut left, right| {
-                for Reverse(candidate) in right {
-                    retain_top(&mut left, candidate, limit);
-                }
-                left
-            });
+            .reduce(BinaryHeap::new, |left, right| merge_top(left, right, limit));
+
+        let base_heap = self
+            .base
+            .as_ref()
+            .filter(|base| base.dimension == query_vec.len())
+            .map(|base| {
+                base.rows
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(row_index, row)| {
+                        if cancel
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                            || self.deleted_base_uids.contains(&row.uid)
+                            || self.embeddings.contains_key(&row.uid)
+                        {
+                            return None;
+                        }
+                        Some(RankedEmbedding {
+                            uid: row.uid.clone(),
+                            score: base.score_at(
+                                row_index,
+                                query_vec,
+                                query_norm,
+                                &self.similarity,
+                            ),
+                        })
+                    })
+                    .fold(BinaryHeap::new, |mut heap, candidate| {
+                        retain_top(&mut heap, candidate, limit);
+                        heap
+                    })
+                    .reduce(BinaryHeap::new, |left, right| merge_top(left, right, limit))
+            })
+            .unwrap_or_default();
+        let heap = merge_top(overlay_heap, base_heap, limit);
 
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
             // The shared cancel flag is a bare bool and can't carry a reason, so
@@ -856,17 +1092,30 @@ impl EmbeddingIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.embeddings.len()
+        let base_count = self.base.as_ref().map_or(0, |base| {
+            base.rows
+                .iter()
+                .filter(|row| {
+                    !self.deleted_base_uids.contains(&row.uid)
+                        && !self.embeddings.contains_key(&row.uid)
+                })
+                .count()
+        });
+        base_count + self.embeddings.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.embeddings.is_empty()
+        self.len() == 0
     }
 
     /// Return the dimensionality of the stored embeddings (length of the first
     /// vector found), or `None` if the index is empty.
     pub fn dimension(&self) -> Option<usize> {
-        self.embeddings.values().next().map(|v| v.len())
+        self.embeddings
+            .values()
+            .next()
+            .map(Vec::len)
+            .or_else(|| self.base.as_ref().map(|base| base.dimension))
     }
 
     /// Like `vector_search`, but pre-filters embeddings whose UID contains `uid_prefix`.
@@ -886,7 +1135,7 @@ impl EmbeddingIndex {
             return vec![];
         }
 
-        let heap = self
+        let overlay_heap = self
             .embeddings
             .par_iter()
             .filter(|(uid, _)| match uid_prefix {
@@ -899,12 +1148,7 @@ impl EmbeddingIndex {
                 if emb.len() != query_vec.len() {
                     return None;
                 }
-                let dot: f64 = emb
-                    .iter()
-                    .zip(query_vec.iter())
-                    .map(|(a, b)| (*a as f64) * (*b as f64))
-                    .sum();
-                let sim = dot / query_norm;
+                let sim = embedding_similarity(emb, query_vec, query_norm, &self.similarity);
                 Some(RankedEmbedding {
                     uid: uid.clone(),
                     score: sim,
@@ -914,19 +1158,67 @@ impl EmbeddingIndex {
                 retain_top(&mut heap, candidate, limit);
                 heap
             })
-            .reduce(BinaryHeap::new, |mut left, right| {
-                for Reverse(candidate) in right {
-                    retain_top(&mut left, candidate, limit);
-                }
-                left
-            });
+            .reduce(BinaryHeap::new, |left, right| merge_top(left, right, limit));
 
-        finish_top(heap)
+        let base_heap = self
+            .base
+            .as_ref()
+            .filter(|base| base.dimension == query_vec.len())
+            .map(|base| {
+                base.rows
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(row_index, row)| {
+                        if self.deleted_base_uids.contains(&row.uid)
+                            || self.embeddings.contains_key(&row.uid)
+                            || uid_prefix.is_some_and(|prefix| !row.uid.contains(prefix))
+                        {
+                            return None;
+                        }
+                        Some(RankedEmbedding {
+                            uid: row.uid.clone(),
+                            score: base.score_at(
+                                row_index,
+                                query_vec,
+                                query_norm,
+                                &self.similarity,
+                            ),
+                        })
+                    })
+                    .fold(BinaryHeap::new, |mut heap, candidate| {
+                        retain_top(&mut heap, candidate, limit);
+                        heap
+                    })
+                    .reduce(BinaryHeap::new, |left, right| merge_top(left, right, limit))
+            })
+            .unwrap_or_default();
+
+        finish_top(merge_top(overlay_heap, base_heap, limit))
     }
 
     /// Look up the embedding for a given UID.
-    pub fn get(&self, uid: &str) -> Option<&Vec<f32>> {
-        self.embeddings.get(uid)
+    pub fn get(&self, uid: &str) -> Option<Vec<f32>> {
+        if let Some(vector) = self.embeddings.get(uid) {
+            return Some(vector.clone());
+        }
+        if self.deleted_base_uids.contains(uid) {
+            return None;
+        }
+        let base = self.base.as_ref()?;
+        base.row_by_uid.get(uid).map(|row| base.vector_at(*row))
+    }
+
+    fn all_uids(&self) -> Vec<String> {
+        let mut uids: HashSet<String> = self.embeddings.keys().cloned().collect();
+        if let Some(base) = &self.base {
+            uids.extend(
+                base.rows
+                    .iter()
+                    .filter(|row| !self.deleted_base_uids.contains(&row.uid))
+                    .map(|row| row.uid.clone()),
+            );
+        }
+        uids.into_iter().collect()
     }
 
     /// Retain only embeddings whose graph nodes still exist.
@@ -934,18 +1226,20 @@ impl EmbeddingIndex {
     /// Returns the number of removed vectors so callers can report and test
     /// reconciliation without exposing the index's internal map.
     pub(crate) fn retain_uids(&mut self, live_uids: &std::collections::HashSet<String>) -> usize {
-        let before = self.embeddings.len();
+        let before = self.len();
         let removed: Vec<String> = self
-            .embeddings
-            .keys()
+            .all_uids()
+            .into_iter()
             .filter(|uid| !live_uids.contains(uid.as_str()))
-            .cloned()
             .collect();
         for uid in removed {
             self.embeddings.remove(&uid);
+            if self.base.as_ref().is_some_and(|base| base.contains(&uid)) {
+                self.deleted_base_uids.insert(uid.clone());
+            }
             self.pending_deltas.push(EmbeddingDelta::Delete { uid });
         }
-        before - self.embeddings.len()
+        before - self.len()
     }
 }
 
@@ -1869,8 +2163,19 @@ mod tests {
         assert_eq!(envelope.count, 2);
 
         let loaded = EmbeddingIndex::load_binary_v2(&path).unwrap();
-        assert_eq!(loaded.get("sym:alpha"), Some(&vec![0.1, 0.2, 0.3]));
-        assert_eq!(loaded.get("sym:beta"), Some(&vec![0.4, 0.5, 0.6]));
+        assert!(
+            matches!(
+                loaded.base.as_ref().map(|base| &base.bytes),
+                Some(EmbeddingBaseBytes::Mapped(_))
+            ),
+            "file-backed v2 loads must memory-map the immutable base"
+        );
+        assert!(
+            loaded.embeddings.is_empty(),
+            "base vectors must not be heap-copied"
+        );
+        assert_eq!(loaded.get("sym:alpha"), Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(loaded.get("sym:beta"), Some(vec![0.4, 0.5, 0.6]));
 
         let mut corrupt = std::fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 0xff;
@@ -1936,8 +2241,8 @@ mod tests {
         reopened
             .replay_journal_v2(&journal, &identity, &pipeline)
             .unwrap();
-        assert_eq!(reopened.get("keep"), Some(&vec![1.0, 0.0]));
-        assert_eq!(reopened.get("added"), Some(&vec![0.5, 0.5]));
+        assert_eq!(reopened.get("keep"), Some(vec![1.0, 0.0]));
+        assert_eq!(reopened.get("added"), Some(vec![0.5, 0.5]));
         assert!(reopened.get("remove").is_none());
 
         assert!(reopened.add_with_pipeline("later", vec![0.25, 0.75], &pipeline, false));
@@ -2011,14 +2316,7 @@ mod tests {
         let mut oracle: Vec<_> = index
             .embeddings
             .iter()
-            .map(|(uid, vector)| {
-                let score: f64 = vector
-                    .iter()
-                    .zip(query)
-                    .map(|(left, right)| f64::from(*left) * f64::from(right))
-                    .sum();
-                (uid.clone(), score)
-            })
+            .map(|(uid, vector)| (uid.clone(), cosine_similarity(&query, vector)))
             .collect();
         oracle.sort_by(|left, right| {
             right
@@ -2088,7 +2386,7 @@ mod tests {
 
         assert!(error.to_string().contains("sync parent after replacing"));
         let reopened = EmbeddingIndex::load_binary(&path).unwrap();
-        assert_eq!(reopened.get("sym:durable"), Some(&vec![1.0, 0.0]));
+        assert_eq!(reopened.get("sym:durable"), Some(vec![1.0, 0.0]));
     }
 
     #[test]

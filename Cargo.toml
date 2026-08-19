@@ -65,6 +65,7 @@ open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 rayon = "1"
+memmap2 = "0.9"
 dirs = "6"
 rmp-serde = "1"
 bumpalo = "3"

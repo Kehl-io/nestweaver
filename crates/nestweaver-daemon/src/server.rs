@@ -7846,6 +7846,7 @@ mod embedding_load_config_tests {
             sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
             transformer_config: snapshot_dir.join("sentence_bert_config.json"),
             pooling_config: snapshot_dir.join("1_Pooling/config.json"),
+            dense_modules: Vec::new(),
         };
 
         std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
@@ -11151,6 +11152,7 @@ mod startup_helper_tests {
             .store
             .batch_insert_note_heading_edges(&[(&note_uid, &heading_uid)])
             .unwrap();
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(state.store.add_embedding(&note_uid, vec![1.0, 0.0]));
         assert!(state.store.add_embedding(&heading_uid, vec![0.0, 1.0]));
         state.store.flush_embedding_index().unwrap();

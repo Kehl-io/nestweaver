@@ -4435,6 +4435,7 @@ dependencies = [
  "csv",
  "lbug",
  "lru 0.18.2",
+ "memmap2",
  "nestweaver-algorithms",
  "nestweaver-schema",
  "openssl-sys",

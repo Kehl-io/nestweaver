@@ -5,7 +5,10 @@ pub mod preprocess;
 use std::path::PathBuf;
 
 use anyhow::Result;
-pub use local::{ArtifactMode, MissingModelArtifactError, ModelArtifacts, resolve_model_artifacts};
+pub use local::{
+    ArtifactMode, DenseArtifacts, MissingModelArtifactError, ModelArtifacts,
+    resolve_model_artifacts,
+};
 use nestweaver_schema::EmbeddingPipelineV2;
 
 /// Requested device-selection policy for the local embedding backend.
@@ -227,7 +230,13 @@ impl EmbedModel {
                     .and_then(|endpoint| endpoint.split("://").nth(1))
                     .and_then(|authority| authority.split('/').next())
                     .unwrap_or("external");
-                Ok(EmbeddingPipelineV2::external(provider, model, dimension))
+                let mut pipeline = EmbeddingPipelineV2::external(provider, model, dimension);
+                // The external transport returns provider vectors, then this
+                // crate applies an explicit L2 normalization pass. Record that
+                // observable NestWeaver policy even though provider revision
+                // and preprocessing remain opaque.
+                pipeline.normalize = Some(true);
+                Ok(pipeline)
             }
         }
     }
