@@ -99,25 +99,24 @@ const SIDECAR_FILES: &[&str] = &[SIDECAR_PAGERANK, SIDECAR_MANIFESTS, SIDECAR_EM
 fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
     let mut lines: Vec<String> = Vec::new();
     for &name in CORE_FILES {
-        let bytes = std::fs::read(snapshot_dir.join(name))
-            .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-        let hash = crate::hash::blake3_hex_bytes(&bytes);
+        let (_, hash) = crate::hash::blake3_file(snapshot_dir.join(name))
+            .map_err(|e| anyhow::anyhow!("failed to stream {name} for checksum: {e}"))?;
         lines.push(format!("{hash}  {name}"));
     }
     for &name in SIDECAR_FILES {
         let path = snapshot_dir.join(name);
         if path.exists() {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| anyhow::anyhow!("failed to read sidecar {name} for checksum: {e}"))?;
-            let hash = crate::hash::blake3_hex_bytes(&bytes);
+            let (_, hash) = crate::hash::blake3_file(&path).map_err(|e| {
+                anyhow::anyhow!("failed to stream sidecar {name} for checksum: {e}")
+            })?;
             lines.push(format!("{hash}  {name}"));
         }
     }
     let publication = snapshot_dir.join(PUBLICATION_FILE);
     if publication.exists() {
-        let bytes = std::fs::read(&publication)
-            .map_err(|e| anyhow::anyhow!("failed to read {PUBLICATION_FILE} for checksum: {e}"))?;
-        let hash = crate::hash::blake3_hex_bytes(&bytes);
+        let (_, hash) = crate::hash::blake3_file(&publication).map_err(|e| {
+            anyhow::anyhow!("failed to stream {PUBLICATION_FILE} for checksum: {e}")
+        })?;
         lines.push(format!("{hash}  {PUBLICATION_FILE}"));
     }
     // Hash directory sidecars file-by-file in deterministic path order.
@@ -129,9 +128,8 @@ fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
         let mut files = collect_files_recursive(&directory, sidecar_dir)?;
         files.sort();
         for (rel_path, abs_path) in files {
-            let bytes = std::fs::read(&abs_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {rel_path} for checksum: {e}"))?;
-            let hash = crate::hash::blake3_hex_bytes(&bytes);
+            let (_, hash) = crate::hash::blake3_file(&abs_path)
+                .map_err(|e| anyhow::anyhow!("failed to stream {rel_path} for checksum: {e}"))?;
             lines.push(format!("{hash}  {rel_path}"));
         }
     }
@@ -211,9 +209,8 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
             if !file_path.exists() {
                 anyhow::bail!("checksum references missing file: {filename}");
             }
-            let bytes = std::fs::read(&file_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {filename}: {e}"))?;
-            let actual = crate::hash::blake3_hex_bytes(&bytes);
+            let (_, actual) = crate::hash::blake3_file(&file_path)
+                .map_err(|e| anyhow::anyhow!("failed to stream {filename}: {e}"))?;
             if actual != expected_hash {
                 anyhow::bail!(
                     "integrity check failed for {filename}: \
@@ -244,9 +241,10 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
         // Legacy single-hash format: concatenated hash of core files
         let mut hasher = blake3::Hasher::new();
         for name in CORE_FILES {
-            let bytes = std::fs::read(snapshot_dir.join(name))
-                .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-            hasher.update(&bytes);
+            let file = std::fs::File::open(snapshot_dir.join(name))
+                .map_err(|e| anyhow::anyhow!("failed to open {name} for checksum: {e}"))?;
+            crate::hash::update_blake3_stream(&mut hasher, file)
+                .map_err(|e| anyhow::anyhow!("failed to stream {name} for checksum: {e}"))?;
         }
         let computed = hasher.finalize().to_hex().to_string();
         if computed != stored {
@@ -591,6 +589,45 @@ fn artifact_contract_for_payload(
     artifact_contract(path, stamp)
 }
 
+fn artifact_contract_for_path(
+    path: &str,
+    absolute: &Path,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    if path == SIDECAR_EMBEDDINGS {
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        let index = nestweaver_store::EmbeddingIndex::load_binary_v2(absolute)
+            .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
+        let envelope = index
+            .artifact_envelope()
+            .ok_or_else(|| anyhow::anyhow!("embedding-v2 envelope is missing"))?;
+        if envelope.brain_uuid != identity.brain_uuid
+            || envelope.publication_uuid != identity.publication_uuid
+            || envelope.source_graph_generation != source_graph_generation
+        {
+            anyhow::bail!("embedding-v2 identity or source generation mismatch");
+        }
+        return Ok((
+            ArtifactKind::Embeddings,
+            envelope.schema_version,
+            envelope.algorithm_fingerprint()?,
+        ));
+    }
+    let payload =
+        if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS {
+            Some(std::fs::read(absolute).map_err(|error| {
+                anyhow::anyhow!("read self-describing artifact {path}: {error}")
+            })?)
+        } else {
+            None
+        };
+    artifact_contract_for_payload(path, stamp, source_graph_generation, payload.as_deref())
+}
+
 fn write_publication_bundle(
     output_dir: &Path,
     stamp: &Stamp,
@@ -604,15 +641,16 @@ fn write_publication_bundle(
         if path == PUBLICATION_FILE || path == CHECKSUM_FILE || path == "checksum.sha256" {
             continue;
         }
-        let bytes = std::fs::read(&absolute)?;
         let (kind, artifact_schema_version, algorithm_fingerprint) =
-            artifact_contract_for_payload(&path, stamp, source_graph_generation, Some(&bytes))?;
+            artifact_contract_for_path(&path, &absolute, stamp, source_graph_generation)?;
+        let (byte_size, blake3) = crate::hash::blake3_file(&absolute)
+            .map_err(|error| anyhow::anyhow!("stream publication artifact {path}: {error}"))?;
         artifacts.push(ArtifactDescriptor {
             path,
             kind,
             artifact_schema_version,
-            byte_size: u64::try_from(bytes.len())?,
-            blake3: crate::hash::blake3_hex_bytes(&bytes),
+            byte_size,
+            blake3,
             brain_uuid: stamp.brain_uuid.clone(),
             publication_uuid: stamp.publication_uuid.clone(),
             producer_version: stamp.engine_version.clone(),
@@ -723,26 +761,12 @@ fn verify_publication_bundle(
                 bundle.source_graph_generation
             );
         }
-        let contract_payload = if descriptor.path == SIDECAR_PAGERANK
-            || descriptor.path == SIDECAR_MANIFESTS
-            || descriptor.path == SIDECAR_EMBEDDINGS
-        {
-            Some(
-                std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to read publication artifact {}: {error}",
-                        descriptor.path
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
-        let (kind, schema_version, fingerprint) = artifact_contract_for_payload(
+        let artifact = snapshot_dir.join(&descriptor.path);
+        let (kind, schema_version, fingerprint) = artifact_contract_for_path(
             &descriptor.path,
+            &artifact,
             stamp,
             bundle.source_graph_generation,
-            contract_payload.as_deref(),
         )?;
         if descriptor.kind != kind
             || descriptor.artifact_schema_version != schema_version
@@ -754,22 +778,20 @@ fn verify_publication_bundle(
             );
         }
         if verify_payloads {
-            let artifact = snapshot_dir.join(&descriptor.path);
-            let artifact_bytes = std::fs::read(&artifact).map_err(|error| {
+            let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
                 anyhow::anyhow!(
-                    "failed to read publication artifact {}: {error}",
+                    "failed to stream publication artifact {}: {error}",
                     descriptor.path
                 )
             })?;
-            if u64::try_from(artifact_bytes.len())? != descriptor.byte_size {
+            if byte_size != descriptor.byte_size {
                 anyhow::bail!(
                     "publication artifact {} size mismatch: descriptor {}, file {}",
                     descriptor.path,
                     descriptor.byte_size,
-                    artifact_bytes.len()
+                    byte_size
                 );
             }
-            let digest = crate::hash::blake3_hex_bytes(&artifact_bytes);
             if digest != descriptor.blake3 {
                 anyhow::bail!(
                     "publication artifact {} digest mismatch: descriptor {}, file {digest}",
@@ -809,8 +831,8 @@ fn verify_publication_bundle(
 pub fn publication_bundle_digest(snapshot_dir: &Path) -> anyhow::Result<String> {
     let stamp = verify_snapshot(snapshot_dir)?;
     let _ = verify_publication_bundle(snapshot_dir, &stamp, true)?;
-    let bytes = std::fs::read(snapshot_dir.join(PUBLICATION_FILE))?;
-    Ok(crate::hash::blake3_hex_bytes(&bytes))
+    let (_, digest) = crate::hash::blake3_file(snapshot_dir.join(PUBLICATION_FILE))?;
+    Ok(digest)
 }
 
 /// Verify a snapshot directory's integrity.

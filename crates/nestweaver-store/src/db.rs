@@ -1568,8 +1568,7 @@ impl GraphStore {
             let compatible = identity.as_ref().is_some_and(|identity| {
                 envelope.brain_uuid == identity.brain_uuid
                     && envelope.publication_uuid == identity.publication_uuid
-            }) && envelope.producer_version == env!("CARGO_PKG_VERSION")
-                && envelope.source_graph_generation <= self.graph_generation()
+            }) && envelope.source_graph_generation <= self.graph_generation()
                 && pipeline_fingerprint.as_deref()
                     == envelope.pipeline.fingerprint().ok().as_deref();
             if !compatible {
@@ -1579,7 +1578,10 @@ impl GraphStore {
                 index.clear();
             }
         }
-        if !index.is_empty()
+        // Trust is carried by the validated/adopted envelope, not inferred
+        // from vector count. Keeping that state explicit prevents later format
+        // changes from accidentally coupling journal recovery to index size.
+        if index.artifact_envelope().is_some()
             && let (Some(db_path), Some(identity), Some(pipeline)) = (
                 self.db_path.as_ref(),
                 self.publication_identity().ok().flatten(),
@@ -1758,7 +1760,13 @@ impl GraphStore {
                     )));
                 }
             };
-            if !base_exists {
+            // Path existence alone does not make a base trustworthy. A legacy,
+            // corrupt, foreign, or pipeline-incompatible file is deliberately
+            // cleared during open and therefore has no adopted envelope. The
+            // next successful embed must replace that file with a complete v2
+            // base instead of appending deltas to an unusable foundation.
+            let trusted_base_exists = base_exists && idx.artifact_envelope().is_some();
+            if !trusted_base_exists {
                 idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
                     .map_err(|e| StoreError::Query(format!("save embedding-v2 sidecar: {e}")))?;
                 idx.adopt_binary_v2(&path).map_err(|error| {

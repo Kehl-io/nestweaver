@@ -2333,6 +2333,75 @@ mod tests {
     }
 
     #[test]
+    fn producer_patch_version_does_not_invalidate_a_compatible_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("producer-version.lbug");
+        let pipeline = test_pipeline("model-a", 2);
+        let base = {
+            let store = GraphStore::create(&db_path).unwrap();
+            store.set_embedding_pipeline(&pipeline).unwrap();
+            assert!(store.add_embedding_with_pipeline(
+                "persisted",
+                vec![1.0, 0.0],
+                &pipeline,
+                false,
+            ));
+            store.flush_embedding_index().unwrap();
+            store.embedding_sidecar_path().unwrap()
+        };
+
+        let mut bytes = std::fs::read(&base).unwrap();
+        let current = env!("CARGO_PKG_VERSION").as_bytes();
+        let replacement = vec![b'9'; current.len()];
+        let offset = bytes
+            .windows(current.len())
+            .position(|window| window == current)
+            .expect("producer version is encoded in the v2 envelope");
+        bytes[offset..offset + current.len()].copy_from_slice(&replacement);
+        std::fs::write(&base, bytes).unwrap();
+
+        let reopened = GraphStore::open(&db_path).unwrap();
+        assert!(
+            reopened.has_embedding("persisted"),
+            "producer package version is provenance, not compatibility"
+        );
+    }
+
+    #[test]
+    fn invalid_existing_base_is_replaced_on_the_next_successful_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("invalid-base-recovery.lbug");
+        let pipeline = test_pipeline("model-a", 2);
+        let base = {
+            let store = GraphStore::create(&db_path).unwrap();
+            store.set_embedding_pipeline(&pipeline).unwrap();
+            store.embedding_sidecar_path().unwrap()
+        };
+        std::fs::write(&base, b"legacy-or-corrupt-base").unwrap();
+
+        for ordinal in 0..4 {
+            let uid = format!("round-{ordinal}");
+            let store = GraphStore::open(&db_path).unwrap();
+            for previous in 0..ordinal {
+                assert!(store.has_embedding(&format!("round-{previous}")));
+            }
+            assert!(store.add_embedding_with_pipeline(
+                &uid,
+                vec![1.0, ordinal as f32],
+                &pipeline,
+                false,
+            ));
+            store.flush_embedding_index().unwrap();
+        }
+
+        let reopened = GraphStore::open(&db_path).unwrap();
+        for ordinal in 0..4 {
+            assert!(reopened.has_embedding(&format!("round-{ordinal}")));
+        }
+        assert!(EmbeddingIndex::load_binary_v2(&base).is_ok());
+    }
+
+    #[test]
     fn bounded_vector_top_k_matches_full_sort_oracle_with_ties() {
         let mut index = EmbeddingIndex::new();
         for (uid, vector) in [

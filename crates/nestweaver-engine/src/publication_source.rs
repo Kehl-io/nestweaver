@@ -10,7 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const PUBLICATION_SOURCE_MANIFEST_VERSION: u32 = 1;
+pub const PUBLICATION_SOURCE_MANIFEST_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationSourceFile {
+    pub path: String,
+    pub byte_size: u64,
+    /// Platform change token used only to prove that a second capture may
+    /// reuse `content_blake3`. `None` means the platform cannot make that
+    /// proof, so validation hashes the file again.
+    pub change_token: Option<String>,
+    pub content_blake3: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationRepoSource {
@@ -22,6 +33,7 @@ pub struct PublicationRepoSource {
     pub observed_head: Option<String>,
     pub content_blake3: String,
     pub file_count: u64,
+    pub files: Vec<PublicationSourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +44,7 @@ pub struct PublicationVaultSource {
     pub root_path: String,
     pub content_blake3: String,
     pub file_count: u64,
+    pub files: Vec<PublicationSourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +56,42 @@ pub struct PublicationSourceManifest {
 
 impl PublicationSourceManifest {
     pub fn capture(store: &nestweaver_store::GraphStore) -> anyhow::Result<Self> {
+        Self::capture_with_prior(store, None)
+    }
+
+    /// Re-capture source identity for the cutover gate while reusing a prior
+    /// content digest only when a strong platform change token proves that the
+    /// exact file is unchanged. Path enumeration and metadata checks always
+    /// run again; ambiguous files are content-hashed again.
+    pub fn recapture_for_validation(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> anyhow::Result<Self> {
+        Self::capture_with_prior(store, Some(self))
+    }
+
+    fn capture_with_prior(
+        store: &nestweaver_store::GraphStore,
+        prior: Option<&Self>,
+    ) -> anyhow::Result<Self> {
+        let prior_repos = prior
+            .map(|manifest| {
+                manifest
+                    .repos
+                    .iter()
+                    .map(|source| (source.uid.as_str(), source))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let prior_vaults = prior
+            .map(|manifest| {
+                manifest
+                    .vaults
+                    .iter()
+                    .map(|source| (source.uid.as_str(), source))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let mut repos = store
             .list_repos(None)
             .map_err(|error| anyhow::anyhow!("list publication repositories: {error}"))?
@@ -55,7 +104,11 @@ impl PublicationSourceManifest {
                     )
                 })?;
                 let root = canonical_source_root(Path::new(root), "repository")?;
-                let (content_blake3, file_count) = hash_repo_tree(&root)?;
+                let prior = prior_repos
+                    .get(repo.uid.as_str())
+                    .filter(|source| source.root_path == root.to_string_lossy())
+                    .map(|source| source.files.as_slice());
+                let (content_blake3, file_count, files) = hash_repo_tree(&root, prior)?;
                 Ok(PublicationRepoSource {
                     uid: repo.uid,
                     url: repo.url,
@@ -65,6 +118,7 @@ impl PublicationSourceManifest {
                     observed_head: git_head(&root),
                     content_blake3,
                     file_count,
+                    files,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -74,7 +128,11 @@ impl PublicationSourceManifest {
             .into_iter()
             .map(|vault| {
                 let root = canonical_source_root(Path::new(&vault.root_path), "vault")?;
-                let (content_blake3, file_count) = hash_markdown_tree(&root)?;
+                let prior = prior_vaults
+                    .get(vault.uid.as_str())
+                    .filter(|source| source.root_path == root.to_string_lossy())
+                    .map(|source| source.files.as_slice());
+                let (content_blake3, file_count, files) = hash_markdown_tree(&root, prior)?;
                 Ok(PublicationVaultSource {
                     uid: vault.uid,
                     name: vault.name,
@@ -82,6 +140,7 @@ impl PublicationSourceManifest {
                     root_path: root.to_string_lossy().to_string(),
                     content_blake3,
                     file_count,
+                    files,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -152,7 +211,10 @@ fn git_head(root: &Path) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-fn hash_repo_tree(root: &Path) -> anyhow::Result<(String, u64)> {
+fn hash_repo_tree(
+    root: &Path,
+    prior: Option<&[PublicationSourceFile]>,
+) -> anyhow::Result<(String, u64, Vec<PublicationSourceFile>)> {
     let output = std::process::Command::new("git")
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
         .current_dir(root)
@@ -166,20 +228,51 @@ fn hash_repo_tree(root: &Path) -> anyhow::Result<(String, u64)> {
             .filter(|path| !path.is_empty())
             .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
             .collect::<Vec<_>>();
-        return hash_relative_files(root, paths);
+        return hash_relative_files(root, paths, prior);
     }
-    hash_walk(root, |_| true)
+    let walker = ignore::WalkBuilder::new(root)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .filter_entry(|entry| {
+            !entry.file_type().is_some_and(|kind| kind.is_dir())
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| crate::index::SKIP_DIRS.contains(&name) || name == ".git")
+        })
+        .build();
+    let paths = walker
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.path().strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect();
+    hash_relative_files(root, paths, prior)
 }
 
-fn hash_markdown_tree(root: &Path) -> anyhow::Result<(String, u64)> {
-    hash_walk(root, |path| {
-        path.extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("md"))
-    })
+fn hash_markdown_tree(
+    root: &Path,
+    prior: Option<&[PublicationSourceFile]>,
+) -> anyhow::Result<(String, u64, Vec<PublicationSourceFile>)> {
+    hash_walk(
+        root,
+        |path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("md"))
+        },
+        prior,
+    )
 }
 
-fn hash_walk(root: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<(String, u64)> {
+fn hash_walk(
+    root: &Path,
+    include: impl Fn(&Path) -> bool,
+    prior: Option<&[PublicationSourceFile]>,
+) -> anyhow::Result<(String, u64, Vec<PublicationSourceFile>)> {
     let mut paths = walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -192,38 +285,120 @@ fn hash_walk(root: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<(St
         })
         .collect::<Vec<_>>();
     paths.sort();
-    hash_relative_files(root, paths)
+    hash_relative_files(root, paths, prior)
 }
 
-fn hash_relative_files(root: &Path, mut paths: Vec<PathBuf>) -> anyhow::Result<(String, u64)> {
+fn hash_relative_files(
+    root: &Path,
+    mut paths: Vec<PathBuf>,
+    prior: Option<&[PublicationSourceFile]>,
+) -> anyhow::Result<(String, u64, Vec<PublicationSourceFile>)> {
     paths.sort();
     paths.dedup();
+    let prior = prior
+        .unwrap_or_default()
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut files = Vec::with_capacity(paths.len());
     let mut hasher = blake3::Hasher::new();
-    let mut count = 0_u64;
-    let mut buffer = vec![0_u8; 1024 * 1024];
     for relative in paths {
         let path = root.join(&relative);
         if !path.is_file() {
             continue;
         }
-        let relative_bytes = relative.to_string_lossy();
-        hasher.update(&(relative_bytes.len() as u64).to_le_bytes());
-        hasher.update(relative_bytes.as_bytes());
-        let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("read publication source {}", path.display()))?;
-        let size = file.metadata()?.len();
-        hasher.update(&size.to_le_bytes());
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        count += 1;
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("inspect publication source {}", path.display()))?;
+        let byte_size = metadata.len();
+        let change_token = strong_change_token(&metadata);
+        let relative = relative.to_string_lossy().to_string();
+        let reusable = prior
+            .get(relative.as_str())
+            .filter(|prior| {
+                change_token.is_some()
+                    && prior.byte_size == byte_size
+                    && prior.change_token == change_token
+            })
+            .map(|prior| prior.content_blake3.clone());
+        let content_blake3 = match reusable {
+            Some(digest) => digest,
+            None => hash_source_file(&path, &metadata)?,
+        };
+        hasher.update(&(relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update(&byte_size.to_le_bytes());
+        hasher.update(content_blake3.as_bytes());
+        files.push(PublicationSourceFile {
+            path: relative,
+            byte_size,
+            change_token,
+            content_blake3,
+        });
     }
-    Ok((hasher.finalize().to_hex().to_string(), count))
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        files.len() as u64,
+        files,
+    ))
 }
+
+fn hash_source_file(path: &Path, before: &std::fs::Metadata) -> anyhow::Result<String> {
+    let before_modified = before.modified().ok();
+    let before_token = strong_change_token(before);
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("read publication source {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        #[cfg(test)]
+        HASHED_SOURCE_BYTES.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    let path_after = std::fs::metadata(path)
+        .with_context(|| format!("reinspect publication source {}", path.display()))?;
+    if before.len() != after.len()
+        || before_modified != after.modified().ok()
+        || before_token != strong_change_token(&after)
+        || before.len() != path_after.len()
+        || before_modified != path_after.modified().ok()
+        || before_token != strong_change_token(&path_after)
+    {
+        anyhow::bail!(
+            "publication source changed while it was being captured: {}",
+            path.display()
+        );
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(unix)]
+fn strong_change_token(metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!(
+        "unix-v1:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    ))
+}
+
+#[cfg(not(unix))]
+fn strong_change_token(_metadata: &std::fs::Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+static HASHED_SOURCE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static HASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -231,15 +406,92 @@ mod tests {
 
     #[test]
     fn markdown_source_fingerprint_is_stable_and_content_sensitive() {
+        let _guard = HASH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.md"), "alpha").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "one").unwrap();
-        let first = hash_markdown_tree(dir.path()).unwrap();
-        let second = hash_markdown_tree(dir.path()).unwrap();
-        assert_eq!(first, second);
+        let first = hash_markdown_tree(dir.path(), None).unwrap();
+        let second = hash_markdown_tree(dir.path(), Some(&first.2)).unwrap();
+        assert_eq!(first.0, second.0);
         std::fs::write(dir.path().join("ignored.txt"), "two").unwrap();
-        assert_eq!(hash_markdown_tree(dir.path()).unwrap(), first);
+        assert_eq!(
+            hash_markdown_tree(dir.path(), Some(&second.2)).unwrap().0,
+            first.0
+        );
         std::fs::write(dir.path().join("a.md"), "beta").unwrap();
-        assert_ne!(hash_markdown_tree(dir.path()).unwrap(), first);
+        assert_ne!(
+            hash_markdown_tree(dir.path(), Some(&second.2)).unwrap().0,
+            first.0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_reuses_unchanged_content_and_hashes_changed_files() {
+        let _guard = HASH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "alpha").unwrap();
+        HASHED_SOURCE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let first = hash_markdown_tree(dir.path(), None).unwrap();
+        assert_eq!(
+            HASHED_SOURCE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+
+        HASHED_SOURCE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let unchanged = hash_markdown_tree(dir.path(), Some(&first.2)).unwrap();
+        assert_eq!(unchanged.0, first.0);
+        assert_eq!(
+            HASHED_SOURCE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "unchanged validation should prove equality from the strong change token"
+        );
+
+        std::fs::write(&path, "changed-content").unwrap();
+        HASHED_SOURCE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let changed = hash_markdown_tree(dir.path(), Some(&unchanged.2)).unwrap();
+        assert_ne!(changed.0, first.0);
+        assert_eq!(
+            HASHED_SOURCE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            "changed-content".len() as u64
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_git_repository_uses_index_ignore_policy_and_incremental_validation() {
+        let _guard = HASH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn live() {}\n").unwrap();
+        std::fs::write(dir.path().join("ignored.log"), "large generated log").unwrap();
+        std::fs::write(dir.path().join("target/bundle.js"), "generated").unwrap();
+
+        let first = hash_repo_tree(dir.path(), None).unwrap();
+        let paths = first
+            .2
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"src/lib.rs"));
+        assert!(!paths.contains(&"ignored.log"));
+        assert!(!paths.contains(&"target/bundle.js"));
+
+        HASHED_SOURCE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let unchanged = hash_repo_tree(dir.path(), Some(&first.2)).unwrap();
+        assert_eq!(unchanged.0, first.0);
+        assert_eq!(
+            HASHED_SOURCE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

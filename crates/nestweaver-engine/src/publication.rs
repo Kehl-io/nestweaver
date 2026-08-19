@@ -412,6 +412,11 @@ pub struct CurrentPublicationPointer {
     pub publication_uuid: String,
     #[serde(default)]
     pub expected_previous_publication_uuid: Option<String>,
+    /// Present only when this pointer was produced by rollback. It records the
+    /// abandoned publication and makes rollback deliberately one-way: another
+    /// rollback is refused until a fresh activation writes a normal pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolled_back_from_publication_uuid: Option<String>,
     pub manifest_blake3: String,
     pub checksum_blake3: String,
 }
@@ -422,6 +427,8 @@ struct PointerPayload<'a> {
     brain_uuid: &'a str,
     publication_uuid: &'a str,
     expected_previous_publication_uuid: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolled_back_from_publication_uuid: Option<&'a str>,
     manifest_blake3: &'a str,
 }
 
@@ -449,10 +456,23 @@ impl CurrentPublicationPointer {
             brain_uuid: identity.brain_uuid.clone(),
             publication_uuid: identity.publication_uuid.clone(),
             expected_previous_publication_uuid,
+            rolled_back_from_publication_uuid: None,
             manifest_blake3,
             checksum_blake3: String::new(),
         };
         pointer.checksum_blake3 = pointer.payload_digest()?;
+        Ok(pointer)
+    }
+
+    fn after_rollback(
+        identity: &nestweaver_store::PublicationIdentity,
+        rolled_back_from_publication_uuid: String,
+        manifest_blake3: String,
+    ) -> anyhow::Result<Self> {
+        let mut pointer = Self::new(identity, None, manifest_blake3)?;
+        pointer.rolled_back_from_publication_uuid = Some(rolled_back_from_publication_uuid);
+        pointer.checksum_blake3 = pointer.payload_digest()?;
+        pointer.validate()?;
         Ok(pointer)
     }
 
@@ -462,6 +482,7 @@ impl CurrentPublicationPointer {
             brain_uuid: &self.brain_uuid,
             publication_uuid: &self.publication_uuid,
             expected_previous_publication_uuid: self.expected_previous_publication_uuid.as_deref(),
+            rolled_back_from_publication_uuid: self.rolled_back_from_publication_uuid.as_deref(),
             manifest_blake3: &self.manifest_blake3,
         })?;
         Ok(crate::hash::blake3_hex_bytes(&bytes))
@@ -489,6 +510,18 @@ impl CurrentPublicationPointer {
             if previous == current {
                 anyhow::bail!(
                     "CURRENT expected previous publication UUID equals its selected publication"
+                );
+            }
+        }
+        if let Some(abandoned) = self.rolled_back_from_publication_uuid.as_deref() {
+            let abandoned = parse_uuid("rolled_back_from_publication_uuid", abandoned)?;
+            let current = parse_uuid("publication_uuid", &self.publication_uuid)?;
+            if abandoned == current {
+                anyhow::bail!("rollback source UUID equals the selected publication UUID");
+            }
+            if self.expected_previous_publication_uuid.is_some() {
+                anyhow::bail!(
+                    "a rolled-back CURRENT pointer cannot advertise another rollback predecessor"
                 );
             }
         }
@@ -539,6 +572,22 @@ pub fn operation_path(publication_root: &Path, operation_uuid: &str) -> anyhow::
 
 pub fn default_publication_root(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".publications")
+}
+
+/// Resolve the retained incumbent graph used to authorize activation rollback
+/// without consulting or opening the newly selected publication. `None`
+/// denotes the implicit base database used before the first cutover.
+pub fn retained_predecessor_database(
+    base_db_path: &Path,
+    predecessor_publication_uuid: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let Some(predecessor) = predecessor_publication_uuid else {
+        return Ok(base_db_path.to_path_buf());
+    };
+    Ok(
+        slot_path(&default_publication_root(base_db_path), predecessor)?
+            .join(PUBLICATION_GRAPH_FILE),
+    )
 }
 
 pub fn read_current(publication_root: &Path) -> anyhow::Result<Option<CurrentPublicationPointer>> {
@@ -693,10 +742,23 @@ pub fn compare_and_swap_current(
         .as_deref()
         .map(|value| parse_uuid("declared previous publication_uuid", value))
         .transpose()?;
-    if declared_previous != expected {
+    let rollback_source = next
+        .rolled_back_from_publication_uuid
+        .as_deref()
+        .map(|value| parse_uuid("rolled_back_from_publication_uuid", value))
+        .transpose()?;
+    let predecessor_contract_holds = if rollback_source.is_some() {
+        rollback_source == expected && declared_previous.is_none()
+    } else {
+        declared_previous == expected
+    };
+    if !predecessor_contract_holds {
         anyhow::bail!(
-            "CURRENT pointer declares previous {}, but compare-and-swap expects {}",
+            "CURRENT pointer declares previous {} and rollback source {}, but compare-and-swap expects {}",
             declared_previous
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            rollback_source
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
             expected
@@ -741,6 +803,11 @@ pub fn rollback_current(
         .map_err(|error| anyhow::anyhow!("refusing CURRENT rollback from dirty graph: {error}"))?;
     let current = read_current(publication_root)?
         .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
+    if let Some(abandoned) = current.rolled_back_from_publication_uuid.as_deref() {
+        anyhow::bail!(
+            "CURRENT already represents the one-step rollback from {abandoned}; activate a fresh publication before another rollback"
+        );
+    }
     if parse_uuid("expected current publication_uuid", expected_current)?
         != parse_uuid(
             "observed current publication_uuid",
@@ -794,9 +861,9 @@ pub fn rollback_current(
         brain_uuid: bundle.brain_uuid,
         publication_uuid: bundle.publication_uuid,
     };
-    let previous = CurrentPublicationPointer::new(
+    let previous = CurrentPublicationPointer::after_rollback(
         &previous_identity,
-        Some(current.publication_uuid.clone()),
+        current.publication_uuid.clone(),
         crate::hash::blake3_hex_bytes(&manifest_bytes),
     )?;
     compare_and_swap_current(
@@ -983,6 +1050,90 @@ mod tests {
                 .is_none()
         );
         assert_eq!(resolve_selected_database(&base).unwrap(), base);
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn rollback_does_not_open_the_failed_selected_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let incumbent = store.publication_identity().unwrap().unwrap();
+        let target = incumbent.next_publication().unwrap();
+        let pointer = write_resolvable_slot(&base, &target);
+        let target_graph = slot_path(&default_publication_root(&base), &target.publication_uuid)
+            .unwrap()
+            .join(PUBLICATION_GRAPH_FILE);
+        std::fs::write(&target_graph, b"failed startup graph").unwrap();
+        assert!(resolve_selected_database(&base).is_err());
+
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            rollback_current(
+                &default_publication_root(&base),
+                &lease,
+                &pointer.publication_uuid,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(resolve_selected_database(&base).unwrap(), base);
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn rollback_is_one_step_and_never_reselects_the_abandoned_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let base_store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let base_identity = base_store.publication_identity().unwrap().unwrap();
+        drop(base_store);
+
+        let first_identity = base_identity.next_publication().unwrap();
+        let first = write_resolvable_slot(&base, &first_identity);
+        let second_identity = first_identity.next_publication().unwrap();
+        let second_without_predecessor = write_resolvable_slot(&base, &second_identity);
+        let second = CurrentPublicationPointer::new(
+            &second_identity,
+            Some(first_identity.publication_uuid.clone()),
+            second_without_predecessor.manifest_blake3,
+        )
+        .unwrap();
+        let root = default_publication_root(&base);
+        std::fs::write(
+            current_pointer_path(&root),
+            serde_json::to_vec_pretty(&second).unwrap(),
+        )
+        .unwrap();
+
+        let predecessor = retained_predecessor_database(
+            &base,
+            second.expected_previous_publication_uuid.as_deref(),
+        )
+        .unwrap();
+        let predecessor_store = nestweaver_store::GraphStore::open(&predecessor).unwrap();
+        let lease = predecessor_store.acquire_index_publication_lease().unwrap();
+        let selected = rollback_current(&root, &lease, &second.publication_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.publication_uuid, first.publication_uuid);
+        assert_eq!(
+            selected.rolled_back_from_publication_uuid.as_deref(),
+            Some(second.publication_uuid.as_str())
+        );
+        assert!(selected.expected_previous_publication_uuid.is_none());
+
+        let error = rollback_current(&root, &lease, &selected.publication_uuid).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already represents the one-step rollback")
+        );
+        assert_eq!(
+            read_current(&root).unwrap().unwrap().publication_uuid,
+            first.publication_uuid,
+            "a second rollback must not toggle back to the abandoned slot"
+        );
         lease.release().unwrap();
     }
 

@@ -560,9 +560,9 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             .filter(|entry| entry.file_type().is_file())
         {
             let path = normalized_relative_path(temp_dir.path(), entry.path())?;
-            let bytes = std::fs::read(entry.path())?;
-            sizes.insert(path.clone(), u64::try_from(bytes.len())?);
-            hashes.insert(path, crate::hash::blake3_hex_bytes(&bytes));
+            let (byte_size, digest) = crate::hash::blake3_file(entry.path())?;
+            sizes.insert(path.clone(), byte_size);
+            hashes.insert(path, digest);
         }
         validate_backup_publication_inventory(&manifest, &publication, &sizes, &hashes)?;
 
@@ -766,20 +766,20 @@ fn build_backup_publication_bundle(
         if path == crate::publication::PUBLICATION_MANIFEST_FILE || path == "manifest.json" {
             continue;
         }
-        let bytes = std::fs::read(entry.path())?;
-        let (kind, schema, fingerprint) = backup_artifact_contract_for_payload(
+        let (kind, schema, fingerprint) = backup_artifact_contract_for_path(
             &path,
             &db_filename,
-            &bytes,
+            entry.path(),
             identity,
             source_graph_generation,
         )?;
+        let (byte_size, blake3) = crate::hash::blake3_file(entry.path())?;
         artifacts.push(crate::publication::ArtifactDescriptor {
             path,
             kind,
             artifact_schema_version: schema,
-            byte_size: u64::try_from(bytes.len())?,
-            blake3: crate::hash::blake3_hex_bytes(&bytes),
+            byte_size,
+            blake3,
             brain_uuid: identity.brain_uuid.clone(),
             publication_uuid: identity.publication_uuid.clone(),
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -799,17 +799,18 @@ fn build_backup_publication_bundle(
     Ok(bundle)
 }
 
-fn backup_artifact_contract_for_payload(
+fn backup_artifact_contract_for_path(
     path: &str,
     db_filename: &str,
-    payload: &[u8],
+    absolute: &Path,
     identity: &nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
 ) -> anyhow::Result<(crate::publication::ArtifactKind, u32, String)> {
     match path.strip_prefix(db_filename) {
         Some(".pagerank.json") => {
+            let payload = std::fs::read(absolute)?;
             let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
-                payload,
+                &payload,
                 identity,
                 env!("CARGO_PKG_VERSION"),
                 source_graph_generation,
@@ -821,8 +822,9 @@ fn backup_artifact_contract_for_payload(
             ));
         }
         Some(".manifests.json") => {
+            let payload = std::fs::read(absolute)?;
             let (schema, fingerprint) = crate::publication::repo_manifest_artifact_contract(
-                payload,
+                &payload,
                 identity,
                 env!("CARGO_PKG_VERSION"),
                 source_graph_generation,
@@ -834,7 +836,7 @@ fn backup_artifact_contract_for_payload(
             ));
         }
         Some(".embeddings.bin") => {
-            let index = nestweaver_store::EmbeddingIndex::load_binary_v2_bytes(payload)
+            let index = nestweaver_store::EmbeddingIndex::load_binary_v2(absolute)
                 .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
             let envelope = index
                 .artifact_envelope()
@@ -852,8 +854,9 @@ fn backup_artifact_contract_for_payload(
             ));
         }
         Some(crate::publication::SOURCE_MANIFEST_SUFFIX) => {
+            let payload = std::fs::read(absolute)?;
             let (schema, fingerprint) = crate::publication::source_manifest_artifact_contract(
-                payload,
+                &payload,
                 identity,
                 env!("CARGO_PKG_VERSION"),
                 source_graph_generation,
@@ -865,8 +868,9 @@ fn backup_artifact_contract_for_payload(
             ));
         }
         Some(crate::publication::PRESERVED_STATE_SUFFIX) => {
+            let payload = std::fs::read(absolute)?;
             let (schema, fingerprint) = crate::publication::preserved_state_artifact_contract(
-                payload,
+                &payload,
                 identity,
                 env!("CARGO_PKG_VERSION"),
                 source_graph_generation,

@@ -594,9 +594,19 @@ impl RegexIndex {
             required.push((Occur::Must, Box::new(BooleanQuery::new(alternatives))));
         }
         let query = BooleanQuery::new(required);
+        // Tantivy's collector reports only the retained hits, not whether more
+        // matches existed. Probe one past the caller's budget so saturation is
+        // explicit and the caller can conservatively widen this scope to the
+        // graph instead of silently dropping regex matches.
         let hits = searcher
-            .search(&query, &TopDocs::with_limit(cap).order_by_score())
+            .search(
+                &query,
+                &TopDocs::with_limit(cap.saturating_add(1)).order_by_score(),
+            )
             .map_err(|error| StoreError::Query(format!("query regex shard: {error}")))?;
+        if hits.len() > cap {
+            return Ok(None);
+        }
         let mut uids = HashSet::with_capacity(hits.len());
         for (_, address) in hits {
             let document: TantivyDocument = searcher.doc(address).map_err(|error| {
@@ -671,21 +681,6 @@ impl RegexIndex {
             .map_err(|error| {
                 StoreError::Query(format!("retire regex scope {scope_uid}: {error}"))
             })?;
-        if scope_root.exists() {
-            std::fs::remove_dir_all(&scope_root).map_err(|error| {
-                StoreError::Query(format!(
-                    "garbage-collect retired regex scope {scope_uid}: {error}"
-                ))
-            })?;
-            crate::durable_sidecar::sync_parent_directory_durable(&scope_root).map_err(
-                |error| {
-                    StoreError::Query(format!(
-                        "sync retired regex scope directory {scope_uid}: {error}"
-                    ))
-                },
-            )?;
-            return Ok(true);
-        }
         Ok(selector_removed)
     }
 
@@ -922,6 +917,46 @@ mod tests {
     }
 
     #[test]
+    fn saturated_candidate_query_widens_instead_of_dropping_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let uids = ["one", "two", "three", "four", "five"];
+        let documents = uids
+            .iter()
+            .map(|uid| RegexShardDocument {
+                uid,
+                kind: "Symbol",
+                text_hash: uid,
+                trigrams: &trigrams,
+            })
+            .collect::<Vec<_>>();
+        let published = metadata(1, documents.len(), "digest-five");
+        index.replace_scope(published.clone(), &documents).unwrap();
+
+        assert_eq!(
+            index
+                .candidate_uids(&published, &[HashSet::from(["alp".to_string()])], 2,)
+                .unwrap(),
+            None,
+            "a saturated shard must widen to the graph scan oracle"
+        );
+        assert_eq!(
+            index
+                .candidate_uids(
+                    &published,
+                    &[HashSet::from(["alp".to_string()])],
+                    documents.len(),
+                )
+                .unwrap()
+                .unwrap()
+                .len(),
+            documents.len(),
+            "an exact-cap result is complete and need not widen"
+        );
+    }
+
+    #[test]
     fn garbage_collection_keeps_only_selected_generations_and_retires_one_scope() {
         let temp = tempfile::tempdir().unwrap();
         let index = RegexIndex::new(temp.path());
@@ -947,6 +982,48 @@ mod tests {
         assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 1);
 
         assert!(index.retire_scope("repo:test").unwrap());
+        assert!(index.scope_root("repo:test").exists());
+        assert!(!index.scope_root("repo:test").join("CURRENT").exists());
+        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert!(!index.scope_root("repo:test").exists());
+    }
+
+    #[test]
+    fn retiring_scope_leaves_generation_for_an_existing_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        index
+            .replace_scope(metadata(1, 1, "digest-one"), &[document])
+            .unwrap();
+
+        let (opened, _, _) = index.open_current("repo:test").unwrap().unwrap();
+        let reader = opened
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        let searcher = reader.searcher();
+
+        assert!(index.retire_scope("repo:test").unwrap());
+        assert!(index.metadata("repo:test").unwrap().is_none());
+        assert_eq!(
+            searcher.num_docs(),
+            2,
+            "metadata plus one candidate remain readable"
+        );
+        assert!(index.scope_root("repo:test").exists());
+
+        drop(searcher);
+        drop(reader);
+        drop(opened);
+        assert_eq!(index.garbage_collect().unwrap(), 1);
         assert!(!index.scope_root("repo:test").exists());
     }
 

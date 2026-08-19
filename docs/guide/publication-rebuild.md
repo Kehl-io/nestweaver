@@ -34,6 +34,15 @@ Resume is refused if source content, configuration, binary version, publication
 format, or database identity changed. Stabilize the named input and start a new
 operation instead of overriding that refusal.
 
+Graph progress is checkpointed after each repository and vault. A retry resumes
+from the first unfinished source, but only when the checkpoint's captured
+content digest still matches. Final source revalidation enumerates every input
+again and uses strong filesystem change tokens to avoid rereading unchanged
+files on supported systems; ambiguous or changed metadata always falls back to
+content hashing. Bundle size and BLAKE3 validation stream through a fixed-size
+buffer, so multi-gigabyte graph artifacts do not require multi-gigabyte heap
+allocations.
+
 ## Cancellation and cleanup
 
 Cancellation is cooperative at safe batch boundaries. Read the latest revision
@@ -63,13 +72,21 @@ nestweaver publication rollback --config /path/to/instance.toml
 nestweaver daemon start --config /path/to/instance.toml
 ```
 
-Rollback is intentionally one step. Keep the predecessor until the new release
-has passed normal workload verification and a fresh backup has been taken.
+Rollback is intentionally one step. A second rollback is refused instead of
+switching back to the abandoned publication; a later successful activation
+establishes a new one-step predecessor. Keep the predecessor until the new
+release has passed normal workload verification and a fresh backup has been
+taken.
 
 ## Failure behavior
 
 - Missing, stale, corrupt, incompatible, or foreign regex shards widen only the
   affected scope to a graph scan; they cannot silently remove matches.
+- A regex candidate query that reaches its safety cap is treated as saturated
+  and widens that scope to a graph scan; the cap can never truncate matches.
+- Retiring a regex scope unlinks only its selector. Immutable generation files
+  remain available to existing readers until a separate retention pass removes
+  them.
 - A sidecar write failure leaves the graph commit valid and its coalesced
   outbox work retryable.
 - A failed source revalidation, seal, pointer switch, or startup smoke leaves or

@@ -2396,7 +2396,51 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
-    /// Show cross-repo references for a symbol
+    /// Find cross-repository references and API contracts for a symbol
+    #[command(
+        name = "cross-repo-contracts",
+        after_help = "Examples:\n  nestweaver cross-repo-contracts UserService\n  nestweaver cross-repo-contracts sym:repo:... --limit 100 --json"
+    )]
+    CrossRepoContracts {
+        /// Symbol name or UID
+        symbol: String,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
+            help = "Maximum contract links to return"
+        )]
+        limit: Option<usize>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
+    /// Find notes that link to a note UID or title
+    #[command(
+        name = "backlinks",
+        after_help = "Examples:\n  nestweaver backlinks 'Architecture Overview'\n  nestweaver backlinks note:vault:Notes:abc123 --json"
+    )]
+    Backlinks {
+        /// Target note UID (`note:...`) or title
+        target: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
+    /// Show cross-repo references for a symbol (legacy command)
     CrossRepoRefs {
         /// Symbol name or UID
         name_or_uid: String,
@@ -3167,6 +3211,29 @@ enum Commands {
             help = "Cap affected symbols returned, most-impactful first (1-10000)"
         )]
         limit: Option<usize>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
+    /// Assess file-level change impact using the MCP-compatible tool contract
+    #[command(
+        name = "detect-changes",
+        after_help = "Examples:\n  nestweaver detect-changes --files src/auth.rs\n  nestweaver detect-changes --files src/auth.rs --files src/db.rs --json"
+    )]
+    DetectChanges {
+        #[arg(
+            long = "files",
+            required = true,
+            help = "Changed file paths, repo-relative (repeat for several)"
+        )]
+        files: Vec<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -4675,7 +4742,7 @@ enum PublicationCommands {
         #[arg(long, help = "Database path used to derive the publication root")]
         db: Option<PathBuf>,
     },
-    /// Roll back CURRENT to its retained predecessor publication
+    /// Roll back CURRENT once to its retained predecessor; a second call is refused
     Rollback {
         #[arg(
             long,
@@ -8702,6 +8769,126 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
+        Commands::CrossRepoContracts {
+            symbol,
+            limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let mut args = if symbol.starts_with("sym:") {
+                serde_json::json!({ "uid": symbol })
+            } else {
+                serde_json::json!({ "name": symbol })
+            };
+            if let Some(limit) = limit {
+                args["limit"] = serde_json::json!(limit);
+            }
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "cross_repo_contracts",
+                args.clone(),
+            )? {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    let mut value = nestweaver_mcp::tools::dispatch(
+                        &store,
+                        None,
+                        "cross_repo_contracts",
+                        args,
+                        None,
+                    )?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!(
+                    "Cross-repo contracts for {}: {} returned of {} ({})",
+                    payload["uid"].as_str().unwrap_or("?"),
+                    payload["returned"].as_u64().unwrap_or(0),
+                    payload["total"].as_u64().unwrap_or(0),
+                    payload["contracts_status"].as_str().unwrap_or("unknown")
+                );
+                if let Some(contracts) = payload["contracts"].as_array() {
+                    for contract in contracts {
+                        println!(
+                            "  {} -> {} [{}] ({:.2})",
+                            contract["source_name"]
+                                .as_str()
+                                .or_else(|| contract["source_uid"].as_str())
+                                .unwrap_or("?"),
+                            contract["target_name"]
+                                .as_str()
+                                .or_else(|| contract["target_uid"].as_str())
+                                .unwrap_or("?"),
+                            contract["link_type"].as_str().unwrap_or("?"),
+                            contract["confidence"].as_f64().unwrap_or(0.0)
+                        );
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Backlinks {
+            target,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let args = if target.starts_with("note:") {
+                serde_json::json!({ "uid": target })
+            } else {
+                serde_json::json!({ "title": target })
+            };
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "backlinks",
+                args.clone(),
+            )? {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    let mut value =
+                        nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!(
+                    "Backlinks to {} ({}):",
+                    payload["target_uid"].as_str().unwrap_or("?"),
+                    payload["count"].as_u64().unwrap_or(0)
+                );
+                if let Some(backlinks) = payload["backlinks"].as_array() {
+                    for backlink in backlinks {
+                        println!(
+                            "  {} — {} ({:.2})",
+                            backlink["source_note_title"].as_str().unwrap_or("?"),
+                            backlink["source_note_path"].as_str().unwrap_or("?"),
+                            backlink["confidence"].as_f64().unwrap_or(0.0)
+                        );
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
         Commands::CrossRepoRefs {
             name_or_uid,
             repo: repo_filter,
@@ -8709,13 +8896,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            if use_daemon && repo_filter.is_none() {
                 let db_default = default_db_path();
                 let db_path = db.as_deref().unwrap_or(&db_default);
-                let mut args = serde_json::json!({ "name_or_uid": name_or_uid });
-                if let Some(ref rf) = repo_filter {
-                    args["repo"] = serde_json::json!(rf);
-                }
+                let args = if name_or_uid.starts_with("sym:") {
+                    serde_json::json!({ "uid": name_or_uid })
+                } else {
+                    serde_json::json!({ "name": name_or_uid })
+                };
                 if let Some(value) =
                     try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)?
                 {
@@ -10265,6 +10453,65 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 render_blast_radius_text(&payload);
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::DetectChanges {
+            files,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let args = serde_json::json!({ "changed_files": files });
+            let payload = match try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "detect_changes",
+                args.clone(),
+            )? {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    let mut value = nestweaver_mcp::tools::dispatch(
+                        &store,
+                        None,
+                        "detect_changes",
+                        args,
+                        None,
+                    )?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!(
+                    "Change impact: risk={}, status={}, gate={}",
+                    payload["risk"].as_str().unwrap_or("unknown"),
+                    payload["status"].as_str().unwrap_or("unknown"),
+                    payload["gate_state"].as_str().unwrap_or("unknown")
+                );
+                println!(
+                    "Affected: {} symbols, {} processes (blast radius {})",
+                    payload["affected_symbol_count"].as_u64().unwrap_or(0),
+                    payload["affected_process_count"].as_u64().unwrap_or(0),
+                    payload["blast_radius"].as_u64().unwrap_or(0)
+                );
+                if let Some(notifications) = payload["notifications"].as_array() {
+                    for notification in notifications {
+                        println!(
+                            "Warning: {}",
+                            notification["message"]
+                                .as_str()
+                                .unwrap_or("analysis degraded")
+                        );
+                    }
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -19987,6 +20234,7 @@ mod cli_help_contract_tests {
         });
 
         let expected = [
+            "nestweaver backlinks",
             "nestweaver backup save",
             "nestweaver blast-radius",
             "nestweaver brain add",
@@ -20004,6 +20252,8 @@ mod cli_help_contract_tests {
             "nestweaver clusters",
             "nestweaver context",
             "nestweaver count-patterns",
+            "nestweaver cross-repo-contracts",
+            "nestweaver detect-changes",
             "nestweaver flow-trace",
             "nestweaver generate-guide",
             "nestweaver hubs",
@@ -22631,13 +22881,16 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
         }
         PublicationCommands::Rollback { db, config, json } => {
             let (base_db, cfg) = resolve_base_db_with_config(db, config.as_deref())?;
-            let selected_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
-            ensure_no_live_daemon_for_snapshot_build(&selected_db)?;
             let root = nestweaver_engine::publication::default_publication_root(&base_db);
             let current = nestweaver_engine::publication::read_current(&root)?
                 .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
-            let store = GraphStore::open(&selected_db).map_err(|error| {
-                anyhow::anyhow!("open selected publication for rollback: {error}")
+            let predecessor_db = nestweaver_engine::publication::retained_predecessor_database(
+                &base_db,
+                current.expected_previous_publication_uuid.as_deref(),
+            )?;
+            ensure_no_live_daemon_for_snapshot_build(&predecessor_db)?;
+            let store = GraphStore::open(&predecessor_db).map_err(|error| {
+                anyhow::anyhow!("open retained predecessor for rollback: {error}")
             })?;
             if let Some(cfg) = cfg.as_ref() {
                 cfg.assert_expected_brain(&store)?;
@@ -22838,6 +23091,24 @@ fn run_publication_rebuild(
                     let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
                     let mut completed = 0_u64;
                     for repo in &sources.repos {
+                        let checkpoint = publication_graph_checkpoint("repo", &repo.uid);
+                        if let Some(recorded) = state.completed_artifacts.get(&checkpoint) {
+                            if recorded != &repo.content_blake3 {
+                                anyhow::bail!(
+                                    "repository checkpoint {checkpoint} does not match the captured source digest"
+                                );
+                            }
+                            completed += 1;
+                            state = reload_and_acknowledge_cancel(
+                                &publication_root,
+                                &operation_uuid,
+                                state,
+                            )?;
+                            if state.phase == PublicationPhase::Cancelled {
+                                return Ok(state);
+                            }
+                            continue;
+                        }
                         state = publication_progress(
                             &publication_root,
                             &state,
@@ -22856,6 +23127,13 @@ fn run_publication_rebuild(
                             repo.name.as_deref(),
                             config.indexing.limits(),
                         )?;
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            checkpoint,
+                            repo.content_blake3.clone(),
+                        )?;
                         completed += 1;
                         state = reload_and_acknowledge_cancel(
                             &publication_root,
@@ -22867,6 +23145,24 @@ fn run_publication_rebuild(
                         }
                     }
                     for vault in &sources.vaults {
+                        let checkpoint = publication_graph_checkpoint("vault", &vault.uid);
+                        if let Some(recorded) = state.completed_artifacts.get(&checkpoint) {
+                            if recorded != &vault.content_blake3 {
+                                anyhow::bail!(
+                                    "vault checkpoint {checkpoint} does not match the captured source digest"
+                                );
+                            }
+                            completed += 1;
+                            state = reload_and_acknowledge_cancel(
+                                &publication_root,
+                                &operation_uuid,
+                                state,
+                            )?;
+                            if state.phase == PublicationPhase::Cancelled {
+                                return Ok(state);
+                            }
+                            continue;
+                        }
                         state = publication_progress(
                             &publication_root,
                             &state,
@@ -22880,6 +23176,13 @@ fn run_publication_rebuild(
                             &vault.instance_id,
                             &vault.name,
                             &[],
+                        )?;
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            checkpoint,
+                            vault.content_blake3.clone(),
                         )?;
                         completed += 1;
                         state = reload_and_acknowledge_cancel(
@@ -23035,7 +23338,7 @@ fn run_publication_rebuild(
                 PublicationPhase::Validating => {
                     let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
                     let active = GraphStore::open_read_only(&active_db)?;
-                    let observed = nestweaver_engine::PublicationSourceManifest::capture(&active)?;
+                    let observed = sources.recapture_for_validation(&active)?;
                     drop(active);
                     let observed_state = nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&active_db)?;
                     let observed_input = publication_input_fingerprint(
@@ -23057,9 +23360,17 @@ fn run_publication_rebuild(
                 }
                 PublicationPhase::Ready if !activate => return Ok(state),
                 PublicationPhase::Ready | PublicationPhase::Activating => {
-                    let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
-                    ensure_no_live_daemon_for_snapshot_build(&active_db)?;
-                    let store = GraphStore::open(&active_db)?;
+                    let incumbent_db =
+                        nestweaver_engine::publication::retained_predecessor_database(
+                            &base_db,
+                            state.plan.expected_current_publication_uuid.as_deref(),
+                        )?;
+                    ensure_no_live_daemon_for_snapshot_build(&incumbent_db)?;
+                    let store = GraphStore::open(&incumbent_db).map_err(|error| {
+                        anyhow::anyhow!(
+                            "open retained incumbent publication for activation: {error}"
+                        )
+                    })?;
                     let lease = store.acquire_index_publication_lease()?;
                     state = nestweaver_engine::publication_operation::select_operation(
                         &publication_root,
@@ -23068,20 +23379,39 @@ fn run_publication_rebuild(
                         &lease,
                     )?;
                     lease.release()?;
-                    drop(store);
                     let smoke = publication_startup_smoke(&base_db, &state.plan);
                     if let Err(error) = smoke {
-                        let selected_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
-                        let selected = GraphStore::open(&selected_db)?;
-                        let rollback_lease = selected.acquire_index_publication_lease()?;
-                        let _ = nestweaver_engine::publication::rollback_current(
+                        let rollback_lease = store.acquire_index_publication_lease().map_err(
+                            |rollback_error| {
+                                anyhow::anyhow!(
+                                    "selected publication failed startup smoke: {error:#}; automatic rollback could not acquire the retained incumbent lease: {rollback_error}"
+                                )
+                            },
+                        )?;
+                        let rollback = nestweaver_engine::publication::rollback_current(
                             &publication_root,
                             &rollback_lease,
                             &state.plan.target_publication_uuid,
                         );
-                        rollback_lease.release()?;
-                        return Err(error).context("selected publication failed startup smoke and was rolled back");
+                        let release = rollback_lease.release();
+                        return match (rollback, release) {
+                            (Ok(_), Ok(())) => Err(error).context(
+                                "selected publication failed startup smoke; automatic rollback to the retained incumbent succeeded",
+                            ),
+                            (rollback, release) => Err(anyhow::anyhow!(
+                                "selected publication failed startup smoke: {error:#}; automatic rollback failed: {}; rollback lease release: {}",
+                                rollback
+                                    .err()
+                                    .map(|value| format!("{value:#}"))
+                                    .unwrap_or_else(|| "succeeded".to_string()),
+                                release
+                                    .err()
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "succeeded".to_string()),
+                            )),
+                        };
                     }
+                    drop(store);
                     state = nestweaver_engine::publication_operation::complete_activation(
                         &publication_root,
                         &operation_uuid,
@@ -23202,6 +23532,13 @@ fn publication_progress(
             total: (total != 0).then_some(total),
             message,
         },
+    )
+}
+
+fn publication_graph_checkpoint(kind: &str, source_uid: &str) -> String {
+    format!(
+        "graph/{kind}/{}.done",
+        nestweaver_engine::hash::blake3_hex(source_uid)
     )
 }
 
@@ -25990,6 +26327,64 @@ mod pr_impact_hook_tests {
                 .contains("echo second"),
             "a second foreign hook must get a numbered backup"
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_alias_cli_tests {
+    use super::*;
+
+    #[test]
+    fn documented_skill_capabilities_are_first_class_cli_commands() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let detect = Cli::try_parse_from([
+                    "nestweaver",
+                    "detect-changes",
+                    "--files",
+                    "src/a.rs",
+                    "--files",
+                    "src/b.rs",
+                    "--json",
+                ])
+                .unwrap();
+                assert!(matches!(
+                    detect.command,
+                    Commands::DetectChanges { files, json: true, .. }
+                        if files == ["src/a.rs", "src/b.rs"]
+                ));
+
+                let contracts = Cli::try_parse_from([
+                    "nestweaver",
+                    "cross-repo-contracts",
+                    "SharedApi",
+                    "--limit",
+                    "25",
+                ])
+                .unwrap();
+                assert!(matches!(
+                    contracts.command,
+                    Commands::CrossRepoContracts { symbol, limit: Some(25), .. }
+                        if symbol == "SharedApi"
+                ));
+
+                let backlinks = Cli::try_parse_from([
+                    "nestweaver",
+                    "backlinks",
+                    "Architecture Overview",
+                    "--json",
+                ])
+                .unwrap();
+                assert!(matches!(
+                    backlinks.command,
+                    Commands::Backlinks { target, json: true, .. }
+                        if target == "Architecture Overview"
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

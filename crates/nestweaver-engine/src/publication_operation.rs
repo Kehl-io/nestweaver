@@ -690,12 +690,10 @@ fn validate_target_slot(
     }
     for descriptor in &bundle.artifacts {
         let artifact = slot.join(&descriptor.path);
-        let payload = std::fs::read(&artifact).map_err(|error| {
-            anyhow::anyhow!("read target artifact {}: {error}", artifact.display())
+        let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
+            anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
         })?;
-        if u64::try_from(payload.len())? != descriptor.byte_size
-            || crate::hash::blake3_hex_bytes(&payload) != descriptor.blake3
-        {
+        if byte_size != descriptor.byte_size || digest != descriptor.blake3 {
             anyhow::bail!(
                 "target artifact {} failed size or digest validation",
                 descriptor.path
@@ -921,6 +919,56 @@ mod tests {
             acknowledge_cancel(dir.path(), &plan.operation_uuid, requested.revision).unwrap();
         assert_eq!(cancelled.phase, PublicationPhase::Cancelled);
         assert!(resume_operation(dir.path(), &plan, cancelled.revision).is_err());
+    }
+
+    #[test]
+    fn completed_graph_artifacts_survive_retryable_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let created = create_operation(dir.path(), plan.clone()).unwrap();
+        let graph = advance_phase(
+            dir.path(),
+            &plan.operation_uuid,
+            created.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        let checkpoint = "graph/repo/0123456789abcdef.done".to_string();
+        let digest = "a".repeat(64);
+        let recorded = record_artifact(
+            dir.path(),
+            &plan.operation_uuid,
+            graph.revision,
+            checkpoint.clone(),
+            digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(recorded.completed_artifacts.get(&checkpoint), Some(&digest));
+        assert!(
+            record_artifact(
+                dir.path(),
+                &plan.operation_uuid,
+                recorded.revision,
+                checkpoint.clone(),
+                "b".repeat(64),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("different digest")
+        );
+
+        let failed = record_failure(
+            dir.path(),
+            &plan.operation_uuid,
+            recorded.revision,
+            "interrupted",
+            "worker stopped after a repository checkpoint",
+            true,
+        )
+        .unwrap();
+        let resumed = resume_operation(dir.path(), &plan, failed.revision).unwrap();
+        assert_eq!(resumed.completed_artifacts.get(&checkpoint), Some(&digest));
+        assert_eq!(resumed.phase, PublicationPhase::Graph);
     }
 
     #[test]
