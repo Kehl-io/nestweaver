@@ -11019,9 +11019,9 @@ mod startup_helper_tests {
         repo_uid: &str,
         package_name: &str,
     ) -> String {
-        let manifests_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
         let mut manifests =
-            nestweaver_engine::load_manifest_cache(&manifests_path).unwrap_or_default();
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
+                .unwrap_or_default();
         manifests.insert(
             repo_uid.to_string(),
             nestweaver_engine::ManifestInfo {
@@ -11030,7 +11030,8 @@ mod startup_helper_tests {
                 entry_files: Vec::new(),
             },
         );
-        nestweaver_engine::save_manifest_cache(&manifests, &manifests_path).unwrap();
+        nestweaver_engine::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)
+            .unwrap();
 
         let symbol_uid = format!("sym:{repo_uid}:{package_name}");
         state
@@ -11056,6 +11057,7 @@ mod startup_helper_tests {
                 canonical_id: None,
             })
             .unwrap();
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(state.store.add_embedding(&symbol_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
         symbol_uid
@@ -11071,6 +11073,18 @@ mod startup_helper_tests {
                 instance_id: "test".to_string(),
             })
             .unwrap();
+    }
+
+    fn seed_pagerank_cache(state: &DaemonState, node_query: &str) -> std::path::PathBuf {
+        let scope = nestweaver_store::GraphScope {
+            node_queries: vec![node_query.to_string()],
+            edge_queries: Vec::new(),
+        };
+        state.store.compute_pagerank(0.85, 20, &scope).unwrap();
+        let path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        state.store.save_pagerank_cache(&path).unwrap();
+        state.store.load_pagerank_cache(&path).unwrap();
+        path
     }
 
     fn seed_extension(state: &DaemonState, uid: &str, key: &str, value: serde_json::Value) {
@@ -11264,15 +11278,14 @@ mod startup_helper_tests {
                 &[],
             )
             .unwrap();
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(
             state
                 .store
                 .add_embedding("note:nonexistent-vault-noop", vec![1.0, 0.0])
         );
         state.store.flush_embedding_index().unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, r#"{"nonexistent-vault-noop":0.5}"#).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let generation_before = state.store.graph_generation();
 
         let response = run_remove_vault_with_projection(
@@ -12603,11 +12616,8 @@ mod startup_helper_tests {
                 },
             ),
         ]);
-        nestweaver_engine::save_manifest_cache(
-            &manifests,
-            &nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json"),
-        )
-        .unwrap();
+        nestweaver_engine::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)
+            .unwrap();
 
         let response = DaemonService::new(state)
             .suggest_links_json(Request::new(JsonRequest {
@@ -12623,7 +12633,7 @@ mod startup_helper_tests {
     }
 
     #[tokio::test]
-    async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {
+    async fn suggest_links_does_not_trust_a_legacy_only_manifest_sidecar() {
         let state = test_state_with_writer();
         for (uid, url) in [
             ("repo:test:legacy-app", "https://example.test/legacy-app"),
@@ -12666,11 +12676,9 @@ mod startup_helper_tests {
             .into_inner();
 
         let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
-        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
-            link["description"] == "Depends on legacy-dependency-package (from manifest)"
-        }));
-        assert!(canonical_path.exists());
-        assert!(!legacy_path.exists());
+        assert!(suggestions["links"].as_array().unwrap().is_empty());
+        assert!(!canonical_path.exists());
+        assert!(legacy_path.exists());
     }
 
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
@@ -12796,11 +12804,8 @@ mod startup_helper_tests {
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
         assert_eq!(state.store.list_repos(None).unwrap().len(), 1);
-        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
-            &state.db_path,
-            ".manifests.json",
-        ))
-        .unwrap();
+        let manifests =
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path).unwrap();
         assert!(!manifests.contains_key("repo:test:first"));
         assert!(manifests.contains_key("repo:test:second"));
         assert!(!state.store.has_embedding(&first_symbol));
@@ -12912,11 +12917,8 @@ mod startup_helper_tests {
             reconciliations, 0,
             "code-only purge must not rebuild Tantivy"
         );
-        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
-            &state.db_path,
-            ".manifests.json",
-        ))
-        .unwrap();
+        let manifests =
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path).unwrap();
         assert!(!manifests.contains_key("repo:old:partial"));
         assert!(manifests.contains_key("repo:survivor:purge"));
         assert!(!state.store.has_embedding(&removed_symbol));
@@ -12945,9 +12947,7 @@ mod startup_helper_tests {
             .entry("repo:old:first".to_string())
             .or_default();
         nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, r#"{"repo:old:first":1.0}"#).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let graph_generation = state.store.graph_generation();
         let pagerank_generation = state.store.pagerank_generation();
         let mut reconciliations = 0;
@@ -12998,11 +12998,8 @@ mod startup_helper_tests {
             reconciliations, 0,
             "code-only merge must not rebuild Tantivy"
         );
-        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
-            &state.db_path,
-            ".manifests.json",
-        ))
-        .unwrap();
+        let manifests =
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path).unwrap();
         assert!(!manifests.contains_key("repo:old:first"));
         assert!(manifests.contains_key("repo:old:second"));
         assert!(!state.store.has_embedding(&first_symbol));
@@ -13021,10 +13018,7 @@ mod startup_helper_tests {
                 instance_id: "old".to_string(),
             })
             .unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        let persisted_rank = r#"{"rank-sentinel":0.75}"#;
-        std::fs::write(&pagerank_path, persisted_rank).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Vault) RETURN n.uid");
         let graph_generation = state.store.graph_generation();
         let pagerank_generation = state.store.pagerank_generation();
         let mut reconciliations = 0;
@@ -13251,9 +13245,7 @@ mod startup_helper_tests {
         let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
         filemeta.repos.entry(repo_uid.to_string()).or_default();
         nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let graph_generation = state.store.graph_generation();
         let pagerank_generation = state.store.pagerank_generation();
         let mut reconciliations = 0;
@@ -13303,9 +13295,7 @@ mod startup_helper_tests {
         let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
         filemeta.repos.entry(repo_uid.to_string()).or_default();
         nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let graph_generation = state.store.graph_generation();
         let pagerank_generation = state.store.pagerank_generation();
         let mut reconciliations = 0;
@@ -13350,9 +13340,7 @@ mod startup_helper_tests {
                 None,
             ))
             .unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, r#"{"repo:test:pagerank":1.0}"#).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let before_scores = state.store.pagerank_scores().unwrap();
         let before_generation = state.store.pagerank_generation();
         assert!(
@@ -13496,9 +13484,7 @@ mod startup_helper_tests {
     fn node_deletion_generation_exhaustion_is_reported_while_pagerank_is_invalidated() {
         let state = test_state_with_writer_generation(Some(u64::MAX));
         let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let pagerank_generation = state.store.pagerank_generation();
 
         let failures = finalize_node_graph_deletion(&state, "generation exhaustion regression");
@@ -13536,11 +13522,10 @@ mod startup_helper_tests {
             "tags",
             serde_json::json!(["keep"]),
         );
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Project) RETURN n.uid");
         let generation_before = state.store.graph_generation();
 
         let response = run_remove_project_with(
@@ -13664,11 +13649,10 @@ mod startup_helper_tests {
             "external_refs",
             serde_json::json!(["ticket-null-141"]),
         );
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Project) RETURN n.uid");
         let generation_before = state.store.graph_generation();
 
         let response = run_remove_project_with(
@@ -13976,11 +13960,10 @@ mod startup_helper_tests {
             "aliases",
             serde_json::json!(["still-live"]),
         );
+        state.store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Project) RETURN n.uid");
         let generation_before = state.store.graph_generation();
         let pagerank_generation_before = state.store.pagerank_generation();
         let liveness_called = std::cell::Cell::new(false);
@@ -14256,9 +14239,7 @@ mod startup_helper_tests {
         );
         deps.save(&deps_path).unwrap();
 
-        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{file_uid}":1.0}}"#)).unwrap();
-        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
         let tantivy = state.tantivy.as_ref().unwrap();
         tantivy
             .update_note(
@@ -14316,12 +14297,9 @@ mod startup_helper_tests {
             "code-only remove must not rebuild unrelated vault search documents"
         );
         assert!(
-            nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
-                &state.db_path,
-                ".manifests.json"
-            ))
-            .unwrap()
-            .contains_key(repo_uid),
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
+                .unwrap()
+                .contains_key(repo_uid),
             "the live Repo row must retain its manifest after a partial delete"
         );
         assert!(
