@@ -9540,6 +9540,7 @@ function hello(name) { return "Hello " + name; }
             .next()
             .unwrap()
             .uid;
+        store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
         assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
         store.flush_embedding_index().unwrap();

@@ -582,7 +582,7 @@ fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty(), "config error polluted MCP stdout");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("canonicalize --config"),
+        String::from_utf8_lossy(&output.stderr).contains("loading --config"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

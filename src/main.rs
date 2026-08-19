@@ -4628,8 +4628,9 @@ enum PublicationCommands {
     },
     /// Request cooperative cancellation at an exact observed revision
     Cancel {
+        /// Publication operation UUID to cancel
         operation: String,
-        #[arg(long)]
+        #[arg(long, help = "Exact journal revision observed by the caller")]
         revision: u64,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
@@ -4638,8 +4639,9 @@ enum PublicationCommands {
     },
     /// Permanently discard failed/cancelled unselected staging
     Discard {
+        /// Publication operation UUID to discard
         operation: String,
-        #[arg(long)]
+        #[arg(long, help = "Exact journal revision observed by the caller")]
         revision: u64,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
@@ -20442,10 +20444,9 @@ where
     // pair taken from pre-existing vectors.
     let mut produced_dim: Option<usize> = None;
     let mut produced_pipeline: Option<nestweaver_schema::EmbeddingPipelineV2> = None;
-    // Checkpoint the index to the sidecar about every five minutes so an
-    // interrupted pass keeps completed work. Per-batch flushing is not
-    // implementable: save_binary rewrites the entire sidecar on every call,
-    // so the cadence must stay coarse.
+    // Checkpoint the index to its bounded append journal about every five
+    // minutes so an interrupted pass keeps completed work without rewriting
+    // the mmap base after every batch.
     let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
         nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
     );
@@ -20878,13 +20879,6 @@ where
         }
     }
 
-    // Flush the embedding index to the sidecar file once at the end.
-    if success_count > 0
-        && let Err(e) = store.flush_embedding_index()
-    {
-        eprintln!("Warning: failed to save embedding sidecar: {e}");
-    }
-
     if rejected_count > 0 {
         eprintln!(
             "Error: {rejected_count} embedding(s) rejected by the embedding guards \
@@ -20905,8 +20899,21 @@ where
     // also sits below the rejection warning so a fully-rejected run cannot
     // write the pair before the warning says the writes failed.
     if let Some(pipeline) = produced_pipeline.as_ref() {
-        if let Err(e) = store.set_embedding_pipeline(pipeline) {
-            eprintln!("Warning: failed to record embedding model metadata: {e}");
+        match store.set_embedding_pipeline(pipeline) {
+            Ok(()) => {
+                if let Err(e) = store.flush_embedding_index() {
+                    eprintln!("Warning: failed to save embedding sidecar: {e}");
+                    error_count += success_count;
+                }
+            }
+            Err(e) => {
+                // Never write vectors under absent or stale pipeline metadata:
+                // open-time trust requires both to describe one exact space.
+                eprintln!(
+                    "Warning: failed to record embedding pipeline; sidecar was not saved: {e}"
+                );
+                error_count += success_count;
+            }
         }
     } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
         && let Ok(Some((recorded, _))) = store.get_embedding_metadata()
@@ -27010,6 +27017,9 @@ mod embed_metadata_truth_tests {
                 store.insert_symbol(&test_symbol(name)).unwrap();
             }
             let producer = metadata.map(|(model, _)| model).unwrap_or("seed-model");
+            if let Some((model, dim)) = metadata {
+                store.set_embedding_metadata(model, dim).unwrap();
+            }
             for name in embedded {
                 assert!(
                     store.add_embedding_with_force(
@@ -27022,9 +27032,6 @@ mod embed_metadata_truth_tests {
                 );
             }
             store.flush_embedding_index().unwrap();
-            if let Some((model, dim)) = metadata {
-                store.set_embedding_metadata(model, dim).unwrap();
-            }
         }
         (dir, db_path)
     }
@@ -27087,14 +27094,13 @@ mod embed_metadata_truth_tests {
     /// guard. The run produced nothing, so the recorded pair must not move —
     /// and the exit path must not claim success.
     ///
-    /// The fixture records dimension 768 against a 3-dimensional index — the
-    /// poisoned state the unconditional stamp used to create — so the
-    /// pre-change stamp, which would have rewritten the pair to
-    /// `(RECORDED_MODEL, 3)` from a pre-existing vector, fails the "untouched"
-    /// assertion instead of coincidentally rewriting the same values.
+    /// Pipeline v2 cannot persist the formerly possible poisoned state where
+    /// metadata dimension disagreed with stored vectors. A valid 3-dimensional
+    /// incumbent and a 4-dimensional producer still exercise the rejection
+    /// and prove the authoritative metadata remains untouched.
     #[test]
     fn fully_rejected_embed_leaves_metadata_untouched_and_reports_failure() {
-        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 768)));
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 3)));
         let loader = StubLoader::new(4); // stub emits the wrong dimension
 
         let code = run_embed(
@@ -27121,7 +27127,7 @@ mod embed_metadata_truth_tests {
         );
         assert_eq!(
             recorded_metadata(&db_path),
-            Some((RECORDED_MODEL.to_string(), 768)),
+            Some((RECORDED_MODEL.to_string(), 3)),
             "a run that produced no accepted vectors must not stamp"
         );
         let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();

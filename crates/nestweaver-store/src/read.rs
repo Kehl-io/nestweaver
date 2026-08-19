@@ -1406,7 +1406,6 @@ impl GraphStore {
             "MATCH (n:Project) RETURN n.uid",
             "MATCH (n:Contract) RETURN n.uid",
             "MATCH (n:UnresolvedWikilink) RETURN n.uid",
-            "MATCH (n:TrigramPosting) RETURN n.uid",
         ] {
             let result = conn.query(query).map_err(|error| {
                 StoreError::Query(format!(

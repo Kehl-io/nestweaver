@@ -342,10 +342,26 @@ impl EmbeddingIndex {
                 return false;
             }
         };
+        if embedding.len() != pipeline.produced_dimension as usize {
+            tracing::warn!(
+                uid,
+                got = embedding.len(),
+                declared = pipeline.produced_dimension,
+                "rejecting embedding whose vector dimension disagrees with its pipeline"
+            );
+            return false;
+        }
         if let Some(recorded) = &self.recorded_pipeline_fingerprint
             && recorded != &incoming
         {
-            if !force {
+            // Metadata on an empty index is only an intended producer, not an
+            // occupied semantic space. The first accepted vector may replace
+            // it without `--force`; no mixed vectors can result.
+            if self.is_empty() {
+                self.recorded_pipeline_fingerprint = Some(incoming.clone());
+                self.recorded_model_id = Some(pipeline.model_id.clone());
+                self.similarity = pipeline.similarity.clone();
+            } else if !force {
                 tracing::warn!(
                     uid,
                     recorded,
@@ -353,8 +369,7 @@ impl EmbeddingIndex {
                     "rejecting embedding pipeline mismatch"
                 );
                 return false;
-            }
-            if !self.force_cleared {
+            } else if !self.force_cleared {
                 self.embeddings.clear();
                 self.base = None;
                 self.deleted_base_uids.clear();
@@ -1257,14 +1272,10 @@ pub const EMBED_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::
 /// Time-based checkpoint for long embed passes.
 ///
 /// An interrupted embed pass used to lose everything: the only flush ran
-/// once at the end. `flush_if_due` flushes at chunk boundaries once
-/// `interval` has elapsed and new embeddings were accepted since the last
-/// flush, so a killed pass keeps all work up to the last checkpoint.
-///
-/// Per-batch flushing is NOT implementable: `EmbeddingIndex::save_binary`
-/// rewrites the entire sidecar file on every call (roughly a quarter of a
-/// gigabyte for a large graph), so the cadence must stay coarse — minutes,
-/// not batches.
+/// once at the end. `flush_if_due` checkpoints the bounded delta journal at
+/// chunk boundaries once `interval` has elapsed and new embeddings were
+/// accepted since the last checkpoint, so a killed pass keeps all work up to
+/// the last durable boundary without rewriting the mmap base each batch.
 ///
 /// Mid-run call sites (CLI and daemon embed loops) should use
 /// [`Self::flush_if_due_with_stamp`] so the model fingerprint travels with
@@ -1315,9 +1326,10 @@ impl EmbeddingFlushCheckpoint {
     ///
     /// The stamp keys off `produced_dim` (the dimension of vectors THIS run
     /// produced): when it is `None` the run produced nothing yet and the
-    /// existing fingerprint is left untouched. A failed stamp after a
-    /// successful flush only warns (matching the warn-only flush style at the
-    /// call sites); the flush itself still counts.
+    /// existing fingerprint is left untouched. Metadata is persisted before
+    /// the vector checkpoint so readers never accept vectors under stale
+    /// producer metadata. Either failure prevents this checkpoint from
+    /// advancing.
     pub fn flush_if_due_with_stamp(
         &mut self,
         store: &GraphStore,
@@ -1804,9 +1816,8 @@ mod tests {
     // An interrupted embed pass used to lose everything: the only flush ran
     // once at the end. The checkpoint flushes at chunk boundaries once the
     // interval elapsed AND new embeddings were accepted since the last
-    // flush. The 300s cadence itself lives in `EMBED_CHECKPOINT_INTERVAL`
-    // (per-batch flushing is not implementable — save_binary rewrites the
-    // whole sidecar), so these tests drive the helper with a zero/long
+    // flush. The 300s cadence itself lives in `EMBED_CHECKPOINT_INTERVAL`;
+    // these tests drive the journal checkpoint helper with a zero/long
     // interval instead.
 
     #[test]
@@ -2204,6 +2215,23 @@ mod tests {
             "a second semantic-space switch in one run must be refused"
         );
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn empty_index_allows_first_vector_to_replace_intended_pipeline() {
+        let intended = test_pipeline("model-a", 768);
+        let produced = test_pipeline("model-a", 3);
+        let mut index = EmbeddingIndex::new();
+        index.set_recorded_model_id(Some(intended.model_id.clone()));
+        index.set_recorded_pipeline_fingerprint(Some(intended.fingerprint().unwrap()));
+
+        assert!(index.add_with_pipeline("first", vec![1.0, 0.0, 0.0], &produced, false));
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.recorded_pipeline_fingerprint,
+            Some(produced.fingerprint().unwrap())
+        );
+        assert!(!index.add_with_pipeline("bad", vec![1.0, 0.0], &produced, false));
     }
 
     #[test]
