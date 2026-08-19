@@ -44,9 +44,13 @@ struct SentenceTransformerModule {
 
 #[derive(Debug, Deserialize)]
 struct SentenceTransformerConfig {
-    max_seq_length: usize,
     #[serde(default)]
     similarity_fn_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransformerConfig {
+    max_seq_length: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,8 +524,10 @@ impl LocalModel {
             serde_json::from_slice(&std::fs::read(&artifacts.modules)?)?;
         let sentence_config: SentenceTransformerConfig =
             serde_json::from_slice(&std::fs::read(&artifacts.sentence_transformer_config)?)?;
+        let transformer_config: TransformerConfig =
+            serde_json::from_slice(&std::fs::read(&artifacts.transformer_config)?)?;
         anyhow::ensure!(
-            sentence_config.max_seq_length > 0,
+            transformer_config.max_seq_length > 0,
             "Sentence Transformers max_seq_length must be non-zero"
         );
         let pooling_config: PoolingConfig =
@@ -669,7 +675,7 @@ impl LocalModel {
             normalize: Some(normalize),
             similarity,
             max_sequence_length: Some(
-                u32::try_from(sentence_config.max_seq_length)
+                u32::try_from(transformer_config.max_seq_length)
                     .context("max sequence length does not fit u32")?,
             ),
             truncation: EmbeddingTruncation::LongestFirst,
@@ -681,7 +687,7 @@ impl LocalModel {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: sentence_config.max_seq_length,
+                max_length: transformer_config.max_seq_length,
                 ..TruncationParams::default()
             }))
             .map_err(|error| anyhow::anyhow!("configure tokenizer truncation: {error}"))?;

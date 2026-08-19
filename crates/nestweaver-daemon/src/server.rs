@@ -7861,7 +7861,7 @@ mod embedding_load_config_tests {
         .expect("write modules fixture");
         std::fs::write(
             &artifacts.sentence_transformer_config,
-            r#"{"max_seq_length":8,"similarity_fn_name":"cosine"}"#,
+            r#"{"similarity_fn_name":"cosine"}"#,
         )
         .expect("write sentence-transformer fixture");
         std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
