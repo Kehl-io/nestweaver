@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 pub use local::{ArtifactMode, MissingModelArtifactError, ModelArtifacts, resolve_model_artifacts};
+use nestweaver_schema::EmbeddingPipelineV2;
 
 /// Requested device-selection policy for the local embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -193,6 +194,41 @@ impl EmbedModel {
         match &self.backend {
             EmbedBackend::Local(model) => Some(model.device_kind()),
             EmbedBackend::External => None,
+        }
+    }
+
+    /// Complete semantic-space contract for vectors produced by this model.
+    /// External providers reveal their dimension only in a response, so the
+    /// caller supplies that observed value without inventing revision or
+    /// preprocessing metadata.
+    pub fn pipeline_for_dimension(&self, dimension: usize) -> Result<EmbeddingPipelineV2> {
+        match &self.backend {
+            EmbedBackend::Local(model) => {
+                anyhow::ensure!(
+                    model.dimension() == dimension,
+                    "local embedding dimension changed from {} to {dimension}",
+                    model.dimension()
+                );
+                Ok(model.pipeline().clone())
+            }
+            EmbedBackend::External => {
+                let dimension = u32::try_from(dimension)
+                    .map_err(|_| anyhow::anyhow!("embedding dimension does not fit u32"))?;
+                anyhow::ensure!(dimension > 0, "external embedding dimension is unknown");
+                let model = self
+                    .config
+                    .external_model
+                    .as_deref()
+                    .unwrap_or("text-embedding-3-small");
+                let provider = self
+                    .config
+                    .external_endpoint
+                    .as_deref()
+                    .and_then(|endpoint| endpoint.split("://").nth(1))
+                    .and_then(|authority| authority.split('/').next())
+                    .unwrap_or("external");
+                Ok(EmbeddingPipelineV2::external(provider, model, dimension))
+            }
         }
     }
 

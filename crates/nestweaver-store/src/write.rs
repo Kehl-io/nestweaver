@@ -7194,30 +7194,38 @@ impl GraphStore {
     /// is keyed by the fixed string `"embedding"` — only one such record
     /// can exist at a time. Calling this again replaces any previous value.
     pub fn set_embedding_metadata(&self, model_id: &str, dimension: u32) -> Result<(), StoreError> {
-        // Lock order is embedding index -> database. Snapshot capture uses the
-        // same order while retaining the index guard through metadata capture
-        // and sidecar staging. Taking the database connection first here would
-        // permit an AB/BA deadlock and a model/vector split-brain snapshot.
+        let pipeline = nestweaver_schema::EmbeddingPipelineV2::external(
+            "legacy-unverified",
+            model_id,
+            dimension,
+        );
+        self.set_embedding_pipeline(&pipeline)
+    }
+
+    /// Persist the complete embedding-pipeline contract as the authoritative
+    /// singleton and synchronize the in-memory write guard to its fingerprint.
+    pub fn set_embedding_pipeline(
+        &self,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<(), StoreError> {
+        pipeline
+            .validate()
+            .map_err(|error| StoreError::Query(format!("invalid embedding pipeline: {error}")))?;
+        let fingerprint = pipeline.fingerprint().map_err(|error| {
+            StoreError::Query(format!("fingerprint embedding pipeline: {error}"))
+        })?;
         let mut embedding_index = self
             .embedding_index
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let conn = self.conn()?;
-
-        // Encode both fields into a single JSON string so we can use the
-        // two-column Meta table without widening it. Serialize via serde so a
-        // model_id containing quotes/backslashes/newlines (e.g. a local model
-        // path) can't produce invalid JSON that fails to parse on read.
-        let value = serde_json::json!({ "model_id": model_id, "dimension": dimension }).to_string();
-
-        // Delete the existing singleton, if any. Best-effort: silently
-        // ignore errors from tables that were never created (old DBs).
+        let value = serde_json::to_string(pipeline)
+            .map_err(|error| StoreError::Query(format!("serialize embedding pipeline: {error}")))?;
         let _ = exec_params(
             &conn,
             "MATCH (m:Meta {key: $k}) DETACH DELETE m",
             vec![("k", lbug::Value::String("embedding".to_string()))],
         );
-
         let result = exec_params(
             &conn,
             "CREATE (:Meta {key: $k, value: $v})",
@@ -7227,10 +7235,8 @@ impl GraphStore {
             ],
         );
         if result.is_ok() {
-            // Keep the in-memory index's recorded model in sync with what was
-            // just persisted, so the recorded-model write guard in this
-            // long-lived store checks against the new fingerprint.
-            embedding_index.set_recorded_model_id(Some(model_id.to_string()));
+            embedding_index.set_recorded_pipeline_fingerprint(Some(fingerprint));
+            embedding_index.set_recorded_model_id(Some(pipeline.model_id.clone()));
         }
         result
     }

@@ -163,8 +163,8 @@ pub fn stage_backup_from_store(
     let staging = tempfile::tempdir()?;
 
     store
-        .flush_embedding_index()
-        .map_err(|e| anyhow::anyhow!("failed to flush embedding index: {e}"))?;
+        .compact_embedding_index()
+        .map_err(|e| anyhow::anyhow!("failed to compact embedding index: {e}"))?;
     store
         .checkpoint()
         .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
@@ -746,6 +746,24 @@ fn backup_artifact_contract_for_payload(
                 fingerprint,
             ));
         }
+        Some(".embeddings.bin") => {
+            let index = nestweaver_store::EmbeddingIndex::load_binary_v2_bytes(payload)
+                .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
+            let envelope = index
+                .artifact_envelope()
+                .ok_or_else(|| anyhow::anyhow!("embedding-v2 envelope is missing"))?;
+            if envelope.brain_uuid != identity.brain_uuid
+                || envelope.publication_uuid != identity.publication_uuid
+                || envelope.source_graph_generation != source_graph_generation
+            {
+                anyhow::bail!("embedding-v2 identity or source generation mismatch");
+            }
+            return Ok((
+                crate::publication::ArtifactKind::Embeddings,
+                envelope.schema_version,
+                envelope.algorithm_fingerprint()?,
+            ));
+        }
         _ => {}
     }
     backup_artifact_contract(path, db_filename)
@@ -808,7 +826,9 @@ fn backup_artifact_contract(
                 1,
                 "nestweaver-graph-generation-v1",
             ),
-            Some(".embeddings.bin") => (ArtifactKind::Embeddings, 1, "legacy-embedding-binary-v1"),
+            Some(".embeddings.bin") => anyhow::bail!(
+                "embedding contract requires payload inspection; use backup_artifact_contract_for_payload"
+            ),
             Some(".embeddings") => (ArtifactKind::Embeddings, 1, "legacy-embedding-json-v1"),
             Some(".pagerank.json") => anyhow::bail!(
                 "PageRank contract requires payload inspection; use backup_artifact_contract_for_payload"

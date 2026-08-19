@@ -1151,7 +1151,7 @@ fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
             },
         ),
     ]);
-    nestweaver_engine::save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+    nestweaver_engine::save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
     drop(store);
 
     nestweaver_cmd()

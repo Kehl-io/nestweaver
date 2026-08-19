@@ -170,12 +170,25 @@ trait CliBatchEmbedder {
     // Only called from the `embed`-gated local branch of `run_embed`.
     #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
+    fn pipeline_for_dimension(
+        &self,
+        model_id: &str,
+        dimension: usize,
+    ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2>;
 }
 
 #[cfg(feature = "embed")]
 impl CliBatchEmbedder for nestweaver_embed::EmbedModel {
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.embed(texts)
+    }
+
+    fn pipeline_for_dimension(
+        &self,
+        _model_id: &str,
+        dimension: usize,
+    ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2> {
+        nestweaver_embed::EmbedModel::pipeline_for_dimension(self, dimension)
     }
 }
 
@@ -20377,6 +20390,7 @@ where
             path.display()
         )
     })?;
+    store.reset_embedding_force_guard();
 
     let do_symbols = scope == "all" || scope == "symbols";
     let do_notes = scope == "all" || scope == "notes";
@@ -20427,6 +20441,7 @@ where
     // overwrite the recorded fingerprint with a fabricated (model, dimension)
     // pair taken from pre-existing vectors.
     let mut produced_dim: Option<usize> = None;
+    let mut produced_pipeline: Option<nestweaver_schema::EmbeddingPipelineV2> = None;
     // Checkpoint the index to the sidecar about every five minutes so an
     // interrupted pass keeps completed work. Per-batch flushing is not
     // implementable: save_binary rewrites the entire sidecar on every call,
@@ -20473,8 +20488,16 @@ where
                         Ok(embeddings) => {
                             for (sym, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&sym.uid, emb, api_model, force) {
+                                let pipeline = nestweaver_schema::EmbeddingPipelineV2::external(
+                                    "openai-compatible",
+                                    api_model,
+                                    u32::try_from(emb_dim)?,
+                                );
+                                if store
+                                    .add_embedding_with_pipeline(&sym.uid, emb, &pipeline, force)
+                                {
                                     success_count += 1;
+                                    produced_pipeline.get_or_insert(pipeline);
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
                                     }
@@ -20488,11 +20511,10 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                         &store,
                         success_count,
-                        api_model,
-                        produced_dim,
+                        produced_pipeline.as_ref(),
                     ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
@@ -20525,9 +20547,16 @@ where
                         Ok(embeddings) => {
                             for (note, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&note.uid, emb, api_model, force)
+                                let pipeline = nestweaver_schema::EmbeddingPipelineV2::external(
+                                    "openai-compatible",
+                                    api_model,
+                                    u32::try_from(emb_dim)?,
+                                );
+                                if store
+                                    .add_embedding_with_pipeline(&note.uid, emb, &pipeline, force)
                                 {
                                     success_count += 1;
+                                    produced_pipeline.get_or_insert(pipeline);
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
                                     }
@@ -20541,11 +20570,10 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                         &store,
                         success_count,
-                        api_model,
-                        produced_dim,
+                        produced_pipeline.as_ref(),
                     ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
@@ -20597,8 +20625,15 @@ where
                         Ok(embeddings) => {
                             for (h, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&h.uid, emb, api_model, force) {
+                                let pipeline = nestweaver_schema::EmbeddingPipelineV2::external(
+                                    "openai-compatible",
+                                    api_model,
+                                    u32::try_from(emb_dim)?,
+                                );
+                                if store.add_embedding_with_pipeline(&h.uid, emb, &pipeline, force)
+                                {
                                     success_count += 1;
+                                    produced_pipeline.get_or_insert(pipeline);
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
                                     }
@@ -20612,11 +20647,10 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                         &store,
                         success_count,
-                        api_model,
-                        produced_dim,
+                        produced_pipeline.as_ref(),
                     ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
@@ -20663,13 +20697,16 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(
+                                    let pipeline = embed_model
+                                        .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if store.add_embedding_with_pipeline(
                                         &sym.uid,
                                         emb.clone(),
-                                        local_model_id,
+                                        &pipeline,
                                         force,
                                     ) {
                                         success_count += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
                                         }
@@ -20683,11 +20720,10 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             success_count,
-                            local_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
@@ -20722,13 +20758,16 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(
+                                    let pipeline = embed_model
+                                        .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if store.add_embedding_with_pipeline(
                                         &note.uid,
                                         emb.clone(),
-                                        local_model_id,
+                                        &pipeline,
                                         force,
                                     ) {
                                         success_count += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
                                         }
@@ -20742,11 +20781,10 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             success_count,
-                            local_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
@@ -20794,13 +20832,16 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(
+                                    let pipeline = embed_model
+                                        .pipeline_for_dimension(local_model_id, emb.len())?;
+                                    if store.add_embedding_with_pipeline(
                                         &h.uid,
                                         emb.clone(),
-                                        local_model_id,
+                                        &pipeline,
                                         force,
                                     ) {
                                         success_count += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
                                         }
@@ -20814,11 +20855,10 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             success_count,
-                            local_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
@@ -20864,15 +20904,8 @@ where
     // already embedded, or every batch rejected — stamps nothing. The stamp
     // also sits below the rejection warning so a fully-rejected run cannot
     // write the pair before the warning says the writes failed.
-    if let Some(dim) = produced_dim {
-        let effective_model = if endpoint.is_some() {
-            external_embedding_model(model)
-        } else {
-            local_model_id
-        };
-        if !effective_model.is_empty()
-            && let Err(e) = store.set_embedding_metadata(effective_model, dim as u32)
-        {
+    if let Some(pipeline) = produced_pipeline.as_ref() {
+        if let Err(e) = store.set_embedding_pipeline(pipeline) {
             eprintln!("Warning: failed to record embedding model metadata: {e}");
         }
     } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
@@ -26880,6 +26913,18 @@ mod embed_metadata_truth_tests {
                 .iter()
                 .map(|_| vec![0.1_f32; self.dimension])
                 .collect())
+        }
+
+        fn pipeline_for_dimension(
+            &self,
+            model_id: &str,
+            dimension: usize,
+        ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2> {
+            Ok(nestweaver_schema::EmbeddingPipelineV2::external(
+                "test-stub",
+                model_id,
+                u32::try_from(dimension)?,
+            ))
         }
     }
 

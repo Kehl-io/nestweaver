@@ -2658,12 +2658,48 @@ impl GraphStore {
             .to_string();
         let dimension = parsed
             .get("dimension")
+            .or_else(|| parsed.get("produced_dimension"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         if model_id.is_empty() || dimension == 0 {
             return Ok(None);
         }
         Ok(Some((model_id, dimension)))
+    }
+
+    /// Read the complete v2 semantic-space contract. Legacy model/dimension
+    /// metadata deliberately returns `None`: it cannot prove tokenizer,
+    /// revision, pooling, or normalization compatibility.
+    pub fn get_embedding_pipeline(
+        &self,
+    ) -> Result<Option<nestweaver_schema::EmbeddingPipelineV2>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = match conn.prepare("MATCH (m:Meta {key: $k}) RETURN m.value") {
+            Ok(statement) => statement,
+            Err(_) => return Ok(None),
+        };
+        let mut rows = match conn.execute(
+            &mut statement,
+            vec![("k", Value::String("embedding".to_string()))],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Ok(None),
+        };
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let encoded = extract_string(&row, 0)?;
+        let value: serde_json::Value = serde_json::from_str(&encoded)
+            .map_err(|error| StoreError::Query(format!("parse embedding metadata: {error}")))?;
+        if value.get("schema_version").is_none() {
+            return Ok(None);
+        }
+        let pipeline: nestweaver_schema::EmbeddingPipelineV2 = serde_json::from_value(value)
+            .map_err(|error| StoreError::Query(format!("parse embedding pipeline v2: {error}")))?;
+        pipeline.validate().map_err(|error| {
+            StoreError::Query(format!("validate embedding pipeline v2: {error}"))
+        })?;
+        Ok(Some(pipeline))
     }
 
     /// Repos whose last contract derivation failed, sorted by UID.

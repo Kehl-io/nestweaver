@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -7,6 +8,59 @@ use serde::{Deserialize, Serialize};
 use crate::db::GraphStore;
 use crate::error::{CancelReason, StoreError};
 use crate::ranking::SeedResolutionConfig;
+
+#[derive(Debug)]
+struct RankedEmbedding {
+    uid: String,
+    score: f64,
+}
+
+impl PartialEq for RankedEmbedding {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.uid == other.uid
+    }
+}
+
+impl Eq for RankedEmbedding {}
+
+impl PartialOrd for RankedEmbedding {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedEmbedding {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.uid.cmp(&self.uid))
+    }
+}
+
+fn retain_top(
+    heap: &mut BinaryHeap<Reverse<RankedEmbedding>>,
+    candidate: RankedEmbedding,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(Reverse(candidate));
+    } else if heap.peek().is_some_and(|worst| candidate > worst.0) {
+        heap.pop();
+        heap.push(Reverse(candidate));
+    }
+}
+
+fn finish_top(heap: BinaryHeap<Reverse<RankedEmbedding>>) -> Vec<(String, f64)> {
+    let mut ranked: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
+    ranked.sort_by(|left, right| right.cmp(left));
+    ranked
+        .into_iter()
+        .map(|item| (item.uid, item.score))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // EmbeddingIndex
@@ -43,6 +97,67 @@ pub struct EmbeddingIndex {
     /// never read per-add. `None` means unknown (never stamped, or unreadable),
     /// and unknown always allows the write: the dimension guard still applies.
     recorded_model_id: Option<String>,
+    recorded_pipeline_fingerprint: Option<String>,
+    artifact_envelope: Option<EmbeddingArtifactEnvelopeV2>,
+    pending_deltas: Vec<EmbeddingDelta>,
+    journal_sequence: u64,
+    journal_valid_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum EmbeddingDelta {
+    Clear,
+    Upsert { uid: String },
+    Delete { uid: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EmbeddingJournalPayload {
+    sequence: u64,
+    brain_uuid: String,
+    publication_uuid: String,
+    pipeline_fingerprint: String,
+    delta: EmbeddingJournalDelta,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum EmbeddingJournalDelta {
+    Clear,
+    Upsert { uid: String, vector: Vec<f32> },
+    Delete { uid: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EmbeddingJournalRecord {
+    payload: EmbeddingJournalPayload,
+    checksum: String,
+}
+
+const EMBEDDING_JOURNAL_MAGIC: &[u8; 8] = b"NWJ2\0\0\0\x02";
+const EMBEDDING_JOURNAL_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
+const EMBEDDING_JOURNAL_COMPACT_RECORDS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingArtifactEnvelopeV2 {
+    pub schema_version: u32,
+    pub brain_uuid: String,
+    pub publication_uuid: String,
+    pub source_graph_generation: u64,
+    pub producer_version: String,
+    pub pipeline: nestweaver_schema::EmbeddingPipelineV2,
+    pub count: u64,
+    pub dimension: u32,
+    pub uid_table_bytes: u64,
+    pub vector_bytes: u64,
+    pub payload_blake3: String,
+}
+
+impl EmbeddingArtifactEnvelopeV2 {
+    pub fn algorithm_fingerprint(&self) -> Result<String, anyhow::Error> {
+        self.pipeline.fingerprint().map_err(anyhow::Error::msg)
+    }
 }
 
 impl Default for EmbeddingIndex {
@@ -57,6 +172,11 @@ impl EmbeddingIndex {
             embeddings: HashMap::new(),
             force_cleared: false,
             recorded_model_id: None,
+            recorded_pipeline_fingerprint: None,
+            artifact_envelope: None,
+            pending_deltas: Vec::new(),
+            journal_sequence: 0,
+            journal_valid_bytes: None,
         }
     }
 
@@ -67,6 +187,63 @@ impl EmbeddingIndex {
     /// dimension only).
     pub fn set_recorded_model_id(&mut self, model_id: Option<String>) {
         self.recorded_model_id = model_id;
+    }
+
+    pub fn set_recorded_pipeline_fingerprint(&mut self, fingerprint: Option<String>) {
+        self.recorded_pipeline_fingerprint = fingerprint;
+    }
+
+    pub fn artifact_envelope(&self) -> Option<&EmbeddingArtifactEnvelopeV2> {
+        self.artifact_envelope.as_ref()
+    }
+
+    #[must_use = "a false return means a pipeline or dimension guard rejected the embedding"]
+    pub fn add_with_pipeline(
+        &mut self,
+        uid: &str,
+        embedding: Vec<f32>,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+        force: bool,
+    ) -> bool {
+        let incoming = match pipeline.fingerprint() {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                tracing::warn!(uid, %error, "rejecting embedding from invalid pipeline");
+                return false;
+            }
+        };
+        if let Some(recorded) = &self.recorded_pipeline_fingerprint
+            && recorded != &incoming
+        {
+            if !force {
+                tracing::warn!(
+                    uid,
+                    recorded,
+                    incoming,
+                    "rejecting embedding pipeline mismatch"
+                );
+                return false;
+            }
+            if !self.force_cleared {
+                self.embeddings.clear();
+                self.pending_deltas.push(EmbeddingDelta::Clear);
+                self.force_cleared = true;
+            } else {
+                tracing::warn!(
+                    uid,
+                    recorded,
+                    incoming,
+                    "rejecting a second pipeline switch in one embedding run"
+                );
+                return false;
+            }
+        }
+        let accepted = self.add_with_model(uid, embedding, Some(&pipeline.model_id), force);
+        if accepted {
+            self.recorded_pipeline_fingerprint = Some(incoming);
+            self.recorded_model_id = Some(pipeline.model_id.clone());
+        }
+        accepted
     }
 
     /// Insert an embedding. Returns `true` if accepted, `false` if rejected
@@ -128,6 +305,7 @@ impl EmbeddingIndex {
                     "dimension change detected with --force; clearing index for model switch"
                 );
                 self.embeddings.clear();
+                self.pending_deltas.push(EmbeddingDelta::Clear);
                 self.force_cleared = true;
             } else if force {
                 tracing::warn!(
@@ -149,6 +327,9 @@ impl EmbeddingIndex {
             }
         }
         self.embeddings.insert(uid.to_string(), embedding);
+        self.pending_deltas.push(EmbeddingDelta::Upsert {
+            uid: uid.to_string(),
+        });
         true
     }
 
@@ -157,6 +338,12 @@ impl EmbeddingIndex {
     /// switch while still refusing mixed dimensions within one run.
     pub fn reset_force_guard(&mut self) {
         self.force_cleared = false;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.embeddings.clear();
+        self.artifact_envelope = None;
+        self.pending_deltas.clear();
     }
 
     pub fn save(&self, path: &Path) -> Result<(), anyhow::Error> {
@@ -172,6 +359,11 @@ impl EmbeddingIndex {
             embeddings,
             force_cleared: false,
             recorded_model_id: None,
+            recorded_pipeline_fingerprint: None,
+            artifact_envelope: None,
+            pending_deltas: Vec::new(),
+            journal_sequence: 0,
+            journal_valid_bytes: None,
         })
     }
 
@@ -269,7 +461,314 @@ impl EmbeddingIndex {
             embeddings,
             force_cleared: false,
             recorded_model_id: None,
+            recorded_pipeline_fingerprint: None,
+            artifact_envelope: None,
+            pending_deltas: Vec::new(),
+            journal_sequence: 0,
+            journal_valid_bytes: None,
         })
+    }
+
+    /// Write the self-describing v2 vector artifact. The payload is
+    /// deterministic and checksummed as one UID-table/vector snapshot.
+    pub fn save_binary_v2(
+        &self,
+        path: &Path,
+        identity: &crate::PublicationIdentity,
+        source_graph_generation: u64,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<EmbeddingArtifactEnvelopeV2, anyhow::Error> {
+        use std::io::Write;
+        pipeline.validate().map_err(anyhow::Error::msg)?;
+        let dimension = self.dimension().unwrap_or(0);
+        anyhow::ensure!(
+            self.is_empty() || dimension == pipeline.produced_dimension as usize,
+            "embedding pipeline dimension {} does not match vector dimension {dimension}",
+            pipeline.produced_dimension
+        );
+        let mut entries: Vec<_> = self.embeddings.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        let mut uid_table = Vec::new();
+        let mut vectors = Vec::with_capacity(entries.len() * dimension * 4);
+        for (uid, vector) in &entries {
+            anyhow::ensure!(uid.len() <= u16::MAX as usize, "embedding UID is too long");
+            anyhow::ensure!(vector.len() == dimension, "embedding dimensions are mixed");
+            uid_table.extend_from_slice(&(uid.len() as u16).to_le_bytes());
+            uid_table.extend_from_slice(uid.as_bytes());
+            for value in vector.iter() {
+                vectors.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut payload = Vec::with_capacity(uid_table.len() + vectors.len());
+        payload.extend_from_slice(&uid_table);
+        payload.extend_from_slice(&vectors);
+        let envelope = EmbeddingArtifactEnvelopeV2 {
+            schema_version: 2,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            source_graph_generation,
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            pipeline: pipeline.clone(),
+            count: entries.len() as u64,
+            dimension: dimension as u32,
+            uid_table_bytes: uid_table.len() as u64,
+            vector_bytes: vectors.len() as u64,
+            payload_blake3: blake3::hash(&payload).to_hex().to_string(),
+        };
+        let encoded = serde_json::to_vec(&envelope)?;
+        atomic_replace_file(path, |raw| {
+            let mut file = std::io::BufWriter::new(raw);
+            file.write_all(b"NWE2")?;
+            file.write_all(&2_u32.to_le_bytes())?;
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+            file.write_all(&payload)?;
+            file.flush()
+        })?;
+        Ok(envelope)
+    }
+
+    pub fn load_binary_v2(path: &Path) -> Result<Self, anyhow::Error> {
+        let data = std::fs::read(path)?;
+        Self::load_binary_v2_bytes(&data)
+    }
+
+    pub fn load_binary_v2_bytes(data: &[u8]) -> Result<Self, anyhow::Error> {
+        anyhow::ensure!(data.len() >= 16, "embedding v2 file too small");
+        anyhow::ensure!(
+            &data[0..4] == b"NWE2",
+            "embedding artifact requires full re-embed into v2"
+        );
+        let version = u32::from_le_bytes(data[4..8].try_into()?);
+        anyhow::ensure!(version == 2, "unsupported embedding file version {version}");
+        let envelope_len = u64::from_le_bytes(data[8..16].try_into()?) as usize;
+        anyhow::ensure!(
+            16 + envelope_len <= data.len(),
+            "truncated embedding v2 envelope"
+        );
+        let envelope: EmbeddingArtifactEnvelopeV2 =
+            serde_json::from_slice(&data[16..16 + envelope_len])?;
+        anyhow::ensure!(envelope.schema_version == 2, "unsupported embedding schema");
+        envelope.pipeline.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            envelope.pipeline.produced_dimension == envelope.dimension,
+            "embedding envelope pipeline dimension mismatch"
+        );
+        let payload = &data[16 + envelope_len..];
+        anyhow::ensure!(
+            payload.len() as u64 == envelope.uid_table_bytes + envelope.vector_bytes,
+            "embedding v2 payload length mismatch"
+        );
+        anyhow::ensure!(
+            blake3::hash(payload).to_hex().as_str() == envelope.payload_blake3,
+            "embedding v2 payload checksum mismatch"
+        );
+        let uid_end = envelope.uid_table_bytes as usize;
+        let mut offset = 0usize;
+        let mut uids = Vec::with_capacity(envelope.count as usize);
+        while offset < uid_end {
+            anyhow::ensure!(offset + 2 <= uid_end, "truncated embedding UID length");
+            let length = u16::from_le_bytes(payload[offset..offset + 2].try_into()?) as usize;
+            offset += 2;
+            anyhow::ensure!(offset + length <= uid_end, "truncated embedding UID");
+            uids.push(std::str::from_utf8(&payload[offset..offset + length])?.to_string());
+            offset += length;
+        }
+        anyhow::ensure!(
+            uids.len() == envelope.count as usize,
+            "embedding UID count mismatch"
+        );
+        let dimension = envelope.dimension as usize;
+        anyhow::ensure!(
+            envelope.vector_bytes as usize == uids.len() * dimension * 4,
+            "embedding vector byte count mismatch"
+        );
+        let vectors = &payload[uid_end..];
+        let mut embeddings = HashMap::with_capacity(uids.len());
+        for (row, uid) in uids.into_iter().enumerate() {
+            let start = row * dimension * 4;
+            let vector = (0..dimension)
+                .map(|column| {
+                    let position = start + column * 4;
+                    f32::from_le_bytes(vectors[position..position + 4].try_into().unwrap())
+                })
+                .collect();
+            anyhow::ensure!(
+                embeddings.insert(uid, vector).is_none(),
+                "duplicate embedding UID"
+            );
+        }
+        let fingerprint = envelope
+            .pipeline
+            .fingerprint()
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            embeddings,
+            force_cleared: false,
+            recorded_model_id: Some(envelope.pipeline.model_id.clone()),
+            recorded_pipeline_fingerprint: Some(fingerprint),
+            artifact_envelope: Some(envelope),
+            pending_deltas: Vec::new(),
+            journal_sequence: 0,
+            journal_valid_bytes: None,
+        })
+    }
+
+    pub fn replay_journal_v2(
+        &mut self,
+        path: &Path,
+        identity: &crate::PublicationIdentity,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<(), anyhow::Error> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            bytes.len() >= EMBEDDING_JOURNAL_MAGIC.len()
+                && &bytes[..EMBEDDING_JOURNAL_MAGIC.len()] == EMBEDDING_JOURNAL_MAGIC,
+            "invalid embedding journal header"
+        );
+        let expected_pipeline = pipeline.fingerprint().map_err(anyhow::Error::msg)?;
+        let mut offset = EMBEDDING_JOURNAL_MAGIC.len();
+        let mut previous_sequence = 0u64;
+        let mut valid_end = offset;
+        while offset < bytes.len() {
+            if offset + 4 > bytes.len() {
+                break;
+            }
+            let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+            offset += 4;
+            if offset + length > bytes.len() {
+                break;
+            }
+            let record: EmbeddingJournalRecord =
+                serde_json::from_slice(&bytes[offset..offset + length])?;
+            offset += length;
+            let canonical = serde_json::to_vec(&record.payload)?;
+            anyhow::ensure!(
+                blake3::hash(&canonical).to_hex().as_str() == record.checksum,
+                "embedding journal record checksum mismatch"
+            );
+            anyhow::ensure!(
+                record.payload.sequence == previous_sequence.saturating_add(1),
+                "embedding journal sequence gap"
+            );
+            anyhow::ensure!(
+                record.payload.brain_uuid == identity.brain_uuid
+                    && record.payload.publication_uuid == identity.publication_uuid
+                    && record.payload.pipeline_fingerprint == expected_pipeline,
+                "embedding journal identity or pipeline mismatch"
+            );
+            match record.payload.delta {
+                EmbeddingJournalDelta::Clear => self.embeddings.clear(),
+                EmbeddingJournalDelta::Upsert { uid, vector } => {
+                    anyhow::ensure!(
+                        vector.len() == pipeline.produced_dimension as usize,
+                        "embedding journal vector dimension mismatch"
+                    );
+                    self.embeddings.insert(uid, vector);
+                }
+                EmbeddingJournalDelta::Delete { uid } => {
+                    self.embeddings.remove(&uid);
+                }
+            }
+            previous_sequence = record.payload.sequence;
+            valid_end = offset;
+        }
+        self.journal_sequence = previous_sequence;
+        self.journal_valid_bytes = Some(valid_end as u64);
+        self.pending_deltas.clear();
+        Ok(())
+    }
+
+    pub fn append_journal_v2(
+        &mut self,
+        path: &Path,
+        identity: &crate::PublicationIdentity,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+    ) -> Result<usize, anyhow::Error> {
+        if self.pending_deltas.is_empty() {
+            return Ok(0);
+        }
+        let fingerprint = pipeline.fingerprint().map_err(anyhow::Error::msg)?;
+        let mut journal = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                EMBEDDING_JOURNAL_MAGIC.to_vec()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            journal.len() >= EMBEDDING_JOURNAL_MAGIC.len()
+                && &journal[..EMBEDDING_JOURNAL_MAGIC.len()] == EMBEDDING_JOURNAL_MAGIC,
+            "invalid embedding journal header"
+        );
+        if let Some(valid_bytes) = self.journal_valid_bytes {
+            journal.truncate(valid_bytes as usize);
+        }
+
+        let count = self.pending_deltas.len();
+        let mut next_sequence = self.journal_sequence;
+        for delta in &self.pending_deltas {
+            next_sequence = next_sequence.saturating_add(1);
+            let delta = match delta {
+                EmbeddingDelta::Clear => EmbeddingJournalDelta::Clear,
+                EmbeddingDelta::Upsert { uid } => {
+                    let vector = self.embeddings.get(uid).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("pending embedding upsert {uid} has no vector")
+                    })?;
+                    EmbeddingJournalDelta::Upsert {
+                        uid: uid.clone(),
+                        vector,
+                    }
+                }
+                EmbeddingDelta::Delete { uid } => {
+                    EmbeddingJournalDelta::Delete { uid: uid.clone() }
+                }
+            };
+            let payload = EmbeddingJournalPayload {
+                sequence: next_sequence,
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                pipeline_fingerprint: fingerprint.clone(),
+                delta,
+            };
+            let checksum = blake3::hash(&serde_json::to_vec(&payload)?)
+                .to_hex()
+                .to_string();
+            let encoded = serde_json::to_vec(&EmbeddingJournalRecord { payload, checksum })?;
+            anyhow::ensure!(
+                encoded.len() <= u32::MAX as usize,
+                "embedding journal record too large"
+            );
+            journal.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            journal.extend_from_slice(&encoded);
+        }
+
+        // Keep the journal bounded and replace it atomically. A failed write
+        // leaves both the prior journal and the in-memory pending delta set
+        // intact, so the next checkpoint can retry without losing or
+        // duplicating updates.
+        atomic_replace_file(path, |file| std::io::Write::write_all(file, &journal))?;
+        self.pending_deltas.clear();
+        self.journal_sequence = next_sequence;
+        self.journal_valid_bytes = None;
+        Ok(count)
+    }
+
+    pub fn should_compact_journal(&self, path: &Path) -> bool {
+        self.journal_sequence as usize >= EMBEDDING_JOURNAL_COMPACT_RECORDS
+            || path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() >= EMBEDDING_JOURNAL_COMPACT_BYTES)
+    }
+
+    pub fn mark_base_persisted(&mut self) {
+        self.pending_deltas.clear();
+        self.journal_sequence = 0;
+        self.journal_valid_bytes = None;
     }
 
     /// Return the top-`limit` (uid, similarity) pairs sorted descending.
@@ -303,7 +802,11 @@ impl EmbeddingIndex {
             return Ok(vec![]);
         }
 
-        let mut scores: Vec<(String, f64)> = self
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let heap = self
             .embeddings
             .par_iter()
             .filter_map(|(uid, emb)| {
@@ -325,9 +828,21 @@ impl EmbeddingIndex {
                     .map(|(a, b)| (*a as f64) * (*b as f64))
                     .sum();
                 let sim = dot / query_norm;
-                Some((uid.clone(), sim))
+                Some(RankedEmbedding {
+                    uid: uid.clone(),
+                    score: sim,
+                })
             })
-            .collect();
+            .fold(BinaryHeap::new, |mut heap, candidate| {
+                retain_top(&mut heap, candidate, limit);
+                heap
+            })
+            .reduce(BinaryHeap::new, |mut left, right| {
+                for Reverse(candidate) in right {
+                    retain_top(&mut left, candidate, limit);
+                }
+                left
+            });
 
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
             // The shared cancel flag is a bare bool and can't carry a reason, so
@@ -337,9 +852,7 @@ impl EmbeddingIndex {
             return Err(StoreError::Cancelled(CancelReason::Timeout));
         }
 
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(limit);
-        Ok(scores)
+        Ok(finish_top(heap))
     }
 
     pub fn len(&self) -> usize {
@@ -373,7 +886,7 @@ impl EmbeddingIndex {
             return vec![];
         }
 
-        let mut scores: Vec<(String, f64)> = self
+        let heap = self
             .embeddings
             .par_iter()
             .filter(|(uid, _)| match uid_prefix {
@@ -392,13 +905,23 @@ impl EmbeddingIndex {
                     .map(|(a, b)| (*a as f64) * (*b as f64))
                     .sum();
                 let sim = dot / query_norm;
-                Some((uid.clone(), sim))
+                Some(RankedEmbedding {
+                    uid: uid.clone(),
+                    score: sim,
+                })
             })
-            .collect();
+            .fold(BinaryHeap::new, |mut heap, candidate| {
+                retain_top(&mut heap, candidate, limit);
+                heap
+            })
+            .reduce(BinaryHeap::new, |mut left, right| {
+                for Reverse(candidate) in right {
+                    retain_top(&mut left, candidate, limit);
+                }
+                left
+            });
 
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(limit);
-        scores
+        finish_top(heap)
     }
 
     /// Look up the embedding for a given UID.
@@ -412,7 +935,16 @@ impl EmbeddingIndex {
     /// reconciliation without exposing the index's internal map.
     pub(crate) fn retain_uids(&mut self, live_uids: &std::collections::HashSet<String>) -> usize {
         let before = self.embeddings.len();
-        self.embeddings.retain(|uid, _| live_uids.contains(uid));
+        let removed: Vec<String> = self
+            .embeddings
+            .keys()
+            .filter(|uid| !live_uids.contains(uid.as_str()))
+            .cloned()
+            .collect();
+        for uid in removed {
+            self.embeddings.remove(&uid);
+            self.pending_deltas.push(EmbeddingDelta::Delete { uid });
+        }
         before - self.embeddings.len()
     }
 }
@@ -502,14 +1034,30 @@ impl EmbeddingFlushCheckpoint {
         if !self.is_due(success_count) {
             return Ok(false);
         }
-        store.flush_embedding_index()?;
-        self.record_flush(success_count);
         if let Some(dim) = produced_dim
             && !model_id.is_empty()
-            && let Err(e) = store.set_embedding_metadata(model_id, dim as u32)
         {
-            tracing::warn!("failed to stamp embedding metadata at checkpoint: {e}");
+            store.set_embedding_metadata(model_id, dim as u32)?;
         }
+        store.flush_embedding_index()?;
+        self.record_flush(success_count);
+        Ok(true)
+    }
+
+    pub fn flush_if_due_with_pipeline(
+        &mut self,
+        store: &GraphStore,
+        success_count: usize,
+        pipeline: Option<&nestweaver_schema::EmbeddingPipelineV2>,
+    ) -> Result<bool, StoreError> {
+        if !self.is_due(success_count) {
+            return Ok(false);
+        }
+        if let Some(pipeline) = pipeline {
+            store.set_embedding_pipeline(pipeline)?;
+        }
+        store.flush_embedding_index()?;
+        self.record_flush(success_count);
         Ok(true)
     }
 
@@ -673,7 +1221,19 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_schema::{EmbeddingPipelineV2, Symbol, SymbolKind, Visibility};
+    use std::io::Write as _;
+
+    fn test_pipeline(model: &str, dimension: u32) -> EmbeddingPipelineV2 {
+        EmbeddingPipelineV2::external("test-provider", model, dimension)
+    }
+
+    fn test_identity() -> crate::PublicationIdentity {
+        crate::PublicationIdentity {
+            brain_uuid: "00000000-0000-4000-8000-000000000001".to_string(),
+            publication_uuid: "00000000-0000-4000-8000-000000000002".to_string(),
+        }
+    }
 
     #[test]
     fn cosine_similarity_identical_vectors() {
@@ -988,6 +1548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
         let sidecar = store.embedding_sidecar_path().unwrap();
+        store.set_embedding_metadata("test-model", 3).unwrap();
         assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
 
         let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
@@ -1286,6 +1847,188 @@ mod tests {
             let rt = loaded.get(uid).unwrap();
             assert_eq!(orig, rt, "round-trip mismatch for {uid}");
         }
+    }
+
+    #[test]
+    fn binary_v2_round_trip_binds_identity_pipeline_and_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings-v2.bin");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 3);
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add_with_pipeline("sym:beta", vec![0.4, 0.5, 0.6], &pipeline, false));
+        assert!(index.add_with_pipeline("sym:alpha", vec![0.1, 0.2, 0.3], &pipeline, false));
+
+        let envelope = index
+            .save_binary_v2(&path, &identity, 42, &pipeline)
+            .unwrap();
+        assert_eq!(envelope.brain_uuid, identity.brain_uuid);
+        assert_eq!(envelope.publication_uuid, identity.publication_uuid);
+        assert_eq!(envelope.source_graph_generation, 42);
+        assert_eq!(envelope.pipeline, pipeline);
+        assert_eq!(envelope.count, 2);
+
+        let loaded = EmbeddingIndex::load_binary_v2(&path).unwrap();
+        assert_eq!(loaded.get("sym:alpha"), Some(&vec![0.1, 0.2, 0.3]));
+        assert_eq!(loaded.get("sym:beta"), Some(&vec![0.4, 0.5, 0.6]));
+
+        let mut corrupt = std::fs::read(&path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let error = match EmbeddingIndex::load_binary_v2_bytes(&corrupt) {
+            Ok(_) => panic!("corrupt embedding payload must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn pipeline_guard_rejects_same_dimension_semantic_mixing() {
+        let first = test_pipeline("model-a", 3);
+        let second = test_pipeline("model-b", 3);
+        let third = test_pipeline("model-c", 3);
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add_with_pipeline("a", vec![1.0, 0.0, 0.0], &first, false));
+        assert!(!index.add_with_pipeline("b", vec![0.0, 1.0, 0.0], &second, false));
+        assert_eq!(index.len(), 1);
+
+        assert!(index.add_with_pipeline("b", vec![0.0, 1.0, 0.0], &second, true));
+        assert_eq!(index.len(), 1, "forced switch must clear the old space");
+        assert!(index.get("a").is_none());
+        assert!(
+            !index.add_with_pipeline("c", vec![0.0, 0.0, 1.0], &third, true),
+            "a second semantic-space switch in one run must be refused"
+        );
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn journal_replays_upserts_deletes_and_ignores_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("embeddings-v2.bin");
+        let journal = dir.path().join("embeddings-v2.journal");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 2);
+
+        let mut original = EmbeddingIndex::new();
+        assert!(original.add_with_pipeline("keep", vec![1.0, 0.0], &pipeline, false));
+        assert!(original.add_with_pipeline("remove", vec![0.0, 1.0], &pipeline, false));
+        original
+            .save_binary_v2(&base, &identity, 1, &pipeline)
+            .unwrap();
+        original.mark_base_persisted();
+        assert!(original.add_with_pipeline("added", vec![0.5, 0.5], &pipeline, false));
+        let live = std::collections::HashSet::from(["keep".to_string(), "added".to_string()]);
+        assert_eq!(original.retain_uids(&live), 1);
+        assert_eq!(
+            original
+                .append_journal_v2(&journal, &identity, &pipeline)
+                .unwrap(),
+            2
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&[99, 0, 0])
+            .unwrap();
+
+        let mut reopened = EmbeddingIndex::load_binary_v2(&base).unwrap();
+        reopened
+            .replay_journal_v2(&journal, &identity, &pipeline)
+            .unwrap();
+        assert_eq!(reopened.get("keep"), Some(&vec![1.0, 0.0]));
+        assert_eq!(reopened.get("added"), Some(&vec![0.5, 0.5]));
+        assert!(reopened.get("remove").is_none());
+
+        assert!(reopened.add_with_pipeline("later", vec![0.25, 0.75], &pipeline, false));
+        reopened
+            .append_journal_v2(&journal, &identity, &pipeline)
+            .unwrap();
+        let mut final_index = EmbeddingIndex::load_binary_v2(&base).unwrap();
+        final_index
+            .replay_journal_v2(&journal, &identity, &pipeline)
+            .unwrap();
+        assert!(final_index.get("later").is_some());
+        assert_eq!(final_index.len(), 3);
+    }
+
+    #[test]
+    fn store_checkpoint_appends_journal_and_reopens_without_rewriting_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("journal-reopen.lbug");
+        let pipeline = test_pipeline("model-a", 2);
+        let base_before = dir.path().join("base-before.bin");
+        let mut journal_name = db_path.as_os_str().to_owned();
+        journal_name.push(".embeddings.journal");
+        let journal_path = std::path::PathBuf::from(journal_name);
+
+        {
+            let store = GraphStore::create(&db_path).unwrap();
+            store.set_embedding_pipeline(&pipeline).unwrap();
+            assert!(store.add_embedding_with_pipeline("first", vec![1.0, 0.0], &pipeline, false));
+            store.flush_embedding_index().unwrap();
+            let base = store.embedding_sidecar_path().unwrap();
+            std::fs::hard_link(&base, &base_before).unwrap();
+
+            assert!(store.add_embedding_with_pipeline("second", vec![0.0, 1.0], &pipeline, false));
+            store.flush_embedding_index().unwrap();
+            assert!(
+                journal_path.exists(),
+                "routine checkpoint must use the journal"
+            );
+            assert_eq!(
+                std::fs::read(&base).unwrap(),
+                std::fs::read(&base_before).unwrap(),
+                "routine checkpoint must not rewrite the corpus-sized base"
+            );
+        }
+
+        let reopened = GraphStore::open(&db_path).unwrap();
+        assert!(reopened.has_embedding("first"));
+        assert!(reopened.has_embedding("second"));
+        reopened.compact_embedding_index().unwrap();
+        assert!(!journal_path.exists());
+        drop(reopened);
+
+        let compacted = GraphStore::open(&db_path).unwrap();
+        assert!(compacted.has_embedding("first"));
+        assert!(compacted.has_embedding("second"));
+    }
+
+    #[test]
+    fn bounded_vector_top_k_matches_full_sort_oracle_with_ties() {
+        let mut index = EmbeddingIndex::new();
+        for (uid, vector) in [
+            ("z", vec![1.0, 0.0]),
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![0.8, 0.2]),
+            ("c", vec![0.5, 0.5]),
+            ("d", vec![0.0, 1.0]),
+        ] {
+            assert!(index.add(uid, vector, false));
+        }
+        let query = [1.0, 0.0];
+        let mut oracle: Vec<_> = index
+            .embeddings
+            .iter()
+            .map(|(uid, vector)| {
+                let score: f64 = vector
+                    .iter()
+                    .zip(query)
+                    .map(|(left, right)| f64::from(*left) * f64::from(right))
+                    .sum();
+                (uid.clone(), score)
+            })
+            .collect();
+        oracle.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        oracle.truncate(3);
+        assert_eq!(index.vector_search(&query, 3), oracle);
+        assert_eq!(index.vector_search(&query, 0), Vec::<(String, f64)>::new());
     }
 
     #[test]

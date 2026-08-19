@@ -1528,12 +1528,17 @@ impl GraphStore {
     fn load_embedding_index(db_path: &Path) -> crate::search::EmbeddingIndex {
         let binary_path = Self::embedding_sidecar_binary_for(db_path);
         if binary_path.exists()
-            && let Ok(idx) = crate::search::EmbeddingIndex::load_binary(&binary_path)
+            && let Ok(idx) = crate::search::EmbeddingIndex::load_binary_v2(&binary_path)
         {
             return idx;
         }
-        let json_path = Self::embedding_sidecar_json_for(db_path);
-        crate::search::EmbeddingIndex::load(&json_path).unwrap_or_default()
+        if binary_path.exists() {
+            tracing::warn!(
+                path = %binary_path.display(),
+                "legacy or invalid embedding artifact is unavailable; run a full re-embed for embedding pipeline v2"
+            );
+        }
+        crate::search::EmbeddingIndex::new()
     }
 
     /// Hand the embedding index the model id recorded in the database's
@@ -1553,10 +1558,46 @@ impl GraphStore {
                 None
             }
         };
-        self.embedding_index
+        let pipeline_fingerprint = self
+            .get_embedding_pipeline()
+            .ok()
+            .flatten()
+            .and_then(|pipeline| pipeline.fingerprint().ok());
+        let mut index = self
+            .embedding_index
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_recorded_model_id(recorded);
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(envelope) = index.artifact_envelope().cloned() {
+            let identity = self.publication_identity().ok().flatten();
+            let compatible = identity.as_ref().is_some_and(|identity| {
+                envelope.brain_uuid == identity.brain_uuid
+                    && envelope.publication_uuid == identity.publication_uuid
+            }) && envelope.producer_version == env!("CARGO_PKG_VERSION")
+                && envelope.source_graph_generation <= self.graph_generation()
+                && pipeline_fingerprint.as_deref()
+                    == envelope.pipeline.fingerprint().ok().as_deref();
+            if !compatible {
+                tracing::warn!(
+                    "embedding-v2 artifact is foreign, stale, or pipeline-incompatible; semantic search is unavailable until a full re-embed"
+                );
+                index.clear();
+            }
+        }
+        if !index.is_empty()
+            && let (Some(db_path), Some(identity), Some(pipeline)) = (
+                self.db_path.as_ref(),
+                self.publication_identity().ok().flatten(),
+                self.get_embedding_pipeline().ok().flatten(),
+            )
+        {
+            let journal = Self::embedding_journal_for(db_path);
+            if let Err(error) = index.replay_journal_v2(&journal, &identity, &pipeline) {
+                tracing::warn!(%error, "embedding journal is invalid; semantic search is unavailable until a full re-embed");
+                index.clear();
+            }
+        }
+        index.set_recorded_model_id(recorded);
+        index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
     }
 
     /// Compute the legacy JSON sidecar path for a given database path.
@@ -1571,6 +1612,12 @@ impl GraphStore {
         let mut s = db_path.as_os_str().to_owned();
         s.push(".embeddings.bin");
         std::path::PathBuf::from(s)
+    }
+
+    fn embedding_journal_for(db_path: &Path) -> std::path::PathBuf {
+        let mut value = db_path.as_os_str().to_owned();
+        value.push(".embeddings.journal");
+        std::path::PathBuf::from(value)
     }
 
     /// Return the path to the embedding sidecar file (binary format),
@@ -1636,6 +1683,21 @@ impl GraphStore {
         idx.add_with_model(uid, embedding, Some(model_id), force)
     }
 
+    #[must_use = "a false return means a pipeline or dimension guard rejected the embedding"]
+    pub fn add_embedding_with_pipeline(
+        &self,
+        uid: &str,
+        embedding: Vec<f32>,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+        force: bool,
+    ) -> bool {
+        let mut index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        index.add_with_pipeline(uid, embedding, pipeline, force)
+    }
+
     /// Re-arm the embedding index's once-per-run force-clear guard. Call at
     /// the start of an embed run — matters for long-lived stores (the daemon)
     /// where the index outlives individual embed runs.
@@ -1659,14 +1721,87 @@ impl GraphStore {
     /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
-        let idx = self
+        let mut idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(path) = self.embedding_sidecar_path() {
-            idx.save_binary(&path)
-                .map_err(|e| StoreError::Query(format!("save binary embedding sidecar: {e}")))?;
+            if idx.is_empty() {
+                return Ok(());
+            }
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query("embedding v2 requires publication identity".to_string())
+            })?;
+            let pipeline = self.get_embedding_pipeline()?.ok_or_else(|| {
+                StoreError::Query(
+                    "embedding vectors have no pipeline-v2 metadata; run a full re-embed"
+                        .to_string(),
+                )
+            })?;
+            let db_path = self
+                .db_path
+                .as_ref()
+                .expect("sidecar path requires database path");
+            let journal = Self::embedding_journal_for(db_path);
+            if !path.exists() {
+                idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+                    .map_err(|e| StoreError::Query(format!("save embedding-v2 sidecar: {e}")))?;
+                idx.mark_base_persisted();
+                crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
+                    |error| StoreError::Query(format!("retire embedding journal: {error}")),
+                )?;
+            } else {
+                idx.append_journal_v2(&journal, &identity, &pipeline)
+                    .map_err(|e| StoreError::Query(format!("append embedding journal: {e}")))?;
+                if idx.should_compact_journal(&journal) {
+                    idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+                        .map_err(|e| {
+                            StoreError::Query(format!("compact embedding-v2 sidecar: {e}"))
+                        })?;
+                    idx.mark_base_persisted();
+                    crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
+                        |error| {
+                            StoreError::Query(format!(
+                                "retire compacted embedding journal: {error}"
+                            ))
+                        },
+                    )?;
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Fold the append journal into a complete sibling-safe base snapshot.
+    /// Backup/cutover paths use this to package one self-contained artifact.
+    pub fn compact_embedding_index(&self) -> Result<(), StoreError> {
+        let mut index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if index.is_empty() {
+            return Ok(());
+        }
+        let Some(path) = self.embedding_sidecar_path() else {
+            return Ok(());
+        };
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("embedding compaction requires publication identity".to_string())
+        })?;
+        let pipeline = self.get_embedding_pipeline()?.ok_or_else(|| {
+            StoreError::Query("embedding compaction requires pipeline-v2 metadata".to_string())
+        })?;
+        index
+            .save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+            .map_err(|error| StoreError::Query(format!("compact embedding-v2 sidecar: {error}")))?;
+        index.mark_base_persisted();
+        let journal = Self::embedding_journal_for(
+            self.db_path
+                .as_ref()
+                .expect("embedding sidecar requires database path"),
+        );
+        crate::durable_sidecar::remove_file_durable_if_exists(&journal)
+            .map_err(|error| StoreError::Query(format!("retire embedding journal: {error}")))?;
         Ok(())
     }
 
@@ -1685,16 +1820,20 @@ impl GraphStore {
             .map_err(|_| StoreError::Query("embedding count does not fit u64".to_string()))?;
         let index_dimension = u32::try_from(idx.dimension().unwrap_or(0))
             .map_err(|_| StoreError::Query("embedding dimension does not fit u32".to_string()))?;
-        let metadata = self.get_embedding_metadata()?;
+        let pipeline = self.get_embedding_pipeline()?;
 
-        let (model_id, dimension) = match metadata {
-            Some((model_id, dimension)) => {
+        let (model_id, dimension) = match pipeline.as_ref() {
+            Some(pipeline) => {
+                let dimension = pipeline.produced_dimension;
                 if count > 0 && dimension != index_dimension {
                     return Err(StoreError::Query(format!(
                         "embedding metadata dimension {dimension} does not match sidecar dimension {index_dimension}"
                     )));
                 }
-                (model_id, if count > 0 { dimension } else { 0 })
+                (
+                    pipeline.model_id.clone(),
+                    if count > 0 { dimension } else { 0 },
+                )
             }
             None if count > 0 => {
                 return Err(StoreError::Query(
@@ -1705,17 +1844,43 @@ impl GraphStore {
             None => (String::new(), 0),
         };
 
+        // An empty semantic index has no artifact. Requiring or inventing a
+        // pipeline for zero vectors would falsely claim a semantic space and
+        // make graph-only snapshots impossible.
+        if count == 0 {
+            return Ok(EmbeddingSnapshotLease {
+                state: EmbeddingSnapshotState {
+                    model_id,
+                    dimension,
+                    count,
+                },
+                _guard: idx,
+            });
+        }
+
         // Flush the canonical sidecar first, then serialize the exact same
         // mutex-protected index into the snapshot staging directory. Both
         // writes use atomic_replace_file (file fsync + rename + parent fsync).
         if let Some(path) = self.embedding_sidecar_path() {
-            idx.save_binary(&path).map_err(|error| {
-                StoreError::Query(format!("flush binary embedding sidecar: {error}"))
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query("embedding snapshot requires publication identity".to_string())
             })?;
+            let pipeline = pipeline.as_ref().ok_or_else(|| {
+                StoreError::Query("embedding snapshot requires pipeline-v2 metadata".to_string())
+            })?;
+            idx.save_binary_v2(&path, &identity, self.graph_generation(), pipeline)
+                .map_err(|error| {
+                    StoreError::Query(format!("flush embedding-v2 sidecar: {error}"))
+                })?;
         }
-        idx.save_binary(destination).map_err(|error| {
-            StoreError::Query(format!("stage binary embedding sidecar: {error}"))
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("embedding snapshot requires publication identity".to_string())
         })?;
+        let pipeline = pipeline.as_ref().ok_or_else(|| {
+            StoreError::Query("embedding snapshot requires pipeline-v2 metadata".to_string())
+        })?;
+        idx.save_binary_v2(destination, &identity, self.graph_generation(), pipeline)
+            .map_err(|error| StoreError::Query(format!("stage embedding-v2 sidecar: {error}")))?;
 
         Ok(EmbeddingSnapshotLease {
             state: EmbeddingSnapshotState {

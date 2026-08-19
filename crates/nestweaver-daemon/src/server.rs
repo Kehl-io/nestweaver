@@ -1783,6 +1783,7 @@ impl DaemonService {
 
             let mut attempted = 0u32;
             let mut embedded = 0u32;
+            let mut produced_pipeline: Option<nestweaver_schema::EmbeddingPipelineV2> = None;
             let limit: usize = 64; // Max nodes per watcher cycle
 
             // Symbols
@@ -1802,8 +1803,13 @@ impl DaemonService {
                         Ok(emb) => {
                             // Dimension-guard rejections must not count as
                             // embedded (add_embedding logs them).
-                            if store.add_embedding(&sym.uid, emb) {
+                            let pipeline = model.pipeline_for_dimension(emb.len());
+                            if let Ok(pipeline) = pipeline
+                                && store
+                                    .add_embedding_with_pipeline(&sym.uid, emb, &pipeline, false)
+                            {
                                 embedded += 1;
+                                produced_pipeline.get_or_insert(pipeline);
                             }
                         }
                         Err(e) => {
@@ -1832,8 +1838,13 @@ impl DaemonService {
                     attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
-                            if store.add_embedding(&note.uid, emb) {
+                            let pipeline = model.pipeline_for_dimension(emb.len());
+                            if let Ok(pipeline) = pipeline
+                                && store
+                                    .add_embedding_with_pipeline(&note.uid, emb, &pipeline, false)
+                            {
                                 embedded += 1;
+                                produced_pipeline.get_or_insert(pipeline);
                             }
                         }
                         Err(e) => {
@@ -1858,8 +1869,17 @@ impl DaemonService {
                     attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
-                            if store.add_embedding(&heading.uid, emb) {
+                            let pipeline = model.pipeline_for_dimension(emb.len());
+                            if let Ok(pipeline) = pipeline
+                                && store.add_embedding_with_pipeline(
+                                    &heading.uid,
+                                    emb,
+                                    &pipeline,
+                                    false,
+                                )
+                            {
                                 embedded += 1;
+                                produced_pipeline.get_or_insert(pipeline);
                             }
                         }
                         Err(e) => {
@@ -1870,6 +1890,12 @@ impl DaemonService {
             }
 
             if embedded > 0 {
+                if let Some(pipeline) = produced_pipeline.as_ref()
+                    && let Err(e) = store.set_embedding_pipeline(pipeline)
+                {
+                    tracing::warn!("failed to stamp watcher embedding pipeline: {e}");
+                    return;
+                }
                 if let Err(e) = store.flush_embedding_index() {
                     tracing::warn!("failed to flush embedding index: {e}");
                 }
@@ -6627,7 +6653,6 @@ impl NestWeaverDaemon for DaemonService {
             // The model the daemon actually loaded (startup preference: the
             // DB-recorded id wins, else the configured external/local model).
             // Used to stamp embedding metadata after a productive run.
-            let embed_model_id = status.model_id.clone();
 
             let store = self.state.store.clone();
             let progress = Arc::clone(&self.state.embed_progress);
@@ -6652,6 +6677,7 @@ impl NestWeaverDaemon for DaemonService {
                 // accepted write; gates the metadata stamp below (mirrors the
                 // CLI's `run_embed` tail).
                 let mut produced_dim: Option<usize> = None;
+                let mut produced_pipeline: Option<nestweaver_schema::EmbeddingPipelineV2> = None;
                 // Checkpoint the index to the sidecar about every five minutes
                 // so an interrupted pass keeps completed work. Per-batch
                 // flushing is not implementable: save_binary rewrites the
@@ -6725,13 +6751,14 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(
-                                        &sym.uid,
-                                        emb,
-                                        &embed_model_id,
-                                        force,
+                                    let pipeline = model
+                                        .pipeline_for_dimension(emb_dim)
+                                        .map_err(|error| Status::internal(error.to_string()))?;
+                                    if store.add_embedding_with_pipeline(
+                                        &sym.uid, emb, &pipeline, force,
                                     ) {
                                         succeeded += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);
                                         }
@@ -6746,11 +6773,10 @@ impl NestWeaverDaemon for DaemonService {
                             }
                             progress.advance(1);
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             succeeded as usize,
-                            &embed_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
@@ -6775,13 +6801,14 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(
-                                        &note.uid,
-                                        emb,
-                                        &embed_model_id,
-                                        force,
+                                    let pipeline = model
+                                        .pipeline_for_dimension(emb_dim)
+                                        .map_err(|error| Status::internal(error.to_string()))?;
+                                    if store.add_embedding_with_pipeline(
+                                        &note.uid, emb, &pipeline, force,
                                     ) {
                                         succeeded += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);
                                         }
@@ -6796,11 +6823,10 @@ impl NestWeaverDaemon for DaemonService {
                             }
                             progress.advance(1);
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             succeeded as usize,
-                            &embed_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
@@ -6825,13 +6851,17 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(
+                                    let pipeline = model
+                                        .pipeline_for_dimension(emb_dim)
+                                        .map_err(|error| Status::internal(error.to_string()))?;
+                                    if store.add_embedding_with_pipeline(
                                         &heading.uid,
                                         emb,
-                                        &embed_model_id,
+                                        &pipeline,
                                         force,
                                     ) {
                                         succeeded += 1;
+                                        produced_pipeline.get_or_insert(pipeline);
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);
                                         }
@@ -6846,11 +6876,10 @@ impl NestWeaverDaemon for DaemonService {
                             }
                             progress.advance(1);
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_pipeline(
                             &store,
                             succeeded as usize,
-                            &embed_model_id,
-                            produced_dim,
+                            produced_pipeline.as_ref(),
                         ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
@@ -6869,8 +6898,8 @@ impl NestWeaverDaemon for DaemonService {
                 // overwrite) metadata. The daemon route previously never
                 // stamped at all, leaving daemon-populated databases without a
                 // fingerprint for the startup and CLI guards to check.
-                if let Some(dim) = produced_dim
-                    && let Err(e) = store.set_embedding_metadata(&embed_model_id, dim as u32)
+                if let Some(pipeline) = produced_pipeline.as_ref()
+                    && let Err(e) = store.set_embedding_pipeline(pipeline)
                 {
                     tracing::warn!("failed to record embedding model metadata: {e}");
                 }
@@ -7813,7 +7842,34 @@ mod embedding_load_config_tests {
             config: snapshot_dir.join("config.json"),
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
+            modules: snapshot_dir.join("modules.json"),
+            sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
+            transformer_config: snapshot_dir.join("sentence_bert_config.json"),
+            pooling_config: snapshot_dir.join("1_Pooling/config.json"),
         };
+
+        std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling fixture");
+        std::fs::write(
+            &artifacts.modules,
+            r#"[
+                {"idx":0,"name":"0","path":"","type":"sentence_transformers.models.Transformer"},
+                {"idx":1,"name":"1","path":"1_Pooling","type":"sentence_transformers.models.Pooling"},
+                {"idx":2,"name":"2","path":"2_Normalize","type":"sentence_transformers.models.Normalize"}
+            ]"#,
+        )
+        .expect("write modules fixture");
+        std::fs::write(
+            &artifacts.sentence_transformer_config,
+            r#"{"max_seq_length":8,"similarity_fn_name":"cosine"}"#,
+        )
+        .expect("write sentence-transformer fixture");
+        std::fs::write(&artifacts.transformer_config, r#"{"max_seq_length":8}"#)
+            .expect("write transformer fixture");
+        std::fs::write(
+            &artifacts.pooling_config,
+            r#"{"pooling_mode_mean_tokens":true,"include_prompt":true}"#,
+        )
+        .expect("write pooling fixture");
 
         std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
         let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");

@@ -518,13 +518,8 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
         SIDECAR_MANIFESTS => anyhow::bail!(
             "repository manifest contract requires payload inspection; use artifact_contract_for_payload"
         ),
-        SIDECAR_EMBEDDINGS => (
-            ArtifactKind::Embeddings,
-            1,
-            format!(
-                "legacy-embedding-binary-v1:model={}:dimension={}",
-                stamp.embedding_model_id, stamp.embedding_dimension
-            ),
+        SIDECAR_EMBEDDINGS => anyhow::bail!(
+            "embedding contract requires payload inspection; use artifact_contract_for_payload"
         ),
         path if path.starts_with(&format!("{SIDECAR_TANTIVY_DIR}/")) => (
             ArtifactKind::Bm25,
@@ -551,7 +546,7 @@ fn artifact_contract_for_payload(
     source_graph_generation: u64,
     payload: Option<&[u8]>,
 ) -> anyhow::Result<(ArtifactKind, u32, String)> {
-    if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS {
+    if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS || path == SIDECAR_EMBEDDINGS {
         let payload =
             payload.ok_or_else(|| anyhow::anyhow!("artifact contract requires its payload"))?;
         let identity = nestweaver_store::PublicationIdentity {
@@ -566,7 +561,7 @@ fn artifact_contract_for_payload(
                 source_graph_generation,
             )?;
             Ok((ArtifactKind::Ranking, schema, fingerprint))
-        } else {
+        } else if path == SIDECAR_MANIFESTS {
             let (schema, fingerprint) = crate::publication::repo_manifest_artifact_contract(
                 payload,
                 &identity,
@@ -574,6 +569,23 @@ fn artifact_contract_for_payload(
                 source_graph_generation,
             )?;
             Ok((ArtifactKind::RepoManifest, schema, fingerprint))
+        } else {
+            let index = nestweaver_store::EmbeddingIndex::load_binary_v2_bytes(payload)
+                .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
+            let envelope = index
+                .artifact_envelope()
+                .ok_or_else(|| anyhow::anyhow!("embedding-v2 envelope is missing"))?;
+            if envelope.brain_uuid != identity.brain_uuid
+                || envelope.publication_uuid != identity.publication_uuid
+                || envelope.source_graph_generation != source_graph_generation
+            {
+                anyhow::bail!("embedding-v2 identity or source generation mismatch");
+            }
+            Ok((
+                ArtifactKind::Embeddings,
+                envelope.schema_version,
+                envelope.algorithm_fingerprint()?,
+            ))
         };
     }
     artifact_contract(path, stamp)
@@ -711,19 +723,21 @@ fn verify_publication_bundle(
                 bundle.source_graph_generation
             );
         }
-        let contract_payload =
-            if descriptor.path == SIDECAR_PAGERANK || descriptor.path == SIDECAR_MANIFESTS {
-                Some(
-                    std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to read publication artifact {}: {error}",
-                            descriptor.path
-                        )
-                    })?,
-                )
-            } else {
-                None
-            };
+        let contract_payload = if descriptor.path == SIDECAR_PAGERANK
+            || descriptor.path == SIDECAR_MANIFESTS
+            || descriptor.path == SIDECAR_EMBEDDINGS
+        {
+            Some(
+                std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to read publication artifact {}: {error}",
+                        descriptor.path
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         let (kind, schema_version, fingerprint) = artifact_contract_for_payload(
             &descriptor.path,
             stamp,
@@ -915,7 +929,7 @@ fn verify_snapshot_artifacts(snapshot_dir: &Path, stamp: &Stamp) -> Result<(), a
 
     let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if embedding_path.exists() {
-        let embeddings = nestweaver_store::EmbeddingIndex::load_binary(&embedding_path)
+        let embeddings = nestweaver_store::EmbeddingIndex::load_binary_v2(&embedding_path)
             .map_err(|error| anyhow::anyhow!("invalid snapshot embedding artifact: {error}"))?;
         let count = u64::try_from(embeddings.len())?;
         let dimension = u32::try_from(embeddings.dimension().unwrap_or(0))?;
