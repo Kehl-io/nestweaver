@@ -1123,6 +1123,10 @@ impl EmbeddingIndex {
         self.len() == 0
     }
 
+    pub(crate) fn has_pending_deltas(&self) -> bool {
+        !self.pending_deltas.is_empty()
+    }
+
     /// Return the dimensionality of the stored embeddings (length of the first
     /// vector found), or `None` if the index is empty.
     pub fn dimension(&self) -> Option<usize> {

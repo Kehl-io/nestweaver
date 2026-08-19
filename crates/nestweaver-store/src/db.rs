@@ -1728,7 +1728,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(path) = self.embedding_sidecar_path() {
-            if idx.is_empty() {
+            if idx.is_empty() && !idx.has_pending_deltas() {
                 return Ok(());
             }
             let identity = self.publication_identity()?.ok_or_else(|| {
@@ -3440,6 +3440,23 @@ mod tests {
             legacy_path.exists(),
             "failed retirement must preserve fallback"
         );
+    }
+
+    #[test]
+    fn embedding_reconciliation_persists_deletion_of_the_last_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:stale", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+
+        assert_eq!(store.reconcile_embedding_index().unwrap(), 1);
+        assert!(!store.has_embedding("symbol:stale"));
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.has_embedding("symbol:stale"));
     }
 
     #[test]

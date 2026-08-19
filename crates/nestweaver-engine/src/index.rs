@@ -457,9 +457,10 @@ fn reconcile_deleted_graph_state_with_io(
         let before = manifests.len();
         manifests.retain(|uid, _| live_repo_uids.contains(uid));
         let removed = before - manifests.len();
-        if removed > 0 {
-            crate::manifest::save_manifest_cache_for_db(&manifests, store, db_path)?;
-        }
+        // The envelope is graph-generation-bound. Even when every Repo row
+        // survives a partial child deletion, republish the unchanged payload
+        // at the new generation or the next reader must reject it as stale.
+        crate::manifest::save_manifest_cache_for_db(&manifests, store, db_path)?;
         Ok(removed)
     })()
     .map_err(|error| format!("manifest reconciliation failed: {error:#}"));
