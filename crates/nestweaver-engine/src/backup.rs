@@ -326,6 +326,24 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
     })
 }
 
+/// Return whether an archive member is a regular payload file.
+///
+/// NestWeaver emits only directories and regular files. Links and special
+/// entries are neither part of the canonical publication inventory nor safe
+/// to materialize during restore.
+fn backup_archive_member_is_payload(
+    path: &str,
+    entry_type: tar::EntryType,
+) -> anyhow::Result<bool> {
+    if entry_type.is_dir() {
+        return Ok(false);
+    }
+    if entry_type.is_file() {
+        return Ok(true);
+    }
+    anyhow::bail!("unsupported backup archive member type for {path}: {entry_type:?}")
+}
+
 /// Read the manifest from an existing `.nwsnap.zst` archive without full extraction.
 ///
 /// Verifies that file sizes in the archive match the manifest checksums entries
@@ -346,6 +364,15 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
         let path = entry.path()?.to_string_lossy().to_string();
         let normalized = path.strip_prefix("./").unwrap_or(&path).to_string();
 
+        // Tar directory members are not required to end in `/`. Classifying
+        // them from the rendered path therefore turns every nested sidecar
+        // directory into an apparent, unmanifested payload. Trust the header
+        // type instead, and fail closed on links/devices that NestWeaver never
+        // emits and must not materialize during restore.
+        if !backup_archive_member_is_payload(&normalized, entry.header().entry_type())? {
+            continue;
+        }
+
         if normalized == "manifest.json" {
             let m: BackupManifest = serde_json::from_reader(&mut entry)?;
             manifest = Some(m);
@@ -358,7 +385,7 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
             archive_checksums.insert(normalized.clone(), sha256);
             archive_blake3.insert(normalized, blake3);
             publication = Some(serde_json::from_slice(&bytes)?);
-        } else if !normalized.is_empty() && !normalized.ends_with('/') {
+        } else if !normalized.is_empty() {
             // Track file sizes for verification.
             let size = entry.header().size()?;
             archive_file_sizes.insert(normalized.clone(), size);
@@ -493,7 +520,15 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let file = std::fs::File::open(&config.snapshot_path)?;
     let decoder = nestweaver_store::zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(temp_dir.path())?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().to_string();
+        let normalized = path.strip_prefix("./").unwrap_or(&path).to_string();
+        let _ = backup_archive_member_is_payload(&normalized, entry.header().entry_type())?;
+        if !entry.unpack_in(temp_dir.path())? {
+            anyhow::bail!("unsafe backup archive member path: {normalized}");
+        }
+    }
 
     let manifest_path = temp_dir.path().join("manifest.json");
     let manifest_str = std::fs::read_to_string(&manifest_path)
@@ -1355,6 +1390,60 @@ mod tests {
                 .checksums
                 .contains_key(crate::publication::PUBLICATION_MANIFEST_FILE)
         );
+    }
+
+    #[test]
+    fn backup_inspect_ignores_nested_directory_members_in_exact_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        drop(store);
+
+        // Regex v3 is the first routinely nested backup sidecar. `tar` writes
+        // these directory members without a required trailing slash, which
+        // must not make inspect count them as publication payloads.
+        let shard_file = crate::sidecar_path(&db_path, ".regex-v3")
+            .join("scopes/scope-a/generations/generation-a/meta.json");
+        std::fs::create_dir_all(shard_file.parent().unwrap()).unwrap();
+        std::fs::write(&shard_file, b"{}\n").unwrap();
+
+        let output = dir.path().join("nested.nwsnap.zst");
+        let config = BackupConfig {
+            db_path,
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "nested".to_string(),
+            workspace_path: None,
+        };
+
+        backup_save(&config).unwrap();
+        let manifest = backup_inspect(&output).unwrap();
+        assert_eq!(manifest.instance_id, "nested");
+        assert!(
+            manifest.checksums.contains_key(
+                "test.lbug.regex-v3/scopes/scope-a/generations/generation-a/meta.json"
+            )
+        );
+    }
+
+    #[test]
+    fn backup_archive_member_contract_rejects_links_and_special_entries() {
+        assert!(!backup_archive_member_is_payload("nested", tar::EntryType::Directory).unwrap());
+        assert!(backup_archive_member_is_payload("payload", tar::EntryType::Regular).unwrap());
+        for entry_type in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Fifo,
+        ] {
+            let error = backup_archive_member_is_payload("unsafe", entry_type).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported backup archive member type")
+            );
+        }
     }
 
     #[test]
