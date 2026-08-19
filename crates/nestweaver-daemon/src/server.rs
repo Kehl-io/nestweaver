@@ -15102,6 +15102,30 @@ mod startup_helper_tests {
         }
     }
 
+    #[cfg(feature = "embed")]
+    struct PipelineCountingEmbed {
+        inner: CountingEmbed,
+        model_id: &'static str,
+    }
+
+    #[cfg(feature = "embed")]
+    impl nestweaver_engine::EmbedQueryFn for PipelineCountingEmbed {
+        fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.inner.embed_query(text)
+        }
+
+        fn pipeline_for_dimension(
+            &self,
+            dimension: usize,
+        ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2> {
+            Ok(nestweaver_schema::EmbeddingPipelineV2::external(
+                "daemon-test",
+                self.model_id,
+                u32::try_from(dimension)?,
+            ))
+        }
+    }
+
     /// Insert one un-embedded symbol so the embed callback has work to do.
     #[cfg(feature = "embed")]
     fn insert_unembedded_symbol(store: &GraphStore, uid: &str) {
@@ -16314,9 +16338,12 @@ external_model = "unavailable-test-model"
     async fn embed_handler_stamps_the_loaded_models_fingerprint_after_a_productive_run() {
         let state = test_state_with_writer();
         insert_unembedded_symbol(&state.store, "sym-stamp");
-        let model = Arc::new(CountingEmbed {
-            calls: Arc::new(AtomicU32::new(0)),
-            vector: vec![0.1, 0.2, 0.3],
+        let model = Arc::new(PipelineCountingEmbed {
+            inner: CountingEmbed {
+                calls: Arc::new(AtomicU32::new(0)),
+                vector: vec![0.1, 0.2, 0.3],
+            },
+            model_id: "daemon-loaded-model",
         }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
         let mut ready = state.embedding_runtime.status();
         ready.state = "ready".to_string();
