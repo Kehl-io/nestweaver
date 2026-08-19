@@ -2702,6 +2702,11 @@ enum Commands {
         #[command(subcommand)]
         command: SnapshotCommands,
     },
+    /// Inspect and control durable publication rebuild operations
+    Publication {
+        #[command(subcommand)]
+        command: PublicationCommands,
+    },
     /// Backup and restore the NestWeaver database
     Backup {
         #[command(subcommand)]
@@ -4592,6 +4597,41 @@ enum SnapshotCommands {
         backend: Option<String>,
         #[arg(long, help = "Storage backend path")]
         backend_path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PublicationCommands {
+    /// Show one operation or list every active operation journal
+    Status {
+        #[arg(long, help = "Operation UUID; omit to list all operations")]
+        operation: Option<String>,
+        #[arg(long, help = "Publication root; defaults from --db")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Database path used to derive the publication root")]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output JSON")]
+        json: bool,
+    },
+    /// Request cooperative cancellation at an exact observed revision
+    Cancel {
+        operation: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, help = "Publication root; defaults from --db")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Database path used to derive the publication root")]
+        db: Option<PathBuf>,
+    },
+    /// Permanently discard failed/cancelled unselected staging
+    Discard {
+        operation: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, help = "Publication root; defaults from --db")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Database path used to derive the publication root")]
+        db: Option<PathBuf>,
     },
 }
 
@@ -9157,7 +9197,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(Some(&db_path))?;
             let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(&db_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
             if json {
@@ -10058,6 +10098,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
+        Commands::Publication { command } => run_publication(command).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Config { command } => run_config(command),
@@ -10238,7 +10279,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Load manifest sidecar for manifest-driven entry points.
             let db_path = db.clone().unwrap_or_else(default_db_path);
             let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(&db_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
 
             let result = nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests)?;
 
@@ -22238,6 +22279,108 @@ fn format_bytes(bytes: u64) -> String {
 // `snapshot build` never routes through a daemon: it guards for a quiesced DB
 // and reads the store directly (autospawning a RW daemon would trip that
 // guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
+fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
+    fn root(root: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+        if root.is_some() && db.is_some() {
+            anyhow::bail!("pass either --root or --db, not both");
+        }
+        match root {
+            Some(root) => Ok(root),
+            None => Ok(nestweaver_engine::publication::default_publication_root(
+                &resolve_db_with_config(db, None)?,
+            )),
+        }
+    }
+
+    match command {
+        PublicationCommands::Status {
+            operation,
+            root: explicit_root,
+            db,
+            json,
+        } => {
+            let root = root(explicit_root, db)?;
+            if let Some(operation) = operation {
+                let state =
+                    nestweaver_engine::publication_operation::load_operation(&root, &operation)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&state)?);
+                } else {
+                    println!("Operation: {}", state.plan.operation_uuid);
+                    println!("Phase: {:?}", state.phase);
+                    println!("Revision: {}", state.revision);
+                    println!("Target publication: {}", state.plan.target_publication_uuid);
+                    println!("Cancel requested: {}", state.cancel_requested);
+                    if let Some(progress) = state.progress {
+                        println!(
+                            "Progress: {}/{} — {}",
+                            progress.completed,
+                            progress
+                                .total
+                                .map(|total| total.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            progress.message
+                        );
+                    }
+                    if let Some(failure) = state.failure {
+                        println!(
+                            "Failure: {} (retryable={}): {}",
+                            failure.code, failure.retryable, failure.message
+                        );
+                    }
+                }
+            } else {
+                let states = nestweaver_engine::publication_operation::list_operations(&root)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&states)?);
+                } else if states.is_empty() {
+                    println!("No publication operations in {}", root.display());
+                } else {
+                    for state in states {
+                        println!(
+                            "{}  {:?}  revision={}  target={}",
+                            state.plan.operation_uuid,
+                            state.phase,
+                            state.revision,
+                            state.plan.target_publication_uuid
+                        );
+                    }
+                }
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        PublicationCommands::Cancel {
+            operation,
+            revision,
+            root: explicit_root,
+            db,
+        } => {
+            let root = root(explicit_root, db)?;
+            let state = nestweaver_engine::publication_operation::request_cancel(
+                &root, &operation, revision,
+            )?;
+            println!(
+                "Cancellation requested for {} at revision {}",
+                operation, state.revision
+            );
+            Ok(EXIT_SUCCESS)
+        }
+        PublicationCommands::Discard {
+            operation,
+            revision,
+            root: explicit_root,
+            db,
+        } => {
+            let root = root(explicit_root, db)?;
+            nestweaver_engine::publication_operation::discard_operation(
+                &root, &operation, revision,
+            )?;
+            println!("Discarded publication operation {operation}");
+            Ok(EXIT_SUCCESS)
+        }
+    }
+}
+
 fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         SnapshotCommands::Build {
