@@ -1,0 +1,1005 @@
+//! Durable, optimistic-CAS state for cancellable publication rebuilds.
+//!
+//! The operation journal lives outside immutable slots. Every checkpoint is a
+//! checksummed temp/fsync/rename/parent-fsync replacement, and every writer
+//! supplies the revision it observed so a resumed or duplicated process cannot
+//! overwrite newer progress.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub const OPERATION_STATE_VERSION: u32 = 1;
+pub const OPERATION_STATE_FILE: &str = "state.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationPhase {
+    Planned,
+    Graph,
+    TextSearch,
+    Regex,
+    Embeddings,
+    Metadata,
+    Validating,
+    Ready,
+    Activating,
+    Activated,
+    Cancelled,
+}
+
+impl PublicationPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Activated | Self::Cancelled)
+    }
+
+    fn successor(self) -> Option<Self> {
+        match self {
+            Self::Planned => Some(Self::Graph),
+            Self::Graph => Some(Self::TextSearch),
+            Self::TextSearch => Some(Self::Regex),
+            Self::Regex => Some(Self::Embeddings),
+            Self::Embeddings => Some(Self::Metadata),
+            Self::Metadata => Some(Self::Validating),
+            Self::Validating => Some(Self::Ready),
+            Self::Ready => Some(Self::Activating),
+            Self::Activating => Some(Self::Activated),
+            Self::Activated | Self::Cancelled => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationOperationPlan {
+    pub operation_uuid: String,
+    pub brain_uuid: String,
+    pub target_publication_uuid: String,
+    pub expected_current_publication_uuid: Option<String>,
+    pub input_fingerprint: String,
+    pub producer_version: String,
+    pub publication_format_version: u32,
+    pub created_unix_millis: u64,
+}
+
+impl PublicationOperationPlan {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        parse_non_nil_uuid("operation_uuid", &self.operation_uuid)?;
+        parse_non_nil_uuid("brain_uuid", &self.brain_uuid)?;
+        let target = parse_non_nil_uuid("target_publication_uuid", &self.target_publication_uuid)?;
+        if let Some(expected) = &self.expected_current_publication_uuid {
+            let expected = parse_non_nil_uuid("expected_current_publication_uuid", expected)?;
+            if expected == target {
+                anyhow::bail!("target publication must differ from the expected incumbent");
+            }
+        }
+        if self.input_fingerprint.is_empty()
+            || self.producer_version.is_empty()
+            || self.publication_format_version == 0
+        {
+            anyhow::bail!(
+                "publication plan requires input fingerprint, producer version, and non-zero format version"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationProgress {
+    pub completed: u64,
+    pub total: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationFailure {
+    pub phase: PublicationPhase,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationOperationState {
+    pub state_version: u32,
+    pub revision: u64,
+    pub plan: PublicationOperationPlan,
+    pub phase: PublicationPhase,
+    pub cancel_requested: bool,
+    pub progress: Option<PublicationProgress>,
+    pub completed_artifacts: BTreeMap<String, String>,
+    pub validated_manifest_blake3: Option<String>,
+    pub failure: Option<PublicationFailure>,
+    pub updated_unix_millis: u64,
+}
+
+impl PublicationOperationState {
+    fn new(plan: PublicationOperationPlan) -> anyhow::Result<Self> {
+        plan.validate()?;
+        Ok(Self {
+            state_version: OPERATION_STATE_VERSION,
+            revision: 0,
+            updated_unix_millis: plan.created_unix_millis,
+            plan,
+            phase: PublicationPhase::Planned,
+            cancel_requested: false,
+            progress: None,
+            completed_artifacts: BTreeMap::new(),
+            validated_manifest_blake3: None,
+            failure: None,
+        })
+    }
+
+    pub fn resumable_with(&self, requested: &PublicationOperationPlan) -> anyhow::Result<()> {
+        requested.validate()?;
+        if self.phase.is_terminal() {
+            anyhow::bail!(
+                "publication operation is terminal in phase {:?}",
+                self.phase
+            );
+        }
+        if self.plan.operation_uuid != requested.operation_uuid
+            || self.plan.brain_uuid != requested.brain_uuid
+            || self.plan.target_publication_uuid != requested.target_publication_uuid
+            || self.plan.expected_current_publication_uuid
+                != requested.expected_current_publication_uuid
+            || self.plan.input_fingerprint != requested.input_fingerprint
+            || self.plan.producer_version != requested.producer_version
+            || self.plan.publication_format_version != requested.publication_format_version
+        {
+            anyhow::bail!(
+                "publication operation is incompatible with the requested resume; discard it explicitly or resume with the original inputs"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ChecksummedOperationState {
+    checksum_blake3: String,
+    state: PublicationOperationState,
+}
+
+pub fn operation_state_path(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(
+        crate::publication::operation_path(publication_root, operation_uuid)?
+            .join(OPERATION_STATE_FILE),
+    )
+}
+
+pub fn create_operation(
+    publication_root: &Path,
+    plan: PublicationOperationPlan,
+) -> anyhow::Result<PublicationOperationState> {
+    let state = PublicationOperationState::new(plan)?;
+    let operations = publication_root.join("operations");
+    std::fs::create_dir_all(&operations)?;
+    let operation_dir =
+        crate::publication::operation_path(publication_root, &state.plan.operation_uuid)?;
+    std::fs::create_dir(&operation_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "create publication operation {}: {error}",
+            operation_dir.display()
+        )
+    })?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
+    if let Err(error) = persist_state(&operation_dir.join(OPERATION_STATE_FILE), &state) {
+        let _ = std::fs::remove_dir(&operation_dir);
+        return Err(error);
+    }
+    Ok(state)
+}
+
+pub fn load_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<PublicationOperationState> {
+    parse_non_nil_uuid("operation_uuid", operation_uuid)?;
+    let path = operation_state_path(publication_root, operation_uuid)?;
+    let bytes = std::fs::read(&path).map_err(|error| {
+        anyhow::anyhow!("read publication operation {}: {error}", path.display())
+    })?;
+    let envelope: ChecksummedOperationState = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!("decode publication operation {}: {error}", path.display())
+    })?;
+    validate_loaded_state(operation_uuid, &envelope)?;
+    Ok(envelope.state)
+}
+
+pub fn list_operations(publication_root: &Path) -> anyhow::Result<Vec<PublicationOperationState>> {
+    let root = publication_root.join("operations");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut states = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        states.push(load_operation(publication_root, &name)?);
+    }
+    states.sort_by(|left, right| {
+        left.plan
+            .created_unix_millis
+            .cmp(&right.plan.created_unix_millis)
+            .then_with(|| left.plan.operation_uuid.cmp(&right.plan.operation_uuid))
+    });
+    Ok(states)
+}
+
+fn checkpoint_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    update: impl FnOnce(&mut PublicationOperationState) -> anyhow::Result<()>,
+) -> anyhow::Result<PublicationOperationState> {
+    let incumbent = load_operation(publication_root, operation_uuid)?;
+    if incumbent.revision != expected_revision {
+        anyhow::bail!(
+            "stale publication-operation writer: expected revision {expected_revision}, current revision {}",
+            incumbent.revision
+        );
+    }
+    let mut next = incumbent.clone();
+    update(&mut next)?;
+    validate_update(&incumbent, &next)?;
+    next.revision = incumbent
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("publication operation revision exhausted"))?;
+    next.updated_unix_millis = unix_millis().max(incumbent.updated_unix_millis);
+    persist_state(
+        &operation_state_path(publication_root, operation_uuid)?,
+        &next,
+    )?;
+    Ok(next)
+}
+
+pub fn advance_phase(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    phase: PublicationPhase,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if state.cancel_requested {
+                anyhow::bail!("publication cancellation is requested");
+            }
+            if let Some(failure) = &state.failure {
+                anyhow::bail!(
+                    "publication is failed at {:?}: {}",
+                    failure.phase,
+                    failure.message
+                );
+            }
+            if state.phase.successor() != Some(phase) {
+                anyhow::bail!(
+                    "invalid publication phase transition {:?} -> {phase:?}",
+                    state.phase
+                );
+            }
+            state.phase = phase;
+            state.progress = None;
+            Ok(())
+        },
+    )
+}
+
+pub fn update_progress(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    progress: PublicationProgress,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if state.phase.is_terminal() || state.cancel_requested || state.failure.is_some() {
+                anyhow::bail!("publication operation is not accepting progress");
+            }
+            if progress.message.is_empty()
+                || progress
+                    .total
+                    .is_some_and(|total| progress.completed > total)
+            {
+                anyhow::bail!("invalid publication progress");
+            }
+            state.progress = Some(progress);
+            Ok(())
+        },
+    )
+}
+
+pub fn record_artifact(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    relative_path: String,
+    blake3: String,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            validate_relative_path(&relative_path)?;
+            validate_digest(&blake3)?;
+            if state.phase.is_terminal() || state.cancel_requested || state.failure.is_some() {
+                anyhow::bail!("publication operation is not accepting artifacts");
+            }
+            if let Some(incumbent) = state.completed_artifacts.get(&relative_path)
+                && incumbent != &blake3
+            {
+                anyhow::bail!(
+                    "artifact {relative_path} was already checkpointed with a different digest"
+                );
+            }
+            state.completed_artifacts.insert(relative_path, blake3);
+            Ok(())
+        },
+    )
+}
+
+pub fn mark_ready(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    let incumbent = load_operation(publication_root, operation_uuid)?;
+    if incumbent.revision != expected_revision {
+        anyhow::bail!(
+            "stale publication-operation writer: expected revision {expected_revision}, current revision {}",
+            incumbent.revision
+        );
+    }
+    if incumbent.phase != PublicationPhase::Validating {
+        anyhow::bail!("publication can become ready only from validating");
+    }
+    let digest = validate_target_slot(publication_root, &incumbent)?;
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            state.validated_manifest_blake3 = Some(digest);
+            state.phase = PublicationPhase::Ready;
+            state.progress = None;
+            Ok(())
+        },
+    )
+}
+
+/// Activate a validated slot under the incumbent graph publication lease.
+/// Re-entering after a crash is idempotent: if `CURRENT` already selects the
+/// target while the journal still says `activating`, only the final journal
+/// checkpoint is performed.
+pub fn activate_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+) -> anyhow::Result<PublicationOperationState> {
+    let mut state = load_operation(publication_root, operation_uuid)?;
+    if state.revision != expected_revision {
+        anyhow::bail!(
+            "stale publication-operation writer: expected revision {expected_revision}, current revision {}",
+            state.revision
+        );
+    }
+    if state.failure.is_some() || state.cancel_requested {
+        anyhow::bail!("publication operation is failed or cancelled");
+    }
+    if state.phase == PublicationPhase::Ready {
+        state = advance_phase(
+            publication_root,
+            operation_uuid,
+            state.revision,
+            PublicationPhase::Activating,
+        )?;
+    } else if state.phase != PublicationPhase::Activating {
+        anyhow::bail!("publication activation requires ready or activating phase");
+    }
+
+    let current = crate::publication::read_current(publication_root)?;
+    let already_selected = current.as_ref().is_some_and(|pointer| {
+        uuid_equal(
+            &pointer.publication_uuid,
+            &state.plan.target_publication_uuid,
+        )
+        .unwrap_or(false)
+            && pointer.manifest_blake3
+                == state.validated_manifest_blake3.clone().unwrap_or_default()
+    });
+    if !already_selected {
+        let digest = validate_target_slot(publication_root, &state)?;
+        if state.validated_manifest_blake3.as_deref() != Some(digest.as_str()) {
+            anyhow::bail!("validated publication manifest digest changed before activation");
+        }
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: state.plan.brain_uuid.clone(),
+            publication_uuid: state.plan.target_publication_uuid.clone(),
+        };
+        let pointer = crate::publication::CurrentPublicationPointer::new(
+            &identity,
+            state.plan.expected_current_publication_uuid.clone(),
+            digest,
+        )?;
+        crate::publication::compare_and_swap_current(
+            publication_root,
+            lease,
+            state.plan.expected_current_publication_uuid.as_deref(),
+            &pointer,
+        )?;
+    }
+    advance_phase(
+        publication_root,
+        operation_uuid,
+        state.revision,
+        PublicationPhase::Activated,
+    )
+}
+
+pub fn request_cancel(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if state.phase.is_terminal() {
+                anyhow::bail!("cannot cancel terminal publication phase {:?}", state.phase);
+            }
+            state.cancel_requested = true;
+            Ok(())
+        },
+    )
+}
+
+pub fn acknowledge_cancel(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if !state.cancel_requested {
+                anyhow::bail!("publication cancellation was not requested");
+            }
+            state.phase = PublicationPhase::Cancelled;
+            state.progress = None;
+            Ok(())
+        },
+    )
+}
+
+pub fn record_failure(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+) -> anyhow::Result<PublicationOperationState> {
+    let code = code.into();
+    let message = message.into();
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if state.phase.is_terminal() {
+                anyhow::bail!("cannot fail terminal publication phase {:?}", state.phase);
+            }
+            if code.is_empty() || message.is_empty() {
+                anyhow::bail!("publication failure requires a code and message");
+            }
+            state.failure = Some(PublicationFailure {
+                phase: state.phase,
+                code,
+                message,
+                retryable,
+            });
+            Ok(())
+        },
+    )
+}
+
+pub fn resume_operation(
+    publication_root: &Path,
+    requested: &PublicationOperationPlan,
+    expected_revision: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        &requested.operation_uuid,
+        expected_revision,
+        |state| {
+            state.resumable_with(requested)?;
+            if state
+                .failure
+                .as_ref()
+                .is_some_and(|failure| !failure.retryable)
+            {
+                anyhow::bail!("publication failure is not retryable; discard explicitly");
+            }
+            state.failure = None;
+            state.cancel_requested = false;
+            Ok(())
+        },
+    )
+}
+
+/// Explicitly discard a cancelled or failed staging operation. The target slot
+/// is first moved under the operation directory, then the complete operation is
+/// renamed out of the active UUID namespace before recursive deletion. A crash
+/// at any point therefore leaves either an inspectable active operation or an
+/// ignored `.discarded-*` tombstone, never a half-deleted selectable slot.
+pub fn discard_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+) -> anyhow::Result<()> {
+    let state = load_operation(publication_root, operation_uuid)?;
+    if state.revision != expected_revision {
+        anyhow::bail!(
+            "stale publication-operation writer: expected revision {expected_revision}, current revision {}",
+            state.revision
+        );
+    }
+    if state.phase != PublicationPhase::Cancelled && state.failure.is_none() {
+        anyhow::bail!("only a cancelled or failed staging operation may be discarded");
+    }
+    if crate::publication::read_current(publication_root)?.is_some_and(|pointer| {
+        uuid_equal(
+            &pointer.publication_uuid,
+            &state.plan.target_publication_uuid,
+        )
+        .unwrap_or(false)
+    }) {
+        anyhow::bail!("refusing to discard the currently selected publication");
+    }
+
+    let operation_dir = crate::publication::operation_path(publication_root, operation_uuid)?;
+    let slot =
+        crate::publication::slot_path(publication_root, &state.plan.target_publication_uuid)?;
+    if slot.exists() {
+        let nested = operation_dir.join("discarded-slot");
+        std::fs::rename(&slot, &nested)?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&slot)?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&nested)?;
+    }
+    let tombstone = publication_root.join("operations").join(format!(
+        ".discarded-{}-{}",
+        state.plan.operation_uuid, state.revision
+    ));
+    std::fs::rename(&operation_dir, &tombstone)?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
+    std::fs::remove_dir_all(&tombstone)?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&tombstone)?;
+    Ok(())
+}
+
+fn validate_update(
+    incumbent: &PublicationOperationState,
+    next: &PublicationOperationState,
+) -> anyhow::Result<()> {
+    next.plan.validate()?;
+    if next.state_version != OPERATION_STATE_VERSION
+        || next.plan != incumbent.plan
+        || next.revision != incumbent.revision
+        || next.updated_unix_millis != incumbent.updated_unix_millis
+    {
+        anyhow::bail!("publication checkpoint attempted to rewrite immutable journal fields");
+    }
+    if incumbent.phase.is_terminal() && next != incumbent {
+        anyhow::bail!("terminal publication operations are immutable");
+    }
+    if next.phase != incumbent.phase
+        && incumbent.phase.successor() != Some(next.phase)
+        && !(next.phase == PublicationPhase::Cancelled && next.cancel_requested)
+    {
+        anyhow::bail!(
+            "invalid publication journal phase transition {:?} -> {:?}",
+            incumbent.phase,
+            next.phase
+        );
+    }
+    Ok(())
+}
+
+fn validate_target_slot(
+    publication_root: &Path,
+    state: &PublicationOperationState,
+) -> anyhow::Result<String> {
+    let slot =
+        crate::publication::slot_path(publication_root, &state.plan.target_publication_uuid)?;
+    let path = slot.join(crate::publication::PUBLICATION_MANIFEST_FILE);
+    let bytes = std::fs::read(&path)
+        .map_err(|error| anyhow::anyhow!("read target manifest {}: {error}", path.display()))?;
+    let bundle: crate::publication::PublicationBundleV3 = serde_json::from_slice(&bytes)?;
+    bundle.validate_metadata(state.plan.publication_format_version)?;
+    if !uuid_equal(&bundle.brain_uuid, &state.plan.brain_uuid)?
+        || !uuid_equal(
+            &bundle.publication_uuid,
+            &state.plan.target_publication_uuid,
+        )?
+        || bundle.producer_version != state.plan.producer_version
+    {
+        anyhow::bail!("target publication manifest identity or producer does not match operation");
+    }
+    for descriptor in &bundle.artifacts {
+        let artifact = slot.join(&descriptor.path);
+        let payload = std::fs::read(&artifact).map_err(|error| {
+            anyhow::anyhow!("read target artifact {}: {error}", artifact.display())
+        })?;
+        if u64::try_from(payload.len())? != descriptor.byte_size
+            || crate::hash::blake3_hex_bytes(&payload) != descriptor.blake3
+        {
+            anyhow::bail!(
+                "target artifact {} failed size or digest validation",
+                descriptor.path
+            );
+        }
+    }
+    Ok(crate::hash::blake3_hex_bytes(&bytes))
+}
+
+fn validate_relative_path(path: &str) -> anyhow::Result<()> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("unsafe publication artifact path {}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str) -> anyhow::Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("expected a 64-character hexadecimal BLAKE3 digest");
+    }
+    Ok(())
+}
+
+fn validate_loaded_state(
+    requested_operation_uuid: &str,
+    envelope: &ChecksummedOperationState,
+) -> anyhow::Result<()> {
+    if envelope.state.state_version != OPERATION_STATE_VERSION {
+        anyhow::bail!(
+            "publication operation state version {} is incompatible with supported version {}",
+            envelope.state.state_version,
+            OPERATION_STATE_VERSION
+        );
+    }
+    envelope.state.plan.validate()?;
+    if !uuid_equal(
+        requested_operation_uuid,
+        &envelope.state.plan.operation_uuid,
+    )? {
+        anyhow::bail!("publication operation path identity does not match journal identity");
+    }
+    let observed = state_checksum(&envelope.state)?;
+    if observed != envelope.checksum_blake3 {
+        anyhow::bail!(
+            "publication operation checksum mismatch: recorded {}, observed {observed}",
+            envelope.checksum_blake3
+        );
+    }
+    Ok(())
+}
+
+fn persist_state(path: &Path, state: &PublicationOperationState) -> anyhow::Result<()> {
+    let envelope = ChecksummedOperationState {
+        checksum_blake3: state_checksum(state)?,
+        state: state.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&bytes))?;
+    Ok(())
+}
+
+fn state_checksum(state: &PublicationOperationState) -> anyhow::Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(state)?)
+        .to_hex()
+        .to_string())
+}
+
+fn parse_non_nil_uuid(label: &str, value: &str) -> anyhow::Result<uuid::Uuid> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|error| anyhow::anyhow!("invalid {label} '{value}': {error}"))?;
+    if parsed.is_nil() {
+        anyhow::bail!("invalid {label}: nil UUID is not an identity");
+    }
+    Ok(parsed)
+}
+
+fn uuid_equal(left: &str, right: &str) -> anyhow::Result<bool> {
+    Ok(uuid::Uuid::parse_str(left)? == uuid::Uuid::parse_str(right)?)
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> PublicationOperationPlan {
+        PublicationOperationPlan {
+            operation_uuid: uuid::Uuid::new_v4().to_string(),
+            brain_uuid: uuid::Uuid::new_v4().to_string(),
+            target_publication_uuid: uuid::Uuid::new_v4().to_string(),
+            expected_current_publication_uuid: Some(uuid::Uuid::new_v4().to_string()),
+            input_fingerprint: "inputs-v1:abc".to_string(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            publication_format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+            created_unix_millis: 42,
+        }
+    }
+
+    fn advance_to_validating(
+        root: &Path,
+        plan: &PublicationOperationPlan,
+        mut state: PublicationOperationState,
+    ) -> PublicationOperationState {
+        for phase in [
+            PublicationPhase::Graph,
+            PublicationPhase::TextSearch,
+            PublicationPhase::Regex,
+            PublicationPhase::Embeddings,
+            PublicationPhase::Metadata,
+            PublicationPhase::Validating,
+        ] {
+            state = advance_phase(root, &plan.operation_uuid, state.revision, phase).unwrap();
+        }
+        state
+    }
+
+    fn write_target_bundle(root: &Path, plan: &PublicationOperationPlan) -> String {
+        let slot = crate::publication::slot_path(root, &plan.target_publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let bundle = crate::publication::PublicationBundleV3 {
+            format_version: plan.publication_format_version,
+            brain_uuid: plan.brain_uuid.clone(),
+            publication_uuid: plan.target_publication_uuid.clone(),
+            producer_version: plan.producer_version.clone(),
+            source_graph_generation: 0,
+            artifacts: Vec::new(),
+        };
+        let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
+        std::fs::write(
+            slot.join(crate::publication::PUBLICATION_MANIFEST_FILE),
+            &bytes,
+        )
+        .unwrap();
+        crate::hash::blake3_hex_bytes(&bytes)
+    }
+
+    #[test]
+    fn operation_checkpoints_are_durable_sequential_and_revision_cas_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let created = create_operation(dir.path(), plan.clone()).unwrap();
+        assert_eq!(
+            load_operation(dir.path(), &plan.operation_uuid).unwrap(),
+            created
+        );
+
+        let graph = advance_phase(
+            dir.path(),
+            &plan.operation_uuid,
+            created.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        assert_eq!(graph.revision, 1);
+        assert!(
+            advance_phase(
+                dir.path(),
+                &plan.operation_uuid,
+                created.revision,
+                PublicationPhase::TextSearch,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale publication-operation writer")
+        );
+        assert!(
+            advance_phase(
+                dir.path(),
+                &plan.operation_uuid,
+                graph.revision,
+                PublicationPhase::Embeddings,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid publication phase transition")
+        );
+    }
+
+    #[test]
+    fn cancel_failure_and_resume_are_explicit_and_compatibility_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let state = create_operation(dir.path(), plan.clone()).unwrap();
+        let failed = record_failure(
+            dir.path(),
+            &plan.operation_uuid,
+            state.revision,
+            "network",
+            "model fetch interrupted",
+            true,
+        )
+        .unwrap();
+        assert!(
+            advance_phase(
+                dir.path(),
+                &plan.operation_uuid,
+                failed.revision,
+                PublicationPhase::Graph,
+            )
+            .is_err()
+        );
+        let mut incompatible = plan.clone();
+        incompatible.input_fingerprint = "different".to_string();
+        assert!(resume_operation(dir.path(), &incompatible, failed.revision).is_err());
+        let resumed = resume_operation(dir.path(), &plan, failed.revision).unwrap();
+        assert!(resumed.failure.is_none());
+        let requested = request_cancel(dir.path(), &plan.operation_uuid, resumed.revision).unwrap();
+        let cancelled =
+            acknowledge_cancel(dir.path(), &plan.operation_uuid, requested.revision).unwrap();
+        assert_eq!(cancelled.phase, PublicationPhase::Cancelled);
+        assert!(resume_operation(dir.path(), &plan, cancelled.revision).is_err());
+    }
+
+    #[test]
+    fn corrupt_or_path_mismatched_operation_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        create_operation(dir.path(), plan.clone()).unwrap();
+        let path = operation_state_path(dir.path(), &plan.operation_uuid).unwrap();
+        let mut envelope: ChecksummedOperationState =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope.state.cancel_requested = true;
+        std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+        assert!(
+            load_operation(dir.path(), &plan.operation_uuid)
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+    }
+
+    #[test]
+    fn validated_operation_activates_once_and_recovers_after_pointer_only_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent_db = dir.path().join("incumbent.lbug");
+        let incumbent = nestweaver_store::GraphStore::create(&incumbent_db).unwrap();
+        let incumbent_identity = incumbent.publication_identity().unwrap().unwrap();
+        let mut plan = plan();
+        plan.brain_uuid = incumbent_identity.brain_uuid.clone();
+        plan.expected_current_publication_uuid = None;
+        let state = create_operation(dir.path(), plan.clone()).unwrap();
+        let validating = advance_to_validating(dir.path(), &plan, state);
+        let expected_digest = write_target_bundle(dir.path(), &plan);
+        let ready = mark_ready(dir.path(), &plan.operation_uuid, validating.revision).unwrap();
+        assert_eq!(
+            ready.validated_manifest_blake3.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        let lease = incumbent.acquire_index_publication_lease().unwrap();
+        let activated =
+            activate_operation(dir.path(), &plan.operation_uuid, ready.revision, &lease).unwrap();
+        assert_eq!(activated.phase, PublicationPhase::Activated);
+        let current = crate::publication::read_current(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.publication_uuid, plan.target_publication_uuid);
+        lease.release().unwrap();
+
+        // A second operation simulates death after CURRENT commits but before
+        // the final journal checkpoint. Re-entry must observe the selected
+        // target and complete without attempting a conflicting CAS.
+        let mut recovery_plan = plan.clone();
+        recovery_plan.operation_uuid = uuid::Uuid::new_v4().to_string();
+        recovery_plan.target_publication_uuid = uuid::Uuid::new_v4().to_string();
+        recovery_plan.expected_current_publication_uuid = Some(current.publication_uuid);
+        let state = create_operation(dir.path(), recovery_plan.clone()).unwrap();
+        let validating = advance_to_validating(dir.path(), &recovery_plan, state);
+        let digest = write_target_bundle(dir.path(), &recovery_plan);
+        let ready = mark_ready(
+            dir.path(),
+            &recovery_plan.operation_uuid,
+            validating.revision,
+        )
+        .unwrap();
+        let activating = advance_phase(
+            dir.path(),
+            &recovery_plan.operation_uuid,
+            ready.revision,
+            PublicationPhase::Activating,
+        )
+        .unwrap();
+        let target_identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: recovery_plan.brain_uuid.clone(),
+            publication_uuid: recovery_plan.target_publication_uuid.clone(),
+        };
+        let pointer = crate::publication::CurrentPublicationPointer::new(
+            &target_identity,
+            recovery_plan.expected_current_publication_uuid.clone(),
+            digest,
+        )
+        .unwrap();
+        let lease = incumbent.acquire_index_publication_lease().unwrap();
+        crate::publication::compare_and_swap_current(
+            dir.path(),
+            &lease,
+            recovery_plan.expected_current_publication_uuid.as_deref(),
+            &pointer,
+        )
+        .unwrap();
+        let recovered = activate_operation(
+            dir.path(),
+            &recovery_plan.operation_uuid,
+            activating.revision,
+            &lease,
+        )
+        .unwrap();
+        assert_eq!(recovered.phase, PublicationPhase::Activated);
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn list_and_explicit_discard_remove_only_unselected_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let state = create_operation(dir.path(), plan.clone()).unwrap();
+        assert_eq!(list_operations(dir.path()).unwrap().len(), 1);
+        let requested = request_cancel(dir.path(), &plan.operation_uuid, state.revision).unwrap();
+        let cancelled =
+            acknowledge_cancel(dir.path(), &plan.operation_uuid, requested.revision).unwrap();
+        let slot =
+            crate::publication::slot_path(dir.path(), &plan.target_publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("partial"), b"staging").unwrap();
+        discard_operation(dir.path(), &plan.operation_uuid, cancelled.revision).unwrap();
+        assert!(!slot.exists());
+        assert!(list_operations(dir.path()).unwrap().is_empty());
+    }
+}

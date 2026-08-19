@@ -253,6 +253,7 @@ pub mod parsed_cache;
 pub mod process;
 pub mod project;
 pub mod publication;
+pub mod publication_operation;
 pub mod pull;
 pub mod query;
 pub mod read_symbols;
