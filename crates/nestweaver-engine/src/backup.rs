@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 /// Known sidecar suffixes to include in backups.
 const SIDECAR_SUFFIXES: &[&str] = &[
     ".tantivy",
+    ".pagerank.json",
     ".parsed_cache.bin",
     ".resolution_deps.bin",
     ".filemeta.json",
@@ -25,8 +26,9 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".embeddings",
 ];
 
-/// Current backup manifest version.
-const MANIFEST_VERSION: u32 = 1;
+/// Current backup manifest version. Version 2 embeds the same typed
+/// `PublicationBundleV3` inventory used by snapshots and publication cutover.
+const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
@@ -45,6 +47,12 @@ pub struct BackupManifest {
     pub schema_version: u32,
     pub created_at: String,
     pub instance_id: String,
+    #[serde(default)]
+    pub brain_uuid: String,
+    #[serde(default)]
+    pub publication_uuid: String,
+    #[serde(default)]
+    pub publication_manifest_blake3: String,
     pub repos: Vec<BackupRepoInfo>,
     pub repo_count: usize,
     pub symbol_count: usize,
@@ -99,6 +107,8 @@ pub struct StagedBackup {
     symbol_count: usize,
     start: Instant,
     write_pause: Duration,
+    publication_identity: nestweaver_store::PublicationIdentity,
+    source_graph_generation: u64,
 }
 
 /// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
@@ -180,6 +190,11 @@ pub fn stage_backup_from_store(
             indexed_sha: r.indexed_sha,
         })
         .collect();
+    let publication_identity = store
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read backup publication identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("backup graph has no publication identity"))?;
+    let source_graph_generation = store.graph_generation();
 
     let write_pause = pause_start.elapsed();
     publication
@@ -191,6 +206,8 @@ pub fn stage_backup_from_store(
         symbol_count,
         start,
         write_pause,
+        publication_identity,
+        source_graph_generation,
     })
 }
 
@@ -211,8 +228,31 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         symbol_count,
         start,
         write_pause,
+        publication_identity,
+        source_graph_generation,
     } = staged;
-    let mut manifest = build_backup_manifest(config, staging.path(), repos, symbol_count)?;
+    let bundle = build_backup_publication_bundle(
+        config,
+        staging.path(),
+        &publication_identity,
+        source_graph_generation,
+    )?;
+    let publication_bytes = serde_json::to_vec_pretty(&bundle)?;
+    std::fs::write(
+        staging
+            .path()
+            .join(crate::publication::PUBLICATION_MANIFEST_FILE),
+        &publication_bytes,
+    )?;
+    let publication_manifest_blake3 = crate::hash::blake3_hex_bytes(&publication_bytes);
+    let mut manifest = build_backup_manifest(
+        config,
+        staging.path(),
+        repos,
+        symbol_count,
+        &bundle,
+        publication_manifest_blake3,
+    )?;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
@@ -243,8 +283,10 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest: Option<BackupManifest> = None;
+    let mut publication: Option<crate::publication::PublicationBundleV3> = None;
     let mut archive_file_sizes: HashMap<String, u64> = HashMap::new();
     let mut archive_checksums: HashMap<String, String> = HashMap::new();
+    let mut archive_blake3: HashMap<String, String> = HashMap::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -254,6 +296,15 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
         if normalized == "manifest.json" {
             let m: BackupManifest = serde_json::from_reader(&mut entry)?;
             manifest = Some(m);
+        } else if normalized == crate::publication::PUBLICATION_MANIFEST_FILE {
+            let size = entry.header().size()?;
+            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
+            std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+            archive_file_sizes.insert(normalized.clone(), size);
+            let (sha256, blake3) = hash_stream_both(std::io::Cursor::new(&bytes))?;
+            archive_checksums.insert(normalized.clone(), sha256);
+            archive_blake3.insert(normalized, blake3);
+            publication = Some(serde_json::from_slice(&bytes)?);
         } else if !normalized.is_empty() && !normalized.ends_with('/') {
             // Track file sizes for verification.
             let size = entry.header().size()?;
@@ -261,13 +312,26 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
 
             // Compute checksum for files listed in manifest checksums (streamed,
             // so a multi-GB member never lands in memory).
-            let hash = sha256_stream(&mut entry)?;
-            archive_checksums.insert(normalized, hash);
+            let (sha256, blake3) = hash_stream_both(&mut entry)?;
+            archive_checksums.insert(normalized.clone(), sha256);
+            archive_blake3.insert(normalized, blake3);
         }
     }
 
     let mut manifest =
         manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in archive"))?;
+
+    if manifest.version >= 2 {
+        let publication = publication
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("publication.json not found in v2 backup archive"))?;
+        validate_backup_publication_inventory(
+            &manifest,
+            publication,
+            &archive_file_sizes,
+            &archive_blake3,
+        )?;
+    }
 
     // The in-archive manifest cannot record its own compressed size
     // (sealed before compression finishes). Recompute it from the
@@ -393,6 +457,51 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         ));
     }
     check_schema_compatibility(&manifest)?;
+    if manifest.version >= 2 {
+        let publication_path = temp_dir
+            .path()
+            .join(crate::publication::PUBLICATION_MANIFEST_FILE);
+        let publication_bytes = std::fs::read(&publication_path)?;
+        let publication: crate::publication::PublicationBundleV3 =
+            serde_json::from_slice(&publication_bytes)?;
+        let mut sizes = HashMap::new();
+        let mut hashes = HashMap::new();
+        for entry in walkdir::WalkDir::new(temp_dir.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = normalized_relative_path(temp_dir.path(), entry.path())?;
+            let bytes = std::fs::read(entry.path())?;
+            sizes.insert(path.clone(), u64::try_from(bytes.len())?);
+            hashes.insert(path, crate::hash::blake3_hex_bytes(&bytes));
+        }
+        validate_backup_publication_inventory(&manifest, &publication, &sizes, &hashes)?;
+
+        let graph = publication
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
+            .ok_or_else(|| anyhow::anyhow!("backup publication has no graph artifact"))?;
+        let graph_store =
+            nestweaver_store::GraphStore::open_read_only(&temp_dir.path().join(&graph.path))
+                .map_err(|error| anyhow::anyhow!("open restored graph identity: {error}"))?;
+        let graph_identity = graph_store
+            .publication_identity()
+            .map_err(|error| anyhow::anyhow!("read restored graph identity: {error}"))?
+            .ok_or_else(|| anyhow::anyhow!("restored graph has no publication identity"))?;
+        if graph_identity.brain_uuid != publication.brain_uuid
+            || graph_identity.publication_uuid != publication.publication_uuid
+        {
+            anyhow::bail!(
+                "backup publication identity mismatch: manifest {}/{}, graph {}/{}",
+                publication.brain_uuid,
+                publication.publication_uuid,
+                graph_identity.brain_uuid,
+                graph_identity.publication_uuid
+            );
+        }
+    }
 
     // The backup saves clones under `clones/` (historical name), but the
     // daemon and CLI expect them at `workspace/`. Rename after extraction
@@ -542,11 +651,130 @@ fn copy_db_files(
 }
 
 /// Build the backup manifest by inspecting staged files.
+fn build_backup_publication_bundle(
+    config: &BackupConfig,
+    staging: &Path,
+    identity: &nestweaver_store::PublicationIdentity,
+    source_graph_generation: u64,
+) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+    identity
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid backup publication identity: {error}"))?;
+    let db_filename = config
+        .db_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("db_path has no filename"))?
+        .to_string_lossy()
+        .to_string();
+    let mut entries: Vec<_> = walkdir::WalkDir::new(staging)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .collect();
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
+    let mut artifacts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let path = normalized_relative_path(staging, entry.path())?;
+        if path == crate::publication::PUBLICATION_MANIFEST_FILE || path == "manifest.json" {
+            continue;
+        }
+        let (kind, schema, fingerprint) = backup_artifact_contract(&path, &db_filename)?;
+        let bytes = std::fs::read(entry.path())?;
+        artifacts.push(crate::publication::ArtifactDescriptor {
+            path,
+            kind,
+            artifact_schema_version: schema,
+            byte_size: u64::try_from(bytes.len())?,
+            blake3: crate::hash::blake3_hex_bytes(&bytes),
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation,
+            algorithm_fingerprint: fingerprint,
+        });
+    }
+    let bundle = crate::publication::PublicationBundleV3 {
+        format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+        brain_uuid: identity.brain_uuid.clone(),
+        publication_uuid: identity.publication_uuid.clone(),
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+        source_graph_generation,
+        artifacts,
+    };
+    bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    Ok(bundle)
+}
+
+fn backup_artifact_contract(
+    path: &str,
+    db_filename: &str,
+) -> anyhow::Result<(crate::publication::ArtifactKind, u32, String)> {
+    use crate::publication::ArtifactKind;
+    let suffix = path.strip_prefix(db_filename);
+    let contract = if path == db_filename {
+        (ArtifactKind::Graph, 1, "ladybugdb-graph-v1")
+    } else if path == "instance.toml" {
+        (ArtifactKind::InstanceConfig, 1, "instance-config-toml-v1")
+    } else if path.starts_with("clones/") {
+        (ArtifactKind::WorkspaceClone, 1, "git-object-store-v1")
+    } else if path.starts_with(&format!("{db_filename}.tantivy/")) {
+        (ArtifactKind::Bm25, 1, "nestweaver-tantivy-bm25-v1")
+    } else {
+        match suffix {
+            Some(".parsed_cache.bin") => {
+                (ArtifactKind::ParsedCache, 1, "nestweaver-parsed-cache-v1")
+            }
+            Some(".resolution_deps.bin") => (
+                ArtifactKind::ResolutionDependencies,
+                1,
+                "nestweaver-resolution-deps-v1",
+            ),
+            Some(".filemeta.json") => {
+                (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
+            }
+            Some(".manifests.json") => (
+                ArtifactKind::RepoManifest,
+                1,
+                "nestweaver-repo-manifest-json-v1",
+            ),
+            Some(".gitactivity.json") => {
+                (ArtifactKind::GitActivity, 1, "nestweaver-git-activity-v1")
+            }
+            Some(".cochange.json") => (ArtifactKind::Cochange, 1, "nestweaver-cochange-v1"),
+            Some(".interactions.json") => {
+                (ArtifactKind::Interactions, 1, "nestweaver-interactions-v1")
+            }
+            Some(".extensions.json")
+            | Some(".extensions.migration.json")
+            | Some(".extensions.handoff.json") => (
+                ArtifactKind::Extensions,
+                1,
+                "nestweaver-schema-extensions-v1",
+            ),
+            Some(".aliases.json") => (ArtifactKind::Aliases, 1, "nestweaver-aliases-v1"),
+            Some(".bundles.json") => (ArtifactKind::Bundles, 1, "nestweaver-context-bundles-v1"),
+            Some(".generation") => (
+                ArtifactKind::Generation,
+                1,
+                "nestweaver-graph-generation-v1",
+            ),
+            Some(".embeddings.bin") => (ArtifactKind::Embeddings, 1, "legacy-embedding-binary-v1"),
+            Some(".embeddings") => (ArtifactKind::Embeddings, 1, "legacy-embedding-json-v1"),
+            Some(".pagerank.json") => (ArtifactKind::Ranking, 1, "nestweaver-pagerank-json-v1"),
+            Some(".wal") => (ArtifactKind::WriteAheadLog, 1, "ladybugdb-wal-v1"),
+            _ => anyhow::bail!("unclassified backup artifact: {path}"),
+        }
+    };
+    Ok((contract.0, contract.1, contract.2.to_string()))
+}
+
 fn build_backup_manifest(
     config: &BackupConfig,
     staging: &Path,
     repos: Vec<BackupRepoInfo>,
     symbol_count: usize,
+    bundle: &crate::publication::PublicationBundleV3,
+    publication_manifest_blake3: String,
 ) -> anyhow::Result<BackupManifest> {
     let db_filename = config
         .db_path
@@ -611,6 +839,9 @@ fn build_backup_manifest(
         schema_version: 1,
         created_at,
         instance_id: config.instance_id.clone(),
+        brain_uuid: bundle.brain_uuid.clone(),
+        publication_uuid: bundle.publication_uuid.clone(),
+        publication_manifest_blake3,
         repo_count: repos.len(),
         symbol_count,
         repos,
@@ -656,6 +887,84 @@ fn verify_backup_checksums(data_dir: &Path, manifest: &BackupManifest) -> anyhow
     Ok(())
 }
 
+fn validate_backup_publication_inventory(
+    manifest: &BackupManifest,
+    publication: &crate::publication::PublicationBundleV3,
+    file_sizes: &HashMap<String, u64>,
+    file_hashes: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    publication.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    if publication.brain_uuid != manifest.brain_uuid
+        || publication.publication_uuid != manifest.publication_uuid
+    {
+        anyhow::bail!(
+            "backup summary identity {}/{} does not match publication {}/{}",
+            manifest.brain_uuid,
+            manifest.publication_uuid,
+            publication.brain_uuid,
+            publication.publication_uuid
+        );
+    }
+    let publication_digest = file_hashes
+        .get(crate::publication::PUBLICATION_MANIFEST_FILE)
+        .ok_or_else(|| anyhow::anyhow!("publication.json is absent from backup inventory"))?;
+    if publication_digest != &manifest.publication_manifest_blake3 {
+        anyhow::bail!(
+            "backup publication manifest digest mismatch: summary {}, file {publication_digest}",
+            manifest.publication_manifest_blake3
+        );
+    }
+
+    let described: std::collections::BTreeSet<_> = publication
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect();
+    if publication
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
+        .count()
+        != 1
+    {
+        anyhow::bail!("backup publication must describe exactly one graph artifact");
+    }
+    let present: std::collections::BTreeSet<_> = file_hashes
+        .keys()
+        .filter(|path| {
+            path.as_str() != "manifest.json"
+                && path.as_str() != crate::publication::PUBLICATION_MANIFEST_FILE
+        })
+        .map(String::as_str)
+        .collect();
+    if described != present {
+        anyhow::bail!(
+            "backup publication does not exactly describe payloads (described {}, present {})",
+            described.len(),
+            present.len()
+        );
+    }
+    for descriptor in &publication.artifacts {
+        let size = file_sizes
+            .get(&descriptor.path)
+            .ok_or_else(|| anyhow::anyhow!("missing backup artifact {}", descriptor.path))?;
+        let digest = file_hashes
+            .get(&descriptor.path)
+            .ok_or_else(|| anyhow::anyhow!("missing backup digest {}", descriptor.path))?;
+        if *size != descriptor.byte_size || digest != &descriptor.blake3 {
+            anyhow::bail!(
+                "backup artifact {} does not match its descriptor (size {}/{}, digest {}/{})",
+                descriptor.path,
+                size,
+                descriptor.byte_size,
+                digest,
+                descriptor.blake3
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Check that the manifest version is compatible with this engine.
 fn check_schema_compatibility(manifest: &BackupManifest) -> anyhow::Result<()> {
     if manifest.version > MANIFEST_VERSION {
@@ -681,12 +990,7 @@ fn checksum_sidecars(
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
-        let rel = entry
-            .path()
-            .strip_prefix(staging)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .to_string();
+        let rel = normalized_relative_path(staging, entry.path())?;
 
         // Skip the db file — already checksummed.
         if rel == db_filename {
@@ -702,6 +1006,23 @@ fn checksum_sidecars(
         checksums.insert(rel, hash);
     }
     Ok(())
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> anyhow::Result<String> {
+    let relative = path.strip_prefix(root)?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                components.push(value.to_string_lossy().into_owned())
+            }
+            _ => anyhow::bail!("unsafe backup artifact path: {}", path.display()),
+        }
+    }
+    if components.is_empty() {
+        anyhow::bail!("backup artifact path is empty: {}", path.display());
+    }
+    Ok(components.join("/"))
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -774,6 +1095,26 @@ fn sha256_stream(mut reader: impl std::io::Read) -> std::io::Result<String> {
     Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
 }
 
+/// Compute the legacy backup SHA-256 and publication BLAKE3 digests in one
+/// streaming pass.
+fn hash_stream_both(mut reader: impl std::io::Read) -> std::io::Result<(String, String)> {
+    let mut sha256 = Sha256::new();
+    let mut blake3 = blake3::Hasher::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha256.update(&buffer[..read]);
+        blake3.update(&buffer[..read]);
+    }
+    Ok((
+        format!("sha256:{}", hex_encode(&sha256.finalize())),
+        blake3.finalize().to_hex().to_string(),
+    ))
+}
+
 /// Convenience: stream-hash a file at `path` (see [`sha256_stream`]).
 fn sha256_stream_path(path: impl AsRef<Path>) -> std::io::Result<String> {
     sha256_stream(std::fs::File::open(path)?)
@@ -844,7 +1185,15 @@ mod tests {
 
         let manifest = backup_inspect(&output).unwrap();
         assert_eq!(manifest.instance_id, "test");
-        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.version, MANIFEST_VERSION);
+        assert!(uuid::Uuid::parse_str(&manifest.brain_uuid).is_ok());
+        assert!(uuid::Uuid::parse_str(&manifest.publication_uuid).is_ok());
+        assert_eq!(manifest.publication_manifest_blake3.len(), 64);
+        assert!(
+            manifest
+                .checksums
+                .contains_key(crate::publication::PUBLICATION_MANIFEST_FILE)
+        );
     }
 
     #[test]
@@ -1349,6 +1698,9 @@ mod tests {
             schema_version: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             instance_id: "future".to_string(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
+            publication_manifest_blake3: String::new(),
             repos: Vec::new(),
             repo_count: 0,
             symbol_count: 0,

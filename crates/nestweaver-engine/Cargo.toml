@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 toml = "1.1"
+toml_edit = "0.25"
 serde_yaml = "0.9"
 serde_yaml_ng = "0.10"
 openapiv3 = "2"

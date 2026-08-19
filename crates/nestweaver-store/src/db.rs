@@ -323,14 +323,31 @@ pub struct PublicationIdentity {
 }
 
 impl PublicationIdentity {
-    fn generate() -> Self {
+    /// Create the identity for a brand-new logical brain.
+    pub fn new_brain() -> Self {
         Self {
             brain_uuid: uuid::Uuid::new_v4().to_string(),
             publication_uuid: uuid::Uuid::new_v4().to_string(),
         }
     }
 
-    fn validate(&self) -> Result<(), StoreError> {
+    /// Create a fresh publication slot for this same logical brain.
+    ///
+    /// The current publication UUID is deliberately not retained: a staged
+    /// rebuild is a different complete graph/artifact lineage even though it
+    /// represents the same user data.
+    pub fn next_publication(&self) -> Result<Self, StoreError> {
+        self.validate()?;
+        let next = Self {
+            brain_uuid: self.brain_uuid.clone(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Validate both UUIDs and the invariant that the two identities differ.
+    pub fn validate(&self) -> Result<(), StoreError> {
         let parse = |name: &str, value: &str| {
             let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
                 StoreError::Query(format!("invalid {name} metadata '{value}': {error}"))
@@ -570,6 +587,56 @@ impl GraphStore {
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
+        store.load_graph_generation(&store.generation_sidecar_path());
+        store.load_recorded_embedding_model_into_index();
+        Ok(store)
+    }
+
+    /// Create a new persistent database with an explicitly chosen publication
+    /// identity.
+    ///
+    /// This is the safe creation primitive for a staged full rebuild: callers
+    /// derive `identity` with [`PublicationIdentity::next_publication`], so the
+    /// new slot inherits the incumbent brain UUID but cannot masquerade as the
+    /// incumbent publication. The destination must not already exist; this API
+    /// never adopts or rewrites identity on an existing database.
+    pub fn create_with_publication_identity(
+        path: &Path,
+        identity: &PublicationIdentity,
+    ) -> Result<Self, StoreError> {
+        identity.validate()?;
+        if path.exists() {
+            return Err(StoreError::Query(format!(
+                "refusing to create staged publication over existing database {}",
+                path.display()
+            )));
+        }
+
+        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        let store = GraphStore {
+            db,
+            pagerank_cache: Mutex::new(None),
+            pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
+            graph_generation: AtomicU64::new(0),
+            trigram_scope_cache: Mutex::new(None),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
+            interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
+            db_path: Some(path.to_path_buf()),
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
+            embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
+        };
+        store.init_schema()?;
+        store.initialize_publication_identity(identity)?;
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
         Ok(store)
@@ -1816,7 +1883,51 @@ impl GraphStore {
             return Ok(identity);
         }
 
-        let identity = PublicationIdentity::generate();
+        let identity = PublicationIdentity::new_brain();
+        self.initialize_publication_identity(&identity)
+    }
+
+    /// Assert that this store is the brain selected by configuration.
+    /// UUID spellings are compared by value rather than text so alternate
+    /// encodings cannot bypass the binding.
+    pub fn assert_brain_uuid(&self, expected: &str) -> Result<PublicationIdentity, StoreError> {
+        let expected = uuid::Uuid::parse_str(expected).map_err(|error| {
+            StoreError::Query(format!("invalid expected_brain_uuid '{expected}': {error}"))
+        })?;
+        if expected.is_nil() {
+            return Err(StoreError::Query(
+                "invalid expected_brain_uuid: nil UUID is not a data identity".to_string(),
+            ));
+        }
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query(
+                "database has no publication identity; open it writable to initialize identity before binding it to configuration"
+                    .to_string(),
+            )
+        })?;
+        let actual = uuid::Uuid::parse_str(&identity.brain_uuid).map_err(|error| {
+            StoreError::Query(format!(
+                "invalid brain_uuid metadata '{}': {error}",
+                identity.brain_uuid
+            ))
+        })?;
+        if actual != expected {
+            return Err(StoreError::Query(format!(
+                "brain identity mismatch: configuration expects {expected}, but database {} contains {}. Inspect the database with `nestweaver instance identity --db <path>`; if this database is intentionally correct, bind the config with `nestweaver instance adopt-identity <config> --db <path>`. Otherwise restore or rebuild the expected brain",
+                self.db_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<in-memory>".to_string()),
+                identity.brain_uuid
+            )));
+        }
+        Ok(identity)
+    }
+
+    fn initialize_publication_identity(
+        &self,
+        identity: &PublicationIdentity,
+    ) -> Result<PublicationIdentity, StoreError> {
         identity.validate()?;
         let conn = self.conn()?;
         conn.query("BEGIN TRANSACTION")
@@ -1847,7 +1958,17 @@ impl GraphStore {
                         publication_uuid,
                     };
                     existing.validate()?;
-                    Ok(existing)
+                    if existing != *identity {
+                        Err(StoreError::Query(format!(
+                            "refusing to replace existing publication identity {}/{} with {}/{}",
+                            existing.brain_uuid,
+                            existing.publication_uuid,
+                            identity.brain_uuid,
+                            identity.publication_uuid
+                        )))
+                    } else {
+                        Ok(existing)
+                    }
                 }
                 (brain_uuid, publication_uuid) => Err(StoreError::Query(format!(
                     "incomplete publication identity: brain_uuid={}, publication_uuid={}; repair or rebuild the database",
@@ -2387,6 +2508,78 @@ mod tests {
 
         let read_only = GraphStore::open_read_only(&path).unwrap();
         assert_eq!(read_only.publication_identity().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn staged_publication_inherits_brain_and_gets_fresh_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent_path = dir.path().join("incumbent.lbug");
+        let incumbent = GraphStore::create(&incumbent_path).unwrap();
+        let incumbent_identity = incumbent.publication_identity().unwrap().unwrap();
+        let staged_identity = incumbent_identity.next_publication().unwrap();
+        assert_eq!(staged_identity.brain_uuid, incumbent_identity.brain_uuid);
+        assert_ne!(
+            staged_identity.publication_uuid,
+            incumbent_identity.publication_uuid
+        );
+
+        let staged_path = dir.path().join("staged.lbug");
+        let staged =
+            GraphStore::create_with_publication_identity(&staged_path, &staged_identity).unwrap();
+        assert_eq!(
+            staged.publication_identity().unwrap(),
+            Some(staged_identity.clone())
+        );
+        drop(staged);
+
+        let reopened = GraphStore::open_read_only(&staged_path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(staged_identity)
+        );
+    }
+
+    #[test]
+    fn staged_publication_creation_never_overwrites_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.lbug");
+        let incumbent = GraphStore::create(&path).unwrap();
+        let incumbent_identity = incumbent.publication_identity().unwrap().unwrap();
+        let staged_identity = incumbent_identity.next_publication().unwrap();
+        drop(incumbent);
+
+        let error = GraphStore::create_with_publication_identity(&path, &staged_identity)
+            .err()
+            .expect("existing database must be refused")
+            .to_string();
+        assert!(
+            error.contains("refusing to create staged publication"),
+            "{error}"
+        );
+
+        let reopened = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(incumbent_identity)
+        );
+    }
+
+    #[test]
+    fn expected_brain_uuid_is_value_checked_and_mismatch_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let expected = uuid::Uuid::parse_str(&identity.brain_uuid).unwrap();
+        let alternate_spelling = expected.as_braced().to_string().to_uppercase();
+        assert_eq!(
+            store.assert_brain_uuid(&alternate_spelling).unwrap(),
+            identity
+        );
+
+        let foreign = uuid::Uuid::new_v4().to_string();
+        let error = store.assert_brain_uuid(&foreign).unwrap_err().to_string();
+        assert!(error.contains("brain identity mismatch"), "{error}");
+        assert!(error.contains(&foreign), "{error}");
+        assert!(error.contains(&identity.brain_uuid), "{error}");
     }
 
     #[test]

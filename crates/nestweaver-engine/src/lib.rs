@@ -251,6 +251,7 @@ pub mod parse_pool;
 pub mod parsed_cache;
 pub mod process;
 pub mod project;
+pub mod publication;
 pub mod pull;
 pub mod query;
 pub mod read_symbols;
@@ -315,12 +316,12 @@ pub use cluster_dispatch::{
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
-    AuthzConfig, CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule,
-    InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig, PrImpactConfig, ProjectConfig,
-    RankingConfig, RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig,
-    StorageConfig, UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
-    default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
-    validate_instance_id,
+    AuthzConfig, CrossDomainConfig, ExpectedBrainAdoption, ExternalRefConfig, FeatureConfig,
+    GitConfig, GlobRule, InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig,
+    PrImpactConfig, ProjectConfig, RankingConfig, RepoConfig, RepoType, ResponseConfig,
+    SchemaExtensions, SeedResolutionConfig, StorageConfig, UpstreamEntry, WikiSourceConfig,
+    WorkspaceConfig, adopt_expected_brain_uuid, append_repo_to_config_file, default_kind_priority,
+    default_test_path_patterns, remove_repo_from_config_file, validate_instance_id,
 };
 pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{
@@ -400,6 +401,7 @@ pub use project::{
     ProjectMaterializationResult, detect_implicit_projects, materialize_projects,
     materialize_projects_with_lease,
 };
+pub use publication::*;
 pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, EmbedModelProvider,

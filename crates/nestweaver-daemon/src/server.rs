@@ -8805,6 +8805,23 @@ pub async fn run_server(
         db_path
     };
 
+    // An expected brain UUID is an assertion, never an instruction to assign
+    // identity to a new empty database. Refuse before `open_or_create` can
+    // materialize a different brain at a mistyped/missing path. Snapshot
+    // replicas have already materialized a verified graph above and are
+    // checked against the assertion immediately after opening it.
+    if !read_only
+        && !db_path.exists()
+        && let Some(expected) = instance_cfg
+            .as_ref()
+            .and_then(|config| config.expected_brain_uuid.as_deref())
+    {
+        anyhow::bail!(
+            "instance config expects brain {expected}, but no database exists at {}; refusing to create a different brain. Restore or rebuild the expected brain explicitly, or remove the assertion only when intentionally creating a new brain",
+            db_path.display()
+        );
+    }
+
     // Open the graph store: read-only for a snapshot replica, read-write
     // otherwise (the daemon is the sole DB owner).
     // Time the pre-bind phases. A client gives the daemon a bounded window to
@@ -8833,6 +8850,14 @@ pub async fn run_server(
             }
         }
     };
+    if let Some(config) = instance_cfg.as_ref() {
+        config.assert_expected_brain(&store).with_context(|| {
+            format!(
+                "database identity assertion failed for {}",
+                db_path.display()
+            )
+        })?;
+    }
     // Arm the guard in `lifecycle::db_write_lock`. From here on this process
     // holds lbug's POSIX record lock on the database, and that probe would
     // silently drop it when its own descriptor closes.

@@ -4411,6 +4411,31 @@ enum MemoryCommands {
 
 #[derive(Subcommand)]
 enum InstanceCommands {
+    /// Inspect the graph-owned brain and publication identities.
+    Identity {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Explicitly bind an instance config to the selected database's brain.
+    #[command(name = "adopt-identity")]
+    AdoptIdentity {
+        /// Instance config to update while preserving comments and formatting.
+        config_path: PathBuf,
+        #[arg(
+            long,
+            help = "Database to adopt; overrides the config's db field [env: NESTWEAVER_DB]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Validate and show the change without writing")]
+        dry_run: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     /// Register an instance from a TOML config file
     Register {
         /// Path to the instance config file (.toml)
@@ -4863,17 +4888,48 @@ fn default_db_path() -> PathBuf {
 /// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
 /// select a DB instead of being silently ignored (Bug #19).
 fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
-    if let Some(db) = db {
-        return Ok(db);
+    let cfg = config
+        .map(|cfg_path| {
+            nestweaver_engine::InstanceConfig::from_file(cfg_path)
+                .with_context(|| format!("loading --config {}", cfg_path.display()))
+        })
+        .transpose()?;
+    let resolved = db
+        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
+        .unwrap_or_else(default_db_path);
+    if let Some(config) = cfg.as_ref() {
+        assert_config_expected_brain(config, &resolved)?;
     }
-    if let Some(cfg_path) = config {
-        let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)
-            .with_context(|| format!("loading --config {}", cfg_path.display()))?;
-        if let Some(db) = cfg.db_path() {
-            return Ok(db);
-        }
+    Ok(resolved)
+}
+
+/// Enforce a config's data binding before a command can route to a daemon or
+/// directly open the selected database. This deliberately uses a read-only
+/// handle and never initializes identity: `expected_brain_uuid` is an
+/// assertion, not an adoption mechanism.
+fn assert_config_expected_brain(
+    config: &nestweaver_engine::InstanceConfig,
+    db_path: &Path,
+) -> anyhow::Result<()> {
+    let Some(expected) = config.expected_brain_uuid.as_deref() else {
+        return Ok(());
+    };
+    if !db_path.exists() {
+        anyhow::bail!(
+            "instance '{}' expects brain {expected}, but no database exists at {}; restore or rebuild that brain explicitly",
+            config.instance_id,
+            db_path.display()
+        );
     }
-    Ok(default_db_path())
+    let store = nestweaver_store::GraphStore::open_read_only(db_path).with_context(|| {
+        format!(
+            "open {} to verify expected_brain_uuid for instance '{}'",
+            db_path.display(),
+            config.instance_id
+        )
+    })?;
+    config.assert_expected_brain(&store)?;
+    Ok(())
 }
 
 /// Load an optional instance config for `[ranking]`/`[response]` settings.
@@ -5420,20 +5476,20 @@ fn resolve_index_db_path(
     config: Option<&Path>,
     repo_root: &Path,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = db {
-        return Ok(explicit);
+    let cfg = config
+        .map(|cfg_path| {
+            nestweaver_engine::InstanceConfig::from_file(cfg_path)
+                .with_context(|| format!("loading --config {}", cfg_path.display()))
+        })
+        .transpose()?;
+    let resolved = db
+        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
+        .or_else(|| std::env::var("NESTWEAVER_DB").ok().map(PathBuf::from))
+        .unwrap_or_else(|| repo_root.join("nestweaver.lbug"));
+    if let Some(config) = cfg.as_ref() {
+        assert_config_expected_brain(config, &resolved)?;
     }
-    if let Some(cfg_path) = config {
-        let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)
-            .with_context(|| format!("loading --config {}", cfg_path.display()))?;
-        if let Some(db) = cfg.db_path() {
-            return Ok(db);
-        }
-    }
-    if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        return Ok(PathBuf::from(env_db));
-    }
-    Ok(repo_root.join("nestweaver.lbug"))
+    Ok(resolved)
 }
 
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
@@ -21104,6 +21160,100 @@ fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> 
 
 fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     match command {
+        InstanceCommands::Identity { db, json } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
+            let store = nestweaver_store::GraphStore::open_read_only(&db_path)
+                .map_err(|error| anyhow::anyhow!("open {}: {error}", db_path.display()))?;
+            let identity = store
+                .publication_identity()
+                .map_err(|error| anyhow::anyhow!("read graph identity: {error}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "database {} has no publication identity; reopen it writable with this NestWeaver version to initialize it",
+                        db_path.display()
+                    )
+                })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "db": db_path,
+                        "brain_uuid": identity.brain_uuid,
+                        "publication_uuid": identity.publication_uuid,
+                    }))?
+                );
+            } else {
+                println!("Database:         {}", db_path.display());
+                println!("Brain UUID:       {}", identity.brain_uuid);
+                println!("Publication UUID: {}", identity.publication_uuid);
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        InstanceCommands::AdoptIdentity {
+            config_path,
+            db,
+            dry_run,
+            json,
+        } => {
+            let config = nestweaver_engine::InstanceConfig::from_file(&config_path)
+                .with_context(|| format!("load config {}", config_path.display()))?;
+            let db_path = db
+                .or_else(|| config.db_path())
+                .unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
+            let store = nestweaver_store::GraphStore::open_read_only(&db_path)
+                .map_err(|error| anyhow::anyhow!("open {}: {error}", db_path.display()))?;
+            let identity = store
+                .publication_identity()
+                .map_err(|error| anyhow::anyhow!("read graph identity: {error}"))?
+                .ok_or_else(|| anyhow::anyhow!("database has no publication identity"))?;
+            let adoption = nestweaver_engine::adopt_expected_brain_uuid(
+                &config_path,
+                &identity.brain_uuid,
+                dry_run,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "config": config_path,
+                        "db": db_path,
+                        "dry_run": dry_run,
+                        "changed": adoption.changed,
+                        "previous_expected_brain_uuid": adoption.previous,
+                        "adopted_brain_uuid": adoption.adopted,
+                        "publication_uuid": identity.publication_uuid,
+                    }))?
+                );
+            } else if dry_run {
+                println!(
+                    "Would bind {} to brain {} from {}{}",
+                    config_path.display(),
+                    adoption.adopted,
+                    db_path.display(),
+                    if adoption.changed {
+                        ""
+                    } else {
+                        " (already bound)"
+                    }
+                );
+            } else if adoption.changed {
+                println!(
+                    "Bound {} to brain {} from {}.",
+                    config_path.display(),
+                    adoption.adopted,
+                    db_path.display()
+                );
+            } else {
+                println!(
+                    "{} is already bound to brain {}.",
+                    config_path.display(),
+                    adoption.adopted
+                );
+            }
+            Ok(EXIT_SUCCESS)
+        }
         InstanceCommands::Register { config_path } => {
             let config = nestweaver_engine::InstanceConfig::from_file(Path::new(&config_path))?;
             // Store the canonical path so the registry entry is immune to
@@ -23422,6 +23572,81 @@ credential_method = "gh"
             dir.join("snapshots").display(),
             dir.join("workspace").display(),
         )
+    }
+
+    fn identity_bound_config(
+        dir: &std::path::Path,
+        db: &std::path::Path,
+        expected_brain_uuid: &str,
+    ) -> String {
+        valid_local_instance_config(dir, "").replacen(
+            "instance_id = \"missing-db-test\"",
+            &format!(
+                "instance_id = \"missing-db-test\"\ndb = \"{}\"\nexpected_brain_uuid = \"{expected_brain_uuid}\"",
+                db.display()
+            ),
+            1,
+        )
+    }
+
+    #[test]
+    fn config_db_resolution_enforces_expected_brain_uuid_even_with_db_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        drop(store);
+
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(
+            &config_path,
+            identity_bound_config(dir.path(), &db, &identity.brain_uuid),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_db_with_config(None, Some(&config_path)).unwrap(),
+            db
+        );
+        assert_eq!(
+            resolve_db_with_config(Some(db.clone()), Some(&config_path)).unwrap(),
+            db
+        );
+
+        std::fs::write(
+            &config_path,
+            identity_bound_config(
+                dir.path(),
+                &db,
+                &nestweaver_store::PublicationIdentity::new_brain().brain_uuid,
+            ),
+        )
+        .unwrap();
+        let error = resolve_db_with_config(Some(db), Some(&config_path))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("brain identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn expected_brain_uuid_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.lbug");
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(
+            &config_path,
+            identity_bound_config(
+                dir.path(),
+                &missing,
+                &nestweaver_store::PublicationIdentity::new_brain().brain_uuid,
+            ),
+        )
+        .unwrap();
+
+        let error = resolve_index_db_path(None, Some(&config_path), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no database exists"), "{error}");
+        assert!(!missing.exists());
     }
 
     /// The CLI must send the exact arg names the MCP tools read —
