@@ -4,7 +4,14 @@
 
 ### ⚠ BREAKING CHANGES
 
+* **storage/publication:** regex acceleration moves from graph-resident posting nodes to disposable per-repository/per-vault Tantivy shards, and semantic vectors move to embedding pipeline v2. Existing brains require one full staged graph reindex and re-embed with `nestweaver publication rebuild --config <instance.toml>`. The incumbent stays selected until validation and is retained for one-step rollback; there is no destructive in-place posting/vector migration.
 * **daemon/config:** commands that explicitly pass `--config` now fail when a current-version, already-running daemon cannot prove the same canonical configured path (including compiled-default daemons and daemons using a different config). Previously these commands could exit successfully while silently ignoring the requested configuration. Use `nestweaver daemon --db <db> restart --config <path>` to apply a different configuration. A verified version-upgrade restart still applies the explicit config to its verified successor. Relative paths and symlinks remain accepted when they canonicalize to the daemon's configured path. Editing that file in place does not trigger a path mismatch, but the daemon must still be restarted to load the changed contents.
+
+### Features
+
+* **publication:** add resumable staged rebuild, cooperative cancellation, source/config revalidation, typed preserved-state receipts, atomic `CURRENT` cutover, startup artifact smoke checks, and bounded pointer rollback
+* **regex:** replace quadratic LadybugDB trigram postings with incrementally maintained per-scope Tantivy shards, bounded reader reuse, safe tombstone retirement/generation garbage collection, scoped fail-open scans, and cross-surface execution diagnostics
+* **embedding:** add identity-bound pipeline fingerprints, Sentence Transformers module semantics, mmap base plus durable delta journal, streamed compaction, and bounded exact top-k search
 
 ### Bug Fixes
 

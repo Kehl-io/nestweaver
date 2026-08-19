@@ -27,6 +27,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".embeddings.bin",
     ".embeddings",
     crate::publication::SOURCE_MANIFEST_SUFFIX,
+    crate::publication::PRESERVED_STATE_SUFFIX,
 ];
 
 /// Current backup manifest version. Version 2 embeds the same typed
@@ -828,6 +829,19 @@ fn backup_artifact_contract_for_payload(
                 fingerprint,
             ));
         }
+        Some(crate::publication::PRESERVED_STATE_SUFFIX) => {
+            let (schema, fingerprint) = crate::publication::preserved_state_artifact_contract(
+                payload,
+                identity,
+                env!("CARGO_PKG_VERSION"),
+                source_graph_generation,
+            )?;
+            return Ok((
+                crate::publication::ArtifactKind::PreservedState,
+                schema,
+                fingerprint,
+            ));
+        }
         _ => {}
     }
     backup_artifact_contract(path, db_filename)
@@ -901,6 +915,9 @@ fn backup_artifact_contract(
             Some(".embeddings") => (ArtifactKind::Embeddings, 1, "legacy-embedding-json-v1"),
             Some(crate::publication::SOURCE_MANIFEST_SUFFIX) => anyhow::bail!(
                 "source manifest contract requires payload inspection; use backup_artifact_contract_for_payload"
+            ),
+            Some(crate::publication::PRESERVED_STATE_SUFFIX) => anyhow::bail!(
+                "preserved-state contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),
             Some(".pagerank.json") => anyhow::bail!(
                 "PageRank contract requires payload inspection; use backup_artifact_contract_for_payload"

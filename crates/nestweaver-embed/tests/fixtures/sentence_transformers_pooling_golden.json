@@ -1,0 +1,13 @@
+{
+  "source": "sentence-transformers Pooling forward semantics (masked two-token fixture)",
+  "token_vectors": [[1.0, 4.0], [3.0, 2.0], [99.0, 99.0]],
+  "attention_mask": [1, 1, 0],
+  "expected": [
+    1.0, 4.0,
+    3.0, 4.0,
+    2.0, 3.0,
+    2.8284271247461903, 4.242640687119286,
+    2.3333333333333335, 2.6666666666666665,
+    3.0, 2.0
+  ]
+}

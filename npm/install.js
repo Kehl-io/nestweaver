@@ -69,6 +69,9 @@ try {
   fs.rmSync(archivePath, { force: true });
   fs.chmodSync(path.join(binDir, "nestweaver"), 0o755);
   console.log("NestWeaver installed successfully.");
+  console.log(
+    "Upgrading an existing pre-publication brain? Stop its daemon and run `nestweaver publication rebuild --config /path/to/instance.toml`; the incumbent remains recoverable until validated cutover.",
+  );
 } catch (err) {
   console.warn(`Failed to install NestWeaver binary: ${err.message}`);
   console.warn(`  URL: ${url}`);

@@ -255,6 +255,7 @@ pub mod project;
 pub mod publication;
 pub mod publication_operation;
 pub mod publication_source;
+pub mod publication_state;
 pub mod pull;
 pub mod query;
 pub mod read_symbols;

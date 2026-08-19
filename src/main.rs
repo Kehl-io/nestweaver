@@ -11457,7 +11457,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 stale_index: false,
                                 ready_scopes: 0,
                                 dirty_scopes: 0,
+                                error_scopes: 0,
+                                posting_hits: 0,
+                                hydrated_candidates: 0,
                                 scanned_candidates: 0,
+                                truncation_reason: None,
+                                timings: Default::default(),
                                 note: None,
                             }
                         });
@@ -11488,7 +11493,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
                         }
                         if res.truncated {
-                            println!("(results truncated — hit candidate cap or time budget)");
+                            println!(
+                                "(results truncated — {})",
+                                regex_truncation_label(res.truncation_reason)
+                            );
                         }
                         if res.stale_index {
                             print_stale_index_note();
@@ -11497,6 +11505,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
                             );
                         }
+                    }
+                    if !json {
+                        print_regex_execution_note(&res);
                     }
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -11539,7 +11550,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
                 }
                 if res.truncated {
-                    println!("(results truncated — hit candidate cap or time budget)");
+                    println!(
+                        "(results truncated — {})",
+                        regex_truncation_label(res.truncation_reason)
+                    );
                 }
                 if res.stale_index {
                     print_stale_index_note();
@@ -11548,6 +11562,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
                     );
                 }
+            }
+            if !json {
+                print_regex_execution_note(&res);
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -11602,6 +11619,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             for f in &c.top_files {
                                 println!("    {} ({})", f.path, f.count);
                             }
+                            println!(
+                                "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
+                                c.ready_scopes,
+                                c.dirty_scopes,
+                                c.error_scopes,
+                                c.posting_hits,
+                                c.hydrated_candidates,
+                                c.scanned_candidates,
+                                c.timings.total_ms,
+                            );
                         }
                         // Surface in-band staleness the daemon's stderr
                         // warning can't reach us with.
@@ -11628,6 +11655,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     for f in &c.top_files {
                         println!("    {} ({})", f.path, f.count);
                     }
+                    println!(
+                        "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
+                        c.ready_scopes,
+                        c.dirty_scopes,
+                        c.error_scopes,
+                        c.posting_hits,
+                        c.hydrated_candidates,
+                        c.scanned_candidates,
+                        c.timings.total_ms,
+                    );
                 }
                 // Surface in-band staleness (the direct path's own
                 // stderr warning is a once-per-process latch that may already
@@ -16645,10 +16682,27 @@ fn pattern_count_from_tool_json(
             .get("dirty_scopes")
             .and_then(|value| value.as_u64())
             .unwrap_or(0) as usize,
+        error_scopes: c
+            .get("error_scopes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        posting_hits: c
+            .get("posting_hits")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        hydrated_candidates: c
+            .get("hydrated_candidates")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
         scanned_candidates: c
             .get("scanned_candidates")
             .and_then(|value| value.as_u64())
             .unwrap_or(0) as usize,
+        timings: c
+            .get("timings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -16659,6 +16713,34 @@ fn print_stale_index_note() {
     println!(
         "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with `index --with-trigrams`)"
     );
+}
+
+fn print_regex_execution_note(res: &nestweaver_store::regex::RegexSearchResult) {
+    println!(
+        "(regex scopes: {} ready, {} scanned, {} errors; {} posting hits, {} hydrated, {} verified; {} ms total [plan {}, hydrate {}, verify {}])",
+        res.ready_scopes,
+        res.dirty_scopes,
+        res.error_scopes,
+        res.posting_hits,
+        res.hydrated_candidates,
+        res.scanned_candidates,
+        res.timings.total_ms,
+        res.timings.planning_ms,
+        res.timings.hydration_ms,
+        res.timings.verification_ms,
+    );
+}
+
+fn regex_truncation_label(
+    reason: Option<nestweaver_store::regex::RegexTruncationReason>,
+) -> &'static str {
+    use nestweaver_store::regex::RegexTruncationReason;
+    match reason {
+        Some(RegexTruncationReason::ResultLimit) => "result limit reached",
+        Some(RegexTruncationReason::Deadline) => "time budget reached",
+        Some(RegexTruncationReason::CandidateCap) => "candidate safety cap reached",
+        Some(RegexTruncationReason::Unknown) | None => "search budget reached",
+    }
 }
 
 fn hybrid_search_candidates_from_value(
@@ -20262,6 +20344,57 @@ where
         Option<CliEmbeddingAccelerator>,
     ) -> anyhow::Result<Box<dyn CliBatchEmbedder>>,
 {
+    run_embed_with_cancel(
+        db,
+        local,
+        endpoint,
+        model,
+        model_id,
+        cache_dir,
+        accelerator,
+        batch_size,
+        scope,
+        force,
+        stats,
+        use_daemon,
+        local_model_loader,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_embed_with_cancel<Load>(
+    db: Option<&Path>,
+    local: bool,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    model_id: Option<&str>,
+    cache_dir: Option<&Path>,
+    accelerator: Option<CliEmbeddingAccelerator>,
+    batch_size: usize,
+    scope: &str,
+    force: bool,
+    stats: bool,
+    use_daemon: bool,
+    local_model_loader: Load,
+    cancel_requested: Option<&dyn Fn() -> anyhow::Result<bool>>,
+) -> anyhow::Result<i32>
+where
+    Load: Fn(
+        &str,
+        Option<&Path>,
+        Option<CliEmbeddingAccelerator>,
+    ) -> anyhow::Result<Box<dyn CliBatchEmbedder>>,
+{
+    let check_cancel = || -> anyhow::Result<()> {
+        if let Some(check) = cancel_requested
+            && check()?
+        {
+            anyhow::bail!("embedding cancelled at a safe batch boundary");
+        }
+        Ok(())
+    };
+    check_cancel()?;
     // Validate flags
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
@@ -20526,6 +20659,7 @@ where
             if total > 0 {
                 eprintln!("Embedding {total} symbol(s) via API (batch size {batch_size})…");
                 for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    check_cancel()?;
                     let done = batch_idx * batch_size + chunk.len();
                     eprint!("\rEmbedding symbols... {done}/{total}");
                     let texts: Vec<String> = chunk
@@ -20594,6 +20728,7 @@ where
             if total > 0 {
                 eprintln!("Embedding {total} note(s) via API (batch size {batch_size})…");
                 for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    check_cancel()?;
                     let done = batch_idx * batch_size + chunk.len();
                     eprint!("\rEmbedding notes... {done}/{total}");
                     let texts: Vec<String> = chunk.iter().map(|n| n.title.clone()).collect();
@@ -20661,6 +20796,7 @@ where
 
                 eprintln!("Embedding {total} heading(s) via API (batch size {batch_size})…");
                 for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    check_cancel()?;
                     let done = batch_idx * batch_size + chunk.len();
                     eprint!("\rEmbedding headings... {done}/{total}");
                     let texts: Vec<String> = chunk
@@ -20736,6 +20872,7 @@ where
                 if total > 0 {
                     eprintln!("Embedding {total} symbol(s) with local model…");
                     for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        check_cancel()?;
                         let done = batch_idx * batch_size + batch.len();
                         eprint!("\rEmbedding symbols... {done}/{total}");
                         let texts: Vec<String> = batch
@@ -20803,6 +20940,7 @@ where
                 if total > 0 {
                     eprintln!("Embedding {total} note(s) with local model…");
                     for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        check_cancel()?;
                         let done = batch_idx * batch_size + batch.len();
                         eprint!("\rEmbedding notes... {done}/{total}");
                         let texts: Vec<String> = batch
@@ -20871,6 +21009,7 @@ where
 
                     eprintln!("Embedding {total} heading(s) with local model…");
                     for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        check_cancel()?;
                         let done = batch_idx * batch_size + batch.len();
                         eprint!("\rEmbedding headings... {done}/{total}");
                         let texts: Vec<String> = batch
@@ -22565,7 +22704,11 @@ fn run_publication_rebuild(
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("incumbent database has no publication identity"))?;
     let sources = nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?;
-    let input_fingerprint = sources.fingerprint()?;
+    let preserved_state =
+        nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&incumbent_db)?;
+    let preserved_state_fingerprint = preserved_state.fingerprint()?;
+    let input_fingerprint =
+        publication_input_fingerprint(&sources, config_path, &preserved_state_fingerprint)?;
     drop(incumbent_store);
     let current = nestweaver_engine::publication::read_current(&publication_root)?;
     if let Some(current) = current.as_ref()
@@ -22760,6 +22903,8 @@ fn run_publication_rebuild(
                     }
                     discover_cross_domain_links(&store)?;
                     drop(store);
+                    let receipt = preserved_state.clone().import_into(&target_db)?;
+                    receipt.write_bound(&target_db)?;
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
                         &operation_uuid,
@@ -22819,7 +22964,14 @@ fn run_publication_rebuild(
                     });
                     let external = config.embedding.external_endpoint.as_deref();
                     let cache_dir = nestweaver_engine::resolve_user_path(&config.embedding.cache_dir)?;
-                    let exit = run_embed(
+                    let cancel_check = || {
+                        Ok(nestweaver_engine::publication_operation::load_operation(
+                            &publication_root,
+                            &operation_uuid,
+                        )?
+                        .cancel_requested)
+                    };
+                    let exit = run_embed_with_cancel(
                         Some(&target_db),
                         external.is_none(),
                         external,
@@ -22833,6 +22985,7 @@ fn run_publication_rebuild(
                         true,
                         false,
                         load_cli_local_embedder,
+                        Some(&cancel_check),
                     )?;
                     if exit != EXIT_SUCCESS {
                         anyhow::bail!("complete publication re-embed reported failures");
@@ -22884,9 +23037,15 @@ fn run_publication_rebuild(
                     let active = GraphStore::open_read_only(&active_db)?;
                     let observed = nestweaver_engine::PublicationSourceManifest::capture(&active)?;
                     drop(active);
-                    if observed != sources {
+                    let observed_state = nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&active_db)?;
+                    let observed_input = publication_input_fingerprint(
+                        &observed,
+                        config_path,
+                        &observed_state.fingerprint()?,
+                    )?;
+                    if observed != sources || observed_input != state.plan.input_fingerprint {
                         anyhow::bail!(
-                            "publication sources changed during rebuild; resume starts only after the inputs are stable"
+                            "publication sources, configuration, or preserved user state changed during rebuild; resume starts only after the inputs are stable"
                         );
                     }
                     nestweaver_engine::backup::seal_publication_slot(&target_db, &slot)?;
@@ -22941,6 +23100,17 @@ fn run_publication_rebuild(
             if let Ok(latest) = nestweaver_engine::publication_operation::load_operation(
                 &publication_root,
                 &operation_uuid,
+            ) && latest.cancel_requested
+                && !latest.phase.is_terminal()
+            {
+                nestweaver_engine::publication_operation::acknowledge_cancel(
+                    &publication_root,
+                    &operation_uuid,
+                    latest.revision,
+                )?
+            } else if let Ok(latest) = nestweaver_engine::publication_operation::load_operation(
+                &publication_root,
+                &operation_uuid,
             ) && !latest.phase.is_terminal()
                 && latest.failure.is_none()
             {
@@ -22952,8 +23122,10 @@ fn run_publication_rebuild(
                     format!("{error:#}"),
                     true,
                 );
+                return Err(error);
+            } else {
+                return Err(error);
             }
-            return Err(error);
         }
     };
     if json {
@@ -22977,6 +23149,23 @@ fn run_publication_rebuild(
             EXIT_SUCCESS
         },
     )
+}
+
+fn publication_input_fingerprint(
+    sources: &nestweaver_engine::PublicationSourceManifest,
+    config_path: &Path,
+    preserved_state_fingerprint: &str,
+) -> anyhow::Result<String> {
+    let source_fingerprint = sources.fingerprint()?;
+    let config_bytes = std::fs::read(config_path)
+        .with_context(|| format!("read publication config {}", config_path.display()))?;
+    let mut bytes = b"nestweaver-publication-input-v1\0".to_vec();
+    bytes.extend_from_slice(source_fingerprint.as_bytes());
+    bytes.extend_from_slice(b"\0instance-config\0");
+    bytes.extend_from_slice(&config_bytes);
+    bytes.extend_from_slice(b"\0preserved-state\0");
+    bytes.extend_from_slice(preserved_state_fingerprint.as_bytes());
+    Ok(nestweaver_engine::hash::blake3_hex_bytes(&bytes))
 }
 
 fn verify_staged_publication_identity(
@@ -23054,6 +23243,12 @@ fn publication_startup_smoke(
     store.list_vaults(None)?;
     store.count_symbols()?;
     store.count_notes()?;
+    let text_index = TantivyIndex::open_reader_only(&tantivy_sidecar_path_for(&selected_db))?;
+    text_index.search("nestweaver", 1)?;
+    store.regex_search("(?s).", None, None, Some(1), Some(1_000))?;
+    if let Some(dimension) = store.embedding_index_dimension() {
+        store.vector_search(&vec![0.0; dimension], 1);
+    }
     Ok(())
 }
 
@@ -24814,7 +25009,7 @@ credential_method = "gh"
         let serialized = serde_json::to_string(&c).unwrap();
         assert_eq!(
             serialized,
-            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"scanned_candidates":0}"#
+            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"error_scopes":0,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":0,"timings":{"planning_ms":0,"hydration_ms":0,"verification_ms":0,"total_ms":0}}"#
         );
 
         // A pre-`stale_index` daemon payload still rebuilds (default false).
@@ -27675,6 +27870,49 @@ mod embed_metadata_truth_tests {
     fn recorded_metadata(db_path: &Path) -> Option<(String, u32)> {
         let store = nestweaver_store::GraphStore::open_read_only(db_path).unwrap();
         store.get_embedding_metadata().unwrap()
+    }
+
+    #[test]
+    fn publication_embed_cancellation_stops_before_loading_the_model() {
+        let (_dir, db_path) = seed_embed_db(&[], &["pending"], None);
+        let loader = StubLoader::new(3);
+        let error = run_embed_with_cancel(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL),
+            None,
+            None,
+            8,
+            "all",
+            true,
+            false,
+            false,
+            loader.closure(),
+            Some(&|| Ok(true)),
+        )
+        .expect_err("a requested cancellation must stop embedding");
+        assert!(error.to_string().contains("safe batch boundary"));
+        assert_eq!(loader.call_count(), 0);
+    }
+
+    #[test]
+    fn publication_resume_fingerprint_changes_with_instance_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("instance.toml");
+        std::fs::write(&config, "instance_id = 'alpha'\n").unwrap();
+        let sources = nestweaver_engine::PublicationSourceManifest {
+            version: nestweaver_engine::publication_source::PUBLICATION_SOURCE_MANIFEST_VERSION,
+            repos: Vec::new(),
+            vaults: Vec::new(),
+        };
+        let first = publication_input_fingerprint(&sources, &config, "preserved-a").unwrap();
+        std::fs::write(&config, "instance_id = 'beta'\n").unwrap();
+        let second = publication_input_fingerprint(&sources, &config, "preserved-a").unwrap();
+        assert_ne!(first, second);
+        let third = publication_input_fingerprint(&sources, &config, "preserved-b").unwrap();
+        assert_ne!(second, third);
     }
 
     /// Reproduction A: a fully embedded database re-embedded with a different

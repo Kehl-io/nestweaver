@@ -280,6 +280,22 @@ The first build compiles LadybugDB from source and may take several minutes.
 </details>
 
 <details>
+<summary>Publication Commands</summary>
+
+| Command | Description |
+|---------|-------------|
+| `publication rebuild --config <path>` | Build a fresh graph and every derived artifact beside the incumbent, validate it, then atomically activate it |
+| `publication status` | Inspect resumable operation phase, progress, cancellation, and actionable failure state |
+| `publication cancel` | Request cooperative cancellation at an exact observed journal revision |
+| `publication discard` | Remove cancelled or failed unselected staging at an exact revision |
+| `publication rollback` | Switch back one step to the retained predecessor while the daemon is stopped |
+
+The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
+[publication rebuild and recovery guide](docs/guide/publication-rebuild.md).
+
+</details>
+
+<details>
 <summary>Analysis Commands</summary>
 
 | Command | Description |

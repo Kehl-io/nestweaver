@@ -257,10 +257,6 @@ pub struct GraphStore {
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
-    /// Generation/digest-keyed trigram scope trust verdict. The digest keeps
-    /// raw/import mutations that do not bump the in-process generation from
-    /// reusing a narrower stale verdict.
-    pub(crate) trigram_scope_cache: Mutex<Option<crate::regex::TrigramScopeCache>>,
     /// Last canonical generation while an index publication is dirty. A
     /// present value means `graph_generation` is either its dirty N+1
     /// reservation or the prepared clean N+2 publication. Keeping this
@@ -296,6 +292,7 @@ pub struct GraphStore {
     /// the same regex-v3 implementation as persistent stores without creating
     /// graph-resident postings.
     regex_ephemeral_root: Option<tempfile::TempDir>,
+    pub(crate) regex_reader_pool: std::sync::Arc<crate::regex_index::RegexReaderPool>,
     /// Cached PPR adjacency graph. Holds the last-built `(uids, uid_to_idx,
     /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
@@ -582,7 +579,6 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -590,6 +586,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -634,7 +631,6 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -642,6 +638,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -670,7 +667,6 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -678,6 +674,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -707,7 +704,6 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -715,6 +711,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -770,7 +767,6 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
@@ -778,6 +774,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
             regex_ephemeral_root: Some(regex_ephemeral_root),
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),

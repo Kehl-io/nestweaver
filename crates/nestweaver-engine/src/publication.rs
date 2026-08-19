@@ -15,6 +15,10 @@ pub const SOURCE_MANIFEST_SUFFIX: &str = ".sources.json";
 pub const SOURCE_MANIFEST_ARTIFACT_KIND: &str = "publication_source_manifest";
 pub const SOURCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SOURCE_MANIFEST_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-source-manifest-v1";
+pub const PRESERVED_STATE_SUFFIX: &str = ".preserved-state.json";
+pub const PRESERVED_STATE_ARTIFACT_KIND: &str = "publication_preserved_state_receipt";
+pub const PRESERVED_STATE_SCHEMA_VERSION: u32 = 1;
+pub const PRESERVED_STATE_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-preserved-state-v1";
 
 /// Validate a live PageRank envelope before a sealed publication describes
 /// it, returning the exact schema and algorithm/scope fingerprint carried by
@@ -109,12 +113,38 @@ pub(crate) fn source_manifest_artifact_contract(
     ))
 }
 
+pub(crate) fn preserved_state_artifact_contract(
+    bytes: &[u8],
+    identity: &nestweaver_store::PublicationIdentity,
+    producer_version: &str,
+    source_graph_generation: u64,
+) -> anyhow::Result<(u32, String)> {
+    let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+        serde_json::from_slice(bytes).map_err(|error| {
+            anyhow::anyhow!("preserved-state receipt is not self-describing: {error}")
+        })?;
+    let _: crate::publication_state::PreservedStateReceipt =
+        envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+            artifact_kind: PRESERVED_STATE_ARTIFACT_KIND,
+            artifact_schema_version: PRESERVED_STATE_SCHEMA_VERSION,
+            identity,
+            producer_version,
+            source_graph_generation,
+            algorithm_fingerprint: PRESERVED_STATE_ALGORITHM_FINGERPRINT,
+        })?;
+    Ok((
+        PRESERVED_STATE_SCHEMA_VERSION,
+        PRESERVED_STATE_ALGORITHM_FINGERPRINT.to_string(),
+    ))
+}
+
 /// Typed role of one file in a sealed publication bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Graph,
     SourceManifest,
+    PreservedState,
     CompatibilityStamp,
     InstanceConfig,
     Ranking,

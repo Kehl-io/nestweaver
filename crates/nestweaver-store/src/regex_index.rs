@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
@@ -113,6 +114,48 @@ struct Fields {
     metadata: Field,
 }
 
+#[derive(Clone)]
+struct CachedShard {
+    generation: String,
+    index: Index,
+    fields: Fields,
+    metadata: RegexShardMetadata,
+}
+
+/// Process-local, descriptor-bounded cache of opened scope indexes.
+/// Searchers remain snapshot-isolated; the cache only avoids reopening the
+/// same directory and is cleared before generation garbage collection.
+pub(crate) struct RegexReaderPool {
+    shards: Mutex<lru::LruCache<String, CachedShard>>,
+}
+
+impl Default for RegexReaderPool {
+    fn default() -> Self {
+        Self {
+            shards: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(32).expect("non-zero regex reader pool capacity"),
+            )),
+        }
+    }
+}
+
+impl RegexReaderPool {
+    fn clear(&self) {
+        self.shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let uid = builder.add_text_field("uid", STRING | STORED);
@@ -193,14 +236,28 @@ fn read_metadata(index: &Index, fields: Fields) -> Result<(RegexShardMetadata, u
 }
 
 /// Filesystem manager for immutable per-scope regex shard generations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RegexIndex {
     root: PathBuf,
+    readers: Arc<RegexReaderPool>,
 }
 
 impl RegexIndex {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            readers: Arc::new(RegexReaderPool::default()),
+        }
+    }
+
+    pub(crate) fn with_reader_pool(
+        root: impl Into<PathBuf>,
+        readers: Arc<RegexReaderPool>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            readers,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -246,6 +303,19 @@ impl RegexIndex {
         let Some(pointer) = self.current_pointer(scope_uid)? else {
             return Ok(None);
         };
+        if let Some(cached) = self
+            .readers
+            .shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope_uid)
+            .filter(|cached| {
+                cached.generation == pointer.generation && cached.metadata == pointer.metadata
+            })
+            .cloned()
+        {
+            return Ok(Some((cached.index, cached.fields, cached.metadata)));
+        }
         let path = self
             .scope_root(scope_uid)
             .join("generations")
@@ -260,6 +330,19 @@ impl RegexIndex {
                 "regex shard metadata/content mismatch for scope {scope_uid}"
             )));
         }
+        self.readers
+            .shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .put(
+                scope_uid.to_string(),
+                CachedShard {
+                    generation: pointer.generation,
+                    index: index.clone(),
+                    fields,
+                    metadata: observed.clone(),
+                },
+            );
         Ok(Some((index, fields, observed)))
     }
 
@@ -581,9 +664,138 @@ impl RegexIndex {
     /// readers may finish against immutable generation files; cleanup is a
     /// separate retention operation.
     pub fn retire_scope(&self, scope_uid: &str) -> Result<bool, StoreError> {
-        let current = self.scope_root(scope_uid).join("CURRENT");
-        crate::durable_sidecar::remove_file_durable_if_exists(&current)
-            .map_err(|error| StoreError::Query(format!("retire regex scope {scope_uid}: {error}")))
+        self.readers.clear();
+        let scope_root = self.scope_root(scope_uid);
+        let current = scope_root.join("CURRENT");
+        let selector_removed = crate::durable_sidecar::remove_file_durable_if_exists(&current)
+            .map_err(|error| {
+                StoreError::Query(format!("retire regex scope {scope_uid}: {error}"))
+            })?;
+        if scope_root.exists() {
+            std::fs::remove_dir_all(&scope_root).map_err(|error| {
+                StoreError::Query(format!(
+                    "garbage-collect retired regex scope {scope_uid}: {error}"
+                ))
+            })?;
+            crate::durable_sidecar::sync_parent_directory_durable(&scope_root).map_err(
+                |error| {
+                    StoreError::Query(format!(
+                        "sync retired regex scope directory {scope_uid}: {error}"
+                    ))
+                },
+            )?;
+            return Ok(true);
+        }
+        Ok(selector_removed)
+    }
+
+    /// Remove unselected generations and selector-less retired scopes.
+    ///
+    /// This is deliberately separate from publication: a reader that still
+    /// holds an old generation may delay deletion on Windows. The selected
+    /// generation is never removed, and a corrupt selector fails closed
+    /// rather than guessing which generation is live. A later refresh retries
+    /// cleanup, so transient descriptor pressure cannot lose the shard.
+    pub fn garbage_collect(&self) -> Result<usize, StoreError> {
+        self.readers.clear();
+        let scopes = self.root.join("scopes");
+        let entries = match std::fs::read_dir(&scopes) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(StoreError::Query(format!(
+                    "list regex shards for garbage collection: {error}"
+                )));
+            }
+        };
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                StoreError::Query(format!("read regex shard for garbage collection: {error}"))
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|error| StoreError::Query(format!("inspect regex shard: {error}")))?
+                .is_dir()
+            {
+                continue;
+            }
+            let scope_root = entry.path();
+            let current_path = scope_root.join("CURRENT");
+            let pointer = match std::fs::read(&current_path) {
+                Ok(bytes) => {
+                    let pointer: CurrentPointer = serde_json::from_slice(&bytes).map_err(|error| {
+                        StoreError::Query(format!(
+                            "refusing regex garbage collection with corrupt selector {}: {error}",
+                            current_path.display()
+                        ))
+                    })?;
+                    pointer.validate()?;
+                    pointer
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::remove_dir_all(&scope_root).map_err(|error| {
+                        StoreError::Query(format!(
+                            "remove retired regex shard {}: {error}",
+                            scope_root.display()
+                        ))
+                    })?;
+                    removed += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(StoreError::Query(format!(
+                        "read regex shard selector {}: {error}",
+                        current_path.display()
+                    )));
+                }
+            };
+            if scope_hash(&pointer.metadata.scope_uid) != entry.file_name().to_string_lossy() {
+                return Err(StoreError::Query(format!(
+                    "refusing regex garbage collection after scope-hash collision for {}",
+                    pointer.metadata.scope_uid
+                )));
+            }
+            let generations = scope_root.join("generations");
+            let generation_entries = match std::fs::read_dir(&generations) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(StoreError::Query(format!(
+                        "list regex generations {}: {error}",
+                        generations.display()
+                    )));
+                }
+            };
+            for generation in generation_entries {
+                let generation = generation.map_err(|error| {
+                    StoreError::Query(format!("read regex generation: {error}"))
+                })?;
+                if generation.file_name() == std::ffi::OsStr::new(&pointer.generation) {
+                    continue;
+                }
+                let path = generation.path();
+                if generation
+                    .file_type()
+                    .map_err(|error| {
+                        StoreError::Query(format!("inspect regex generation: {error}"))
+                    })?
+                    .is_dir()
+                {
+                    std::fs::remove_dir_all(&path).map_err(|error| {
+                        StoreError::Query(format!(
+                            "remove unselected regex generation {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    removed += 1;
+                }
+            }
+        }
+        crate::durable_sidecar::sync_parent_directory_durable(&scopes).map_err(|error| {
+            StoreError::Query(format!("sync regex garbage collection: {error}"))
+        })?;
+        Ok(removed)
     }
 
     /// Inspect every currently selected shard without trusting directory names
@@ -707,5 +919,97 @@ mod tests {
                 .unwrap(),
             HashSet::from(["sym:two".to_string()])
         );
+    }
+
+    #[test]
+    fn garbage_collection_keeps_only_selected_generations_and_retires_one_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        index
+            .replace_scope(
+                metadata(1, 1, "digest-one"),
+                std::slice::from_ref(&document),
+            )
+            .unwrap();
+        index
+            .replace_scope(metadata(2, 1, "digest-two"), &[document])
+            .unwrap();
+        let generations = index.scope_root("repo:test").join("generations");
+        assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 2);
+        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 1);
+
+        assert!(index.retire_scope("repo:test").unwrap());
+        assert!(!index.scope_root("repo:test").exists());
+    }
+
+    #[test]
+    fn reader_pool_evicts_under_many_scope_descriptor_pressure() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        for ordinal in 0..40 {
+            let scope_uid = format!("repo:scope-{ordinal}");
+            let trigrams = HashSet::from(["alp".to_string()]);
+            let document = RegexShardDocument {
+                uid: "sym:one",
+                kind: "Symbol",
+                text_hash: "hash-one",
+                trigrams: &trigrams,
+            };
+            let mut scope_metadata = metadata(1, 1, &format!("digest-{ordinal}"));
+            scope_metadata.scope_uid = scope_uid.clone();
+            index.replace_scope(scope_metadata, &[document]).unwrap();
+            assert!(index.metadata(&scope_uid).unwrap().is_some());
+        }
+        assert_eq!(index.readers.len(), 32);
+        assert!(index.retire_scope("repo:scope-0").unwrap());
+    }
+
+    #[test]
+    fn pointer_faults_preserve_an_old_or_complete_new_shard() {
+        use crate::durable_sidecar::{TestFault, with_test_fault};
+
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        let initial = metadata(1, 1, "digest-one");
+        index
+            .replace_scope(initial.clone(), std::slice::from_ref(&document))
+            .unwrap();
+
+        let staged = metadata(2, 1, "digest-two");
+        let error = with_test_fault(TestFault::Persist, || {
+            index.replace_scope(staged, std::slice::from_ref(&document))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("publish regex pointer"));
+        assert_eq!(index.metadata("repo:test").unwrap(), Some(initial));
+        assert_eq!(index.garbage_collect().unwrap(), 1);
+
+        let published = metadata(3, 1, "digest-three");
+        let error = with_test_fault(TestFault::ParentSync, || {
+            index.replace_scope(published.clone(), &[document])
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("publish regex pointer"));
+        assert_eq!(index.metadata("repo:test").unwrap(), Some(published));
+
+        let error =
+            with_test_fault(TestFault::Remove, || index.retire_scope("repo:test")).unwrap_err();
+        assert!(error.to_string().contains("retire regex scope"));
+        assert!(index.metadata("repo:test").unwrap().is_some());
     }
 }

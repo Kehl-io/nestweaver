@@ -949,7 +949,18 @@ mod tests {
 
     #[test]
     fn pooling_modes_match_sentence_transformers_masked_formulas() {
-        let tokens = vec![vec![1.0, 4.0], vec![3.0, 2.0], vec![99.0, 99.0]];
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            source: String,
+            token_vectors: Vec<Vec<f32>>,
+            attention_mask: Vec<u32>,
+            expected: Vec<f32>,
+        }
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../tests/fixtures/sentence_transformers_pooling_golden.json"
+        ))
+        .unwrap();
+        assert!(golden.source.contains("sentence-transformers"));
         let modes = [
             EmbeddingPoolingMode::Cls,
             EmbeddingPoolingMode::Max,
@@ -958,24 +969,10 @@ mod tests {
             EmbeddingPoolingMode::WeightedMean,
             EmbeddingPoolingMode::LastToken,
         ];
-        let actual = pool_token_vectors(&tokens, &[1, 1, 0], &modes).unwrap();
-        let root_two = 2.0_f32.sqrt();
-        let expected = vec![
-            1.0,
-            4.0, // CLS
-            3.0,
-            4.0, // max
-            2.0,
-            3.0, // mean
-            4.0 / root_two,
-            6.0 / root_two, // mean sqrt length
-            7.0 / 3.0,
-            8.0 / 3.0, // weighted mean
-            3.0,
-            2.0, // last token
-        ];
-        assert_eq!(actual.len(), expected.len());
-        for (actual, expected) in actual.iter().zip(expected) {
+        let actual =
+            pool_token_vectors(&golden.token_vectors, &golden.attention_mask, &modes).unwrap();
+        assert_eq!(actual.len(), golden.expected.len());
+        for (actual, expected) in actual.iter().zip(golden.expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
     }
