@@ -1745,7 +1745,23 @@ impl GraphStore {
                 .as_ref()
                 .expect("sidecar path requires database path");
             let journal = Self::embedding_journal_for(db_path);
-            if !path.exists() {
+            let base_exists = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => true,
+                Ok(_) => {
+                    return Err(StoreError::Query(format!(
+                        "embedding-v2 base {} is not a regular file",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(StoreError::Query(format!(
+                        "inspect embedding-v2 base {}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            if !base_exists {
                 idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
                     .map_err(|e| StoreError::Query(format!("save embedding-v2 sidecar: {e}")))?;
                 idx.adopt_binary_v2(&path).map_err(|error| {
@@ -3457,6 +3473,20 @@ mod tests {
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert!(!reopened.has_embedding("symbol:stale"));
+    }
+
+    #[test]
+    fn embedding_flush_rejects_a_non_file_base_before_appending_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:stale", vec![1.0, 0.0]));
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        std::fs::create_dir(&embedding_path).unwrap();
+
+        let error = store.flush_embedding_index().unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]
