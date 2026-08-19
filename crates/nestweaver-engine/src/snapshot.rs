@@ -496,10 +496,8 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
         SIDECAR_PAGERANK => anyhow::bail!(
             "PageRank contract requires payload inspection; use artifact_contract_for_payload"
         ),
-        SIDECAR_MANIFESTS => (
-            ArtifactKind::RepoManifest,
-            1,
-            "nestweaver-repo-manifest-json-v1".to_string(),
+        SIDECAR_MANIFESTS => anyhow::bail!(
+            "repository manifest contract requires payload inspection; use artifact_contract_for_payload"
         ),
         SIDECAR_EMBEDDINGS => (
             ArtifactKind::Embeddings,
@@ -525,20 +523,30 @@ fn artifact_contract_for_payload(
     source_graph_generation: u64,
     payload: Option<&[u8]>,
 ) -> anyhow::Result<(ArtifactKind, u32, String)> {
-    if path == SIDECAR_PAGERANK {
-        let payload = payload
-            .ok_or_else(|| anyhow::anyhow!("PageRank contract requires its artifact payload"))?;
+    if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS {
+        let payload =
+            payload.ok_or_else(|| anyhow::anyhow!("artifact contract requires its payload"))?;
         let identity = nestweaver_store::PublicationIdentity {
             brain_uuid: stamp.brain_uuid.clone(),
             publication_uuid: stamp.publication_uuid.clone(),
         };
-        let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
-            payload,
-            &identity,
-            &stamp.engine_version,
-            source_graph_generation,
-        )?;
-        return Ok((ArtifactKind::Ranking, schema, fingerprint));
+        return if path == SIDECAR_PAGERANK {
+            let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
+                payload,
+                &identity,
+                &stamp.engine_version,
+                source_graph_generation,
+            )?;
+            Ok((ArtifactKind::Ranking, schema, fingerprint))
+        } else {
+            let (schema, fingerprint) = crate::publication::repo_manifest_artifact_contract(
+                payload,
+                &identity,
+                &stamp.engine_version,
+                source_graph_generation,
+            )?;
+            Ok((ArtifactKind::RepoManifest, schema, fingerprint))
+        };
     }
     artifact_contract(path, stamp)
 }
@@ -675,18 +683,19 @@ fn verify_publication_bundle(
                 bundle.source_graph_generation
             );
         }
-        let contract_payload = if descriptor.path == SIDECAR_PAGERANK {
-            Some(
-                std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to read publication artifact {}: {error}",
-                        descriptor.path
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
+        let contract_payload =
+            if descriptor.path == SIDECAR_PAGERANK || descriptor.path == SIDECAR_MANIFESTS {
+                Some(
+                    std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to read publication artifact {}: {error}",
+                            descriptor.path
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
         let (kind, schema_version, fingerprint) = artifact_contract_for_payload(
             &descriptor.path,
             stamp,
@@ -1437,8 +1446,8 @@ mod tests {
         store
             .save_pagerank_cache(&crate::sidecar_path(&db, ".pagerank.json"))
             .unwrap();
+        crate::save_manifest_cache_for_db(&std::collections::HashMap::new(), &store, &db).unwrap();
         drop(store);
-        std::fs::write(crate::sidecar_path(&db, ".manifests.json"), b"{}").unwrap();
 
         let stamp = make_stamp(
             env!("CARGO_PKG_VERSION"),

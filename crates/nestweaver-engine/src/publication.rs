@@ -52,6 +52,33 @@ pub(crate) fn pagerank_artifact_contract(
     ))
 }
 
+pub(crate) fn repo_manifest_artifact_contract(
+    bytes: &[u8],
+    identity: &nestweaver_store::PublicationIdentity,
+    producer_version: &str,
+    source_graph_generation: u64,
+) -> anyhow::Result<(u32, String)> {
+    let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+        serde_json::from_slice(bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "repository manifest sidecar is not a self-describing v2 artifact envelope: {error}"
+            )
+        })?;
+    let _: std::collections::HashMap<String, crate::manifest::ManifestInfo> = envelope
+        .validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+            artifact_kind: crate::manifest::MANIFEST_ARTIFACT_KIND,
+            artifact_schema_version: crate::manifest::MANIFEST_ARTIFACT_SCHEMA_VERSION,
+            identity,
+            producer_version,
+            source_graph_generation,
+            algorithm_fingerprint: crate::manifest::MANIFEST_ALGORITHM_FINGERPRINT,
+        })?;
+    Ok((
+        crate::manifest::MANIFEST_ARTIFACT_SCHEMA_VERSION,
+        crate::manifest::MANIFEST_ALGORITHM_FINGERPRINT.to_string(),
+    ))
+}
+
 /// Typed role of one file in a sealed publication bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -202,6 +202,7 @@ pub fn resolve_repo_selector<'a>(
 pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
+mod artifact_sidecar;
 pub mod atomic_changes;
 pub mod authz;
 pub mod backup;

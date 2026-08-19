@@ -6381,7 +6381,8 @@ impl NestWeaverDaemon for DaemonService {
 
         let result = tokio::task::spawn_blocking(move || {
             let manifests =
-                nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)
+                    .unwrap_or_default();
             let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
             serde_json::to_string(&suggestions)
@@ -12497,7 +12498,8 @@ mod startup_helper_tests {
         .unwrap();
 
         assert_eq!(result.repo_uids_removed, vec![source_uid.clone()]);
-        let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap();
+        let manifests =
+            nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path).unwrap();
         assert!(!manifests.contains_key(&source_uid));
         assert_eq!(
             manifests[&target_uid].package_name.as_deref(),

@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::content_reader::ContentReader;
 
+pub(crate) const MANIFEST_ARTIFACT_KIND: &str = "repo_manifest";
+pub(crate) const MANIFEST_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const MANIFEST_ALGORITHM_FINGERPRINT: &str = "nestweaver-repo-manifest-v2";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestInfo {
     pub package_name: Option<String>,
@@ -76,20 +80,35 @@ pub fn manifest_cache_path(db_path: &Path) -> PathBuf {
 /// Load the canonical manifest sidecar, migrating the legacy replacement-
 /// extension path when it is the only copy present.
 pub fn load_manifest_cache_for_db(
+    store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> Result<HashMap<String, ManifestInfo>, anyhow::Error> {
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    load_manifest_cache(&manifest_cache_path(db_path))
+    Ok(crate::artifact_sidecar::load_json(
+        store,
+        &manifest_cache_path(db_path),
+        MANIFEST_ARTIFACT_KIND,
+        MANIFEST_ARTIFACT_SCHEMA_VERSION,
+        MANIFEST_ALGORITHM_FINGERPRINT,
+    )?
+    .unwrap_or_default())
 }
 
 /// Persist the canonical manifest sidecar and retire the legacy copy only
 /// after the replacement has been durably flushed and renamed into place.
 pub fn save_manifest_cache_for_db(
     manifests: &HashMap<String, ManifestInfo>,
+    store: &nestweaver_store::GraphStore,
     db_path: &Path,
 ) -> Result<(), anyhow::Error> {
     let canonical_path = manifest_cache_path(db_path);
-    save_manifest_cache(manifests, &canonical_path)?;
+    crate::artifact_sidecar::save_json(
+        store,
+        &canonical_path,
+        MANIFEST_ARTIFACT_KIND,
+        MANIFEST_ARTIFACT_SCHEMA_VERSION,
+        MANIFEST_ALGORITHM_FINGERPRINT,
+        manifests,
+    )?;
 
     let legacy_path = db_path.with_extension("manifests.json");
     if legacy_path != canonical_path {
@@ -739,15 +758,16 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
     fn save_manifest_cache_for_db_retires_legacy_only_after_canonical_save() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
         let legacy_path = db_path.with_extension("manifests.json");
         std::fs::write(&legacy_path, r#"{"repo:legacy":{}}"#).unwrap();
         let manifests = HashMap::from([("repo:canonical".to_string(), ManifestInfo::default())]);
 
-        save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+        save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
 
         assert!(!legacy_path.exists());
         assert!(
-            load_manifest_cache(&manifest_cache_path(&db_path))
+            load_manifest_cache_for_db(&store, &db_path)
                 .unwrap()
                 .contains_key("repo:canonical")
         );
@@ -755,9 +775,47 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         std::fs::write(&legacy_path, r#"{"repo:still-safe":{}}"#).unwrap();
         std::fs::remove_file(manifest_cache_path(&db_path)).unwrap();
         std::fs::create_dir(manifest_cache_path(&db_path)).unwrap();
-        let error = save_manifest_cache_for_db(&manifests, &db_path).unwrap_err();
+        let error = save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap_err();
         assert!(!error.to_string().is_empty());
         assert!(legacy_path.exists(), "failed canonical save removed legacy");
+    }
+
+    #[test]
+    fn canonical_manifest_cache_rejects_legacy_foreign_and_stale_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db = dir.path().join("source.lbug");
+        let source = nestweaver_store::GraphStore::create(&source_db).unwrap();
+        let manifests = HashMap::from([("repo:source".to_string(), ManifestInfo::default())]);
+        save_manifest_cache_for_db(&manifests, &source, &source_db).unwrap();
+        let source_path = manifest_cache_path(&source_db);
+        let valid = std::fs::read(&source_path).unwrap();
+
+        std::fs::write(&source_path, r#"{"repo:legacy":{}}"#).unwrap();
+        let legacy = load_manifest_cache_for_db(&source, &source_db).unwrap_err();
+        assert!(
+            legacy.to_string().contains("run a full reindex"),
+            "{legacy}"
+        );
+
+        std::fs::write(&source_path, &valid).unwrap();
+        source.bump_graph_generation();
+        let stale = load_manifest_cache_for_db(&source, &source_db).unwrap_err();
+        assert!(
+            stale.to_string().contains("stale artifact generation"),
+            "{stale}"
+        );
+
+        let foreign_db = dir.path().join("foreign.lbug");
+        let foreign = nestweaver_store::GraphStore::create(&foreign_db).unwrap();
+        let foreign_path = manifest_cache_path(&foreign_db);
+        std::fs::write(&foreign_path, valid).unwrap();
+        let foreign_error = load_manifest_cache_for_db(&foreign, &foreign_db).unwrap_err();
+        assert!(
+            foreign_error
+                .to_string()
+                .contains("foreign artifact identity"),
+            "{foreign_error}"
+        );
     }
 
     #[test]

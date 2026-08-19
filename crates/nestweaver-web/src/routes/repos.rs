@@ -56,7 +56,7 @@ pub async fn cross_repo_refs(
 }
 
 pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path)?;
+    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)?;
     let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)?;
     let json = json!({
         "links": serde_json::to_value(&suggestions.links)?,

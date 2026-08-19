@@ -718,18 +718,34 @@ fn backup_artifact_contract_for_payload(
     identity: &nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
 ) -> anyhow::Result<(crate::publication::ArtifactKind, u32, String)> {
-    if path.strip_prefix(db_filename) == Some(".pagerank.json") {
-        let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
-            payload,
-            identity,
-            env!("CARGO_PKG_VERSION"),
-            source_graph_generation,
-        )?;
-        return Ok((
-            crate::publication::ArtifactKind::Ranking,
-            schema,
-            fingerprint,
-        ));
+    match path.strip_prefix(db_filename) {
+        Some(".pagerank.json") => {
+            let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
+                payload,
+                identity,
+                env!("CARGO_PKG_VERSION"),
+                source_graph_generation,
+            )?;
+            return Ok((
+                crate::publication::ArtifactKind::Ranking,
+                schema,
+                fingerprint,
+            ));
+        }
+        Some(".manifests.json") => {
+            let (schema, fingerprint) = crate::publication::repo_manifest_artifact_contract(
+                payload,
+                identity,
+                env!("CARGO_PKG_VERSION"),
+                source_graph_generation,
+            )?;
+            return Ok((
+                crate::publication::ArtifactKind::RepoManifest,
+                schema,
+                fingerprint,
+            ));
+        }
+        _ => {}
     }
     backup_artifact_contract(path, db_filename)
 }
@@ -761,10 +777,8 @@ fn backup_artifact_contract(
             Some(".filemeta.json") => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
             }
-            Some(".manifests.json") => (
-                ArtifactKind::RepoManifest,
-                1,
-                "nestweaver-repo-manifest-json-v1",
+            Some(".manifests.json") => anyhow::bail!(
+                "repository manifest contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),
             Some(".gitactivity.json") => {
                 (ArtifactKind::GitActivity, 1, "nestweaver-git-activity-v1")
