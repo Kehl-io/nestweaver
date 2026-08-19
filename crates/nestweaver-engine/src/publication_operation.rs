@@ -399,6 +399,20 @@ pub fn activate_operation(
     expected_revision: u64,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
 ) -> anyhow::Result<PublicationOperationState> {
+    let state = select_operation(publication_root, operation_uuid, expected_revision, lease)?;
+    complete_activation(publication_root, operation_uuid, state.revision)
+}
+
+/// Select a validated publication but leave the journal in `Activating` so
+/// the caller can run a startup/read smoke against the exact path that
+/// `CURRENT` resolves. A failed smoke may roll the pointer back before the
+/// operation is made terminal.
+pub fn select_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+) -> anyhow::Result<PublicationOperationState> {
     let mut state = load_operation(publication_root, operation_uuid)?;
     if state.revision != expected_revision {
         anyhow::bail!(
@@ -450,6 +464,27 @@ pub fn activate_operation(
             state.plan.expected_current_publication_uuid.as_deref(),
             &pointer,
         )?;
+    }
+    Ok(state)
+}
+
+pub fn complete_activation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    let state = load_operation(publication_root, operation_uuid)?;
+    if state.revision != expected_revision || state.phase != PublicationPhase::Activating {
+        anyhow::bail!("publication completion requires the observed activating revision");
+    }
+    let current = crate::publication::read_current(publication_root)?
+        .ok_or_else(|| anyhow::anyhow!("CURRENT disappeared before activation completed"))?;
+    if !uuid_equal(
+        &current.publication_uuid,
+        &state.plan.target_publication_uuid,
+    )? || current.manifest_blake3 != state.validated_manifest_blake3.clone().unwrap_or_default()
+    {
+        anyhow::bail!("CURRENT does not select the validated target publication");
     }
     advance_phase(
         publication_root,

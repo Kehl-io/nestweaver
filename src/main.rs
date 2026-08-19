@@ -4615,6 +4615,33 @@ enum SnapshotCommands {
 
 #[derive(Subcommand)]
 enum PublicationCommands {
+    /// Build, validate, and optionally activate a fresh publication from every indexed source
+    Rebuild {
+        #[arg(
+            long,
+            help = "Resume this operation UUID instead of starting a new rebuild"
+        )]
+        operation: Option<String>,
+        #[arg(
+            long,
+            help = "Stable database anchor used to derive the publication root"
+        )]
+        db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config used to rebuild declared topology"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value = "32", help = "Embedding batch size")]
+        batch_size: usize,
+        #[arg(
+            long,
+            help = "Validate and retain the new publication without switching CURRENT"
+        )]
+        no_activate: bool,
+        #[arg(long, help = "Output the terminal operation state as JSON")]
+        json: bool,
+    },
     /// Show one operation or list every active operation journal
     Status {
         #[arg(long, help = "Operation UUID; omit to list all operations")]
@@ -4647,6 +4674,18 @@ enum PublicationCommands {
         root: Option<PathBuf>,
         #[arg(long, help = "Database path used to derive the publication root")]
         db: Option<PathBuf>,
+    },
+    /// Roll back CURRENT to its retained predecessor publication
+    Rollback {
+        #[arg(
+            long,
+            help = "Stable database anchor used to derive the publication root"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Output JSON")]
+        json: bool,
     },
 }
 
@@ -4943,6 +4982,21 @@ fn default_db_path() -> PathBuf {
 /// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
 /// select a DB instead of being silently ignored (Bug #19).
 fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let (resolved, cfg) = resolve_base_db_with_config(db, config)?;
+    let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
+    if let Some(config) = cfg.as_ref() {
+        assert_config_expected_brain(config, &selected)?;
+    }
+    Ok(selected)
+}
+
+/// Resolve the stable database anchor without following publication
+/// `CURRENT`. Publication administration derives its root from this path;
+/// ordinary reads and writes must use [`resolve_db_with_config`] instead.
+fn resolve_base_db_with_config(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>)> {
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
@@ -4952,10 +5006,7 @@ fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow:
     let resolved = db
         .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
         .unwrap_or_else(default_db_path);
-    if let Some(config) = cfg.as_ref() {
-        assert_config_expected_brain(config, &resolved)?;
-    }
-    Ok(resolved)
+    Ok((resolved, cfg))
 }
 
 /// Enforce a config's data binding before a command can route to a daemon or
@@ -5541,10 +5592,11 @@ fn resolve_index_db_path(
         .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
         .or_else(|| std::env::var("NESTWEAVER_DB").ok().map(PathBuf::from))
         .unwrap_or_else(|| repo_root.join("nestweaver.lbug"));
+    let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
     if let Some(config) = cfg.as_ref() {
-        assert_config_expected_brain(config, &resolved)?;
+        assert_config_expected_brain(config, &selected)?;
     }
-    Ok(resolved)
+    Ok(selected)
 }
 
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
@@ -19884,6 +19936,8 @@ mod cli_help_contract_tests {
             "nestweaver memory lint",
             "nestweaver memory related",
             "nestweaver project-context",
+            "nestweaver publication rebuild",
+            "nestweaver publication rollback",
             "nestweaver ranking explain",
             "nestweaver ranking rank",
             "nestweaver read-symbols",
@@ -22326,13 +22380,31 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
         }
         match root {
             Some(root) => Ok(root),
-            None => Ok(nestweaver_engine::publication::default_publication_root(
-                &resolve_db_with_config(db, None)?,
-            )),
+            None => {
+                let (base, _) = resolve_base_db_with_config(db, None)?;
+                Ok(nestweaver_engine::publication::default_publication_root(
+                    &base,
+                ))
+            }
         }
     }
 
     match command {
+        PublicationCommands::Rebuild {
+            operation,
+            db,
+            config,
+            batch_size,
+            no_activate,
+            json,
+        } => run_publication_rebuild(
+            db,
+            &config,
+            operation.as_deref(),
+            batch_size,
+            !no_activate,
+            json,
+        ),
         PublicationCommands::Status {
             operation,
             root: explicit_root,
@@ -22418,7 +22490,571 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             println!("Discarded publication operation {operation}");
             Ok(EXIT_SUCCESS)
         }
+        PublicationCommands::Rollback { db, config, json } => {
+            let (base_db, cfg) = resolve_base_db_with_config(db, config.as_deref())?;
+            let selected_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+            ensure_no_live_daemon_for_snapshot_build(&selected_db)?;
+            let root = nestweaver_engine::publication::default_publication_root(&base_db);
+            let current = nestweaver_engine::publication::read_current(&root)?
+                .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
+            let store = GraphStore::open(&selected_db).map_err(|error| {
+                anyhow::anyhow!("open selected publication for rollback: {error}")
+            })?;
+            if let Some(cfg) = cfg.as_ref() {
+                cfg.assert_expected_brain(&store)?;
+            }
+            let lease = store.acquire_index_publication_lease()?;
+            let selected = nestweaver_engine::publication::rollback_current(
+                &root,
+                &lease,
+                &current.publication_uuid,
+            )?;
+            lease.release()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "rolled_back_from": current.publication_uuid,
+                        "selected_publication": selected.as_ref().map(|pointer| &pointer.publication_uuid),
+                        "selected_database": nestweaver_engine::publication::resolve_selected_database(&base_db)?,
+                    }))?
+                );
+            } else if let Some(selected) = selected {
+                println!(
+                    "Rolled back publication {} to {}. Restart the daemon before serving requests.",
+                    current.publication_uuid, selected.publication_uuid
+                );
+            } else {
+                println!(
+                    "Rolled back publication {} to the retained base database. Restart the daemon before serving requests.",
+                    current.publication_uuid
+                );
+            }
+            Ok(EXIT_SUCCESS)
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_publication_rebuild(
+    db: Option<PathBuf>,
+    config_path: &Path,
+    operation_uuid: Option<&str>,
+    batch_size: usize,
+    activate: bool,
+    json: bool,
+) -> anyhow::Result<i32> {
+    if batch_size == 0 {
+        anyhow::bail!("--batch-size must be at least 1");
+    }
+    let (base_db, cfg) = resolve_base_db_with_config(db, Some(config_path))?;
+    let config = cfg.ok_or_else(|| anyhow::anyhow!("publication rebuild requires --config"))?;
+    let publication_root = nestweaver_engine::publication::default_publication_root(&base_db);
+    let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+    if !incumbent_db.exists() {
+        anyhow::bail!(
+            "incumbent database not found at {}; index the configured sources first",
+            incumbent_db.display()
+        );
+    }
+    ensure_no_live_daemon_for_snapshot_build(&incumbent_db)?;
+    let incumbent_store = GraphStore::open_read_only(&incumbent_db)
+        .map_err(|error| anyhow::anyhow!("open incumbent publication: {error}"))?;
+    config.assert_expected_brain(&incumbent_store)?;
+    let incumbent_identity = incumbent_store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("incumbent database has no publication identity"))?;
+    let sources = nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?;
+    let input_fingerprint = sources.fingerprint()?;
+    drop(incumbent_store);
+    let current = nestweaver_engine::publication::read_current(&publication_root)?;
+    if let Some(current) = current.as_ref()
+        && uuid::Uuid::parse_str(&current.publication_uuid)?
+            != uuid::Uuid::parse_str(&incumbent_identity.publication_uuid)?
+    {
+        anyhow::bail!(
+            "CURRENT selects {}, but the resolved graph reports {}; refuse a mixed publication",
+            current.publication_uuid,
+            incumbent_identity.publication_uuid
+        );
+    }
+
+    let mut state = if let Some(operation_uuid) = operation_uuid {
+        let loaded = nestweaver_engine::publication_operation::load_operation(
+            &publication_root,
+            operation_uuid,
+        )?;
+        let mut requested = loaded.plan.clone();
+        requested.input_fingerprint = input_fingerprint.clone();
+        requested.producer_version = env!("CARGO_PKG_VERSION").to_string();
+        requested.publication_format_version = nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION;
+        if loaded.cancel_requested {
+            let cancelled = nestweaver_engine::publication_operation::acknowledge_cancel(
+                &publication_root,
+                &loaded.plan.operation_uuid,
+                loaded.revision,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cancelled)?);
+            } else {
+                println!(
+                    "Publication {} was cancelled at revision {}.",
+                    cancelled.plan.operation_uuid, cancelled.revision
+                );
+            }
+            return Ok(EXIT_ERROR);
+        } else if loaded.failure.is_some() {
+            nestweaver_engine::publication_operation::resume_operation(
+                &publication_root,
+                &requested,
+                loaded.revision,
+            )?
+        } else {
+            loaded.resumable_with(&requested)?;
+            loaded
+        }
+    } else {
+        let target = incumbent_identity.next_publication()?;
+        let plan = nestweaver_engine::publication_operation::PublicationOperationPlan {
+            operation_uuid: uuid::Uuid::new_v4().to_string(),
+            brain_uuid: incumbent_identity.brain_uuid.clone(),
+            target_publication_uuid: target.publication_uuid,
+            expected_current_publication_uuid: current
+                .as_ref()
+                .map(|pointer| pointer.publication_uuid.clone()),
+            input_fingerprint,
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            publication_format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            created_unix_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+        };
+        let created =
+            nestweaver_engine::publication_operation::create_operation(&publication_root, plan)?;
+        eprintln!("Publication operation: {}", created.plan.operation_uuid);
+        created
+    };
+    let operation_uuid = state.plan.operation_uuid.clone();
+    let slot = nestweaver_engine::publication::slot_path(
+        &publication_root,
+        &state.plan.target_publication_uuid,
+    )?;
+    let target_db = slot.join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+
+    let result = (|| -> anyhow::Result<nestweaver_engine::publication_operation::PublicationOperationState> {
+        loop {
+            let latest = nestweaver_engine::publication_operation::load_operation(
+                &publication_root,
+                &operation_uuid,
+            )?;
+            if latest.revision != state.revision {
+                if latest.cancel_requested {
+                    return nestweaver_engine::publication_operation::acknowledge_cancel(
+                        &publication_root,
+                        &operation_uuid,
+                        latest.revision,
+                    );
+                }
+                anyhow::bail!("publication journal changed while the rebuild worker was active");
+            }
+            state = latest;
+            if state.cancel_requested {
+                return nestweaver_engine::publication_operation::acknowledge_cancel(
+                    &publication_root,
+                    &operation_uuid,
+                    state.revision,
+                );
+            }
+            use nestweaver_engine::publication_operation::PublicationPhase;
+            match state.phase {
+                PublicationPhase::Planned => {
+                    if !target_db.exists() {
+                        std::fs::create_dir_all(&slot)?;
+                        let target_identity = nestweaver_store::PublicationIdentity {
+                            brain_uuid: state.plan.brain_uuid.clone(),
+                            publication_uuid: state.plan.target_publication_uuid.clone(),
+                        };
+                        let store = GraphStore::create_with_publication_identity(
+                            &target_db,
+                            &target_identity,
+                        )?;
+                        drop(store);
+                    } else {
+                        verify_staged_publication_identity(&target_db, &state.plan)?;
+                    }
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::Graph,
+                    )?;
+                }
+                PublicationPhase::Graph => {
+                    verify_staged_publication_identity(&target_db, &state.plan)?;
+                    let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
+                    let mut completed = 0_u64;
+                    for repo in &sources.repos {
+                        state = publication_progress(
+                            &publication_root,
+                            &state,
+                            completed,
+                            total,
+                            format!("indexing repository {}", repo.url),
+                        )?;
+                        let indexed_sha = repo.observed_head.as_deref().unwrap_or("local");
+                        nestweaver_engine::index::index_directory_with_options_and_limits(
+                            Path::new(&repo.root_path),
+                            &target_db,
+                            &repo.instance_id,
+                            &repo.url,
+                            indexed_sha,
+                            true,
+                            repo.name.as_deref(),
+                            config.indexing.limits(),
+                        )?;
+                        completed += 1;
+                        state = reload_and_acknowledge_cancel(
+                            &publication_root,
+                            &operation_uuid,
+                            state,
+                        )?;
+                        if state.phase == PublicationPhase::Cancelled {
+                            return Ok(state);
+                        }
+                    }
+                    for vault in &sources.vaults {
+                        state = publication_progress(
+                            &publication_root,
+                            &state,
+                            completed,
+                            total,
+                            format!("indexing vault {}", vault.name),
+                        )?;
+                        index_markdown_directory_with_ignore(
+                            Path::new(&vault.root_path),
+                            &target_db,
+                            &vault.instance_id,
+                            &vault.name,
+                            &[],
+                        )?;
+                        completed += 1;
+                        state = reload_and_acknowledge_cancel(
+                            &publication_root,
+                            &operation_uuid,
+                            state,
+                        )?;
+                        if state.phase == PublicationPhase::Cancelled {
+                            return Ok(state);
+                        }
+                    }
+                    let store = GraphStore::open(&target_db)?;
+                    nestweaver_engine::project::materialize_projects(
+                        &store,
+                        &config,
+                        &config.instance_id,
+                        &target_db,
+                    )?;
+                    if let Some(links) = config.links.as_deref() {
+                        nestweaver_engine::materialize_declared_links(&store, links)?;
+                    }
+                    discover_cross_domain_links(&store)?;
+                    drop(store);
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::TextSearch,
+                    )?;
+                }
+                PublicationPhase::TextSearch => {
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        0,
+                        1,
+                        "building BM25 index".to_string(),
+                    )?;
+                    let store = GraphStore::open_read_only(&target_db)?;
+                    let tantivy = TantivyIndex::open_or_create(&tantivy_sidecar_path_for(&target_db))?;
+                    tantivy.reindex_from_store(&store)?;
+                    drop(store);
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::Regex,
+                    )?;
+                }
+                PublicationPhase::Regex => {
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        0,
+                        1,
+                        "building per-scope regex shards".to_string(),
+                    )?;
+                    let store = GraphStore::open(&target_db)?;
+                    store.rebuild_trigram_index()?;
+                    drop(store);
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::Embeddings,
+                    )?;
+                }
+                PublicationPhase::Embeddings => {
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        0,
+                        0,
+                        "re-embedding the complete staged corpus".to_string(),
+                    )?;
+                    let accelerator = Some(match config.embedding.accelerator {
+                        nestweaver_engine::config::EmbeddingAccelerator::Auto => CliEmbeddingAccelerator::Auto,
+                        nestweaver_engine::config::EmbeddingAccelerator::Metal => CliEmbeddingAccelerator::Metal,
+                        nestweaver_engine::config::EmbeddingAccelerator::Cpu => CliEmbeddingAccelerator::Cpu,
+                    });
+                    let external = config.embedding.external_endpoint.as_deref();
+                    let cache_dir = nestweaver_engine::resolve_user_path(&config.embedding.cache_dir)?;
+                    let exit = run_embed(
+                        Some(&target_db),
+                        external.is_none(),
+                        external,
+                        config.embedding.external_model.as_deref(),
+                        Some(&config.embedding.model_id),
+                        external.is_none().then_some(cache_dir.as_path()),
+                        if external.is_none() { accelerator } else { None },
+                        batch_size,
+                        "all",
+                        true,
+                        true,
+                        false,
+                        load_cli_local_embedder,
+                    )?;
+                    if exit != EXIT_SUCCESS {
+                        anyhow::bail!("complete publication re-embed reported failures");
+                    }
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::Metadata,
+                    )?;
+                }
+                PublicationPhase::Metadata => {
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        0,
+                        1,
+                        "materializing topology and ranking metadata".to_string(),
+                    )?;
+                    let store = GraphStore::open(&target_db)?;
+                    let mut manifests = std::collections::HashMap::new();
+                    for repo in &sources.repos {
+                        let reader = nestweaver_engine::content_reader::FilesystemReader::new(
+                            Path::new(&repo.root_path),
+                        );
+                        manifests.insert(repo.uid.clone(), nestweaver_engine::parse_manifest(&reader));
+                    }
+                    nestweaver_engine::save_manifest_cache_for_db(&manifests, &store, &target_db)?;
+                    store.compute_pagerank(
+                        0.85,
+                        20,
+                        &nestweaver_store::GraphScope::unified(),
+                    )?;
+                    store.save_pagerank_cache(&nestweaver_engine::sidecar_path(
+                        &target_db,
+                        ".pagerank.json",
+                    ))?;
+                    drop(store);
+                    sources.write_bound(&target_db)?;
+                    state = nestweaver_engine::publication_operation::advance_phase(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        PublicationPhase::Validating,
+                    )?;
+                }
+                PublicationPhase::Validating => {
+                    let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+                    let active = GraphStore::open_read_only(&active_db)?;
+                    let observed = nestweaver_engine::PublicationSourceManifest::capture(&active)?;
+                    drop(active);
+                    if observed != sources {
+                        anyhow::bail!(
+                            "publication sources changed during rebuild; resume starts only after the inputs are stable"
+                        );
+                    }
+                    nestweaver_engine::backup::seal_publication_slot(&target_db, &slot)?;
+                    state = nestweaver_engine::publication_operation::mark_ready(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                    )?;
+                }
+                PublicationPhase::Ready if !activate => return Ok(state),
+                PublicationPhase::Ready | PublicationPhase::Activating => {
+                    let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+                    ensure_no_live_daemon_for_snapshot_build(&active_db)?;
+                    let store = GraphStore::open(&active_db)?;
+                    let lease = store.acquire_index_publication_lease()?;
+                    state = nestweaver_engine::publication_operation::select_operation(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                        &lease,
+                    )?;
+                    lease.release()?;
+                    drop(store);
+                    let smoke = publication_startup_smoke(&base_db, &state.plan);
+                    if let Err(error) = smoke {
+                        let selected_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+                        let selected = GraphStore::open(&selected_db)?;
+                        let rollback_lease = selected.acquire_index_publication_lease()?;
+                        let _ = nestweaver_engine::publication::rollback_current(
+                            &publication_root,
+                            &rollback_lease,
+                            &state.plan.target_publication_uuid,
+                        );
+                        rollback_lease.release()?;
+                        return Err(error).context("selected publication failed startup smoke and was rolled back");
+                    }
+                    state = nestweaver_engine::publication_operation::complete_activation(
+                        &publication_root,
+                        &operation_uuid,
+                        state.revision,
+                    )?;
+                    return Ok(state);
+                }
+                PublicationPhase::Activated | PublicationPhase::Cancelled => return Ok(state),
+            }
+        }
+    })();
+
+    let state = match result {
+        Ok(state) => state,
+        Err(error) => {
+            if let Ok(latest) = nestweaver_engine::publication_operation::load_operation(
+                &publication_root,
+                &operation_uuid,
+            ) && !latest.phase.is_terminal()
+                && latest.failure.is_none()
+            {
+                let _ = nestweaver_engine::publication_operation::record_failure(
+                    &publication_root,
+                    &operation_uuid,
+                    latest.revision,
+                    "publication_rebuild_failed",
+                    format!("{error:#}"),
+                    true,
+                );
+            }
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        println!(
+            "Publication {} is {:?} at revision {} (target {}).",
+            state.plan.operation_uuid,
+            state.phase,
+            state.revision,
+            state.plan.target_publication_uuid
+        );
+        if state.phase == nestweaver_engine::publication_operation::PublicationPhase::Activated {
+            println!("Restart the daemon so every surface opens the selected publication.");
+        }
+    }
+    Ok(
+        if state.phase == nestweaver_engine::publication_operation::PublicationPhase::Cancelled {
+            EXIT_ERROR
+        } else {
+            EXIT_SUCCESS
+        },
+    )
+}
+
+fn verify_staged_publication_identity(
+    target_db: &Path,
+    plan: &nestweaver_engine::publication_operation::PublicationOperationPlan,
+) -> anyhow::Result<()> {
+    let store = GraphStore::open_read_only(target_db)?;
+    let identity = store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("staged publication has no identity"))?;
+    if uuid::Uuid::parse_str(&identity.brain_uuid)? != uuid::Uuid::parse_str(&plan.brain_uuid)?
+        || uuid::Uuid::parse_str(&identity.publication_uuid)?
+            != uuid::Uuid::parse_str(&plan.target_publication_uuid)?
+    {
+        anyhow::bail!("staged publication identity does not match its operation plan");
+    }
+    Ok(())
+}
+
+fn publication_progress(
+    root: &Path,
+    state: &nestweaver_engine::publication_operation::PublicationOperationState,
+    completed: u64,
+    total: u64,
+    message: String,
+) -> anyhow::Result<nestweaver_engine::publication_operation::PublicationOperationState> {
+    eprintln!("[{phase:?}] {message}", phase = state.phase);
+    nestweaver_engine::publication_operation::update_progress(
+        root,
+        &state.plan.operation_uuid,
+        state.revision,
+        nestweaver_engine::publication_operation::PublicationProgress {
+            completed,
+            total: (total != 0).then_some(total),
+            message,
+        },
+    )
+}
+
+fn reload_and_acknowledge_cancel(
+    root: &Path,
+    operation_uuid: &str,
+    state: nestweaver_engine::publication_operation::PublicationOperationState,
+) -> anyhow::Result<nestweaver_engine::publication_operation::PublicationOperationState> {
+    let latest = nestweaver_engine::publication_operation::load_operation(root, operation_uuid)?;
+    if latest.revision != state.revision && !latest.cancel_requested {
+        anyhow::bail!("publication journal changed while the rebuild worker was active");
+    }
+    if latest.cancel_requested {
+        return nestweaver_engine::publication_operation::acknowledge_cancel(
+            root,
+            operation_uuid,
+            latest.revision,
+        );
+    }
+    Ok(latest)
+}
+
+fn publication_startup_smoke(
+    base_db: &Path,
+    plan: &nestweaver_engine::publication_operation::PublicationOperationPlan,
+) -> anyhow::Result<()> {
+    let selected_db = nestweaver_engine::publication::resolve_selected_database(base_db)?;
+    let store = GraphStore::open_read_only(&selected_db)?;
+    let identity = store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("selected publication has no identity"))?;
+    if uuid::Uuid::parse_str(&identity.brain_uuid)? != uuid::Uuid::parse_str(&plan.brain_uuid)?
+        || uuid::Uuid::parse_str(&identity.publication_uuid)?
+            != uuid::Uuid::parse_str(&plan.target_publication_uuid)?
+    {
+        anyhow::bail!("selected publication smoke observed the wrong graph identity");
+    }
+    store.list_repos(None)?;
+    store.list_vaults(None)?;
+    store.count_symbols()?;
+    store.count_notes()?;
+    Ok(())
 }
 
 fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<i32> {

@@ -254,6 +254,7 @@ pub mod process;
 pub mod project;
 pub mod publication;
 pub mod publication_operation;
+pub mod publication_source;
 pub mod pull;
 pub mod query;
 pub mod read_symbols;
@@ -404,6 +405,7 @@ pub use project::{
     materialize_projects_with_lease,
 };
 pub use publication::*;
+pub use publication_source::*;
 pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, EmbedModelProvider,

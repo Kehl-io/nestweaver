@@ -111,6 +111,7 @@ nestweaver-client = { workspace = true }
 nestweaver-proto = { workspace = true }
 libc = "0.2"
 sha2 = { workspace = true }
+uuid = { workspace = true }
 hex = "0.4"
 tonic.workspace = true
 reqwest = { version = "0.13", features = ["json"] }

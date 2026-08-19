@@ -12,6 +12,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".pagerank.json",
     ".parsed_cache.bin",
     ".resolution_deps.bin",
+    crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
     ".filemeta.json",
     ".manifests.json",
     ".gitactivity.json",
@@ -25,6 +26,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".generation",
     ".embeddings.bin",
     ".embeddings",
+    crate::publication::SOURCE_MANIFEST_SUFFIX,
 ];
 
 /// Current backup manifest version. Version 2 embeds the same typed
@@ -96,6 +98,55 @@ pub struct RestoreResult {
     pub manifest: BackupManifest,
     pub data_dir: PathBuf,
     pub duration: Duration,
+}
+
+/// Seal an already-built publication slot in its live store layout.
+///
+/// Unlike an archive backup this performs no copying: the caller builds the
+/// graph and sidecars directly beneath `slot_root`, then this function derives
+/// one canonical, identity-bound inventory and durably publishes
+/// `publication.json` last. A half-built slot is therefore never selectable.
+pub fn seal_publication_slot(
+    db_path: &Path,
+    slot_root: &Path,
+) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+    let db_parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if std::fs::canonicalize(db_parent)? != std::fs::canonicalize(slot_root)? {
+        anyhow::bail!(
+            "publication database {} must live directly beneath slot root {}",
+            db_path.display(),
+            slot_root.display()
+        );
+    }
+    let store = nestweaver_store::GraphStore::open_read_only(db_path)
+        .map_err(|error| anyhow::anyhow!("open staged publication graph: {error}"))?;
+    let identity = store
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("staged publication graph has no identity"))?;
+    let source_graph_generation = store.graph_generation();
+    drop(store);
+
+    let config = BackupConfig {
+        db_path: db_path.to_path_buf(),
+        output_path: slot_root.join("unused.nwsnap.zst"),
+        include_clones: false,
+        instance_id: "publication".to_string(),
+        workspace_path: None,
+    };
+    let bundle =
+        build_backup_publication_bundle(&config, slot_root, &identity, source_graph_generation)?;
+    let bytes = serde_json::to_vec_pretty(&bundle)?;
+    let manifest_path = slot_root.join(crate::publication::PUBLICATION_MANIFEST_FILE);
+    nestweaver_store::durable_sidecar::atomic_replace_file(&manifest_path, |file| {
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")
+    })?;
+    Ok(bundle)
 }
 
 /// Create a backup of the NestWeaver database and all sidecar files.
@@ -764,6 +815,19 @@ fn backup_artifact_contract_for_payload(
                 envelope.algorithm_fingerprint()?,
             ));
         }
+        Some(crate::publication::SOURCE_MANIFEST_SUFFIX) => {
+            let (schema, fingerprint) = crate::publication::source_manifest_artifact_contract(
+                payload,
+                identity,
+                env!("CARGO_PKG_VERSION"),
+                source_graph_generation,
+            )?;
+            return Ok((
+                crate::publication::ArtifactKind::SourceManifest,
+                schema,
+                fingerprint,
+            ));
+        }
         _ => {}
     }
     backup_artifact_contract(path, db_filename)
@@ -799,6 +863,11 @@ fn backup_artifact_contract(
                 1,
                 "nestweaver-resolution-deps-v1",
             ),
+            Some(crate::resolver_generation::RESOLVER_GENERATION_SIDECAR) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-resolver-generation-v1",
+            ),
             Some(".filemeta.json") => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
             }
@@ -830,6 +899,9 @@ fn backup_artifact_contract(
                 "embedding contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),
             Some(".embeddings") => (ArtifactKind::Embeddings, 1, "legacy-embedding-json-v1"),
+            Some(crate::publication::SOURCE_MANIFEST_SUFFIX) => anyhow::bail!(
+                "source manifest contract requires payload inspection; use backup_artifact_contract_for_payload"
+            ),
             Some(".pagerank.json") => anyhow::bail!(
                 "PageRank contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),
@@ -1759,6 +1831,33 @@ mod tests {
     fn backup_sidecars_include_incomplete_extension_migration_journal() {
         assert!(SIDECAR_SUFFIXES.contains(&".extensions.migration.json"));
         assert!(SIDECAR_SUFFIXES.contains(&".extensions.handoff.json"));
+        assert!(
+            SIDECAR_SUFFIXES.contains(&crate::resolver_generation::RESOLVER_GENERATION_SIDECAR)
+        );
+    }
+
+    #[test]
+    fn live_publication_slot_is_sealed_last_with_graph_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let db_path = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        drop(store);
+
+        let bundle = seal_publication_slot(&db_path, &slot).unwrap();
+        assert_eq!(bundle.brain_uuid, identity.brain_uuid);
+        assert_eq!(bundle.publication_uuid, identity.publication_uuid);
+        assert!(bundle.artifacts.iter().any(|artifact| {
+            artifact.kind == crate::publication::ArtifactKind::Graph
+                && artifact.path == crate::publication::PUBLICATION_GRAPH_FILE
+        }));
+        let persisted: crate::publication::PublicationBundleV3 = serde_json::from_slice(
+            &std::fs::read(slot.join(crate::publication::PUBLICATION_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, bundle);
     }
 
     #[test]

@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 
 pub const CURRENT_POINTER_VERSION: u32 = 1;
 pub const PUBLICATION_MANIFEST_FILE: &str = "publication.json";
+pub const PUBLICATION_GRAPH_FILE: &str = "graph.lbug";
+pub const SOURCE_MANIFEST_SUFFIX: &str = ".sources.json";
+pub const SOURCE_MANIFEST_ARTIFACT_KIND: &str = "publication_source_manifest";
+pub const SOURCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const SOURCE_MANIFEST_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-source-manifest-v1";
 
 /// Validate a live PageRank envelope before a sealed publication describes
 /// it, returning the exact schema and algorithm/scope fingerprint carried by
@@ -76,6 +81,31 @@ pub(crate) fn repo_manifest_artifact_contract(
     Ok((
         crate::manifest::MANIFEST_ARTIFACT_SCHEMA_VERSION,
         crate::manifest::MANIFEST_ALGORITHM_FINGERPRINT.to_string(),
+    ))
+}
+
+pub(crate) fn source_manifest_artifact_contract(
+    bytes: &[u8],
+    identity: &nestweaver_store::PublicationIdentity,
+    producer_version: &str,
+    source_graph_generation: u64,
+) -> anyhow::Result<(u32, String)> {
+    let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+        serde_json::from_slice(bytes).map_err(|error| {
+            anyhow::anyhow!("source manifest is not a self-describing artifact: {error}")
+        })?;
+    let _: serde_json::Value =
+        envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+            artifact_kind: SOURCE_MANIFEST_ARTIFACT_KIND,
+            artifact_schema_version: SOURCE_MANIFEST_SCHEMA_VERSION,
+            identity,
+            producer_version,
+            source_graph_generation,
+            algorithm_fingerprint: SOURCE_MANIFEST_ALGORITHM_FINGERPRINT,
+        })?;
+    Ok((
+        SOURCE_MANIFEST_SCHEMA_VERSION,
+        SOURCE_MANIFEST_ALGORITHM_FINGERPRINT.to_string(),
     ))
 }
 
@@ -498,6 +528,84 @@ pub fn read_current(publication_root: &Path) -> anyhow::Result<Option<CurrentPub
     Ok(Some(pointer))
 }
 
+/// Resolve the database selected by a publication root without trusting the
+/// pointer alone. An absent `CURRENT` preserves the legacy/base database; a
+/// selected slot is admitted only after its manifest, identity, graph
+/// descriptor, and graph-owned identity agree. Full payload checksums are performed by
+/// the validation/activation path; repeating a multi-gigabyte graph hash on
+/// every short-lived CLI invocation would make the selector itself O(graph).
+pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf> {
+    let publication_root = default_publication_root(base_db_path);
+    let Some(pointer) = read_current(&publication_root)? else {
+        return Ok(base_db_path.to_path_buf());
+    };
+    let slot = slot_path(&publication_root, &pointer.publication_uuid)?;
+    let manifest_path = slot.join(PUBLICATION_MANIFEST_FILE);
+    let manifest_bytes = std::fs::read(&manifest_path).with_context(|| {
+        format!(
+            "read selected publication manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    if crate::hash::blake3_hex_bytes(&manifest_bytes) != pointer.manifest_blake3 {
+        anyhow::bail!("selected publication manifest no longer matches CURRENT");
+    }
+    let bundle: PublicationBundleV3 =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "parse selected publication manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    if parse_uuid("CURRENT brain_uuid", &pointer.brain_uuid)?
+        != parse_uuid("bundle brain_uuid", &bundle.brain_uuid)?
+        || parse_uuid("CURRENT publication_uuid", &pointer.publication_uuid)?
+            != parse_uuid("bundle publication_uuid", &bundle.publication_uuid)?
+    {
+        anyhow::bail!("selected publication manifest identity does not match CURRENT");
+    }
+    let mut graph_artifacts = bundle
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Graph);
+    let graph = graph_artifacts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("selected publication has no graph artifact"))?;
+    if graph_artifacts.next().is_some() {
+        anyhow::bail!("selected publication has more than one graph artifact");
+    }
+    let graph_path = slot.join(&graph.path);
+    let metadata = std::fs::metadata(&graph_path).with_context(|| {
+        format!(
+            "inspect selected publication graph {}",
+            graph_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!("selected publication graph is not a regular file");
+    }
+    // A selected local graph remains writable after cutover, so its live size
+    // and checksum legitimately advance beyond the sealed baseline. The graph
+    // identity is the stable binding that must never change.
+    let store = nestweaver_store::GraphStore::open_read_only(&graph_path)
+        .map_err(|error| anyhow::anyhow!("open selected publication graph: {error}"))?;
+    let identity = store
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read selected publication identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("selected publication graph has no identity"))?;
+    if parse_uuid("selected graph brain_uuid", &identity.brain_uuid)?
+        != parse_uuid("CURRENT brain_uuid", &pointer.brain_uuid)?
+        || parse_uuid(
+            "selected graph publication_uuid",
+            &identity.publication_uuid,
+        )? != parse_uuid("CURRENT publication_uuid", &pointer.publication_uuid)?
+    {
+        anyhow::bail!("selected publication graph identity does not match CURRENT");
+    }
+    Ok(graph_path)
+}
+
 /// Durably select `next` when the currently selected publication UUID equals
 /// `expected_current`. The caller must hold the incumbent graph's publication
 /// lease, which serializes switch attempts with graph/sidecar publication.
@@ -589,6 +697,87 @@ pub fn compare_and_swap_current(
     .with_context(|| format!("durably replace CURRENT pointer {}", path.display()))
 }
 
+/// Roll back exactly one selected publication while the active graph is
+/// quiesced. The first cutover returns to the implicit legacy/base database by
+/// removing `CURRENT`; later cutovers select the retained predecessor slot.
+/// A stale caller can never roll back a newer selection.
+pub fn rollback_current(
+    publication_root: &Path,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+    expected_current: &str,
+) -> anyhow::Result<Option<CurrentPublicationPointer>> {
+    lease
+        .ensure_clean_for_snapshot()
+        .map_err(|error| anyhow::anyhow!("refusing CURRENT rollback from dirty graph: {error}"))?;
+    let current = read_current(publication_root)?
+        .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
+    if parse_uuid("expected current publication_uuid", expected_current)?
+        != parse_uuid(
+            "observed current publication_uuid",
+            &current.publication_uuid,
+        )?
+    {
+        anyhow::bail!(
+            "CURRENT rollback conflict: expected {}, observed {}",
+            expected_current,
+            current.publication_uuid
+        );
+    }
+    let store_identity = lease
+        .store()
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read rollback graph identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("rollback graph has no publication identity"))?;
+    if parse_uuid("rollback brain_uuid", &store_identity.brain_uuid)?
+        != parse_uuid("CURRENT brain_uuid", &current.brain_uuid)?
+    {
+        anyhow::bail!("refusing CURRENT rollback across brains");
+    }
+
+    let Some(previous_uuid) = current.expected_previous_publication_uuid.as_deref() else {
+        let path = current_pointer_path(publication_root);
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove CURRENT pointer {}", path.display()))?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path)?;
+        return Ok(None);
+    };
+    let previous_slot = slot_path(publication_root, previous_uuid)?;
+    let manifest_path = previous_slot.join(PUBLICATION_MANIFEST_FILE);
+    let manifest_bytes = std::fs::read(&manifest_path).with_context(|| {
+        format!(
+            "read rollback publication manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let bundle: PublicationBundleV3 = serde_json::from_slice(&manifest_bytes)?;
+    bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    if parse_uuid(
+        "rollback predecessor publication_uuid",
+        &bundle.publication_uuid,
+    )? != parse_uuid("CURRENT predecessor publication_uuid", previous_uuid)?
+        || parse_uuid("rollback predecessor brain_uuid", &bundle.brain_uuid)?
+            != parse_uuid("CURRENT brain_uuid", &current.brain_uuid)?
+    {
+        anyhow::bail!("rollback predecessor manifest identity does not match CURRENT");
+    }
+    let previous_identity = nestweaver_store::PublicationIdentity {
+        brain_uuid: bundle.brain_uuid,
+        publication_uuid: bundle.publication_uuid,
+    };
+    let previous = CurrentPublicationPointer::new(
+        &previous_identity,
+        Some(current.publication_uuid.clone()),
+        crate::hash::blake3_hex_bytes(&manifest_bytes),
+    )?;
+    compare_and_swap_current(
+        publication_root,
+        lease,
+        Some(&current.publication_uuid),
+        &previous,
+    )?;
+    Ok(Some(previous))
+}
+
 use anyhow::Context;
 
 #[cfg(test)]
@@ -670,6 +859,101 @@ mod tests {
         .unwrap();
         std::fs::write(slot.join(PUBLICATION_MANIFEST_FILE), &bytes).unwrap();
         crate::hash::blake3_hex_bytes(&bytes)
+    }
+
+    fn write_resolvable_slot(
+        base_db: &Path,
+        identity: &nestweaver_store::PublicationIdentity,
+    ) -> CurrentPublicationPointer {
+        let root = default_publication_root(base_db);
+        let slot = slot_path(&root, &identity.publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let graph_path = slot.join(PUBLICATION_GRAPH_FILE);
+        let store =
+            nestweaver_store::GraphStore::create_with_publication_identity(&graph_path, identity)
+                .unwrap();
+        let generation = store.graph_generation();
+        drop(store);
+        let graph = std::fs::read(&graph_path).unwrap();
+        let bundle = PublicationBundleV3 {
+            format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: generation,
+            artifacts: vec![ArtifactDescriptor {
+                path: PUBLICATION_GRAPH_FILE.to_string(),
+                kind: ArtifactKind::Graph,
+                artifact_schema_version: 1,
+                byte_size: graph.len() as u64,
+                blake3: crate::hash::blake3_hex_bytes(&graph),
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                source_graph_generation: generation,
+                algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+            }],
+        };
+        let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
+        std::fs::write(slot.join(PUBLICATION_MANIFEST_FILE), &manifest).unwrap();
+        let pointer = CurrentPublicationPointer::new(
+            identity,
+            None,
+            crate::hash::blake3_hex_bytes(&manifest),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            current_pointer_path(&root),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
+        pointer
+    }
+
+    #[test]
+    fn selected_database_resolution_is_fail_closed_and_keeps_legacy_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        assert_eq!(resolve_selected_database(&base).unwrap(), base);
+
+        let identity = nestweaver_store::PublicationIdentity::new_brain();
+        let pointer = write_resolvable_slot(&base, &identity);
+        let expected = slot_path(&default_publication_root(&base), &pointer.publication_uuid)
+            .unwrap()
+            .join(PUBLICATION_GRAPH_FILE);
+        assert_eq!(resolve_selected_database(&base).unwrap(), expected);
+
+        std::fs::write(&expected, b"not-a-database").unwrap();
+        let error = resolve_selected_database(&base).unwrap_err().to_string();
+        assert!(error.contains("open selected publication graph"), "{error}");
+    }
+
+    #[test]
+    fn first_publication_rollback_returns_to_the_base_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let incumbent = store.publication_identity().unwrap().unwrap();
+        let target = incumbent.next_publication().unwrap();
+        let pointer = write_resolvable_slot(&base, &target);
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            rollback_current(
+                &default_publication_root(&base),
+                &lease,
+                &pointer.publication_uuid,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            read_current(&default_publication_root(&base))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(resolve_selected_database(&base).unwrap(), base);
+        lease.release().unwrap();
     }
 
     #[test]
