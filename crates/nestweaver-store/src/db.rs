@@ -197,7 +197,9 @@ impl IndexPublicationLease<'_> {
     /// publication with no ranks.
     pub fn save_pagerank(&self, path: &Path) -> Result<(), StoreError> {
         self.store.validate_index_publication_owner(self.token)?;
-        self.store.save_pagerank_cache_for_publication_owner(path)
+        let clean_generation = self.clean_generation()?;
+        self.store
+            .save_pagerank_cache_for_publication_owner(path, clean_generation)
     }
 
     /// Restore the prior canonical generation when no graph mutation occurred.
@@ -235,6 +237,11 @@ impl Drop for IndexPublicationLease<'_> {
 pub struct GraphStore {
     pub(crate) db: lbug::Database,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// Algorithm and scope fingerprint for the scores currently held in
+    /// `pagerank_cache`. It is persisted with the scores so a loader cannot
+    /// confuse code-only, notes-only, unified, or parameter-incompatible
+    /// ranks.
+    pub(crate) pagerank_artifact_fingerprint: Mutex<Option<String>>,
     /// Monotonic counter that bumps whenever PageRank scores change. Lets
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
@@ -566,6 +573,7 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -616,6 +624,7 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -650,6 +659,7 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -685,6 +695,7 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -742,6 +753,7 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -804,6 +816,10 @@ impl GraphStore {
     pub(crate) fn invalidate_ranking_caches_locked(&self) {
         *self
             .pagerank_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .pagerank_artifact_fingerprint
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         *self

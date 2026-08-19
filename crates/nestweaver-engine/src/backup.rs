@@ -678,8 +678,14 @@ fn build_backup_publication_bundle(
         if path == crate::publication::PUBLICATION_MANIFEST_FILE || path == "manifest.json" {
             continue;
         }
-        let (kind, schema, fingerprint) = backup_artifact_contract(&path, &db_filename)?;
         let bytes = std::fs::read(entry.path())?;
+        let (kind, schema, fingerprint) = backup_artifact_contract_for_payload(
+            &path,
+            &db_filename,
+            &bytes,
+            identity,
+            source_graph_generation,
+        )?;
         artifacts.push(crate::publication::ArtifactDescriptor {
             path,
             kind,
@@ -703,6 +709,29 @@ fn build_backup_publication_bundle(
     };
     bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
     Ok(bundle)
+}
+
+fn backup_artifact_contract_for_payload(
+    path: &str,
+    db_filename: &str,
+    payload: &[u8],
+    identity: &nestweaver_store::PublicationIdentity,
+    source_graph_generation: u64,
+) -> anyhow::Result<(crate::publication::ArtifactKind, u32, String)> {
+    if path.strip_prefix(db_filename) == Some(".pagerank.json") {
+        let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
+            payload,
+            identity,
+            env!("CARGO_PKG_VERSION"),
+            source_graph_generation,
+        )?;
+        return Ok((
+            crate::publication::ArtifactKind::Ranking,
+            schema,
+            fingerprint,
+        ));
+    }
+    backup_artifact_contract(path, db_filename)
 }
 
 fn backup_artifact_contract(
@@ -760,7 +789,9 @@ fn backup_artifact_contract(
             ),
             Some(".embeddings.bin") => (ArtifactKind::Embeddings, 1, "legacy-embedding-binary-v1"),
             Some(".embeddings") => (ArtifactKind::Embeddings, 1, "legacy-embedding-json-v1"),
-            Some(".pagerank.json") => (ArtifactKind::Ranking, 1, "nestweaver-pagerank-json-v1"),
+            Some(".pagerank.json") => anyhow::bail!(
+                "PageRank contract requires payload inspection; use backup_artifact_contract_for_payload"
+            ),
             Some(".wal") => (ArtifactKind::WriteAheadLog, 1, "ladybugdb-wal-v1"),
             _ => anyhow::bail!("unclassified backup artifact: {path}"),
         }

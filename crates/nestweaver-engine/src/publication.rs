@@ -11,6 +11,47 @@ use std::path::{Path, PathBuf};
 pub const CURRENT_POINTER_VERSION: u32 = 1;
 pub const PUBLICATION_MANIFEST_FILE: &str = "publication.json";
 
+/// Validate a live PageRank envelope before a sealed publication describes
+/// it, returning the exact schema and algorithm/scope fingerprint carried by
+/// the payload. This prevents snapshot and backup manifests from laundering a
+/// foreign, stale, corrupt, or generically-labelled ranking sidecar.
+pub(crate) fn pagerank_artifact_contract(
+    bytes: &[u8],
+    identity: &nestweaver_store::PublicationIdentity,
+    producer_version: &str,
+    source_graph_generation: u64,
+) -> anyhow::Result<(u32, String)> {
+    let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+        serde_json::from_slice(bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "PageRank sidecar is not a self-describing v2 artifact envelope: {error}"
+            )
+        })?;
+    if !envelope
+        .algorithm_fingerprint
+        .starts_with(nestweaver_store::ranking::PAGERANK_ALGORITHM_FINGERPRINT_PREFIX)
+    {
+        anyhow::bail!(
+            "incompatible PageRank algorithm fingerprint '{}'",
+            envelope.algorithm_fingerprint
+        );
+    }
+    let fingerprint = envelope.algorithm_fingerprint.clone();
+    let _: std::collections::HashMap<String, f64> =
+        envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+            artifact_kind: nestweaver_store::ranking::PAGERANK_ARTIFACT_KIND,
+            artifact_schema_version: nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION,
+            identity,
+            producer_version,
+            source_graph_generation,
+            algorithm_fingerprint: &fingerprint,
+        })?;
+    Ok((
+        nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION,
+        fingerprint,
+    ))
+}
+
 /// Typed role of one file in a sealed publication bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -493,10 +493,8 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
             SNAPSHOT_FORMAT_VERSION,
             "nestweaver-snapshot-stamp-v3".to_string(),
         ),
-        SIDECAR_PAGERANK => (
-            ArtifactKind::Ranking,
-            1,
-            "nestweaver-pagerank-json-v1".to_string(),
+        SIDECAR_PAGERANK => anyhow::bail!(
+            "PageRank contract requires payload inspection; use artifact_contract_for_payload"
         ),
         SIDECAR_MANIFESTS => (
             ArtifactKind::RepoManifest,
@@ -521,6 +519,30 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
     Ok(contract)
 }
 
+fn artifact_contract_for_payload(
+    path: &str,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+    payload: Option<&[u8]>,
+) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    if path == SIDECAR_PAGERANK {
+        let payload = payload
+            .ok_or_else(|| anyhow::anyhow!("PageRank contract requires its artifact payload"))?;
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
+            payload,
+            &identity,
+            &stamp.engine_version,
+            source_graph_generation,
+        )?;
+        return Ok((ArtifactKind::Ranking, schema, fingerprint));
+    }
+    artifact_contract(path, stamp)
+}
+
 fn write_publication_bundle(
     output_dir: &Path,
     stamp: &Stamp,
@@ -534,9 +556,9 @@ fn write_publication_bundle(
         if path == PUBLICATION_FILE || path == CHECKSUM_FILE || path == "checksum.sha256" {
             continue;
         }
-        let (kind, artifact_schema_version, algorithm_fingerprint) =
-            artifact_contract(&path, stamp)?;
         let bytes = std::fs::read(&absolute)?;
+        let (kind, artifact_schema_version, algorithm_fingerprint) =
+            artifact_contract_for_payload(&path, stamp, source_graph_generation, Some(&bytes))?;
         artifacts.push(ArtifactDescriptor {
             path,
             kind,
@@ -653,7 +675,24 @@ fn verify_publication_bundle(
                 bundle.source_graph_generation
             );
         }
-        let (kind, schema_version, fingerprint) = artifact_contract(&descriptor.path, stamp)?;
+        let contract_payload = if descriptor.path == SIDECAR_PAGERANK {
+            Some(
+                std::fs::read(snapshot_dir.join(&descriptor.path)).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to read publication artifact {}: {error}",
+                        descriptor.path
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let (kind, schema_version, fingerprint) = artifact_contract_for_payload(
+            &descriptor.path,
+            stamp,
+            bundle.source_graph_generation,
+            contract_payload.as_deref(),
+        )?;
         if descriptor.kind != kind
             || descriptor.artifact_schema_version != schema_version
             || descriptor.algorithm_fingerprint != fingerprint
@@ -1387,11 +1426,22 @@ mod tests {
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
         // Give the source DB sidecars so build_snapshot captures them.
-        std::fs::write(crate::sidecar_path(&db, ".pagerank.json"), b"{}").unwrap();
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store
+            .compute_pagerank(
+                0.85,
+                20,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        store
+            .save_pagerank_cache(&crate::sidecar_path(&db, ".pagerank.json"))
+            .unwrap();
+        drop(store);
         std::fs::write(crate::sidecar_path(&db, ".manifests.json"), b"{}").unwrap();
 
         let stamp = make_stamp(
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
             "0.1.0",
             "schema-hash-abc",
             "text-embedding-3-small",
