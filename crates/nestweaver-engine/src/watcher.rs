@@ -1319,7 +1319,10 @@ mod tests {
         store.bump_graph_generation();
         store.save_graph_generation(&generation_path).unwrap();
         let stale_generation = store.graph_generation();
-        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
+            .unwrap();
+        store.save_pagerank_cache(&pagerank_path).unwrap();
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let watcher = BrainWatcher::new(&db_path, &root, "test", "test");
 
