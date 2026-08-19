@@ -224,6 +224,15 @@ struct TrigramScopeState {
     candidate_digest: String,
 }
 
+#[derive(Debug, Clone)]
+struct RegexGraphScopeState {
+    desired_epoch: u64,
+    acknowledged_epoch: u64,
+    candidate_count: usize,
+    candidate_digest: String,
+    tombstone: bool,
+}
+
 struct TrigramDocumentState {
     scope_uid: String,
     text_hash: String,
@@ -650,19 +659,6 @@ impl GraphStore {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
         let index = RegexIndex::new(root);
-        let mut desired: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        for candidate in self.collect_candidates(None, None)? {
-            if !candidate.scope_uid.is_empty() {
-                desired
-                    .entry(candidate.scope_uid.clone())
-                    .or_default()
-                    .push(candidate);
-            }
-        }
-        for candidates in desired.values_mut() {
-            candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
-        }
-
         let existing = index
             .list_metadata()
             .unwrap_or_default()
@@ -670,45 +666,49 @@ impl GraphStore {
             .map(|metadata| (metadata.scope_uid.clone(), metadata))
             .collect::<HashMap<_, _>>();
         let mut stats = TrigramRefreshStats::default();
-
-        let mut prior_documents: HashMap<String, (String, String)> = HashMap::new();
-        for scope_uid in existing.keys() {
-            if let Ok(Some(hashes)) = index.document_hashes(scope_uid) {
-                for (uid, hash) in hashes {
-                    prior_documents.insert(uid, (scope_uid.clone(), hash));
-                }
-            }
+        let active_scopes = self.active_regex_scopes()?;
+        let states = self.read_regex_scope_states()?;
+        let mut work_scopes = if force_full {
+            let mut scopes = active_scopes.clone();
+            scopes.extend(states.keys().cloned());
+            scopes.extend(existing.keys().cloned());
+            scopes
+        } else {
+            self.regex_outbox_scopes()?
+        };
+        // A graph imported from a pre-v3 release has no outbox yet. Bootstrap
+        // once; all subsequent normal work is driven only by coalesced scopes.
+        if !force_full && work_scopes.is_empty() && (states.is_empty() || existing.is_empty()) {
+            work_scopes = active_scopes.clone();
         }
-        let desired_documents: HashMap<String, (String, String)> = desired
-            .iter()
-            .flat_map(|(scope_uid, candidates)| {
-                candidates.iter().map(|candidate| {
-                    (
-                        candidate.uid.clone(),
-                        (scope_uid.clone(), candidate.text_hash.clone()),
-                    )
-                })
-            })
-            .collect();
-        stats.nodes_added = desired_documents
-            .keys()
-            .filter(|uid| !prior_documents.contains_key(uid.as_str()))
-            .count();
-        stats.nodes_changed = desired_documents
-            .iter()
-            .filter(|(uid, desired)| {
-                prior_documents
-                    .get(uid.as_str())
-                    .is_some_and(|prior| prior != *desired)
-            })
-            .count();
-        stats.nodes_deleted = prior_documents
-            .keys()
-            .filter(|uid| !desired_documents.contains_key(uid.as_str()))
-            .count();
-        for (scope_uid, candidates) in &desired {
-            let digest = candidate_digest(candidates);
-            let prior = existing.get(scope_uid);
+        let mut ordered: Vec<_> = work_scopes.into_iter().collect();
+        ordered.sort();
+        for scope_uid in ordered {
+            if !active_scopes.contains(&scope_uid) {
+                let epoch = match states.get(&scope_uid) {
+                    Some(state) if state.tombstone => state.desired_epoch,
+                    _ => self.mark_regex_scope_dirty(&scope_uid, true)?,
+                };
+                if index.retire_scope(&scope_uid)? {
+                    stats.scopes_refreshed += 1;
+                }
+                self.acknowledge_regex_tombstone(&scope_uid, epoch)?;
+                continue;
+            }
+
+            let epoch = if force_full {
+                self.mark_regex_scope_dirty(&scope_uid, false)?
+            } else {
+                match states.get(&scope_uid).filter(|state| !state.tombstone) {
+                    Some(state) => state.desired_epoch,
+                    None => self.mark_regex_scope_dirty(&scope_uid, false)?,
+                }
+            };
+            let one_scope = HashSet::from([scope_uid.clone()]);
+            let mut candidates = self.collect_candidates_for_scopes(&one_scope, None, None)?;
+            candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
+            let digest = candidate_digest(&candidates);
+            let prior = existing.get(&scope_uid);
             let compatible = prior.is_some_and(|metadata| {
                 metadata.schema_version == REGEX_INDEX_SCHEMA_VERSION
                     && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
@@ -716,13 +716,46 @@ impl GraphStore {
                     && metadata.publication_uuid == identity.publication_uuid
                     && metadata.candidate_count == candidates.len()
                     && metadata.candidate_digest == digest
+                    && metadata.scope_epoch == epoch
             });
-            if compatible && !force_full {
+            let graph_acknowledged = states.get(&scope_uid).is_some_and(|state| {
+                state.desired_epoch == epoch
+                    && state.acknowledged_epoch == epoch
+                    && !state.tombstone
+                    && state.candidate_count == candidates.len()
+                    && state.candidate_digest == digest
+            });
+            if compatible && graph_acknowledged && !force_full {
                 stats.scopes_unchanged += 1;
                 continue;
             }
 
-            let scope_epoch = prior.map_or(1, |metadata| metadata.scope_epoch.saturating_add(1));
+            let prior_documents_result = index.document_hashes(&scope_uid);
+            let prior_documents = prior_documents_result
+                .as_ref()
+                .ok()
+                .and_then(|documents| documents.clone())
+                .unwrap_or_default();
+            let desired_documents: HashMap<_, _> = candidates
+                .iter()
+                .map(|candidate| (candidate.uid.clone(), candidate.text_hash.clone()))
+                .collect();
+            stats.nodes_added += desired_documents
+                .keys()
+                .filter(|uid| !prior_documents.contains_key(uid.as_str()))
+                .count();
+            stats.nodes_changed += desired_documents
+                .iter()
+                .filter(|(uid, hash)| {
+                    prior_documents
+                        .get(uid.as_str())
+                        .is_some_and(|prior| prior != *hash)
+                })
+                .count();
+            stats.nodes_deleted += prior_documents
+                .keys()
+                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .count();
             let metadata = RegexShardMetadata {
                 schema_version: REGEX_INDEX_SCHEMA_VERSION,
                 tokenizer_fingerprint: REGEX_TOKENIZER_FINGERPRINT.to_string(),
@@ -730,9 +763,9 @@ impl GraphStore {
                 publication_uuid: identity.publication_uuid.clone(),
                 source_graph_generation: self.graph_generation(),
                 scope_uid: scope_uid.clone(),
-                scope_epoch,
+                scope_epoch: epoch,
                 candidate_count: candidates.len(),
-                candidate_digest: digest,
+                candidate_digest: digest.clone(),
             };
             let trigram_sets: Vec<HashSet<String>> = candidates
                 .iter()
@@ -748,15 +781,43 @@ impl GraphStore {
                     trigrams,
                 })
                 .collect();
-            index.replace_scope(metadata, &documents)?;
+            let changed_uids: HashSet<_> = desired_documents
+                .iter()
+                .filter(|(uid, hash)| prior_documents.get(uid.as_str()) != Some(*hash))
+                .map(|(uid, _)| uid.as_str())
+                .collect();
+            let deleted_uids: Vec<_> = prior_documents
+                .keys()
+                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .cloned()
+                .collect();
+            let changed_documents: Vec<_> = documents
+                .iter()
+                .filter(|document| changed_uids.contains(document.uid))
+                .cloned()
+                .collect();
+            let can_update = !force_full
+                && prior_documents_result.is_ok()
+                && prior.is_some_and(|prior| {
+                    prior.schema_version == REGEX_INDEX_SCHEMA_VERSION
+                        && prior.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+                        && prior.brain_uuid == identity.brain_uuid
+                        && prior.publication_uuid == identity.publication_uuid
+                });
+            if can_update {
+                index.update_scope(
+                    prior.expect("checked above"),
+                    metadata,
+                    &changed_documents,
+                    &deleted_uids,
+                )?;
+            } else {
+                index.replace_scope(metadata, &documents)?;
+            }
+            self.acknowledge_regex_scope(&scope_uid, epoch, candidates.len(), &digest)?;
 
             stats.scopes_refreshed += 1;
             stats.postings_added += trigram_sets.iter().map(HashSet::len).sum::<usize>();
-        }
-        for scope_uid in existing.keys() {
-            if !desired.contains_key(scope_uid) && index.retire_scope(scope_uid)? {
-                stats.scopes_refreshed += 1;
-            }
         }
         stats.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         *self
@@ -920,6 +981,82 @@ impl GraphStore {
         Ok(docs)
     }
 
+    fn read_regex_scope_states(&self) -> Result<HashMap<String, RegexGraphScopeState>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query(
+                "MATCH (s:RegexScopeState) RETURN s.uid, s.desired_epoch, \
+                 s.acknowledged_epoch, s.candidate_count, s.candidate_digest, s.tombstone",
+            )
+            .map_err(|error| StoreError::Query(format!("read regex scope states: {error}")))?;
+        let mut states = HashMap::new();
+        for row in rows {
+            if let [
+                Value::String(uid),
+                Value::Int64(desired),
+                Value::Int64(acknowledged),
+                Value::Int64(count),
+                Value::String(digest),
+                Value::Bool(tombstone),
+            ] = row.as_slice()
+            {
+                states.insert(
+                    uid.clone(),
+                    RegexGraphScopeState {
+                        desired_epoch: (*desired).max(0) as u64,
+                        acknowledged_epoch: (*acknowledged).max(0) as u64,
+                        candidate_count: (*count).max(0) as usize,
+                        candidate_digest: digest.clone(),
+                        tombstone: *tombstone,
+                    },
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    fn regex_outbox_scopes(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (o:RegexScopeOutbox) RETURN o.uid")
+            .map_err(|error| StoreError::Query(format!("read regex outbox: {error}")))?;
+        Ok(rows
+            .filter_map(|row| match row.first() {
+                Some(Value::String(uid)) => Some(uid.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn active_regex_scopes(&self) -> Result<HashSet<String>, StoreError> {
+        let mut scopes: HashSet<String> = self
+            .list_repos(None)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        scopes.extend(self.list_vaults(None)?.into_iter().map(|vault| vault.uid));
+        // Corrupt/imported graphs and focused store tests can contain owned
+        // candidates before their Repo/Vault root. Preserve correctness by
+        // discovering ownership only when the authoritative root inventory is
+        // empty; healthy production graphs take the constant-size root path.
+        if scopes.is_empty() {
+            let conn = self.conn()?;
+            if let Ok(rows) = conn.query("MATCH (s:Symbol) RETURN s.repo_uid") {
+                scopes.extend(rows.filter_map(|row| match row.first() {
+                    Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+                    _ => None,
+                }));
+            }
+            if let Ok(rows) = conn.query("MATCH (n:Note) RETURN n.vault_uid") {
+                scopes.extend(rows.filter_map(|row| match row.first() {
+                    Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+                    _ => None,
+                }));
+            }
+        }
+        Ok(scopes)
+    }
+
     /// Collect all searchable candidate nodes (Sections, Notes, Symbols),
     /// optionally filtered by `path_prefix` (matched against location) and
     /// `kinds` (case-insensitive kind names: "Section", "Note", "Symbol").
@@ -1026,6 +1163,196 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Collect fallback/rebuild text only for explicitly selected source
+    /// scopes. Trusted regex shards never need a corpus-wide candidate load.
+    fn collect_candidates_for_scopes(
+        &self,
+        scopes: &HashSet<String>,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        let want_kind = |kind: &str| {
+            kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
+        };
+        let mut ordered: Vec<_> = scopes
+            .iter()
+            .filter(|uid| !uid.is_empty())
+            .cloned()
+            .collect();
+        ordered.sort();
+        let mut candidates = Vec::new();
+        for scope_uid in ordered {
+            if want_kind("Symbol") {
+                for symbol in self.lookup_symbols_by_repo(&scope_uid)? {
+                    if symbol.signature.is_empty()
+                        || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: symbol.uid,
+                        scope_uid: symbol.repo_uid,
+                        text_hash: text_hash(&symbol.signature),
+                        kind: "Symbol".to_string(),
+                        title: symbol.name,
+                        location: format!("{}:{}", symbol.file_path, symbol.start_line),
+                        text: symbol.signature,
+                        start_line: symbol.start_line,
+                    });
+                }
+            }
+            let notes = self.list_notes(Some(&scope_uid))?;
+            let note_paths: HashMap<_, _> = notes
+                .iter()
+                .map(|note| (note.uid.clone(), note.file_path.clone()))
+                .collect();
+            if want_kind("Note") {
+                for note in notes {
+                    if note.title.is_empty()
+                        || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: note.uid,
+                        scope_uid: note.vault_uid,
+                        text_hash: text_hash(&note.title),
+                        kind: "Note".to_string(),
+                        title: note.title.clone(),
+                        location: note.file_path,
+                        text: note.title,
+                        start_line: 1,
+                    });
+                }
+            }
+            if want_kind("Section") {
+                let mut sections = Vec::new();
+                for note_uid in note_paths.keys() {
+                    sections.extend(self.sections_in_note(note_uid)?);
+                }
+                for section in sections {
+                    if section.text_content.is_empty() {
+                        continue;
+                    }
+                    let path = note_paths
+                        .get(&section.note_uid)
+                        .cloned()
+                        .unwrap_or_default();
+                    if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: section.uid,
+                        scope_uid: scope_uid.clone(),
+                        text_hash: if section.text_hash.is_empty() {
+                            text_hash(&section.text_content)
+                        } else {
+                            section.text_hash
+                        },
+                        kind: "Section".to_string(),
+                        title: String::new(),
+                        location: format!("{path}:{}", section.start_line),
+                        text: section.text_content,
+                        start_line: section.start_line,
+                    });
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Hydrate only derived-index hits, in bounded primary-key batches.
+    fn load_candidates_by_uid(
+        &self,
+        uids: &HashSet<String>,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        let want_kind = |kind: &str| {
+            kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
+        };
+        let mut ordered: Vec<_> = uids.iter().cloned().collect();
+        ordered.sort();
+        let mut candidates = Vec::new();
+        if want_kind("Symbol") {
+            for symbol in self.lookup_symbols_by_uids(&ordered)? {
+                if symbol.signature.is_empty()
+                    || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
+                {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: symbol.uid,
+                    scope_uid: symbol.repo_uid,
+                    text_hash: text_hash(&symbol.signature),
+                    kind: "Symbol".to_string(),
+                    title: symbol.name,
+                    location: format!("{}:{}", symbol.file_path, symbol.start_line),
+                    text: symbol.signature,
+                    start_line: symbol.start_line,
+                });
+            }
+        }
+        if want_kind("Note") {
+            for note in self.lookup_notes_by_uids(&ordered)? {
+                if note.title.is_empty()
+                    || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
+                {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: note.uid,
+                    scope_uid: note.vault_uid,
+                    text_hash: text_hash(&note.title),
+                    kind: "Note".to_string(),
+                    title: note.title.clone(),
+                    location: note.file_path,
+                    text: note.title,
+                    start_line: 1,
+                });
+            }
+        }
+        if want_kind("Section") {
+            let sections = self.lookup_sections_by_uids(&ordered)?;
+            let note_uids: Vec<_> = sections
+                .iter()
+                .map(|section| section.note_uid.clone())
+                .collect();
+            let note_paths: HashMap<_, _> = self
+                .lookup_notes_by_uids(&note_uids)?
+                .into_iter()
+                .map(|note| (note.uid, (note.file_path, note.vault_uid)))
+                .collect();
+            for section in sections {
+                if section.text_content.is_empty() {
+                    continue;
+                }
+                let (path, scope_uid) = note_paths
+                    .get(&section.note_uid)
+                    .cloned()
+                    .unwrap_or_default();
+                if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: section.uid,
+                    scope_uid,
+                    text_hash: if section.text_hash.is_empty() {
+                        text_hash(&section.text_content)
+                    } else {
+                        section.text_hash
+                    },
+                    kind: "Section".to_string(),
+                    title: String::new(),
+                    location: format!("{path}:{}", section.start_line),
+                    text: section.text_content,
+                    start_line: section.start_line,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Look up the candidate node UIDs that satisfy the trigram CNF clauses.
     /// For each AND-clause we union the postings of its OR-trigrams; the final
     /// candidate set is the intersection across all AND-clauses.
@@ -1044,7 +1371,7 @@ impl GraphStore {
         all_candidates: &[Candidate],
     ) -> Result<TrigramPrefilterPlan, StoreError> {
         if self.regex_sidecar_root().is_some() {
-            return self.regex_v3_candidate_uids(clauses, all_candidates);
+            return self.regex_v3_candidate_uids(clauses);
         }
         let mut by_scope: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
         for candidate in all_candidates {
@@ -1180,16 +1507,12 @@ impl GraphStore {
     fn regex_v3_candidate_uids(
         &self,
         clauses: &[HashSet<String>],
-        all_candidates: &[Candidate],
     ) -> Result<TrigramPrefilterPlan, StoreError> {
         let Some(root) = self.regex_sidecar_root() else {
             return Ok(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
                 ready_scopes: HashSet::new(),
-                dirty_scopes: all_candidates
-                    .iter()
-                    .map(|candidate| candidate.scope_uid.clone())
-                    .collect(),
+                dirty_scopes: self.active_regex_scopes()?,
                 has_index: false,
             });
         };
@@ -1197,23 +1520,18 @@ impl GraphStore {
         let identity = self.publication_identity()?.ok_or_else(|| {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
-        let mut by_scope: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        for candidate in all_candidates {
-            by_scope
-                .entry(candidate.scope_uid.clone())
-                .or_default()
-                .push(candidate.clone());
-        }
-        for candidates in by_scope.values_mut() {
-            candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
-        }
-
+        let states = self.read_regex_scope_states()?;
+        let active_scopes = self.active_regex_scopes()?;
         let has_index = index.root().join("scopes").is_dir();
         let mut ready_scopes = HashSet::new();
         let mut dirty_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
-        for (scope_uid, candidates) in by_scope {
-            if scope_uid.is_empty() {
+        for scope_uid in active_scopes {
+            let Some(state) = states.get(&scope_uid) else {
+                dirty_scopes.insert(scope_uid);
+                continue;
+            };
+            if state.tombstone || state.desired_epoch != state.acknowledged_epoch {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
@@ -1228,8 +1546,10 @@ impl GraphStore {
                 && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
                 && metadata.brain_uuid == identity.brain_uuid
                 && metadata.publication_uuid == identity.publication_uuid
-                && metadata.candidate_count == candidates.len()
-                && metadata.candidate_digest == candidate_digest(&candidates);
+                && metadata.source_graph_generation <= self.graph_generation()
+                && metadata.scope_epoch == state.acknowledged_epoch
+                && metadata.candidate_count == state.candidate_count
+                && metadata.candidate_digest == state.candidate_digest;
             if !trusted {
                 dirty_scopes.insert(scope_uid);
                 continue;
@@ -1291,13 +1611,15 @@ impl GraphStore {
         let start = Instant::now();
         let limit = limit.unwrap_or(usize::MAX);
 
-        // Validate scope manifests against the complete corpus before applying
-        // request filters. A path/kind subset must never make a healthy scope
-        // appear stale merely because candidates were intentionally omitted.
-        let all_candidates = self.collect_candidates(None, None)?;
+        let uses_regex_v3 = self.regex_sidecar_root().is_some();
         let clauses = required_trigram_clauses(pattern);
         let plan = match &clauses {
-            Some(clauses) => Some(self.trigram_candidate_uids(clauses, &all_candidates)?),
+            Some(clauses) if uses_regex_v3 => Some(self.regex_v3_candidate_uids(clauses)?),
+            Some(clauses) => {
+                // The legacy graph-posting path still needs its corpus digest.
+                let all_candidates = self.collect_candidates(None, None)?;
+                Some(self.trigram_candidate_uids(clauses, &all_candidates)?)
+            }
             None => None,
         };
         let scanned_fallback = plan
@@ -1309,14 +1631,31 @@ impl GraphStore {
         let ready_scopes = plan.as_ref().map_or(0, |plan| plan.ready_scopes.len());
         let dirty_scopes = plan.as_ref().map_or(0, |plan| plan.dirty_scopes.len());
 
-        let mut candidates = self.collect_candidates(path_prefix, kinds)?;
-        if let Some(plan) = &plan {
+        let mut candidates = if uses_regex_v3 {
+            match &plan {
+                Some(plan) => {
+                    let mut candidates =
+                        self.collect_candidates_for_scopes(&plan.dirty_scopes, path_prefix, kinds)?;
+                    candidates.extend(self.load_candidates_by_uid(
+                        &plan.matching_ready_uids,
+                        path_prefix,
+                        kinds,
+                    )?);
+                    candidates
+                }
+                None => self.collect_candidates(path_prefix, kinds)?,
+            }
+        } else {
+            self.collect_candidates(path_prefix, kinds)?
+        };
+        if !uses_regex_v3 && let Some(plan) = &plan {
             candidates.retain(|candidate| {
                 plan.dirty_scopes.contains(&candidate.scope_uid)
                     || (plan.ready_scopes.contains(&candidate.scope_uid)
                         && plan.matching_ready_uids.contains(&candidate.uid))
             });
         }
+        candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
 
         // Scan the full candidate set, bounded by the wall-clock deadline (and a
         // high safety ceiling) — NOT a low pre-truncation. `truncated` is set
@@ -1397,11 +1736,17 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
-        // Scope trust is always verified against the complete corpus. Request
-        // filters select results only; they must not make omitted candidates
-        // look like scope drift and disable otherwise healthy postings.
-        let corpus_candidates = self.collect_candidates(None, None)?;
-        let filtered_candidates = self.collect_candidates(path_prefix, kinds)?;
+        let uses_regex_v3 = self.regex_sidecar_root().is_some();
+        let corpus_candidates = if uses_regex_v3 {
+            Vec::new()
+        } else {
+            self.collect_candidates(None, None)?
+        };
+        let filtered_candidates = if uses_regex_v3 {
+            Vec::new()
+        } else {
+            self.collect_candidates(path_prefix, kinds)?
+        };
 
         let mut out = Vec::new();
         for pattern in patterns {
@@ -1410,6 +1755,7 @@ impl GraphStore {
             // Optional trigram narrowing.
             let clauses = required_trigram_clauses(pattern);
             let plan = match &clauses {
+                Some(clauses) if uses_regex_v3 => Some(self.regex_v3_candidate_uids(clauses)?),
                 Some(clauses) => Some(self.trigram_candidate_uids(clauses, &corpus_candidates)?),
                 None => None,
             };
@@ -1420,8 +1766,30 @@ impl GraphStore {
             let mut per_file: HashMap<String, u64> = HashMap::new();
             let mut total: u64 = 0;
             let mut scanned_candidates = 0usize;
-            for c in &filtered_candidates {
-                if let Some(plan) = &plan {
+            let v3_candidates;
+            let candidates = if uses_regex_v3 {
+                v3_candidates = match &plan {
+                    Some(plan) => {
+                        let mut candidates = self.collect_candidates_for_scopes(
+                            &plan.dirty_scopes,
+                            path_prefix,
+                            kinds,
+                        )?;
+                        candidates.extend(self.load_candidates_by_uid(
+                            &plan.matching_ready_uids,
+                            path_prefix,
+                            kinds,
+                        )?);
+                        candidates
+                    }
+                    None => self.collect_candidates(path_prefix, kinds)?,
+                };
+                &v3_candidates
+            } else {
+                &filtered_candidates
+            };
+            for c in candidates {
+                if !uses_regex_v3 && let Some(plan) = &plan {
                     let should_scan = plan.dirty_scopes.contains(&c.scope_uid)
                         || (plan.ready_scopes.contains(&c.scope_uid)
                             && plan.matching_ready_uids.contains(&c.uid));
@@ -1652,7 +2020,7 @@ mod tests {
 
         let second = store.refresh_trigram_index(false).unwrap();
         assert_eq!(second.scopes_refreshed, 0);
-        assert_eq!(second.scopes_unchanged, 2);
+        assert_eq!(second.scopes_unchanged, 0);
 
         let identity = store.publication_identity().unwrap().unwrap();
         let metadata = RegexIndex::new(root).list_metadata().unwrap();
@@ -2174,12 +2542,12 @@ mod tests {
 
         let refresh = store.refresh_trigram_index(false).unwrap();
         assert_eq!(refresh.scopes_refreshed, 1);
-        assert!(refresh.scopes_unchanged >= 2);
+        assert_eq!(refresh.scopes_unchanged, 0);
         assert_eq!(refresh.nodes_added, 1);
         let unchanged = store.refresh_trigram_index(false).unwrap();
         assert_eq!(unchanged.scopes_refreshed, 0);
         assert_eq!(unchanged.postings_added, 0);
-        assert!(unchanged.scopes_unchanged >= 3);
+        assert_eq!(unchanged.scopes_unchanged, 0);
     }
 
     #[test]
@@ -2195,8 +2563,13 @@ mod tests {
             .unwrap()
             .query("MATCH (s:Symbol {uid: 'sym:1'}) SET s.repo_uid = 'repo:0'")
             .unwrap();
+        store.mark_regex_scope_dirty("repo:1", false).unwrap();
+        store.mark_regex_scope_dirty("repo:0", false).unwrap();
         let refresh = store.refresh_trigram_index(false).unwrap();
-        assert_eq!(refresh.nodes_changed, 1);
+        assert_eq!(refresh.nodes_added, 1);
+        assert_eq!(refresh.nodes_changed, 0);
+        // The emptied source scope is retired as a tombstone rather than
+        // opening its old manifest only to count deleted documents.
         assert_eq!(refresh.nodes_deleted, 0);
 
         let result = store

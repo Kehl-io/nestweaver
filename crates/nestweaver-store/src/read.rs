@@ -989,6 +989,43 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Batch primary-key-oriented symbol hydration for derived-index hits.
+    pub fn lookup_symbols_by_uids(&self, uids: &[String]) -> Result<Vec<Symbol>, StoreError> {
+        const CHUNK: usize = 256;
+        let conn = self.conn()?;
+        let mut symbols = Vec::new();
+        for chunk in uids.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicate = (0..chunk.len())
+                .map(|index| format!("s.uid = $uid{index}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let query = format!("MATCH (s:Symbol) WHERE {predicate} RETURN {SYMBOL_COLUMNS}");
+            let mut statement = conn
+                .prepare(&query)
+                .map_err(|error| StoreError::Query(format!("prepare symbol UID batch: {error}")))?;
+            let parameters = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
+                .collect::<Vec<_>>();
+            let parameter_refs = parameters
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect();
+            let rows = conn
+                .execute(&mut statement, parameter_refs)
+                .map_err(|error| StoreError::Query(format!("execute symbol UID batch: {error}")))?;
+            symbols.extend(
+                rows.map(|row| row_to_symbol(&row))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(symbols)
+    }
+
     /// Like [`lookup_symbols_by_repo`] but on an externally-provided connection
     /// (for use inside an open transaction).
     pub fn lookup_symbols_by_repo_on(
@@ -1145,6 +1182,45 @@ impl GraphStore {
             .map(|row| row_to_section(&row))
             .collect::<Result<_, _>>()?;
         sections.sort_by_key(|s| s.start_line);
+        Ok(sections)
+    }
+
+    /// Batch primary-key-oriented section hydration for derived-index hits.
+    pub fn lookup_sections_by_uids(&self, uids: &[String]) -> Result<Vec<Section>, StoreError> {
+        const CHUNK: usize = 256;
+        let conn = self.conn()?;
+        let mut sections = Vec::new();
+        for chunk in uids.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicate = (0..chunk.len())
+                .map(|index| format!("s.uid = $uid{index}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let query = format!("MATCH (s:Section) WHERE {predicate} RETURN {SECTION_COLUMNS}");
+            let mut statement = conn.prepare(&query).map_err(|error| {
+                StoreError::Query(format!("prepare section UID batch: {error}"))
+            })?;
+            let parameters = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
+                .collect::<Vec<_>>();
+            let parameter_refs = parameters
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect();
+            let rows = conn
+                .execute(&mut statement, parameter_refs)
+                .map_err(|error| {
+                    StoreError::Query(format!("execute section UID batch: {error}"))
+                })?;
+            sections.extend(
+                rows.map(|row| row_to_section(&row))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
         Ok(sections)
     }
 
@@ -1624,6 +1700,43 @@ impl GraphStore {
             Some(row) => row_to_note(&row),
             None => Err(StoreError::NotFound),
         }
+    }
+
+    /// Batch primary-key-oriented note hydration for derived-index hits.
+    pub fn lookup_notes_by_uids(&self, uids: &[String]) -> Result<Vec<Note>, StoreError> {
+        const CHUNK: usize = 256;
+        let conn = self.conn()?;
+        let mut notes = Vec::new();
+        for chunk in uids.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicate = (0..chunk.len())
+                .map(|index| format!("n.uid = $uid{index}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let query = format!("MATCH (n:Note) WHERE {predicate} RETURN {NOTE_COLUMNS}");
+            let mut statement = conn
+                .prepare(&query)
+                .map_err(|error| StoreError::Query(format!("prepare note UID batch: {error}")))?;
+            let parameters = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
+                .collect::<Vec<_>>();
+            let parameter_refs = parameters
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect();
+            let rows = conn
+                .execute(&mut statement, parameter_refs)
+                .map_err(|error| StoreError::Query(format!("execute note UID batch: {error}")))?;
+            notes.extend(
+                rows.map(|row| row_to_note(&row))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(notes)
     }
 
     /// Look up a single Section by UID.

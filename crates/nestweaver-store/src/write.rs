@@ -807,8 +807,19 @@ impl GraphStore {
     }
 
     pub fn insert_symbol(&self, symbol: &Symbol) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        self.insert_symbol_with_conn(&conn, symbol)
+        let conn = self.begin_transaction()?;
+        let result = (|| {
+            self.insert_symbol_with_conn(&conn, symbol)?;
+            Self::mark_regex_scope_dirty_on(&conn, &symbol.repo_uid, false)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn insert_symbol_with_conn(
@@ -1237,6 +1248,235 @@ impl GraphStore {
         Ok(())
     }
 
+    fn mark_regex_scope_dirty_on(
+        conn: &lbug::Connection<'_>,
+        scope_uid: &str,
+        tombstone: bool,
+    ) -> Result<u64, StoreError> {
+        let mut read = conn
+            .prepare(
+                "MATCH (s:RegexScopeState {uid: $uid}) RETURN s.desired_epoch, \
+                 s.acknowledged_epoch, s.candidate_count, s.candidate_digest",
+            )
+            .map_err(|error| StoreError::Query(format!("prepare regex scope state: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut read,
+                vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("read regex scope state: {error}")))?;
+        let (desired, acknowledged, count, digest) =
+            rows.next()
+                .map_or((0_u64, 0_u64, 0_i64, String::new()), |row| {
+                    let integer = |index: usize| match row.get(index) {
+                        Some(lbug::Value::Int64(value)) => (*value).max(0) as u64,
+                        _ => 0,
+                    };
+                    let digest = match row.get(3) {
+                        Some(lbug::Value::String(value)) => value.clone(),
+                        _ => String::new(),
+                    };
+                    (integer(0), integer(1), integer(2) as i64, digest)
+                });
+        let desired = desired.saturating_add(1).min(i64::MAX as u64);
+        exec_params(
+            conn,
+            "MATCH (s:RegexScopeState {uid: $uid}) DETACH DELETE s",
+            vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+        )?;
+        exec_params(
+            conn,
+            "CREATE (:RegexScopeState {uid: $uid, desired_epoch: $desired, \
+             acknowledged_epoch: $ack, candidate_count: $count, candidate_digest: $digest, \
+             tombstone: $tombstone, last_error: ''})",
+            vec![
+                ("uid", lbug::Value::String(scope_uid.to_string())),
+                ("desired", lbug::Value::Int64(desired as i64)),
+                ("ack", lbug::Value::Int64(acknowledged as i64)),
+                ("count", lbug::Value::Int64(count)),
+                ("digest", lbug::Value::String(digest)),
+                ("tombstone", lbug::Value::Bool(tombstone)),
+            ],
+        )?;
+        exec_params(
+            conn,
+            "MATCH (o:RegexScopeOutbox {uid: $uid}) DETACH DELETE o",
+            vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+        )?;
+        exec_params(
+            conn,
+            "CREATE (:RegexScopeOutbox {uid: $uid, desired_epoch: $desired})",
+            vec![
+                ("uid", lbug::Value::String(scope_uid.to_string())),
+                ("desired", lbug::Value::Int64(desired as i64)),
+            ],
+        )?;
+        Ok(desired)
+    }
+
+    pub(crate) fn mark_regex_scope_dirty(
+        &self,
+        scope_uid: &str,
+        tombstone: bool,
+    ) -> Result<u64, StoreError> {
+        let conn = self.begin_transaction()?;
+        match Self::mark_regex_scope_dirty_on(&conn, scope_uid, tombstone) {
+            Ok(epoch) => {
+                self.commit_transaction(&conn)?;
+                Ok(epoch)
+            }
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn acknowledge_regex_scope(
+        &self,
+        scope_uid: &str,
+        epoch: u64,
+        candidate_count: usize,
+        candidate_digest: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let result = (|| {
+            let mut read = conn
+                .prepare(
+                    "MATCH (s:RegexScopeState {uid: $uid}) RETURN s.desired_epoch, s.tombstone",
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("prepare regex acknowledgement: {error}"))
+                })?;
+            let mut rows = conn
+                .execute(
+                    &mut read,
+                    vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("read regex acknowledgement: {error}"))
+                })?;
+            let row = rows.next().ok_or_else(|| {
+                StoreError::Query(format!("regex scope {scope_uid} has no desired epoch"))
+            })?;
+            let desired = match row.first() {
+                Some(lbug::Value::Int64(value)) => (*value).max(0) as u64,
+                _ => 0,
+            };
+            let tombstone = matches!(row.get(1), Some(lbug::Value::Bool(true)));
+            if desired != epoch || tombstone {
+                return Err(StoreError::Query(format!(
+                    "regex scope {scope_uid} advanced while publishing epoch {epoch} (desired {desired})"
+                )));
+            }
+            exec_params(
+                &conn,
+                "MATCH (s:RegexScopeState {uid: $uid}) DETACH DELETE s",
+                vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+            )?;
+            exec_params(
+                &conn,
+                "CREATE (:RegexScopeState {uid: $uid, desired_epoch: $epoch, \
+                 acknowledged_epoch: $epoch, candidate_count: $count, candidate_digest: $digest, \
+                 tombstone: false, last_error: ''})",
+                vec![
+                    ("uid", lbug::Value::String(scope_uid.to_string())),
+                    (
+                        "epoch",
+                        lbug::Value::Int64(epoch.min(i64::MAX as u64) as i64),
+                    ),
+                    (
+                        "count",
+                        lbug::Value::Int64(candidate_count.min(i64::MAX as usize) as i64),
+                    ),
+                    ("digest", lbug::Value::String(candidate_digest.to_string())),
+                ],
+            )?;
+            exec_params(
+                &conn,
+                "MATCH (o:RegexScopeOutbox {uid: $uid}) DETACH DELETE o",
+                vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn acknowledge_regex_tombstone(
+        &self,
+        scope_uid: &str,
+        epoch: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let result = (|| {
+            let mut read = conn
+                .prepare(
+                    "MATCH (s:RegexScopeState {uid: $uid}) RETURN s.desired_epoch, s.tombstone",
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("prepare regex tombstone acknowledgement: {error}"))
+                })?;
+            let mut rows = conn
+                .execute(
+                    &mut read,
+                    vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("read regex tombstone acknowledgement: {error}"))
+                })?;
+            let row = rows.next().ok_or_else(|| {
+                StoreError::Query(format!("regex scope {scope_uid} has no tombstone epoch"))
+            })?;
+            let desired = match row.first() {
+                Some(lbug::Value::Int64(value)) => (*value).max(0) as u64,
+                _ => 0,
+            };
+            let tombstone = matches!(row.get(1), Some(lbug::Value::Bool(true)));
+            if desired != epoch || !tombstone {
+                return Err(StoreError::Query(format!(
+                    "regex tombstone {scope_uid} advanced while retiring epoch {epoch} (desired {desired}, tombstone {tombstone})"
+                )));
+            }
+            exec_params(
+                &conn,
+                "MATCH (s:RegexScopeState {uid: $uid}) DETACH DELETE s",
+                vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+            )?;
+            exec_params(
+                &conn,
+                "CREATE (:RegexScopeState {uid: $uid, desired_epoch: $epoch, \
+                 acknowledged_epoch: $epoch, candidate_count: 0, candidate_digest: '', \
+                 tombstone: true, last_error: ''})",
+                vec![
+                    ("uid", lbug::Value::String(scope_uid.to_string())),
+                    (
+                        "epoch",
+                        lbug::Value::Int64(epoch.min(i64::MAX as u64) as i64),
+                    ),
+                ],
+            )?;
+            exec_params(
+                &conn,
+                "MATCH (o:RegexScopeOutbox {uid: $uid}) DETACH DELETE o",
+                vec![("uid", lbug::Value::String(scope_uid.to_string()))],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
+    }
+
     /// Atomically delete old repo data and insert the replacement in a single
     /// transaction. This prevents concurrent readers from seeing an empty repo
     /// between the delete and the insert (the concurrency bug where the
@@ -1277,6 +1517,8 @@ impl GraphStore {
             services,
             service_symbol_edges,
         )?;
+
+        Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
 
         self.commit_transaction(&conn)?;
         Ok(counts)
@@ -1545,6 +1787,8 @@ impl GraphStore {
         )?;
         Self::batch_insert_project_note_edges_on(&conn, &preserved_project_refs)?;
 
+        Self::mark_regex_scope_dirty_on(&conn, &vault.uid, false)?;
+
         self.commit_transaction(&conn)?;
         Ok(deleted)
     }
@@ -1811,38 +2055,49 @@ impl GraphStore {
     }
 
     pub fn insert_note(&self, note: &Note) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        exec_params(
-            &conn,
-            "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
+        let conn = self.begin_transaction()?;
+        let result = (|| {
+            exec_params(
+                &conn,
+                "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
              note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
              created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
-            vec![
-                ("uid", lbug::Value::String(note.uid.clone())),
-                ("vid", lbug::Value::String(note.vault_uid.clone())),
-                ("fp", lbug::Value::String(note.file_path.clone())),
-                ("title", lbug::Value::String(note.title.clone())),
-                ("nk", lbug::Value::String(note.note_kind.to_string())),
-                ("wc", lbug::Value::Int64(note.word_count as i64)),
-                ("hash", lbug::Value::String(note.content_hash.clone())),
-                (
-                    "fm",
-                    lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
-                ),
-                (
-                    "ca",
-                    lbug::Value::String(note.created_at.clone().unwrap_or_default()),
-                ),
-                (
-                    "ma",
-                    lbug::Value::String(note.modified_at.clone().unwrap_or_default()),
-                ),
-                (
-                    "pr",
-                    lbug::Value::Double(note.pagerank_score.unwrap_or(0.0)),
-                ),
-            ],
-        )
+                vec![
+                    ("uid", lbug::Value::String(note.uid.clone())),
+                    ("vid", lbug::Value::String(note.vault_uid.clone())),
+                    ("fp", lbug::Value::String(note.file_path.clone())),
+                    ("title", lbug::Value::String(note.title.clone())),
+                    ("nk", lbug::Value::String(note.note_kind.to_string())),
+                    ("wc", lbug::Value::Int64(note.word_count as i64)),
+                    ("hash", lbug::Value::String(note.content_hash.clone())),
+                    (
+                        "fm",
+                        lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "ca",
+                        lbug::Value::String(note.created_at.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "ma",
+                        lbug::Value::String(note.modified_at.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "pr",
+                        lbug::Value::Double(note.pagerank_score.unwrap_or(0.0)),
+                    ),
+                ],
+            )?;
+            Self::mark_regex_scope_dirty_on(&conn, &note.vault_uid, false)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn batch_insert_notes(&self, notes: &[Note]) -> Result<(), StoreError> {
@@ -1999,30 +2254,57 @@ impl GraphStore {
     }
 
     pub fn insert_section(&self, section: &Section) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        exec_params(
-            &conn,
-            "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
+        let conn = self.begin_transaction()?;
+        let result = (|| {
+            exec_params(
+                &conn,
+                "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
              start_line: $sl, end_line: $el, text_hash: $th, text_content: $tc, \
              word_count: $wc, pagerank_score: $pr})",
-            vec![
-                ("uid", lbug::Value::String(section.uid.clone())),
-                ("nid", lbug::Value::String(section.note_uid.clone())),
-                (
-                    "hid",
-                    lbug::Value::String(section.heading_uid.clone().unwrap_or_default()),
-                ),
-                ("sl", lbug::Value::Int64(section.start_line as i64)),
-                ("el", lbug::Value::Int64(section.end_line as i64)),
-                ("th", lbug::Value::String(section.text_hash.clone())),
-                ("tc", lbug::Value::String(section.text_content.clone())),
-                ("wc", lbug::Value::Int64(section.word_count as i64)),
-                (
-                    "pr",
-                    lbug::Value::Double(section.pagerank_score.unwrap_or(0.0)),
-                ),
-            ],
-        )
+                vec![
+                    ("uid", lbug::Value::String(section.uid.clone())),
+                    ("nid", lbug::Value::String(section.note_uid.clone())),
+                    (
+                        "hid",
+                        lbug::Value::String(section.heading_uid.clone().unwrap_or_default()),
+                    ),
+                    ("sl", lbug::Value::Int64(section.start_line as i64)),
+                    ("el", lbug::Value::Int64(section.end_line as i64)),
+                    ("th", lbug::Value::String(section.text_hash.clone())),
+                    ("tc", lbug::Value::String(section.text_content.clone())),
+                    ("wc", lbug::Value::Int64(section.word_count as i64)),
+                    (
+                        "pr",
+                        lbug::Value::Double(section.pagerank_score.unwrap_or(0.0)),
+                    ),
+                ],
+            )?;
+            let mut lookup = conn
+                .prepare("MATCH (n:Note {uid: $uid}) RETURN n.vault_uid LIMIT 1")
+                .map_err(|error| StoreError::Query(format!("prepare section scope: {error}")))?;
+            let scope_uid = conn
+                .execute(
+                    &mut lookup,
+                    vec![("uid", lbug::Value::String(section.note_uid.clone()))],
+                )
+                .map_err(|error| StoreError::Query(format!("read section scope: {error}")))?
+                .next()
+                .and_then(|row| match row.first() {
+                    Some(lbug::Value::String(uid)) => Some(uid.clone()),
+                    _ => None,
+                });
+            if let Some(scope_uid) = scope_uid.filter(|uid| !uid.is_empty()) {
+                Self::mark_regex_scope_dirty_on(&conn, &scope_uid, false)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn batch_insert_sections(&self, sections: &[Section]) -> Result<(), StoreError> {
@@ -2886,7 +3168,9 @@ impl GraphStore {
                  AND NOT (t)<-[:NOTE_TAGGED_WITH]-() \
                  AND NOT (t)<-[:SECTION_TAGGED_WITH]-() DETACH DELETE t",
                 vec![("vid", lbug::Value::String(vault.uid.clone()))],
-            )
+            )?;
+            Self::mark_regex_scope_dirty_on(&conn, &vault.uid, false)?;
+            Ok(())
         })();
         if let Err(error) = mutation {
             return match self.rollback_transaction(&conn) {
@@ -2980,6 +3264,20 @@ impl GraphStore {
         let mutation =
             Self::delete_vault_cascade_with_outcome_on_with_faults(&conn, vault_uid, faults);
         if let Err(primary) = mutation {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(primary),
+                Err(rollback) => self.classify_failed_vault_attempt(
+                    vault_uid,
+                    &before,
+                    value,
+                    primary,
+                    Some(rollback),
+                    faults,
+                    false,
+                ),
+            };
+        }
+        if let Err(primary) = Self::mark_regex_scope_dirty_on(&conn, vault_uid, true) {
             return match self.rollback_transaction(&conn) {
                 Ok(()) => Err(primary),
                 Err(rollback) => self.classify_failed_vault_attempt(
@@ -3958,6 +4256,7 @@ impl GraphStore {
                     });
                 }
             };
+            Self::mark_regex_scope_dirty_on(&conn, repo_uid, true)?;
             self.commit_transaction(&conn).and_then(|()| {
                 if faults.bulk_commit_after {
                     Err(StoreError::Query(
@@ -7237,6 +7536,7 @@ impl GraphStore {
         if result.is_ok() {
             embedding_index.set_recorded_pipeline_fingerprint(Some(fingerprint));
             embedding_index.set_recorded_model_id(Some(pipeline.model_id.clone()));
+            embedding_index.set_similarity(pipeline.similarity.clone());
         }
         result
     }

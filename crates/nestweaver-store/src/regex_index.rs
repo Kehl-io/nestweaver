@@ -365,6 +365,116 @@ impl RegexIndex {
         Ok(())
     }
 
+    /// Apply an exact document delta to the currently selected scope.
+    ///
+    /// Tantivy commits are atomic for readers. `CURRENT` remains bound to the
+    /// previous metadata until the commit has been reopened and validated; in
+    /// that short interval the graph/sidecar metadata mismatch makes callers
+    /// scan this scope. A crash can therefore make the disposable shard stale,
+    /// but can never make search trust a partial update.
+    pub fn update_scope(
+        &self,
+        previous: &RegexShardMetadata,
+        metadata: RegexShardMetadata,
+        upserts: &[RegexShardDocument<'_>],
+        deletes: &[String],
+    ) -> Result<(), StoreError> {
+        if metadata.schema_version != REGEX_INDEX_SCHEMA_VERSION
+            || metadata.tokenizer_fingerprint != REGEX_TOKENIZER_FINGERPRINT
+            || metadata.scope_uid != previous.scope_uid
+        {
+            return Err(StoreError::Query(
+                "invalid incremental regex shard metadata".to_string(),
+            ));
+        }
+        let pointer = self
+            .current_pointer(&metadata.scope_uid)?
+            .ok_or_else(|| StoreError::Query("regex shard CURRENT is missing".to_string()))?;
+        if pointer.metadata != *previous {
+            return Err(StoreError::Query(format!(
+                "regex scope {} advanced before incremental publication",
+                metadata.scope_uid
+            )));
+        }
+        let path = self
+            .scope_root(&metadata.scope_uid)
+            .join("generations")
+            .join(&pointer.generation);
+        let index = Index::open_in_dir(&path).map_err(|error| {
+            StoreError::Query(format!("open regex shard {}: {error}", path.display()))
+        })?;
+        let fields = inspect_fields(&index.schema())?;
+        let (observed, _) = read_metadata(&index, fields)?;
+        if observed != *previous {
+            return Err(StoreError::Query(format!(
+                "regex scope {} metadata changed before incremental publication",
+                metadata.scope_uid
+            )));
+        }
+
+        let mut writer = index
+            .writer(50_000_000)
+            .map_err(|error| StoreError::Query(format!("open regex shard writer: {error}")))?;
+        for uid in deletes
+            .iter()
+            .map(String::as_str)
+            .chain(upserts.iter().map(|document| document.uid))
+        {
+            writer.delete_term(Term::from_field_text(fields.uid, uid));
+        }
+        writer.delete_term(Term::from_field_text(
+            fields.uid,
+            &format!("meta:{}", metadata.scope_uid),
+        ));
+        let encoded_metadata = serde_json::to_string(&metadata)
+            .map_err(|error| StoreError::Query(format!("serialize regex metadata: {error}")))?;
+        writer
+            .add_document(doc!(
+                fields.uid => format!("meta:{}", metadata.scope_uid),
+                fields.kind => METADATA_KIND.to_string(),
+                fields.metadata => encoded_metadata,
+            ))
+            .map_err(|error| StoreError::Query(format!("write regex metadata: {error}")))?;
+        for document in upserts {
+            let mut tantivy_document = TantivyDocument::default();
+            tantivy_document.add_text(fields.uid, document.uid);
+            tantivy_document.add_text(fields.kind, document.kind);
+            tantivy_document.add_text(fields.text_hash, document.text_hash);
+            for trigram in document.trigrams {
+                tantivy_document.add_text(fields.trigram, trigram);
+            }
+            writer.add_document(tantivy_document).map_err(|error| {
+                StoreError::Query(format!("write regex candidate {}: {error}", document.uid))
+            })?;
+        }
+        writer
+            .commit()
+            .map_err(|error| StoreError::Query(format!("commit regex shard delta: {error}")))?;
+        writer
+            .wait_merging_threads()
+            .map_err(|error| StoreError::Query(format!("finish regex shard merge: {error}")))?;
+        drop(index);
+
+        let verification = Index::open_in_dir(&path)
+            .map_err(|error| StoreError::Query(format!("reopen regex shard: {error}")))?;
+        let verified_fields = inspect_fields(&verification.schema())?;
+        let (verified_metadata, verified_count) = read_metadata(&verification, verified_fields)?;
+        if verified_metadata != metadata || verified_count != metadata.candidate_count {
+            return Err(StoreError::Query(
+                "incremental regex shard failed metadata/count validation".to_string(),
+            ));
+        }
+        drop(verification);
+
+        let pointer = CurrentPointer::new(pointer.generation, metadata)?;
+        let pointer_path = self.scope_root(&pointer.metadata.scope_uid).join("CURRENT");
+        let bytes = serde_json::to_vec_pretty(&pointer)
+            .map_err(|error| StoreError::Query(format!("serialize regex pointer: {error}")))?;
+        crate::durable_sidecar::atomic_replace_file(&pointer_path, |file| file.write_all(&bytes))
+            .map_err(|error| StoreError::Query(format!("publish regex pointer: {error}")))?;
+        Ok(())
+    }
+
     /// Return exact candidate UIDs from a trusted shard. Metadata mismatch is
     /// explicit so callers can widen to a graph scan for this scope.
     pub fn candidate_uids(
@@ -526,5 +636,76 @@ impl RegexIndex {
         }
         metadata.sort_by(|left, right| left.scope_uid.cmp(&right.scope_uid));
         Ok(metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(scope_epoch: u64, count: usize, digest: &str) -> RegexShardMetadata {
+        RegexShardMetadata {
+            schema_version: REGEX_INDEX_SCHEMA_VERSION,
+            tokenizer_fingerprint: REGEX_TOKENIZER_FINGERPRINT.to_string(),
+            brain_uuid: "brain".to_string(),
+            publication_uuid: "publication".to_string(),
+            source_graph_generation: scope_epoch,
+            scope_uid: "repo:test".to_string(),
+            scope_epoch,
+            candidate_count: count,
+            candidate_digest: digest.to_string(),
+        }
+    }
+
+    #[test]
+    fn exact_delta_updates_current_generation_without_rebuilding_the_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let first_trigrams = HashSet::from(["alp".to_string(), "lph".to_string()]);
+        let first = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &first_trigrams,
+        };
+        let initial = metadata(1, 1, "digest-one");
+        index.replace_scope(initial.clone(), &[first]).unwrap();
+        let generation = index
+            .current_pointer("repo:test")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let second_trigrams = HashSet::from(["bet".to_string(), "eta".to_string()]);
+        let second = RegexShardDocument {
+            uid: "sym:two",
+            kind: "Symbol",
+            text_hash: "hash-two",
+            trigrams: &second_trigrams,
+        };
+        let updated = metadata(2, 1, "digest-two");
+        index
+            .update_scope(
+                &initial,
+                updated.clone(),
+                &[second],
+                &["sym:one".to_string()],
+            )
+            .unwrap();
+
+        let pointer = index.current_pointer("repo:test").unwrap().unwrap();
+        assert_eq!(pointer.generation, generation);
+        assert_eq!(pointer.metadata, updated);
+        assert_eq!(
+            index.document_hashes("repo:test").unwrap().unwrap(),
+            std::collections::HashMap::from([("sym:two".to_string(), "hash-two".to_string())])
+        );
+        assert_eq!(
+            index
+                .candidate_uids(&pointer.metadata, &[HashSet::from(["bet".to_string()])], 10,)
+                .unwrap()
+                .unwrap(),
+            HashSet::from(["sym:two".to_string()])
+        );
     }
 }

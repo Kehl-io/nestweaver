@@ -1558,10 +1558,9 @@ impl GraphStore {
                 None
             }
         };
-        let pipeline_fingerprint = self
-            .get_embedding_pipeline()
-            .ok()
-            .flatten()
+        let pipeline = self.get_embedding_pipeline().ok().flatten();
+        let pipeline_fingerprint = pipeline
+            .as_ref()
             .and_then(|pipeline| pipeline.fingerprint().ok());
         let mut index = self
             .embedding_index
@@ -1587,7 +1586,7 @@ impl GraphStore {
             && let (Some(db_path), Some(identity), Some(pipeline)) = (
                 self.db_path.as_ref(),
                 self.publication_identity().ok().flatten(),
-                self.get_embedding_pipeline().ok().flatten(),
+                pipeline.clone(),
             )
         {
             let journal = Self::embedding_journal_for(db_path);
@@ -1598,6 +1597,9 @@ impl GraphStore {
         }
         index.set_recorded_model_id(recorded);
         index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
+        if let Some(pipeline) = pipeline {
+            index.set_similarity(pipeline.similarity);
+        }
     }
 
     /// Compute the legacy JSON sidecar path for a given database path.
@@ -1746,7 +1748,9 @@ impl GraphStore {
             if !path.exists() {
                 idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
                     .map_err(|e| StoreError::Query(format!("save embedding-v2 sidecar: {e}")))?;
-                idx.mark_base_persisted();
+                idx.adopt_binary_v2(&path).map_err(|error| {
+                    StoreError::Query(format!("reopen embedding-v2 sidecar: {error}"))
+                })?;
                 crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
                     |error| StoreError::Query(format!("retire embedding journal: {error}")),
                 )?;
@@ -1758,7 +1762,9 @@ impl GraphStore {
                         .map_err(|e| {
                             StoreError::Query(format!("compact embedding-v2 sidecar: {e}"))
                         })?;
-                    idx.mark_base_persisted();
+                    idx.adopt_binary_v2(&path).map_err(|error| {
+                        StoreError::Query(format!("reopen compacted embedding-v2 sidecar: {error}"))
+                    })?;
                     crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
                         |error| {
                             StoreError::Query(format!(
@@ -1794,7 +1800,9 @@ impl GraphStore {
         index
             .save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
             .map_err(|error| StoreError::Query(format!("compact embedding-v2 sidecar: {error}")))?;
-        index.mark_base_persisted();
+        index.adopt_binary_v2(&path).map_err(|error| {
+            StoreError::Query(format!("reopen compacted embedding-v2 sidecar: {error}"))
+        })?;
         let journal = Self::embedding_journal_for(
             self.db_path
                 .as_ref()
@@ -2655,6 +2663,30 @@ impl GraphStore {
                 key STRING, \
                 value STRING, \
                 PRIMARY KEY(key))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Graph-owned regex consistency boundary. Mutations coalesce one
+        // outbox row per source scope in the same transaction as searchable
+        // graph changes; Tantivy acknowledgement happens only after its shard
+        // generation is durable and validated.
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS RegexScopeState(\
+                uid STRING, \
+                desired_epoch INT64, \
+                acknowledged_epoch INT64, \
+                candidate_count INT64, \
+                candidate_digest STRING, \
+                tombstone BOOL, \
+                last_error STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS RegexScopeOutbox(\
+                uid STRING, \
+                desired_epoch INT64, \
+                PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
