@@ -17432,6 +17432,15 @@ fn run_brain(
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
                 };
+                // nw-192: the daemon formats only a COUNT into its terminal
+                // message ("...; N eligible file(s) skipped"), while the
+                // direct path below prints "  {path} - {reason}" per file.
+                // IndexProgress has carried the per-file `skipped_files` all
+                // along and `index` already prints them; only this vault path
+                // dropped them on the floor. A reporter saw 210 of 1,244 .md
+                // files skipped with no way to learn why, because the daemon
+                // serves this by default.
+                let mut skipped_files: Vec<nestweaver_proto::IndexSkipDetail> = Vec::new();
                 rt.block_on(async {
                     let stream = client.inner_mut().index_vault(req).await?.into_inner();
                     consume_cli_index_progress(stream, |progress| {
@@ -17446,9 +17455,24 @@ fn run_brain(
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
+                        // REPLACE, don't extend: the daemon emits the same
+                        // full list on more than one phase message, so
+                        // accumulating double-counted every skip.
+                        if !progress.skipped_files.is_empty() {
+                            skipped_files = progress.skipped_files.clone();
+                        }
                     })
                     .await
                 })?;
+                if !skipped_files.is_empty() {
+                    out.status(&format!("Skipped {} file(s):", skipped_files.len()));
+                    for file in &skipped_files {
+                        out.status(&format!(
+                            "  {} — {}: {}",
+                            file.path, file.reason_code, file.detail
+                        ));
+                    }
+                }
                 return Ok((EXIT_SUCCESS, None));
             }
 
