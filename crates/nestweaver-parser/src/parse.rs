@@ -1269,6 +1269,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // nw-151: recover calls written inside Rust macro bodies.
+    if lang == Language::Rust {
+        collect_rust_macro_calls(tree.root_node(), source_bytes, &mut references);
+    }
+
     // Type extraction: walk the same tree with type-specific queries
     let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
 
@@ -1278,6 +1283,72 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         references,
         type_bindings,
     })
+}
+
+
+/// Emit CALL references for calls written inside Rust macro bodies (nw-151).
+///
+/// tree-sitter-rust parses macro arguments as an opaque `token_tree`, so
+/// nothing inside `assert!(..)` is ever a `call_expression` and the .scm
+/// captures only the macro's own name. In Rust test suites assertions are the
+/// dominant call site, which hollowed out the whole test-to-code call graph
+/// that `affected-tests` is built on: of `rollback_current`'s four callers,
+/// the three that call it only inside `assert!` produced no edge at all.
+///
+/// Inside a `token_tree` a call is an `identifier` whose next sibling is a
+/// `token_tree` -- `foo(..)` parses as `(identifier) (token_tree ..)`. A bare
+/// identifier with no following token_tree (a variable passed to `println!`)
+/// is correctly not treated as a call.
+///
+/// This is deliberately shallow: it recovers the call NAME, leaving the normal
+/// resolver priority chain to decide what it points at. A tuple-struct pattern
+/// such as `Some(x)` in `matches!` also matches this shape; it resolves like
+/// any other bare name, and against std types resolves to nothing.
+fn collect_rust_macro_calls(
+    node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "macro_invocation" {
+            let mut inner = child.walk();
+            for part in child.children(&mut inner) {
+                if part.kind() == "token_tree" {
+                    collect_calls_in_token_tree(part, source_bytes, references);
+                }
+            }
+        }
+        collect_rust_macro_calls(child, source_bytes, references);
+    }
+}
+
+fn collect_calls_in_token_tree(
+    tree_node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut cursor = tree_node.walk();
+    let children: Vec<tree_sitter::Node<'_>> = tree_node.children(&mut cursor).collect();
+    for (index, child) in children.iter().enumerate() {
+        if child.kind() == "identifier"
+            && children
+                .get(index + 1)
+                .is_some_and(|next| next.kind() == "token_tree")
+            && let Ok(name) = child.utf8_text(source_bytes)
+        {
+            references.push(RawReference {
+                name: name.to_string(),
+                kind: ReferenceKind::Call,
+                start_line: child.start_position().row as u32 + 1,
+                context: String::new(),
+                receiver: None,
+            });
+        }
+        if child.kind() == "token_tree" {
+            collect_calls_in_token_tree(*child, source_bytes, references);
+        }
+    }
 }
 
 // ── type extraction helpers ────────────────────────────────────────────────
@@ -5888,5 +5959,51 @@ fn main() {
             parsed.type_bindings
         );
         assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+}
+#[cfg(test)]
+mod macro_call_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-151: assertions are the dominant call site in Rust test suites, and
+    /// tree-sitter parses macro arguments as an opaque token_tree, so calls
+    /// inside `assert!(..)` produced no CALLS edge at all. That hollowed out
+    /// the test-to-code graph `affected-tests` depends on.
+    #[test]
+    fn calls_inside_macro_bodies_are_recovered() {
+        let src = "fn t() {\n    assert!(rollback_current(&a, &b).is_ok());\n    assert_eq!(read_current(&r), None);\n    println!(\"{}\", plain_variable);\n}\n";
+        let parsed = parse_source(Path::new("src/t.rs"), src).expect("parses");
+        let calls: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        for expected in ["rollback_current", "read_current"] {
+            assert!(
+                calls.contains(&expected),
+                "missing {expected} in {calls:?}"
+            );
+        }
+        // A bare identifier passed to a macro is NOT a call.
+        assert!(
+            !calls.contains(&"plain_variable"),
+            "a non-call identifier must not become a call: {calls:?}"
+        );
+    }
+
+    /// The recovered call must carry the line it appears on, not the macro's.
+    #[test]
+    fn a_recovered_macro_call_keeps_its_own_line() {
+        let src = "fn t() {\n\n\n    assert!(deep_call());\n}\n";
+        let parsed = parse_source(Path::new("src/t.rs"), src).expect("parses");
+        let call = parsed
+            .references
+            .iter()
+            .find(|r| r.name == "deep_call")
+            .expect("recovered call");
+        assert_eq!(call.start_line, 4);
     }
 }
