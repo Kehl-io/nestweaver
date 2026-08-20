@@ -2043,6 +2043,30 @@ enum ResolveOutcome {
 
 /// Lookup indices built once over all notes in the vault. Drives the
 /// 5-priority wikilink resolver.
+/// Resolve `.`/`..` segments in a vault-relative link against the folder the
+/// link was written in. Returns `None` if the path escapes the vault root
+/// (nw-165).
+fn normalize_relative(source_folder: &str, key: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if source_folder.is_empty() {
+        Vec::new()
+    } else {
+        source_folder.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for segment in key.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 struct WikilinkLookup<'a> {
     /// Path key → note_uid. Path keys are lowercased, with optional ".md"
     /// stripped, normalised to forward slashes.
@@ -2163,6 +2187,11 @@ impl<'a> WikilinkLookup<'a> {
     ///   otherwise split across all candidates.
     fn resolve(&self, target: &str, source_folder: &str) -> ResolveOutcome {
         let key = target.trim().replace('\\', "/").to_lowercase();
+        // nw-166: markdown links keep their extension (`[x](codebase-recon.md)`),
+        // but `by_path` is built from extension-stripped paths and the stem/title
+        // tiers never carry one. Without this, a same-folder markdown link
+        // resolved to nothing and was reported as a broken link.
+        let key = key.strip_suffix(".md").unwrap_or(&key).to_string();
         if key.is_empty() {
             return ResolveOutcome::Unresolved;
         }
@@ -2194,6 +2223,21 @@ impl<'a> WikilinkLookup<'a> {
                         note_uid: uid.to_string(),
                         confidence: 1.0,
                     }]);
+                }
+                // nw-165: `.` and `..` segments never matched, because by_path
+                // holds only normalized paths. `[[../notes/x]]` and
+                // `[[../../../Backlog]]` were reported broken even though the
+                // target existed.
+                if key.starts_with("..") || key.contains("/../") || key.contains("./") {
+                    if let Some(normalized) =
+                        normalize_relative(&source_folder.replace('\\', "/").to_lowercase(), &key)
+                        && let Some(&uid) = self.by_path.get(&normalized)
+                    {
+                        return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                            note_uid: uid.to_string(),
+                            confidence: 1.0,
+                        }]);
+                    }
                 }
             }
         }
@@ -2254,6 +2298,36 @@ impl<'a> WikilinkLookup<'a> {
                     })
                     .collect(),
             );
+        }
+
+        // nw-165: path-qualified fallback to the filename stem, which is what
+        // Obsidian does. by_stem / by_title / by_folder_name are keyed on bare
+        // names and can never contain a slash, so a path-qualified key that
+        // missed by_path above could not match ANY later tier and was reported
+        // as a genuinely broken link -- 40 such links in the reference vault
+        // had an existing target.
+        if key.contains('/')
+            && let Some(base) = key.rsplit('/').find(|segment| !segment.is_empty())
+            && base != key
+        {
+            // Below the exact-path tiers: only the filename was corroborated,
+            // not the path component.
+            if let Some(uids) = self.by_stem.get(base)
+                && uids.len() == 1
+            {
+                return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                    note_uid: uids[0].to_string(),
+                    confidence: 0.85,
+                }]);
+            }
+            if let Some(uids) = self.by_title.get(base)
+                && uids.len() == 1
+            {
+                return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                    note_uid: uids[0].to_string(),
+                    confidence: 0.85,
+                }]);
+            }
         }
 
         // Priority 5: ambiguous title match (was bundled inside priority
@@ -4239,5 +4313,33 @@ sub b body
             n,
             "final vault state must have all N notes"
         );
+    }
+}
+#[cfg(test)]
+mod link_resolution_tests {
+    use super::normalize_relative;
+
+    /// nw-165: `..` and `.` segments must resolve against the source folder.
+    #[test]
+    fn relative_segments_normalize_against_the_source_folder() {
+        assert_eq!(
+            normalize_relative("workspaces/orbit/notes/2026-08/prd", "../research/x").as_deref(),
+            Some("workspaces/orbit/notes/2026-08/research/x")
+        );
+        assert_eq!(
+            normalize_relative("workspaces/orbit/backlog", "../../../backlog").as_deref(),
+            Some("backlog")
+        );
+        assert_eq!(
+            normalize_relative("a/b", "./c").as_deref(),
+            Some("a/b/c")
+        );
+    }
+
+    /// Escaping the vault root yields None rather than a path outside it.
+    #[test]
+    fn escaping_the_vault_root_is_refused() {
+        assert_eq!(normalize_relative("a", "../../x"), None);
+        assert_eq!(normalize_relative("", ".."), None);
     }
 }
