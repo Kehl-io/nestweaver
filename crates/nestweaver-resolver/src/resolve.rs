@@ -550,6 +550,57 @@ fn resolve_single_reference(
 
     let candidates = symbol_map.get(effective_name.as_str());
 
+    // Priority 1.5: explicit path qualifier (nw-152).
+    //
+    // The .scm captures only the trailing identifier of a scoped call, so
+    // `nestweaver_engine::publication::read_current(..)` arrived here as the
+    // bare name `read_current`. With no `use` for that module in the file, it
+    // matched nothing in the tiers below and fell through to
+    // `unresolved:read_current` at confidence 0.0 -- the edge was dropped
+    // entirely. Resolution accuracy therefore depended on which UNRELATED types
+    // a file happened to import.
+    //
+    // The parser now records the qualifier as the reference receiver, so prefer
+    // a candidate whose file stem matches the qualifier's last module segment.
+    //
+    // Gated on the qualifier containing `::` so this only fires for a genuine
+    // multi-segment path. A bare receiver -- a JS variable in `store.method()`,
+    // or the type in `HashMap::new()` -- is excluded, because matching those
+    // against a same-named file would invent edges rather than recover them.
+    if let Some(qualifier) = reference.receiver.as_deref()
+        && qualifier.contains("::")
+        && let Some(syms) = &candidates
+        && let Some(module) = qualifier.rsplit("::").find(|segment| !segment.is_empty())
+    {
+        let mut qualified: Vec<_> = syms
+            .iter()
+            .filter(|(candidate_file, _)| {
+                candidate_file
+                    .rsplit('/')
+                    .next()
+                    .and_then(|base| base.split('.').next())
+                    .is_some_and(|stem| stem == module)
+            })
+            .collect();
+        qualified.sort_by_key(|(path, _)| *path);
+        if let Some((candidate_file, sym)) = qualified.into_iter().next() {
+            let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
+            let confidence = confidence_score(MatchType::ImportResolved, language);
+            return Some(ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type,
+                confidence,
+                link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "path_qualified".to_string(),
+                    weight: confidence,
+                    note: Some(format!("{qualifier}::{name}")),
+                }],
+            });
+        }
+    }
+
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
@@ -862,6 +913,83 @@ mod tests {
         assert!(
             python_conf < java_conf,
             "python ({python_conf}) should be less than java ({java_conf})"
+        );
+    }
+
+    /// nw-152: a fully-qualified call with no matching `use` must still
+    /// resolve. Real case: src/main.rs calls
+    /// `nestweaver_engine::publication::read_current(..)` with no `use` for
+    /// that module, so the edge was dropped and `impact read_current` reported
+    /// zero callers in main.rs -- while a sibling call to a DIFFERENT module
+    /// resolved fine purely because an unrelated type from it was imported.
+    #[test]
+    fn a_fully_qualified_call_resolves_without_a_matching_use() {
+        let mut caller = make_symbol("run_publication_rebuild", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("read_current", ReferenceKind::Call, 20);
+        // The parser records the qualifying path as the receiver.
+        call.receiver = Some("nestweaver_engine::publication".to_string());
+
+        let files = vec![
+            ("src/lib.rs".to_string(), vec![make_symbol("root", 1)], vec![]),
+            ("src/main.rs".to_string(), vec![caller], vec![call]),
+            (
+                "src/publication.rs".to_string(),
+                vec![make_symbol("read_current", 5)],
+                vec![],
+            ),
+            // A decoy with the same symbol name in an unrelated module: the
+            // qualifier must pick publication.rs, not this one.
+            (
+                "src/other.rs".to_string(),
+                vec![make_symbol("read_current", 5)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "expected one CALLS edge, got {calls:?}");
+        let expected = symbol_uid("repo:test:abc", "src/publication.rs", "read_current", 5);
+        assert_eq!(
+            calls[0].target_uid, expected,
+            "the qualifier must select publication.rs over the same-named decoy"
+        );
+        assert!(
+            !calls[0].target_uid.starts_with("unresolved:"),
+            "a qualified call must not fall through to unresolved"
+        );
+    }
+
+    /// The qualifier tier must NOT fire for a bare receiver: a JS
+    /// `store.method()` receiver is a variable, not a module path, and
+    /// matching it against a same-named file would invent edges.
+    #[test]
+    fn a_bare_receiver_does_not_trigger_path_qualified_resolution() {
+        let mut caller = make_symbol("handler", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("where", ReferenceKind::Call, 20);
+        call.receiver = Some("knex".to_string());
+
+        let files = vec![
+            ("src/main.js".to_string(), vec![caller], vec![call]),
+            (
+                "src/knex.js".to_string(),
+                vec![make_symbol("where", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let qualified: Vec<_> = edges
+            .iter()
+            .filter(|e| e.evidence.iter().any(|ev| ev.kind == "path_qualified"))
+            .collect();
+        assert!(
+            qualified.is_empty(),
+            "a bare receiver must not resolve via the path-qualified tier: {qualified:?}"
         );
     }
 

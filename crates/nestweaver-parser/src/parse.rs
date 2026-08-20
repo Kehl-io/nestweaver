@@ -1219,11 +1219,39 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                             None
                         };
 
+                    // Strategy 4: qualifying path of a scoped call (nw-152).
+                    // `a::b::c()` and `A.b.c()` parse as a scoped/qualified
+                    // function node whose `path` (or `scope`) field is the
+                    // qualifier. The .scm captures only the trailing identifier,
+                    // so without this the qualifier is lost and the resolver has
+                    // nothing but a bare name to work with -- which is why a
+                    // fully-qualified call with no matching `use` resolved to
+                    // nothing at all.
+                    let from_scoped_path = if from_function_child.is_none()
+                        && from_direct_object.is_none()
+                        && from_receiver_field.is_none()
+                    {
+                        node.child_by_field_name("function")
+                            .filter(|f| {
+                                let k = f.kind();
+                                k.contains("scoped") || k.contains("qualified")
+                            })
+                            .and_then(|f| {
+                                f.child_by_field_name("path")
+                                    .or_else(|| f.child_by_field_name("scope"))
+                            })
+                            .and_then(|p| p.utf8_text(source_bytes).ok())
+                            .map(|s| arena.alloc_str(s) as &str)
+                    } else {
+                        None
+                    };
+
                     // Convert the chosen arena-backed &str to an owned String only once,
                     // at the point where we need it for RawReference.
                     from_function_child
                         .or(from_direct_object)
                         .or(from_receiver_field)
+                        .or(from_scoped_path)
                         .map(|s| s.to_string())
                 } else {
                     None

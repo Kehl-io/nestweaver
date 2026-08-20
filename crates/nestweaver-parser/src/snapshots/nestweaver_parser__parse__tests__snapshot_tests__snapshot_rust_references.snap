@@ -86,7 +86,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: Call
   start_line: 31
   context: "sensors: HashMap::new()"
-  receiver: ~
+  receiver: HashMap
 - name: Sensor
   kind: TypeRef
   start_line: 35
@@ -131,7 +131,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: Call
   start_line: 41
   context: "let mgr = SensorManager::new();"
-  receiver: ~
+  receiver: SensorManager
 - name: println
   kind: Call
   start_line: 42
