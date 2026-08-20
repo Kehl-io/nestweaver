@@ -2006,12 +2006,12 @@ url = "https://github.com/example/existing"
                 .unwrap()
                 .contains_key(&removed_symbol_uid)
         );
+        store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
         store.flush_embedding_index().unwrap();
 
-        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
         assert!(
-            nestweaver_engine::load_manifest_cache(&manifests_path)
+            nestweaver_engine::load_manifest_cache_for_db(&store, &db_path)
                 .unwrap()
                 .contains_key(&repo_uid)
         );
@@ -2136,7 +2136,7 @@ url = "https://github.com/example/existing"
             "code-only admin deletion must not rebuild unrelated vault search"
         );
         assert!(
-            !nestweaver_engine::load_manifest_cache(&manifests_path)
+            !nestweaver_engine::load_manifest_cache_for_db(&store, &db_path)
                 .unwrap()
                 .contains_key(&repo_uid),
             "admin deletion must remove the deleted repo manifest"
@@ -2190,7 +2190,10 @@ url = "https://github.com/example/existing"
         deps.save(&deps_path).unwrap();
 
         let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
-        std::fs::write(&pagerank_path, format!(r#"{{"{file_uid}":1.0}}"#)).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&pagerank_path).unwrap();
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let tantivy =
             nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap();

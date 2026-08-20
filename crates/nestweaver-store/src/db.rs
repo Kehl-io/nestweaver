@@ -197,7 +197,9 @@ impl IndexPublicationLease<'_> {
     /// publication with no ranks.
     pub fn save_pagerank(&self, path: &Path) -> Result<(), StoreError> {
         self.store.validate_index_publication_owner(self.token)?;
-        self.store.save_pagerank_cache_for_publication_owner(path)
+        let clean_generation = self.clean_generation()?;
+        self.store
+            .save_pagerank_cache_for_publication_owner(path, clean_generation)
     }
 
     /// Restore the prior canonical generation when no graph mutation occurred.
@@ -235,6 +237,11 @@ impl Drop for IndexPublicationLease<'_> {
 pub struct GraphStore {
     pub(crate) db: lbug::Database,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// Algorithm and scope fingerprint for the scores currently held in
+    /// `pagerank_cache`. It is persisted with the scores so a loader cannot
+    /// confuse code-only, notes-only, unified, or parameter-incompatible
+    /// ranks.
+    pub(crate) pagerank_artifact_fingerprint: Mutex<Option<String>>,
     /// Monotonic counter that bumps whenever PageRank scores change. Lets
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
@@ -250,10 +257,6 @@ pub struct GraphStore {
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
-    /// Generation/digest-keyed trigram scope trust verdict. The digest keeps
-    /// raw/import mutations that do not bump the in-process generation from
-    /// reusing a narrower stale verdict.
-    pub(crate) trigram_scope_cache: Mutex<Option<crate::regex::TrigramScopeCache>>,
     /// Last canonical generation while an index publication is dirty. A
     /// present value means `graph_generation` is either its dirty N+1
     /// reservation or the prepared clean N+2 publication. Keeping this
@@ -284,6 +287,12 @@ pub struct GraphStore {
     /// sidecar so `graph_generation` can be loaded on open and persisted on
     /// mutation without callers having to thread the path through.
     pub(crate) db_path: Option<PathBuf>,
+    /// Private filesystem namespace for rebuildable sidecars owned by an
+    /// in-memory graph. Keeping the TempDir alive makes in-memory stores use
+    /// the same regex-v3 implementation as persistent stores without creating
+    /// graph-resident postings.
+    regex_ephemeral_root: Option<tempfile::TempDir>,
+    pub(crate) regex_reader_pool: std::sync::Arc<crate::regex_index::RegexReaderPool>,
     /// Cached PPR adjacency graph. Holds the last-built `(uids, uid_to_idx,
     /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
@@ -312,6 +321,66 @@ pub struct GraphStore {
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
 }
+
+/// Persistent identity of one NestWeaver brain and its current publication
+/// slot. These IDs describe the data, not the configured instance name or the
+/// database path used for daemon runtime files.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationIdentity {
+    pub brain_uuid: String,
+    pub publication_uuid: String,
+}
+
+impl PublicationIdentity {
+    /// Create the identity for a brand-new logical brain.
+    pub fn new_brain() -> Self {
+        Self {
+            brain_uuid: uuid::Uuid::new_v4().to_string(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// Create a fresh publication slot for this same logical brain.
+    ///
+    /// The current publication UUID is deliberately not retained: a staged
+    /// rebuild is a different complete graph/artifact lineage even though it
+    /// represents the same user data.
+    pub fn next_publication(&self) -> Result<Self, StoreError> {
+        self.validate()?;
+        let next = Self {
+            brain_uuid: self.brain_uuid.clone(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Validate both UUIDs and the invariant that the two identities differ.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let parse = |name: &str, value: &str| {
+            let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
+                StoreError::Query(format!("invalid {name} metadata '{value}': {error}"))
+            })?;
+            if parsed.is_nil() {
+                return Err(StoreError::Query(format!(
+                    "invalid {name} metadata: nil UUID is not a data identity"
+                )));
+            }
+            Ok(parsed)
+        };
+        let brain_uuid = parse("brain_uuid", &self.brain_uuid)?;
+        let publication_uuid = parse("publication_uuid", &self.publication_uuid)?;
+        if brain_uuid == publication_uuid {
+            return Err(StoreError::Query(
+                "brain_uuid and publication_uuid must be distinct".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const BRAIN_UUID_META_KEY: &str = "publication.brain_uuid";
+const PUBLICATION_UUID_META_KEY: &str = "publication.publication_uuid";
 
 /// Authoritative embedding state captured while the in-memory embedding mutex
 /// remained held for the complete flush/metadata/count/stage operation.
@@ -506,16 +575,18 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -526,6 +597,59 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
+        store.load_graph_generation(&store.generation_sidecar_path());
+        store.load_recorded_embedding_model_into_index();
+        Ok(store)
+    }
+
+    /// Create a new persistent database with an explicitly chosen publication
+    /// identity.
+    ///
+    /// This is the safe creation primitive for a staged full rebuild: callers
+    /// derive `identity` with [`PublicationIdentity::next_publication`], so the
+    /// new slot inherits the incumbent brain UUID but cannot masquerade as the
+    /// incumbent publication. The destination must not already exist; this API
+    /// never adopts or rewrites identity on an existing database.
+    pub fn create_with_publication_identity(
+        path: &Path,
+        identity: &PublicationIdentity,
+    ) -> Result<Self, StoreError> {
+        identity.validate()?;
+        if path.exists() {
+            return Err(StoreError::Query(format!(
+                "refusing to create staged publication over existing database {}",
+                path.display()
+            )));
+        }
+
+        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        let store = GraphStore {
+            db,
+            pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
+            graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
+            interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
+            db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
+            embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
+        };
+        store.init_schema()?;
+        store.initialize_publication_identity(identity)?;
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
         Ok(store)
@@ -539,16 +663,18 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -559,6 +685,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
         Ok(store)
@@ -573,16 +700,18 @@ impl GraphStore {
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            regex_ephemeral_root: None,
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -627,19 +756,25 @@ impl GraphStore {
     /// Create an in-memory database and initialise schema tables.
     pub fn in_memory() -> Result<Self, StoreError> {
         let db = lbug::Database::in_memory(lbug::SystemConfig::default())?;
+        let regex_ephemeral_root = tempfile::Builder::new()
+            .prefix("nestweaver-regex-v3-memory-")
+            .tempdir()
+            .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
+            pagerank_artifact_fingerprint: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
-            trigram_scope_cache: Mutex::new(None),
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
+            regex_ephemeral_root: Some(regex_ephemeral_root),
+            regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             impact_snapshot_cache: Mutex::new(None),
@@ -650,6 +785,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.ensure_publication_identity()?;
         store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
@@ -691,6 +827,10 @@ impl GraphStore {
     pub(crate) fn invalidate_ranking_caches_locked(&self) {
         *self
             .pagerank_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .pagerank_artifact_fingerprint
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         *self
@@ -1385,12 +1525,17 @@ impl GraphStore {
     fn load_embedding_index(db_path: &Path) -> crate::search::EmbeddingIndex {
         let binary_path = Self::embedding_sidecar_binary_for(db_path);
         if binary_path.exists()
-            && let Ok(idx) = crate::search::EmbeddingIndex::load_binary(&binary_path)
+            && let Ok(idx) = crate::search::EmbeddingIndex::load_binary_v2(&binary_path)
         {
             return idx;
         }
-        let json_path = Self::embedding_sidecar_json_for(db_path);
-        crate::search::EmbeddingIndex::load(&json_path).unwrap_or_default()
+        if binary_path.exists() {
+            tracing::warn!(
+                path = %binary_path.display(),
+                "legacy or invalid embedding artifact is unavailable; run a full re-embed for embedding pipeline v2"
+            );
+        }
+        crate::search::EmbeddingIndex::new()
     }
 
     /// Hand the embedding index the model id recorded in the database's
@@ -1410,10 +1555,50 @@ impl GraphStore {
                 None
             }
         };
-        self.embedding_index
+        let pipeline = self.get_embedding_pipeline().ok().flatten();
+        let pipeline_fingerprint = pipeline
+            .as_ref()
+            .and_then(|pipeline| pipeline.fingerprint().ok());
+        let mut index = self
+            .embedding_index
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_recorded_model_id(recorded);
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(envelope) = index.artifact_envelope().cloned() {
+            let identity = self.publication_identity().ok().flatten();
+            let compatible = identity.as_ref().is_some_and(|identity| {
+                envelope.brain_uuid == identity.brain_uuid
+                    && envelope.publication_uuid == identity.publication_uuid
+            }) && envelope.source_graph_generation <= self.graph_generation()
+                && pipeline_fingerprint.as_deref()
+                    == envelope.pipeline.fingerprint().ok().as_deref();
+            if !compatible {
+                tracing::warn!(
+                    "embedding-v2 artifact is foreign, stale, or pipeline-incompatible; semantic search is unavailable until a full re-embed"
+                );
+                index.clear();
+            }
+        }
+        // Trust is carried by the validated/adopted envelope, not inferred
+        // from vector count. Keeping that state explicit prevents later format
+        // changes from accidentally coupling journal recovery to index size.
+        if index.artifact_envelope().is_some()
+            && let (Some(db_path), Some(identity), Some(pipeline)) = (
+                self.db_path.as_ref(),
+                self.publication_identity().ok().flatten(),
+                pipeline.clone(),
+            )
+        {
+            let journal = Self::embedding_journal_for(db_path);
+            if let Err(error) = index.replay_journal_v2(&journal, &identity, &pipeline) {
+                tracing::warn!(%error, "embedding journal is invalid; semantic search is unavailable until a full re-embed");
+                index.clear();
+            }
+        }
+        index.set_recorded_model_id(recorded);
+        index.set_recorded_pipeline_fingerprint(pipeline_fingerprint);
+        if let Some(pipeline) = pipeline {
+            index.set_similarity(pipeline.similarity);
+        }
     }
 
     /// Compute the legacy JSON sidecar path for a given database path.
@@ -1430,12 +1615,34 @@ impl GraphStore {
         std::path::PathBuf::from(s)
     }
 
+    fn embedding_journal_for(db_path: &Path) -> std::path::PathBuf {
+        let mut value = db_path.as_os_str().to_owned();
+        value.push(".embeddings.journal");
+        std::path::PathBuf::from(value)
+    }
+
     /// Return the path to the embedding sidecar file (binary format),
     /// or `None` for in-memory stores.
     pub fn embedding_sidecar_path(&self) -> Option<std::path::PathBuf> {
         self.db_path
             .as_ref()
             .map(|p| Self::embedding_sidecar_binary_for(p))
+    }
+
+    /// Return the dedicated per-scope regex-v3 sidecar root.
+    pub fn regex_sidecar_root(&self) -> Option<std::path::PathBuf> {
+        self.db_path
+            .as_ref()
+            .map(|path| {
+                let mut value = path.as_os_str().to_owned();
+                value.push(".regex-v3");
+                std::path::PathBuf::from(value)
+            })
+            .or_else(|| {
+                self.regex_ephemeral_root
+                    .as_ref()
+                    .map(|root| root.path().join("regex-v3"))
+            })
     }
 
     /// Add an embedding to the in-memory index without saving to disk.
@@ -1477,6 +1684,21 @@ impl GraphStore {
         idx.add_with_model(uid, embedding, Some(model_id), force)
     }
 
+    #[must_use = "a false return means a pipeline or dimension guard rejected the embedding"]
+    pub fn add_embedding_with_pipeline(
+        &self,
+        uid: &str,
+        embedding: Vec<f32>,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+        force: bool,
+    ) -> bool {
+        let mut index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        index.add_with_pipeline(uid, embedding, pipeline, force)
+    }
+
     /// Re-arm the embedding index's once-per-run force-clear guard. Call at
     /// the start of an embed run — matters for long-lived stores (the daemon)
     /// where the index outlives individual embed runs.
@@ -1500,14 +1722,115 @@ impl GraphStore {
     /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
-        let idx = self
+        let mut idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(path) = self.embedding_sidecar_path() {
-            idx.save_binary(&path)
-                .map_err(|e| StoreError::Query(format!("save binary embedding sidecar: {e}")))?;
+            if idx.is_empty() && !idx.has_pending_deltas() {
+                return Ok(());
+            }
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query("embedding v2 requires publication identity".to_string())
+            })?;
+            let pipeline = self.get_embedding_pipeline()?.ok_or_else(|| {
+                StoreError::Query(
+                    "embedding vectors have no pipeline-v2 metadata; run a full re-embed"
+                        .to_string(),
+                )
+            })?;
+            let db_path = self
+                .db_path
+                .as_ref()
+                .expect("sidecar path requires database path");
+            let journal = Self::embedding_journal_for(db_path);
+            let base_exists = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => true,
+                Ok(_) => {
+                    return Err(StoreError::Query(format!(
+                        "embedding-v2 base {} is not a regular file",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(StoreError::Query(format!(
+                        "inspect embedding-v2 base {}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            // Path existence alone does not make a base trustworthy. A legacy,
+            // corrupt, foreign, or pipeline-incompatible file is deliberately
+            // cleared during open and therefore has no adopted envelope. The
+            // next successful embed must replace that file with a complete v2
+            // base instead of appending deltas to an unusable foundation.
+            let trusted_base_exists = base_exists && idx.artifact_envelope().is_some();
+            if !trusted_base_exists {
+                idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+                    .map_err(|e| StoreError::Query(format!("save embedding-v2 sidecar: {e}")))?;
+                idx.adopt_binary_v2(&path).map_err(|error| {
+                    StoreError::Query(format!("reopen embedding-v2 sidecar: {error}"))
+                })?;
+                crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
+                    |error| StoreError::Query(format!("retire embedding journal: {error}")),
+                )?;
+            } else {
+                idx.append_journal_v2(&journal, &identity, &pipeline)
+                    .map_err(|e| StoreError::Query(format!("append embedding journal: {e}")))?;
+                if idx.should_compact_journal(&journal) {
+                    idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+                        .map_err(|e| {
+                            StoreError::Query(format!("compact embedding-v2 sidecar: {e}"))
+                        })?;
+                    idx.adopt_binary_v2(&path).map_err(|error| {
+                        StoreError::Query(format!("reopen compacted embedding-v2 sidecar: {error}"))
+                    })?;
+                    crate::durable_sidecar::remove_file_durable_if_exists(&journal).map_err(
+                        |error| {
+                            StoreError::Query(format!(
+                                "retire compacted embedding journal: {error}"
+                            ))
+                        },
+                    )?;
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Fold the append journal into a complete sibling-safe base snapshot.
+    /// Backup/cutover paths use this to package one self-contained artifact.
+    pub fn compact_embedding_index(&self) -> Result<(), StoreError> {
+        let mut index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if index.is_empty() {
+            return Ok(());
+        }
+        let Some(path) = self.embedding_sidecar_path() else {
+            return Ok(());
+        };
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("embedding compaction requires publication identity".to_string())
+        })?;
+        let pipeline = self.get_embedding_pipeline()?.ok_or_else(|| {
+            StoreError::Query("embedding compaction requires pipeline-v2 metadata".to_string())
+        })?;
+        index
+            .save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
+            .map_err(|error| StoreError::Query(format!("compact embedding-v2 sidecar: {error}")))?;
+        index.adopt_binary_v2(&path).map_err(|error| {
+            StoreError::Query(format!("reopen compacted embedding-v2 sidecar: {error}"))
+        })?;
+        let journal = Self::embedding_journal_for(
+            self.db_path
+                .as_ref()
+                .expect("embedding sidecar requires database path"),
+        );
+        crate::durable_sidecar::remove_file_durable_if_exists(&journal)
+            .map_err(|error| StoreError::Query(format!("retire embedding journal: {error}")))?;
         Ok(())
     }
 
@@ -1526,16 +1849,20 @@ impl GraphStore {
             .map_err(|_| StoreError::Query("embedding count does not fit u64".to_string()))?;
         let index_dimension = u32::try_from(idx.dimension().unwrap_or(0))
             .map_err(|_| StoreError::Query("embedding dimension does not fit u32".to_string()))?;
-        let metadata = self.get_embedding_metadata()?;
+        let pipeline = self.get_embedding_pipeline()?;
 
-        let (model_id, dimension) = match metadata {
-            Some((model_id, dimension)) => {
+        let (model_id, dimension) = match pipeline.as_ref() {
+            Some(pipeline) => {
+                let dimension = pipeline.produced_dimension;
                 if count > 0 && dimension != index_dimension {
                     return Err(StoreError::Query(format!(
                         "embedding metadata dimension {dimension} does not match sidecar dimension {index_dimension}"
                     )));
                 }
-                (model_id, if count > 0 { dimension } else { 0 })
+                (
+                    pipeline.model_id.clone(),
+                    if count > 0 { dimension } else { 0 },
+                )
             }
             None if count > 0 => {
                 return Err(StoreError::Query(
@@ -1546,17 +1873,43 @@ impl GraphStore {
             None => (String::new(), 0),
         };
 
+        // An empty semantic index has no artifact. Requiring or inventing a
+        // pipeline for zero vectors would falsely claim a semantic space and
+        // make graph-only snapshots impossible.
+        if count == 0 {
+            return Ok(EmbeddingSnapshotLease {
+                state: EmbeddingSnapshotState {
+                    model_id,
+                    dimension,
+                    count,
+                },
+                _guard: idx,
+            });
+        }
+
         // Flush the canonical sidecar first, then serialize the exact same
         // mutex-protected index into the snapshot staging directory. Both
         // writes use atomic_replace_file (file fsync + rename + parent fsync).
         if let Some(path) = self.embedding_sidecar_path() {
-            idx.save_binary(&path).map_err(|error| {
-                StoreError::Query(format!("flush binary embedding sidecar: {error}"))
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query("embedding snapshot requires publication identity".to_string())
             })?;
+            let pipeline = pipeline.as_ref().ok_or_else(|| {
+                StoreError::Query("embedding snapshot requires pipeline-v2 metadata".to_string())
+            })?;
+            idx.save_binary_v2(&path, &identity, self.graph_generation(), pipeline)
+                .map_err(|error| {
+                    StoreError::Query(format!("flush embedding-v2 sidecar: {error}"))
+                })?;
         }
-        idx.save_binary(destination).map_err(|error| {
-            StoreError::Query(format!("stage binary embedding sidecar: {error}"))
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("embedding snapshot requires publication identity".to_string())
         })?;
+        let pipeline = pipeline.as_ref().ok_or_else(|| {
+            StoreError::Query("embedding snapshot requires pipeline-v2 metadata".to_string())
+        })?;
+        idx.save_binary_v2(destination, &identity, self.graph_generation(), pipeline)
+            .map_err(|error| StoreError::Query(format!("stage embedding-v2 sidecar: {error}")))?;
 
         Ok(EmbeddingSnapshotLease {
             state: EmbeddingSnapshotState {
@@ -1697,6 +2050,186 @@ impl GraphStore {
     /// Return a new connection to the underlying database.
     pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
         Ok(lbug::Connection::new(&self.db)?)
+    }
+
+    fn publication_meta_value_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) RETURN m.value")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("key", lbug::Value::String(key.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("read publication identity: {error}")))?;
+        rows.next()
+            .map(|row| crate::read::extract_string(&row, 0))
+            .transpose()
+    }
+
+    fn create_publication_meta_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        let mut statement = conn
+            .prepare("CREATE (:Meta {key: $key, value: $value})")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(key.to_string())),
+                ("value", lbug::Value::String(value.to_string())),
+            ],
+        )
+        .map_err(|error| StoreError::Query(format!("write publication identity: {error}")))?;
+        Ok(())
+    }
+
+    /// Read the database-bound identity. A legacy read-only database may have
+    /// neither key and returns `None`; a partial or malformed identity is an
+    /// error because silently inventing the missing half could attach foreign
+    /// artifacts to this graph.
+    pub fn publication_identity(&self) -> Result<Option<PublicationIdentity>, StoreError> {
+        let conn = self.conn()?;
+        let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
+        let publication_uuid = Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+        match (brain_uuid, publication_uuid) {
+            (None, None) => Ok(None),
+            (Some(brain_uuid), Some(publication_uuid)) => {
+                let identity = PublicationIdentity {
+                    brain_uuid,
+                    publication_uuid,
+                };
+                identity.validate()?;
+                Ok(Some(identity))
+            }
+            (brain_uuid, publication_uuid) => Err(StoreError::Query(format!(
+                "incomplete publication identity: brain_uuid={}, publication_uuid={}; repair or rebuild the database",
+                brain_uuid.is_some(),
+                publication_uuid.is_some()
+            ))),
+        }
+    }
+
+    /// Initialize identity for a new or legacy writable database exactly once.
+    /// Both keys are committed in one LadybugDB transaction. Existing identity
+    /// is validated and returned unchanged.
+    pub fn ensure_publication_identity(&self) -> Result<PublicationIdentity, StoreError> {
+        if let Some(identity) = self.publication_identity()? {
+            return Ok(identity);
+        }
+
+        let identity = PublicationIdentity::new_brain();
+        self.initialize_publication_identity(&identity)
+    }
+
+    /// Assert that this store is the brain selected by configuration.
+    /// UUID spellings are compared by value rather than text so alternate
+    /// encodings cannot bypass the binding.
+    pub fn assert_brain_uuid(&self, expected: &str) -> Result<PublicationIdentity, StoreError> {
+        let expected = uuid::Uuid::parse_str(expected).map_err(|error| {
+            StoreError::Query(format!("invalid expected_brain_uuid '{expected}': {error}"))
+        })?;
+        if expected.is_nil() {
+            return Err(StoreError::Query(
+                "invalid expected_brain_uuid: nil UUID is not a data identity".to_string(),
+            ));
+        }
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query(
+                "database has no publication identity; open it writable to initialize identity before binding it to configuration"
+                    .to_string(),
+            )
+        })?;
+        let actual = uuid::Uuid::parse_str(&identity.brain_uuid).map_err(|error| {
+            StoreError::Query(format!(
+                "invalid brain_uuid metadata '{}': {error}",
+                identity.brain_uuid
+            ))
+        })?;
+        if actual != expected {
+            return Err(StoreError::Query(format!(
+                "brain identity mismatch: configuration expects {expected}, but database {} contains {}. Inspect the database with `nestweaver instance identity --db <path>`; if this database is intentionally correct, bind the config with `nestweaver instance adopt-identity <config> --db <path>`. Otherwise restore or rebuild the expected brain",
+                self.db_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<in-memory>".to_string()),
+                identity.brain_uuid
+            )));
+        }
+        Ok(identity)
+    }
+
+    fn initialize_publication_identity(
+        &self,
+        identity: &PublicationIdentity,
+    ) -> Result<PublicationIdentity, StoreError> {
+        identity.validate()?;
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|error| StoreError::Query(format!("begin publication identity: {error}")))?;
+        let result = (|| {
+            // Re-check under the write transaction so two openers cannot each
+            // publish a different identity for the same legacy database.
+            let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
+            let publication_uuid =
+                Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+            match (brain_uuid, publication_uuid) {
+                (None, None) => {
+                    Self::create_publication_meta_on(
+                        &conn,
+                        BRAIN_UUID_META_KEY,
+                        &identity.brain_uuid,
+                    )?;
+                    Self::create_publication_meta_on(
+                        &conn,
+                        PUBLICATION_UUID_META_KEY,
+                        &identity.publication_uuid,
+                    )?;
+                    Ok(identity.clone())
+                }
+                (Some(brain_uuid), Some(publication_uuid)) => {
+                    let existing = PublicationIdentity {
+                        brain_uuid,
+                        publication_uuid,
+                    };
+                    existing.validate()?;
+                    if existing != *identity {
+                        Err(StoreError::Query(format!(
+                            "refusing to replace existing publication identity {}/{} with {}/{}",
+                            existing.brain_uuid,
+                            existing.publication_uuid,
+                            identity.brain_uuid,
+                            identity.publication_uuid
+                        )))
+                    } else {
+                        Ok(existing)
+                    }
+                }
+                (brain_uuid, publication_uuid) => Err(StoreError::Query(format!(
+                    "incomplete publication identity: brain_uuid={}, publication_uuid={}; repair or rebuild the database",
+                    brain_uuid.is_some(),
+                    publication_uuid.is_some()
+                ))),
+            }
+        })();
+
+        match result {
+            Ok(identity) => {
+                conn.query("COMMIT").map_err(|error| {
+                    StoreError::Query(format!("commit publication identity: {error}"))
+                })?;
+                Ok(identity)
+            }
+            Err(error) => {
+                let _ = conn.query("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Begin an explicit write transaction. All subsequent writes on the
@@ -2118,42 +2651,9 @@ impl GraphStore {
         .map_err(|e| StoreError::Query(e.to_string()))?;
         let _ = conn.query("ALTER TABLE IMPLEMENTS_CONTRACT ADD evidence STRING DEFAULT ''");
 
-        // ── Trigram posting table (F3/F4) ───────────────────────────────────
-        // Maps a lowercased 3-gram to a node UID whose indexed text contains
-        // it. Built opt-in via `index --with-trigrams`; used to pre-filter
-        // candidate nodes before running the real regex. Correctness never
-        // depends on its presence — see crate::regex.
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramPosting(\
-                uid STRING, \
-                trigram STRING, \
-                node_uid STRING, \
-                scope_uid STRING, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-        // Forward migration for posting tables created before scoped trigram
-        // maintenance. Legacy rows retain the empty default and are replaced
-        // by the first v2 refresh.
-        let _ = conn.query("ALTER TABLE TrigramPosting ADD scope_uid STRING DEFAULT ''");
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramDocument(\
-                uid STRING, \
-                scope_uid STRING, \
-                text_hash STRING, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS TrigramScope(\
-                uid STRING, \
-                status STRING, \
-                candidate_count INT64, \
-                candidate_digest STRING, \
-                indexed_generation INT64, \
-                PRIMARY KEY(uid))",
-        )
-        .map_err(|e| StoreError::Query(e.to_string()))?;
+        // Regex v3 stores postings in disposable per-scope Tantivy shards.
+        // Fresh graphs intentionally create no graph-resident posting tables;
+        // older tables may remain until the mandatory fresh-reindex cutover.
 
         // ── Unresolved wikilink table (broken-links) ────────────────────────
         // A `[[Target]]` whose text matches no note in the vault produces NO
@@ -2187,6 +2687,30 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // Graph-owned regex consistency boundary. Mutations coalesce one
+        // outbox row per source scope in the same transaction as searchable
+        // graph changes; Tantivy acknowledgement happens only after its shard
+        // generation is durable and validated.
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS RegexScopeState(\
+                uid STRING, \
+                desired_epoch INT64, \
+                acknowledged_epoch INT64, \
+                candidate_count INT64, \
+                candidate_digest STRING, \
+                tombstone BOOL, \
+                last_error STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS RegexScopeOutbox(\
+                uid STRING, \
+                desired_epoch INT64, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         Ok(())
     }
 }
@@ -2194,6 +2718,177 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_identity_is_created_once_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.lbug");
+        let created = GraphStore::create(&path).unwrap();
+        let first = created.publication_identity().unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(&first.brain_uuid).is_ok());
+        assert!(uuid::Uuid::parse_str(&first.publication_uuid).is_ok());
+        assert_ne!(first.brain_uuid, first.publication_uuid);
+        drop(created);
+
+        let reopened = GraphStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(first.clone())
+        );
+        drop(reopened);
+
+        let read_only = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(read_only.publication_identity().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn staged_publication_inherits_brain_and_gets_fresh_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent_path = dir.path().join("incumbent.lbug");
+        let incumbent = GraphStore::create(&incumbent_path).unwrap();
+        let incumbent_identity = incumbent.publication_identity().unwrap().unwrap();
+        let staged_identity = incumbent_identity.next_publication().unwrap();
+        assert_eq!(staged_identity.brain_uuid, incumbent_identity.brain_uuid);
+        assert_ne!(
+            staged_identity.publication_uuid,
+            incumbent_identity.publication_uuid
+        );
+
+        let staged_path = dir.path().join("staged.lbug");
+        let staged =
+            GraphStore::create_with_publication_identity(&staged_path, &staged_identity).unwrap();
+        assert_eq!(
+            staged.publication_identity().unwrap(),
+            Some(staged_identity.clone())
+        );
+        drop(staged);
+
+        let reopened = GraphStore::open_read_only(&staged_path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(staged_identity)
+        );
+    }
+
+    #[test]
+    fn staged_publication_creation_never_overwrites_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.lbug");
+        let incumbent = GraphStore::create(&path).unwrap();
+        let incumbent_identity = incumbent.publication_identity().unwrap().unwrap();
+        let staged_identity = incumbent_identity.next_publication().unwrap();
+        drop(incumbent);
+
+        let error = GraphStore::create_with_publication_identity(&path, &staged_identity)
+            .err()
+            .expect("existing database must be refused")
+            .to_string();
+        assert!(
+            error.contains("refusing to create staged publication"),
+            "{error}"
+        );
+
+        let reopened = GraphStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reopened.publication_identity().unwrap(),
+            Some(incumbent_identity)
+        );
+    }
+
+    #[test]
+    fn expected_brain_uuid_is_value_checked_and_mismatch_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let expected = uuid::Uuid::parse_str(&identity.brain_uuid).unwrap();
+        let alternate_spelling = expected.as_braced().to_string().to_uppercase();
+        assert_eq!(
+            store.assert_brain_uuid(&alternate_spelling).unwrap(),
+            identity
+        );
+
+        let foreign = uuid::Uuid::new_v4().to_string();
+        let error = store.assert_brain_uuid(&foreign).unwrap_err().to_string();
+        assert!(error.contains("brain identity mismatch"), "{error}");
+        assert!(error.contains(&foreign), "{error}");
+        assert!(error.contains(&identity.brain_uuid), "{error}");
+    }
+
+    #[test]
+    fn partial_publication_identity_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) DETACH DELETE m")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![(
+                "key",
+                lbug::Value::String(PUBLICATION_UUID_META_KEY.to_string()),
+            )],
+        )
+        .unwrap();
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("incomplete publication identity"), "{error}");
+        let error = store.ensure_publication_identity().unwrap_err().to_string();
+        assert!(error.contains("incomplete publication identity"), "{error}");
+    }
+
+    #[test]
+    fn malformed_publication_identity_fails_closed() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .unwrap();
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(BRAIN_UUID_META_KEY.to_string())),
+                ("value", lbug::Value::String("not-a-uuid".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("invalid brain_uuid metadata"), "{error}");
+        let error = store.ensure_publication_identity().unwrap_err().to_string();
+        assert!(error.contains("invalid brain_uuid metadata"), "{error}");
+    }
+
+    #[test]
+    fn equivalent_publication_identity_uuid_encodings_cannot_bypass_distinctness() {
+        let store = GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let publication_uuid = uuid::Uuid::parse_str(&identity.publication_uuid).unwrap();
+        let conn = store.conn().unwrap();
+        for (key, value) in [
+            (
+                BRAIN_UUID_META_KEY,
+                publication_uuid.simple().to_string().to_uppercase(),
+            ),
+            (
+                PUBLICATION_UUID_META_KEY,
+                publication_uuid.hyphenated().to_string(),
+            ),
+        ] {
+            let mut statement = conn
+                .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+                .unwrap();
+            conn.execute(
+                &mut statement,
+                vec![
+                    ("key", lbug::Value::String(key.to_string())),
+                    ("value", lbug::Value::String(value)),
+                ],
+            )
+            .unwrap();
+        }
+
+        let error = store.publication_identity().unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+    }
 
     #[test]
     fn index_publication_lease_is_send_without_a_held_mutex_guard() {
@@ -2766,6 +3461,37 @@ mod tests {
             legacy_path.exists(),
             "failed retirement must preserve fallback"
         );
+    }
+
+    #[test]
+    fn embedding_reconciliation_persists_deletion_of_the_last_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:stale", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+
+        assert_eq!(store.reconcile_embedding_index().unwrap(), 1);
+        assert!(!store.has_embedding("symbol:stale"));
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.has_embedding("symbol:stale"));
+    }
+
+    #[test]
+    fn embedding_flush_rejects_a_non_file_base_before_appending_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:stale", vec![1.0, 0.0]));
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        std::fs::create_dir(&embedding_path).unwrap();
+
+        let error = store.flush_embedding_index().unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]

@@ -18,6 +18,17 @@ use crate::repo_display_name;
 /// `None::<&dyn EmbedQueryFn>` at each call site.
 pub trait EmbedQueryFn: Send + Sync {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+
+    fn pipeline_for_dimension(
+        &self,
+        dimension: usize,
+    ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2> {
+        Ok(nestweaver_schema::EmbeddingPipelineV2::external(
+            "opaque-runtime",
+            "unknown-test-or-custom-model",
+            u32::try_from(dimension)?,
+        ))
+    }
 }
 
 /// Supplies the current embedding model from a runtime-owned readiness
@@ -31,6 +42,13 @@ pub trait EmbedModelProvider: Send + Sync {
 impl EmbedQueryFn for nestweaver_embed::EmbedModel {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         nestweaver_embed::EmbedModel::embed_query(self, text)
+    }
+
+    fn pipeline_for_dimension(
+        &self,
+        dimension: usize,
+    ) -> anyhow::Result<nestweaver_schema::EmbeddingPipelineV2> {
+        nestweaver_embed::EmbedModel::pipeline_for_dimension(self, dimension)
     }
 }
 

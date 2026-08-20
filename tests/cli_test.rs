@@ -1151,7 +1151,7 @@ fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
             },
         ),
     ]);
-    nestweaver_engine::save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+    nestweaver_engine::save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
     drop(store);
 
     nestweaver_cmd()
@@ -1668,6 +1668,81 @@ fn cli_cross_repo_refs_empty_for_known_symbol() {
         .assert()
         .success()
         .stdout(contains("No cross-repo references"));
+}
+
+#[test]
+fn cli_capability_aliases_execute_mcp_equivalent_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("app.js"),
+        "export function capabilityProbe(x) { return x + 1; }",
+    )
+    .unwrap();
+    std::fs::write(vault_dir.join("Source.md"), "Links to [[Target]].").unwrap();
+    std::fs::write(vault_dir.join("Target.md"), "# Target\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let detect = nestweaver_cmd()
+        .args(["detect-changes", "--files", "app.js", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        detect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&detect.stderr)
+    );
+    let detect: serde_json::Value = serde_json::from_slice(&detect.stdout).unwrap();
+    assert!(detect["status"].is_string());
+    assert!(detect["gate_state"].is_string());
+
+    let contracts = nestweaver_cmd()
+        .args(["cross-repo-contracts", "capabilityProbe", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        contracts.status.success(),
+        "{}",
+        String::from_utf8_lossy(&contracts.stderr)
+    );
+    let contracts: serde_json::Value = serde_json::from_slice(&contracts.stdout).unwrap();
+    assert_eq!(contracts["returned"], 0);
+    assert_eq!(contracts["contracts_status"], "complete");
+    assert!(contracts["uid"].as_str().unwrap().starts_with("sym:"));
+
+    let backlinks = nestweaver_cmd()
+        .args(["backlinks", "Target", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    assert!(
+        backlinks.status.success(),
+        "{}",
+        String::from_utf8_lossy(&backlinks.stderr)
+    );
+    let backlinks: serde_json::Value = serde_json::from_slice(&backlinks.stdout).unwrap();
+    assert_eq!(backlinks["count"], 1);
+    assert_eq!(backlinks["backlinks"][0]["source_note_title"], "Source");
 }
 
 #[test]

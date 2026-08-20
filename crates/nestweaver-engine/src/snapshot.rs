@@ -3,6 +3,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::publication::{ArtifactDescriptor, ArtifactKind, PublicationBundleV3};
+
 /// The oldest engine version that can read the current snapshot format.
 ///
 /// Bump this ONLY when the snapshot layout changes in a backwards-incompatible
@@ -10,14 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// releases that don't touch the snapshot wire format should leave this alone.
 /// Snapshot-format capability level implemented by this reader.
 ///
-/// Format v2 makes the embedding sidecar part of the authoritative snapshot
-/// state.  The first shipped reader did not understand that invariant, so v2
-/// writers must fence it out even while this development tree still reports
-/// the older package version.  New readers compare against this capability
-/// level; old readers compare against their package version and reject v2.
-pub const MIN_SNAPSHOT_READER_VERSION: &str = "4.1.1";
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Format v2 made the embedding sidecar part of the authoritative snapshot.
+/// Format v3 additionally binds the stamp to the graph's durable brain and
+/// publication identities. Writers fence out older readers that cannot enforce
+/// those invariants. The explicit capability version lets this development
+/// tree read snapshots it writes before the package version is raised.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "6.3.0";
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 pub const SNAPSHOT_CAPABILITY_EMBEDDINGS: &str = "embedding-sidecar-v1";
+pub const SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY: &str = "publication-identity-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
@@ -26,6 +29,13 @@ pub struct Stamp {
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub instance_id: String,
+    /// Stable identity of the brain data. This is deliberately independent of
+    /// the configured `instance_id` and the database's filesystem path.
+    #[serde(default)]
+    pub brain_uuid: String,
+    /// Identity of the complete publication slot captured by this snapshot.
+    #[serde(default)]
+    pub publication_uuid: String,
     pub engine_version: String,
     pub min_compatible_engine: String,
     pub schema_hash_core: String,
@@ -69,10 +79,12 @@ const GRAPH_FILE: &str = "graph.lbug";
 const MANIFEST_FILE: &str = "manifest.json";
 const STAMP_FILE: &str = "stamp.json";
 const CHECKSUM_FILE: &str = "checksum.blake3";
+const PUBLICATION_FILE: &str = crate::publication::PUBLICATION_MANIFEST_FILE;
 /// Sidecar filenames (relative to the db_path prefix, not snapshot_dir).
 const SIDECAR_PAGERANK: &str = "pagerank.json";
 const SIDECAR_MANIFESTS: &str = "manifests.json";
 const SIDECAR_TANTIVY_DIR: &str = "tantivy";
+const SIDECAR_REGEX_DIR: &str = "regex-v3";
 const SIDECAR_EMBEDDINGS: &str = "embeddings.bin";
 
 /// Core files that MUST be present and checksummed in every snapshot.
@@ -87,29 +99,37 @@ const SIDECAR_FILES: &[&str] = &[SIDECAR_PAGERANK, SIDECAR_MANIFESTS, SIDECAR_EM
 fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
     let mut lines: Vec<String> = Vec::new();
     for &name in CORE_FILES {
-        let bytes = std::fs::read(snapshot_dir.join(name))
-            .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-        let hash = crate::hash::blake3_hex_bytes(&bytes);
+        let (_, hash) = crate::hash::blake3_file(snapshot_dir.join(name))
+            .map_err(|e| anyhow::anyhow!("failed to stream {name} for checksum: {e}"))?;
         lines.push(format!("{hash}  {name}"));
     }
     for &name in SIDECAR_FILES {
         let path = snapshot_dir.join(name);
         if path.exists() {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| anyhow::anyhow!("failed to read sidecar {name} for checksum: {e}"))?;
-            let hash = crate::hash::blake3_hex_bytes(&bytes);
+            let (_, hash) = crate::hash::blake3_file(&path).map_err(|e| {
+                anyhow::anyhow!("failed to stream sidecar {name} for checksum: {e}")
+            })?;
             lines.push(format!("{hash}  {name}"));
         }
     }
-    // Hash tantivy directory contents if present (hash each file, sorted)
-    let tantivy_dir = snapshot_dir.join(SIDECAR_TANTIVY_DIR);
-    if tantivy_dir.is_dir() {
-        let mut tantivy_files = collect_files_recursive(&tantivy_dir, SIDECAR_TANTIVY_DIR)?;
-        tantivy_files.sort();
-        for (rel_path, abs_path) in tantivy_files {
-            let bytes = std::fs::read(&abs_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {rel_path} for checksum: {e}"))?;
-            let hash = crate::hash::blake3_hex_bytes(&bytes);
+    let publication = snapshot_dir.join(PUBLICATION_FILE);
+    if publication.exists() {
+        let (_, hash) = crate::hash::blake3_file(&publication).map_err(|e| {
+            anyhow::anyhow!("failed to stream {PUBLICATION_FILE} for checksum: {e}")
+        })?;
+        lines.push(format!("{hash}  {PUBLICATION_FILE}"));
+    }
+    // Hash directory sidecars file-by-file in deterministic path order.
+    for sidecar_dir in [SIDECAR_TANTIVY_DIR, SIDECAR_REGEX_DIR] {
+        let directory = snapshot_dir.join(sidecar_dir);
+        if !directory.is_dir() {
+            continue;
+        }
+        let mut files = collect_files_recursive(&directory, sidecar_dir)?;
+        files.sort();
+        for (rel_path, abs_path) in files {
+            let (_, hash) = crate::hash::blake3_file(&abs_path)
+                .map_err(|e| anyhow::anyhow!("failed to stream {rel_path} for checksum: {e}"))?;
             lines.push(format!("{hash}  {rel_path}"));
         }
     }
@@ -189,9 +209,8 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
             if !file_path.exists() {
                 anyhow::bail!("checksum references missing file: {filename}");
             }
-            let bytes = std::fs::read(&file_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {filename}: {e}"))?;
-            let actual = crate::hash::blake3_hex_bytes(&bytes);
+            let (_, actual) = crate::hash::blake3_file(&file_path)
+                .map_err(|e| anyhow::anyhow!("failed to stream {filename}: {e}"))?;
             if actual != expected_hash {
                 anyhow::bail!(
                     "integrity check failed for {filename}: \
@@ -222,9 +241,10 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
         // Legacy single-hash format: concatenated hash of core files
         let mut hasher = blake3::Hasher::new();
         for name in CORE_FILES {
-            let bytes = std::fs::read(snapshot_dir.join(name))
-                .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-            hasher.update(&bytes);
+            let file = std::fs::File::open(snapshot_dir.join(name))
+                .map_err(|e| anyhow::anyhow!("failed to open {name} for checksum: {e}"))?;
+            crate::hash::update_blake3_stream(&mut hasher, file)
+                .map_err(|e| anyhow::anyhow!("failed to stream {name} for checksum: {e}"))?;
         }
         let computed = hasher.finalize().to_hex().to_string();
         if computed != stored {
@@ -295,8 +315,19 @@ pub fn build_snapshot_from_store(
 
         let mut authoritative_stamp = stamp.clone();
         let embedding = embedding_lease.state();
+        let publication_identity = store
+            .publication_identity()
+            .map_err(|error| anyhow::anyhow!("failed to read publication identity: {error}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "database has no publication identity; reopen it writable to initialize identity before snapshotting"
+                )
+            })?;
         authoritative_stamp.format_version = SNAPSHOT_FORMAT_VERSION;
-        authoritative_stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        authoritative_stamp.capabilities = vec![
+            SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string(),
+            SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY.to_string(),
+        ];
         if !semver_ge(
             &authoritative_stamp.min_compatible_engine,
             MIN_SNAPSHOT_READER_VERSION,
@@ -306,7 +337,18 @@ pub fn build_snapshot_from_store(
         authoritative_stamp.embedding_model_id = embedding.model_id.clone();
         authoritative_stamp.embedding_dimension = embedding.dimension;
         authoritative_stamp.embedding_count = embedding.count;
-        build_snapshot_files(&staging, &authoritative_stamp, manifest, db_path)?;
+        authoritative_stamp.brain_uuid = publication_identity.brain_uuid;
+        authoritative_stamp.publication_uuid = publication_identity.publication_uuid;
+        build_snapshot_files(
+            &staging,
+            &authoritative_stamp,
+            manifest,
+            db_path,
+            store.graph_generation(),
+        )?;
+        verify_snapshot(&staging).map_err(|error| {
+            anyhow::anyhow!("staged snapshot failed publication validation: {error}")
+        })?;
         sync_directory_tree(&staging)?;
         std::fs::rename(&staging, output_dir).map_err(|error| {
             anyhow::anyhow!(
@@ -369,6 +411,7 @@ fn build_snapshot_files(
     stamp: &Stamp,
     manifest: &Manifest,
     db_path: &Path,
+    source_graph_generation: u64,
 ) -> Result<(), anyhow::Error> {
     // ── Core files ──────────────────────────────────────────────────────────
     std::fs::copy(db_path, output_dir.join(GRAPH_FILE))
@@ -426,6 +469,23 @@ fn build_snapshot_files(
         );
     }
 
+    let regex_src = crate::sidecar_path(db_path, ".regex-v3");
+    if regex_src.is_dir() {
+        copy_dir_all(&regex_src, &output_dir.join(SIDECAR_REGEX_DIR)).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to copy regex-v3 directory {}: {error}",
+                regex_src.display()
+            )
+        })?;
+    } else {
+        tracing::debug!(
+            src = %regex_src.display(),
+            "build_snapshot: regex-v3 index directory not found, skipping"
+        );
+    }
+
+    write_publication_bundle(output_dir, stamp, source_graph_generation)?;
+
     // ── Checksums (after all files are in place) ────────────────────────────
     let checksums = compute_checksums(output_dir)?;
     std::fs::write(output_dir.join(CHECKSUM_FILE), &checksums)?;
@@ -433,11 +493,353 @@ fn build_snapshot_files(
     Ok(())
 }
 
+fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    let contract = match path {
+        GRAPH_FILE => (
+            ArtifactKind::Graph,
+            1,
+            format!("ladybugdb:effective-schema:{}", stamp.schema_hash_effective),
+        ),
+        MANIFEST_FILE => (
+            ArtifactKind::SourceManifest,
+            1,
+            "nestweaver-source-manifest-v1".to_string(),
+        ),
+        STAMP_FILE => (
+            ArtifactKind::CompatibilityStamp,
+            SNAPSHOT_FORMAT_VERSION,
+            "nestweaver-snapshot-stamp-v3".to_string(),
+        ),
+        SIDECAR_PAGERANK => anyhow::bail!(
+            "PageRank contract requires payload inspection; use artifact_contract_for_payload"
+        ),
+        SIDECAR_MANIFESTS => anyhow::bail!(
+            "repository manifest contract requires payload inspection; use artifact_contract_for_payload"
+        ),
+        SIDECAR_EMBEDDINGS => anyhow::bail!(
+            "embedding contract requires payload inspection; use artifact_contract_for_payload"
+        ),
+        path if path.starts_with(&format!("{SIDECAR_TANTIVY_DIR}/")) => (
+            ArtifactKind::Bm25,
+            1,
+            "nestweaver-tantivy-bm25-v1".to_string(),
+        ),
+        path if path.starts_with(&format!("{SIDECAR_REGEX_DIR}/")) => (
+            ArtifactKind::Regex,
+            nestweaver_store::REGEX_INDEX_SCHEMA_VERSION,
+            format!(
+                "regex-v{}:{}",
+                nestweaver_store::REGEX_INDEX_SCHEMA_VERSION,
+                nestweaver_store::REGEX_TOKENIZER_FINGERPRINT
+            ),
+        ),
+        _ => anyhow::bail!("unclassified publication artifact: {path}"),
+    };
+    Ok(contract)
+}
+
+fn artifact_contract_for_payload(
+    path: &str,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+    payload: Option<&[u8]>,
+) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS || path == SIDECAR_EMBEDDINGS {
+        let payload =
+            payload.ok_or_else(|| anyhow::anyhow!("artifact contract requires its payload"))?;
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        return if path == SIDECAR_PAGERANK {
+            let (schema, fingerprint) = crate::publication::pagerank_artifact_contract(
+                payload,
+                &identity,
+                &stamp.engine_version,
+                source_graph_generation,
+            )?;
+            Ok((ArtifactKind::Ranking, schema, fingerprint))
+        } else if path == SIDECAR_MANIFESTS {
+            let (schema, fingerprint) = crate::publication::repo_manifest_artifact_contract(
+                payload,
+                &identity,
+                &stamp.engine_version,
+                source_graph_generation,
+            )?;
+            Ok((ArtifactKind::RepoManifest, schema, fingerprint))
+        } else {
+            let index = nestweaver_store::EmbeddingIndex::load_binary_v2_bytes(payload)
+                .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
+            let envelope = index
+                .artifact_envelope()
+                .ok_or_else(|| anyhow::anyhow!("embedding-v2 envelope is missing"))?;
+            if envelope.brain_uuid != identity.brain_uuid
+                || envelope.publication_uuid != identity.publication_uuid
+                || envelope.source_graph_generation != source_graph_generation
+            {
+                anyhow::bail!("embedding-v2 identity or source generation mismatch");
+            }
+            Ok((
+                ArtifactKind::Embeddings,
+                envelope.schema_version,
+                envelope.algorithm_fingerprint()?,
+            ))
+        };
+    }
+    artifact_contract(path, stamp)
+}
+
+fn artifact_contract_for_path(
+    path: &str,
+    absolute: &Path,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    if path == SIDECAR_EMBEDDINGS {
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        let index = nestweaver_store::EmbeddingIndex::load_binary_v2(absolute)
+            .map_err(|error| anyhow::anyhow!("inspect embedding-v2 artifact: {error}"))?;
+        let envelope = index
+            .artifact_envelope()
+            .ok_or_else(|| anyhow::anyhow!("embedding-v2 envelope is missing"))?;
+        if envelope.brain_uuid != identity.brain_uuid
+            || envelope.publication_uuid != identity.publication_uuid
+            || envelope.source_graph_generation != source_graph_generation
+        {
+            anyhow::bail!("embedding-v2 identity or source generation mismatch");
+        }
+        return Ok((
+            ArtifactKind::Embeddings,
+            envelope.schema_version,
+            envelope.algorithm_fingerprint()?,
+        ));
+    }
+    let payload =
+        if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS {
+            Some(std::fs::read(absolute).map_err(|error| {
+                anyhow::anyhow!("read self-describing artifact {path}: {error}")
+            })?)
+        } else {
+            None
+        };
+    artifact_contract_for_payload(path, stamp, source_graph_generation, payload.as_deref())
+}
+
+fn write_publication_bundle(
+    output_dir: &Path,
+    stamp: &Stamp,
+    source_graph_generation: u64,
+) -> anyhow::Result<PublicationBundleV3> {
+    let mut files = collect_files_recursive(output_dir, "")?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut artifacts = Vec::with_capacity(files.len());
+    for (path, absolute) in files {
+        let path = path.trim_start_matches('/').to_string();
+        if path == PUBLICATION_FILE || path == CHECKSUM_FILE || path == "checksum.sha256" {
+            continue;
+        }
+        let (kind, artifact_schema_version, algorithm_fingerprint) =
+            artifact_contract_for_path(&path, &absolute, stamp, source_graph_generation)?;
+        let (byte_size, blake3) = crate::hash::blake3_file(&absolute)
+            .map_err(|error| anyhow::anyhow!("stream publication artifact {path}: {error}"))?;
+        artifacts.push(ArtifactDescriptor {
+            path,
+            kind,
+            artifact_schema_version,
+            byte_size,
+            blake3,
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+            producer_version: stamp.engine_version.clone(),
+            source_graph_generation,
+            algorithm_fingerprint,
+        });
+    }
+    let bundle = PublicationBundleV3 {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        brain_uuid: stamp.brain_uuid.clone(),
+        publication_uuid: stamp.publication_uuid.clone(),
+        producer_version: stamp.engine_version.clone(),
+        source_graph_generation,
+        artifacts,
+    };
+    let bytes = serde_json::to_vec_pretty(&bundle)?;
+    std::fs::write(output_dir.join(PUBLICATION_FILE), bytes)?;
+    Ok(bundle)
+}
+
+fn verify_publication_bundle(
+    snapshot_dir: &Path,
+    stamp: &Stamp,
+    verify_payloads: bool,
+) -> anyhow::Result<PublicationBundleV3> {
+    let publication_path = snapshot_dir.join(PUBLICATION_FILE);
+    let bytes = std::fs::read(&publication_path)
+        .map_err(|error| anyhow::anyhow!("failed to read {PUBLICATION_FILE}: {error}"))?;
+    let bundle: PublicationBundleV3 = serde_json::from_slice(&bytes)?;
+    bundle.validate_metadata(SNAPSHOT_FORMAT_VERSION)?;
+    if bundle.format_version != SNAPSHOT_FORMAT_VERSION {
+        anyhow::bail!(
+            "publication bundle format {} does not match expected v{SNAPSHOT_FORMAT_VERSION}",
+            bundle.format_version
+        );
+    }
+    let bundle_identity = nestweaver_store::PublicationIdentity {
+        brain_uuid: bundle.brain_uuid.clone(),
+        publication_uuid: bundle.publication_uuid.clone(),
+    };
+    bundle_identity
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid publication bundle identity: {error}"))?;
+    let stamp_identity = nestweaver_store::PublicationIdentity {
+        brain_uuid: stamp.brain_uuid.clone(),
+        publication_uuid: stamp.publication_uuid.clone(),
+    };
+    if bundle_identity != stamp_identity {
+        anyhow::bail!(
+            "publication bundle identity {}/{} does not match compatibility stamp {}/{}",
+            bundle.brain_uuid,
+            bundle.publication_uuid,
+            stamp.brain_uuid,
+            stamp.publication_uuid
+        );
+    }
+    if bundle.producer_version != stamp.engine_version {
+        anyhow::bail!(
+            "publication bundle producer '{}' does not match stamp engine '{}'",
+            bundle.producer_version,
+            stamp.engine_version
+        );
+    }
+
+    let mut described = std::collections::BTreeSet::new();
+    for descriptor in &bundle.artifacts {
+        let relative = Path::new(&descriptor.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            anyhow::bail!(
+                "publication bundle contains unsafe artifact path: {}",
+                descriptor.path
+            );
+        }
+        if !described.insert(descriptor.path.clone()) {
+            anyhow::bail!(
+                "publication bundle contains duplicate artifact: {}",
+                descriptor.path
+            );
+        }
+        if descriptor.brain_uuid != bundle.brain_uuid
+            || descriptor.publication_uuid != bundle.publication_uuid
+        {
+            anyhow::bail!(
+                "publication artifact {} has foreign identity {}/{}",
+                descriptor.path,
+                descriptor.brain_uuid,
+                descriptor.publication_uuid
+            );
+        }
+        if descriptor.producer_version.is_empty()
+            || descriptor.algorithm_fingerprint.is_empty()
+            || descriptor.artifact_schema_version == 0
+        {
+            anyhow::bail!(
+                "publication artifact {} has incomplete schema/producer/fingerprint metadata",
+                descriptor.path
+            );
+        }
+        if descriptor.source_graph_generation != bundle.source_graph_generation {
+            anyhow::bail!(
+                "publication artifact {} source generation {} does not match bundle {}",
+                descriptor.path,
+                descriptor.source_graph_generation,
+                bundle.source_graph_generation
+            );
+        }
+        let artifact = snapshot_dir.join(&descriptor.path);
+        let (kind, schema_version, fingerprint) = artifact_contract_for_path(
+            &descriptor.path,
+            &artifact,
+            stamp,
+            bundle.source_graph_generation,
+        )?;
+        if descriptor.kind != kind
+            || descriptor.artifact_schema_version != schema_version
+            || descriptor.algorithm_fingerprint != fingerprint
+        {
+            anyhow::bail!(
+                "publication artifact {} contract metadata does not match its declared path/kind",
+                descriptor.path
+            );
+        }
+        if verify_payloads {
+            let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to stream publication artifact {}: {error}",
+                    descriptor.path
+                )
+            })?;
+            if byte_size != descriptor.byte_size {
+                anyhow::bail!(
+                    "publication artifact {} size mismatch: descriptor {}, file {}",
+                    descriptor.path,
+                    descriptor.byte_size,
+                    byte_size
+                );
+            }
+            if digest != descriptor.blake3 {
+                anyhow::bail!(
+                    "publication artifact {} digest mismatch: descriptor {}, file {digest}",
+                    descriptor.path,
+                    descriptor.blake3
+                );
+            }
+        }
+    }
+
+    let actual: std::collections::BTreeSet<String> = collect_files_recursive(snapshot_dir, "")?
+        .into_iter()
+        .map(|(path, _)| path.trim_start_matches('/').to_string())
+        .filter(|path| {
+            path != PUBLICATION_FILE && path != CHECKSUM_FILE && path != "checksum.sha256"
+        })
+        .collect();
+    if actual != described {
+        anyhow::bail!(
+            "publication bundle does not exactly describe payloads (described {}, present {})",
+            described.len(),
+            actual.len()
+        );
+    }
+    if bundle
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Graph)
+        .count()
+        != 1
+    {
+        anyhow::bail!("publication bundle must contain exactly one graph artifact");
+    }
+    Ok(bundle)
+}
+
+pub fn publication_bundle_digest(snapshot_dir: &Path) -> anyhow::Result<String> {
+    let stamp = verify_snapshot(snapshot_dir)?;
+    let _ = verify_publication_bundle(snapshot_dir, &stamp, true)?;
+    let (_, digest) = crate::hash::blake3_file(snapshot_dir.join(PUBLICATION_FILE))?;
+    Ok(digest)
+}
+
 /// Verify a snapshot directory's integrity.
 ///
 /// Supports both the new per-file checksum format and the legacy single-hash
 /// format for backwards compatibility.
-pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
+fn verify_snapshot_envelope(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
     verify_checksums(snapshot_dir)?;
 
     let stamp_json = std::fs::read_to_string(snapshot_dir.join(STAMP_FILE))
@@ -449,6 +851,40 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
             "snapshot format {} is newer than this engine supports ({SNAPSHOT_FORMAT_VERSION})",
             stamp.format_version
         );
+    }
+    if stamp.format_version >= 3 {
+        if !stamp
+            .capabilities
+            .iter()
+            .any(|capability| capability == SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY)
+        {
+            anyhow::bail!(
+                "snapshot format {} does not declare publication-identity capability",
+                stamp.format_version
+            );
+        }
+        let parse_identity = |name: &str, value: &str| {
+            let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
+                anyhow::anyhow!("snapshot has invalid {name} '{value}': {error}")
+            })?;
+            if parsed.is_nil() {
+                anyhow::bail!("snapshot has invalid {name}: nil UUID is not a data identity");
+            }
+            Ok(parsed)
+        };
+        let brain_uuid = parse_identity("brain_uuid", &stamp.brain_uuid)?;
+        let publication_uuid = parse_identity("publication_uuid", &stamp.publication_uuid)?;
+        if brain_uuid == publication_uuid {
+            anyhow::bail!("snapshot brain_uuid and publication_uuid must be distinct");
+        }
+        let checksums = std::fs::read_to_string(snapshot_dir.join(CHECKSUM_FILE))?;
+        if !checksums
+            .lines()
+            .any(|line| line.ends_with(&format!("  {PUBLICATION_FILE}")))
+        {
+            anyhow::bail!("snapshot v3 publication bundle is not covered by the checksum manifest");
+        }
+        verify_publication_bundle(snapshot_dir, &stamp, false)?;
     }
     let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if stamp.format_version == 0 {
@@ -487,8 +923,35 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
             }
         }
     }
+    Ok(stamp)
+}
+
+fn verify_snapshot_artifacts(snapshot_dir: &Path, stamp: &Stamp) -> Result<(), anyhow::Error> {
+    if stamp.format_version >= 3 {
+        verify_publication_bundle(snapshot_dir, stamp, true)?;
+        let graph_path = snapshot_dir.join(GRAPH_FILE);
+        let graph = nestweaver_store::GraphStore::open_read_only(&graph_path)
+            .map_err(|error| anyhow::anyhow!("open snapshot graph for identity check: {error}"))?;
+        let graph_identity = graph
+            .publication_identity()
+            .map_err(|error| anyhow::anyhow!("read snapshot graph identity: {error}"))?
+            .ok_or_else(|| anyhow::anyhow!("snapshot graph has no publication identity"))?;
+        if graph_identity.brain_uuid != stamp.brain_uuid
+            || graph_identity.publication_uuid != stamp.publication_uuid
+        {
+            anyhow::bail!(
+                "snapshot publication identity mismatch: stamp brain/publication={}/{}, graph={}/{}",
+                stamp.brain_uuid,
+                stamp.publication_uuid,
+                graph_identity.brain_uuid,
+                graph_identity.publication_uuid
+            );
+        }
+    }
+
+    let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if embedding_path.exists() {
-        let embeddings = nestweaver_store::EmbeddingIndex::load_binary(&embedding_path)
+        let embeddings = nestweaver_store::EmbeddingIndex::load_binary_v2(&embedding_path)
             .map_err(|error| anyhow::anyhow!("invalid snapshot embedding artifact: {error}"))?;
         let count = u64::try_from(embeddings.len())?;
         let dimension = u32::try_from(embeddings.dimension().unwrap_or(0))?;
@@ -503,6 +966,14 @@ pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
         }
     }
 
+    Ok(())
+}
+
+/// Verify a snapshot's checksummed envelope and then reopen its typed
+/// artifacts to confirm that their embedded metadata agrees with the stamp.
+pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
+    let stamp = verify_snapshot_envelope(snapshot_dir)?;
+    verify_snapshot_artifacts(snapshot_dir, &stamp)?;
     Ok(stamp)
 }
 
@@ -522,11 +993,12 @@ fn semver_ge(a: &str, b: &str) -> bool {
 /// Load a snapshot, validating compatibility against the running engine.
 ///
 /// Steps:
-/// 1. `verify_snapshot()` — integrity check.
+/// 1. Verify the checksummed envelope without opening artifact payloads.
 /// 2. Check `stamp.min_compatible_engine <= engine_version` (stamp requires at least that version).
 /// 3. Check `stamp.schema_hash_effective == expected_schema_hash`.
 /// 4. Check `stamp.embedding_model_id == expected_embedding_model`.
-/// 5. Return `(stamp, path to graph.lbug)`.
+/// 5. Open and validate compatible artifact payloads.
+/// 6. Return `(stamp, path to graph.lbug)`.
 pub fn load_snapshot(
     snapshot_dir: &Path,
     engine_version: &str,
@@ -551,14 +1023,14 @@ pub fn load_snapshot_with_config(
     expected_schema_hash: Option<&str>,
     expected_embedding_model: Option<&str>,
 ) -> Result<(Stamp, PathBuf), anyhow::Error> {
-    let stamp = verify_snapshot(snapshot_dir)?;
+    let stamp = verify_snapshot_envelope(snapshot_dir)?;
 
     // The snapshot requires at least min_compatible_engine to load it.
     // If the running engine_version < min_compatible_engine, reject.
-    // `engine_version` remains the application compatibility input.  For v2,
+    // `engine_version` remains the application compatibility input. For v3,
     // this source tree has a reader capability newer than its package version;
     // using the explicit capability lets it read snapshots it writes while the
-    // raised stamp still makes every pre-v2 reader fail closed.
+    // raised stamp still makes every pre-v3 reader fail closed.
     let reader_version = if engine_version == env!("CARGO_PKG_VERSION")
         && stamp.format_version >= 2
         && semver_ge(MIN_SNAPSHOT_READER_VERSION, &stamp.min_compatible_engine)
@@ -610,6 +1082,11 @@ pub fn load_snapshot_with_config(
             expected_embedding_model
         );
     }
+
+    // Only compatible artifacts are opened. This prevents an older reader
+    // from asking LadybugDB or the embedding decoder to parse a payload whose
+    // declared engine/schema contract it cannot understand.
+    verify_snapshot_artifacts(snapshot_dir, &stamp)?;
 
     Ok((stamp, snapshot_dir.join(GRAPH_FILE)))
 }
@@ -716,6 +1193,12 @@ fn materialize_snapshot_with_config_and_hook(
             std::fs::rename(&tantivy_src, &tantivy_dst)
                 .map_err(|e| anyhow::anyhow!("failed to stage verified tantivy index: {e}"))?;
         }
+        let regex_src = verified_snapshot.join(SIDECAR_REGEX_DIR);
+        if regex_src.is_dir() {
+            let regex_dst = crate::sidecar_path(&db_path, ".regex-v3");
+            std::fs::rename(&regex_src, &regex_dst)
+                .map_err(|e| anyhow::anyhow!("failed to stage verified regex-v3 index: {e}"))?;
+        }
         std::fs::remove_dir_all(&verified_snapshot)?;
         sync_directory_tree(&staging)?;
         publish_restored_directory(&staging, working_dir)?;
@@ -807,11 +1290,11 @@ pub fn schema_hashes(cfg: Option<&crate::config::InstanceConfig>) -> (String, St
 mod tests {
     use super::*;
 
-    /// The last engine release before the v2 snapshot floor was raised. A
-    /// historical fact, so it is correctly a literal — unlike the *current*
-    /// reader, which must track `MIN_SNAPSHOT_READER_VERSION` or these tests
-    /// break at every release that raises the floor.
-    const PRE_V2_READER: &str = "4.1.0";
+    /// A representative numeric reader version below the v3 capability floor.
+    /// It must not equal this development tree's package version: matching the
+    /// package version deliberately activates the source reader's newer
+    /// capability override before the release version itself is raised.
+    const PRE_V3_READER: &str = "6.2.999";
 
     fn make_stamp(
         engine_version: &str,
@@ -823,6 +1306,8 @@ mod tests {
             format_version: 0,
             capabilities: Vec::new(),
             instance_id: "test-instance".to_string(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
             engine_version: engine_version.to_string(),
             min_compatible_engine: min_compatible.to_string(),
             schema_hash_core: nestweaver_schema::core_schema_hash(),
@@ -870,7 +1355,7 @@ mod tests {
         );
         let manifest = make_manifest();
 
-        build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
+        let built = build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
 
         assert!(snap_dir.join(GRAPH_FILE).exists(), "graph.lbug missing");
         assert!(
@@ -879,9 +1364,85 @@ mod tests {
         );
         assert!(snap_dir.join(STAMP_FILE).exists(), "stamp.json missing");
         assert!(
+            snap_dir.join(PUBLICATION_FILE).exists(),
+            "publication.json missing"
+        );
+        assert!(
             snap_dir.join(CHECKSUM_FILE).exists(),
             "checksum.blake3 missing"
         );
+        let source_identity = nestweaver_store::GraphStore::open_read_only(&db)
+            .unwrap()
+            .publication_identity()
+            .unwrap()
+            .unwrap();
+        assert_eq!(built.brain_uuid, source_identity.brain_uuid);
+        assert_eq!(built.publication_uuid, source_identity.publication_uuid);
+        assert!(
+            built
+                .capabilities
+                .iter()
+                .any(|capability| capability == SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY)
+        );
+
+        let bundle: PublicationBundleV3 =
+            serde_json::from_slice(&std::fs::read(snap_dir.join(PUBLICATION_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(bundle.brain_uuid, source_identity.brain_uuid);
+        assert_eq!(bundle.publication_uuid, source_identity.publication_uuid);
+        assert_eq!(
+            bundle
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == ArtifactKind::Graph)
+                .count(),
+            1
+        );
+        assert!(
+            bundle
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.brain_uuid == source_identity.brain_uuid
+                    && artifact.publication_uuid == source_identity.publication_uuid
+                    && !artifact.algorithm_fingerprint.is_empty())
+        );
+        let digest = publication_bundle_digest(&snap_dir).unwrap();
+        assert_eq!(
+            digest,
+            crate::hash::blake3_hex_bytes(&std::fs::read(snap_dir.join(PUBLICATION_FILE)).unwrap())
+        );
+    }
+
+    #[test]
+    fn v3_bundle_rejects_foreign_artifact_identity_even_when_rechecksummed() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let publication_path = snap_dir.join(PUBLICATION_FILE);
+        let mut bundle: PublicationBundleV3 =
+            serde_json::from_slice(&std::fs::read(&publication_path).unwrap()).unwrap();
+        bundle.artifacts[0].brain_uuid = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            &publication_path,
+            serde_json::to_vec_pretty(&bundle).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(error.contains("foreign identity"), "{error}");
     }
 
     #[test]
@@ -944,11 +1505,22 @@ mod tests {
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
         // Give the source DB sidecars so build_snapshot captures them.
-        std::fs::write(crate::sidecar_path(&db, ".pagerank.json"), b"{}").unwrap();
-        std::fs::write(crate::sidecar_path(&db, ".manifests.json"), b"{}").unwrap();
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store
+            .compute_pagerank(
+                0.85,
+                20,
+                &nestweaver_store::ranking::GraphScope::code_only(),
+            )
+            .unwrap();
+        store
+            .save_pagerank_cache(&crate::sidecar_path(&db, ".pagerank.json"))
+            .unwrap();
+        crate::save_manifest_cache_for_db(&std::collections::HashMap::new(), &store, &db).unwrap();
+        drop(store);
 
         let stamp = make_stamp(
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
             "0.1.0",
             "schema-hash-abc",
             "text-embedding-3-small",
@@ -1029,6 +1601,108 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_stamp_identity_that_does_not_match_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.publication_uuid = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(
+            error.contains("publication bundle identity")
+                || error.contains("publication identity mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_equivalent_identity_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.brain_uuid = uuid::Uuid::parse_str(&stamp.publication_uuid)
+            .unwrap()
+            .simple()
+            .to_string()
+            .to_uppercase();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+    }
+
+    #[test]
+    fn reader_remains_compatible_with_v2_snapshots_without_identity_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("6.2.0", "4.1.1", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        // Model a snapshot emitted by the v2 writer: identity was neither a
+        // declared capability nor part of the serialized stamp contract.
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut stamp: Stamp =
+            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+        stamp.format_version = 2;
+        stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        stamp.brain_uuid.clear();
+        stamp.publication_uuid.clear();
+        stamp.min_compatible_engine = "4.1.1".to_string();
+        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let verified = verify_snapshot(&snap_dir).unwrap();
+        assert_eq!(verified.format_version, 2);
+        assert!(verified.brain_uuid.is_empty());
+        assert!(verified.publication_uuid.is_empty());
+        load_snapshot_with_config(&snap_dir, "6.2.0", None, None)
+            .expect("the v3 reader must retain v2 read compatibility");
+    }
+
+    #[test]
     fn load_rejects_incompatible_engine() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
@@ -1057,6 +1731,36 @@ mod tests {
             msg.contains("engine") && (msg.contains("rebuild") || msg.contains("requires")),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn compatibility_gate_precedes_artifact_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("99.0.0", "99.0.0", "schema-hash-abc", "model"),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        // Keep the envelope internally checksummed while making the graph
+        // payload impossible to open. An incompatible reader must reject on
+        // the declared engine contract before LadybugDB sees these bytes.
+        std::fs::write(snap_dir.join(GRAPH_FILE), b"not a database").unwrap();
+        std::fs::write(
+            snap_dir.join(CHECKSUM_FILE),
+            compute_checksums(&snap_dir).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_snapshot_with_config(&snap_dir, "6.3.0", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires engine >= 99.0.0"), "{error}");
+        assert!(!error.contains("open snapshot graph"), "{error}");
     }
 
     #[test]
@@ -1137,8 +1841,25 @@ mod tests {
         let manifest = make_manifest();
         build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
 
-        // Replace the per-file checksum with a legacy single-hash checksum
-        // (BLAKE3 of graph.lbug + manifest.json + stamp.json concatenated).
+        // Model an actual v2 snapshot before replacing its per-file checksum
+        // with the legacy single-hash form. V3 must never accept this weaker
+        // checksum because it would omit publication.json.
+        let stamp_path = snap_dir.join(STAMP_FILE);
+        let mut legacy_stamp: Stamp =
+            serde_json::from_slice(&std::fs::read(&stamp_path).unwrap()).unwrap();
+        legacy_stamp.format_version = 2;
+        legacy_stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        legacy_stamp.brain_uuid.clear();
+        legacy_stamp.publication_uuid.clear();
+        legacy_stamp.min_compatible_engine = "4.1.1".to_string();
+        std::fs::write(
+            &stamp_path,
+            serde_json::to_vec_pretty(&legacy_stamp).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(snap_dir.join(PUBLICATION_FILE)).unwrap();
+
+        // BLAKE3 of graph.lbug + manifest.json + stamp.json concatenated.
         let mut hasher = blake3::Hasher::new();
         for name in CORE_FILES {
             hasher.update(&std::fs::read(snap_dir.join(name)).unwrap());
@@ -1190,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshot_fences_old_reader_but_current_reader_accepts_its_output() {
+    fn v3_snapshot_fences_old_reader_but_current_reader_accepts_its_output() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
@@ -1206,16 +1927,16 @@ mod tests {
         assert_eq!(stamp.format_version, SNAPSHOT_FORMAT_VERSION);
         assert_eq!(stamp.min_compatible_engine, MIN_SNAPSHOT_READER_VERSION);
         assert!(
-            !semver_ge(PRE_V2_READER, &stamp.min_compatible_engine),
-            "the last pre-v2 reader must sit below the raised compatibility floor"
+            !semver_ge(PRE_V3_READER, &stamp.min_compatible_engine),
+            "the last pre-v3 reader must sit below the raised compatibility floor"
         );
         // Assert the fence actually FENCES. Previously this test only checked
         // the semver relation and then expected the same old reader to load,
         // which is self-contradictory the moment the floor rises past it.
-        load_snapshot_with_config(&snap_dir, PRE_V2_READER, None, None)
-            .expect_err("a pre-v2 reader must be refused by the raised floor");
+        load_snapshot_with_config(&snap_dir, PRE_V3_READER, None, None)
+            .expect_err("a pre-v3 reader must be refused by the raised floor");
         load_snapshot_with_config(&snap_dir, MIN_SNAPSHOT_READER_VERSION, None, None)
-            .expect("the v2-capable reader must accept the v2 snapshot it wrote");
+            .expect("the v3-capable reader must accept the v3 snapshot it wrote");
     }
 
     #[test]

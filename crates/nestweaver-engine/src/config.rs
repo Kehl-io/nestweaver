@@ -172,6 +172,11 @@ pub struct FeatureConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InstanceConfig {
     pub instance_id: String,
+    /// Optional data-identity assertion for this instance. Unlike
+    /// `instance_id`, this value is bound to graph contents and remains stable
+    /// across paths, restores, and full publication rebuilds.
+    #[serde(default)]
+    pub expected_brain_uuid: Option<String>,
     /// Optional path to the graph database (`.lbug`) this instance reads.
     /// Lets `--config` select a DB so read commands don't also need `--db`.
     /// Absent → callers fall back to `--db` / `NESTWEAVER_DB` / the default.
@@ -885,6 +890,25 @@ impl InstanceConfig {
         self.db.as_ref().map(std::path::PathBuf::from)
     }
 
+    /// Enforce this configuration's optional brain identity assertion against
+    /// an opened graph store.
+    pub fn assert_expected_brain(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> Result<Option<nestweaver_store::PublicationIdentity>, anyhow::Error> {
+        self.expected_brain_uuid
+            .as_deref()
+            .map(|expected| {
+                store.assert_brain_uuid(expected).map_err(|error| {
+                    anyhow::anyhow!(
+                        "instance '{}' cannot bind its expected_brain_uuid: {error}",
+                        self.instance_id
+                    )
+                })
+            })
+            .transpose()
+    }
+
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
         reject_obsolete_instance_shape(s)?;
@@ -894,6 +918,15 @@ impl InstanceConfig {
         // `sym:repo:<instance>:<hash>:…` uids where a colon is ambiguous for
         // any split-on-colon consumer.
         validate_instance_id(&config.instance_id)?;
+        if let Some(expected) = config.expected_brain_uuid.as_deref() {
+            let parsed = uuid::Uuid::parse_str(expected).map_err(|error| {
+                anyhow::anyhow!("invalid expected_brain_uuid '{expected}': {error}")
+            })?;
+            if parsed.is_nil() {
+                anyhow::bail!("invalid expected_brain_uuid: nil UUID is not a data identity");
+            }
+            config.expected_brain_uuid = Some(parsed.to_string());
+        }
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         // Feature F6: clamp ranking-prior multipliers into bounds on load so
         // downstream code can trust the values without re-validating.
@@ -942,6 +975,53 @@ impl InstanceConfig {
         let contents = std::fs::read_to_string(path)?;
         Self::from_toml_str(&contents)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedBrainAdoption {
+    pub previous: Option<String>,
+    pub adopted: String,
+    pub changed: bool,
+}
+
+/// Explicitly bind an instance config to `brain_uuid` while preserving TOML
+/// comments and formatting. The complete edited config is validated before a
+/// crash-safe same-directory replacement; a dry run performs every check but
+/// does not write.
+pub fn adopt_expected_brain_uuid(
+    path: &std::path::Path,
+    brain_uuid: &str,
+    dry_run: bool,
+) -> Result<ExpectedBrainAdoption, anyhow::Error> {
+    use std::io::Write;
+
+    let parsed = uuid::Uuid::parse_str(brain_uuid)
+        .map_err(|error| anyhow::anyhow!("invalid brain UUID '{brain_uuid}': {error}"))?;
+    if parsed.is_nil() {
+        anyhow::bail!("invalid brain UUID: nil UUID is not a data identity");
+    }
+    let adopted = parsed.to_string();
+    let source = std::fs::read_to_string(path)?;
+    let mut document = source.parse::<toml_edit::DocumentMut>()?;
+    let previous = document
+        .get("expected_brain_uuid")
+        .and_then(toml_edit::Item::as_str)
+        .map(ToOwned::to_owned);
+    document["expected_brain_uuid"] = toml_edit::value(adopted.clone());
+    let rendered = document.to_string();
+    InstanceConfig::from_toml_str(&rendered)
+        .map_err(|error| anyhow::anyhow!("adopted config would be invalid: {error}"))?;
+    let changed = source != rendered;
+    if changed && !dry_run {
+        nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| {
+            file.write_all(rendered.as_bytes())
+        })?;
+    }
+    Ok(ExpectedBrainAdoption {
+        previous,
+        adopted,
+        changed,
+    })
 }
 
 /// Append a `[[repos]]` entry to an instance config file if it is not already
@@ -1206,6 +1286,115 @@ credential_method = "ssh"
 [[repos]]
 url = "https://github.com/example/repo"
 "#;
+
+    #[test]
+    fn expected_brain_uuid_is_optional_validated_and_canonicalized() {
+        let config = InstanceConfig::from_toml_str(MINIMAL_TOML).unwrap();
+        assert!(config.expected_brain_uuid.is_none());
+
+        let expected = uuid::Uuid::new_v4();
+        let configured = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            &format!(
+                "instance_id = \"test-instance\"\nexpected_brain_uuid = \"{}\"",
+                expected.as_braced().to_string().to_uppercase()
+            ),
+            1,
+        );
+        let config = InstanceConfig::from_toml_str(&configured).unwrap();
+        let canonical_expected = expected.to_string();
+        assert_eq!(
+            config.expected_brain_uuid.as_deref(),
+            Some(canonical_expected.as_str())
+        );
+
+        let malformed = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            "instance_id = \"test-instance\"\nexpected_brain_uuid = \"not-a-uuid\"",
+            1,
+        );
+        let error = InstanceConfig::from_toml_str(&malformed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid expected_brain_uuid"), "{error}");
+
+        let nil = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            "instance_id = \"test-instance\"\nexpected_brain_uuid = \"00000000-0000-0000-0000-000000000000\"",
+            1,
+        );
+        let error = InstanceConfig::from_toml_str(&nil).unwrap_err().to_string();
+        assert!(error.contains("nil UUID"), "{error}");
+    }
+
+    #[test]
+    fn expected_brain_uuid_assertion_refuses_a_foreign_store() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        let configured = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            &format!(
+                "instance_id = \"test-instance\"\nexpected_brain_uuid = \"{}\"",
+                identity.brain_uuid
+            ),
+            1,
+        );
+        let config = InstanceConfig::from_toml_str(&configured).unwrap();
+        assert_eq!(
+            config.assert_expected_brain(&store).unwrap(),
+            Some(identity)
+        );
+
+        let foreign = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            &format!(
+                "instance_id = \"test-instance\"\nexpected_brain_uuid = \"{}\"",
+                uuid::Uuid::new_v4()
+            ),
+            1,
+        );
+        let config = InstanceConfig::from_toml_str(&foreign).unwrap();
+        let error = config
+            .assert_expected_brain(&store)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("brain identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn explicit_identity_adoption_preserves_comments_validates_and_supports_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let source = MINIMAL_TOML.replacen(
+            "instance_id = \"test-instance\"",
+            "# keep this comment\ninstance_id = \"test-instance\"",
+            1,
+        );
+        std::fs::write(&path, &source).unwrap();
+        let identity = nestweaver_store::PublicationIdentity::new_brain();
+
+        let dry_run = adopt_expected_brain_uuid(&path, &identity.brain_uuid, true).unwrap();
+        assert!(dry_run.changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+        let adopted = adopt_expected_brain_uuid(&path, &identity.brain_uuid, false).unwrap();
+        assert!(adopted.changed);
+        assert!(adopted.previous.is_none());
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("# keep this comment"));
+        let config = InstanceConfig::from_file(&path).unwrap();
+        assert_eq!(
+            config.expected_brain_uuid.as_deref(),
+            Some(identity.brain_uuid.as_str())
+        );
+
+        let unchanged = adopt_expected_brain_uuid(&path, &identity.brain_uuid, false).unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(
+            unchanged.previous.as_deref(),
+            Some(identity.brain_uuid.as_str())
+        );
+    }
 
     #[test]
     fn daemon_start_at_login_is_opt_in_and_absent_by_default() {

@@ -646,9 +646,11 @@ pub fn save_interaction_store(
     store: &InteractionStore,
 ) -> Result<(), anyhow::Error> {
     let path = interaction_sidecar_path(db_path);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(store)?)?;
-    std::fs::rename(&tmp, &path)?;
+    let bytes = serde_json::to_vec(store)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+        use std::io::Write as _;
+        file.write_all(&bytes)
+    })?;
     Ok(())
 }
 

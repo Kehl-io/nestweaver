@@ -71,6 +71,33 @@ db = "/path/to/brain.lbug"
 An explicit `--db` takes precedence. When `db` is absent, NestWeaver uses
 `NESTWEAVER_DB` and then `./nestweaver.lbug`.
 
+#### `expected_brain_uuid` (optional)
+
+Binds the config to one logical brain, independently of its path or
+`instance_id`. When set, NestWeaver refuses to query, index, or start a daemon
+against a database with a different graph-owned identity.
+
+```toml
+expected_brain_uuid = "2ad44321-c93b-49b1-953c-626a00586673"
+```
+
+This is an assertion, not an adoption mechanism. If the configured database is
+missing, NestWeaver will not create a new brain under the expected UUID. Restore
+or rebuild the expected brain explicitly. UUID spellings are canonicalized
+during config validation, and malformed or nil UUIDs are rejected.
+
+Inspect and intentionally bind identity with:
+
+```sh
+nestweaver instance identity --db /path/to/brain.lbug
+nestweaver instance adopt-identity ./instance.toml --db /path/to/brain.lbug --dry-run
+nestweaver instance adopt-identity ./instance.toml --db /path/to/brain.lbug
+```
+
+`adopt-identity` changes the config assertion; it never rewrites graph identity.
+NestWeaver validates the complete edited TOML and durably replaces the config
+while preserving its comments and formatting.
+
 #### `[snapshot_storage]`
 
 Where snapshots are stored for distribution.

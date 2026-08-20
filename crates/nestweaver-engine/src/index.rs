@@ -428,17 +428,23 @@ pub fn reconcile_deleted_graph_state(
     store: &GraphStore,
     db_path: &Path,
 ) -> DeletedGraphStateReconciliation {
-    reconcile_deleted_graph_state_with_io(store, db_path, &FileSystemDeletionReconciliationIo)
+    reconcile_deleted_graph_state_with_io(store, db_path, &FileSystemDeletionReconciliationIo, None)
 }
 
 fn reconcile_deleted_graph_state_with_io(
     store: &GraphStore,
     db_path: &Path,
     io: &dyn DeletionReconciliationIo,
+    manifests_before_generation_advance: Option<
+        Result<std::collections::HashMap<String, crate::manifest::ManifestInfo>, anyhow::Error>,
+    >,
 ) -> DeletedGraphStateReconciliation {
     let manifests_removed = (|| -> Result<usize, anyhow::Error> {
         let manifests_path = crate::manifest::manifest_cache_path(db_path);
-        let mut manifests = crate::manifest::load_manifest_cache_for_db(db_path)?;
+        let mut manifests = match manifests_before_generation_advance {
+            Some(loaded) => loaded?,
+            None => crate::manifest::load_manifest_cache_for_db(store, db_path)?,
+        };
         if !manifests_path.exists() {
             return Ok(0);
         }
@@ -451,9 +457,10 @@ fn reconcile_deleted_graph_state_with_io(
         let before = manifests.len();
         manifests.retain(|uid, _| live_repo_uids.contains(uid));
         let removed = before - manifests.len();
-        if removed > 0 {
-            crate::manifest::save_manifest_cache_for_db(&manifests, db_path)?;
-        }
+        // The envelope is graph-generation-bound. Even when every Repo row
+        // survives a partial child deletion, republish the unchanged payload
+        // at the new generation or the next reader must reject it as stale.
+        crate::manifest::save_manifest_cache_for_db(&manifests, store, db_path)?;
         Ok(removed)
     })()
     .map_err(|error| format!("manifest reconciliation failed: {error:#}"));
@@ -524,7 +531,41 @@ fn finalize_code_graph_deletion_with_io(
     for uid in repo_uids {
         remove_repo_sidecar_slices_with_io(db_path, uid, io, &mut failures);
     }
-    let reconciliation = reconcile_deleted_graph_state_with_io(store, db_path, io);
+
+    // Read the incumbent manifest while it still matches generation N. The
+    // graph mutation is already committed, but the generation transition is
+    // the boundary that makes the old envelope stale; reconciliation below
+    // filters this payload against the authoritative post-mutation live set
+    // and republishes it at N+1.
+    let manifests_before_generation_advance =
+        crate::manifest::load_manifest_cache_for_db(store, db_path);
+
+    // Establish the generation that every reconciled artifact describes
+    // BEFORE writing those artifacts. The previous ordering saved manifests
+    // at N and then advanced the graph to N+1, making a freshly written,
+    // identity-bound artifact stale immediately. Advancing in memory first is
+    // also the existing fail-safe rule: if later persistence fails, live
+    // readers see N+1 and a reopen sees the older durable generation, so the
+    // N+1 artifact is rejected rather than trusted against an unknown graph.
+    let generation_advanced = match store.try_bump_graph_generation() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+    };
+
+    let reconciliation = reconcile_deleted_graph_state_with_io(
+        store,
+        db_path,
+        io,
+        Some(manifests_before_generation_advance),
+    );
     match reconciliation.manifests_removed {
         Ok(removed) => tracing::info!(removed, operation, "manifest cache reconciled"),
         Err(error) => {
@@ -586,20 +627,6 @@ fn finalize_code_graph_deletion_with_io(
         ),
     }
 
-    // Advance before its durable companion so live readers are safe even when
-    // sidecar persistence fails, but never wrap an exhausted counter.
-    let generation_advanced = match store.try_bump_graph_generation() {
-        Ok(_) => true,
-        Err(error) => {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::GenerationPersistence,
-                None,
-                format!("advance graph generation: {error:#}"),
-            );
-            false
-        }
-    };
     let generation_path = crate::sidecar_path(db_path, ".generation");
     if generation_advanced && let Err(error) = store.save_graph_generation(&generation_path) {
         push_reconciliation_failure(
@@ -2038,6 +2065,12 @@ fn index_directory_with_store_inner(
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
+    // Capture generation-N derived state before graph publication advances to
+    // N+2. Loading it after the graph commit would correctly reject it as
+    // stale and, historically, `unwrap_or_default` then discarded every other
+    // repository's manifest entry.
+    let mut manifest_cache =
+        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -2119,9 +2152,8 @@ fn index_directory_with_store_inner(
     }
 
     let manifest = crate::manifest::parse_manifest(&reader);
-    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
-    cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
+    manifest_cache.insert(r_uid, manifest);
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
@@ -6065,6 +6097,8 @@ fn full_index_fallback(
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    let mut manifest_cache =
+        crate::manifest::load_manifest_cache_for_db(store, db_path).unwrap_or_default();
     let filemeta_cache = load_filemeta_sidecar(&filemeta_path)
         .repos
         .get(&r_uid)
@@ -6128,9 +6162,8 @@ fn full_index_fallback(
 
     // Update the manifest cache sidecar (same as index_directory does).
     let manifest = crate::manifest::parse_manifest(&reader);
-    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
-    cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
+    manifest_cache.insert(r_uid, manifest);
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&manifest_cache, store, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
@@ -6170,6 +6203,28 @@ mod tests {
     /// works; these tests hold it fixed so shape versioning is not the variable
     /// under test.
     const RESPONSE_SHAPE_FIXTURE: u64 = 0xE1691E;
+
+    fn write_pagerank_fixture(store: &GraphStore, path: &Path, scores: HashMap<String, f64>) {
+        let identity = store.publication_identity().unwrap().unwrap();
+        let fingerprint = format!(
+            "{}test-fixture",
+            nestweaver_store::ranking::PAGERANK_ALGORITHM_FINGERPRINT_PREFIX
+        );
+        let envelope = nestweaver_store::artifact_envelope::ArtifactEnvelope::new(
+            nestweaver_store::artifact_envelope::ArtifactExpectation {
+                artifact_kind: nestweaver_store::ranking::PAGERANK_ARTIFACT_KIND,
+                artifact_schema_version:
+                    nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                identity: &identity,
+                producer_version: env!("CARGO_PKG_VERSION"),
+                source_graph_generation: store.graph_generation(),
+                algorithm_fingerprint: &fingerprint,
+            },
+            &scores,
+        )
+        .unwrap();
+        fs::write(path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+    }
 
     #[test]
     fn default_source_limit_indexes_nestweaver_sized_rust_file() {
@@ -6431,7 +6486,11 @@ mod tests {
         // A PageRank sidecar that predates the commit below. Serving it after
         // the commit would be the silent-wrong-ranks outcome the guard exists
         // to prevent, so recovery must overwrite rather than preserve it.
-        std::fs::write(&pagerank_path, r#"{"stale-precrash-score":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale-precrash-score".to_string(), 1.0)]),
+        );
 
         let lease = establish_index_publication_marker_with_io(
             &store,
@@ -9416,8 +9475,18 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let manifests_path = crate::sidecar_path(&db_path, ".manifests.json");
-        let manifests = crate::load_manifest_cache(&manifests_path).unwrap();
+        let persisted_manifest_envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+            serde_json::from_slice(
+                &fs::read(crate::sidecar_path(&db_path, ".manifests.json")).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_manifest_envelope.source_graph_generation,
+            store.graph_generation(),
+            "deletion reconciliation must publish manifests at the generation it makes live; payload={}",
+            persisted_manifest_envelope.payload
+        );
+        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
         let suggestions = crate::suggest_links(&store, &manifests).unwrap();
         assert!(
             suggestions.links.iter().all(|link| {
@@ -9472,6 +9541,7 @@ function hello(name) { return "Hello " + name; }
             .next()
             .unwrap()
             .uid;
+        store.set_embedding_metadata("test-model", 2).unwrap();
         assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
         assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
         store.flush_embedding_index().unwrap();
@@ -9556,7 +9626,11 @@ function hello(name) { return "Hello " + name; }
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         fs::create_dir(&generation_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"deleted":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("deleted".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let pagerank_generation = store.pagerank_generation();
 
@@ -9617,10 +9691,9 @@ function hello(name) { return "Hello " + name; }
         let db_path = dir.path().join("test.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let repo_uid = "repo:test:legacy-retirement".to_string();
-        let manifests_path = crate::manifest::manifest_cache_path(&db_path);
         let manifests =
             HashMap::from([(repo_uid.clone(), crate::manifest::ManifestInfo::default())]);
-        crate::manifest::save_manifest_cache(&manifests, &manifests_path).unwrap();
+        crate::manifest::save_manifest_cache_for_db(&manifests, &store, &db_path).unwrap();
         let legacy_path = db_path.with_extension("manifests.json");
         fs::create_dir(&legacy_path).unwrap();
 
@@ -9695,7 +9768,11 @@ function hello(name) { return "Hello " + name; }
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
@@ -9732,8 +9809,7 @@ function hello(name) { return "Hello " + name; }
             !store.pagerank_scores().unwrap().contains_key("stale"),
             "the committed graph must invalidate the live stale PageRank cache"
         );
-        let persisted: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let persisted = persisted_pagerank(&db_path);
         assert!(
             !persisted.contains_key("stale"),
             "the committed graph may publish fresh PageRank but must not retain the stale score"
@@ -9856,7 +9932,11 @@ function hello(name) { return "Hello " + name; }
         let db_path = dir.path().join("test.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
@@ -9927,7 +10007,11 @@ function hello(name) { return "Hello " + name; }
         let db_path = dir.path().join("test.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
@@ -10029,7 +10113,24 @@ function hello(name) { return "Hello " + name; }
                 pagerank_path.display()
             )
         });
-        serde_json::from_slice(&bytes).unwrap()
+        let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+            serde_json::from_slice(&bytes).unwrap();
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: envelope.brain_uuid.clone(),
+            publication_uuid: envelope.publication_uuid.clone(),
+        };
+        let fingerprint = envelope.algorithm_fingerprint.clone();
+        envelope
+            .validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+                artifact_kind: nestweaver_store::ranking::PAGERANK_ARTIFACT_KIND,
+                artifact_schema_version:
+                    nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                identity: &identity,
+                producer_version: env!("CARGO_PKG_VERSION"),
+                source_graph_generation: envelope.source_graph_generation,
+                algorithm_fingerprint: &fingerprint,
+            })
+            .unwrap()
     }
 
     fn assert_note_ranks(persisted: &HashMap<String, f64>, publisher: &str) {
@@ -10195,7 +10296,11 @@ function hello(name) { return "Hello " + name; }
         let db_path = dir.path().join("test.lbug");
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
@@ -10244,7 +10349,11 @@ function hello(name) { return "Hello " + name; }
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         store.bump_graph_generation();
         store.save_graph_generation(&generation_path).unwrap();
@@ -10301,7 +10410,11 @@ function hello(name) { return "Hello " + name; }
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         store.bump_graph_generation();
         store.save_graph_generation(&generation_path).unwrap();
@@ -10371,8 +10484,12 @@ function hello(name) { return "Hello " + name; }
                 scope_digest,
             );
             cache.save();
+            write_pagerank_fixture(
+                &store,
+                &pagerank_path,
+                HashMap::from([("stale".to_string(), 1.0)]),
+            );
         }
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
         fs::create_dir(&marker_path).unwrap();
 
         let recovering = GraphStore::open_or_create(&db_path).unwrap();
@@ -10561,8 +10678,7 @@ function hello(name) { return "Hello " + name; }
             !store.pagerank_scores().unwrap().contains_key(&removed_uid),
             "the live server store must not serve the deleted symbol's stale score"
         );
-        let persisted: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let persisted = persisted_pagerank(&db_path);
         assert!(
             !persisted.contains_key(&removed_uid),
             "a daemon restart must not reload the deleted symbol from the PageRank sidecar"
@@ -10628,7 +10744,11 @@ function hello(name) { return "Hello " + name; }
         index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         let generation_before = store.graph_generation();
@@ -11022,9 +11142,7 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        let pagerank_before: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_before = persisted_pagerank(&db_path);
         fs::remove_file(&removed_file).unwrap();
 
         let result = index_directory(
@@ -11040,8 +11158,7 @@ function hello(name) { return "Hello " + name; }
             result.files_deleted, 1,
             "the force-reindex path must report deletion of the repo's last parseable file"
         );
-        let pagerank_after: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_after = persisted_pagerank(&db_path);
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop the deleted repo's symbols"
@@ -11075,9 +11192,7 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        let pagerank_before: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_before = persisted_pagerank(&db_path);
         fs::remove_file(&removed_file).unwrap();
 
         let result = index_directory(
@@ -11093,8 +11208,7 @@ function hello(name) { return "Hello " + name; }
             result.files_deleted, 1,
             "re-identification must report files deleted with the old repo uid"
         );
-        let pagerank_after: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_after = persisted_pagerank(&db_path);
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted during re-identification"
@@ -11151,9 +11265,7 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        let pagerank_before: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_before = persisted_pagerank(&db_path);
         fs::remove_file(removed_repo.join("removed.js")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "--amend", "--no-edit", "--allow-empty", "-q"]);
@@ -11165,8 +11277,7 @@ function hello(name) { return "Hello " + name; }
             result.files_deleted, 1,
             "non-ancestor fallback must report files deleted before the full index"
         );
-        let pagerank_after: HashMap<String, f64> =
-            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        let pagerank_after = persisted_pagerank(&db_path);
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
@@ -11490,7 +11601,11 @@ function hello(name) { return "Hello " + name; }
         git(&["commit", "-q", "-m", "update"]);
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
         drop(store);
@@ -11561,7 +11676,11 @@ function hello(name) { return "Hello " + name; }
         git(&["commit", "--amend", "--no-edit", "-q"]);
         let store = GraphStore::open_or_create(&db_path).unwrap();
         let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
-        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        write_pagerank_fixture(
+            &store,
+            &pagerank_path,
+            HashMap::from([("stale".to_string(), 1.0)]),
+        );
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
         drop(store);

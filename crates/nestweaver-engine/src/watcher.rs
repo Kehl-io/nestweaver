@@ -598,7 +598,7 @@ impl BrainWatcher {
                 let canonical_manifests_path = crate::manifest::manifest_cache_path(&self.db_path);
                 let uses_canonical_path = manifests_path == &canonical_manifests_path;
                 let loaded = if uses_canonical_path {
-                    crate::manifest::load_manifest_cache_for_db(&self.db_path)
+                    crate::manifest::load_manifest_cache_for_db(store, &self.db_path)
                 } else {
                     crate::manifest::load_manifest_cache(manifests_path)
                 };
@@ -606,7 +606,11 @@ impl BrainWatcher {
                     Ok(mut cache) => {
                         cache.insert(repo_key.clone(), manifest);
                         let saved = if uses_canonical_path {
-                            crate::manifest::save_manifest_cache_for_db(&cache, &self.db_path)
+                            crate::manifest::save_manifest_cache_for_db(
+                                &cache,
+                                store,
+                                &self.db_path,
+                            )
                         } else {
                             crate::manifest::save_manifest_cache(&cache, manifests_path)
                         };
@@ -1315,7 +1319,10 @@ mod tests {
         store.bump_graph_generation();
         store.save_graph_generation(&generation_path).unwrap();
         let stale_generation = store.graph_generation();
-        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
+            .unwrap();
+        store.save_pagerank_cache(&pagerank_path).unwrap();
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let watcher = BrainWatcher::new(&db_path, &root, "test", "test");
 
@@ -1367,7 +1374,7 @@ mod tests {
 
         assert!(canonical_path.exists());
         assert!(!legacy_path.exists());
-        let manifests = crate::load_manifest_cache_for_db(&db_path).unwrap();
+        let manifests = crate::load_manifest_cache_for_db(&store, &db_path).unwrap();
         assert_eq!(manifests.len(), 1);
         assert_eq!(
             manifests.values().next().unwrap().package_name.as_deref(),

@@ -295,7 +295,79 @@ fn assert_successful_output(output: &Output, context: &str) {
     );
 }
 
-/// Parity assertion: byte-identical stdout and equal exit codes across modes.
+fn normalize_regex_diagnostics(stdout: &[u8], mode_label: &str) -> Vec<u8> {
+    if mode_label == "json" {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+            return stdout.to_vec();
+        };
+        fn zero_timings(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(serde_json::Value::Object(timings)) = object.get_mut("timings") {
+                        for key in ["planning_ms", "hydration_ms", "verification_ms", "total_ms"] {
+                            if timings.contains_key(key) {
+                                timings.insert(key.to_string(), serde_json::Value::from(0));
+                            }
+                        }
+                    }
+                    for child in object.values_mut() {
+                        zero_timings(child);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        zero_timings(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        zero_timings(&mut value);
+        return serde_json::to_vec(&value).unwrap();
+    }
+
+    let Ok(mut text) = String::from_utf8(stdout.to_vec()) else {
+        return stdout.to_vec();
+    };
+    let mut offset = 0;
+    while let Some(relative_end) = text[offset..].find(" ms") {
+        let end = offset + relative_end;
+        let start = text[..end]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| character.is_ascii_digit())
+            .last()
+            .map_or(end, |(index, _)| index);
+        if start == end {
+            offset = end + 3;
+            continue;
+        }
+        text.replace_range(start..end, "<elapsed>");
+        offset = start + "<elapsed> ms".len();
+    }
+    for marker in ["plan ", "hydrate ", "verify "] {
+        let mut offset = 0;
+        while let Some(relative) = text[offset..].find(marker) {
+            let start = offset + relative + marker.len();
+            let end = start
+                + text[start..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+            if end > start {
+                text.replace_range(start..end, "<elapsed>");
+            }
+            offset = start + "<elapsed>".len();
+        }
+    }
+    text.into_bytes()
+}
+
+/// Parity assertion: deterministic stdout and equal exit codes across modes.
+/// Regex execution timings are intentionally measured independently by each
+/// route, so only those elapsed values are normalized; results and every work
+/// counter remain byte-for-byte compared.
 fn assert_parity(command: &str, mode_label: &str, direct: &Output, daemon: &Output) {
     assert_eq!(
         direct.status.code(),
@@ -307,9 +379,20 @@ fn assert_parity(command: &str, mode_label: &str, direct: &Output, daemon: &Outp
         String::from_utf8_lossy(&direct.stderr),
         String::from_utf8_lossy(&daemon.stderr)
     );
+    let normalize_timings = matches!(command, "regex-search" | "count-patterns");
+    let direct_normalized = if normalize_timings {
+        normalize_regex_diagnostics(&direct.stdout, mode_label)
+    } else {
+        direct.stdout.clone()
+    };
+    let daemon_normalized = if normalize_timings {
+        normalize_regex_diagnostics(&daemon.stdout, mode_label)
+    } else {
+        daemon.stdout.clone()
+    };
     assert_eq!(
-        direct.stdout,
-        daemon.stdout,
+        direct_normalized,
+        daemon_normalized,
         "{command} ({mode_label}): stdout diverged between direct and daemon mode\n\
          --- direct ---\n{}\n--- daemon ---\n{}",
         String::from_utf8_lossy(&direct.stdout),

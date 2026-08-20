@@ -56,7 +56,7 @@ pub async fn cross_repo_refs(
 }
 
 pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path)?;
+    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.store, &state.db_path)?;
     let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)?;
     let json = json!({
         "links": serde_json::to_value(&suggestions.links)?,
@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {
+    async fn suggest_links_does_not_trust_a_legacy_only_manifest_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
         let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
@@ -149,10 +149,8 @@ mod tests {
             .unwrap();
         let suggestions: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
-            link["description"] == "Depends on legacy-dependency-package (from manifest)"
-        }));
-        assert!(canonical_path.exists());
-        assert!(!legacy_path.exists());
+        assert!(suggestions["links"].as_array().unwrap().is_empty());
+        assert!(!canonical_path.exists());
+        assert!(legacy_path.exists());
     }
 }

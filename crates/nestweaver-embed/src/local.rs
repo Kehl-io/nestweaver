@@ -3,8 +3,15 @@ use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::{HFClient, HFClientBuilder, HFClientSync, HFError, split_id};
+use nestweaver_schema::{
+    EMBEDDING_PIPELINE_SCHEMA_VERSION, EmbeddingBackend, EmbeddingPipelineV2, EmbeddingPoolingMode,
+    EmbeddingQuantization, EmbeddingSimilarity, EmbeddingTruncation,
+};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::PathBuf;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 use tracing::info;
 
 use crate::{DeviceKind, DevicePolicy};
@@ -15,6 +22,277 @@ pub struct ModelArtifacts {
     pub config: PathBuf,
     pub tokenizer: PathBuf,
     pub weights: PathBuf,
+    pub modules: PathBuf,
+    pub sentence_transformer_config: PathBuf,
+    pub transformer_config: PathBuf,
+    pub pooling_config: PathBuf,
+    pub dense_modules: Vec<DenseArtifacts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseArtifacts {
+    pub config: PathBuf,
+    pub weights: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentenceTransformerModule {
+    #[serde(rename = "type")]
+    module_type: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentenceTransformerConfig {
+    #[serde(default)]
+    similarity_fn_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransformerConfig {
+    max_seq_length: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolingConfig {
+    #[serde(default)]
+    pooling_mode_cls_token: bool,
+    #[serde(default)]
+    pooling_mode_max_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_sqrt_len_tokens: bool,
+    #[serde(default)]
+    pooling_mode_weightedmean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+    #[serde(default = "default_include_prompt")]
+    include_prompt: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DenseConfig {
+    in_features: usize,
+    out_features: usize,
+    #[serde(default)]
+    bias: bool,
+    activation_function: String,
+}
+
+#[derive(Clone)]
+enum DenseActivation {
+    Identity,
+    Tanh,
+    Relu,
+    Gelu,
+}
+
+impl DenseActivation {
+    fn parse(value: &str) -> Result<Self> {
+        let name = value.rsplit('.').next().unwrap_or(value);
+        match name.to_ascii_lowercase().as_str() {
+            "identity" => Ok(Self::Identity),
+            "tanh" => Ok(Self::Tanh),
+            "relu" => Ok(Self::Relu),
+            "gelu" | "geluactivation" => Ok(Self::Gelu),
+            _ => anyhow::bail!(
+                "unsupported Sentence Transformers Dense activation '{value}'; supported activations are Identity, Tanh, ReLU, and GELU"
+            ),
+        }
+    }
+
+    fn apply(&self, value: f32) -> f32 {
+        match self {
+            Self::Identity => value,
+            Self::Tanh => value.tanh(),
+            Self::Relu => value.max(0.0),
+            Self::Gelu => {
+                0.5 * value * (1.0 + (0.797_884_6_f32 * (value + 0.044_715 * value.powi(3))).tanh())
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DenseRuntime {
+    weights: Vec<Vec<f32>>,
+    bias: Vec<f32>,
+    activation: DenseActivation,
+}
+
+impl DenseRuntime {
+    fn apply(&self, input: &[f32]) -> Vec<f32> {
+        self.weights
+            .iter()
+            .zip(&self.bias)
+            .map(|(row, bias)| {
+                let value = row
+                    .iter()
+                    .zip(input)
+                    .fold(*bias, |sum, (weight, value)| sum + weight * value);
+                self.activation.apply(value)
+            })
+            .collect()
+    }
+}
+
+fn load_dense_runtime(artifacts: &DenseArtifacts, config: &DenseConfig) -> Result<DenseRuntime> {
+    let builder = unsafe {
+        VarBuilder::from_mmaped_safetensors(
+            std::slice::from_ref(&artifacts.weights),
+            candle_core::DType::F32,
+            &Device::Cpu,
+        )?
+    }
+    .pp("linear");
+    let weights = builder
+        .get((config.out_features, config.in_features), "weight")?
+        .to_vec2::<f32>()?;
+    let bias = if config.bias {
+        builder.get(config.out_features, "bias")?.to_vec1::<f32>()?
+    } else {
+        vec![0.0; config.out_features]
+    };
+    Ok(DenseRuntime {
+        weights,
+        bias,
+        activation: DenseActivation::parse(&config.activation_function)?,
+    })
+}
+
+#[derive(Clone)]
+enum PostPoolingModule {
+    Dense(DenseRuntime),
+    Normalize,
+}
+
+fn pool_token_vectors(
+    token_vectors: &[Vec<f32>],
+    attention_mask: &[u32],
+    modes: &[EmbeddingPoolingMode],
+) -> Result<Vec<f32>> {
+    let active: Vec<&[f32]> = token_vectors
+        .iter()
+        .zip(attention_mask)
+        .filter_map(|(vector, mask)| (*mask != 0).then_some(vector.as_slice()))
+        .collect();
+    anyhow::ensure!(
+        !active.is_empty(),
+        "embedding attention mask selected no tokens"
+    );
+    let hidden = active[0].len();
+    anyhow::ensure!(
+        active.iter().all(|vector| vector.len() == hidden),
+        "embedding transformer returned mixed hidden dimensions"
+    );
+    let mut embedding = Vec::with_capacity(hidden * modes.len());
+    for mode in modes {
+        let mut pooled = vec![0.0_f32; hidden];
+        match mode {
+            EmbeddingPoolingMode::Cls => pooled.copy_from_slice(active[0]),
+            EmbeddingPoolingMode::LastToken => pooled.copy_from_slice(active[active.len() - 1]),
+            EmbeddingPoolingMode::Max => {
+                pooled.fill(f32::NEG_INFINITY);
+                for vector in &active {
+                    for (slot, value) in pooled.iter_mut().zip(vector.iter()) {
+                        *slot = slot.max(*value);
+                    }
+                }
+            }
+            EmbeddingPoolingMode::Mean | EmbeddingPoolingMode::MeanSqrtLength => {
+                for vector in &active {
+                    for (slot, value) in pooled.iter_mut().zip(vector.iter()) {
+                        *slot += value;
+                    }
+                }
+                let divisor = if matches!(mode, EmbeddingPoolingMode::MeanSqrtLength) {
+                    (active.len() as f32).sqrt()
+                } else {
+                    active.len() as f32
+                };
+                for value in &mut pooled {
+                    *value /= divisor;
+                }
+            }
+            EmbeddingPoolingMode::WeightedMean => {
+                let denominator = (active.len() * (active.len() + 1) / 2) as f32;
+                for (position, vector) in active.iter().enumerate() {
+                    let weight = (position + 1) as f32;
+                    for (slot, value) in pooled.iter_mut().zip(vector.iter()) {
+                        *slot += value * weight;
+                    }
+                }
+                for value in &mut pooled {
+                    *value /= denominator;
+                }
+            }
+        }
+        embedding.extend(pooled);
+    }
+    Ok(embedding)
+}
+
+const fn default_include_prompt() -> bool {
+    true
+}
+
+fn file_sha256(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn snapshot_revision(path: &std::path::Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    components.windows(2).find_map(|pair| {
+        (pair[0].as_os_str() == "snapshots")
+            .then(|| pair[1].as_os_str().to_string_lossy().to_string())
+    })
+}
+
+fn module_fingerprint(artifacts: &ModelArtifacts) -> Result<String> {
+    let mut digest = Sha256::new();
+    for (name, path) in [
+        ("modules.json", &artifacts.modules),
+        (
+            "config_sentence_transformers.json",
+            &artifacts.sentence_transformer_config,
+        ),
+        ("sentence_bert_config.json", &artifacts.transformer_config),
+        ("pooling/config.json", &artifacts.pooling_config),
+    ] {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(std::fs::read(path)?);
+        digest.update([0xff]);
+    }
+    for (index, dense) in artifacts.dense_modules.iter().enumerate() {
+        digest.update(format!("dense/{index}/config.json").as_bytes());
+        digest.update([0]);
+        digest.update(std::fs::read(&dense.config)?);
+        digest.update([0xff]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn weights_fingerprint(artifacts: &ModelArtifacts) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"transformer/model.safetensors\0");
+    digest.update(std::fs::read(&artifacts.weights)?);
+    for (index, dense) in artifacts.dense_modules.iter().enumerate() {
+        digest.update(format!("\0dense/{index}/model.safetensors\0").as_bytes());
+        digest.update(std::fs::read(&dense.weights)?);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 /// Whether artifact resolution may contact Hugging Face.
@@ -88,7 +366,7 @@ fn resolve_model_artifacts_with_builder(
     let (owner, name) = split_id(&config.model_id);
     let repo = client.model(owner, name);
 
-    let resolve = |filename: &'static str| -> Result<PathBuf> {
+    let resolve = |filename: &str| -> Result<PathBuf> {
         repo.download_file()
             .filename(filename)
             .local_files_only(mode == ArtifactMode::CacheOnly)
@@ -114,10 +392,60 @@ fn resolve_model_artifacts_with_builder(
             })
     };
 
+    let modules = resolve("modules.json")?;
+    let module_descriptors: Vec<SentenceTransformerModule> =
+        serde_json::from_slice(&std::fs::read(&modules)?)
+            .context("parse Sentence Transformers modules.json")?;
+    let transformer = module_descriptors
+        .iter()
+        .find(|module| module.module_type.ends_with(".Transformer"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Sentence Transformers pipeline has no Transformer module")
+        })?;
+    let pooling = module_descriptors
+        .iter()
+        .find(|module| module.module_type.ends_with(".Pooling"))
+        .ok_or_else(|| anyhow::anyhow!("Sentence Transformers pipeline has no Pooling module"))?;
+    for module in &module_descriptors {
+        if !module.module_type.ends_with(".Transformer")
+            && !module.module_type.ends_with(".Pooling")
+            && !module.module_type.ends_with(".Dense")
+            && !module.module_type.ends_with(".Normalize")
+        {
+            anyhow::bail!(
+                "unsupported Sentence Transformers module '{}'; supported modules are Transformer, Pooling, Dense, and Normalize",
+                module.module_type
+            );
+        }
+    }
+    let module_file = |path: &str, filename: &str| {
+        if path.is_empty() {
+            filename.to_string()
+        } else {
+            format!("{path}/{filename}")
+        }
+    };
+
+    let dense_modules = module_descriptors
+        .iter()
+        .filter(|module| module.module_type.ends_with(".Dense"))
+        .map(|module| {
+            Ok(DenseArtifacts {
+                config: resolve(&module_file(&module.path, "config.json"))?,
+                weights: resolve(&module_file(&module.path, "model.safetensors"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(ModelArtifacts {
-        config: resolve("config.json")?,
-        tokenizer: resolve("tokenizer.json")?,
-        weights: resolve("model.safetensors")?,
+        config: resolve(&module_file(&transformer.path, "config.json"))?,
+        tokenizer: resolve(&module_file(&transformer.path, "tokenizer.json"))?,
+        weights: resolve(&module_file(&transformer.path, "model.safetensors"))?,
+        modules,
+        sentence_transformer_config: resolve("config_sentence_transformers.json")?,
+        transformer_config: resolve(&module_file(&transformer.path, "sentence_bert_config.json"))?,
+        pooling_config: resolve(&module_file(&pooling.path, "config.json"))?,
+        dense_modules,
     })
 }
 
@@ -145,6 +473,9 @@ pub struct LocalModel {
     device: Device,
     device_kind: DeviceKind,
     dimension: usize,
+    pipeline: EmbeddingPipelineV2,
+    pooling: Vec<EmbeddingPoolingMode>,
+    post_pooling_modules: Vec<PostPoolingModule>,
 }
 
 impl LocalModel {
@@ -189,10 +520,177 @@ impl LocalModel {
     ) -> Result<Self> {
         let config_str = std::fs::read_to_string(&artifacts.config)?;
         let bert_config: BertConfig = serde_json::from_str(&config_str)?;
-        let dimension = bert_config.hidden_size;
+        let modules: Vec<SentenceTransformerModule> =
+            serde_json::from_slice(&std::fs::read(&artifacts.modules)?)?;
+        let sentence_config: SentenceTransformerConfig =
+            serde_json::from_slice(&std::fs::read(&artifacts.sentence_transformer_config)?)?;
+        let transformer_config: TransformerConfig =
+            serde_json::from_slice(&std::fs::read(&artifacts.transformer_config)?)?;
+        anyhow::ensure!(
+            transformer_config.max_seq_length > 0,
+            "Sentence Transformers max_seq_length must be non-zero"
+        );
+        let pooling_config: PoolingConfig =
+            serde_json::from_slice(&std::fs::read(&artifacts.pooling_config)?)?;
+        let mut pooling = Vec::new();
+        for (enabled, mode) in [
+            (
+                pooling_config.pooling_mode_cls_token,
+                EmbeddingPoolingMode::Cls,
+            ),
+            (
+                pooling_config.pooling_mode_max_tokens,
+                EmbeddingPoolingMode::Max,
+            ),
+            (
+                pooling_config.pooling_mode_mean_tokens,
+                EmbeddingPoolingMode::Mean,
+            ),
+            (
+                pooling_config.pooling_mode_mean_sqrt_len_tokens,
+                EmbeddingPoolingMode::MeanSqrtLength,
+            ),
+            (
+                pooling_config.pooling_mode_weightedmean_tokens,
+                EmbeddingPoolingMode::WeightedMean,
+            ),
+            (
+                pooling_config.pooling_mode_lasttoken,
+                EmbeddingPoolingMode::LastToken,
+            ),
+        ] {
+            if enabled {
+                pooling.push(mode);
+            }
+        }
+        anyhow::ensure!(
+            !pooling.is_empty(),
+            "Sentence Transformers Pooling module enables no supported pooling mode"
+        );
+        let pooling_position = modules
+            .iter()
+            .position(|module| module.module_type.ends_with(".Pooling"))
+            .expect("pooling module was validated during artifact resolution");
+        anyhow::ensure!(
+            modules[..pooling_position]
+                .iter()
+                .all(|module| module.module_type.ends_with(".Transformer")),
+            "Sentence Transformers modules before Pooling must be Transformer modules"
+        );
+        let dense_configs: Vec<DenseConfig> = artifacts
+            .dense_modules
+            .iter()
+            .map(|dense| {
+                serde_json::from_slice(&std::fs::read(&dense.config)?)
+                    .context("parse Sentence Transformers Dense config")
+            })
+            .collect::<Result<_>>()?;
+        let mut dense_config_index = 0usize;
+        let pooled_dimension = bert_config
+            .hidden_size
+            .checked_mul(pooling.len())
+            .ok_or_else(|| anyhow::anyhow!("embedding dimension overflow"))?;
+        let mut dimension = pooled_dimension;
+        for module in &modules[pooling_position + 1..] {
+            if module.module_type.ends_with(".Dense") {
+                let config = dense_configs.get(dense_config_index).ok_or_else(|| {
+                    anyhow::anyhow!("Dense module artifact/config count mismatch")
+                })?;
+                anyhow::ensure!(
+                    config.in_features == dimension,
+                    "Sentence Transformers Dense input dimension {} does not match prior module output {dimension}",
+                    config.in_features
+                );
+                anyhow::ensure!(config.out_features > 0, "Dense output dimension is zero");
+                DenseActivation::parse(&config.activation_function)?;
+                dimension = config.out_features;
+                dense_config_index += 1;
+            } else if !module.module_type.ends_with(".Normalize") {
+                anyhow::bail!(
+                    "unsupported Sentence Transformers module order at '{}'; only Dense and Normalize may follow Pooling",
+                    module.module_type
+                );
+            }
+        }
+        anyhow::ensure!(
+            dense_config_index == dense_configs.len(),
+            "Dense module artifact/config count mismatch"
+        );
+        let normalize = modules
+            .iter()
+            .any(|module| module.module_type.ends_with(".Normalize"));
+        let revision = snapshot_revision(&artifacts.weights).ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding model artifacts are not bound to an immutable Hugging Face snapshot"
+            )
+        })?;
+        for path in [
+            &artifacts.config,
+            &artifacts.tokenizer,
+            &artifacts.modules,
+            &artifacts.sentence_transformer_config,
+            &artifacts.transformer_config,
+            &artifacts.pooling_config,
+        ] {
+            anyhow::ensure!(
+                snapshot_revision(path).as_deref() == Some(revision.as_str()),
+                "embedding artifacts came from mixed model revisions"
+            );
+        }
+        for dense in &artifacts.dense_modules {
+            for path in [&dense.config, &dense.weights] {
+                anyhow::ensure!(
+                    snapshot_revision(path).as_deref() == Some(revision.as_str()),
+                    "embedding Dense artifacts came from mixed model revisions"
+                );
+            }
+        }
+        let similarity = match sentence_config
+            .similarity_fn_name
+            .as_deref()
+            .unwrap_or("cosine")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cosine" => EmbeddingSimilarity::Cosine,
+            "dot" | "dot_product" => EmbeddingSimilarity::DotProduct,
+            other => anyhow::bail!("unsupported Sentence Transformers similarity '{other}'"),
+        };
+        let pipeline = EmbeddingPipelineV2 {
+            schema_version: EMBEDDING_PIPELINE_SCHEMA_VERSION,
+            backend: EmbeddingBackend::SentenceTransformersLocal,
+            provider: "huggingface".to_string(),
+            model_id: config.model_id.clone(),
+            model_revision: Some(revision),
+            weights_sha256: Some(weights_fingerprint(&artifacts)?),
+            tokenizer_sha256: Some(file_sha256(&artifacts.tokenizer)?),
+            tokenizer_config_sha256: Some(file_sha256(&artifacts.config)?),
+            modules_sha256: Some(module_fingerprint(&artifacts)?),
+            produced_dimension: u32::try_from(dimension)
+                .context("embedding dimension does not fit u32")?,
+            projection_dimension: (dimension != pooled_dimension)
+                .then_some(u32::try_from(dimension).context("Dense dimension does not fit u32")?),
+            pooling: pooling.clone(),
+            include_prompt: Some(pooling_config.include_prompt),
+            normalize: Some(normalize),
+            similarity,
+            max_sequence_length: Some(
+                u32::try_from(transformer_config.max_seq_length)
+                    .context("max sequence length does not fit u32")?,
+            ),
+            truncation: EmbeddingTruncation::LongestFirst,
+            quantization: EmbeddingQuantization::Float32,
+        };
+        pipeline.validate().map_err(anyhow::Error::msg)?;
 
-        let tokenizer = Tokenizer::from_file(&artifacts.tokenizer)
+        let mut tokenizer = Tokenizer::from_file(&artifacts.tokenizer)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: transformer_config.max_seq_length,
+                ..TruncationParams::default()
+            }))
+            .map_err(|error| anyhow::anyhow!("configure tokenizer truncation: {error}"))?;
 
         info!(?device_kind, device = ?device, model = %config.model_id, "Loading embedding model");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -204,12 +702,28 @@ impl LocalModel {
                 )?
             };
             let model = BertModel::load(vb, &bert_config)?;
+            let mut post_pooling_modules = Vec::new();
+            let mut dense_index = 0usize;
+            for module in &modules[pooling_position + 1..] {
+                if module.module_type.ends_with(".Dense") {
+                    post_pooling_modules.push(PostPoolingModule::Dense(load_dense_runtime(
+                        &artifacts.dense_modules[dense_index],
+                        &dense_configs[dense_index],
+                    )?));
+                    dense_index += 1;
+                } else if module.module_type.ends_with(".Normalize") {
+                    post_pooling_modules.push(PostPoolingModule::Normalize);
+                }
+            }
             let candidate = Self {
                 model,
                 tokenizer,
                 device,
                 device_kind,
                 dimension,
+                pipeline,
+                pooling,
+                post_pooling_modules,
             };
             candidate.embed(&["test"])?;
             Ok::<Self, anyhow::Error>(candidate)
@@ -238,6 +752,10 @@ impl LocalModel {
         self.device_kind
     }
 
+    pub fn pipeline(&self) -> &EmbeddingPipelineV2 {
+        &self.pipeline
+    }
+
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
@@ -250,11 +768,10 @@ impl LocalModel {
             let ids = encoding.get_ids().to_vec();
             let type_ids = encoding.get_type_ids().to_vec();
             let attention_mask: Vec<u32> = encoding.get_attention_mask().to_vec();
-            let len = ids.len();
 
             let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
             let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
-            let attention_mask_tensor = Tensor::new(attention_mask, &self.device)?
+            let attention_mask_tensor = Tensor::new(attention_mask.as_slice(), &self.device)?
                 .to_dtype(candle_core::DType::F32)?
                 .unsqueeze(0)?;
 
@@ -262,23 +779,27 @@ impl LocalModel {
                 self.model
                     .forward(&input_ids, &token_type_ids, Some(&attention_mask_tensor))?;
 
-            // Mean pooling over non-padding tokens
-            let mask_expanded = attention_mask_tensor
-                .unsqueeze(2)?
-                .broadcast_as(output.shape())?;
-            let masked = (output * mask_expanded)?;
-            let summed = masked.sum(1)?;
-            let count = Tensor::new(vec![len as f32], &self.device)?
-                .unsqueeze(0)?
-                .broadcast_as(summed.shape())?;
-            let mean_pooled = (summed / count)?;
-
-            // L2 normalize
-            let norm = mean_pooled.sqr()?.sum(1)?.sqrt()?;
-            let norm_expanded = norm.unsqueeze(1)?.broadcast_as(mean_pooled.shape())?;
-            let normalized = (mean_pooled / norm_expanded)?;
-
-            let embedding: Vec<f32> = normalized.squeeze(0)?.to_vec1()?;
+            let token_vectors =
+                output.to_vec3::<f32>()?.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("embedding transformer returned no batch output")
+                })?;
+            let mut embedding = pool_token_vectors(&token_vectors, &attention_mask, &self.pooling)?;
+            for module in &self.post_pooling_modules {
+                match module {
+                    PostPoolingModule::Dense(dense) => embedding = dense.apply(&embedding),
+                    PostPoolingModule::Normalize => {
+                        let norm = embedding
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f32>()
+                            .sqrt();
+                        anyhow::ensure!(norm > 0.0 && norm.is_finite(), "invalid embedding norm");
+                        for value in &mut embedding {
+                            *value /= norm;
+                        }
+                    }
+                }
+            }
             all_embeddings.push(embedding);
         }
 
@@ -426,6 +947,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pooling_modes_match_sentence_transformers_masked_formulas() {
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            source: String,
+            token_vectors: Vec<Vec<f32>>,
+            attention_mask: Vec<u32>,
+            expected: Vec<f32>,
+        }
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../tests/fixtures/sentence_transformers_pooling_golden.json"
+        ))
+        .unwrap();
+        assert!(golden.source.contains("sentence-transformers"));
+        let modes = [
+            EmbeddingPoolingMode::Cls,
+            EmbeddingPoolingMode::Max,
+            EmbeddingPoolingMode::Mean,
+            EmbeddingPoolingMode::MeanSqrtLength,
+            EmbeddingPoolingMode::WeightedMean,
+            EmbeddingPoolingMode::LastToken,
+        ];
+        let actual =
+            pool_token_vectors(&golden.token_vectors, &golden.attention_mask, &modes).unwrap();
+        assert_eq!(actual.len(), golden.expected.len());
+        for (actual, expected) in actual.iter().zip(golden.expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn dense_runtime_applies_projection_bias_and_activation() {
+        let dense = DenseRuntime {
+            weights: vec![vec![1.0, 2.0], vec![-1.0, 1.0]],
+            bias: vec![0.5, -0.5],
+            activation: DenseActivation::Relu,
+        };
+        assert_eq!(dense.apply(&[2.0, 3.0]), vec![8.5, 0.5]);
+    }
+
     fn write_cached_artifacts(cache_dir: &Path, omitted: Option<&str>) -> ModelArtifacts {
         // hf-hub documents refs/<revision> and snapshots/<commit>/<filename>
         // as its public cache representation. Regular files are sufficient for
@@ -440,11 +1001,35 @@ mod tests {
             config: snapshot_dir.join("config.json"),
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
+            modules: snapshot_dir.join("modules.json"),
+            sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
+            transformer_config: snapshot_dir.join("sentence_bert_config.json"),
+            pooling_config: snapshot_dir.join("1_Pooling/config.json"),
+            dense_modules: Vec::new(),
         };
-        for path in [&artifacts.config, &artifacts.tokenizer, &artifacts.weights] {
+        std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling module");
+        for path in [
+            &artifacts.config,
+            &artifacts.tokenizer,
+            &artifacts.weights,
+            &artifacts.sentence_transformer_config,
+            &artifacts.transformer_config,
+            &artifacts.pooling_config,
+        ] {
             if path.file_name().and_then(|name| name.to_str()) != omitted {
                 std::fs::write(path, b"fixture").expect("write cached artifact");
             }
+        }
+        if artifacts.modules.file_name().and_then(|name| name.to_str()) != omitted {
+            std::fs::write(
+                &artifacts.modules,
+                br#"[
+                    {"idx":0,"name":"0","path":"","type":"sentence_transformers.models.Transformer"},
+                    {"idx":1,"name":"1","path":"1_Pooling","type":"sentence_transformers.models.Pooling"},
+                    {"idx":2,"name":"2","path":"2_Normalize","type":"sentence_transformers.models.Normalize"}
+                ]"#,
+            )
+            .expect("write modules artifact");
         }
         artifacts
     }
@@ -578,6 +1163,11 @@ mod tests {
             config: PathBuf::from("resolved-config"),
             tokenizer: PathBuf::from("resolved-tokenizer"),
             weights: PathBuf::from("resolved-weights"),
+            modules: PathBuf::from("resolved-modules"),
+            sentence_transformer_config: PathBuf::from("resolved-sentence-config"),
+            transformer_config: PathBuf::from("resolved-transformer-config"),
+            pooling_config: PathBuf::from("resolved-pooling-config"),
+            dense_modules: Vec::new(),
         };
         let selection_count = Cell::new(0);
         let resolution_count = Cell::new(0);

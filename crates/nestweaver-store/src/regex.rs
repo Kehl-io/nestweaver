@@ -3,20 +3,19 @@
 //! NestWeaver already stores searchable text in the graph: `Section.text_content`
 //! (markdown brain bodies), `Note.title`, and `Symbol.signature`. This module
 //! lets agents run a real `regex` against that text without shelling out to
-//! `rg`/`grep`, with an optional trigram pre-filter to skip non-matching nodes.
+//! `rg`/`grep`, with a disposable per-scope Tantivy trigram accelerator.
 //!
 //! ## Correctness vs. optimization
 //!
-//! The trigram posting table is purely an optimization. Correctness never
-//! depends on it: when no posting table exists (the `index --with-trigrams`
-//! flag was not used), when the pattern yields no usable literal trigrams
+//! The regex sidecar is purely an optimization. Correctness never depends on
+//! it: when no shard exists, when the pattern yields no usable literal trigrams
 //! (e.g. `.{4,}`), or for any repository/vault scope whose manifest is stale,
 //! we fall back to scanning that scope's candidate text and running the
 //! compiled regex against it. Ready scopes remain prefiltered. The trigram
 //! pre-filter only ever *narrows* the candidate set — we always confirm with
 //! the real regex.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -26,6 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+use crate::regex_index::{
+    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardDocument,
+    RegexShardMetadata,
+};
 use crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX;
 
 /// Safety ceiling on how many candidate nodes a single search will SCAN before
@@ -45,11 +48,6 @@ pub const DEFAULT_MAX_MILLIS: u64 = 2000;
 /// before compilation so an untrusted client cannot force a large compile just
 /// by sending a huge pattern.
 pub const MAX_PATTERN_BYTES: usize = 4096;
-
-/// Legacy global provenance key. Its presence identifies the v1 positional
-/// posting schema; the first v2 refresh migrates it atomically to stable,
-/// scope-owned postings.
-const TRIGRAM_INDEX_META_KEY: &str = "trigram_index";
 
 /// One-shot latch so the stale-index warning is printed once per process
 /// instead of on every search.
@@ -118,9 +116,26 @@ pub struct RegexSearchResult {
     /// stale, or mid-refresh. Correctness is preserved per scope.
     #[serde(default)]
     pub dirty_scopes: usize,
+    /// Scopes whose accelerator could not be opened or queried. These are a
+    /// subset of `dirty_scopes` and were safely scanned instead.
+    #[serde(default)]
+    pub error_scopes: usize,
+    /// Unique candidate UIDs returned by trusted posting lists before graph
+    /// hydration.
+    #[serde(default)]
+    pub posting_hits: usize,
+    /// Posting hits that still existed in the graph and passed filters.
+    #[serde(default)]
+    pub hydrated_candidates: usize,
     /// Candidate nodes actually evaluated by the real regex.
     #[serde(default)]
     pub scanned_candidates: usize,
+    /// Exact reason the result set is partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<RegexTruncationReason>,
+    /// Query-stage wall times for operational diagnosis.
+    #[serde(default)]
+    pub timings: RegexStageTimings,
     /// Human-readable explanation when an empty result is NOT a definitive
     /// "no matches exist".
     ///
@@ -132,6 +147,24 @@ pub struct RegexSearchResult {
     /// than each remembering to bolt it on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegexTruncationReason {
+    ResultLimit,
+    Deadline,
+    CandidateCap,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegexStageTimings {
+    pub planning_ms: u64,
+    pub hydration_ms: u64,
+    pub verification_ms: u64,
+    pub total_ms: u64,
 }
 
 /// The note attached to an empty-but-truncated regex search.
@@ -176,7 +209,15 @@ pub struct PatternCount {
     #[serde(default)]
     pub dirty_scopes: usize,
     #[serde(default)]
+    pub error_scopes: usize,
+    #[serde(default)]
+    pub posting_hits: usize,
+    #[serde(default)]
+    pub hydrated_candidates: usize,
+    #[serde(default)]
     pub scanned_candidates: usize,
+    #[serde(default)]
+    pub timings: RegexStageTimings,
 }
 
 /// Work performed by an incremental trigram refresh.
@@ -199,6 +240,7 @@ pub struct TrigramRefreshStats {
 struct Candidate {
     uid: String,
     /// Repository UID for symbols, vault UID for notes and sections.
+    #[allow(dead_code)] // retained in the frozen candidate contract/golden fixtures
     scope_uid: String,
     /// Content-derived identity used to determine whether this node's
     /// postings need to change.
@@ -213,31 +255,20 @@ struct Candidate {
     start_line: u32,
 }
 
-#[derive(Clone)]
-struct TrigramScopeState {
-    status: String,
+#[derive(Debug, Clone)]
+struct RegexGraphScopeState {
+    desired_epoch: u64,
+    acknowledged_epoch: u64,
     candidate_count: usize,
     candidate_digest: String,
-}
-
-struct TrigramDocumentState {
-    scope_uid: String,
-    text_hash: String,
+    tombstone: bool,
 }
 
 struct TrigramPrefilterPlan {
     matching_ready_uids: HashSet<String>,
     ready_scopes: HashSet<String>,
     dirty_scopes: HashSet<String>,
-    has_index: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct TrigramScopeCache {
-    generation: u64,
-    corpus_digest: String,
-    ready_scopes: HashSet<String>,
-    dirty_scopes: HashSet<String>,
+    error_scopes: HashSet<String>,
     has_index: bool,
 }
 
@@ -254,29 +285,6 @@ fn candidate_digest(candidates: &[Candidate]) -> String {
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
-}
-
-fn stable_posting_uid(trigram: &str, node_uid: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(trigram.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(node_uid.as_bytes());
-    format!("tg:v2:{}", hasher.finalize().to_hex())
-}
-
-fn widened_scan_plan(
-    ready_scopes: &HashSet<String>,
-    dirty_scopes: &HashSet<String>,
-    has_index: bool,
-) -> TrigramPrefilterPlan {
-    let mut all_dirty = dirty_scopes.clone();
-    all_dirty.extend(ready_scopes.iter().cloned());
-    TrigramPrefilterPlan {
-        matching_ready_uids: HashSet::new(),
-        ready_scopes: HashSet::new(),
-        dirty_scopes: all_dirty,
-        has_index,
-    }
 }
 
 /// Lowercase 3-grams of `s`, deduplicated. Operates on Unicode scalar values
@@ -353,20 +361,6 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
 }
 
 impl GraphStore {
-    /// True when the trigram posting table exists and has at least one row.
-    /// Used to decide whether to attempt the pre-filter or go straight to a
-    /// full scan.
-    fn has_trigram_index(&self) -> bool {
-        let conn = match self.conn() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        match conn.query("MATCH (t:TrigramPosting) RETURN t.trigram LIMIT 1") {
-            Ok(result) => result.count() > 0,
-            Err(_) => false,
-        }
-    }
-
     /// Incrementally refresh trigram postings over all indexed text. Existing
     /// callers keep the historical return value (postings written), while
     /// [`GraphStore::refresh_trigram_index`] exposes detailed work metrics.
@@ -388,401 +382,317 @@ impl GraphStore {
         &self,
         force_full: bool,
     ) -> Result<TrigramRefreshStats, StoreError> {
-        let refresh_started = Instant::now();
-        *self
-            .trigram_scope_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let candidates = self.collect_candidates(None, None)?;
-        let mut desired: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        for candidate in candidates {
-            // Unknown ownership is never publishable as trusted. Search keeps
-            // these candidates in the empty dirty scope and scans them.
-            if candidate.scope_uid.is_empty() {
+        self.refresh_regex_v3(force_full)
+    }
+
+    fn refresh_regex_v3(&self, force_full: bool) -> Result<TrigramRefreshStats, StoreError> {
+        let started = Instant::now();
+        let root = self.regex_sidecar_root().ok_or_else(|| {
+            StoreError::Query("regex v3 requires an on-disk graph store".to_string())
+        })?;
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("regex v3 requires graph publication identity".to_string())
+        })?;
+        let index = RegexIndex::with_reader_pool(root, self.regex_reader_pool.clone());
+        match index.garbage_collect() {
+            Ok(report) => {
+                for failure in report.failures {
+                    tracing::warn!(
+                        scope_hash = %failure.scope_hash,
+                        error = %failure.error,
+                        "deferred regex shard garbage collection for one scope"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "deferred regex shard garbage collection"),
+        }
+        let active_scopes = self.active_regex_scopes()?;
+        let metadata_report = match index.list_metadata() {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, "regex shard metadata listing is unavailable");
+                crate::regex_index::RegexMetadataReport {
+                    metadata: Vec::new(),
+                    failures: vec![crate::regex_index::RegexScopeIssue {
+                        scope_hash: "<unknown>".to_string(),
+                        error: error.to_string(),
+                    }],
+                }
+            }
+        };
+        let unknown_metadata_failure = metadata_report
+            .failures
+            .iter()
+            .any(|failure| failure.scope_hash == "<unknown>");
+        for failure in &metadata_report.failures {
+            tracing::warn!(
+                scope_hash = %failure.scope_hash,
+                error = %failure.error,
+                "regex shard metadata is unavailable for one scope"
+            );
+        }
+        let existing = metadata_report
+            .metadata
+            .into_iter()
+            .map(|metadata| (metadata.scope_uid.clone(), metadata))
+            .collect::<HashMap<_, _>>();
+        // Metadata absence is itself scope-local evidence that acceleration is
+        // unavailable, whether CURRENT is corrupt, missing, or was safely
+        // retired. An unidentifiable directory-read failure is the sole case
+        // that widens repair to every active scope.
+        let unavailable_scopes = if unknown_metadata_failure {
+            active_scopes.clone()
+        } else {
+            active_scopes
+                .iter()
+                .filter(|scope_uid| !existing.contains_key(scope_uid.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
+        let mut stats = TrigramRefreshStats::default();
+        let states = self.read_regex_scope_states()?;
+        let mut work_scopes = if force_full {
+            let mut scopes = active_scopes.clone();
+            scopes.extend(states.keys().cloned());
+            scopes.extend(existing.keys().cloned());
+            scopes
+        } else {
+            self.regex_outbox_scopes()?
+        };
+        work_scopes.extend(unavailable_scopes);
+        // A graph imported from a pre-v3 release has no outbox yet. Bootstrap
+        // once; all subsequent normal work is driven only by coalesced scopes.
+        if !force_full && work_scopes.is_empty() && (states.is_empty() || existing.is_empty()) {
+            work_scopes = active_scopes.clone();
+        }
+        let mut ordered: Vec<_> = work_scopes.into_iter().collect();
+        ordered.sort();
+        for scope_uid in ordered {
+            if !active_scopes.contains(&scope_uid) {
+                let epoch = match states.get(&scope_uid) {
+                    Some(state) if state.tombstone => state.desired_epoch,
+                    _ => self.mark_regex_scope_dirty(&scope_uid, true)?,
+                };
+                if index.retire_scope(&scope_uid)? {
+                    stats.scopes_refreshed += 1;
+                }
+                self.acknowledge_regex_tombstone(&scope_uid, epoch)?;
                 continue;
             }
-            desired
-                .entry(candidate.scope_uid.clone())
-                .or_default()
-                .push(candidate);
-        }
-        for values in desired.values_mut() {
-            values.sort_by(|a, b| a.uid.cmp(&b.uid));
-        }
 
-        let conn = self.conn()?;
-        // Positional v1 IDs (`tg:<number>`) sort before versioned v2 IDs
-        // (`tg:v2:<hash>`), so checking the first UID detects legacy rows
-        // without scanning and materializing a potentially 12.9M-row table.
-        let has_legacy_uid = conn
-            .query("MATCH (t:TrigramPosting) RETURN t.uid ORDER BY t.uid LIMIT 1")
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|row| row.first().cloned())
-            .is_some_and(|value| match value {
-                Value::String(uid) => !uid.starts_with("tg:v2:"),
-                _ => true,
+            let epoch = if force_full {
+                self.mark_regex_scope_dirty(&scope_uid, false)?
+            } else {
+                match states.get(&scope_uid).filter(|state| !state.tombstone) {
+                    Some(state) => state.desired_epoch,
+                    None => self.mark_regex_scope_dirty(&scope_uid, false)?,
+                }
+            };
+            let one_scope = HashSet::from([scope_uid.clone()]);
+            let mut candidates = self.collect_candidates_for_scopes(&one_scope, None, None)?;
+            candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
+            let digest = candidate_digest(&candidates);
+            let prior = existing.get(&scope_uid);
+            let compatible = prior.is_some_and(|metadata| {
+                metadata.schema_version == REGEX_INDEX_SCHEMA_VERSION
+                    && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+                    && metadata.brain_uuid == identity.brain_uuid
+                    && metadata.publication_uuid == identity.publication_uuid
+                    && metadata.candidate_count == candidates.len()
+                    && metadata.candidate_digest == digest
+                    && metadata.scope_epoch == epoch
             });
-        let legacy = has_legacy_uid
-            || conn
-                .query("MATCH (t:TrigramPosting) WHERE t.scope_uid = '' RETURN t.uid LIMIT 1")
-                .map(|rows| rows.count() > 0)
-                .unwrap_or(false)
-            || conn
-                .query(&format!(
-                    "MATCH (m:Meta {{key: '{TRIGRAM_INDEX_META_KEY}'}}) RETURN m.value LIMIT 1"
-                ))
-                .map(|rows| rows.count() > 0)
-                .unwrap_or(false);
-        let mut stats = TrigramRefreshStats {
-            migrated_legacy_index: legacy,
-            ..Default::default()
-        };
-        if force_full || legacy {
-            // Fail closed before any destructive full-rebuild statement. If
-            // the process dies between the table clears below, every former
-            // v2 scope remains visibly `building` and search scans it instead
-            // of trusting a partially cleared posting set.
-            for (scope_uid, scope) in self.read_trigram_scopes()? {
-                Self::write_trigram_scope(
-                    &conn,
-                    &scope_uid,
-                    "building",
-                    scope.candidate_count,
-                    &scope.candidate_digest,
-                    self.graph_generation(),
-                )?;
-            }
-            // A concurrent query can populate the cache in the interval
-            // between the initial invalidation and the first durable
-            // `building` marker. Invalidate again after every incumbent scope
-            // is fail-closed and before deleting any postings, so a forced
-            // rebuild (whose candidate corpus may be unchanged) cannot leave a
-            // cached `ready` verdict trusting partial data after failure.
-            *self
-                .trigram_scope_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            stats.postings_deleted = conn
-                .query("MATCH (t:TrigramPosting) RETURN count(t)")
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
-                .and_then(|row| row.first().cloned())
-                .and_then(|value| match value {
-                    Value::Int64(count) => Some(count.max(0) as usize),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            conn.query("MATCH (t:TrigramPosting) DETACH DELETE t")
-                .map_err(|e| StoreError::Query(format!("clear trigram postings: {e}")))?;
-            conn.query("MATCH (d:TrigramDocument) DETACH DELETE d")
-                .map_err(|e| StoreError::Query(format!("clear trigram documents: {e}")))?;
-            // Keep the durable `building` rows written above. Missing scope
-            // state is also fail-closed, but retaining the marker makes an
-            // interrupted rebuild directly observable and lets each scope's
-            // update transaction publish `ready` atomically.
-            let _ = conn.query(&format!(
-                "MATCH (m:Meta {{key: '{TRIGRAM_INDEX_META_KEY}'}}) DETACH DELETE m"
-            ));
-        }
-
-        let existing_scopes = self.read_trigram_scopes()?;
-        let mut all_scope_uids: HashSet<String> = desired.keys().cloned().collect();
-        all_scope_uids.extend(existing_scopes.keys().cloned());
-        let existing_docs = self.read_trigram_documents()?;
-        let desired_scope_by_uid: HashMap<String, String> = desired
-            .values()
-            .flatten()
-            .map(|candidate| (candidate.uid.clone(), candidate.scope_uid.clone()))
-            .collect();
-
-        let mut scope_uids: Vec<String> = all_scope_uids.into_iter().collect();
-        scope_uids.sort();
-        for scope_uid in scope_uids {
-            let scope_candidates = desired.get(&scope_uid).map(Vec::as_slice).unwrap_or(&[]);
-            let digest = candidate_digest(scope_candidates);
-            let unchanged = !force_full
-                && !legacy
-                && existing_scopes.get(&scope_uid).is_some_and(|scope| {
-                    scope.status == "ready"
-                        && scope.candidate_count == scope_candidates.len()
-                        && scope.candidate_digest == digest
-                });
-            if unchanged {
+            let graph_acknowledged = states.get(&scope_uid).is_some_and(|state| {
+                state.desired_epoch == epoch
+                    && state.acknowledged_epoch == epoch
+                    && !state.tombstone
+                    && state.candidate_count == candidates.len()
+                    && state.candidate_digest == digest
+            });
+            if compatible && graph_acknowledged && !force_full {
                 stats.scopes_unchanged += 1;
                 continue;
             }
 
-            Self::write_trigram_scope(
-                &conn,
-                &scope_uid,
-                "building",
-                scope_candidates.len(),
-                &digest,
-                self.graph_generation(),
-            )?;
-
-            let old_for_scope: HashMap<String, String> = existing_docs
+            let prior_documents_result = index.document_hashes(&scope_uid);
+            let prior_documents = prior_documents_result
+                .as_ref()
+                .ok()
+                .and_then(|documents| documents.clone())
+                .unwrap_or_default();
+            let desired_documents: HashMap<_, _> = candidates
                 .iter()
-                .filter(|(_, doc)| doc.scope_uid == scope_uid)
-                .map(|(uid, doc)| (uid.clone(), doc.text_hash.clone()))
+                .map(|candidate| (candidate.uid.clone(), candidate.text_hash.clone()))
                 .collect();
-            let deleted: Vec<String> = old_for_scope
+            stats.nodes_added += desired_documents
                 .keys()
-                // A node that moved scopes is deleted and reinserted by its
-                // destination scope. Treating it as deleted by the source
-                // scope is order-dependent: if the destination ran first,
-                // the source would erase the newly published postings.
-                .filter(|uid| !desired_scope_by_uid.contains_key(uid.as_str()))
-                .cloned()
-                .collect();
-            let changed: Vec<&Candidate> = scope_candidates
+                .filter(|uid| !prior_documents.contains_key(uid.as_str()))
+                .count();
+            stats.nodes_changed += desired_documents
                 .iter()
-                .filter(|candidate| {
-                    old_for_scope
-                        .get(&candidate.uid)
-                        .is_none_or(|hash| hash != &candidate.text_hash)
+                .filter(|(uid, hash)| {
+                    prior_documents
+                        .get(uid.as_str())
+                        .is_some_and(|prior| prior != *hash)
+                })
+                .count();
+            stats.nodes_deleted += prior_documents
+                .keys()
+                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .count();
+            let metadata = RegexShardMetadata {
+                schema_version: REGEX_INDEX_SCHEMA_VERSION,
+                tokenizer_fingerprint: REGEX_TOKENIZER_FINGERPRINT.to_string(),
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                source_graph_generation: self.graph_generation(),
+                scope_uid: scope_uid.clone(),
+                scope_epoch: epoch,
+                candidate_count: candidates.len(),
+                candidate_digest: digest.clone(),
+            };
+            let trigram_sets: Vec<HashSet<String>> = candidates
+                .iter()
+                .map(|candidate| trigrams(&candidate.text))
+                .collect();
+            let documents: Vec<RegexShardDocument<'_>> = candidates
+                .iter()
+                .zip(&trigram_sets)
+                .map(|(candidate, trigrams)| RegexShardDocument {
+                    uid: &candidate.uid,
+                    kind: &candidate.kind,
+                    text_hash: &candidate.text_hash,
+                    trigrams,
                 })
                 .collect();
+            let changed_uids: HashSet<_> = desired_documents
+                .iter()
+                .filter(|(uid, hash)| prior_documents.get(uid.as_str()) != Some(*hash))
+                .map(|(uid, _)| uid.as_str())
+                .collect();
+            let deleted_uids: Vec<_> = prior_documents
+                .keys()
+                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .cloned()
+                .collect();
+            let changed_documents: Vec<_> = documents
+                .iter()
+                .filter(|document| changed_uids.contains(document.uid))
+                .cloned()
+                .collect();
+            let can_update = !force_full
+                && prior_documents_result.is_ok()
+                && prior.is_some_and(|prior| {
+                    prior.schema_version == REGEX_INDEX_SCHEMA_VERSION
+                        && prior.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+                        && prior.brain_uuid == identity.brain_uuid
+                        && prior.publication_uuid == identity.publication_uuid
+                });
+            if can_update {
+                index.update_scope(
+                    prior.expect("checked above"),
+                    metadata,
+                    &changed_documents,
+                    &deleted_uids,
+                )?;
+            } else {
+                index.replace_scope(metadata, &documents)?;
+            }
+            self.acknowledge_regex_scope(&scope_uid, epoch, candidates.len(), &digest)?;
 
-            let txn = self.begin_transaction()?;
-            let update = (|| -> Result<(usize, usize), StoreError> {
-                let mut postings_deleted = 0usize;
-                for uid in deleted
-                    .iter()
-                    .chain(changed.iter().map(|candidate| &candidate.uid))
-                {
-                    postings_deleted += Self::delete_trigram_document(&txn, uid)?;
-                }
-                let mut postings_added = 0usize;
-                let mut insert_posting = txn
-                    .prepare("CREATE (:TrigramPosting {uid: $uid, trigram: $trigram, node_uid: $node_uid, scope_uid: $scope_uid})")
-                    .map_err(|e| StoreError::Query(format!("prepare trigram insert: {e}")))?;
-                for candidate in &changed {
-                    Self::insert_trigram_document(&txn, candidate)?;
-                    for trigram in trigrams(&candidate.text) {
-                        let posting_uid = stable_posting_uid(&trigram, &candidate.uid);
-                        txn.execute(
-                            &mut insert_posting,
-                            vec![
-                                ("uid", Value::String(posting_uid.clone())),
-                                ("trigram", Value::String(trigram)),
-                                ("node_uid", Value::String(candidate.uid.clone())),
-                                ("scope_uid", Value::String(scope_uid.clone())),
-                            ],
-                        )
-                        .map_err(|e| {
-                            StoreError::Query(format!(
-                                "insert stable trigram posting {posting_uid} (collision or duplicate): {e}"
-                            ))
-                        })?;
-                        postings_added += 1;
-                    }
-                }
-                if scope_candidates.is_empty() {
-                    let mut delete_scope = txn
-                        .prepare("MATCH (s:TrigramScope {uid: $uid}) DETACH DELETE s")
-                        .map_err(|e| {
-                            StoreError::Query(format!("prepare empty trigram scope delete: {e}"))
-                        })?;
-                    txn.execute(
-                        &mut delete_scope,
-                        vec![("uid", Value::String(scope_uid.clone()))],
-                    )
-                    .map_err(|e| StoreError::Query(format!("delete empty trigram scope: {e}")))?;
-                } else {
-                    Self::write_trigram_scope(
-                        &txn,
-                        &scope_uid,
-                        "ready",
-                        scope_candidates.len(),
-                        &digest,
-                        self.graph_generation(),
-                    )?;
-                }
-                Ok((postings_added, postings_deleted))
-            })();
-            match update {
-                Ok((added, deleted_postings)) => {
-                    self.commit_transaction(&txn)?;
-                    stats.scopes_refreshed += 1;
-                    stats.postings_added += added;
-                    stats.postings_deleted += deleted_postings;
-                    stats.nodes_deleted += deleted.len();
-                    for candidate in changed {
-                        if existing_docs.contains_key(&candidate.uid) {
-                            stats.nodes_changed += 1;
-                        } else {
-                            stats.nodes_added += 1;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = self.rollback_transaction(&txn);
-                    return Err(error);
+            stats.scopes_refreshed += 1;
+            stats.postings_added += trigram_sets.iter().map(HashSet::len).sum::<usize>();
+        }
+        stats.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        match index.garbage_collect() {
+            Ok(report) => {
+                for failure in report.failures {
+                    tracing::warn!(
+                        scope_hash = %failure.scope_hash,
+                        error = %failure.error,
+                        "deferred regex shard garbage collection for one scope"
+                    );
                 }
             }
+            Err(error) => tracing::warn!(%error, "deferred regex shard garbage collection"),
         }
-        *self
-            .trigram_scope_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        stats.elapsed_ms = refresh_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         Ok(stats)
     }
 
-    fn write_trigram_scope(
-        conn: &lbug::Connection<'_>,
-        uid: &str,
-        status: &str,
-        candidate_count: usize,
-        candidate_digest: &str,
-        indexed_generation: u64,
-    ) -> Result<(), StoreError> {
-        let mut delete = conn
-            .prepare("MATCH (s:TrigramScope {uid: $uid}) DETACH DELETE s")
-            .map_err(|e| StoreError::Query(format!("prepare trigram scope delete: {e}")))?;
-        conn.execute(&mut delete, vec![("uid", Value::String(uid.to_string()))])
-            .map_err(|e| StoreError::Query(format!("delete trigram scope: {e}")))?;
-        let mut insert = conn
-            .prepare("CREATE (:TrigramScope {uid: $uid, status: $status, candidate_count: $count, candidate_digest: $digest, indexed_generation: $generation})")
-            .map_err(|e| StoreError::Query(format!("prepare trigram scope insert: {e}")))?;
-        conn.execute(
-            &mut insert,
-            vec![
-                ("uid", Value::String(uid.to_string())),
-                ("status", Value::String(status.to_string())),
-                ("count", Value::Int64(candidate_count as i64)),
-                ("digest", Value::String(candidate_digest.to_string())),
-                (
-                    "generation",
-                    Value::Int64(indexed_generation.min(i64::MAX as u64) as i64),
-                ),
-            ],
-        )
-        .map_err(|e| StoreError::Query(format!("write trigram scope: {e}")))?;
-        Ok(())
-    }
-
-    fn delete_trigram_document(
-        conn: &lbug::Connection<'_>,
-        node_uid: &str,
-    ) -> Result<usize, StoreError> {
-        let mut count = conn
-            .prepare("MATCH (t:TrigramPosting {node_uid: $uid}) RETURN count(t)")
-            .map_err(|e| StoreError::Query(format!("prepare trigram posting count: {e}")))?;
+    fn read_regex_scope_states(&self) -> Result<HashMap<String, RegexGraphScopeState>, StoreError> {
+        let conn = self.conn()?;
         let rows = conn
-            .execute(
-                &mut count,
-                vec![("uid", Value::String(node_uid.to_string()))],
+            .query(
+                "MATCH (s:RegexScopeState) RETURN s.uid, s.desired_epoch, \
+                 s.acknowledged_epoch, s.candidate_count, s.candidate_digest, s.tombstone",
             )
-            .map_err(|e| StoreError::Query(format!("count trigram postings: {e}")))?;
-        let posting_count = rows
-            .into_iter()
-            .next()
-            .and_then(|row| row.first().cloned())
-            .and_then(|value| match value {
-                Value::Int64(count) => Some(count.max(0) as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let mut delete_postings = conn
-            .prepare("MATCH (t:TrigramPosting {node_uid: $uid}) DETACH DELETE t")
-            .map_err(|e| StoreError::Query(format!("prepare trigram posting delete: {e}")))?;
-        conn.execute(
-            &mut delete_postings,
-            vec![("uid", Value::String(node_uid.to_string()))],
-        )
-        .map_err(|e| StoreError::Query(format!("delete trigram postings: {e}")))?;
-        let mut delete_doc = conn
-            .prepare("MATCH (d:TrigramDocument {uid: $uid}) DETACH DELETE d")
-            .map_err(|e| StoreError::Query(format!("prepare trigram document delete: {e}")))?;
-        conn.execute(
-            &mut delete_doc,
-            vec![("uid", Value::String(node_uid.to_string()))],
-        )
-        .map_err(|e| StoreError::Query(format!("delete trigram document: {e}")))?;
-        Ok(posting_count)
-    }
-
-    fn insert_trigram_document(
-        conn: &lbug::Connection<'_>,
-        candidate: &Candidate,
-    ) -> Result<(), StoreError> {
-        let mut insert = conn
-            .prepare("CREATE (:TrigramDocument {uid: $uid, scope_uid: $scope_uid, text_hash: $text_hash})")
-            .map_err(|e| StoreError::Query(format!("prepare trigram document insert: {e}")))?;
-        conn.execute(
-            &mut insert,
-            vec![
-                ("uid", Value::String(candidate.uid.clone())),
-                ("scope_uid", Value::String(candidate.scope_uid.clone())),
-                ("text_hash", Value::String(candidate.text_hash.clone())),
-            ],
-        )
-        .map_err(|e| StoreError::Query(format!("insert trigram document: {e}")))?;
-        Ok(())
-    }
-
-    fn read_trigram_scopes(&self) -> Result<HashMap<String, TrigramScopeState>, StoreError> {
-        let conn = match self.conn() {
-            Ok(conn) => conn,
-            Err(_) => return Ok(HashMap::new()),
-        };
-        let rows = match conn.query(
-            "MATCH (s:TrigramScope) RETURN s.uid, s.status, s.candidate_count, s.candidate_digest",
-        ) {
-            Ok(rows) => rows,
-            // A read-only process can open a v1 database before a writer has
-            // run the schema migration. Missing/unreadable scope state means
-            // trust nothing and scan, never fail the correctness path.
-            Err(_) => return Ok(HashMap::new()),
-        };
-        let mut scopes = HashMap::new();
+            .map_err(|error| StoreError::Query(format!("read regex scope states: {error}")))?;
+        let mut states = HashMap::new();
         for row in rows {
             if let [
                 Value::String(uid),
-                Value::String(status),
+                Value::Int64(desired),
+                Value::Int64(acknowledged),
                 Value::Int64(count),
                 Value::String(digest),
+                Value::Bool(tombstone),
             ] = row.as_slice()
             {
-                scopes.insert(
+                states.insert(
                     uid.clone(),
-                    TrigramScopeState {
-                        status: status.clone(),
+                    RegexGraphScopeState {
+                        desired_epoch: (*desired).max(0) as u64,
+                        acknowledged_epoch: (*acknowledged).max(0) as u64,
                         candidate_count: (*count).max(0) as usize,
                         candidate_digest: digest.clone(),
+                        tombstone: *tombstone,
                     },
                 );
+            }
+        }
+        Ok(states)
+    }
+
+    fn regex_outbox_scopes(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (o:RegexScopeOutbox) RETURN o.uid")
+            .map_err(|error| StoreError::Query(format!("read regex outbox: {error}")))?;
+        Ok(rows
+            .filter_map(|row| match row.first() {
+                Some(Value::String(uid)) => Some(uid.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn active_regex_scopes(&self) -> Result<HashSet<String>, StoreError> {
+        let mut scopes: HashSet<String> = self
+            .list_repos(None)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        scopes.extend(self.list_vaults(None)?.into_iter().map(|vault| vault.uid));
+        // Corrupt/imported graphs and focused store tests can contain owned
+        // candidates before their Repo/Vault root. Preserve correctness by
+        // discovering ownership only when the authoritative root inventory is
+        // empty; healthy production graphs take the constant-size root path.
+        if scopes.is_empty() {
+            let conn = self.conn()?;
+            if let Ok(rows) = conn.query("MATCH (s:Symbol) RETURN s.repo_uid") {
+                scopes.extend(rows.filter_map(|row| match row.first() {
+                    Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+                    _ => None,
+                }));
+            }
+            if let Ok(rows) = conn.query("MATCH (n:Note) RETURN n.vault_uid") {
+                scopes.extend(rows.filter_map(|row| match row.first() {
+                    Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+                    _ => None,
+                }));
             }
         }
         Ok(scopes)
-    }
-
-    fn read_trigram_documents(&self) -> Result<HashMap<String, TrigramDocumentState>, StoreError> {
-        let conn = self.conn()?;
-        let rows = conn
-            .query("MATCH (d:TrigramDocument) RETURN d.uid, d.scope_uid, d.text_hash")
-            .map_err(|e| StoreError::Query(format!("read trigram documents: {e}")))?;
-        let mut docs = HashMap::new();
-        for row in rows {
-            if let [
-                Value::String(uid),
-                Value::String(scope_uid),
-                Value::String(text_hash),
-            ] = row.as_slice()
-            {
-                docs.insert(
-                    uid.clone(),
-                    TrigramDocumentState {
-                        scope_uid: scope_uid.clone(),
-                        text_hash: text_hash.clone(),
-                    },
-                );
-            }
-        }
-        Ok(docs)
     }
 
     /// Collect all searchable candidate nodes (Sections, Notes, Symbols),
@@ -891,150 +801,284 @@ impl GraphStore {
         Ok(out)
     }
 
-    /// Look up the candidate node UIDs that satisfy the trigram CNF clauses.
-    /// For each AND-clause we union the postings of its OR-trigrams; the final
-    /// candidate set is the intersection across all AND-clauses.
-    ///
-    /// Returns `(uids, stale_index)`. `uids` is `None` when the posting table
-    /// is missing OR stale (the graph changed since it was built); the
-    /// caller then falls back to a full scan. `stale_index` is true only when
-    /// a posting table exists but was bypassed as stale, so callers can
-    /// surface that in-band (the stderr warning below fires once per process
-    /// and is invisible on the daemon path). Observing a fresh (non-stale)
-    /// index re-arms the one-shot warning latch, so a long-lived daemon warns
-    /// again if a later rebuild is followed by another restale.
-    fn trigram_candidate_uids(
+    /// Collect fallback/rebuild text only for explicitly selected source
+    /// scopes. Trusted regex shards never need a corpus-wide candidate load.
+    fn collect_candidates_for_scopes(
+        &self,
+        scopes: &HashSet<String>,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        let want_kind = |kind: &str| {
+            kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
+        };
+        let mut ordered: Vec<_> = scopes
+            .iter()
+            .filter(|uid| !uid.is_empty())
+            .cloned()
+            .collect();
+        ordered.sort();
+        let mut candidates = Vec::new();
+        for scope_uid in ordered {
+            if want_kind("Symbol") {
+                for symbol in self.lookup_symbols_by_repo(&scope_uid)? {
+                    if symbol.signature.is_empty()
+                        || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: symbol.uid,
+                        scope_uid: symbol.repo_uid,
+                        text_hash: text_hash(&symbol.signature),
+                        kind: "Symbol".to_string(),
+                        title: symbol.name,
+                        location: format!("{}:{}", symbol.file_path, symbol.start_line),
+                        text: symbol.signature,
+                        start_line: symbol.start_line,
+                    });
+                }
+            }
+            let notes = self.list_notes(Some(&scope_uid))?;
+            let note_paths: HashMap<_, _> = notes
+                .iter()
+                .map(|note| (note.uid.clone(), note.file_path.clone()))
+                .collect();
+            if want_kind("Note") {
+                for note in notes {
+                    if note.title.is_empty()
+                        || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: note.uid,
+                        scope_uid: note.vault_uid,
+                        text_hash: text_hash(&note.title),
+                        kind: "Note".to_string(),
+                        title: note.title.clone(),
+                        location: note.file_path,
+                        text: note.title,
+                        start_line: 1,
+                    });
+                }
+            }
+            if want_kind("Section") {
+                let mut sections = Vec::new();
+                for note_uid in note_paths.keys() {
+                    sections.extend(self.sections_in_note(note_uid)?);
+                }
+                for section in sections {
+                    if section.text_content.is_empty() {
+                        continue;
+                    }
+                    let path = note_paths
+                        .get(&section.note_uid)
+                        .cloned()
+                        .unwrap_or_default();
+                    if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        uid: section.uid,
+                        scope_uid: scope_uid.clone(),
+                        text_hash: if section.text_hash.is_empty() {
+                            text_hash(&section.text_content)
+                        } else {
+                            section.text_hash
+                        },
+                        kind: "Section".to_string(),
+                        title: String::new(),
+                        location: format!("{path}:{}", section.start_line),
+                        text: section.text_content,
+                        start_line: section.start_line,
+                    });
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Hydrate only derived-index hits, in bounded primary-key batches.
+    fn load_candidates_by_uid(
+        &self,
+        uids: &HashSet<String>,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        let want_kind = |kind: &str| {
+            kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
+        };
+        let mut ordered: Vec<_> = uids.iter().cloned().collect();
+        ordered.sort();
+        let mut candidates = Vec::new();
+        if want_kind("Symbol") {
+            for symbol in self.lookup_symbols_by_uids(&ordered)? {
+                if symbol.signature.is_empty()
+                    || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
+                {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: symbol.uid,
+                    scope_uid: symbol.repo_uid,
+                    text_hash: text_hash(&symbol.signature),
+                    kind: "Symbol".to_string(),
+                    title: symbol.name,
+                    location: format!("{}:{}", symbol.file_path, symbol.start_line),
+                    text: symbol.signature,
+                    start_line: symbol.start_line,
+                });
+            }
+        }
+        if want_kind("Note") {
+            for note in self.lookup_notes_by_uids(&ordered)? {
+                if note.title.is_empty()
+                    || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
+                {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: note.uid,
+                    scope_uid: note.vault_uid,
+                    text_hash: text_hash(&note.title),
+                    kind: "Note".to_string(),
+                    title: note.title.clone(),
+                    location: note.file_path,
+                    text: note.title,
+                    start_line: 1,
+                });
+            }
+        }
+        if want_kind("Section") {
+            let sections = self.lookup_sections_by_uids(&ordered)?;
+            let note_uids: Vec<_> = sections
+                .iter()
+                .map(|section| section.note_uid.clone())
+                .collect();
+            let note_paths: HashMap<_, _> = self
+                .lookup_notes_by_uids(&note_uids)?
+                .into_iter()
+                .map(|note| (note.uid, (note.file_path, note.vault_uid)))
+                .collect();
+            for section in sections {
+                if section.text_content.is_empty() {
+                    continue;
+                }
+                let (path, scope_uid) = note_paths
+                    .get(&section.note_uid)
+                    .cloned()
+                    .unwrap_or_default();
+                if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    uid: section.uid,
+                    scope_uid,
+                    text_hash: if section.text_hash.is_empty() {
+                        text_hash(&section.text_content)
+                    } else {
+                        section.text_hash
+                    },
+                    kind: "Section".to_string(),
+                    title: String::new(),
+                    location: format!("{path}:{}", section.start_line),
+                    text: section.text_content,
+                    start_line: section.start_line,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn regex_v3_candidate_uids(
         &self,
         clauses: &[HashSet<String>],
-        all_candidates: &[Candidate],
     ) -> Result<TrigramPrefilterPlan, StoreError> {
-        let mut by_scope: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        for candidate in all_candidates {
-            by_scope
-                .entry(candidate.scope_uid.clone())
-                .or_default()
-                .push(candidate.clone());
-        }
-        for values in by_scope.values_mut() {
-            values.sort_by(|a, b| a.uid.cmp(&b.uid));
-        }
-        let mut corpus_hasher = blake3::Hasher::new();
-        for (scope_uid, candidates) in &by_scope {
-            corpus_hasher.update(scope_uid.as_bytes());
-            corpus_hasher.update(&[0]);
-            corpus_hasher.update(candidate_digest(candidates).as_bytes());
-            corpus_hasher.update(&[0xff]);
-        }
-        let corpus_digest = corpus_hasher.finalize().to_hex().to_string();
-        let generation = self.graph_generation();
-        let cached = self
-            .trigram_scope_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .filter(|cache| cache.generation == generation && cache.corpus_digest == corpus_digest);
-        let (ready_scopes, dirty_scopes, has_index) = if let Some(cache) = cached {
-            (cache.ready_scopes, cache.dirty_scopes, cache.has_index)
-        } else {
-            let stored_scopes = self.read_trigram_scopes()?;
-            let has_index = self.has_trigram_index() || !stored_scopes.is_empty();
-            let mut ready_scopes = HashSet::new();
-            let mut dirty_scopes = HashSet::new();
-            for (scope_uid, candidates) in &by_scope {
-                let digest = candidate_digest(candidates);
-                if stored_scopes.get(scope_uid).is_some_and(|scope| {
-                    scope.status == "ready"
-                        && scope.candidate_count == candidates.len()
-                        && scope.candidate_digest == digest
-                }) {
-                    ready_scopes.insert(scope_uid.clone());
-                } else {
-                    dirty_scopes.insert(scope_uid.clone());
-                }
-            }
-            for scope_uid in stored_scopes.keys() {
-                if !ready_scopes.contains(scope_uid) && !dirty_scopes.contains(scope_uid) {
-                    dirty_scopes.insert(scope_uid.clone());
-                }
-            }
-            *self
-                .trigram_scope_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TrigramScopeCache {
-                generation,
-                corpus_digest,
-                ready_scopes: ready_scopes.clone(),
-                dirty_scopes: dirty_scopes.clone(),
-                has_index,
+        let Some(root) = self.regex_sidecar_root() else {
+            return Ok(TrigramPrefilterPlan {
+                matching_ready_uids: HashSet::new(),
+                ready_scopes: HashSet::new(),
+                dirty_scopes: self.active_regex_scopes()?,
+                error_scopes: HashSet::new(),
+                has_index: false,
             });
-            (ready_scopes, dirty_scopes, has_index)
         };
+        let index = RegexIndex::with_reader_pool(root, self.regex_reader_pool.clone());
+        let identity = self.publication_identity()?.ok_or_else(|| {
+            StoreError::Query("regex v3 requires graph publication identity".to_string())
+        })?;
+        let states = self.read_regex_scope_states()?;
+        let active_scopes = self.active_regex_scopes()?;
+        let has_index = index.root().join("scopes").is_dir();
+        let mut ready_scopes = HashSet::new();
+        let mut dirty_scopes = HashSet::new();
+        let mut error_scopes = HashSet::new();
+        let mut matching_ready_uids = HashSet::new();
+        for scope_uid in active_scopes {
+            let Some(state) = states.get(&scope_uid) else {
+                dirty_scopes.insert(scope_uid);
+                continue;
+            };
+            if state.tombstone || state.desired_epoch != state.acknowledged_epoch {
+                dirty_scopes.insert(scope_uid);
+                continue;
+            }
+            let metadata = match index.metadata(&scope_uid) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    dirty_scopes.insert(scope_uid);
+                    continue;
+                }
+                Err(_) => {
+                    error_scopes.insert(scope_uid.clone());
+                    dirty_scopes.insert(scope_uid);
+                    continue;
+                }
+            };
+            let trusted = metadata.schema_version == REGEX_INDEX_SCHEMA_VERSION
+                && metadata.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+                && metadata.brain_uuid == identity.brain_uuid
+                && metadata.publication_uuid == identity.publication_uuid
+                && metadata.source_graph_generation <= self.graph_generation()
+                && metadata.scope_epoch == state.acknowledged_epoch
+                && metadata.candidate_count == state.candidate_count
+                && metadata.candidate_digest == state.candidate_digest;
+            if !trusted {
+                dirty_scopes.insert(scope_uid);
+                continue;
+            }
+            match index.candidate_uids(&metadata, clauses, CANDIDATE_CAP) {
+                Ok(Some(uids)) => {
+                    ready_scopes.insert(scope_uid);
+                    matching_ready_uids.extend(uids);
+                }
+                Ok(None) => {
+                    dirty_scopes.insert(scope_uid);
+                }
+                Err(_) => {
+                    error_scopes.insert(scope_uid.clone());
+                    dirty_scopes.insert(scope_uid);
+                }
+            }
+        }
 
         if has_index
             && !dirty_scopes.is_empty()
             && !TRIGRAM_STALE_WARNED.swap(true, Ordering::Relaxed)
         {
             eprintln!(
-                "warning: {} trigram scope(s) are stale; scanning only those scopes — rerun `index --with-trigrams` to refresh them",
+                "warning: {} regex shard(s) are unavailable or stale; scanning only those scopes — rerun `index --with-trigrams` to repair them",
                 dirty_scopes.len()
             );
         } else if dirty_scopes.is_empty() {
             TRIGRAM_STALE_WARNED.store(false, Ordering::Relaxed);
         }
-
-        if ready_scopes.is_empty() {
-            return Ok(TrigramPrefilterPlan {
-                matching_ready_uids: HashSet::new(),
-                ready_scopes,
-                dirty_scopes,
-                has_index,
-            });
-        }
-
-        let conn = match self.conn() {
-            Ok(conn) => conn,
-            Err(_) => {
-                return Ok(widened_scan_plan(&ready_scopes, &dirty_scopes, has_index));
-            }
-        };
-        let mut acc: Option<HashSet<String>> = None;
-        for clause in clauses {
-            let mut clause_uids = HashSet::new();
-            for tg in clause {
-                let mut stmt = match conn.prepare(
-                    "MATCH (t:TrigramPosting {trigram: $tg}) RETURN t.node_uid, t.scope_uid",
-                ) {
-                    Ok(stmt) => stmt,
-                    Err(_) => {
-                        return Ok(widened_scan_plan(&ready_scopes, &dirty_scopes, has_index));
-                    }
-                };
-                let rows = match conn.execute(&mut stmt, vec![("tg", Value::String(tg.clone()))]) {
-                    Ok(rows) => rows,
-                    Err(_) => {
-                        return Ok(widened_scan_plan(&ready_scopes, &dirty_scopes, has_index));
-                    }
-                };
-                for row in rows {
-                    if let [Value::String(uid), Value::String(scope_uid)] = row.as_slice()
-                        && ready_scopes.contains(scope_uid)
-                    {
-                        clause_uids.insert(uid.clone());
-                    }
-                }
-            }
-            acc = Some(match acc {
-                None => clause_uids,
-                Some(previous) => previous.intersection(&clause_uids).cloned().collect(),
-            });
-            if acc.as_ref().is_some_and(HashSet::is_empty) {
-                break;
-            }
-        }
         Ok(TrigramPrefilterPlan {
-            matching_ready_uids: acc.unwrap_or_default(),
+            matching_ready_uids,
             ready_scopes,
             dirty_scopes,
+            error_scopes,
             has_index,
         })
     }
@@ -1066,15 +1110,13 @@ impl GraphStore {
         let start = Instant::now();
         let limit = limit.unwrap_or(usize::MAX);
 
-        // Validate scope manifests against the complete corpus before applying
-        // request filters. A path/kind subset must never make a healthy scope
-        // appear stale merely because candidates were intentionally omitted.
-        let all_candidates = self.collect_candidates(None, None)?;
+        let planning_started = Instant::now();
         let clauses = required_trigram_clauses(pattern);
         let plan = match &clauses {
-            Some(clauses) => Some(self.trigram_candidate_uids(clauses, &all_candidates)?),
+            Some(clauses) => Some(self.regex_v3_candidate_uids(clauses)?),
             None => None,
         };
+        let planning_ms = elapsed_millis(planning_started);
         let scanned_fallback = plan
             .as_ref()
             .is_none_or(|plan| !plan.dirty_scopes.is_empty());
@@ -1083,15 +1125,26 @@ impl GraphStore {
             .is_some_and(|plan| plan.has_index && !plan.dirty_scopes.is_empty());
         let ready_scopes = plan.as_ref().map_or(0, |plan| plan.ready_scopes.len());
         let dirty_scopes = plan.as_ref().map_or(0, |plan| plan.dirty_scopes.len());
+        let error_scopes = plan.as_ref().map_or(0, |plan| plan.error_scopes.len());
+        let posting_hits = plan
+            .as_ref()
+            .map_or(0, |plan| plan.matching_ready_uids.len());
 
-        let mut candidates = self.collect_candidates(path_prefix, kinds)?;
-        if let Some(plan) = &plan {
-            candidates.retain(|candidate| {
-                plan.dirty_scopes.contains(&candidate.scope_uid)
-                    || (plan.ready_scopes.contains(&candidate.scope_uid)
-                        && plan.matching_ready_uids.contains(&candidate.uid))
-            });
-        }
+        let hydration_started = Instant::now();
+        let (mut candidates, hydrated_candidates) = match &plan {
+            Some(plan) => {
+                let mut candidates =
+                    self.collect_candidates_for_scopes(&plan.dirty_scopes, path_prefix, kinds)?;
+                let hydrated =
+                    self.load_candidates_by_uid(&plan.matching_ready_uids, path_prefix, kinds)?;
+                let hydrated_candidates = hydrated.len();
+                candidates.extend(hydrated);
+                (candidates, hydrated_candidates)
+            }
+            None => (self.collect_candidates(path_prefix, kinds)?, 0),
+        };
+        candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
+        let hydration_ms = elapsed_millis(hydration_started);
 
         // Scan the full candidate set, bounded by the wall-clock deadline (and a
         // high safety ceiling) — NOT a low pre-truncation. `truncated` is set
@@ -1099,11 +1152,19 @@ impl GraphStore {
         // empty `results` now genuinely means "incomplete scan" rather than
         // "the match was ordered past a 5000 cap and never scanned" (nw-076).
         let mut truncated = false;
+        let mut truncation_reason = None;
         let mut results = Vec::new();
         let mut scanned_candidates = 0usize;
+        let verification_started = Instant::now();
         for (i, c) in candidates.iter().enumerate() {
-            if start.elapsed().as_millis() as u64 > deadline_ms || i >= CANDIDATE_CAP {
+            if start.elapsed().as_millis() as u64 > deadline_ms {
                 truncated = true;
+                truncation_reason = Some(RegexTruncationReason::Deadline);
+                break;
+            }
+            if i >= CANDIDATE_CAP {
+                truncated = true;
+                truncation_reason = Some(RegexTruncationReason::CandidateCap);
                 break;
             }
             scanned_candidates += 1;
@@ -1113,6 +1174,7 @@ impl GraphStore {
                 // returned (previously one result slipped through).
                 if results.len() >= limit {
                     truncated = true;
+                    truncation_reason = Some(RegexTruncationReason::ResultLimit);
                     break;
                 }
                 let (line_in_text, snippet) = line_and_snippet(&c.text, m.start());
@@ -1142,11 +1204,15 @@ impl GraphStore {
                     snippet,
                 });
                 if results.len() >= limit {
-                    truncated = truncated || candidates.len() > results.len();
+                    truncated = i + 1 < candidates.len();
+                    if truncated {
+                        truncation_reason = Some(RegexTruncationReason::ResultLimit);
+                    }
                     break;
                 }
             }
         }
+        let verification_ms = elapsed_millis(verification_started);
 
         // nw-097: attach the note at the source so no caller has to remember.
         Ok(RegexSearchResult {
@@ -1156,7 +1222,17 @@ impl GraphStore {
             stale_index,
             ready_scopes,
             dirty_scopes,
+            error_scopes,
+            posting_hits,
+            hydrated_candidates,
             scanned_candidates,
+            truncation_reason,
+            timings: RegexStageTimings {
+                planning_ms,
+                hydration_ms,
+                verification_ms,
+                total_ms: elapsed_millis(start),
+            },
             note: None,
         }
         .with_scan_budget_note())
@@ -1172,22 +1248,19 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
-        // Scope trust is always verified against the complete corpus. Request
-        // filters select results only; they must not make omitted candidates
-        // look like scope drift and disable otherwise healthy postings.
-        let corpus_candidates = self.collect_candidates(None, None)?;
-        let filtered_candidates = self.collect_candidates(path_prefix, kinds)?;
-
         let mut out = Vec::new();
         for pattern in patterns {
+            let started = Instant::now();
             let re = compile_pattern(pattern)?;
 
             // Optional trigram narrowing.
+            let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
             let plan = match &clauses {
-                Some(clauses) => Some(self.trigram_candidate_uids(clauses, &corpus_candidates)?),
+                Some(clauses) => Some(self.regex_v3_candidate_uids(clauses)?),
                 None => None,
             };
+            let planning_ms = elapsed_millis(planning_started);
             let stale_index = plan
                 .as_ref()
                 .is_some_and(|plan| plan.has_index && !plan.dirty_scopes.is_empty());
@@ -1195,15 +1268,22 @@ impl GraphStore {
             let mut per_file: HashMap<String, u64> = HashMap::new();
             let mut total: u64 = 0;
             let mut scanned_candidates = 0usize;
-            for c in &filtered_candidates {
-                if let Some(plan) = &plan {
-                    let should_scan = plan.dirty_scopes.contains(&c.scope_uid)
-                        || (plan.ready_scopes.contains(&c.scope_uid)
-                            && plan.matching_ready_uids.contains(&c.uid));
-                    if !should_scan {
-                        continue;
-                    }
+            let hydration_started = Instant::now();
+            let (candidates, hydrated_candidates) = match &plan {
+                Some(plan) => {
+                    let mut candidates =
+                        self.collect_candidates_for_scopes(&plan.dirty_scopes, path_prefix, kinds)?;
+                    let hydrated =
+                        self.load_candidates_by_uid(&plan.matching_ready_uids, path_prefix, kinds)?;
+                    let hydrated_candidates = hydrated.len();
+                    candidates.extend(hydrated);
+                    (candidates, hydrated_candidates)
                 }
+                None => (self.collect_candidates(path_prefix, kinds)?, 0),
+            };
+            let hydration_ms = elapsed_millis(hydration_started);
+            let verification_started = Instant::now();
+            for c in &candidates {
                 scanned_candidates += 1;
                 if re.is_match(&c.text) {
                     total += 1;
@@ -1211,6 +1291,7 @@ impl GraphStore {
                     *per_file.entry(file).or_insert(0) += 1;
                 }
             }
+            let verification_ms = elapsed_millis(verification_started);
 
             let files_matched = per_file.len() as u64;
             let mut top_files: Vec<FileCount> = per_file
@@ -1228,11 +1309,26 @@ impl GraphStore {
                 stale_index,
                 ready_scopes: plan.as_ref().map_or(0, |plan| plan.ready_scopes.len()),
                 dirty_scopes: plan.as_ref().map_or(0, |plan| plan.dirty_scopes.len()),
+                error_scopes: plan.as_ref().map_or(0, |plan| plan.error_scopes.len()),
+                posting_hits: plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.matching_ready_uids.len()),
+                hydrated_candidates,
                 scanned_candidates,
+                timings: RegexStageTimings {
+                    planning_ms,
+                    hydration_ms,
+                    verification_ms,
+                    total_ms: elapsed_millis(started),
+                },
             });
         }
         Ok(out)
     }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Strip a trailing `:<line>` suffix from a location to recover the file path.
@@ -1270,7 +1366,12 @@ mod tests {
             stale_index: false,
             ready_scopes: 0,
             dirty_scopes: 0,
+            error_scopes: 0,
+            posting_hits: 0,
+            hydrated_candidates: 0,
             scanned_candidates: 0,
+            truncation_reason: Some(RegexTruncationReason::Unknown),
+            timings: RegexStageTimings::default(),
             note: None,
         }
         .with_scan_budget_note();
@@ -1288,7 +1389,12 @@ mod tests {
             stale_index: false,
             ready_scopes: 0,
             dirty_scopes: 0,
+            error_scopes: 0,
+            posting_hits: 0,
+            hydrated_candidates: 0,
             scanned_candidates: 0,
+            truncation_reason: None,
+            timings: RegexStageTimings::default(),
             note: None,
         }
         .with_scan_budget_note();
@@ -1314,7 +1420,12 @@ mod tests {
             stale_index: false,
             ready_scopes: 0,
             dirty_scopes: 0,
+            error_scopes: 0,
+            posting_hits: 0,
+            hydrated_candidates: 0,
             scanned_candidates: 0,
+            truncation_reason: Some(RegexTruncationReason::Unknown),
+            timings: RegexStageTimings::default(),
             note: None,
         }
         .with_scan_budget_note();
@@ -1333,7 +1444,11 @@ mod tests {
 
     fn store_with_text() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
+        populate_store(&store);
+        store
+    }
 
+    fn populate_store(store: &GraphStore) {
         // A note + section carrying body text.
         store
             .insert_note(&Note {
@@ -1389,8 +1504,95 @@ mod tests {
                 canonical_id: None,
             })
             .unwrap();
+    }
 
-        store
+    #[test]
+    fn on_disk_store_uses_identity_bound_regex_v3_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("brain.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        populate_store(&store);
+
+        let first = store.rebuild_trigram_index().unwrap();
+        assert_eq!(first.scopes_refreshed, 2);
+        assert!(first.postings_added > 0);
+        let root = store.regex_sidecar_root().unwrap();
+        assert!(root.join("scopes").is_dir());
+        let conn = store.conn().unwrap();
+        assert!(
+            conn.query("MATCH (t:TrigramPosting) RETURN t.uid LIMIT 1")
+                .is_err()
+        );
+        assert!(
+            conn.query("MATCH (d:TrigramDocument) RETURN d.uid LIMIT 1")
+                .is_err()
+        );
+
+        let result = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!result.scanned_fallback);
+        assert_eq!(result.ready_scopes, 2);
+        assert_eq!(result.dirty_scopes, 0);
+        assert_eq!(result.results.len(), 2);
+
+        let second = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(second.scopes_refreshed, 0);
+        assert_eq!(second.scopes_unchanged, 0);
+
+        let identity = store.publication_identity().unwrap().unwrap();
+        let metadata = RegexIndex::new(root).list_metadata().unwrap();
+        assert!(metadata.failures.is_empty());
+        assert_eq!(metadata.metadata.len(), 2);
+        assert!(metadata.metadata.iter().all(|entry| {
+            entry.brain_uuid == identity.brain_uuid
+                && entry.publication_uuid == identity.publication_uuid
+                && entry.schema_version == REGEX_INDEX_SCHEMA_VERSION
+        }));
+    }
+
+    #[test]
+    fn corrupt_regex_v3_shard_widens_only_that_scope_to_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("brain.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        populate_store(&store);
+        store.rebuild_trigram_index().unwrap();
+
+        let scopes = store.regex_sidecar_root().unwrap().join("scopes");
+        let scope_dir = std::fs::read_dir(&scopes)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let current = scope_dir.join("CURRENT");
+        let mut bytes = std::fs::read(&current).unwrap();
+        bytes.extend_from_slice(b"corrupt");
+        std::fs::write(&current, bytes).unwrap();
+
+        let result = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(result.scanned_fallback);
+        assert!(result.stale_index);
+        assert_eq!(result.ready_scopes, 1);
+        assert_eq!(result.dirty_scopes, 1);
+        let uids: HashSet<&str> = result.results.iter().map(|hit| hit.uid.as_str()).collect();
+        assert!(uids.contains("sec:v:1:a"));
+        assert!(uids.contains("sym:1"));
+
+        let repaired = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(
+            repaired.scopes_refreshed, 1,
+            "refresh must rebuild only the scope with the corrupt selector"
+        );
+        let result = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!result.scanned_fallback);
+        assert_eq!(result.ready_scopes, 2);
+        assert_eq!(result.dirty_scopes, 0);
     }
 
     #[test]
@@ -1796,32 +1998,17 @@ mod tests {
     }
 
     #[test]
-    fn stable_posting_ids_are_order_independent_and_tuple_sensitive() {
-        let first = stable_posting_uid("abc", "sym:one");
-        assert_eq!(first, stable_posting_uid("abc", "sym:one"));
-        assert_ne!(first, stable_posting_uid("abd", "sym:one"));
-        assert_ne!(first, stable_posting_uid("abc", "sym:two"));
-        assert!(first.starts_with("tg:v2:"));
-    }
-
-    #[test]
-    fn legacy_positional_postings_migrate_to_scoped_v2_once() {
+    fn graph_posting_tables_are_absent_and_refresh_builds_regex_v3() {
         let store = store_with_text();
         let conn = store.conn().unwrap();
-        conn.query("CREATE (:TrigramPosting {uid: 'tg:0', trigram: 'aut', node_uid: 'sym:1', scope_uid: ''})")
-            .unwrap();
-        conn.query("CREATE (:Meta {key: 'trigram_index', value: '1:1'})")
-            .unwrap();
-
-        let migration = store.refresh_trigram_index(false).unwrap();
-        assert!(migration.migrated_legacy_index);
-        assert!(migration.scopes_refreshed >= 2);
-        let legacy = conn
-            .query("MATCH (t:TrigramPosting) WHERE t.scope_uid = '' RETURN count(t)")
-            .unwrap()
-            .next()
-            .and_then(|row| row.first().cloned());
-        assert_eq!(legacy, Some(Value::Int64(0)));
+        assert!(conn.query("MATCH (t:TrigramPosting) RETURN t.uid").is_err());
+        assert!(
+            conn.query("MATCH (d:TrigramDocument) RETURN d.uid")
+                .is_err()
+        );
+        let first = store.refresh_trigram_index(false).unwrap();
+        assert!(!first.migrated_legacy_index);
+        assert!(first.scopes_refreshed >= 2);
         let second = store.refresh_trigram_index(false).unwrap();
         assert!(!second.migrated_legacy_index);
         assert_eq!(second.scopes_refreshed, 0);
@@ -1877,12 +2064,12 @@ mod tests {
 
         let refresh = store.refresh_trigram_index(false).unwrap();
         assert_eq!(refresh.scopes_refreshed, 1);
-        assert!(refresh.scopes_unchanged >= 2);
+        assert_eq!(refresh.scopes_unchanged, 0);
         assert_eq!(refresh.nodes_added, 1);
         let unchanged = store.refresh_trigram_index(false).unwrap();
         assert_eq!(unchanged.scopes_refreshed, 0);
         assert_eq!(unchanged.postings_added, 0);
-        assert!(unchanged.scopes_unchanged >= 3);
+        assert_eq!(unchanged.scopes_unchanged, 0);
     }
 
     #[test]
@@ -1898,8 +2085,13 @@ mod tests {
             .unwrap()
             .query("MATCH (s:Symbol {uid: 'sym:1'}) SET s.repo_uid = 'repo:0'")
             .unwrap();
+        store.mark_regex_scope_dirty("repo:1", false).unwrap();
+        store.mark_regex_scope_dirty("repo:0", false).unwrap();
         let refresh = store.refresh_trigram_index(false).unwrap();
-        assert_eq!(refresh.nodes_changed, 1);
+        assert_eq!(refresh.nodes_added, 1);
+        assert_eq!(refresh.nodes_changed, 0);
+        // The emptied source scope is retired as a tombstone rather than
+        // opening its old manifest only to count deleted documents.
         assert_eq!(refresh.nodes_deleted, 0);
 
         let result = store
@@ -1913,14 +2105,15 @@ mod tests {
             !result.scanned_fallback,
             "both source cleanup and destination publication completed"
         );
-        let scoped_postings = store
-            .conn()
+        let scopes = RegexIndex::new(store.regex_sidecar_root().unwrap())
+            .list_metadata()
             .unwrap()
-            .query("MATCH (t:TrigramPosting {node_uid: 'sym:1'}) RETURN DISTINCT t.scope_uid")
-            .unwrap()
-            .filter_map(|row| row.first().cloned())
-            .collect::<Vec<_>>();
-        assert_eq!(scoped_postings, vec![Value::String("repo:0".to_string())]);
+            .metadata
+            .into_iter()
+            .map(|metadata| metadata.scope_uid)
+            .collect::<HashSet<_>>();
+        assert!(scopes.contains("repo:0"));
+        assert!(!scopes.contains("repo:1"));
     }
 
     /// A generation bump with identical searchable digests must not cause any
@@ -1942,18 +2135,22 @@ mod tests {
         );
     }
 
-    /// Postings without v2 scope state cannot be trusted.
+    /// A shard generation without its durable selector cannot be trusted.
     #[test]
-    fn trigram_index_without_scope_state_is_treated_as_stale() {
+    fn regex_generation_without_current_pointer_is_treated_as_stale() {
         let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
-        // Simulate a partially migrated/legacy index: keep postings but drop
-        // the v2 trust records.
-        let conn = store.conn().unwrap();
-        conn.query("MATCH (s:TrigramScope) DETACH DELETE s")
-            .unwrap();
-        *store.trigram_scope_cache.lock().unwrap() = None;
+        // Keep the immutable generation but remove one scope's durable
+        // selector, simulating a crash before pointer publication.
+        let scopes = store.regex_sidecar_root().unwrap().join("scopes");
+        let scope = std::fs::read_dir(scopes)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(scope.join("CURRENT")).unwrap();
         let res = store
             .regex_search("authenticateUser", None, None, None, None)
             .unwrap();

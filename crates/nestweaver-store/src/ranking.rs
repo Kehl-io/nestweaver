@@ -36,6 +36,36 @@ use crate::db::{GraphStore, PprGraphCached};
 use crate::error::StoreError;
 use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
 
+pub const PAGERANK_ARTIFACT_KIND: &str = "ranking";
+pub const PAGERANK_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:";
+
+fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"nestweaver-pagerank-scope-v2\0");
+    digest.update(&damping.to_bits().to_le_bytes());
+    digest.update(&iterations.to_le_bytes());
+    for query in &scope.node_queries {
+        digest.update(&(query.len() as u64).to_le_bytes());
+        digest.update(query.as_bytes());
+    }
+    for edge in &scope.edge_queries {
+        digest.update(&(edge.query.len() as u64).to_le_bytes());
+        digest.update(edge.query.as_bytes());
+        digest.update(
+            edge.edge_type
+                .map(|kind| kind.rel_table_name())
+                .unwrap_or("<structural>")
+                .as_bytes(),
+        );
+        digest.update(&[0]);
+    }
+    format!(
+        "{PAGERANK_ALGORITHM_FINGERPRINT_PREFIX}{}",
+        digest.finalize().to_hex()
+    )
+}
+
 /// Feature F12 default activity weight. With `score ∈ [0, 1]`, the factor
 /// `1 + w*(score - 0.5)` spans `[1 - w/2, 1 + w/2]`; `w = 1.2` is required for
 /// it to reach the intended `[0.4, 1.6]` clamp (the RFC's `0.6` only reaches
@@ -646,6 +676,11 @@ impl GraphStore {
                 .pagerank_cache
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(HashMap::new());
+            *self
+                .pagerank_artifact_fingerprint
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+                Some(pagerank_algorithm_fingerprint(damping, iterations, scope));
             self.bump_pagerank_generation();
             return Ok(());
         }
@@ -731,6 +766,11 @@ impl GraphStore {
             .pagerank_cache
             .lock()
             .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(score_map);
+        *self
+            .pagerank_artifact_fingerprint
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+            Some(pagerank_algorithm_fingerprint(damping, iterations, scope));
 
         // Bump the generation so cache-holders know to refresh.
         self.bump_pagerank_generation();
@@ -1133,7 +1173,7 @@ impl GraphStore {
             self.invalidate_ranking_caches_locked();
             return Ok(());
         }
-        self.save_pagerank_cache_inner(path)
+        self.save_pagerank_cache_inner(path, self.graph_generation())
     }
 
     /// Persist the PageRank sidecar while the caller's OWN index publication
@@ -1157,6 +1197,7 @@ impl GraphStore {
     pub(crate) fn save_pagerank_cache_for_publication_owner(
         &self,
         path: &std::path::Path,
+        clean_generation: u64,
     ) -> Result<(), StoreError> {
         let _flight = self
             .pagerank_compute_lock
@@ -1174,21 +1215,51 @@ impl GraphStore {
                     .into(),
             ));
         }
-        self.save_pagerank_cache_inner(path)
+        self.save_pagerank_cache_inner(path, clean_generation)
     }
 
-    fn save_pagerank_cache_inner(&self, path: &std::path::Path) -> Result<(), StoreError> {
+    fn save_pagerank_cache_inner(
+        &self,
+        path: &std::path::Path,
+        source_graph_generation: u64,
+    ) -> Result<(), StoreError> {
         let cache = self
             .pagerank_cache
             .lock()
             .map_err(|e| StoreError::Query(format!("lock: {e}")))?;
         if let Some(scores) = cache.as_ref() {
-            let json = serde_json::to_string(scores)
-                .map_err(|e| StoreError::Query(format!("serialize: {e}")))?;
-            crate::durable_sidecar::atomic_replace_file(path, |file| {
-                file.write_all(json.as_bytes())
-            })
-            .map_err(|e| StoreError::Query(format!("write: {e}")))?;
+            let fingerprint = self
+                .pagerank_artifact_fingerprint
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+                .clone()
+                .ok_or_else(|| {
+                    StoreError::Query(
+                        "PageRank scores have no algorithm fingerprint; recompute before saving"
+                            .to_string(),
+                    )
+                })?;
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query(
+                    "database has no publication identity; refusing to persist an unbound PageRank artifact"
+                        .to_string(),
+                )
+            })?;
+            let envelope = crate::artifact_envelope::ArtifactEnvelope::new(
+                crate::artifact_envelope::ArtifactExpectation {
+                    artifact_kind: PAGERANK_ARTIFACT_KIND,
+                    artifact_schema_version: PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                    identity: &identity,
+                    producer_version: env!("CARGO_PKG_VERSION"),
+                    source_graph_generation,
+                    algorithm_fingerprint: &fingerprint,
+                },
+                scores,
+            )?;
+            let json = serde_json::to_vec_pretty(&envelope)
+                .map_err(|e| StoreError::Query(format!("serialize PageRank artifact: {e}")))?;
+            crate::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
+                .map_err(|e| StoreError::Query(format!("write: {e}")))?;
         }
         Ok(())
     }
@@ -1206,14 +1277,51 @@ impl GraphStore {
             return Ok(());
         }
         if path.exists() {
-            let json = std::fs::read_to_string(path)
-                .map_err(|e| StoreError::Query(format!("read: {e}")))?;
-            let scores: HashMap<String, f64> = serde_json::from_str(&json)
-                .map_err(|e| StoreError::Query(format!("deserialize: {e}")))?;
+            // A replacement load is fail-closed: no previously admitted ranks
+            // may survive if the new file proves stale, foreign, incompatible,
+            // or corrupt at any later validation stage.
+            self.invalidate_ranking_caches_locked();
+            let json = std::fs::read(path).map_err(|e| StoreError::Query(format!("read: {e}")))?;
+            let envelope: crate::artifact_envelope::ArtifactEnvelope =
+                serde_json::from_slice(&json).map_err(|error| {
+                    StoreError::Query(format!(
+                        "incompatible PageRank sidecar {}: expected a self-describing v2 artifact envelope; run a full reindex ({error})",
+                        path.display()
+                    ))
+                })?;
+            if !envelope
+                .algorithm_fingerprint
+                .starts_with(PAGERANK_ALGORITHM_FINGERPRINT_PREFIX)
+            {
+                return Err(StoreError::Query(format!(
+                    "incompatible PageRank algorithm fingerprint '{}'; run a full reindex",
+                    envelope.algorithm_fingerprint
+                )));
+            }
+            let identity = self.publication_identity()?.ok_or_else(|| {
+                StoreError::Query(
+                    "database has no publication identity; refusing to load an unbound PageRank artifact"
+                        .to_string(),
+                )
+            })?;
+            let fingerprint = envelope.algorithm_fingerprint.clone();
+            let scores: HashMap<String, f64> =
+                envelope.validate_and_decode(crate::artifact_envelope::ArtifactExpectation {
+                    artifact_kind: PAGERANK_ARTIFACT_KIND,
+                    artifact_schema_version: PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                    identity: &identity,
+                    producer_version: env!("CARGO_PKG_VERSION"),
+                    source_graph_generation: self.graph_generation(),
+                    algorithm_fingerprint: &fingerprint,
+                })?;
             *self
                 .pagerank_cache
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(scores);
+            *self
+                .pagerank_artifact_fingerprint
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(fingerprint);
         }
         Ok(())
     }
@@ -1369,6 +1477,111 @@ mod tests {
             }
         }
         store
+    }
+
+    #[test]
+    fn pagerank_sidecar_binds_identity_generation_algorithm_and_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_symbol(&make_symbol("A", "alpha")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+
+        let envelope: crate::artifact_envelope::ArtifactEnvelope =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        let identity = store.publication_identity().unwrap().unwrap();
+        assert_eq!(envelope.brain_uuid, identity.brain_uuid);
+        assert_eq!(envelope.publication_uuid, identity.publication_uuid);
+        assert_eq!(envelope.source_graph_generation, store.graph_generation());
+        assert_eq!(
+            envelope.artifact_schema_version,
+            super::PAGERANK_ARTIFACT_SCHEMA_VERSION
+        );
+        assert!(
+            envelope
+                .algorithm_fingerprint
+                .starts_with(super::PAGERANK_ALGORITHM_FINGERPRINT_PREFIX)
+        );
+        drop(store);
+
+        let reopened = GraphStore::open(&db).unwrap();
+        reopened.load_pagerank_cache(&sidecar).unwrap();
+        assert_eq!(reopened.pagerank_scores().unwrap().get("A"), Some(&1.0));
+    }
+
+    #[test]
+    fn pagerank_sidecar_rejects_legacy_foreign_stale_and_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db = dir.path().join("source.lbug");
+        let source_sidecar = dir.path().join("source.lbug.pagerank.json");
+        let source = GraphStore::create(&source_db).unwrap();
+        source.insert_symbol(&make_symbol("A", "alpha")).unwrap();
+        source
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        source.save_pagerank_cache(&source_sidecar).unwrap();
+        let valid_bytes = std::fs::read(&source_sidecar).unwrap();
+
+        std::fs::write(&source_sidecar, br#"{"legacy":1.0}"#).unwrap();
+        let legacy = source.load_pagerank_cache(&source_sidecar).unwrap_err();
+        assert!(
+            legacy.to_string().contains("run a full reindex"),
+            "{legacy}"
+        );
+        assert!(source.pagerank_cache.lock().unwrap().is_none());
+
+        std::fs::write(&source_sidecar, &valid_bytes).unwrap();
+        source.bump_graph_generation();
+        let stale = source.load_pagerank_cache(&source_sidecar).unwrap_err();
+        assert!(
+            stale.to_string().contains("stale artifact generation"),
+            "{stale}"
+        );
+        assert!(source.pagerank_cache.lock().unwrap().is_none());
+
+        let foreign_db = dir.path().join("foreign.lbug");
+        let foreign = GraphStore::create(&foreign_db).unwrap();
+        let foreign_sidecar = dir.path().join("foreign.lbug.pagerank.json");
+        std::fs::write(&foreign_sidecar, &valid_bytes).unwrap();
+        let foreign_error = foreign.load_pagerank_cache(&foreign_sidecar).unwrap_err();
+        assert!(
+            foreign_error
+                .to_string()
+                .contains("foreign artifact identity"),
+            "{foreign_error}"
+        );
+        assert!(foreign.pagerank_cache.lock().unwrap().is_none());
+
+        let mut corrupt: crate::artifact_envelope::ArtifactEnvelope =
+            serde_json::from_slice(&valid_bytes).unwrap();
+        corrupt.payload = serde_json::json!({"A": 0.5});
+        std::fs::write(
+            &foreign_sidecar,
+            serde_json::to_vec_pretty(&corrupt).unwrap(),
+        )
+        .unwrap();
+        // Rebind only the identity so checksum validation, rather than the
+        // earlier foreign-identity gate, diagnoses the payload mutation.
+        let foreign_identity = foreign.publication_identity().unwrap().unwrap();
+        corrupt.brain_uuid = foreign_identity.brain_uuid;
+        corrupt.publication_uuid = foreign_identity.publication_uuid;
+        std::fs::write(
+            &foreign_sidecar,
+            serde_json::to_vec_pretty(&corrupt).unwrap(),
+        )
+        .unwrap();
+        let corrupt_error = foreign.load_pagerank_cache(&foreign_sidecar).unwrap_err();
+        assert!(
+            corrupt_error
+                .to_string()
+                .contains("corrupt artifact payload checksum"),
+            "{corrupt_error}"
+        );
+        assert!(foreign.pagerank_cache.lock().unwrap().is_none());
     }
 
     #[test]

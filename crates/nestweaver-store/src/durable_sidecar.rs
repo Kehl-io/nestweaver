@@ -345,6 +345,29 @@ mod tests {
     };
     use crate::GraphStore;
 
+    fn make_symbol(uid: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo-1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {uid}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
     fn only_entry_count(path: &Path) -> usize {
         std::fs::read_dir(path).unwrap().count()
     }
@@ -504,20 +527,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let pagerank_path = dir.path().join("test.lbug.pagerank.json");
-        std::fs::write(&pagerank_path, r#"{"old":1.0}"#).unwrap();
+        let old_bytes;
         {
             let store = GraphStore::open_or_create(&db_path).unwrap();
-            store.load_pagerank_cache(&pagerank_path).unwrap();
+            store.insert_symbol(&make_symbol("old")).unwrap();
+            store
+                .compute_pagerank(0.85, 20, &crate::ranking::GraphScope::code_only())
+                .unwrap();
+            store.save_pagerank_cache(&pagerank_path).unwrap();
+            old_bytes = std::fs::read(&pagerank_path).unwrap();
+            store.insert_symbol(&make_symbol("new")).unwrap();
+            store
+                .compute_pagerank(0.85, 20, &crate::ranking::GraphScope::code_only())
+                .unwrap();
             let error = with_test_fault(TestFault::Persist, || {
                 store.save_pagerank_cache(&pagerank_path)
             })
             .unwrap_err();
             assert!(error.to_string().contains("replace sidecar"));
+            assert_eq!(std::fs::read(&pagerank_path).unwrap(), old_bytes);
         }
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert_eq!(reopened.pagerank_scores().unwrap().get("old"), Some(&1.0));
+        assert!(!reopened.pagerank_scores().unwrap().contains_key("new"));
     }
 
     #[test]
@@ -555,8 +589,11 @@ mod tests {
         let pagerank_path = dir.path().join("test.lbug.pagerank.json");
         {
             let store = GraphStore::open_or_create(&db_path).unwrap();
-            std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
-            store.load_pagerank_cache(&pagerank_path).unwrap();
+            store.insert_symbol(&make_symbol("stale")).unwrap();
+            store
+                .compute_pagerank(0.85, 20, &crate::ranking::GraphScope::code_only())
+                .unwrap();
+            store.save_pagerank_cache(&pagerank_path).unwrap();
             assert!(store.pagerank_scores().unwrap().contains_key("stale"));
         }
 
@@ -564,7 +601,10 @@ mod tests {
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
-        assert!(!reopened.pagerank_scores().unwrap().contains_key("stale"));
+        assert!(
+            reopened.pagerank_cache.lock().unwrap().is_none(),
+            "a missing sidecar must not populate ranks; a later query may legitimately recompute from the graph"
+        );
         assert!(!pagerank_path.exists());
     }
 }

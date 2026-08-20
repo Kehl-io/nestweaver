@@ -1,3 +1,4 @@
+pub mod artifact_envelope;
 pub mod cache;
 pub mod db;
 pub mod durable_sidecar;
@@ -7,6 +8,7 @@ pub mod index_publication;
 pub mod ranking;
 pub mod read;
 pub mod regex;
+pub mod regex_index;
 pub mod search;
 pub mod tantivy_index;
 pub mod traverse;
@@ -15,7 +17,7 @@ pub mod zstd;
 
 pub use db::{
     EmbeddingIndexReconciliation, EmbeddingSnapshotLease, EmbeddingSnapshotState, GraphStore,
-    IndexPublicationLease,
+    IndexPublicationLease, PublicationIdentity,
 };
 pub use error::{CancelReason, StoreError};
 
@@ -34,6 +36,9 @@ pub use read::{
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
     TrigramRefreshStats,
+};
+pub use regex_index::{
+    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardMetadata,
 };
 pub use search::{
     EMBED_CHECKPOINT_INTERVAL, EmbeddingFlushCheckpoint, EmbeddingIndex, SearchResult,

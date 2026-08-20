@@ -347,6 +347,7 @@ fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
         !uids.is_empty(),
         "fixture must index at least one embeddable node"
     );
+    store.set_embedding_metadata("test-model", 3).unwrap();
     for uid in uids {
         assert!(store.add_embedding(&uid, vec![0.1, 0.2, 0.3]));
     }

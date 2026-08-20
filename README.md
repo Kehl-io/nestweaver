@@ -240,6 +240,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `symbol` | Look up a symbol by name and display its metadata |
 | `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
 | `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
+| `detect-changes` | Run the MCP-compatible changed-file impact contract directly from the CLI, including risk, gate state, status, and blind spots |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
 | `read-symbols` | Read a symbol's source span |
 | `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh with `index --with-trigrams`) |
@@ -273,9 +274,26 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain topic-clusters` | Detect topic clusters via Louvain-style local-moving community detection over note wikilinks |
 | `brain tag-graph` | Show a tag's note count and co-occurring tags (or dump the full tag graph) |
 | `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
+| `backlinks` | Resolve a note by UID or title and list the notes that link to it |
 | `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
 | `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files) |
 | `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.) |
+
+</details>
+
+<details>
+<summary>Publication Commands</summary>
+
+| Command | Description |
+|---------|-------------|
+| `publication rebuild --config <path>` | Build a fresh graph and every derived artifact beside the incumbent, validate it, then atomically activate it |
+| `publication status` | Inspect resumable operations and report corrupt/incompatible journals independently |
+| `publication cancel` | Request cooperative cancellation at an exact observed journal revision |
+| `publication discard` | Remove failed staging at an exact revision, or safely discard only an invalid journal |
+| `publication rollback` | Switch back one step to the retained predecessor while the daemon is stopped |
+
+The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
+[publication rebuild and recovery guide](docs/guide/publication-rebuild.md).
 
 </details>
 
@@ -314,7 +332,8 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `list-links` | List all cross-repo links in the instance |
 | `list-features` | List features spanning multiple repositories |
 | `clusters` | Detect community clusters in the dependency graph (Louvain-style local moving, single-level; results cached in a sidecar, `cluster <id\|name>` reads the cache) |
-| `cross-repo-refs` | Find references that cross repository boundaries |
+| `cross-repo-contracts` | Run the MCP-compatible cross-repository contract query for a symbol name or UID |
+| `cross-repo-refs` | Legacy cross-repository reference view; use `cross-repo-contracts` for MCP-equivalent output |
 
 </details>
 

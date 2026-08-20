@@ -4119,6 +4119,7 @@ dependencies = [
  "tonic-prost",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4210,11 +4211,14 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "dirs",
+ "hex",
  "hf-hub",
  "indicatif",
+ "nestweaver-schema",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokenizers 0.23.1",
  "tokio",
  "tracing",
@@ -4261,8 +4265,10 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "url",
+ "uuid",
  "walkdir",
  "wiremock",
  "x509-parser",
@@ -4430,6 +4436,7 @@ dependencies = [
  "csv",
  "lbug",
  "lru 0.18.2",
+ "memmap2",
  "nestweaver-algorithms",
  "nestweaver-schema",
  "openssl-sys",
@@ -4444,6 +4451,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -7300,6 +7308,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8619,6 +8640,9 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wiremock"

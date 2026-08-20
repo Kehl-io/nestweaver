@@ -25,9 +25,11 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 rayon = { workspace = true }
+memmap2 = { workspace = true }
 rmp-serde = "1"
 csv = "1"
 tempfile = { workspace = true }
+uuid = { workspace = true }
 
 [build-dependencies]
 # tree-sitter-sequel 0.3.x requires cc ~1.2.1; keep the workspace build
