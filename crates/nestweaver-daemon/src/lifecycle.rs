@@ -836,6 +836,22 @@ pub fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<
 }
 
 fn persistent_state_root() -> PathBuf {
+    // Honour an explicitly-set $XDG_STATE_HOME on EVERY platform, mirroring
+    // what `runtime_dir` already does with $XDG_RUNTIME_DIR a few hundred
+    // lines up. `dirs::state_dir()` returns the variable on Linux but `None`
+    // on macOS, which has no XDG state concept, so relying on it alone meant
+    // the variable was silently ignored there.
+    //
+    // That inconsistency was not only a portability wart: the daemon GC tests
+    // set $XDG_STATE_HOME to a tempdir and seed instance directories under it,
+    // so on macOS they wrote into the developer's REAL
+    // ~/.local/state/nestweaver/ while asserting against the tempdir. Seven
+    // tests failed for that reason, and the fixtures they leaked
+    // (`abcdabcd`, `aaaaaaaa`, `ffffffff`, ...) accumulated in the user's
+    // state directory — the same directory nw-129 tracks for leaks (nw-194).
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(xdg).join("nestweaver");
+    }
     dirs::state_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
@@ -3090,6 +3106,24 @@ mod tests {
     /// Sweep roots agreeing with the `with_xdg_state_and_runtime` overrides,
     /// with a SCRATCH socket-fallback root. Tests must never run the sweep
     /// against the operator's real `/tmp/nw-sock-<uid>`.
+    /// A path that really exists and is provably outside every temp prefix
+    /// [`is_temp_db_path`] recognises, for tests that need a stand-in "real
+    /// database" the sweep must keep.
+    ///
+    /// `CARGO_MANIFEST_DIR` is NOT safe for this: a git worktree checked out
+    /// under /tmp — routine when reviewing a branch — makes the manifest
+    /// directory itself match `is_temp_db_path`, so the guard assertion failed
+    /// for a reason that had nothing to do with the behaviour under test
+    /// (nw-194). The sweep only calls `.exists()`, so any stable system file
+    /// serves.
+    fn stable_non_temp_path() -> PathBuf {
+        ["/bin/sh", "/usr/bin/env", "/etc/hosts"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.exists() && !is_temp_db_path(candidate))
+            .expect("no stable non-temp system file found")
+    }
+
     fn scratch_gc_roots(state: &Path, runtime: &Path, fallback: &Path) -> DaemonGcRoots {
         DaemonGcRoots {
             state: state.join("nestweaver"),
@@ -3216,8 +3250,7 @@ mod tests {
             // outside any tempdir — a `tempfile::tempdir()` lives under /tmp, so
             // the temp rule would reap it and this case would prove nothing.
             // The sweep only calls `.exists()`, so any stable real file serves.
-            let live_db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-            assert!(live_db.exists() && !is_temp_db_path(&live_db));
+            let live_db = stable_non_temp_path();
             seed_state_dir("cccccccc", live_db.to_str().unwrap());
             let rt_c = seed_runtime_dir("cccccccc");
             let fb_c = seed_fallback_dir(fallback.path(), "cccccccc");
@@ -3931,8 +3964,7 @@ mod tests {
         let fallback = tempfile::tempdir().unwrap();
         with_state_runtime_and_fallback(state.path(), runtime.path(), fallback.path(), || {
             // Any stable path outside the temp roots serves as a real database.
-            let db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-            assert!(db.exists() && !is_temp_db_path(&db));
+            let db = stable_non_temp_path();
             seed_state_dir("ccccdddd", db.to_str().unwrap());
             let rt = seed_runtime_dir("ccccdddd");
             let fb = seed_fallback_dir(fallback.path(), "ccccdddd");

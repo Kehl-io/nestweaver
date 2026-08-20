@@ -15890,7 +15890,13 @@ credential_method = "gh"
         );
     }
 
-    #[cfg(unix)]
+    /// Requires a filesystem that permits non-UTF-8 filenames. Linux ext4 and
+    /// tmpfs do; APFS enforces UTF-8 and refuses the `create` outright with
+    /// EILSEQ, so the fixture cannot even be built on macOS. The guard under
+    /// test canonicalizes before checking UTF-8, which means the path must
+    /// really exist — there is no way to reach the check without the file.
+    /// Gated rather than deleted: the rejection still matters on Linux (nw-194).
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn production_config_loader_rejects_non_utf8_config_provenance() {
         use std::ffi::OsString;
@@ -17786,11 +17792,14 @@ mod boot_reconciliation_tests {
     /// (reaping the zombie), and return its now-free pid, so `kill(pid, 0)`
     /// reports ESRCH deterministically.
     fn reaped_child_pid() -> i32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true
+        // and has no /bin/true, so hardcoding the path panicked with
+        // NotFound on every macOS machine while passing in Linux CI.
+        let mut child = std::process::Command::new("true")
             .spawn()
-            .expect("spawn /bin/true");
+            .expect("spawn true");
         let pid = child.id() as i32;
-        child.wait().expect("reap /bin/true");
+        child.wait().expect("reap true");
         assert!(
             !nestweaver_engine::index_publication::process_is_alive(pid),
             "a reaped child must not read as alive"

@@ -300,10 +300,10 @@ mod tests {
     fn publication_is_abandoned_requires_both_halves() {
         let store = GraphStore::in_memory().unwrap();
         let dead = {
-            let mut child = // nw-138: resolve via PATH. macOS ships true at /usr/bin/true and has
-            // no /bin/true, so hardcoding the path failed 13 tests on every macOS
-            // dev machine while passing in Linux CI.
-            std::process::Command::new("true").spawn().unwrap();
+            // nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true
+            // and has no /bin/true, so hardcoding the path panicked with
+            // NotFound on every macOS machine while passing in Linux CI.
+            let mut child = std::process::Command::new("true").spawn().unwrap();
             let pid = child.id() as i32;
             child.wait().unwrap();
             pid
@@ -366,10 +366,10 @@ mod tests {
         );
 
         let dead = {
-            let mut c = // nw-138: resolve via PATH. macOS ships true at /usr/bin/true and has
-            // no /bin/true, so hardcoding the path failed 13 tests on every macOS
-            // dev machine while passing in Linux CI.
-            std::process::Command::new("true").spawn().unwrap();
+            // nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true
+            // and has no /bin/true, so hardcoding the path panicked with
+            // NotFound on every macOS machine while passing in Linux CI.
+            let mut c = std::process::Command::new("true").spawn().unwrap();
             let pid = c.id() as i32;
             c.wait().unwrap();
             pid
