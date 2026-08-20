@@ -294,14 +294,40 @@ pub fn resolve_references_with_context(
                 None => continue,
             };
 
-            let exported: Vec<&RawSymbol> = target_symbols
+            let visible: Vec<&RawSymbol> = target_symbols
                 .iter()
                 .filter(|s| !matches!(s.visibility, Visibility::Private))
                 .collect();
 
-            if exported.is_empty() {
+            if visible.is_empty() {
                 continue;
             }
+
+            // nw-153: honour the import's named binding. A specifier that names
+            // one item -- `use crate::publication::ArtifactKind` -- must produce
+            // ONE edge to that item, not one edge per symbol in the target file.
+            //
+            // The fan-out made backup_artifact_contract, whose body contains a
+            // single `use`, an importer of all 64 symbols in publication.rs
+            // including rollback_current and compare_and_swap_current. That is
+            // why `impact rollback_current` surfaced unrelated backup code while
+            // missing its real callers.
+            //
+            // The bound name is the specifier's last path segment. Languages
+            // whose specifier names a MODULE rather than an item (JS `./helper`,
+            // Python `os.path`) will not match a symbol, and those keep the
+            // existing every-visible-symbol behaviour so connectivity is
+            // unchanged for them.
+            let bound_name = specifier
+                .rsplit(|c| c == ':' || c == '/' || c == '.')
+                .find(|segment| !segment.is_empty());
+            let named: Option<&&RawSymbol> = bound_name
+                .and_then(|name| visible.iter().find(|candidate| candidate.name == name));
+
+            let exported: Vec<&RawSymbol> = match named {
+                Some(symbol) => vec![*symbol],
+                None => visible,
+            };
 
             let confidence = confidence_score(MatchType::ImportResolved, language);
 
@@ -869,6 +895,63 @@ mod tests {
     /// Genuine per-symbol import attribution — linking only the symbols that
     /// actually reference the imported binding — is tracked separately; it
     /// needs reference matching this pass does not do.
+
+    /// nw-153: a `use` INSIDE a function body must resolve to the one symbol
+    /// it names, not fan out to every symbol in the target file.
+    ///
+    /// Real case: backup_artifact_contract contains exactly one import,
+    /// `use crate::publication::ArtifactKind;`, and acquired 64 IMPORTS
+    /// out-edges into publication.rs -- including rollback_current and
+    /// compare_and_swap_current. That is why `impact rollback_current`
+    /// returned unrelated backup code while missing its real callers.
+    #[test]
+    fn a_named_import_inside_a_function_resolves_to_the_named_symbol_only() {
+        let files = vec![
+            // `crate::` resolution walks up for a crate root, so the fixture
+            // needs one or the import never resolves to a file at all.
+            ("src/lib.rs".to_string(), vec![make_symbol("root", 1)], vec![]),
+            (
+                "src/backup.rs".to_string(),
+                vec![make_symbol("backup_artifact_contract", 10)],
+                vec![make_ref(
+                    "crate::publication::ArtifactKind",
+                    ReferenceKind::Import,
+                    12,
+                )],
+            ),
+            (
+                "src/publication.rs".to_string(),
+                vec![
+                    make_symbol("ArtifactKind", 1),
+                    make_symbol("rollback_current", 20),
+                    make_symbol("compare_and_swap_current", 40),
+                    make_symbol("read_current", 60),
+                    make_symbol("slot_path", 80),
+                ],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert_eq!(
+            import_edges.len(),
+            1,
+            "one named import must yield one edge, not one per symbol in the \
+             target file; got: {import_edges:?}"
+        );
+        // UIDs are hashed, so compare against the computed uid for the symbol
+        // the specifier actually names rather than substring-matching.
+        let expected = symbol_uid("repo:test:abc", "src/publication.rs", "ArtifactKind", 1);
+        assert_eq!(
+            import_edges[0].target_uid, expected,
+            "the edge must point at the imported name, not another symbol in the file"
+        );
+    }
+
     #[test]
     fn top_level_import_creates_one_file_level_proxy_edge() {
         let files = vec![
