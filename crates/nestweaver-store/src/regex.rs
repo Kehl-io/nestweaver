@@ -872,11 +872,31 @@ impl GraphStore {
                 }
             }
             if want_kind("Section") {
-                let mut sections = Vec::new();
-                for note_uid in note_paths.keys() {
-                    sections.extend(self.sections_in_note(note_uid)?);
-                }
+                // nw-134: one bulk query per scope, not one per note.
+                //
+                // The previous loop called sections_in_note() for every note in
+                // the scope. That filters on `note_uid`, which is NOT the primary
+                // key and has no index, so lbug cannot rewrite it to a
+                // PRIMARY_KEY_SCAN -- each call was a FULL Section-table scan. On a
+                // ~1,050-note vault that is ~1,050 full scans where the pre-existing
+                // collect_candidates() did exactly one.
+                //
+                // This is the path a dirty scope takes, so it is what both reported
+                // "regex-search returns 0 results" cases were actually paying: a
+                // watched vault edit dirties the vault scope, and collecting its
+                // candidates consumed the whole time budget before any regex ran.
+                //
+                // NOT list_sections_by_vault: that traverses NOTE_HAS_SECTION, and
+                // the edge is not guaranteed. write.rs:3022 deletes by the note_uid
+                // PROPERTY precisely to catch "fragments whose NOTE_HAS_SECTION edge
+                // is missing", so an edge traversal would silently drop those
+                // sections. Ownership lives on the property; scan once and filter by
+                // this scope's notes in memory.
+                let sections = self.list_all_sections()?;
                 for section in sections {
+                    if !note_paths.contains_key(&section.note_uid) {
+                        continue;
+                    }
                     if section.text_content.is_empty() {
                         continue;
                     }
