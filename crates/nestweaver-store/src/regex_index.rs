@@ -35,6 +35,24 @@ pub struct RegexShardMetadata {
     pub candidate_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexScopeIssue {
+    pub scope_hash: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegexGarbageCollectionReport {
+    pub removed: usize,
+    pub failures: Vec<RegexScopeIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegexMetadataReport {
+    pub metadata: Vec<RegexShardMetadata>,
+    pub failures: Vec<RegexScopeIssue>,
+}
+
 impl RegexShardMetadata {
     pub fn algorithm_fingerprint(&self) -> String {
         format!(
@@ -191,7 +209,7 @@ fn inspect_fields(schema: &Schema) -> Result<Fields, StoreError> {
     })
 }
 
-fn scope_hash(scope_uid: &str) -> String {
+pub(crate) fn scope_hash(scope_uid: &str) -> String {
     blake3::hash(scope_uid.as_bytes()).to_hex().to_string()
 }
 
@@ -691,116 +709,168 @@ impl RegexIndex {
     /// generation is never removed, and a corrupt selector fails closed
     /// rather than guessing which generation is live. A later refresh retries
     /// cleanup, so transient descriptor pressure cannot lose the shard.
-    pub fn garbage_collect(&self) -> Result<usize, StoreError> {
+    pub fn garbage_collect(&self) -> Result<RegexGarbageCollectionReport, StoreError> {
         self.readers.clear();
         let scopes = self.root.join("scopes");
         let entries = match std::fs::read_dir(&scopes) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RegexGarbageCollectionReport::default());
+            }
             Err(error) => {
                 return Err(StoreError::Query(format!(
                     "list regex shards for garbage collection: {error}"
                 )));
             }
         };
-        let mut removed = 0usize;
+        let mut report = RegexGarbageCollectionReport::default();
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                StoreError::Query(format!("read regex shard for garbage collection: {error}"))
-            })?;
-            if !entry
-                .file_type()
-                .map_err(|error| StoreError::Query(format!("inspect regex shard: {error}")))?
-                .is_dir()
-            {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: "<unknown>".to_string(),
+                        error: format!("read regex shard for garbage collection: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let entry_hash = entry.file_name().to_string_lossy().into_owned();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!("inspect regex shard: {error}"),
+                    });
+                    continue;
+                }
             }
             let scope_root = entry.path();
             let current_path = scope_root.join("CURRENT");
-            let pointer = match std::fs::read(&current_path) {
-                Ok(bytes) => {
-                    let pointer: CurrentPointer = serde_json::from_slice(&bytes).map_err(|error| {
-                        StoreError::Query(format!(
-                            "refusing regex garbage collection with corrupt selector {}: {error}",
-                            current_path.display()
-                        ))
-                    })?;
-                    pointer.validate()?;
-                    pointer
-                }
+            let bytes = match std::fs::read(&current_path) {
+                Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::remove_dir_all(&scope_root).map_err(|error| {
-                        StoreError::Query(format!(
-                            "remove retired regex shard {}: {error}",
-                            scope_root.display()
-                        ))
-                    })?;
-                    removed += 1;
+                    match std::fs::remove_dir_all(&scope_root) {
+                        Ok(()) => report.removed += 1,
+                        Err(error) => report.failures.push(RegexScopeIssue {
+                            scope_hash: entry_hash,
+                            error: format!(
+                                "remove retired regex shard {}: {error}",
+                                scope_root.display()
+                            ),
+                        }),
+                    }
                     continue;
                 }
                 Err(error) => {
-                    return Err(StoreError::Query(format!(
-                        "read regex shard selector {}: {error}",
-                        current_path.display()
-                    )));
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!(
+                            "read regex shard selector {}: {error}",
+                            current_path.display()
+                        ),
+                    });
+                    continue;
                 }
             };
-            if scope_hash(&pointer.metadata.scope_uid) != entry.file_name().to_string_lossy() {
-                return Err(StoreError::Query(format!(
-                    "refusing regex garbage collection after scope-hash collision for {}",
-                    pointer.metadata.scope_uid
-                )));
+            let pointer: CurrentPointer = match serde_json::from_slice(&bytes) {
+                Ok(pointer) => pointer,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!(
+                            "refusing regex garbage collection with corrupt selector {}: {error}",
+                            current_path.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = pointer.validate() {
+                report.failures.push(RegexScopeIssue {
+                    scope_hash: entry_hash,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+            if scope_hash(&pointer.metadata.scope_uid) != entry_hash {
+                report.failures.push(RegexScopeIssue {
+                    scope_hash: entry_hash,
+                    error: format!(
+                        "refusing regex garbage collection after scope-hash collision for {}",
+                        pointer.metadata.scope_uid
+                    ),
+                });
+                continue;
             }
             let generations = scope_root.join("generations");
             let generation_entries = match std::fs::read_dir(&generations) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Err(StoreError::Query(format!(
-                        "list regex generations {}: {error}",
-                        generations.display()
-                    )));
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!("list regex generations {}: {error}", generations.display()),
+                    });
+                    continue;
                 }
             };
             for generation in generation_entries {
-                let generation = generation.map_err(|error| {
-                    StoreError::Query(format!("read regex generation: {error}"))
-                })?;
+                let generation = match generation {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        report.failures.push(RegexScopeIssue {
+                            scope_hash: entry_hash.clone(),
+                            error: format!("read regex generation: {error}"),
+                        });
+                        continue;
+                    }
+                };
                 if generation.file_name() == std::ffi::OsStr::new(&pointer.generation) {
                     continue;
                 }
                 let path = generation.path();
-                if generation
-                    .file_type()
-                    .map_err(|error| {
-                        StoreError::Query(format!("inspect regex generation: {error}"))
-                    })?
-                    .is_dir()
-                {
-                    std::fs::remove_dir_all(&path).map_err(|error| {
-                        StoreError::Query(format!(
+                match generation.file_type() {
+                    Ok(kind) if !kind.is_dir() => continue,
+                    Err(error) => {
+                        report.failures.push(RegexScopeIssue {
+                            scope_hash: entry_hash.clone(),
+                            error: format!("inspect regex generation: {error}"),
+                        });
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => report.removed += 1,
+                    Err(error) => report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash.clone(),
+                        error: format!(
                             "remove unselected regex generation {}: {error}",
                             path.display()
-                        ))
-                    })?;
-                    removed += 1;
+                        ),
+                    }),
                 }
             }
         }
         crate::durable_sidecar::sync_parent_directory_durable(&scopes).map_err(|error| {
             StoreError::Query(format!("sync regex garbage collection: {error}"))
         })?;
-        Ok(removed)
+        Ok(report)
     }
 
     /// Inspect every currently selected shard without trusting directory names
     /// as scope identity. Corrupt entries are skipped by callers only when they
     /// can widen the corresponding graph scope to a scan.
-    pub fn list_metadata(&self) -> Result<Vec<RegexShardMetadata>, StoreError> {
+    pub fn list_metadata(&self) -> Result<RegexMetadataReport, StoreError> {
         let scopes = self.root.join("scopes");
         let entries = match std::fs::read_dir(&scopes) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RegexMetadataReport::default());
+            }
             Err(error) => {
                 return Err(StoreError::Query(format!(
                     "list regex shard root {}: {error}",
@@ -808,41 +878,77 @@ impl RegexIndex {
                 )));
             }
         };
-        let mut metadata = Vec::new();
+        let mut report = RegexMetadataReport::default();
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                StoreError::Query(format!("read regex shard directory entry: {error}"))
-            })?;
-            if !entry
-                .file_type()
-                .map_err(|error| StoreError::Query(format!("inspect regex shard: {error}")))?
-                .is_dir()
-            {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: "<unknown>".to_string(),
+                        error: format!("read regex shard directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let entry_hash = entry.file_name().to_string_lossy().into_owned();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!("inspect regex shard: {error}"),
+                    });
+                    continue;
+                }
             }
             let bytes = match std::fs::read(entry.path().join("CURRENT")) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Err(StoreError::Query(format!(
-                        "read regex shard CURRENT: {error}"
-                    )));
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!("read regex shard CURRENT: {error}"),
+                    });
+                    continue;
                 }
             };
-            let pointer: CurrentPointer = serde_json::from_slice(&bytes).map_err(|error| {
-                StoreError::Query(format!("parse regex shard CURRENT: {error}"))
-            })?;
-            pointer.validate()?;
-            if scope_hash(&pointer.metadata.scope_uid) != entry.file_name().to_string_lossy() {
-                return Err(StoreError::Query(format!(
-                    "regex shard directory does not match scope {}",
-                    pointer.metadata.scope_uid
-                )));
+            let pointer: CurrentPointer = match serde_json::from_slice(&bytes) {
+                Ok(pointer) => pointer,
+                Err(error) => {
+                    report.failures.push(RegexScopeIssue {
+                        scope_hash: entry_hash,
+                        error: format!("parse regex shard CURRENT: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = pointer.validate() {
+                report.failures.push(RegexScopeIssue {
+                    scope_hash: entry_hash,
+                    error: error.to_string(),
+                });
+                continue;
             }
-            metadata.push(pointer.metadata);
+            if scope_hash(&pointer.metadata.scope_uid) != entry_hash {
+                report.failures.push(RegexScopeIssue {
+                    scope_hash: entry_hash,
+                    error: format!(
+                        "regex shard directory does not match scope {}",
+                        pointer.metadata.scope_uid
+                    ),
+                });
+                continue;
+            }
+            report.metadata.push(pointer.metadata);
         }
-        metadata.sort_by(|left, right| left.scope_uid.cmp(&right.scope_uid));
-        Ok(metadata)
+        report
+            .metadata
+            .sort_by(|left, right| left.scope_uid.cmp(&right.scope_uid));
+        report
+            .failures
+            .sort_by(|left, right| left.scope_hash.cmp(&right.scope_hash));
+        Ok(report)
     }
 }
 
@@ -978,14 +1084,73 @@ mod tests {
             .unwrap();
         let generations = index.scope_root("repo:test").join("generations");
         assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 2);
-        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert_eq!(index.garbage_collect().unwrap().removed, 1);
         assert_eq!(std::fs::read_dir(&generations).unwrap().count(), 1);
 
         assert!(index.retire_scope("repo:test").unwrap());
         assert!(index.scope_root("repo:test").exists());
         assert!(!index.scope_root("repo:test").join("CURRENT").exists());
-        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert_eq!(index.garbage_collect().unwrap().removed, 1);
         assert!(!index.scope_root("repo:test").exists());
+    }
+
+    #[test]
+    fn corrupt_selector_isolated_from_metadata_and_unrelated_garbage_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:one",
+            kind: "Symbol",
+            text_hash: "hash-one",
+            trigrams: &trigrams,
+        };
+        for scope_uid in ["repo:good", "repo:bad"] {
+            let mut first = metadata(1, 1, "digest-one");
+            first.scope_uid = scope_uid.to_string();
+            index
+                .replace_scope(first, std::slice::from_ref(&document))
+                .unwrap();
+            let mut second = metadata(2, 1, "digest-two");
+            second.scope_uid = scope_uid.to_string();
+            index
+                .replace_scope(second, std::slice::from_ref(&document))
+                .unwrap();
+        }
+        std::fs::write(index.scope_root("repo:bad").join("CURRENT"), b"{not-json").unwrap();
+
+        let metadata = index.list_metadata().unwrap();
+        assert_eq!(
+            metadata
+                .metadata
+                .iter()
+                .map(|entry| entry.scope_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo:good"]
+        );
+        assert_eq!(metadata.failures.len(), 1);
+        assert_eq!(metadata.failures[0].scope_hash, scope_hash("repo:bad"));
+
+        let garbage_collection = index.garbage_collect().unwrap();
+        assert_eq!(garbage_collection.removed, 1);
+        assert_eq!(garbage_collection.failures.len(), 1);
+        assert_eq!(
+            garbage_collection.failures[0].scope_hash,
+            scope_hash("repo:bad")
+        );
+        assert_eq!(
+            std::fs::read_dir(index.scope_root("repo:good").join("generations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(index.scope_root("repo:bad").join("generations"))
+                .unwrap()
+                .count(),
+            2,
+            "a corrupt selector must preserve every generation in that scope"
+        );
     }
 
     #[test]
@@ -1023,7 +1188,7 @@ mod tests {
         drop(searcher);
         drop(reader);
         drop(opened);
-        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert_eq!(index.garbage_collect().unwrap().removed, 1);
         assert!(!index.scope_root("repo:test").exists());
     }
 
@@ -1074,7 +1239,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("publish regex pointer"));
         assert_eq!(index.metadata("repo:test").unwrap(), Some(initial));
-        assert_eq!(index.garbage_collect().unwrap(), 1);
+        assert_eq!(index.garbage_collect().unwrap().removed, 1);
 
         let published = metadata(3, 1, "digest-three");
         let error = with_test_fault(TestFault::ParentSync, || {

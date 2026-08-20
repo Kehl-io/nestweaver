@@ -4735,8 +4735,19 @@ enum PublicationCommands {
     Discard {
         /// Publication operation UUID to discard
         operation: String,
-        #[arg(long, help = "Exact journal revision observed by the caller")]
-        revision: u64,
+        #[arg(
+            long,
+            required_unless_present = "invalid",
+            conflicts_with = "invalid",
+            help = "Exact journal revision observed by the caller"
+        )]
+        revision: Option<u64>,
+        #[arg(
+            long,
+            conflicts_with = "revision",
+            help = "Discard an unreadable journal without deleting any publication slot"
+        )]
+        invalid: bool,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
         #[arg(long, help = "Database path used to derive the publication root")]
@@ -22831,19 +22842,27 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
                     }
                 }
             } else {
-                let states = nestweaver_engine::publication_operation::list_operations(&root)?;
+                let listing = nestweaver_engine::publication_operation::list_operations(&root)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&states)?);
-                } else if states.is_empty() {
+                    println!("{}", serde_json::to_string_pretty(&listing)?);
+                } else if listing.is_empty() {
                     println!("No publication operations in {}", root.display());
                 } else {
-                    for state in states {
+                    for state in listing.operations {
                         println!(
                             "{}  {:?}  revision={}  target={}",
                             state.plan.operation_uuid,
                             state.phase,
                             state.revision,
                             state.plan.target_publication_uuid
+                        );
+                    }
+                    for invalid in listing.invalid_operations {
+                        println!("{}  INVALID  {}", invalid.operation_uuid, invalid.error);
+                        println!(
+                            "  Recover with: nestweaver publication discard {} --invalid --root {}",
+                            invalid.operation_uuid,
+                            root.display()
                         );
                     }
                 }
@@ -22869,14 +22888,26 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
         PublicationCommands::Discard {
             operation,
             revision,
+            invalid,
             root: explicit_root,
             db,
         } => {
             let root = root(explicit_root, db)?;
-            nestweaver_engine::publication_operation::discard_operation(
-                &root, &operation, revision,
-            )?;
-            println!("Discarded publication operation {operation}");
+            if invalid {
+                nestweaver_engine::publication_operation::discard_invalid_operation(
+                    &root, &operation,
+                )?;
+                println!(
+                    "Discarded invalid publication operation {operation}; publication slots were preserved"
+                );
+            } else {
+                nestweaver_engine::publication_operation::discard_operation(
+                    &root,
+                    &operation,
+                    revision.expect("clap requires --revision unless --invalid is present"),
+                )?;
+                println!("Discarded publication operation {operation}");
+            }
             Ok(EXIT_SUCCESS)
         }
         PublicationCommands::Rollback { db, config, json } => {

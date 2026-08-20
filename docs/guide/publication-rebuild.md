@@ -59,7 +59,18 @@ needed, discard it using its latest revision:
 nestweaver publication discard <uuid> --revision <revision> --db /path/to/brain.lbug
 ```
 
-Discard never removes the selected publication.
+The unfiltered status response reports valid operations and invalid journals
+independently, so one incompatible or corrupt `state.json` cannot hide healthy
+operations. An invalid journal has no trustworthy target-slot identity; discard
+it explicitly with:
+
+```sh
+nestweaver publication discard <uuid> --invalid --db /path/to/brain.lbug
+```
+
+Normal discard never removes the selected publication. Invalid-journal discard
+removes only the operation directory and preserves every publication slot for a
+later retention pass.
 
 ## Rollback
 

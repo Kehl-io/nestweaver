@@ -114,6 +114,24 @@ pub struct PublicationOperationState {
     pub updated_unix_millis: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvalidPublicationOperation {
+    pub operation_uuid: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PublicationOperationList {
+    pub operations: Vec<PublicationOperationState>,
+    pub invalid_operations: Vec<InvalidPublicationOperation>,
+}
+
+impl PublicationOperationList {
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty() && self.invalid_operations.is_empty()
+    }
+}
+
 impl PublicationOperationState {
     fn new(plan: PublicationOperationPlan) -> anyhow::Result<Self> {
         plan.validate()?;
@@ -201,7 +219,14 @@ pub fn load_operation(
 ) -> anyhow::Result<PublicationOperationState> {
     parse_non_nil_uuid("operation_uuid", operation_uuid)?;
     let path = operation_state_path(publication_root, operation_uuid)?;
-    let bytes = std::fs::read(&path).map_err(|error| {
+    load_operation_from_path(&path, operation_uuid)
+}
+
+fn load_operation_from_path(
+    path: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<PublicationOperationState> {
+    let bytes = std::fs::read(path).map_err(|error| {
         anyhow::anyhow!("read publication operation {}: {error}", path.display())
     })?;
     let envelope: ChecksummedOperationState = serde_json::from_slice(&bytes).map_err(|error| {
@@ -211,14 +236,17 @@ pub fn load_operation(
     Ok(envelope.state)
 }
 
-pub fn list_operations(publication_root: &Path) -> anyhow::Result<Vec<PublicationOperationState>> {
+pub fn list_operations(publication_root: &Path) -> anyhow::Result<PublicationOperationList> {
     let root = publication_root.join("operations");
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PublicationOperationList::default());
+        }
         Err(error) => return Err(error.into()),
     };
-    let mut states = Vec::new();
+    let mut operations = Vec::new();
+    let mut invalid_operations = Vec::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -230,15 +258,25 @@ pub fn list_operations(publication_root: &Path) -> anyhow::Result<Vec<Publicatio
         if uuid::Uuid::parse_str(&name).is_err() {
             continue;
         }
-        states.push(load_operation(publication_root, &name)?);
+        match load_operation(publication_root, &name) {
+            Ok(state) => operations.push(state),
+            Err(error) => invalid_operations.push(InvalidPublicationOperation {
+                operation_uuid: name,
+                error: format!("{error:#}"),
+            }),
+        }
     }
-    states.sort_by(|left, right| {
+    operations.sort_by(|left, right| {
         left.plan
             .created_unix_millis
             .cmp(&right.plan.created_unix_millis)
             .then_with(|| left.plan.operation_uuid.cmp(&right.plan.operation_uuid))
     });
-    Ok(states)
+    invalid_operations.sort_by(|left, right| left.operation_uuid.cmp(&right.operation_uuid));
+    Ok(PublicationOperationList {
+        operations,
+        invalid_operations,
+    })
 }
 
 fn checkpoint_operation(
@@ -635,6 +673,44 @@ pub fn discard_operation(
     ));
     std::fs::rename(&operation_dir, &tombstone)?;
     nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
+    std::fs::remove_dir_all(&tombstone)?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&tombstone)?;
+    Ok(())
+}
+
+/// Explicitly discard an unreadable operation journal without trusting any of
+/// its contents. Publication slots are deliberately left untouched because an
+/// invalid journal cannot safely identify its target or prove that target is
+/// not selected.
+pub fn discard_invalid_operation(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> anyhow::Result<()> {
+    parse_non_nil_uuid("operation_uuid", operation_uuid)?;
+    let operation_dir = crate::publication::operation_path(publication_root, operation_uuid)?;
+    let tombstone = publication_root.join("operations").join(format!(
+        ".discarded-invalid-{operation_uuid}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::rename(&operation_dir, &tombstone).map_err(|error| {
+        anyhow::anyhow!(
+            "quarantine invalid publication operation {}: {error}",
+            operation_dir.display()
+        )
+    })?;
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
+    if load_operation_from_path(&tombstone.join(OPERATION_STATE_FILE), operation_uuid).is_ok() {
+        std::fs::rename(&tombstone, &operation_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "restore readable publication operation {} after invalid discard refusal: {error}",
+                operation_dir.display()
+            )
+        })?;
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
+        anyhow::bail!(
+            "publication operation journal is readable; discard it with an exact --revision"
+        );
+    }
     std::fs::remove_dir_all(&tombstone)?;
     nestweaver_store::durable_sidecar::sync_parent_directory_durable(&tombstone)?;
     Ok(())
@@ -1073,7 +1149,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan();
         let state = create_operation(dir.path(), plan.clone()).unwrap();
-        assert_eq!(list_operations(dir.path()).unwrap().len(), 1);
+        assert_eq!(list_operations(dir.path()).unwrap().operations.len(), 1);
         let requested = request_cancel(dir.path(), &plan.operation_uuid, state.revision).unwrap();
         let cancelled =
             acknowledge_cancel(dir.path(), &plan.operation_uuid, requested.revision).unwrap();
@@ -1083,6 +1159,85 @@ mod tests {
         std::fs::write(slot.join("partial"), b"staging").unwrap();
         discard_operation(dir.path(), &plan.operation_uuid, cancelled.revision).unwrap();
         assert!(!slot.exists());
+        assert!(list_operations(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_operation_does_not_hide_valid_operations_and_can_be_discarded_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid_plan = plan();
+        create_operation(dir.path(), valid_plan.clone()).unwrap();
+        let invalid_plan = plan();
+        create_operation(dir.path(), invalid_plan.clone()).unwrap();
+        std::fs::write(
+            operation_state_path(dir.path(), &invalid_plan.operation_uuid).unwrap(),
+            b"{not-json",
+        )
+        .unwrap();
+        let invalid_slot =
+            crate::publication::slot_path(dir.path(), &invalid_plan.target_publication_uuid)
+                .unwrap();
+        std::fs::create_dir_all(&invalid_slot).unwrap();
+        std::fs::write(invalid_slot.join("unknown-staging"), b"preserve").unwrap();
+
+        let listing = list_operations(dir.path()).unwrap();
+        assert_eq!(listing.operations.len(), 1);
+        assert_eq!(
+            listing.operations[0].plan.operation_uuid,
+            valid_plan.operation_uuid
+        );
+        assert_eq!(listing.invalid_operations.len(), 1);
+        assert_eq!(
+            listing.invalid_operations[0].operation_uuid,
+            invalid_plan.operation_uuid
+        );
+        assert!(
+            listing.invalid_operations[0]
+                .error
+                .contains("decode publication operation")
+        );
+
+        discard_invalid_operation(dir.path(), &invalid_plan.operation_uuid).unwrap();
+        assert!(
+            invalid_slot.exists(),
+            "an unreadable journal cannot authorize deleting an unknown target slot"
+        );
+        let listing = list_operations(dir.path()).unwrap();
+        assert_eq!(listing.operations.len(), 1);
+        assert!(listing.invalid_operations.is_empty());
+    }
+
+    #[test]
+    fn invalid_discard_refuses_a_readable_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        create_operation(dir.path(), plan.clone()).unwrap();
+        let error = discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap_err();
+        assert!(error.to_string().contains("journal is readable"));
+    }
+
+    #[test]
+    fn future_state_version_is_listed_as_invalid_and_remains_discardable() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let mut state = create_operation(dir.path(), plan.clone()).unwrap();
+        state.state_version = OPERATION_STATE_VERSION + 1;
+        persist_state(
+            &operation_state_path(dir.path(), &plan.operation_uuid).unwrap(),
+            &state,
+        )
+        .unwrap();
+
+        let listing = list_operations(dir.path()).unwrap();
+        assert!(listing.operations.is_empty());
+        assert_eq!(listing.invalid_operations.len(), 1);
+        assert!(
+            listing.invalid_operations[0]
+                .error
+                .contains("state version 2 is incompatible")
+        );
+
+        discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap();
         assert!(list_operations(dir.path()).unwrap().is_empty());
     }
 }

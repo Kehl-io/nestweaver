@@ -394,17 +394,62 @@ impl GraphStore {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
         let index = RegexIndex::with_reader_pool(root, self.regex_reader_pool.clone());
-        if let Err(error) = index.garbage_collect() {
-            tracing::warn!(%error, "deferred regex shard garbage collection");
+        match index.garbage_collect() {
+            Ok(report) => {
+                for failure in report.failures {
+                    tracing::warn!(
+                        scope_hash = %failure.scope_hash,
+                        error = %failure.error,
+                        "deferred regex shard garbage collection for one scope"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "deferred regex shard garbage collection"),
         }
-        let existing = index
-            .list_metadata()
-            .unwrap_or_default()
+        let active_scopes = self.active_regex_scopes()?;
+        let metadata_report = match index.list_metadata() {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, "regex shard metadata listing is unavailable");
+                crate::regex_index::RegexMetadataReport {
+                    metadata: Vec::new(),
+                    failures: vec![crate::regex_index::RegexScopeIssue {
+                        scope_hash: "<unknown>".to_string(),
+                        error: error.to_string(),
+                    }],
+                }
+            }
+        };
+        let unknown_metadata_failure = metadata_report
+            .failures
+            .iter()
+            .any(|failure| failure.scope_hash == "<unknown>");
+        for failure in &metadata_report.failures {
+            tracing::warn!(
+                scope_hash = %failure.scope_hash,
+                error = %failure.error,
+                "regex shard metadata is unavailable for one scope"
+            );
+        }
+        let existing = metadata_report
+            .metadata
             .into_iter()
             .map(|metadata| (metadata.scope_uid.clone(), metadata))
             .collect::<HashMap<_, _>>();
+        // Metadata absence is itself scope-local evidence that acceleration is
+        // unavailable, whether CURRENT is corrupt, missing, or was safely
+        // retired. An unidentifiable directory-read failure is the sole case
+        // that widens repair to every active scope.
+        let unavailable_scopes = if unknown_metadata_failure {
+            active_scopes.clone()
+        } else {
+            active_scopes
+                .iter()
+                .filter(|scope_uid| !existing.contains_key(scope_uid.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
         let mut stats = TrigramRefreshStats::default();
-        let active_scopes = self.active_regex_scopes()?;
         let states = self.read_regex_scope_states()?;
         let mut work_scopes = if force_full {
             let mut scopes = active_scopes.clone();
@@ -414,6 +459,7 @@ impl GraphStore {
         } else {
             self.regex_outbox_scopes()?
         };
+        work_scopes.extend(unavailable_scopes);
         // A graph imported from a pre-v3 release has no outbox yet. Bootstrap
         // once; all subsequent normal work is driven only by coalesced scopes.
         if !force_full && work_scopes.is_empty() && (states.is_empty() || existing.is_empty()) {
@@ -558,8 +604,17 @@ impl GraphStore {
             stats.postings_added += trigram_sets.iter().map(HashSet::len).sum::<usize>();
         }
         stats.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if let Err(error) = index.garbage_collect() {
-            tracing::warn!(%error, "deferred regex shard garbage collection");
+        match index.garbage_collect() {
+            Ok(report) => {
+                for failure in report.failures {
+                    tracing::warn!(
+                        scope_hash = %failure.scope_hash,
+                        error = %failure.error,
+                        "deferred regex shard garbage collection for one scope"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "deferred regex shard garbage collection"),
         }
         Ok(stats)
     }
@@ -1487,8 +1542,9 @@ mod tests {
 
         let identity = store.publication_identity().unwrap().unwrap();
         let metadata = RegexIndex::new(root).list_metadata().unwrap();
-        assert_eq!(metadata.len(), 2);
-        assert!(metadata.iter().all(|entry| {
+        assert!(metadata.failures.is_empty());
+        assert_eq!(metadata.metadata.len(), 2);
+        assert!(metadata.metadata.iter().all(|entry| {
             entry.brain_uuid == identity.brain_uuid
                 && entry.publication_uuid == identity.publication_uuid
                 && entry.schema_version == REGEX_INDEX_SCHEMA_VERSION
@@ -1525,6 +1581,18 @@ mod tests {
         let uids: HashSet<&str> = result.results.iter().map(|hit| hit.uid.as_str()).collect();
         assert!(uids.contains("sec:v:1:a"));
         assert!(uids.contains("sym:1"));
+
+        let repaired = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(
+            repaired.scopes_refreshed, 1,
+            "refresh must rebuild only the scope with the corrupt selector"
+        );
+        let result = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!result.scanned_fallback);
+        assert_eq!(result.ready_scopes, 2);
+        assert_eq!(result.dirty_scopes, 0);
     }
 
     #[test]
@@ -2040,6 +2108,7 @@ mod tests {
         let scopes = RegexIndex::new(store.regex_sidecar_root().unwrap())
             .list_metadata()
             .unwrap()
+            .metadata
             .into_iter()
             .map(|metadata| metadata.scope_uid)
             .collect::<HashSet<_>>();

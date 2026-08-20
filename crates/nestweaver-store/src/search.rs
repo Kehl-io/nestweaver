@@ -164,6 +164,12 @@ impl EmbeddingBase {
             .collect()
     }
 
+    fn vector_bytes_at(&self, row: usize) -> &[u8] {
+        let row = &self.rows[row];
+        let byte_len = self.dimension * std::mem::size_of::<f32>();
+        &self.bytes.as_ref()[row.vector_offset..row.vector_offset + byte_len]
+    }
+
     fn score_at(
         &self,
         row: usize,
@@ -194,6 +200,51 @@ impl EmbeddingBase {
             nestweaver_schema::EmbeddingSimilarity::DotProduct => dot,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum EmbeddingVectorRef<'a> {
+    Overlay(&'a [f32]),
+    Base(&'a [u8]),
+}
+
+impl EmbeddingVectorRef<'_> {
+    fn dimension(self) -> usize {
+        match self {
+            Self::Overlay(vector) => vector.len(),
+            Self::Base(bytes) => bytes.len() / std::mem::size_of::<f32>(),
+        }
+    }
+
+    fn update_hasher(self, hasher: &mut blake3::Hasher) {
+        match self {
+            Self::Overlay(vector) => {
+                for value in vector {
+                    hasher.update(&value.to_le_bytes());
+                }
+            }
+            Self::Base(bytes) => {
+                hasher.update(bytes);
+            }
+        }
+    }
+
+    fn write_to(self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Overlay(vector) => {
+                for value in vector {
+                    writer.write_all(&value.to_le_bytes())?;
+                }
+                Ok(())
+            }
+            Self::Base(bytes) => writer.write_all(bytes),
+        }
+    }
+}
+
+struct EmbeddingSnapshotEntry<'a> {
+    uid: &'a str,
+    vector: EmbeddingVectorRef<'a>,
 }
 
 pub struct EmbeddingIndex {
@@ -646,23 +697,25 @@ impl EmbeddingIndex {
     ) -> Result<EmbeddingArtifactEnvelopeV2, anyhow::Error> {
         use std::io::Write;
         pipeline.validate().map_err(anyhow::Error::msg)?;
+        let entries = self.snapshot_entries();
         let dimension = self.dimension().unwrap_or(0);
         anyhow::ensure!(
-            self.is_empty() || dimension == pipeline.produced_dimension as usize,
+            entries.is_empty() || dimension == pipeline.produced_dimension as usize,
             "embedding pipeline dimension {} does not match vector dimension {dimension}",
             pipeline.produced_dimension
         );
-        let mut entries = self.all_uids();
-        entries.sort();
         let mut uid_table = Vec::new();
-        for uid in &entries {
-            let vector = self
-                .get(uid)
-                .ok_or_else(|| anyhow::anyhow!("embedding UID disappeared during save"))?;
-            anyhow::ensure!(uid.len() <= u16::MAX as usize, "embedding UID is too long");
-            anyhow::ensure!(vector.len() == dimension, "embedding dimensions are mixed");
-            uid_table.extend_from_slice(&(uid.len() as u16).to_le_bytes());
-            uid_table.extend_from_slice(uid.as_bytes());
+        for entry in &entries {
+            anyhow::ensure!(
+                entry.uid.len() <= u16::MAX as usize,
+                "embedding UID is too long"
+            );
+            anyhow::ensure!(
+                entry.vector.dimension() == dimension,
+                "embedding dimensions are mixed"
+            );
+            uid_table.extend_from_slice(&(entry.uid.len() as u16).to_le_bytes());
+            uid_table.extend_from_slice(entry.uid.as_bytes());
         }
         let vector_bytes = entries
             .len()
@@ -671,13 +724,8 @@ impl EmbeddingIndex {
             .ok_or_else(|| anyhow::anyhow!("embedding vector payload size overflow"))?;
         let mut payload_hasher = blake3::Hasher::new();
         payload_hasher.update(&uid_table);
-        for uid in &entries {
-            let vector = self
-                .get(uid)
-                .ok_or_else(|| anyhow::anyhow!("embedding UID disappeared during hash"))?;
-            for value in &vector {
-                payload_hasher.update(&value.to_le_bytes());
-            }
+        for entry in &entries {
+            entry.vector.update_hasher(&mut payload_hasher);
         }
         let envelope = EmbeddingArtifactEnvelopeV2 {
             schema_version: 2,
@@ -700,13 +748,8 @@ impl EmbeddingIndex {
             file.write_all(&(encoded.len() as u64).to_le_bytes())?;
             file.write_all(&encoded)?;
             file.write_all(&uid_table)?;
-            for uid in &entries {
-                let vector = self.get(uid).ok_or_else(|| {
-                    std::io::Error::other("embedding UID disappeared during write")
-                })?;
-                for value in &vector {
-                    file.write_all(&value.to_le_bytes())?;
-                }
+            for entry in &entries {
+                entry.vector.write_to(&mut file)?;
             }
             file.flush()
         })?;
@@ -1238,6 +1281,32 @@ impl EmbeddingIndex {
             );
         }
         uids.into_iter().collect()
+    }
+
+    fn snapshot_entries(&self) -> Vec<EmbeddingSnapshotEntry<'_>> {
+        let mut entries = self
+            .embeddings
+            .iter()
+            .map(|(uid, vector)| EmbeddingSnapshotEntry {
+                uid,
+                vector: EmbeddingVectorRef::Overlay(vector),
+            })
+            .collect::<Vec<_>>();
+        if let Some(base) = &self.base {
+            entries.extend(base.rows.iter().enumerate().filter_map(|(row_index, row)| {
+                if self.deleted_base_uids.contains(&row.uid)
+                    || self.embeddings.contains_key(&row.uid)
+                {
+                    return None;
+                }
+                Some(EmbeddingSnapshotEntry {
+                    uid: &row.uid,
+                    vector: EmbeddingVectorRef::Base(base.vector_bytes_at(row_index)),
+                })
+            }));
+        }
+        entries.sort_by(|left, right| left.uid.cmp(right.uid));
+        entries
     }
 
     /// Retain only embeddings whose graph nodes still exist.
@@ -2199,6 +2268,43 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn binary_v2_compaction_merges_mapped_base_overlay_and_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.bin");
+        let compacted = dir.path().join("compacted.bin");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 2);
+        let mut original = EmbeddingIndex::new();
+        for (uid, vector) in [
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![0.0, 1.0]),
+            ("c", vec![0.5, 0.5]),
+        ] {
+            assert!(original.add_with_pipeline(uid, vector, &pipeline, false));
+        }
+        original
+            .save_binary_v2(&first, &identity, 1, &pipeline)
+            .unwrap();
+
+        let mut reopened = EmbeddingIndex::load_binary_v2(&first).unwrap();
+        assert!(reopened.add_with_pipeline("b", vec![0.25, 0.75], &pipeline, false));
+        assert!(reopened.add_with_pipeline("d", vec![0.75, 0.25], &pipeline, false));
+        let live = HashSet::from(["b".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(reopened.retain_uids(&live), 1);
+        let envelope = reopened
+            .save_binary_v2(&compacted, &identity, 2, &pipeline)
+            .unwrap();
+        assert_eq!(envelope.count, 3);
+
+        let compacted = EmbeddingIndex::load_binary_v2(&compacted).unwrap();
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(compacted.get("b"), Some(vec![0.25, 0.75]));
+        assert_eq!(compacted.get("c"), Some(vec![0.5, 0.5]));
+        assert_eq!(compacted.get("d"), Some(vec![0.75, 0.25]));
+        assert!(compacted.get("a").is_none());
     }
 
     #[test]
