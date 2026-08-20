@@ -16722,6 +16722,46 @@ fn ensure_direct_store_fallback_allowed(
     }
 }
 
+/// Env knob for the client-side RPC ceiling, in seconds. `0` disables it.
+const RPC_TIMEOUT_ENV: &str = "NESTWEAVER_RPC_TIMEOUT_SECS";
+
+/// Default client-side ceiling on a daemon RPC.
+///
+/// Deliberately generous. This is a backstop against a wedged or
+/// indefinitely-blocked daemon, not a latency target — a value tight enough to
+/// be a performance guard would turn slow-but-succeeding queries on a large
+/// graph into failures.
+const RPC_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the CLI will wait for a daemon RPC before giving up.
+///
+/// nw-162: there was no client-side bound at all. `--max-millis` is enforced
+/// SERVER-side and does not bound the client's wall clock, so a daemon that
+/// stopped responding parked the CLI in `Runtime::block_on` indefinitely — one
+/// observed `regex-search` ran 8m38s before being killed, with every tokio
+/// worker idle awaiting a response that never arrived.
+///
+/// When the caller passed `--max-millis`, the server has been asked to answer
+/// within that budget, so the client waits that long plus a margin for
+/// transport and scheduling; anything beyond means the daemon is not honouring
+/// its own deadline. Otherwise the generous default applies.
+fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
+    if let Some(seconds) = std::env::var(RPC_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        // An explicit 0 opts out entirely, for debugging a slow daemon.
+        return (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+    }
+    let budget = args
+        .get("max_millis")
+        .and_then(serde_json::Value::as_u64)
+        .map(|ms| {
+            std::time::Duration::from_millis(ms).saturating_add(std::time::Duration::from_secs(30))
+        });
+    Some(budget.unwrap_or(RPC_TIMEOUT_DEFAULT))
+}
+
 fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
@@ -16780,7 +16820,22 @@ fn try_hybrid_json_rpc_checked(
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
-        Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
+        Ok(mut hybrid) => match rt.block_on(async {
+            match daemon_rpc_timeout(&args) {
+                Some(budget) => tokio::time::timeout(budget, hybrid.query(rpc_name, &args))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "daemon did not answer {rpc_name} within {}s; it may be wedged or \
+                             saturated. Raise or disable the ceiling with {RPC_TIMEOUT_ENV} \
+                             (0 disables), and see `nestweaver daemon --db {} status`.",
+                            budget.as_secs(),
+                            db_path.display()
+                        ))
+                    }),
+                None => hybrid.query(rpc_name, &args).await,
+            }
+        }) {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
                 ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
@@ -24229,6 +24284,31 @@ mod abs_for_daemon_tests {
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("direct start contender should proceed after readiness owner releases");
         contender.join().unwrap();
+    }
+
+    /// nw-162: the CLI had no client-side bound on a daemon RPC, so a wedged
+    /// daemon parked it in `block_on` indefinitely.
+    #[test]
+    fn daemon_rpc_timeout_derives_a_bound_from_the_server_budget() {
+        let bare = serde_json::json!({});
+        assert_eq!(daemon_rpc_timeout(&bare), Some(RPC_TIMEOUT_DEFAULT));
+
+        // --max-millis asks the SERVER to answer within a budget; the client
+        // waits that long plus a transport margin, not forever.
+        let budgeted = serde_json::json!({ "max_millis": 5000 });
+        let bound = daemon_rpc_timeout(&budgeted).expect("a budgeted call is still bounded");
+        assert!(
+            bound > std::time::Duration::from_millis(5000),
+            "the client must allow more than the server budget, got {bound:?}"
+        );
+        assert!(
+            bound < RPC_TIMEOUT_DEFAULT,
+            "a small server budget must not inherit the full default, got {bound:?}"
+        );
+
+        // A non-numeric budget must never panic or silently disable the bound.
+        let junk = serde_json::json!({ "max_millis": "soon" });
+        assert_eq!(daemon_rpc_timeout(&junk), Some(RPC_TIMEOUT_DEFAULT));
     }
 
     #[test]
