@@ -309,15 +309,23 @@ fn trigrams(s: &str) -> HashSet<String> {
     out
 }
 
-/// Extract the set of trigrams that any matching text MUST contain, expressed
-/// as an AND-of-ORs (CNF): the outer Vec is ANDed, each inner set is ORed.
+/// Extract the trigram condition any matching text must satisfy, expressed as
+/// an OR-of-ANDs (DNF): the outer Vec is ORed, each inner set is ANDed.
 ///
-/// The literal extractor already resolves alternations into alternative
-/// literals: for `(alpha|beta)` it yields both `alpha` and `beta`, and a match
-/// needs only ONE of them. All extracted literals are therefore unioned into
-/// a single OR clause. ANDing them per literal (the earlier behavior)
-/// required every alternation branch to appear in the same text and silently
-/// dropped real matches.
+/// This is the standard trigram-index construction (Russ Cox, "Regular
+/// Expression Matching with a Trigram Index"):
+///   trigrams("abcd") = "abc" AND "bcd"   -- conjuncts WITHIN one literal
+///   match(e1|e2)     = match(e1) OR match(e2)  -- alternatives ACROSS branches
+///
+/// The literal extractor resolves alternations into alternative literals: for
+/// `(alpha|beta)` it yields both, and a match needs only ONE of them — so each
+/// literal becomes its own branch. Merging every literal's trigrams into a
+/// single OR clause (nw-142) made a document match on any ONE shared trigram,
+/// which selected ~40% of the corpus for a 20-character identifier. ANDing
+/// ACROSS branches (the behavior before that) was equally wrong: it required
+/// every alternation branch to appear in the same text and dropped real
+/// matches. Per-branch conjunction, cross-branch disjunction is the shape that
+/// is both correct and selective.
 ///
 /// Returns `None` when the regex has no usable required literals (e.g. `.{4,}`,
 /// leading `.*`) or when ANY literal yields no trigrams (e.g. an alternation
@@ -338,11 +346,11 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
         return None;
     }
 
-    // Union every literal's trigrams into ONE OR clause: the literals are
-    // alternatives (a match needs any one of them), not conjuncts. A literal
-    // shorter than 3 chars yields no trigrams → that branch cannot constrain
-    // the search, so the whole prefilter is unusable.
-    let mut clause: HashSet<String> = HashSet::new();
+    // One branch per literal. Within a branch the trigrams are conjuncts; the
+    // branches themselves are alternatives. A literal shorter than 3 chars
+    // yields no trigrams → that branch cannot constrain the search, and since a
+    // match may take that branch, the whole prefilter is unusable.
+    let mut branches: Vec<HashSet<String>> = Vec::new();
     for lit in literals {
         // Inexact literals are prefixes/fragments; their trigrams are still a
         // necessary condition for the branch, so they remain usable.
@@ -352,12 +360,12 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
             // This alternation branch has no usable trigram → cannot prefilter.
             return None;
         }
-        clause.extend(tg);
+        branches.push(tg);
     }
-    if clause.is_empty() {
+    if branches.is_empty() {
         return None;
     }
-    Some(vec![clause])
+    Some(branches)
 }
 
 impl GraphStore {
@@ -1441,6 +1449,49 @@ mod tests {
     /// `fresh_index_observation_rearms_stale_warning_latch` under load (seen
     /// on CI). Every stale-observation test must hold this lock too.
     static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// nw-142: within ONE literal the trigrams are CONJUNCTS - a match must
+    /// contain all of them. Only across alternation branches are they
+    /// alternatives. Unioning everything into one OR clause makes the
+    /// prefilter select any document sharing a single common trigram.
+    ///
+    /// Reference: Russ Cox, "Regular Expression Matching with a Trigram Index":
+    ///   trigrams("abcd") = "abc" AND "bcd"
+    ///   match(e1|e2)     = match(e1) OR match(e2)
+    #[test]
+    fn a_single_literal_yields_one_conjunctive_branch() {
+        let branches = required_trigram_clauses("rollback_current").expect("usable literal");
+        assert_eq!(
+            branches.len(),
+            1,
+            "a plain string is ONE alternation branch, got {branches:?}"
+        );
+        // "rollback_current" is 16 chars -> 14 distinct trigrams, all required.
+        assert_eq!(branches[0], trigrams("rollback_current"));
+        assert!(
+            branches[0].len() > 5,
+            "a 16-char literal must contribute many required trigrams, got {}",
+            branches[0].len()
+        );
+    }
+
+    #[test]
+    fn alternation_yields_one_branch_per_literal() {
+        let branches = required_trigram_clauses("(alpha|bravo)").expect("usable literals");
+        assert_eq!(branches.len(), 2, "two branches expected, got {branches:?}");
+        let sets: Vec<_> = branches.iter().collect();
+        assert!(sets.contains(&&trigrams("alpha")));
+        assert!(sets.contains(&&trigrams("bravo")));
+        // The branches must NOT be merged into one set.
+        assert_ne!(branches[0], branches[1]);
+    }
+
+    /// A branch with no usable trigram cannot constrain the search, so the
+    /// whole prefilter must be abandoned rather than silently narrowed.
+    #[test]
+    fn a_branch_without_trigrams_disables_the_prefilter() {
+        assert!(required_trigram_clauses("(alpha|xy)").is_none());
+    }
 
     fn store_with_text() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();

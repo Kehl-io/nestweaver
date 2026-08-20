@@ -597,28 +597,44 @@ impl RegexIndex {
             .map_err(|error| StoreError::Query(format!("open regex shard reader: {error}")))?;
         let searcher = reader.searcher();
 
-        let mut required: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(clauses.len());
+        // OR-of-ANDs (nw-142). `clauses` is a DNF: each entry is one alternation
+        // branch whose trigrams are CONJUNCTS, and the branches are alternatives.
+        // Building the inner clause with Should (the previous shape) meant a
+        // document matched on any ONE shared trigram, which selected ~40% of the
+        // corpus for a 20-character identifier.
+        //
+        // Trigrams are sorted so the emitted query is deterministic for a given
+        // input; HashSet iteration order is not stable across runs.
+        let mut branches: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(clauses.len());
         for clause in clauses {
-            let alternatives: Vec<(Occur, Box<dyn Query>)> = clause
-                .iter()
+            let mut trigrams: Vec<&String> = clause.iter().collect();
+            trigrams.sort();
+            let conjuncts: Vec<(Occur, Box<dyn Query>)> = trigrams
+                .into_iter()
                 .map(|trigram| {
                     let term = Term::from_field_text(fields.trigram, trigram);
                     (
-                        Occur::Should,
+                        Occur::Must,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     )
                 })
                 .collect();
-            required.push((Occur::Must, Box::new(BooleanQuery::new(alternatives))));
+            branches.push((Occur::Should, Box::new(BooleanQuery::new(conjuncts))));
         }
-        let query = BooleanQuery::new(required);
+        // A single branch needs no disjunction wrapper: emit the conjunction
+        // directly so the common case (a plain literal) is one flat AND query.
+        let query: Box<dyn Query> = if branches.len() == 1 {
+            branches.pop().expect("length checked").1
+        } else {
+            Box::new(BooleanQuery::new(branches))
+        };
         // Tantivy's collector reports only the retained hits, not whether more
         // matches existed. Probe one past the caller's budget so saturation is
         // explicit and the caller can conservatively widen this scope to the
         // graph instead of silently dropping regex matches.
         let hits = searcher
             .search(
-                &query,
+                &*query,
                 &TopDocs::with_limit(cap.saturating_add(1)).order_by_score(),
             )
             .map_err(|error| StoreError::Query(format!("query regex shard: {error}")))?;
@@ -1059,6 +1075,40 @@ mod tests {
                 .len(),
             documents.len(),
             "an exact-cap result is complete and need not widen"
+        );
+    }
+
+    /// nw-142: the trigrams of ONE literal are conjuncts. A document holding
+    /// only some of them must NOT be selected. Before the fix the inner clause
+    /// was built with Occur::Should, so any single shared trigram matched.
+    #[test]
+    fn a_branch_requires_all_of_its_trigrams() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        // Document contains "alp" but NOT "lph".
+        let doc_trigrams = HashSet::from(["alp".to_string(), "zzz".to_string()]);
+        let document = RegexShardDocument {
+            uid: "sym:partial",
+            kind: "Symbol",
+            text_hash: "h",
+            trigrams: &doc_trigrams,
+        };
+        let meta = metadata(1, 1, "digest");
+        index.replace_scope(meta.clone(), &[document]).unwrap();
+
+        // One branch requiring BOTH "alp" AND "lph": must not match.
+        let branch = HashSet::from(["alp".to_string(), "lph".to_string()]);
+        assert_eq!(
+            index.candidate_uids(&meta, &[branch], 10).unwrap(),
+            Some(HashSet::new()),
+            "a branch is a conjunction; a partial trigram overlap must not select"
+        );
+
+        // A branch fully contained in the document must match.
+        let satisfied = HashSet::from(["alp".to_string(), "zzz".to_string()]);
+        assert_eq!(
+            index.candidate_uids(&meta, &[satisfied], 10).unwrap(),
+            Some(HashSet::from(["sym:partial".to_string()])),
         );
     }
 
