@@ -1031,38 +1031,41 @@ impl GraphStore {
                 .ppr_graph_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(PprGraphCached {
+            *guard = Some(std::sync::Arc::new(PprGraphCached {
                 generation: current_gen,
                 scope_hash: s_hash,
                 intent,
                 uids,
-                uid_to_idx,
-                incoming,
-                out_weight,
-            });
+                adjacency: AdjacencyData {
+                    uid_to_idx,
+                    incoming,
+                    out_weight,
+                },
+            }));
         }
 
         // Step 3: read from cache (guaranteed populated).
-        let guard = self
-            .ppr_graph_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let cached = guard
-            .as_ref()
-            .expect("ppr_graph_cache must be Some after fill");
+        //
+        // nw-180: take an Arc handle rather than deep-copying. This path used to
+        // clone a corpus-sized HashMap, Vec<String> and edge list on EVERY call
+        // -- including cache HITS -- purely to scope the lock, which put a ~2s
+        // floor under every brain_context for ~5 KB of output. forward_push_ppr
+        // borrows both, so a refcount bump is all that is needed to release the
+        // lock before the iterative computation.
+        let cached = {
+            let guard = self
+                .ppr_graph_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::sync::Arc::clone(
+                guard
+                    .as_ref()
+                    .expect("ppr_graph_cache must be Some after fill"),
+            )
+        };
 
         // Use the interaction scores already read for the cache key above.
         let interaction_scores = interaction_scores_for_key;
-
-        let adjacency = AdjacencyData {
-            uid_to_idx: cached.uid_to_idx.clone(),
-            incoming: cached.incoming.clone(),
-            out_weight: cached.out_weight.clone(),
-        };
-
-        let uids = cached.uids.clone();
-        // Release the lock before running the iterative PPR computation.
-        drop(guard);
 
         let config = PprConfig {
             damping: effective_damping,
@@ -1072,7 +1075,7 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        let results = forward_push_ppr(&uids, &adjacency, seed_uids, &config);
+        let results = forward_push_ppr(&cached.uids, &cached.adjacency, seed_uids, &config);
 
         {
             let mut cache = self

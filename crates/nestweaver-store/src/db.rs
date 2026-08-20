@@ -33,12 +33,9 @@ pub(crate) struct PprGraphCached {
     pub intent: Option<QueryIntent>,
     /// Ordered list of all node UIDs in scope.
     pub uids: Vec<String>,
-    /// Maps uid → index in `uids`.
-    pub uid_to_idx: HashMap<String, usize>,
-    /// For each node v, the list of `(u, weight)` incoming edges.
-    pub incoming: Vec<Vec<(usize, f64)>>,
-    /// Sum of all outgoing edge weights per node (pre-normalisation denominator).
-    pub out_weight: Vec<f64>,
+    /// Adjacency in the exact shape `forward_push_ppr` borrows, so a reader can
+    /// hand it straight to the algorithm instead of rebuilding one per call.
+    pub adjacency: nestweaver_algorithms::graph::AdjacencyData,
 }
 
 #[derive(Default)]
@@ -297,7 +294,10 @@ pub struct GraphStore {
     /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
     /// graph has not changed between index refreshes.
-    pub(crate) ppr_graph_cache: Mutex<Option<PprGraphCached>>,
+    /// Held behind an `Arc` so a reader can bump a refcount and release the
+    /// lock, rather than deep-copying a corpus-sized adjacency on every call
+    /// (nw-180). Mirrors `symbol_name_cache`.
+    pub(crate) ppr_graph_cache: Mutex<Option<std::sync::Arc<PprGraphCached>>>,
     /// Cached full symbol table for `search_symbols_by_name`. Keyed on
     /// `graph_generation`; stale entries are discarded on any reindex.
     /// Avoids full-table scans on every seed-resolution call for brain_context,
