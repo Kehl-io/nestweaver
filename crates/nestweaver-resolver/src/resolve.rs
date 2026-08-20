@@ -652,12 +652,49 @@ fn resolve_single_reference(
     }
 
     // Priority 4: Same package/directory
+    //
+    // nw-150: for a METHOD call this fallback invents edges. `knex.where(..)`
+    // is captured as a call to the bare name `where`, and binding that to
+    // whatever same-named symbol happens to sit in a sibling file made a
+    // block-scoped `const where = {..}` the single most-depended-on symbol in a
+    // 193k-symbol graph (in_degree 1048), with 524 CALLS "dependents" that were
+    // Knex query-builder calls in files that never import it. It poisoned hubs,
+    // bridges, PageRank and repo-map alike.
+    //
+    // A value receiver is only evidence for a target if it plausibly denotes
+    // it, so require the candidate's file stem to match the receiver. A path
+    // receiver (containing `::`) is already handled by the qualified tier
+    // above, and a receiver-less plain call keeps the original behaviour.
+    let value_receiver = reference
+        .receiver
+        .as_deref()
+        .filter(|receiver| !receiver.contains("::"));
     let same_dir = parent_dir(file_path);
     if let Some(syms) = &candidates {
         let mut same_pkg: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, _)| {
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
+            })
+            .filter(|(candidate_file, _)| match value_receiver {
+                // Compare against the receiver's LAST segment so a chained
+                // receiver still matches: `self.store.query()` -> `store` ->
+                // store.rs. `knex.where()` -> `knex`, which does not match the
+                // unrelated file that happened to declare a local `where`.
+                Some(receiver) => {
+                    let denoted = receiver
+                        .rsplit(['.', ':'])
+                        .find(|segment| !segment.is_empty());
+                    let stem = candidate_file
+                        .rsplit('/')
+                        .next()
+                        .and_then(|base| base.split('.').next());
+                    match (denoted, stem) {
+                        (Some(denoted), Some(stem)) => stem == denoted,
+                        _ => false,
+                    }
+                }
+                None => true,
             })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
@@ -861,6 +898,69 @@ mod tests {
             edge.target_uid.starts_with("unresolved:"),
             "target_uid should start with 'unresolved:', got {}",
             edge.target_uid
+        );
+    }
+
+    /// nw-150: a method call must not bind to an unrelated same-named symbol
+    /// just because it sits in a sibling file.
+    ///
+    /// Real case: `knex.where({..})` in a test file was captured as a call to
+    /// the bare name `where` and bound to `const where = {..}` -- a block-local
+    /// inside an else-branch of an unrelated resolver. That made it the single
+    /// most-depended-on symbol in a 193k-symbol graph (in_degree 1048, 524
+    /// bogus CALLS dependents) and poisoned hubs, bridges and PageRank.
+    #[test]
+    fn a_method_call_does_not_bind_to_an_unrelated_same_named_symbol() {
+        let mut caller = make_symbol("checkin_test", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("where", ReferenceKind::Call, 20);
+        call.receiver = Some("knex".to_string());
+
+        let files = vec![
+            ("src/checkin.test.js".to_string(), vec![caller], vec![call]),
+            // Sibling file declaring a same-named symbol it has nothing to do with.
+            (
+                "src/setVideoViewStatus.js".to_string(),
+                vec![make_symbol("where", 84)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let bogus: Vec<_> = edges
+            .iter()
+            .filter(|e| {
+                e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:")
+            })
+            .collect();
+        assert!(
+            bogus.is_empty(),
+            "knex.where() must not resolve to an unrelated local: {bogus:?}"
+        );
+    }
+
+    /// The gate must still allow a receiver that genuinely denotes the file.
+    #[test]
+    fn a_method_call_still_resolves_when_the_receiver_names_the_file() {
+        let mut caller = make_symbol("handler", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("connect", ReferenceKind::Call, 20);
+        call.receiver = Some("database".to_string());
+
+        let files = vec![
+            ("src/handler.js".to_string(), vec![caller], vec![call]),
+            (
+                "src/database.js".to_string(),
+                vec![make_symbol("connect", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/database.js", "connect", 5);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "database.connect() should still resolve to database.js"
         );
     }
 
