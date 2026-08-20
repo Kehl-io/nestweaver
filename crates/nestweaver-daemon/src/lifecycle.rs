@@ -2117,7 +2117,7 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
             continue;
         }
 
-        if !(is_temp_db_path(&db_path) || !db_path.exists()) {
+        if !is_temp_db_path(&db_path) && db_path.exists() {
             report.kept.push(name);
             continue;
         }

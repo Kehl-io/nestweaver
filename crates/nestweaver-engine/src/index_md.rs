@@ -2228,16 +2228,15 @@ impl<'a> WikilinkLookup<'a> {
                 // holds only normalized paths. `[[../notes/x]]` and
                 // `[[../../../Backlog]]` were reported broken even though the
                 // target existed.
-                if key.starts_with("..") || key.contains("/../") || key.contains("./") {
-                    if let Some(normalized) =
+                if (key.starts_with("..") || key.contains("/../") || key.contains("./"))
+                    && let Some(normalized) =
                         normalize_relative(&source_folder.replace('\\', "/").to_lowercase(), &key)
-                        && let Some(&uid) = self.by_path.get(&normalized)
-                    {
-                        return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                            note_uid: uid.to_string(),
-                            confidence: 1.0,
-                        }]);
-                    }
+                    && let Some(&uid) = self.by_path.get(&normalized)
+                {
+                    return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                        note_uid: uid.to_string(),
+                        confidence: 1.0,
+                    }]);
                 }
             }
         }

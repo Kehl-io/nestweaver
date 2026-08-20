@@ -6426,6 +6426,10 @@ fn daemon_stop_lock_holder_target_with(
 /// evidence while breaking for renamed or symlinked installs. The conjunction
 /// that carries the weight is: the `daemon` subcommand, and names THIS
 /// database.
+// Called only from the Linux `/proc`-based probe below, but kept
+// compiled everywhere so its unit tests run on every platform
+// (nw-136).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
     if !argv_runs_daemon_subcommand(argv) {
         return false;
@@ -6533,6 +6537,10 @@ fn process_argv(_pid: i32) -> Option<Vec<String>> {
 /// `db_path`, else `None`. A stale pidfile PID may have been recycled by an
 /// unrelated process — callers must NOT signal the PID when this returns
 /// `None`.
+// Called only from the Linux `/proc`-based probe below, but kept
+// compiled everywhere so its unit tests run on every platform
+// (nw-136).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<Vec<String>> {
     let argv = process_argv(pid)?;
     argv_is_our_daemon(&argv, db_path).then_some(argv)
@@ -14237,6 +14245,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let inherited_spawn_lock =
                         std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
                     let parent_driven_start = inherited_spawn_lock.is_some();
+                    // Held for its RAII effect on every platform; explicitly
+                    // `.take()`n after daemonize only under
+                    // `#[cfg(not(target_os = "macos"))]` below, so on macOS it
+                    // is never read and needs no `mut`. Scoped to macOS rather
+                    // than blanket-allowed so a genuinely unused lock on Linux
+                    // still fails the build (nw-136).
+                    #[cfg_attr(target_os = "macos", allow(unused_mut, unused_variables))]
                     let mut start_spawn_lock =
                         acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
                     if track_interactions {

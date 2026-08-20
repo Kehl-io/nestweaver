@@ -870,7 +870,7 @@ impl EmbeddingIndex {
             .filter(|bytes| *bytes > 0)
             .ok_or_else(|| anyhow::anyhow!("embedding envelope has zero dimension"))?;
         anyhow::ensure!(
-            envelope.vector_bytes % dimension_bytes == 0,
+            envelope.vector_bytes.is_multiple_of(dimension_bytes),
             "embedding vector region {} is not a multiple of the row size {dimension_bytes}",
             envelope.vector_bytes
         );

@@ -119,18 +119,6 @@ impl CodeWatcher {
         self
     }
 
-    #[cfg(test)]
-    fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
-        self.debounce = Duration::from_millis(debounce_ms);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
-        self.ready_signal = Some(ready);
-        self
-    }
-
     fn acquire_mutation_lease(
         &self,
         label: &'static str,

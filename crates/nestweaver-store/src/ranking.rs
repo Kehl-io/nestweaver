@@ -1164,6 +1164,12 @@ impl GraphStore {
     /// Persist the in-memory PageRank cache to a JSON sidecar file at `path`.
     ///
     /// If the cache is empty (PageRank has not been computed yet), this is a no-op.
+    /// A dirty index publication is ALSO a no-op returning `Ok(())`, not an
+    /// error: the sidecar may not correspond to the committed graph, so
+    /// skipping the write is the correct outcome rather than a failure. This is
+    /// the deliberate exception to the rule that every dirty-publication guard
+    /// in this module returns `StoreError::RankingUnavailable` — query paths
+    /// fail closed, cache I/O silently skips (nw-133).
     /// If the final parent-directory sync fails, the complete new cache may
     /// already be canonical even though crash durability of the rename could
     /// not be confirmed.
@@ -1270,6 +1276,11 @@ impl GraphStore {
     /// Load the PageRank cache from a JSON sidecar file at `path`.
     ///
     /// If the file does not exist, this is a no-op.
+    /// A dirty index publication is ALSO a no-op returning `Ok(())`, not an
+    /// error: a sidecar written before the in-flight publication may predate
+    /// the committed graph, so declining to load it is the correct outcome.
+    /// See [`Self::save_pagerank_cache`] for why cache I/O is the deliberate
+    /// exception to this module's fail-closed guard contract (nw-133).
     pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
         let _flight = self
             .pagerank_compute_lock

@@ -319,7 +319,7 @@ pub fn resolve_references_with_context(
             // existing every-visible-symbol behaviour so connectivity is
             // unchanged for them.
             let bound_name = specifier
-                .rsplit(|c| c == ':' || c == '/' || c == '.')
+                .rsplit([':', '/', '.'])
                 .find(|segment| !segment.is_empty());
             let named: Option<&&RawSymbol> = bound_name
                 .and_then(|name| visible.iter().find(|candidate| candidate.name == name));
@@ -1123,7 +1123,7 @@ mod tests {
     /// Genuine per-symbol import attribution — linking only the symbols that
     /// actually reference the imported binding — is tracked separately; it
     /// needs reference matching this pass does not do.
-
+    ///
     /// nw-153: a `use` INSIDE a function body must resolve to the one symbol
     /// it names, not fan out to every symbol in the target file.
     ///
