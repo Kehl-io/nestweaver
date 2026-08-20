@@ -443,6 +443,19 @@ fn infer_confidence(name: &str, visibility: &str, file_path: &str) -> DeadCodeCo
         return DeadCodeConfidence::High;
     }
 
+    // Explicitly public wins over every naming convention below (nw-155).
+    //
+    // A leading underscore means "private by convention", but an explicit
+    // export overrides the convention: `export { __wbg_init as default }`
+    // makes that symbol a module's PUBLIC entry point no matter how it is
+    // spelled. Reporting it as high-confidence dead code invites a user to
+    // delete live, exported API -- and the command's own help scopes the
+    // visibility caveat to LOW-confidence results, so the tier presented as
+    // trustworthy was the one driven purely by spelling.
+    if visibility == "public" {
+        return DeadCodeConfidence::Low;
+    }
+
     // Naming-convention heuristics for private scope:
     //   - Leading underscore (Python, JS/TS, Dart, Ruby)
     //   - Lowercase first char in Go files (unexported)
@@ -821,6 +834,24 @@ mod tests {
         assert_eq!(result.total_symbols, 3);
         assert_eq!(result.reachable_symbols, 3);
         assert!(result.unreachable_symbols.is_empty());
+    }
+
+    /// nw-155: an explicit export outranks the underscore convention. All 154
+    /// high-confidence results on the reference graph began with `_`, and among
+    /// them were `__wbg_init` -- a module's DEFAULT EXPORT -- plus three
+    /// functions called from within the same file.
+    #[test]
+    fn an_exported_underscore_symbol_is_not_high_confidence() {
+        assert_eq!(
+            infer_confidence("__wbg_init", "public", "src/wasm/glue.js"),
+            DeadCodeConfidence::Low,
+            "an exported symbol must not be high-confidence dead code however it is spelled"
+        );
+        // The convention still applies where nothing contradicts it.
+        assert_eq!(
+            infer_confidence("_helper", "inferred", "src/lib.py"),
+            DeadCodeConfidence::High
+        );
     }
 
     #[test]

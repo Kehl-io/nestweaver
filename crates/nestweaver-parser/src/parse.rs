@@ -1274,6 +1274,35 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         collect_rust_macro_calls(tree.root_node(), source_bytes, &mut references);
     }
 
+    // nw-155: promote symbols named in an `export { .. }` clause to Public.
+    //
+    // has_export_ancestor only recognises the INLINE form, where the declaration
+    // is nested under an export_statement. The list form is a separate statement
+    // elsewhere in the file, so `function _init() {}` + `export { _init as
+    // default }` left _init marked Private -- and dead_code::infer_confidence
+    // returns High for anything private, so a module's DEFAULT EXPORT was
+    // reported as high-confidence dead code. All 154 high-confidence results on
+    // the reference graph were of this shape.
+    if matches!(
+        lang,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    ) {
+        let exported = collect_export_clause_names(tree.root_node(), source_bytes);
+        if !exported.is_empty() {
+            for symbol in &mut symbols {
+                if symbol.visibility == Visibility::Private
+                    && exported.contains(symbol.name.as_str())
+                {
+                    symbol.visibility = Visibility::Public;
+                }
+            }
+        }
+    }
+
     // Type extraction: walk the same tree with type-specific queries
     let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
 
@@ -1285,6 +1314,31 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     })
 }
 
+
+/// Collect the LOCAL names bound by every `export { .. }` clause in a file.
+///
+/// For `export { alpha, beta as default }` this yields {"alpha", "beta"} — the
+/// local name is what identifies the declaration, not the exported alias.
+fn collect_export_clause_names<'a>(
+    node: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<&'a str> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "export_specifier"
+            && let Some(local) = current.child_by_field_name("name")
+            && let Ok(text) = local.utf8_text(source_bytes)
+        {
+            names.insert(text);
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    names
+}
 
 /// Emit CALL references for calls written inside Rust macro bodies (nw-151).
 ///
@@ -6048,5 +6102,51 @@ mod js_const_scope_tests {
             !consts.contains(&"functionLocal"),
             "a function-local const must not be a symbol: {consts:?}"
         );
+    }
+}
+#[cfg(test)]
+mod export_clause_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-155: `export { .. }` is a separate statement from the declaration, so
+    /// has_export_ancestor never saw it and the symbol stayed Private. Since
+    /// dead_code::infer_confidence returns High for anything private, a module's
+    /// DEFAULT EXPORT was reported as high-confidence dead code -- all 154
+    /// high-confidence results on the reference graph were of this shape.
+    #[test]
+    fn export_clause_names_become_public() {
+        let src = concat!(
+            "function _helper() { return 1; }\n",
+            "function plain() { return 2; }\n",
+            "function untouched() { return 3; }\n",
+            "export function direct() { return 4; }\n",
+            "export { _helper, plain as default };\n",
+        );
+        let parsed = parse_source(Path::new("src/w.js"), src).expect("parses");
+        let vis = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .visibility
+        };
+        assert_eq!(vis("_helper"), Visibility::Public, "named in export clause");
+        assert_eq!(vis("plain"), Visibility::Public, "aliased as default");
+        assert_eq!(vis("direct"), Visibility::Public, "inline export, unchanged");
+        assert_eq!(
+            vis("untouched"),
+            Visibility::Private,
+            "a symbol that is genuinely not exported must stay Private"
+        );
+    }
+
+    /// A file with no export clause must be completely unaffected.
+    #[test]
+    fn a_file_without_an_export_clause_is_unchanged() {
+        let parsed =
+            parse_source(Path::new("src/w.js"), "function solo() { return 1; }\n").expect("parses");
+        assert_eq!(parsed.symbols[0].visibility, Visibility::Private);
     }
 }
