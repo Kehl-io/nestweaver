@@ -642,6 +642,150 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
 
 /// Resolve the retained incumbent graph used to authorize activation rollback
 /// without consulting or opening the newly selected publication. `None`
+/// One slot considered by [`prune_slots`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotDisposition {
+    pub publication_uuid: String,
+    pub bytes: u64,
+    /// `None` when the slot is reclaimable; `Some(reason)` when it is retained.
+    pub retained_because: Option<String>,
+}
+
+/// What a [`prune_slots`] pass found and (unless `dry_run`) removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotPruneReport {
+    pub slots: Vec<SlotDisposition>,
+    pub removed_bytes: u64,
+    pub dry_run: bool,
+}
+
+impl SlotPruneReport {
+    pub fn removed(&self) -> impl Iterator<Item = &SlotDisposition> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.retained_because.is_none())
+    }
+    pub fn retained(&self) -> impl Iterator<Item = &SlotDisposition> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.retained_because.is_some())
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => total += directory_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0)
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Reclaim publication slots that nothing can still reach.
+///
+/// nw-135: the `slots` directory was never ENUMERATED anywhere in the repo —
+/// no GC, no retention sweep, no orphan detection. `discard_operation` refuses
+/// anything not cancelled-or-failed, so a slot from a SUCCESSFUL rebuild could
+/// never be removed in-tool at all. Measured on a scratch root, four rebuilds
+/// left all four full slots on disk forever; on the real brain a slot is
+/// ~1.2 GB, which is roughly 55 rebuilds to exhaustion.
+///
+/// Three things are retained, and nothing else is:
+///
+/// 1. The slot CURRENT selects — deleting it would destroy the live graph.
+/// 2. Its retained predecessor, which the documented one-step rollback
+///    contract needs. Exactly one predecessor is required; every slot beyond
+///    that is pure leak.
+/// 3. Any slot targeted by an operation journal that still exists, including
+///    unreadable ones. A journal we cannot parse cannot tell us which slot it
+///    targeted, so every slot stays until that journal is discarded — the same
+///    conservative choice `discard_invalid_operation` already makes.
+pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<SlotPruneReport> {
+    let slots_dir = publication_root.join("slots");
+    let entries = match std::fs::read_dir(&slots_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SlotPruneReport {
+                dry_run,
+                ..Default::default()
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read slots {}", slots_dir.display()));
+        }
+    };
+
+    let mut retained: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(pointer) = read_current(publication_root)? {
+        retained.insert(
+            pointer.publication_uuid.clone(),
+            "selected by CURRENT".to_string(),
+        );
+        if let Some(previous) = pointer.expected_previous_publication_uuid.as_ref() {
+            retained
+                .entry(previous.clone())
+                .or_insert_with(|| "retained predecessor for one-step rollback".to_string());
+        }
+    }
+    let operations = crate::publication_operation::list_operations(publication_root)?;
+    for operation in &operations.operations {
+        retained
+            .entry(operation.plan.target_publication_uuid.clone())
+            .or_insert_with(|| {
+                format!("targeted by operation {}", operation.plan.operation_uuid)
+            });
+    }
+    // An unreadable journal cannot name its target, so nothing may be reclaimed
+    // while one exists.
+    let blocked_by_invalid = operations
+        .invalid_operations
+        .first()
+        .map(|invalid| invalid.operation_uuid.clone());
+
+    let mut report = SlotPruneReport {
+        dry_run,
+        ..Default::default()
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let publication_uuid = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let bytes = directory_bytes(&path);
+        let retained_because = retained.get(&publication_uuid).cloned().or_else(|| {
+            blocked_by_invalid.as_ref().map(|uuid| {
+                format!("unreadable operation journal {uuid} may still target it")
+            })
+        });
+        if retained_because.is_none() && !dry_run {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("remove slot {}", path.display()))?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path)?;
+        }
+        if retained_because.is_none() {
+            report.removed_bytes += bytes;
+        }
+        report.slots.push(SlotDisposition {
+            publication_uuid,
+            bytes,
+            retained_because,
+        });
+    }
+    report.slots.sort_by(|a, b| a.publication_uuid.cmp(&b.publication_uuid));
+    Ok(report)
+}
+
 /// denotes the implicit base database used before the first cutover.
 pub fn retained_predecessor_database(
     base_db_path: &Path,
@@ -1249,6 +1393,81 @@ mod tests {
         assert!(error.contains("compare-and-swap conflict"), "{error}");
         assert_eq!(read_current(dir.path()).unwrap(), Some(next));
         lease.release().unwrap();
+    }
+
+    /// nw-135: nothing in the repo ever enumerated `slots/`. discard_operation
+    /// refuses anything not cancelled-or-failed, so a slot from a SUCCESSFUL
+    /// rebuild could never be removed in-tool — four rebuilds left four full
+    /// slots on disk forever, ~1.2 GB each on the real brain.
+    ///
+    /// The dangerous direction is over-deletion, so this pins what is KEPT.
+    #[test]
+    fn prune_keeps_current_its_predecessor_and_journal_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+
+        let predecessor = store.publication_identity().unwrap().unwrap();
+        let predecessor_digest = write_slot(root, &predecessor);
+        let current_identity = predecessor.next_publication().unwrap();
+        let current_digest = write_slot(root, &current_identity);
+        let orphan = current_identity.next_publication().unwrap();
+        let _ = write_slot(root, &orphan);
+
+        // Two cutovers, as the real flow performs them: the predecessor
+        // becomes CURRENT first, then is superseded — which is what makes it
+        // the retained rollback target.
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let first =
+            CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
+        compare_and_swap_current(root, &lease, None, &first).unwrap();
+        let pointer = CurrentPublicationPointer::new(
+            &current_identity,
+            Some(predecessor.publication_uuid.clone()),
+            current_digest,
+        )
+        .unwrap();
+        compare_and_swap_current(
+            root,
+            &lease,
+            Some(predecessor.publication_uuid.as_str()),
+            &pointer,
+        )
+        .unwrap();
+        drop(lease);
+
+        // Dry run must report the orphan without touching the disk.
+        let preview = prune_slots(root, true).unwrap();
+        assert_eq!(preview.removed().count(), 1);
+        assert!(
+            slot_path(root, &orphan.publication_uuid).unwrap().exists(),
+            "a dry run must not delete anything"
+        );
+
+        let report = prune_slots(root, false).unwrap();
+        let removed: Vec<&str> = report
+            .removed()
+            .map(|slot| slot.publication_uuid.as_str())
+            .collect();
+        assert_eq!(removed, vec![orphan.publication_uuid.as_str()]);
+
+        // The live graph and the one-step rollback target both survive.
+        assert!(
+            slot_path(root, &current_identity.publication_uuid)
+                .unwrap()
+                .exists(),
+            "the slot CURRENT selects must never be reclaimed"
+        );
+        assert!(
+            slot_path(root, &predecessor.publication_uuid)
+                .unwrap()
+                .exists(),
+            "the retained predecessor backs the documented one-step rollback"
+        );
+        assert!(!slot_path(root, &orphan.publication_uuid).unwrap().exists());
+
+        // Idempotent: a second pass finds nothing left to reclaim.
+        assert_eq!(prune_slots(root, false).unwrap().removed().count(), 0);
     }
 
     #[test]

@@ -4761,6 +4761,15 @@ enum PublicationCommands {
         #[arg(long, help = "Database path used to derive the publication root")]
         db: Option<PathBuf>,
     },
+    /// Reclaim publication slots that nothing can still reach
+    Prune {
+        #[arg(long, help = "Report what would be reclaimed without deleting anything")]
+        dry_run: bool,
+        #[arg(long, help = "Publication root; defaults from --db")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Database path used to derive the publication root")]
+        db: Option<PathBuf>,
+    },
     /// Roll back CURRENT once to its retained predecessor; a second call is refused
     Rollback {
         #[arg(
@@ -23241,6 +23250,47 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
                     revision.expect("clap requires --revision unless --invalid is present"),
                 )?;
                 println!("Discarded publication operation {operation}");
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        PublicationCommands::Prune {
+            dry_run,
+            root: explicit_root,
+            db,
+        } => {
+            let root = root(explicit_root, db)?;
+            let report = nestweaver_engine::publication::prune_slots(&root, dry_run)?;
+            if report.slots.is_empty() {
+                println!("No publication slots found under {}", root.display());
+                return Ok(EXIT_SUCCESS);
+            }
+            for slot in report.retained() {
+                println!(
+                    "  keep   {}  {:>9}  ({})",
+                    slot.publication_uuid,
+                    format_bytes(slot.bytes),
+                    slot.retained_because.as_deref().unwrap_or("retained")
+                );
+            }
+            for slot in report.removed() {
+                println!(
+                    "  {} {}  {:>9}",
+                    if dry_run { "would " } else { "remove" },
+                    slot.publication_uuid,
+                    format_bytes(slot.bytes)
+                );
+            }
+            let removed = report.removed().count();
+            if dry_run {
+                println!(
+                    "{removed} slot(s), {} reclaimable — re-run without --dry-run to reclaim",
+                    format_bytes(report.removed_bytes)
+                );
+            } else {
+                println!(
+                    "Reclaimed {removed} slot(s), {}",
+                    format_bytes(report.removed_bytes)
+                );
             }
             Ok(EXIT_SUCCESS)
         }
