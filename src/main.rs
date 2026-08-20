@@ -4748,6 +4748,14 @@ enum PublicationCommands {
             help = "Discard an unreadable journal without deleting any publication slot"
         )]
         invalid: bool,
+        #[arg(
+            long,
+            conflicts_with = "invalid",
+            help = "Acknowledge a requested-but-unacknowledged cancellation first. \
+                    Use when the worker that would have acknowledged it is gone \
+                    (crash, Ctrl-C, --no-activate) and its staged slot is stranded"
+        )]
+        force: bool,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
         #[arg(long, help = "Database path used to derive the publication root")]
@@ -23177,10 +23185,48 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             operation,
             revision,
             invalid,
+            force,
             root: explicit_root,
             db,
         } => {
             let root = root(explicit_root, db)?;
+            // nw-146: request_cancel only sets `cancel_requested`; ONLY the
+            // running worker calls acknowledge_cancel to reach phase Cancelled.
+            // If that worker is gone, both discard paths refused — `--revision`
+            // with "only a cancelled or failed staging operation may be
+            // discarded", `--invalid` with "journal is readable" — and the
+            // staged slot, a full graph copy, was stranded with no CLI path to
+            // reclaim it. An escape existed via `publication rebuild
+            // --operation`, but neither message named it and it needs --config.
+            //
+            // Acknowledging is gated behind an explicit --force rather than
+            // done automatically: the journal records no worker pid, so
+            // "nobody is running" cannot be PROVEN, and auto-acknowledging
+            // could race a live worker mid-write. This mirrors `repair
+            // --force`, which exists for exactly this shape of problem.
+            let mut revision = revision;
+            if force && !invalid {
+                let state = nestweaver_engine::publication_operation::load_operation(
+                    &root, &operation,
+                )?;
+                if state.cancel_requested
+                    && state.phase
+                        != nestweaver_engine::publication_operation::PublicationPhase::Cancelled
+                    && state.failure.is_none()
+                {
+                    let acknowledged =
+                        nestweaver_engine::publication_operation::acknowledge_cancel(
+                            &root,
+                            &operation,
+                            revision.unwrap_or(state.revision),
+                        )?;
+                    println!(
+                        "Acknowledged the pending cancellation of {operation} (revision {} → {})",
+                        state.revision, acknowledged.revision
+                    );
+                    revision = Some(acknowledged.revision);
+                }
+            }
             if invalid {
                 nestweaver_engine::publication_operation::discard_invalid_operation(
                     &root, &operation,

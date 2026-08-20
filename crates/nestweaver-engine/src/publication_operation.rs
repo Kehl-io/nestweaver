@@ -672,7 +672,24 @@ pub fn discard_operation(
         );
     }
     if state.phase != PublicationPhase::Cancelled && state.failure.is_none() {
-        anyhow::bail!("only a cancelled or failed staging operation may be discarded");
+        // nw-146: name the escape. A cancellation that was REQUESTED but never
+        // acknowledged (its worker crashed, was Ctrl-C'd, or ran
+        // --no-activate) lands here, and the old message left the operator
+        // with no next step while a full graph copy stayed on disk.
+        if state.cancel_requested {
+            anyhow::bail!(
+                "publication operation {} has a cancellation requested but not acknowledged \
+                 (phase {:?}) — no worker is left to acknowledge it. Re-run with --force to \
+                 acknowledge and discard in one step.",
+                state.plan.operation_uuid,
+                state.phase
+            );
+        }
+        anyhow::bail!(
+            "only a cancelled or failed staging operation may be discarded (phase {:?}); \
+             cancel it first with `nestweaver publication cancel`",
+            state.phase
+        );
     }
     if crate::publication::read_current(publication_root)?.is_some_and(|pointer| {
         uuid_equal(
@@ -734,7 +751,8 @@ pub fn discard_invalid_operation(
         })?;
         nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
         anyhow::bail!(
-            "publication operation journal is readable; discard it with an exact --revision"
+            "publication operation journal is readable; discard it with an exact --revision \
+             (add --force if a cancellation was requested but never acknowledged)"
         );
     }
     std::fs::remove_dir_all(&tombstone)?;
@@ -1268,6 +1286,40 @@ mod tests {
         // An ordinary transient failure stays retryable.
         let transient = anyhow::anyhow!("connection reset while streaming artifact");
         assert!(!PermanentPublicationFailure::is_permanent(&transient));
+    }
+
+    /// nw-146: `request_cancel` only sets the flag; only the RUNNING worker
+    /// acknowledges it. When that worker is gone, both discard paths refused
+    /// and the staged slot — a full graph copy — was stranded with no CLI
+    /// route to reclaim it.
+    #[test]
+    fn an_unacknowledged_cancel_is_discardable_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = create_operation(root, plan()).unwrap();
+
+        // The worker is gone, so nothing ever acknowledges this.
+        let cancelled =
+            request_cancel(root, &state.plan.operation_uuid, state.revision).unwrap();
+        assert!(cancelled.cancel_requested);
+        assert_ne!(cancelled.phase, PublicationPhase::Cancelled);
+
+        // Before: refused, and the message must now name the way out.
+        let error =
+            discard_operation(root, &cancelled.plan.operation_uuid, cancelled.revision)
+                .expect_err("an unacknowledged cancel is not directly discardable");
+        let message = error.to_string();
+        assert!(
+            message.contains("--force"),
+            "the refusal must name the escape: {message}"
+        );
+
+        // --force path: acknowledge, then discard.
+        let acknowledged =
+            acknowledge_cancel(root, &cancelled.plan.operation_uuid, cancelled.revision).unwrap();
+        assert_eq!(acknowledged.phase, PublicationPhase::Cancelled);
+        discard_operation(root, &acknowledged.plan.operation_uuid, acknowledged.revision)
+            .expect("an acknowledged cancellation must be discardable");
     }
 
     #[test]
