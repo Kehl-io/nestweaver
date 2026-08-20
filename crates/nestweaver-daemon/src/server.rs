@@ -7843,7 +7843,9 @@ mod embedding_load_config_tests {
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
             modules: snapshot_dir.join("modules.json"),
-            sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
+            sentence_transformer_config: Some(
+                snapshot_dir.join("config_sentence_transformers.json"),
+            ),
             transformer_config: snapshot_dir.join("sentence_bert_config.json"),
             pooling_config: snapshot_dir.join("1_Pooling/config.json"),
             dense_modules: Vec::new(),
@@ -7860,7 +7862,10 @@ mod embedding_load_config_tests {
         )
         .expect("write modules fixture");
         std::fs::write(
-            &artifacts.sentence_transformer_config,
+            artifacts
+                .sentence_transformer_config
+                .as_ref()
+                .expect("fixture publishes a sentence-transformer config"),
             r#"{"similarity_fn_name":"cosine"}"#,
         )
         .expect("write sentence-transformer fixture");
