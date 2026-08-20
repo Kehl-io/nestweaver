@@ -22,8 +22,19 @@ pub const PRESERVED_STATE_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-
 
 /// Validate a live PageRank envelope before a sealed publication describes
 /// it, returning the exact schema and algorithm/scope fingerprint carried by
-/// the payload. This prevents snapshot and backup manifests from laundering a
-/// foreign, stale, corrupt, or generically-labelled ranking sidecar.
+/// the payload.
+///
+/// Identity, producer version and source generation ARE checked against the
+/// caller's expectations, so a foreign, stale or corrupt sidecar is rejected.
+///
+/// The algorithm fingerprint is NOT: this function's whole job is to discover
+/// which parameters the payload declares, so it has no independent expectation
+/// to compare against, and the prefix check below is the only enforcement.
+/// nw-147: the previous doc claimed this also caught a "generically-labelled"
+/// sidecar, which the self-comparison never did. A same-brain, same-generation
+/// artifact computed with different damping/iterations/scope still passes here;
+/// closing that needs the envelope to record the parameters themselves so the
+/// fingerprint can be recomputed from them rather than trusted.
 pub(crate) fn pagerank_artifact_contract(
     bytes: &[u8],
     identity: &nestweaver_store::PublicationIdentity,
@@ -45,6 +56,8 @@ pub(crate) fn pagerank_artifact_contract(
             envelope.algorithm_fingerprint
         );
     }
+    // Self-comparison, deliberately and now documented: see the note above on
+    // why this function has no independent expectation (nw-147).
     let fingerprint = envelope.algorithm_fingerprint.clone();
     let _: std::collections::HashMap<String, f64> =
         envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
@@ -780,7 +793,10 @@ pub fn compare_and_swap_current(
         .map(|value| parse_uuid("expected current publication_uuid", value))
         .transpose()?;
     if observed != expected {
-        anyhow::bail!(
+        // Permanent: the expected predecessor will never be CURRENT again, so
+        // retrying this operation can only re-observe the same conflict
+        // (nw-148).
+        return Err(crate::publication_operation::PermanentPublicationFailure(format!(
             "CURRENT compare-and-swap conflict: expected {}, observed {}",
             expected
                 .map(|value| value.to_string())
@@ -788,7 +804,8 @@ pub fn compare_and_swap_current(
             observed
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "<none>".to_string())
-        );
+        ))
+        .into());
     }
     let declared_previous = next
         .expected_previous_publication_uuid

@@ -23763,13 +23763,21 @@ fn run_publication_rebuild(
             ) && !latest.phase.is_terminal()
                 && latest.failure.is_none()
             {
+                // nw-148: this used to hardcode `true`. The flag drives
+                // resume_operation, which refuses non-retryable failures, so
+                // marking a permanently-failed operation retryable removed the
+                // only signal telling an operator to discard and start fresh —
+                // and sent them into a retry loop that fails identically.
+                let retryable =
+                    !nestweaver_engine::publication_operation::PermanentPublicationFailure::
+                        is_permanent(&error);
                 let _ = nestweaver_engine::publication_operation::record_failure(
                     &publication_root,
                     &operation_uuid,
                     latest.revision,
                     "publication_rebuild_failed",
                     format!("{error:#}"),
-                    true,
+                    retryable,
                 );
                 return Err(error);
             } else {

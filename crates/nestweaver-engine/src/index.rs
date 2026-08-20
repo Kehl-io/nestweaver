@@ -1155,9 +1155,17 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                 // them from the committed sidecar so in-process readers keep
                 // the scope the disk now holds; a lazy refill would be
                 // `code_only()`, narrower than a unified publication.
-                if pagerank_scope.is_some()
-                    && let Err(error) =
-                        store.load_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
+                // nw-147: this caller KNOWS the parameters it just computed
+                // with (compute_pagerank above uses 0.85 / 20 over this exact
+                // scope), so it can verify the sidecar's algorithm fingerprint
+                // instead of letting the artifact vouch for itself.
+                if let Some(scope) = pagerank_scope
+                    && let Err(error) = store.load_pagerank_cache_expecting(
+                        &crate::sidecar_path(db_path, ".pagerank.json"),
+                        Some(&nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+                            0.85, 20, scope,
+                        )),
+                    )
                 {
                     tracing::warn!(
                         "fresh PageRank sidecar could not be reloaded after marker retirement: \

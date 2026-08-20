@@ -444,6 +444,32 @@ pub fn activate_operation(
 /// Select a validated publication but leave the journal in `Activating` so
 /// the caller can run a startup/read smoke against the exact path that
 /// `CURRENT` resolves. A failed smoke may roll the pointer back before the
+/// A publication failure that retrying cannot fix.
+///
+/// nw-148: the rebuild path recorded a hardcoded `retryable = true` for every
+/// failure, including ones that can never succeed on retry — a lost CURRENT
+/// compare-and-swap (the expected predecessor will never be CURRENT again) and
+/// a slot artifact that fails digest validation (a retry revalidates the same
+/// corrupt bytes and fails identically). Because the flag drives
+/// `resume_operation`, which refuses non-retryable failures, marking everything
+/// retryable removed the only signal that would tell an operator to discard and
+/// start fresh.
+///
+/// A marker type rather than string matching on the message, so the raise site
+/// owns the classification and it cannot drift when wording changes.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PermanentPublicationFailure(pub String);
+
+impl PermanentPublicationFailure {
+    /// True when `error` (or any of its sources) is permanent.
+    pub fn is_permanent(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.is::<PermanentPublicationFailure>())
+    }
+}
+
 /// operation is made terminal.
 pub fn select_operation(
     publication_root: &Path,
@@ -770,10 +796,12 @@ fn validate_target_slot(
             anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
         })?;
         if byte_size != descriptor.byte_size || digest != descriptor.blake3 {
-            anyhow::bail!(
+            // Permanent: a retry revalidates the same bytes (nw-148).
+            return Err(PermanentPublicationFailure(format!(
                 "target artifact {} failed size or digest validation",
                 descriptor.path
-            );
+            ))
+            .into());
         }
     }
     Ok(crate::hash::blake3_hex_bytes(&bytes))
@@ -1214,6 +1242,32 @@ mod tests {
         create_operation(dir.path(), plan.clone()).unwrap();
         let error = discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap_err();
         assert!(error.to_string().contains("journal is readable"));
+    }
+
+    /// nw-148: a hardcoded `retryable = true` marked permanently-failed
+    /// operations as retryable, and the flag drives resume_operation — so the
+    /// one signal that would tell an operator to discard and start fresh was
+    /// never emitted.
+    #[test]
+    fn permanent_failures_are_distinguishable_from_retryable_ones() {
+        let permanent: anyhow::Error =
+            PermanentPublicationFailure("CURRENT compare-and-swap conflict: expected a, observed b".into())
+                .into();
+        assert!(PermanentPublicationFailure::is_permanent(&permanent));
+        // The message must survive classification unchanged, since operators
+        // and existing assertions read it.
+        assert!(permanent.to_string().contains("compare-and-swap conflict"));
+
+        // Wrapped in context, as the rebuild path propagates it.
+        let wrapped = permanent.context("publication rebuild failed");
+        assert!(
+            PermanentPublicationFailure::is_permanent(&wrapped),
+            "classification must survive context wrapping"
+        );
+
+        // An ordinary transient failure stays retryable.
+        let transient = anyhow::anyhow!("connection reset while streaming artifact");
+        assert!(!PermanentPublicationFailure::is_permanent(&transient));
     }
 
     #[test]

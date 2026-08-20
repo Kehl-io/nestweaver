@@ -40,7 +40,15 @@ pub const PAGERANK_ARTIFACT_KIND: &str = "ranking";
 pub const PAGERANK_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:";
 
-fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
+/// The algorithm/scope fingerprint an artifact computed with these parameters
+/// must carry. Public so a caller that KNOWS the parameters can pass the
+/// expected value to [`GraphStore::load_pagerank_cache_expecting`] instead of
+/// letting the artifact vouch for itself (nw-147).
+pub fn pagerank_algorithm_fingerprint(
+    damping: f64,
+    iterations: u32,
+    scope: &GraphScope,
+) -> String {
     let mut digest = blake3::Hasher::new();
     digest.update(b"nestweaver-pagerank-scope-v2\0");
     digest.update(&damping.to_bits().to_le_bytes());
@@ -1282,6 +1290,32 @@ impl GraphStore {
     /// See [`Self::save_pagerank_cache`] for why cache I/O is the deliberate
     /// exception to this module's fail-closed guard contract (nw-133).
     pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        self.load_pagerank_cache_expecting(path, None)
+    }
+
+    /// [`Self::load_pagerank_cache`] with an explicit expected algorithm/scope
+    /// fingerprint.
+    ///
+    /// nw-147: the validation used to clone the fingerprint OUT of the envelope
+    /// and pass it back in as the expected value, so the equality check in
+    /// `ArtifactEnvelope::validate_and_decode` compared the field to itself.
+    /// Only the `nestweaver-pagerank-v2:` prefix was ever enforced; the BLAKE3
+    /// suffix over (damping, iterations, scope) was taken on trust, and every
+    /// other artifact type passes a real constant. A caller that knows which
+    /// parameters it wants should pass `Some(expected)` — see
+    /// [`pagerank_algorithm_fingerprint`].
+    ///
+    /// `None` keeps prefix-only checking, for the callers that genuinely cannot
+    /// know the parameters. That path still validates publication identity,
+    /// producer version and source generation, so a foreign or stale sidecar is
+    /// rejected; what it cannot detect is a same-brain, same-generation sidecar
+    /// computed with DIFFERENT damping/iterations/scope. Fully closing that
+    /// needs the envelope to record the parameters themselves.
+    pub fn load_pagerank_cache_expecting(
+        &self,
+        path: &std::path::Path,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<(), StoreError> {
         let _flight = self
             .pagerank_compute_lock
             .lock()
@@ -1318,7 +1352,12 @@ impl GraphStore {
                         .to_string(),
                 )
             })?;
-            let fingerprint = envelope.algorithm_fingerprint.clone();
+            // nw-147: prefer the caller's expected value; fall back to the
+            // artifact's own only when the caller could not supply one.
+            let fingerprint = match expected_fingerprint {
+                Some(expected) => expected.to_string(),
+                None => envelope.algorithm_fingerprint.clone(),
+            };
             let scores: HashMap<String, f64> =
                 envelope.validate_and_decode(crate::artifact_envelope::ArtifactExpectation {
                     artifact_kind: PAGERANK_ARTIFACT_KIND,
@@ -1525,6 +1564,47 @@ mod tests {
         let reopened = GraphStore::open(&db).unwrap();
         reopened.load_pagerank_cache(&sidecar).unwrap();
         assert_eq!(reopened.pagerank_scores().unwrap().get("A"), Some(&1.0));
+    }
+
+    /// nw-147: the algorithm fingerprint used to be cloned out of the envelope
+    /// and passed back in as the EXPECTED value, so the equality check compared
+    /// the field to itself and only the version prefix was ever enforced. A
+    /// caller that knows its parameters can now supply the real expectation.
+    #[test]
+    fn pagerank_sidecar_rejects_a_mismatched_algorithm_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_symbol(&make_symbol("A", "alpha")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open(&db).unwrap();
+
+        // The parameters it was actually computed with: accepted.
+        let matching =
+            super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::code_only());
+        reopened
+            .load_pagerank_cache_expecting(&sidecar, Some(&matching))
+            .expect("the fingerprint for the computed parameters must be accepted");
+
+        // A DIFFERENT iteration count is a different artifact contract. Same
+        // brain, same generation, same payload — only the parameters differ,
+        // which is precisely the case the self-comparison could never see.
+        let mismatched =
+            super::pagerank_algorithm_fingerprint(0.85, 30, &GraphScope::code_only());
+        assert_ne!(matching, mismatched, "parameters must change the fingerprint");
+        let error = reopened
+            .load_pagerank_cache_expecting(&sidecar, Some(&mismatched))
+            .expect_err("a sidecar computed with other parameters must be rejected");
+        assert!(
+            error.to_string().contains("fingerprint"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
