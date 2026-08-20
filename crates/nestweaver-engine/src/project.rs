@@ -524,20 +524,73 @@ pub fn materialize_projects_with_lease(
 ///    PROJECT_INCLUDES_NOTE edges.
 ///
 /// Returns the list of detected project slugs (folder names).
+/// Vault folders that hold one directory per project.
+///
+/// nw-161: only `Projects/` was recognised, so on a vault laid out as
+/// `Workspaces/<Name>/` — the layout this project's own CLAUDE.md documents,
+/// with 21 such folders — detection reported "No implicit projects detected"
+/// and the function returned before reaching any write.
+pub const PROJECT_CONTAINER_DIRS: &[&str] = &["Projects", "Workspaces"];
+
+/// Entry-note filenames that mark a directory as a project.
+///
+/// nw-161: only `<slug>/<slug>.md` was accepted. `_Overview.md` is the
+/// convention actually used under `Workspaces/`.
+fn is_entry_note(dir: &Path, slug: &str) -> bool {
+    dir.join(format!("{slug}.md")).is_file() || dir.join("_Overview.md").is_file()
+}
+
 pub fn detect_implicit_projects(
     store: &GraphStore,
     vault_root: &Path,
     vault_uid: &str,
     instance_id: &str,
 ) -> Result<Vec<String>, anyhow::Error> {
-    let projects_dir = vault_root.join("Projects");
-    if !projects_dir.is_dir() {
-        return Ok(Vec::new());
-    }
+    detect_implicit_projects_with_mode(store, vault_root, vault_uid, instance_id, false)
+}
 
+/// [`detect_implicit_projects`] with an explicit write mode.
+///
+/// nw-161: this function WRITES — `upsert_project` and
+/// `batch_insert_project_note_edges` — despite a read-sounding name, and
+/// nothing in `--help` signalled it. `dry_run` reports what would be created
+/// without touching the graph.
+pub fn detect_implicit_projects_with_mode(
+    store: &GraphStore,
+    vault_root: &Path,
+    vault_uid: &str,
+    instance_id: &str,
+    dry_run: bool,
+) -> Result<Vec<String>, anyhow::Error> {
     let mut detected: Vec<String> = Vec::new();
+    for container in PROJECT_CONTAINER_DIRS {
+        let projects_dir = vault_root.join(container);
+        if !projects_dir.is_dir() {
+            continue;
+        }
+        detect_in_container(
+            store,
+            &projects_dir,
+            container,
+            vault_uid,
+            instance_id,
+            dry_run,
+            &mut detected,
+        )?;
+    }
+    Ok(detected)
+}
 
-    let read_dir = std::fs::read_dir(&projects_dir)?;
+fn detect_in_container(
+    store: &GraphStore,
+    projects_dir: &Path,
+    container: &str,
+    vault_uid: &str,
+    instance_id: &str,
+    dry_run: bool,
+    detected: &mut Vec<String>,
+) -> Result<(), anyhow::Error> {
+    let read_dir = std::fs::read_dir(projects_dir)?;
     for entry in read_dir {
         let entry = entry?;
         let path = entry.path();
@@ -550,9 +603,11 @@ pub fn detect_implicit_projects(
             None => continue,
         };
 
-        // Check for the entry note: Projects/<slug>/<slug>.md
-        let entry_note_path = path.join(format!("{slug}.md"));
-        if !entry_note_path.is_file() {
+        if !is_entry_note(&path, &slug) {
+            continue;
+        }
+        if dry_run {
+            detected.push(slug);
             continue;
         }
 
@@ -574,8 +629,8 @@ pub fn detect_implicit_projects(
             let _ = e;
         }
 
-        // Attach all notes under Projects/<slug>/ via vault-relative paths.
-        let prefix = format!("Projects/{slug}/");
+        // Attach all notes under <container>/<slug>/ via vault-relative paths.
+        let prefix = format!("{container}/{slug}/");
         let all_notes = store.list_notes(Some(vault_uid))?;
         let edges: Vec<(&str, &str)> = all_notes
             .iter()
@@ -589,7 +644,7 @@ pub fn detect_implicit_projects(
         detected.push(slug);
     }
 
-    Ok(detected)
+    Ok(())
 }
 
 #[cfg(test)]

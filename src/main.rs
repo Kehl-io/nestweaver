@@ -96,7 +96,7 @@ use nestweaver_engine::{
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
+    changed_files_from_git, compute_clusters, compute_cochanges,
     discover_cross_domain_links, embedding::generate_embeddings_batch, export_cypher,
     export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
@@ -2909,10 +2909,16 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
-    /// Detect implicit projects from vault structure and code patterns
+    /// Detect implicit projects from vault structure. WRITES Project nodes and
+    /// project→note edges to the graph; use --dry-run to preview.
     DetectImplicitProjects {
         #[arg(long, help = "Path to vault directory")]
         vault: PathBuf,
+        #[arg(
+            long,
+            help = "Report what would be created without writing to the graph"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Path to the database file")]
         db: Option<PathBuf>,
     },
@@ -13803,7 +13809,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::DetectImplicitProjects { vault, db } => {
+        Commands::DetectImplicitProjects { vault, dry_run, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
             if !vault.exists() || !vault.is_dir() {
@@ -13812,7 +13818,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // nw-161: NOT taken for --dry-run. The daemon RPC has no dry-run
+            // parameter, so routing a preview through it would perform the very
+            // writes the flag exists to avoid — the same shape as nw-186, where
+            // a daemon branch silently ignored the caller's flags. The local
+            // path opens read-only, so a preview cannot write by construction.
+            if use_daemon && !dry_run {
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory.
                 let vault_abs = abs_for_daemon(&vault);
@@ -13843,10 +13854,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let instance_id = "default";
             let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
 
-            let detected = detect_implicit_projects(&store, &vault, &vault_uid, instance_id)?;
+            let detected = nestweaver_engine::detect_implicit_projects_with_mode(
+                &store,
+                &vault,
+                &vault_uid,
+                instance_id,
+                dry_run,
+            )?;
 
             if detected.is_empty() {
-                println!("No implicit projects detected in {}", vault.display());
+                println!(
+                    "No implicit projects detected in {} (looked under {})",
+                    vault.display(),
+                    nestweaver_engine::project::PROJECT_CONTAINER_DIRS.join(", ")
+                );
+            } else if dry_run {
+                println!(
+                    "Would create {} implicit project(s) (dry run — nothing written):",
+                    detected.len()
+                );
+                for slug in &detected {
+                    println!("  {slug}");
+                }
             } else {
                 println!("Detected {} implicit project(s):", detected.len());
                 for slug in &detected {
