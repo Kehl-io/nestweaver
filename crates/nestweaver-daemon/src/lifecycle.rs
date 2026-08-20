@@ -47,6 +47,21 @@ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
     ))
 }
 
+/// Canonical path to use when *naming* a brain's local state.
+///
+/// Identity must survive a publication cutover, so it is anchored to the
+/// stable base database rather than the currently-selected slot. See
+/// [`nestweaver_engine::publication::instance_anchor_database`] (nw-145).
+///
+/// Deliberately NOT used by the write-lock probe, which must open the real
+/// selected graph, nor by [`legacy_instance_id_from_db_path`], which has to
+/// reproduce a historical hash exactly in order to clean up after it.
+fn identity_db_path(db_path: &Path) -> PathBuf {
+    canonical_db_path(&nestweaver_engine::publication::instance_anchor_database(
+        db_path,
+    ))
+}
+
 /// Full, stable identity of a database path for persistent local state.
 ///
 /// Unlike [`instance_id_from_db_path`], this is never truncated for a unix
@@ -56,7 +71,7 @@ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
 pub fn database_path_fingerprint(db_path: &Path) -> String {
     use sha2::{Digest, Sha256};
 
-    let canonical = canonical_db_path(db_path);
+    let canonical = identity_db_path(db_path);
     let canonical = if canonical.is_absolute() {
         canonical
     } else {
@@ -406,7 +421,7 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
 /// For a human-readable label (parent-dir + hash), use
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    let canonical = canonical_db_path(db_path);
+    let canonical = identity_db_path(db_path);
     // Use SHA-256 for a stable hash that won't change across Rust versions.
     // DefaultHasher (SipHash) is explicitly documented as not portable.
     use sha2::{Digest, Sha256};
@@ -425,7 +440,7 @@ pub fn instance_id_from_db_path(db_path: &Path) -> String {
 /// Never use this in path construction — use [`instance_id_from_db_path`]
 /// (the bare 8-char hash) to keep socket paths short.
 pub fn instance_label_from_db_path(db_path: &Path) -> String {
-    let canonical = canonical_db_path(db_path);
+    let canonical = identity_db_path(db_path);
     let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
@@ -2295,6 +2310,42 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    #[test]
+    fn daemon_identity_survives_a_publication_cutover() {
+        // nw-145: identity used to be derived from the selected path, so a
+        // cutover renamed the daemon. `daemon status`/`daemon stop --db
+        // <base>` then computed an id no running daemon had ever bound, and
+        // reported "Daemon is not running" while one was demonstrably
+        // serving the brain — the tool's own recovery advice was a no-op.
+        let base = Path::new("/data/brain.lbug");
+        let slot_graph = |uuid: &str| {
+            PathBuf::from(format!("/data/brain.lbug.publications/slots/{uuid}/graph.lbug"))
+        };
+        let before = slot_graph("550e8400-e29b-41d4-a716-446655440000");
+        let after = slot_graph("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+
+        let base_id = instance_id_from_db_path(base);
+        assert_eq!(instance_id_from_db_path(&before), base_id);
+        assert_eq!(
+            instance_id_from_db_path(&after),
+            base_id,
+            "a cutover to a new slot must not rename the daemon"
+        );
+
+        // The same anchoring applies to every derived local-state path.
+        assert_eq!(socket_path(&instance_id_from_db_path(&after)), socket_path(&base_id));
+        assert_eq!(
+            database_path_fingerprint(&after),
+            database_path_fingerprint(base)
+        );
+
+        // A different brain is still a different daemon.
+        assert_ne!(
+            instance_id_from_db_path(Path::new("/data/other.lbug")),
+            base_id
+        );
     }
 
     #[test]

@@ -552,6 +552,59 @@ fn validate_digest(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Map a database path back to the stable anchor that names its brain.
+///
+/// This is the syntactic inverse of [`resolve_selected_database`]: given a
+/// selected slot graph `<base>.publications/slots/<uuid>/graph.lbug` it
+/// returns `<base>`, and it returns any other path unchanged.
+///
+/// Local state that identifies a *brain* — daemon instance ids, socket and
+/// pidfile paths, log directories — must be derived from this anchor rather
+/// than from the selected path. A publication cutover moves `CURRENT` to a
+/// new slot, so a selected path is not a stable name: deriving identity from
+/// it renames the daemon out from under itself on every cutover, orphaning
+/// the running process and making `daemon status`/`daemon stop` report a
+/// different instance than the one actually serving the brain (nw-145).
+///
+/// This is deliberately syntactic: no filesystem access, no CURRENT read.
+/// It must keep working for a slot whose manifest is unreadable, which is
+/// precisely when an operator needs to stop the daemon.
+pub fn instance_anchor_database(db_path: &Path) -> PathBuf {
+    let is_graph = db_path.file_name().is_some_and(|n| n == PUBLICATION_GRAPH_FILE);
+    if !is_graph {
+        return db_path.to_path_buf();
+    }
+    // <root>/slots/<uuid>/graph.lbug — require the `slots` component so an
+    // unrelated file that happens to be named graph.lbug is left alone.
+    let Some(slot_dir) = db_path.parent() else {
+        return db_path.to_path_buf();
+    };
+    let Some(slots_dir) = slot_dir.parent() else {
+        return db_path.to_path_buf();
+    };
+    if slots_dir.file_name() != Some(std::ffi::OsStr::new("slots")) {
+        return db_path.to_path_buf();
+    }
+    let Some(root) = slots_dir.parent() else {
+        return db_path.to_path_buf();
+    };
+    // The root is `sidecar_path(base, ".publications")`, i.e. the suffix is
+    // appended to the whole base path, so strip it from the OS string rather
+    // than treating it as a file extension.
+    let root_os = root.as_os_str().as_encoded_bytes();
+    match root_os.strip_suffix(b".publications") {
+        Some(base) if !base.is_empty() => {
+            // SAFETY: `base` is a prefix of bytes returned by
+            // `as_encoded_bytes` split at an ASCII boundary, which the
+            // documented safety contract of `from_encoded_bytes_unchecked`
+            // permits.
+            let base = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(base) };
+            PathBuf::from(base)
+        }
+        _ => db_path.to_path_buf(),
+    }
+}
+
 pub fn current_pointer_path(publication_root: &Path) -> PathBuf {
     publication_root.join("CURRENT")
 }
@@ -1179,6 +1232,33 @@ mod tests {
         assert!(error.contains("compare-and-swap conflict"), "{error}");
         assert_eq!(read_current(dir.path()).unwrap(), Some(next));
         lease.release().unwrap();
+    }
+
+    #[test]
+    fn instance_anchor_inverts_slot_selection_and_leaves_other_paths_alone() {
+        let base = Path::new("/data/brain.lbug");
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let selected = slot_path(&default_publication_root(base), uuid)
+            .expect("valid uuid")
+            .join(PUBLICATION_GRAPH_FILE);
+
+        // The inverse of resolve_selected_database: a selected slot graph
+        // maps back to the base that names the brain.
+        assert_eq!(instance_anchor_database(&selected), base);
+
+        // A base path, and anything that is not a slot graph, is untouched.
+        assert_eq!(instance_anchor_database(base), base);
+        for other in [
+            "/data/graph.lbug",                        // no slots/ ancestor
+            "/data/brain.lbug.publications/slots/x",    // not the graph file
+            "/data/other/slots/x/graph.lbug",           // root lacks the suffix
+        ] {
+            assert_eq!(
+                instance_anchor_database(Path::new(other)),
+                Path::new(other),
+                "unrelated path rewritten: {other}"
+            );
+        }
     }
 
     #[test]
