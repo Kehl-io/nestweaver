@@ -991,33 +991,38 @@ impl GraphStore {
 
     /// Batch primary-key-oriented symbol hydration for derived-index hits.
     pub fn lookup_symbols_by_uids(&self, uids: &[String]) -> Result<Vec<Symbol>, StoreError> {
+        // nw-141: drive this through the primary-key index, NOT a filtered scan.
+        // A disjunction of equality predicates ("uid = $a OR uid = $b OR ...")
+        // is one non-EQUALS predicate to the planner, so it is never rewritten
+        // into a PRIMARY_KEY_SCAN and each chunk degenerates to a full table
+        // scan — cost tracked table size rather than result size (16.9s to
+        // hydrate from a 193k-row Symbol table for a <1KB result).
+        //
+        // UNWIND + a property-map match binds to a single EQUALS per element,
+        // which IS index-accelerated: N probes inside one query plan. This
+        // mirrors batch_lookup_symbols_impl above, which also documents the
+        // correctness reason — filtered scans can return garbled non-PK string
+        // values after delete+checkpoint cycles, while PK point lookups do not.
         const CHUNK: usize = 256;
         let conn = self.conn()?;
-        let mut symbols = Vec::new();
+        let mut symbols = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(CHUNK) {
             if chunk.is_empty() {
                 continue;
             }
-            let predicate = (0..chunk.len())
-                .map(|index| format!("s.uid = $uid{index}"))
+            let in_list: String = chunk
+                .iter()
+                .map(|u| format!("'{}'", u.replace('\'', "''")))
                 .collect::<Vec<_>>()
-                .join(" OR ");
-            let query = format!("MATCH (s:Symbol) WHERE {predicate} RETURN {SYMBOL_COLUMNS}");
-            let mut statement = conn
-                .prepare(&query)
-                .map_err(|error| StoreError::Query(format!("prepare symbol UID batch: {error}")))?;
-            let parameters = chunk
-                .iter()
-                .enumerate()
-                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
-                .collect::<Vec<_>>();
-            let parameter_refs = parameters
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.clone()))
-                .collect();
+                .join(", ");
+            let query = format!(
+                "UNWIND [{}] AS want_uid \
+                 MATCH (s:Symbol {{uid: want_uid}}) RETURN {}",
+                in_list, SYMBOL_COLUMNS
+            );
             let rows = conn
-                .execute(&mut statement, parameter_refs)
-                .map_err(|error| StoreError::Query(format!("execute symbol UID batch: {error}")))?;
+                .query(&query)
+                .map_err(|error| StoreError::Query(format!("symbol UID batch: {error}")))?;
             symbols.extend(
                 rows.map(|row| row_to_symbol(&row))
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1187,35 +1192,30 @@ impl GraphStore {
 
     /// Batch primary-key-oriented section hydration for derived-index hits.
     pub fn lookup_sections_by_uids(&self, uids: &[String]) -> Result<Vec<Section>, StoreError> {
+        // nw-141: primary-key probes via UNWIND, not a disjunction of equality
+        // predicates. An OR chain is a single non-EQUALS predicate to the
+        // planner, so it is never rewritten into a PRIMARY_KEY_SCAN and each
+        // chunk degenerates to a full table scan. See lookup_symbols_by_uids.
         const CHUNK: usize = 256;
         let conn = self.conn()?;
-        let mut sections = Vec::new();
+        let mut sections = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(CHUNK) {
             if chunk.is_empty() {
                 continue;
             }
-            let predicate = (0..chunk.len())
-                .map(|index| format!("s.uid = $uid{index}"))
+            let in_list: String = chunk
+                .iter()
+                .map(|u| format!("'{}'", u.replace('\'', "''")))
                 .collect::<Vec<_>>()
-                .join(" OR ");
-            let query = format!("MATCH (s:Section) WHERE {predicate} RETURN {SECTION_COLUMNS}");
-            let mut statement = conn.prepare(&query).map_err(|error| {
-                StoreError::Query(format!("prepare section UID batch: {error}"))
-            })?;
-            let parameters = chunk
-                .iter()
-                .enumerate()
-                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
-                .collect::<Vec<_>>();
-            let parameter_refs = parameters
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.clone()))
-                .collect();
+                .join(", ");
+            let query = format!(
+                "UNWIND [{}] AS want_uid \
+                 MATCH (s:Section {{uid: want_uid}}) RETURN {}",
+                in_list, SECTION_COLUMNS
+            );
             let rows = conn
-                .execute(&mut statement, parameter_refs)
-                .map_err(|error| {
-                    StoreError::Query(format!("execute section UID batch: {error}"))
-                })?;
+                .query(&query)
+                .map_err(|error| StoreError::Query(format!("section UID batch: {error}")))?;
             sections.extend(
                 rows.map(|row| row_to_section(&row))
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1703,33 +1703,30 @@ impl GraphStore {
 
     /// Batch primary-key-oriented note hydration for derived-index hits.
     pub fn lookup_notes_by_uids(&self, uids: &[String]) -> Result<Vec<Note>, StoreError> {
+        // nw-141: primary-key probes via UNWIND, not a disjunction of equality
+        // predicates. An OR chain is a single non-EQUALS predicate to the
+        // planner, so it is never rewritten into a PRIMARY_KEY_SCAN and each
+        // chunk degenerates to a full table scan. See lookup_symbols_by_uids.
         const CHUNK: usize = 256;
         let conn = self.conn()?;
-        let mut notes = Vec::new();
+        let mut notes = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(CHUNK) {
             if chunk.is_empty() {
                 continue;
             }
-            let predicate = (0..chunk.len())
-                .map(|index| format!("n.uid = $uid{index}"))
+            let in_list: String = chunk
+                .iter()
+                .map(|u| format!("'{}'", u.replace('\'', "''")))
                 .collect::<Vec<_>>()
-                .join(" OR ");
-            let query = format!("MATCH (n:Note) WHERE {predicate} RETURN {NOTE_COLUMNS}");
-            let mut statement = conn
-                .prepare(&query)
-                .map_err(|error| StoreError::Query(format!("prepare note UID batch: {error}")))?;
-            let parameters = chunk
-                .iter()
-                .enumerate()
-                .map(|(index, uid)| (format!("uid{index}"), Value::String(uid.clone())))
-                .collect::<Vec<_>>();
-            let parameter_refs = parameters
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.clone()))
-                .collect();
+                .join(", ");
+            let query = format!(
+                "UNWIND [{}] AS want_uid \
+                 MATCH (n:Note {{uid: want_uid}}) RETURN {}",
+                in_list, NOTE_COLUMNS
+            );
             let rows = conn
-                .execute(&mut statement, parameter_refs)
-                .map_err(|error| StoreError::Query(format!("execute note UID batch: {error}")))?;
+                .query(&query)
+                .map_err(|error| StoreError::Query(format!("note UID batch: {error}")))?;
             notes.extend(
                 rows.map(|row| row_to_note(&row))
                     .collect::<Result<Vec<_>, _>>()?,
