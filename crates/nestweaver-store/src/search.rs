@@ -146,9 +146,51 @@ struct EmbeddingBase {
     rows: Vec<EmbeddingBaseRow>,
     row_by_uid: HashMap<String, usize>,
     dimension: usize,
+    /// Byte range of the checksummed payload within `bytes`, retained so the
+    /// integrity check can run after load instead of during it (nw-184).
+    payload_range: std::ops::Range<usize>,
+    /// `payload_blake3` from the artifact envelope.
+    expected_payload_blake3: String,
+    /// Memoized result of the full-payload checksum. `OnceLock` so the hash
+    /// runs at most once per process and stays usable behind `&self`.
+    payload_verified: std::sync::OnceLock<bool>,
 }
 
 impl EmbeddingBase {
+    /// Verify the full payload checksum, at most once per process.
+    ///
+    /// nw-184: this hash used to run inside `load_binary_v2_storage`, so every
+    /// `GraphStore` open faulted in and hashed the entire embeddings sidecar.
+    /// On this project's own brain that file is 647 MB and the hash measured
+    /// ~345 ms of the 419 ms store open (boots without the file: 63-84 ms).
+    /// Because `load_embedding_index` runs in all four `GraphStore`
+    /// constructors including `open_read_only`, and v6.3.0 opens the selected
+    /// graph read-only on every CLI invocation once a CURRENT pointer exists,
+    /// every command paid that cost before doing any work — while the vast
+    /// majority never read a single vector.
+    ///
+    /// Deferring to first vector access is what comparable systems do: Lucene
+    /// stores a CRC32 footer but only verifies it in `checkIntegrity()` (run
+    /// at merge and by CheckIndex, not on open), and RocksDB verifies
+    /// per-block checksums when a block is actually read. The structural
+    /// checks that bound allocation and catch truncation stay eager, since
+    /// they are O(header) — only the O(payload) hash moves.
+    fn payload_intact(&self) -> bool {
+        *self.payload_verified.get_or_init(|| {
+            let payload = &self.bytes.as_ref()[self.payload_range.clone()];
+            let actual = blake3::hash(payload);
+            let intact = actual.to_hex().as_str() == self.expected_payload_blake3;
+            if !intact {
+                tracing::error!(
+                    expected = %self.expected_payload_blake3,
+                    actual = %actual.to_hex(),
+                    "embedding v2 payload checksum mismatch; ignoring the mapped base"
+                );
+            }
+            intact
+        })
+    }
+
     fn contains(&self, uid: &str) -> bool {
         self.row_by_uid.contains_key(uid)
     }
@@ -697,6 +739,17 @@ impl EmbeddingIndex {
     ) -> Result<EmbeddingArtifactEnvelopeV2, anyhow::Error> {
         use std::io::Write;
         pipeline.validate().map_err(anyhow::Error::msg)?;
+        // nw-184: the base checksum is verified lazily on read, but the write
+        // path must stay fail-closed — re-publishing an unverified base would
+        // launder corruption into a freshly computed checksum that then looks
+        // authoritative. This path reads every vector anyway, so verifying
+        // here costs nothing extra.
+        if let Some(base) = &self.base {
+            anyhow::ensure!(
+                base.payload_intact(),
+                "embedding v2 payload checksum mismatch"
+            );
+        }
         let entries = self.snapshot_entries();
         let dimension = self.dimension().unwrap_or(0);
         anyhow::ensure!(
@@ -793,14 +846,15 @@ impl EmbeddingIndex {
             "embedding envelope pipeline dimension mismatch"
         );
         let payload = &data[16 + envelope_len..];
+        // Captured before `storage` is moved into the base below.
+        let payload_end = data.len();
         anyhow::ensure!(
             payload.len() as u64 == envelope.uid_table_bytes + envelope.vector_bytes,
             "embedding v2 payload length mismatch"
         );
-        anyhow::ensure!(
-            blake3::hash(payload).to_hex().as_str() == envelope.payload_blake3,
-            "embedding v2 payload checksum mismatch"
-        );
+        // nw-184: the full-payload blake3 is NOT computed here. It is deferred
+        // to the first vector access; see `EmbeddingBase::payload_intact`.
+        // Everything below is O(header) or O(uid table) and stays eager.
         // nw-143: `count` lives in the envelope, which is NOT covered by
         // payload_blake3 above — only the payload after it is. Feeding an
         // untrusted length straight to Vec::with_capacity turns one edited or
@@ -876,6 +930,9 @@ impl EmbeddingIndex {
                 rows,
                 row_by_uid,
                 dimension,
+                payload_range: (16 + envelope_len)..payload_end,
+                expected_payload_blake3: envelope.payload_blake3.clone(),
+                payload_verified: std::sync::OnceLock::new(),
             }),
             deleted_base_uids: HashSet::new(),
             force_cleared: false,
@@ -1138,6 +1195,10 @@ impl EmbeddingIndex {
             .base
             .as_ref()
             .filter(|base| base.dimension == query_vec.len())
+            // nw-184: the payload checksum is verified here, on first use,
+            // rather than at open. A base that fails is dropped, so a corrupt
+            // sidecar yields overlay-only results instead of wrong vectors.
+            .filter(|base| base.payload_intact())
             .map(|base| {
                 base.rows
                     .par_iter()
@@ -1257,6 +1318,10 @@ impl EmbeddingIndex {
             .base
             .as_ref()
             .filter(|base| base.dimension == query_vec.len())
+            // nw-184: the payload checksum is verified here, on first use,
+            // rather than at open. A base that fails is dropped, so a corrupt
+            // sidecar yields overlay-only results instead of wrong vectors.
+            .filter(|base| base.payload_intact())
             .map(|base| {
                 base.rows
                     .par_iter()
@@ -1297,7 +1362,8 @@ impl EmbeddingIndex {
         if self.deleted_base_uids.contains(uid) {
             return None;
         }
-        let base = self.base.as_ref()?;
+        // nw-184: never hand back a vector from an unverified payload.
+        let base = self.base.as_ref().filter(|base| base.payload_intact())?;
         base.row_by_uid.get(uid).map(|row| base.vector_at(*row))
     }
 
@@ -2292,13 +2358,40 @@ mod tests {
         assert_eq!(loaded.get("sym:alpha"), Some(vec![0.1, 0.2, 0.3]));
         assert_eq!(loaded.get("sym:beta"), Some(vec![0.4, 0.5, 0.6]));
 
+        // nw-184: the payload checksum is verified on first vector access,
+        // not at load, so that a `GraphStore` open does not hash the whole
+        // sidecar. The guarantee that matters is unchanged: a corrupt payload
+        // never yields a vector, and re-publishing it is refused.
         let mut corrupt = std::fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 0xff;
-        let error = match EmbeddingIndex::load_binary_v2_bytes(&corrupt) {
-            Ok(_) => panic!("corrupt embedding payload must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("checksum mismatch"));
+        let corrupt = EmbeddingIndex::load_binary_v2_bytes(&corrupt)
+            .expect("structural load succeeds; the payload hash is deferred");
+
+        assert_eq!(
+            corrupt.get("sym:alpha"),
+            None,
+            "a corrupt base must not serve vectors"
+        );
+        assert!(
+            corrupt
+                .vector_search_filtered(&[0.1, 0.2, 0.3], 10, None)
+                .is_empty(),
+            "a corrupt base must not contribute search results"
+        );
+
+        // The write path stays fail-closed: republishing an unverified base
+        // would launder corruption into a freshly computed checksum.
+        let republish = corrupt.save_binary_v2(
+            &dir.path().join("republished.bin"),
+            &identity,
+            42,
+            &pipeline,
+        );
+        let error = republish.expect_err("republishing a corrupt base must fail");
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
