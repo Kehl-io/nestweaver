@@ -10943,17 +10943,43 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // shape; the advisory banner stays silent on a trivial (empty) diff.
             if changed_files.is_empty() && !sarif {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "changed_symbols": [],
-                            "affected_symbols": [],
-                            "affected_clusters": [],
-                            "breaking_changes": [],
-                            "risk_level": "Low",
-                            "summary": "No changed files detected.",
-                        }))?
-                    );
+                    // nw-158: this path used to hand-build a partial object
+                    // omitting `status`, `gate_state`, `coverage`,
+                    // `blind_spots`, `notifications` and `_meta` — the very
+                    // fields the MCP tool description tells consumers to read
+                    // BEFORE trusting a green result. A gate keying on
+                    // `gate_state != "ok"` saw undefined and passed, and the
+                    // empty-diff run is exactly the run that reports "Low".
+                    //
+                    // Serialize the REAL type so the contract cannot drift from
+                    // the populated path again. An empty diff is an analysis
+                    // that ran to completion over nothing: Complete and Ok are
+                    // the honest values, not the conservative DegradedUnknown
+                    // default that exists for old results with no field.
+                    let empty = nestweaver_engine::blast_radius::BlastRadiusResult {
+                        changed_symbols: Vec::new(),
+                        affected_symbols: Vec::new(),
+                        affected_symbol_count: 0,
+                        affected_clusters: Vec::new(),
+                        risk_level: RiskLevel::Low,
+                        summary: "No changed files detected.".to_string(),
+                        org_wide: None,
+                        status: nestweaver_engine::blast_radius::AnalysisStatus::Complete,
+                        notifications: Vec::new(),
+                        gate_state: nestweaver_engine::blast_radius::GateState::Ok,
+                        coverage: nestweaver_engine::blast_radius::Coverage::default(),
+                        blind_spots: Vec::new(),
+                        cochanged_files: Vec::new(),
+                        analysis_direction: "over-approximate".to_string(),
+                    };
+                    let mut payload = serde_json::to_value(&empty)?;
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "breaking_changes".to_string(),
+                            serde_json::to_value(&breaking_changes)?,
+                        );
+                    }
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
                 }
                 // Advisory banner: silent when trivial (nothing to review).
                 return Ok((EXIT_SUCCESS, None));
