@@ -157,6 +157,35 @@ pub fn parse_spec_file(path: &str, source: &str) -> Vec<SpecContract> {
 
 /// Parse a watched spec without the full-indexer's best-effort fallback.
 ///
+/// Turn an OpenAPI deserialization failure into something actionable (nw-191).
+///
+/// The `openapiv3` crate models OpenAPI 3.0 only — its own documentation states
+/// it "does not cover OpenAPI v3.1 which was an incompatible change". 3.1
+/// dropped the `nullable` keyword in favour of `type` accepting an ARRAY with
+/// `null` as a member, so a valid 3.1 document fails with a raw serde message
+/// like "components.schemas: invalid type: sequence, expected a string" — which
+/// says nothing about the real cause being the spec VERSION.
+///
+/// Detect the declared version and say so. This does not make 3.1 parse; it
+/// stops the operator from debugging their schema when the parser is the
+/// problem.
+fn explain_openapi_error(source: &str, error: &str) -> String {
+    let declared_31 = source.lines().take(40).any(|line| {
+        let line = line.trim();
+        (line.starts_with("openapi:") || line.starts_with("\"openapi\""))
+            && line.contains("3.1")
+    });
+    if declared_31 {
+        format!(
+            "this document declares OpenAPI 3.1, which is not supported \
+             (the parser models 3.0; 3.1 replaced `nullable` with `type` arrays \
+             such as `type: [string, \"null\"]`). Underlying error: {error}"
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 /// A live watcher replaces an already-published contract graph, so treating a
 /// transient or malformed save as an empty spec would incorrectly clear the
 /// prior contracts. Watcher planning uses this strict seam before opening its
@@ -168,10 +197,10 @@ pub(crate) fn parse_spec_file_strict(
     match spec_kind(path) {
         Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source)
             .map(|spec| openapi_contracts(&spec))
-            .map_err(|error| error.to_string()),
+            .map_err(|error| explain_openapi_error(source, &error.to_string())),
         Some(SpecFileKind::OpenApiJson) => serde_json::from_str::<openapiv3::OpenAPI>(source)
             .map(|spec| openapi_contracts(&spec))
-            .map_err(|error| error.to_string()),
+            .map_err(|error| explain_openapi_error(source, &error.to_string())),
         Some(SpecFileKind::Proto) => protox_parse::parse(path, source)
             .map(|_| parse_proto(path, source))
             .map_err(|error| error.to_string()),
@@ -2376,5 +2405,46 @@ paths:
             Some("typescript")
         );
         assert_eq!(framework_language_str(Language::Rust), None);
+    }
+}
+#[cfg(test)]
+mod openapi_version_tests {
+    use super::parse_spec_file_strict;
+
+    /// nw-191: a 3.1 document must fail with a message naming the real cause.
+    /// The raw serde error ("invalid type: sequence, expected a string") sends
+    /// the operator to debug their schema when the parser is the problem.
+    #[test]
+    fn an_openapi_31_document_reports_the_version_as_the_cause() {
+        let spec = concat!(
+            "openapi: 3.1.0\n",
+            "info:\n  title: t\n  version: '1'\n",
+            "paths: {}\n",
+            "components:\n",
+            "  schemas:\n",
+            "    Thing:\n",
+            "      type: [string, \"null\"]\n",
+        );
+        let error = parse_spec_file_strict("docs/api/openapi.yaml", spec)
+            .expect_err("3.1 type arrays are not supported by the 3.0 parser");
+        assert!(
+            error.contains("OpenAPI 3.1"),
+            "error must name the version as the cause: {error}"
+        );
+        assert!(
+            error.contains("type: [string"),
+            "error should show the 3.1 construct: {error}"
+        );
+    }
+
+    /// A genuinely malformed 3.0 document keeps its original error, unchanged.
+    #[test]
+    fn a_malformed_30_document_is_not_mislabelled() {
+        let error = parse_spec_file_strict("openapi.yaml", "openapi: [unfinished")
+            .expect_err("malformed yaml must still fail");
+        assert!(
+            !error.contains("OpenAPI 3.1"),
+            "must not blame 3.1 for unrelated breakage: {error}"
+        );
     }
 }

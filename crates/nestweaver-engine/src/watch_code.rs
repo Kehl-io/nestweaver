@@ -1250,10 +1250,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
 
-        // Corrupt b.js with invalid UTF-8 so `read_to_string` fails.
+        // nw-190: invalid UTF-8 is now decoded lossily and is NOT a read
+        // failure, so it can no longer stand in for one. Use genuinely
+        // binary content (a NUL byte), which the reader refuses with a
+        // typed BinarySource -- the property under test is that a file the
+        // reader cannot handle skips before publication and preserves the
+        // previously indexed symbols.
         std::fs::write(
             canonical_root.join("src/b.js"),
-            b"export function alpha() { return \xff\xfe; }\n",
+            b"export function alpha() { return 1; }\n\x00binary",
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");

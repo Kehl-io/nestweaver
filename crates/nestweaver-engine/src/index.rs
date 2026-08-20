@@ -11481,9 +11481,12 @@ function hello(name) { return "Hello " + name; }
         let repo_url = "https://example.com/transient-read";
         index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
 
-        fs::write(repo.join("main.rs"), [0xff, 0xfe, 0xfd]).unwrap();
+        // nw-190: invalid UTF-8 now decodes lossily and is no longer a read
+        // failure, so it cannot stand in for one. Use genuinely binary content
+        // (a NUL byte), which the reader refuses with a typed BinarySource.
+        fs::write(repo.join("main.rs"), [0x00, 0xfe, 0xfd]).unwrap();
         git(&["add", "main.rs"]);
-        git(&["commit", "-q", "-m", "invalid-utf8"]);
+        git(&["commit", "-q", "-m", "binary-source"]);
         let error = incremental_index_with_name_and_limits(
             &repo,
             &db_path,

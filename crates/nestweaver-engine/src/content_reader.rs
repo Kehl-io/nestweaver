@@ -23,6 +23,18 @@ pub struct SourceTooLarge {
     pub limit_bytes: u64,
 }
 
+/// A source was skipped because it is binary, not text (nw-190).
+///
+/// Detected with the NUL-byte heuristic shared by ripgrep, git and grep: a file
+/// is binary iff it contains a NUL byte in its leading window. Lossily decoding
+/// such a file would mint garbage symbols, so it is skipped instead — but as a
+/// typed, per-file error the caller can tolerate, never as a repo-fatal one.
+#[derive(Debug, thiserror::Error)]
+#[error("source {path} is binary (contains a NUL byte); skipped")]
+pub struct BinarySource {
+    pub path: String,
+}
+
 /// Maximum time to wait for a single `git cat-file --batch` response.
 ///
 /// A hung-but-alive git process (e.g. a wedged pack read on a corrupt or
@@ -111,10 +123,32 @@ impl ContentReader for FilesystemReader {
         let file = std::fs::File::open(&abs)
             .map_err(|e| anyhow::anyhow!("open {}: {e}", abs.display()))?;
         let mut bounded = file.take(self.limits.max_source_file_bytes() + 1);
-        let mut source = String::new();
+        // nw-190: read bytes and decode lossily rather than read_to_string, which
+        // hard-errors on invalid UTF-8. Every call site propagates that error with
+        // `?`, so ONE bad file aborted the whole repository index -- a reporter lost
+        // ~350k symbols because exactly one of 2,429 non-UTF-8 tracked files had a
+        // parseable source extension.
+        //
+        // from_utf8_lossy returns Cow::Borrowed with NO allocation when the input is
+        // already valid UTF-8, so the overwhelmingly common path costs nothing; only
+        // a file that genuinely contains invalid bytes allocates, and those bytes
+        // become U+FFFD. A stray Latin-1 byte in a legacy JS comment therefore still
+        // yields that file's symbols.
+        let mut raw = Vec::new();
         bounded
-            .read_to_string(&mut source)
+            .read_to_end(&mut raw)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))?;
+        // Genuinely binary content would decode into garbage symbols, so skip it
+        // using the NUL-byte heuristic that ripgrep, git and grep all use: a file is
+        // binary iff it contains a NUL, tested over the leading window.
+        const BINARY_SNIFF_BYTES: usize = 8192;
+        if raw[..raw.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+            return Err(BinarySource {
+                path: rel_path.display().to_string(),
+            }
+            .into());
+        }
+        let source = String::from_utf8_lossy(&raw).into_owned();
         if source.len() as u64 > self.limits.max_source_file_bytes() {
             return Err(SourceTooLarge {
                 path: rel_path.display().to_string(),
@@ -1266,5 +1300,67 @@ mod tests {
         let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
         assert_eq!(oversized.observed_bytes, limit + 1);
         assert_eq!(oversized.limit_bytes, limit);
+    }
+}
+#[cfg(test)]
+mod non_utf8_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// nw-190: invalid UTF-8 must not abort the read. A reporter lost ~350k
+    /// symbols because exactly one of 2,429 non-UTF-8 tracked files had a
+    /// parseable source extension and read_to_string hard-errored.
+    #[test]
+    fn invalid_utf8_decodes_lossily_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.js");
+        // Valid JS with a stray Latin-1 byte in a comment, as in older sources.
+        let mut bytes = b"// copyright \xA9 2004\nfunction cleanPaste() { return 1; }\n".to_vec();
+        bytes.push(0xFF);
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let reader = FilesystemReader::new(dir.path());
+        let source = reader
+            .read_file(Path::new("legacy.js"))
+            .expect("invalid UTF-8 must not fail the read");
+        assert!(
+            source.contains("function cleanPaste()"),
+            "the file's real content must survive: {source:?}"
+        );
+        assert!(
+            source.contains('\u{FFFD}'),
+            "invalid bytes should become the replacement character"
+        );
+    }
+
+    /// Binary content would mint garbage symbols, so it is refused -- but with a
+    /// typed error the caller skips, never a repo-fatal one.
+    #[test]
+    fn binary_content_is_refused_with_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.js");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[0x4d, 0x5a, 0x00, 0x01, 0x02, 0x03])
+            .unwrap();
+
+        let reader = FilesystemReader::new(dir.path());
+        let error = reader
+            .read_file(Path::new("blob.js"))
+            .expect_err("binary must be refused");
+        assert!(
+            error.downcast_ref::<BinarySource>().is_some(),
+            "must be a typed BinarySource so the caller can skip it: {error}"
+        );
+    }
+
+    /// Valid UTF-8 is unchanged and takes the zero-allocation Cow path.
+    #[test]
+    fn valid_utf8_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.js"), "const a = '\u{1F600}';\n").unwrap();
+        let reader = FilesystemReader::new(dir.path());
+        let source = reader.read_file(Path::new("ok.js")).unwrap();
+        assert_eq!(source, "const a = '\u{1F600}';\n");
     }
 }
