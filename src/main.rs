@@ -15979,30 +15979,34 @@ fn resolve_uid_with_repo_filter(
     repo_filter: Option<&str>,
 ) -> anyhow::Result<ResolveResult> {
     let result = resolve_uid(store, name_or_uid)?;
-    match (&result, repo_filter) {
-        (ResolveResult::Ambiguous(candidates), Some(filter)) => {
-            let filter_lower = filter.to_lowercase();
+    let Some(filter) = repo_filter else {
+        return Ok(result);
+    };
 
-            // Build a repo_uid → display_name map for matching
-            let repos = list_repos(store, None)?;
-            let repo_names: std::collections::HashMap<String, String> = repos
-                .iter()
-                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-                .collect();
+    let filter_lower = filter.to_lowercase();
+    // Build a repo_uid → display_name map for matching
+    let repos = list_repos(store, None)?;
+    let repo_names: std::collections::HashMap<String, String> = repos
+        .iter()
+        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+        .collect();
+    let matches_filter = |s: &Symbol| -> bool {
+        // Match by repo display name (primary — supports --name overrides)
+        if let Some(name) = repo_names.get(&s.repo_uid)
+            && name.to_lowercase().contains(&filter_lower)
+        {
+            return true;
+        }
+        // Fallback: file_path prefix or UID substring
+        s.file_path.to_lowercase().starts_with(&filter_lower)
+            || s.uid.to_lowercase().contains(&filter_lower)
+    };
 
+    match &result {
+        ResolveResult::Ambiguous(candidates) => {
             let filtered: Vec<Symbol> = candidates
                 .iter()
-                .filter(|s| {
-                    // Match by repo display name (primary — supports --name overrides)
-                    if let Some(name) = repo_names.get(&s.repo_uid)
-                        && name.to_lowercase().contains(&filter_lower)
-                    {
-                        return true;
-                    }
-                    // Fallback: file_path prefix or UID substring
-                    s.file_path.to_lowercase().starts_with(&filter_lower)
-                        || s.uid.to_lowercase().contains(&filter_lower)
-                })
+                .filter(|s| matches_filter(s))
                 .cloned()
                 .collect();
             match filtered.len() {
@@ -16011,7 +16015,30 @@ fn resolve_uid_with_repo_filter(
                 _ => Ok(ResolveResult::Ambiguous(filtered)),
             }
         }
-        _ => Ok(result),
+        // nw-154: apply the filter to a UNIQUELY-resolving name too.
+        //
+        // This arm previously fell through a `_ => Ok(result)` catch-all, so
+        // --repo was silently ignored for any name that resolved uniquely —
+        // including a repo UID that does not exist. `impact <sym>` with no
+        // filter, with a bogus filter, and with a filter naming a repo that
+        // does not contain the symbol all returned byte-identical results and
+        // exit 0. A CI gate scoped to one repo therefore analysed the whole
+        // graph and passed.
+        ResolveResult::Found(uid) => {
+            let symbols = store
+                .lookup_symbols_by_uids(std::slice::from_ref(uid))
+                .map_err(|e| anyhow::anyhow!("resolve repo filter for {uid}: {e}"))?;
+            match symbols.first() {
+                Some(symbol) if matches_filter(symbol) => Ok(result),
+                // Resolved, but outside the requested repo: report not-found
+                // rather than returning an unfiltered answer.
+                Some(_) => Ok(ResolveResult::NotFound),
+                // Could not re-read the symbol to verify. Do not silently drop
+                // a real result on a lookup failure.
+                None => Ok(result),
+            }
+        }
+        ResolveResult::NotFound => Ok(result),
     }
 }
 
