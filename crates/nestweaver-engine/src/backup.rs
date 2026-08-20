@@ -34,6 +34,12 @@ const SIDECAR_SUFFIXES: &[&str] = &[
 /// `PublicationBundleV3` inventory used by snapshots and publication cutover.
 const MANIFEST_VERSION: u32 = 2;
 
+/// Hard ceiling for the in-archive `publication.json`, which is the only member
+/// read into memory rather than streamed. It is a JSON inventory of artifact
+/// descriptors — a few hundred KB even for a large publication — so 64 MiB is
+/// generous while still bounding a hostile or corrupt header (nw-144).
+const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub db_path: PathBuf,
@@ -377,9 +383,28 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
             let m: BackupManifest = serde_json::from_reader(&mut entry)?;
             manifest = Some(m);
         } else if normalized == crate::publication::PUBLICATION_MANIFEST_FILE {
+            // nw-144: `size` is the untrusted tar header field. Pre-allocating
+            // from it turns a crafted or bit-rotted 8-byte header into an
+            // unbounded allocation, and Rust's alloc handler ABORTS the process
+            // (uncatchable) — a 48 KB archive was enough to kill `backup
+            // inspect` and `backup list` (CWE-789). publication.json is a small
+            // JSON manifest, so read it through a hard cap instead; every
+            // sibling member below is already streamed for the same reason.
             let size = entry.header().size()?;
-            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
-            std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+            anyhow::ensure!(
+                size <= MAX_PUBLICATION_MANIFEST_BYTES,
+                "publication.json declares {size} bytes, above the {MAX_PUBLICATION_MANIFEST_BYTES}-byte ceiling"
+            );
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(&mut entry, MAX_PUBLICATION_MANIFEST_BYTES),
+                &mut bytes,
+            )?;
+            anyhow::ensure!(
+                bytes.len() as u64 == size,
+                "publication.json is {} bytes but its header declares {size}",
+                bytes.len()
+            );
             archive_file_sizes.insert(normalized.clone(), size);
             let (sha256, blake3) = hash_stream_both(std::io::Cursor::new(&bytes))?;
             archive_checksums.insert(normalized.clone(), sha256);

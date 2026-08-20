@@ -801,6 +801,37 @@ impl EmbeddingIndex {
             blake3::hash(payload).to_hex().as_str() == envelope.payload_blake3,
             "embedding v2 payload checksum mismatch"
         );
+        // nw-143: `count` lives in the envelope, which is NOT covered by
+        // payload_blake3 above — only the payload after it is. Feeding an
+        // untrusted length straight to Vec::with_capacity turns one edited or
+        // bit-rotted 8-byte field into an unbounded allocation, and Rust's
+        // alloc error handler ABORTS the process (uncatchable), taking down
+        // search, brain status, backup save and snapshot build alike (CWE-789).
+        //
+        // Both bounds are derivable from bytes already proven present, so this
+        // costs nothing: every uid needs at least a 2-byte length plus 1 byte,
+        // and the vector region pins the count exactly.
+        let dimension_bytes = (envelope.dimension as u64)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| anyhow::anyhow!("embedding envelope has zero dimension"))?;
+        anyhow::ensure!(
+            envelope.vector_bytes % dimension_bytes == 0,
+            "embedding vector region {} is not a multiple of the row size {dimension_bytes}",
+            envelope.vector_bytes
+        );
+        anyhow::ensure!(
+            envelope.count == envelope.vector_bytes / dimension_bytes,
+            "implausible embedding count {}: vector region holds {} rows",
+            envelope.count,
+            envelope.vector_bytes / dimension_bytes
+        );
+        anyhow::ensure!(
+            envelope.count <= envelope.uid_table_bytes / 3,
+            "implausible embedding count {}: uid table is only {} bytes",
+            envelope.count,
+            envelope.uid_table_bytes
+        );
         let uid_end = envelope.uid_table_bytes as usize;
         let mut offset = 0usize;
         let mut uids = Vec::with_capacity(envelope.count as usize);
@@ -2436,6 +2467,44 @@ mod tests {
         let compacted = GraphStore::open(&db_path).unwrap();
         assert!(compacted.has_embedding("first"));
         assert!(compacted.has_embedding("second"));
+    }
+
+    /// nw-143: `count` is outside payload_blake3's coverage, so a tampered or
+    /// bit-rotted field must be rejected as an ERROR, never fed to
+    /// Vec::with_capacity (which aborts the process, uncatchably).
+    #[test]
+    fn an_implausible_embedding_count_is_rejected_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poisoned.bin");
+        let pipeline = test_pipeline("model-a", 2);
+        let identity = test_identity();
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add_with_pipeline("a", vec![1.0, 0.0], &pipeline, false));
+        index.save_binary_v2(&path, &identity, 1, &pipeline).unwrap();
+
+        // Rewrite ONLY the envelope's count field, leaving the payload (and so
+        // payload_blake3) untouched — exactly what a bit flip in that field does.
+        let data = std::fs::read(&path).unwrap();
+        let envelope_len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&data[16..16 + envelope_len]).unwrap();
+        envelope["count"] = serde_json::json!(2_u64.pow(42));
+        let re_encoded = serde_json::to_vec(&envelope).unwrap();
+        let mut poisoned = Vec::new();
+        poisoned.extend_from_slice(&data[0..8]);
+        poisoned.extend_from_slice(&(re_encoded.len() as u64).to_le_bytes());
+        poisoned.extend_from_slice(&re_encoded);
+        poisoned.extend_from_slice(&data[16 + envelope_len..]);
+        std::fs::write(&path, &poisoned).unwrap();
+
+        let error = match EmbeddingIndex::load_binary_v2(&path) {
+            Ok(_) => panic!("a 2^42 count must be rejected, not allocated"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("implausible embedding count"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
