@@ -3601,7 +3601,17 @@ sub b body
         assert_eq!(notes.len(), 1);
         assert_eq!(
             notes[0].vault_uid,
-            nestweaver_schema::vault_uid("owned", &root.to_string_lossy())
+            nestweaver_schema::vault_uid(
+                "owned",
+                // nw-138b: the directory-based indexer canonicalizes the vault root before
+                // deriving the uid (index_md.rs:202/251). Tests must do the same, or on
+                // macOS - where TMPDIR resolves through /private - they compute a
+                // different uid than the code under test. The reader-based variant does
+                // NOT canonicalize, so its tests must keep using the raw root.
+                &std::fs::canonicalize(&root)
+                    .unwrap_or_else(|_| root.clone())
+                    .to_string_lossy(),
+            )
         );
         assert_eq!(notes[0].title, "A");
     }
@@ -3965,7 +3975,17 @@ sub b body
         )
         .unwrap();
         assert_eq!(result.notes_updated, 0);
-        let uid = vault_uid("owned", &root.to_string_lossy());
+        let uid = vault_uid(
+            "owned",
+            // nw-138b: the directory-based indexer canonicalizes the vault root before
+                // deriving the uid (index_md.rs:202/251). Tests must do the same, or on
+                // macOS - where TMPDIR resolves through /private - they compute a
+                // different uid than the code under test. The reader-based variant does
+                // NOT canonicalize, so its tests must keep using the raw root.
+            &std::fs::canonicalize(&root)
+                .unwrap_or_else(|_| root.clone())
+                .to_string_lossy(),
+        );
         assert_eq!(store.lookup_vault(&uid).unwrap().name, "empty");
         let generation = store.graph_generation();
 

@@ -6412,11 +6412,14 @@ mod tests {
     /// wait for it (which reaps the zombie), and return its now-free pid.
     /// `kill(pid, 0)` then reports ESRCH deterministically.
     fn reaped_child_pid() -> i32 {
-        let mut child = std::process::Command::new("/bin/true")
+        let mut child = // nw-138: resolve via PATH. macOS ships true at /usr/bin/true and has
+            // no /bin/true, so hardcoding the path failed 13 tests on every macOS
+            // dev machine while passing in Linux CI.
+            std::process::Command::new("true")
             .spawn()
-            .expect("spawn /bin/true");
+            .expect("spawn true");
         let pid = child.id() as i32;
-        child.wait().expect("reap /bin/true");
+        child.wait().expect("reap true");
         assert!(
             !crate::index_publication::process_is_alive(pid),
             "a reaped child must not read as alive"
