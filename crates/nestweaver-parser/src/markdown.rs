@@ -189,7 +189,7 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     let word_count = u32::try_from(body.split_whitespace().count()).unwrap_or(u32::MAX);
 
     // 7. Extract headings and sections from the body; annotate callout types.
-    let headings = extract_headings(body);
+    let mut headings = extract_headings(body);
     let mut sections = extract_sections(body, &headings);
     for sec in sections.iter_mut() {
         sec.callout_type = extract_callout_type(&sec.text);
@@ -222,6 +222,43 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
 
     // 11. Obsidian block references (`^block-id`).
     let block_refs = extract_block_refs(body);
+
+    // nw-185: shift every line number from body-relative to FILE-absolute.
+    //
+    // Headings and sections were built against `body`, which excludes the
+    // frontmatter block, but every consumer renders them as `file:line` --
+    // regex.rs computes `file_line = start_line + line_in_text - 1` and prints
+    // it as a location. The result was short by exactly the frontmatter length
+    // and self-contradictory: a hit reported at line 32 quoted text that lives
+    // at line 43. The offset was baked into stored data, so the heading UID of
+    // a note whose H1 sits at file line 12 ended in `:2`.
+    //
+    // Shifting here, once, keeps all the body-relative slicing above correct
+    // while making everything that leaves this function file-absolute.
+    let frontmatter_lines = source.lines().count() - body.lines().count();
+    if frontmatter_lines > 0 {
+        let shift = frontmatter_lines as u32;
+        for heading in &mut headings {
+            heading.start_line += shift;
+            heading.end_line += shift;
+        }
+        for section in &mut sections {
+            section.start_line += shift;
+            section.end_line += shift;
+        }
+        for wikilink in &mut wikilinks {
+            // Frontmatter links are recorded with line 0 (no body line); leave
+            // them alone rather than inventing a position.
+            if wikilink.line > 0 {
+                wikilink.line += shift;
+            }
+        }
+        for tag in &mut tags {
+            if tag.line > 0 {
+                tag.line += shift;
+            }
+        }
+    }
 
     Ok(ParsedNote {
         path: rel_path.to_string(),
@@ -1371,11 +1408,29 @@ top 2 body
     }
 
     #[test]
-    fn frontmatter_does_not_shift_heading_line_numbers() {
-        // Body line 1 = "# After FM", regardless of frontmatter length.
+    fn heading_line_numbers_are_file_absolute() {
+        // nw-185: REVERSES the previous contract, which made this body-relative
+        // ("body line 1 = the first heading, regardless of frontmatter length").
+        //
+        // Nothing slices content by these numbers -- read_symbols excludes
+        // notes, and note_get returns stored section text -- but every consumer
+        // RENDERS them as `file:line`. regex.rs computes
+        // `file_line = start_line + line_in_text - 1` and prints it as a
+        // location, so results were short by exactly the frontmatter length and
+        // self-contradictory: a hit reported at line 32 quoted text living at
+        // line 43. Code symbols are already file-absolute, so notes now match.
         let src = "---\ntitle: x\nfoo: bar\nbaz: qux\n---\n# After FM\nbody\n";
         let note = parse_markdown("x.md", src).unwrap();
         assert_eq!(note.headings.len(), 1);
+        assert_eq!(
+            note.headings[0].start_line, 6,
+            "5 frontmatter lines + the heading on file line 6"
+        );
+    }
+
+    #[test]
+    fn a_note_without_frontmatter_is_unshifted() {
+        let note = parse_markdown("x.md", "# Top\nbody\n").unwrap();
         assert_eq!(note.headings[0].start_line, 1);
     }
 
