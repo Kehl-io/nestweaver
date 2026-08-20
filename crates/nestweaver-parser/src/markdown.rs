@@ -771,13 +771,20 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
             // supports non-ASCII tags, and a truncated stem can collide with an
             // unrelated real tag (nw-116).
             let mut prev: Option<char> = None;
+            let mut prev2: Option<char> = None;
             let mut chars = line_text.char_indices().peekable();
             while let Some((idx, ch)) = chars.next() {
                 let is_boundary = match prev {
                     None => true,
                     Some(p) => matches!(p, ' ' | '\t' | '(' | '[' | ',' | ';'),
                 };
-                if ch == '#' && is_boundary {
+                // nw-167: `](#` opens a markdown in-page link, not a tag.
+                // Accepting `(` as a boundary turned every table-of-contents
+                // entry into one: all 46 anchor targets in the reference vault
+                // were indexed as tags (#1-document-purpose ... #the-verdict),
+                // distorting top_tags, the tag graph and every `tags=` filter.
+                let is_markdown_anchor = prev == Some('(') && prev2 == Some(']');
+                if ch == '#' && is_boundary && !is_markdown_anchor {
                     let start = idx + ch.len_utf8();
                     let mut end = start;
                     while let Some(&(j, c)) = chars.peek() {
@@ -792,7 +799,19 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                         let name = line_text[start..end].to_lowercase();
                         // Skip bare `#` (no name), pure-numeric tags like #1 (often markdown
                         // issue refs), and trailing-hyphen artefacts.
-                        if !name.is_empty() && name.chars().any(|c| c.is_alphabetic()) {
+                        //
+                        // nw-167: also skip hex colours written in prose, e.g.
+                        // `(#F5F5F5)` or `(#03a9f4)` -- 91 of the reference
+                        // vault's 659 tags were colour literals. Requiring a
+                        // digit keeps word-shaped tags that happen to be all
+                        // hex letters, such as `#abc` or `#faced`.
+                        let is_hex_colour = matches!(name.len(), 3 | 6 | 8)
+                            && name.chars().all(|c| c.is_ascii_hexdigit())
+                            && name.chars().any(|c| c.is_ascii_digit());
+                        if !name.is_empty()
+                            && name.chars().any(|c| c.is_alphabetic())
+                            && !is_hex_colour
+                        {
                             out.push(RawTag {
                                 name,
                                 source: TagSource::Inline,
@@ -800,10 +819,12 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                                 line: sec.start_line + line_offset as u32,
                             });
                         }
+                        prev2 = None;
                         prev = line_text[start..end].chars().next_back();
                         continue;
                     }
                 }
+                prev2 = prev;
                 prev = Some(ch);
             }
         }
@@ -1889,5 +1910,48 @@ top 2 body
             !parsed.sections.iter().any(|s| s.is_adr_section),
             "regular sections should not be ADR"
         );
+    }
+}
+#[cfg(test)]
+mod tag_boundary_tests {
+    use super::*;
+
+    /// nw-167: `](#anchor)` is a markdown in-page link, and `(#F5F5F5)` is a
+    /// colour literal. Neither is a tag. Accepting `(` as a tag boundary made
+    /// all 46 anchor targets and 91 colour literals in the reference vault into
+    /// tags -- roughly 20% of the tag namespace.
+    #[test]
+    fn markdown_anchors_and_hex_colours_are_not_tags() {
+        let source = concat!(
+            "# Doc\n",
+            "\n",
+            "See [Section 3.4](#34-the-datum-trap) and [TOC](#1-document-purpose).\n",
+            "The accent is (#F5F5F5) and the link colour is (#03a9f4).\n",
+            "A real tag: #project/nestweaver and (#inline-in-parens) counts too.\n",
+        );
+        let parsed = parse_markdown("doc.md", source).expect("parses");
+        let tags: Vec<&str> = parsed.tags.iter().map(|t| t.name.as_str()).collect();
+
+        for absent in [
+            "34-the-datum-trap",
+            "1-document-purpose",
+            "f5f5f5",
+            "03a9f4",
+        ] {
+            assert!(!tags.contains(&absent), "{absent} must not be a tag: {tags:?}");
+        }
+        // A genuine tag, including one legitimately inside parentheses.
+        assert!(tags.contains(&"project/nestweaver"), "got {tags:?}");
+        assert!(tags.contains(&"inline-in-parens"), "got {tags:?}");
+    }
+
+    /// The hex-colour guard must require a digit, so word-shaped tags that
+    /// happen to be all hex letters survive.
+    #[test]
+    fn all_letter_hex_shaped_tags_survive() {
+        let parsed = parse_markdown("doc.md", "# D\n\nTags: #abc and #faced\n").expect("parses");
+        let tags: Vec<&str> = parsed.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(tags.contains(&"abc"), "got {tags:?}");
+        assert!(tags.contains(&"faced"), "got {tags:?}");
     }
 }
