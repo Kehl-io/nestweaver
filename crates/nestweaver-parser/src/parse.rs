@@ -6007,3 +6007,46 @@ mod macro_call_tests {
         assert_eq!(call.start_line, 4);
     }
 }
+#[cfg(test)]
+mod js_const_scope_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-150: a block-scoped const is not addressable from outside its block,
+    /// so it must not become a graph symbol. Indexing them made
+    /// `const where = {..}`, declared inside an else-branch, the single
+    /// most-depended-on symbol in a 193k-symbol graph.
+    #[test]
+    fn only_module_scope_consts_become_symbols() {
+        let src = concat!(
+            "const moduleLevel = { a: 1 };\n",
+            "export const exported = { b: 2 };\n",
+            "function handler(x) {\n",
+            "  if (x) {\n",
+            "    const blockLocal = { class_id: x };\n",
+            "    return blockLocal;\n",
+            "  }\n",
+            "  const functionLocal = 3;\n",
+            "  return functionLocal;\n",
+            "}\n",
+        );
+        let parsed = parse_source(Path::new("src/a.js"), src).expect("parses");
+        let consts: Vec<&str> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Constant)
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(consts.contains(&"moduleLevel"), "got {consts:?}");
+        assert!(consts.contains(&"exported"), "got {consts:?}");
+        assert!(
+            !consts.contains(&"blockLocal"),
+            "a block-local const must not be a symbol: {consts:?}"
+        );
+        assert!(
+            !consts.contains(&"functionLocal"),
+            "a function-local const must not be a symbol: {consts:?}"
+        );
+    }
+}
