@@ -352,7 +352,10 @@ impl std::fmt::Display for MissingModelArtifactError {
         write!(
             formatter,
             "required embedding artifact '{}' for model '{}' is missing from configured cache '{}'; \
-             run `nestweaver embed --local --model-id {} --cache-dir {}` to download missing model files into that cache",
+             run `nestweaver embed` — the daemon seeds this cache itself, so the write lock never \
+             changes hands. With no daemon running, \
+             `nestweaver embed --local --model-id {} --cache-dir {}` downloads them directly \
+             (a deliberate one-off: it takes the write lock, so the daemon must be stopped first).",
             self.filename,
             self.model_id,
             self.cache_dir.display(),
@@ -1184,10 +1187,14 @@ mod tests {
                 cache_dir: PathBuf::from(cache_dir),
             }
             .to_string();
+            // Select the `--local` invocation by content, not by position:
+            // the remediation now leads with `nestweaver embed` (the in-policy
+            // daemon path, nw-139), and it is the --local form whose model-id
+            // and cache-dir arguments this test exists to shell-quote.
             let command = remediation
                 .split('`')
-                .nth(1)
-                .expect("remediation must contain a shell command");
+                .find(|candidate| candidate.contains("--local"))
+                .expect("remediation must contain the --local shell command");
             let script = format!("set -- {command}; printf '%s\\n%s\\n%s\\n' \"$#\" \"$5\" \"$7\"");
             let output = Command::new("sh")
                 .args(["-c", &script])

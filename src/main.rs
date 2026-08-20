@@ -8014,6 +8014,30 @@ fn search_truncation_note(returned: usize, limit: usize) -> Option<String> {
     }
 }
 
+/// Wrap a `search --json` payload with its truncation contract.
+///
+/// nw-187: both JSON paths emitted a BARE ARRAY, so the human path printed
+/// "(limit N reached — there may be more matches)" while `--json` returned an
+/// indistinguishable N-element list. That is the path ~/brain/CLAUDE.md tells
+/// subagents to prefer for token efficiency, so the recommended path was
+/// precisely the one that hid truncation. The MCP tools have always reported
+/// total/returned.
+///
+/// `truncated` is limit-reached, matching `search_truncation_note`: the
+/// backend returns at most `limit` rows and does not report a corpus total, so
+/// "returned == limit" is the only truncation signal available. It can be a
+/// false positive when the corpus holds exactly `limit` matches — reporting a
+/// possible truncation is the safe direction.
+fn search_json_payload(results: serde_json::Value, limit: usize) -> serde_json::Value {
+    let returned = results.as_array().map(|rows| rows.len()).unwrap_or(0);
+    serde_json::json!({
+        "results": results,
+        "returned": returned,
+        "limit": limit,
+        "truncated": search_truncation_note(returned, limit).is_some(),
+    })
+}
+
 fn print_search_truncation_note(returned: usize, limit: usize) {
     if let Some(note) = search_truncation_note(returned, limit) {
         println!("{note}");
@@ -10130,12 +10154,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // built at a different resolution would answer a question the caller
             // did not ask. With an explicit --resolution the check needs no
             // store at all, which is the fully-instant case the help describes.
-            if let Ok(Some(cached)) = load_clusters(&db_path)
-                && let Some(requested) = resolution
-                && (cached.resolution - requested).abs() < f64::EPSILON
+            // nw-157: this gate used to require an EXPLICIT --resolution, so
+            // a bare `clusters` short-circuited the let-chain, missed its own
+            // cache, and recomputed plus rewrote a 65 MB sidecar on every run
+            // (1.89s vs 0.155s with --resolution 0.3 — the same answer, since
+            // the default IS 0.3 on this graph). The cache must be compared
+            // against the EFFECTIVE resolution, not the requested one.
+            //
+            // Deriving the default needs the symbol count, hence the store; an
+            // explicit --resolution still needs no store at all, preserving the
+            // fully-instant case `--help` describes.
+            let cached = load_clusters(&db_path).ok().flatten();
+            let mut opened: Option<std::mem::ManuallyDrop<_>> = None;
+            let mut symbol_count: Option<usize> = None;
+            let effective_resolution = match resolution {
+                Some(requested) => requested,
+                None => {
+                    let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
+                    // Adaptive resolution: pick a sensible default based on
+                    // graph size. Large graphs (>10 K symbols) benefit from
+                    // lower resolution to avoid the explosion of tiny
+                    // communities that resolution=1.0 produces.
+                    let count = store.count_symbols().unwrap_or(0);
+                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };
+                    symbol_count = Some(count);
+                    opened = Some(store);
+                    adaptive
+                }
+            };
+
+            // Reuse is gated on the resolution MATCHING, because the sidecar
+            // holds whichever resolution was computed last: serving a cache
+            // built at a different resolution would answer a question the
+            // caller did not ask.
+            if let Some(cached) = cached
+                && (cached.resolution - effective_resolution).abs() < f64::EPSILON
             {
                 out.status(&format!(
-                    "Using cached clusters (resolution={requested}) from sidecar."
+                    "Using cached clusters (resolution={effective_resolution}) from sidecar."
                 ));
                 print_clusters_output(&cached, json)?;
                 return Ok((EXIT_SUCCESS, None));
@@ -10147,15 +10203,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // catch_unwind prevents the Drop panic from aborting the
             // process (exit code 101).
             let output = {
-                let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-
-                // Adaptive resolution: pick a sensible default based on
-                // graph size.  Large graphs (>10 K symbols) benefit from
-                // lower resolution to avoid the explosion of tiny
-                // communities that resolution=1.0 produces.
-                let sym_count = store.count_symbols().unwrap_or(0);
-                let effective_resolution =
-                    resolution.unwrap_or(if sym_count > 10_000 { 0.3 } else { 0.5 });
+                let store = match opened {
+                    Some(store) => store,
+                    None => std::mem::ManuallyDrop::new(open_store(Some(&db_path))?),
+                };
+                let sym_count = match symbol_count {
+                    Some(count) => count,
+                    None => store.count_symbols().unwrap_or(0),
+                };
 
                 out.status(&format!(
                     "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
@@ -11631,7 +11686,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // the same JSON whether or not the daemon is up.
                         let payload = unwrap_hybrid_payload(value);
                         let count = payload.as_array().map(|a| a.len()).unwrap_or(0);
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&search_json_payload(payload, limit))?
+                        );
                         let stats = format!(
                             "{count} symbols in {} (via hybrid)",
                             format_elapsed(t0.elapsed())
@@ -11661,7 +11719,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let candidates = search_symbols(&store, &query, limit)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&candidates)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&search_json_payload(
+                        serde_json::to_value(&candidates)?,
+                        limit
+                    ))?
+                );
             } else if candidates.is_empty() {
                 println!("No symbols found matching '{query}'.");
             } else {
@@ -11953,19 +12017,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args =
-                    read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "read_symbols",
-                    args,
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
-                }
+            // nw-186: this branch used to print raw pretty JSON and return
+            // EXIT_SUCCESS unconditionally, so `--json`, `-q` and `--plain`
+            // were all dead on the daemon path and a not-found or ambiguous
+            // read exited 0 — scripts gating on exit status saw success. Parse
+            // the response back into the same type the local path produces and
+            // fall through to the one shared render + exit block below.
+            let daemon_result: Option<nestweaver_engine::read_symbols::ReadSymbolsResult> =
+                if use_daemon {
+                    let args =
+                        read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
+                    match try_hybrid_json_rpc_checked(
+                        true,
+                        &db_path,
+                        config.as_deref(),
+                        "read_symbols",
+                        args,
+                    )? {
+                        Some(value) => Some(serde_json::from_value(value).context(
+                            "daemon returned a read_symbols payload this CLI cannot parse",
+                        )?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+
+            if let Some(res) = daemon_result {
+                return render_read_symbols(&res, json);
             }
 
             let store = open_store(Some(&db_path))?;
@@ -11986,47 +12065,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 neighbors,
                 token_budget,
             );
-            if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
-            } else {
-                for w in &res.symbols {
-                    let tag = if w.is_neighbor { " [neighbor]" } else { "" };
-                    println!(
-                        "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
-                        w.name, w.kind, w.path, w.start_line, w.end_line, tag
-                    );
-                    println!("{}", w.body);
-                    println!();
-                }
-                for nf in &res.not_found {
-                    eprintln!("not found: {nf}");
-                }
-                for a in &res.ambiguous {
-                    eprintln!(
-                        "ambiguous: {} \u{2192} {} candidates (pass a UID)",
-                        a.query,
-                        a.candidate_uids.len()
-                    );
-                }
-                if res.truncated {
-                    eprintln!(
-                        "truncated: {} symbol(s) dropped for token budget",
-                        res.dropped.len()
-                    );
-                }
-            }
-            // Exit 2 when targets were requested but none resolved to a symbol
-            // (consistent with `symbol`/`impact`) — or 3 when the failure was
-            // ambiguity, matching `symbol`'s exit-code contract. When at
-            // least one target resolves, succeed even if others were
-            // not-found/ambiguous.
-            if !targets.is_empty() && res.symbols.is_empty() {
-                if !res.ambiguous.is_empty() {
-                    return Ok((EXIT_AMBIGUOUS, None));
-                }
-                return Ok((EXIT_NOT_FOUND, None));
-            }
-            Ok((EXIT_SUCCESS, None))
+            render_read_symbols(&res, json)
         }
         Commands::Symbol {
             name_or_uid,
@@ -16722,6 +16761,101 @@ fn ensure_direct_store_fallback_allowed(
     }
 }
 
+/// Render a `read_symbols` result and compute its exit code.
+///
+/// Shared by the daemon and direct paths so `--json` and the exit-code
+/// contract cannot diverge between them (nw-186).
+fn render_read_symbols(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+    json: bool,
+) -> anyhow::Result<(i32, Option<String>)> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        } else {
+            for w in &res.symbols {
+                let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+                println!(
+                    "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+                    w.name, w.kind, w.path, w.start_line, w.end_line, tag
+                );
+                println!("{}", w.body);
+                println!();
+            }
+            for nf in &res.not_found {
+                eprintln!("not found: {nf}");
+            }
+            for a in &res.ambiguous {
+                eprintln!(
+                    "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                    a.query,
+                    a.candidate_uids.len()
+                );
+            }
+            if res.truncated {
+                eprintln!(
+                    "truncated: {} symbol(s) dropped for token budget",
+                    res.dropped.len()
+                );
+            }
+        }
+        // Exit 2 when targets were requested but none resolved to a symbol
+        // (consistent with `symbol`/`impact`) — or 3 when the failure was
+        // ambiguity, matching `symbol`'s exit-code contract. When at
+        // least one target resolves, succeed even if others were
+        // not-found/ambiguous.
+
+    // Exit 2 when targets were requested but none resolved to a symbol
+    // (consistent with `symbol`/`impact`) — or 3 when the failure was
+    // ambiguity, matching `symbol`'s exit-code contract. When at least one
+    // target resolves, succeed even if others were not-found/ambiguous.
+    //
+    // `not_found`/`ambiguous` stand in for "targets were requested": a result
+    // carrying either had targets that failed to resolve.
+    if res.symbols.is_empty() && !(res.not_found.is_empty() && res.ambiguous.is_empty()) {
+        if !res.ambiguous.is_empty() {
+            return Ok((EXIT_AMBIGUOUS, None));
+        }
+        return Ok((EXIT_NOT_FOUND, None));
+    }
+    Ok((EXIT_SUCCESS, None))
+}
+
+/// The daemon's own application-level message, when a failed RPC was
+/// *answered* rather than unreachable.
+///
+/// nw-170: try_hybrid_json_rpc_checked treated every `hybrid.query` error as a
+/// transport or config failure, so a typo'd note title came back as "refusing
+/// direct fallback ... deliberately reset with `nestweaver daemon start
+/// --reset`" and exit 1. `backlinks "Home"`, `cross-repo-contracts note_get`
+/// and `project-context zzz-nonexistent` all told the user their daemon was
+/// wedged when it had answered perfectly.
+///
+/// The presence of a `tonic::Status` in the error chain is the discriminator:
+/// the daemon received the call and replied. `Unavailable` is excluded because
+/// that is precisely the code for "I cannot serve this", and `DeadlineExceeded`
+/// because a cancelled query genuinely may be worth retrying elsewhere.
+///
+/// The `tool <name> failed: ` prefix that `tool_error` adds is stripped, since
+/// the caller already knows which command it ran.
+fn daemon_application_error(error: &anyhow::Error) -> Option<String> {
+    let status = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .filter(|status| {
+                !matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                )
+            })
+    })?;
+    let message = status.message();
+    let message = message
+        .split_once(" failed: ")
+        .filter(|(head, _)| head.starts_with("tool "))
+        .map_or(message, |(_, tail)| tail);
+    (!message.is_empty()).then(|| message.to_string())
+}
+
 /// Env knob for the client-side RPC ceiling, in seconds. `0` disables it.
 const RPC_TIMEOUT_ENV: &str = "NESTWEAVER_RPC_TIMEOUT_SECS";
 
@@ -16838,6 +16972,13 @@ fn try_hybrid_json_rpc_checked(
         }) {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
+                // nw-170: the daemon answered — "no note found with title
+                // 'Home'" is a valid answer, not a daemon failure. There is
+                // nothing to fall back FROM, so surface it as-is instead of
+                // recommending a daemon reset.
+                if let Some(message) = daemon_application_error(&e) {
+                    return Err(anyhow::anyhow!("{message}"));
+                }
                 ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
                     format!("hybrid query {rpc_name} failed ({e:#}); refusing direct fallback")
                 })?;

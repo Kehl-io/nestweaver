@@ -10,12 +10,12 @@ use std::path::Path;
 
 use nestweaver_schema::Symbol;
 use nestweaver_store::GraphStore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::content_reader::ContentReader;
 
 /// One returned symbol window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolWindow {
     pub uid: String,
     pub name: String,
@@ -34,13 +34,18 @@ pub struct SymbolWindow {
 }
 
 /// A spec that matched more than one symbol.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbiguousMatch {
     pub query: String,
     pub candidate_uids: Vec<String>,
 }
 
-#[derive(Debug, Default, Serialize)]
+// `Deserialize` so the CLI can parse a daemon response back into the SAME type
+// the local path produces, and therefore share one rendering and exit-code
+// path instead of short-circuiting on the daemon branch (nw-186).
+// `serde(default)` keeps an older daemon that omits a newer field readable.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReadSymbolsResult {
     pub symbols: Vec<SymbolWindow>,
     /// Specs that resolved to no symbol.
@@ -62,7 +67,7 @@ pub struct ReadSymbolsResult {
 }
 
 /// How far the mandatory first symbol overran the requested budget.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetOverrun {
     /// The budget the caller asked for.
     pub requested_tokens: usize,

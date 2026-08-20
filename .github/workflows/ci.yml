@@ -95,12 +95,17 @@ jobs:
           cargo test --locked --release -p nestweaver-daemon --features embed \
             daemon_embedding_startup_constructs_cached_model_offline
       # nw-194: this job used to run ONLY the one named test above, so every
-      # macOS-specific daemon failure was invisible to CI while being the first
-      # thing a developer on the project's primary platform hit. Eleven were
-      # accumulating unnoticed. Run the whole lib suite here so the portability
-      # gating cannot silently rot back out.
-      - name: Daemon suite (macOS portability gate)
-        run: cargo test --locked --release -p nestweaver-daemon --features embed --lib
+      # macOS-specific failure was invisible to CI while being the first thing a
+      # developer on the project's primary platform hit. Eleven were accumulating
+      # in nestweaver-daemon and four more in nestweaver-mcp, all from the same
+      # small set of portability assumptions (/bin/true, $XDG_STATE_HOME,
+      # non-UTF-8 filenames, Linux pid reuse).
+      #
+      # Scoped to the WORKSPACE, not just the daemon: the class recurred in a
+      # second crate precisely because the gate was per-crate. --lib keeps this
+      # to unit tests; the ubuntu job still carries integration coverage.
+      - name: Workspace unit tests (macOS portability gate)
+        run: cargo test --locked --release --workspace --lib
       - name: Configure isolated smoke paths
         shell: bash
         run: |

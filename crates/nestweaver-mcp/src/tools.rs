@@ -3713,6 +3713,20 @@ fn tool_schema_brain_search() -> Value {
     })
 }
 
+/// The node kind behind a grouped brain_search row.
+///
+/// nw-169: this was hardcoded `"note"` for every row, but the grouped results
+/// also contain TAG nodes (uid `tag:<vault>:<hash>`, minted by
+/// nestweaver_schema::uid). On this vault `brain_search{query:"Home"}` returned
+/// two tag rows scoring 44.05 and 39.56 above the best real note at 28.9,
+/// labelled `"note"`, carrying no location, and unfetchable — following the
+/// tool's own documented workflow with `note_get{uid}` failed. A client had no
+/// field to filter them on. Labelling them honestly is the fix; they remain
+/// legitimate hits.
+fn grouped_row_kind(uid: &str) -> &'static str {
+    if uid.starts_with("tag:") { "tag" } else { "note" }
+}
+
 fn tool_brain_search(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -3898,14 +3912,14 @@ fn tool_brain_search(
                 if concise {
                     json!({
                         "uid": g.note_uid,
-                        "kind": "note",
+                        "kind": grouped_row_kind(&g.note_uid),
                         "title": g.best_title,
                         "matched_headings": g.matched_headings,
                     })
                 } else {
                     json!({
                         "uid": g.note_uid,
-                        "kind": "note",
+                        "kind": grouped_row_kind(&g.note_uid),
                         "title": g.best_title,
                         "score": g.best_score,
                         "vault_uid": note_vaults.get(g.note_uid.as_str()).copied().unwrap_or_default(),
@@ -4356,14 +4370,14 @@ fn group_search_hits_by_note(
             if concise {
                 json!({
                     "uid": g.note_uid,
-                    "kind": "note",
+                    "kind": grouped_row_kind(&g.note_uid),
                     "title": g.best_title,
                     "matched_headings": g.matched_headings,
                 })
             } else {
                 json!({
                     "uid": g.note_uid,
-                    "kind": "note",
+                    "kind": grouped_row_kind(&g.note_uid),
                     "title": g.best_title,
                     "score": g.best_score,
                     "location": g.file_path,
@@ -5197,24 +5211,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             .lookup_note(uid)
             .with_context(|| format!("failed to look up note with uid '{uid}'"))?
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        let mut matches = store
-            .lookup_notes_by_title(title)
-            .with_context(|| format!("failed to look up notes with title '{title}'"))?;
-        // Slug-tolerant fallback: case-insensitive + slug normalization.
-        // Uses list_notes_lite to avoid loading full note bodies during scan.
-        if matches.is_empty() {
-            let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes_lite(None)
-                && let Some(hit) = all_notes.iter().find(|n| {
-                    n.title.to_lowercase() == needle
-                        || slug_normalize(&n.title) == slug_normalize(title)
-                })
-                && let Ok(note) = store.lookup_note(&hit.uid)
-            {
-                matches.push(note);
-            }
-        }
-        match matches.into_iter().next() {
+        match resolve_note_by_title(store, title)? {
             Some(n) => n,
             None => return Err(anyhow!("no note found with title '{title}'")),
         }
@@ -5351,26 +5348,60 @@ fn slug_normalize(s: &str) -> String {
         .join("-")
 }
 
+/// Resolve a note by title, tolerating case, slug form, and FILENAME STEM.
+///
+/// nw-168: `note_get`/`backlinks` matched only the H1 title (plus a
+/// case/slug fallback), while the wikilink resolver's priority-3b tier also
+/// matches the filename stem. So `~/brain/Home.md`, whose H1 is
+/// "Brain - Command Center", could be linked as `[[Home]]` by 26 notes and
+/// resolved every time, yet `note_get{title:"Home"}` reported "no note found".
+/// The filename is often the only handle a user has.
+///
+/// Stem matching runs LAST, after exact and slug matches, so a real title
+/// always wins over a coincidental filename.
+fn resolve_note_by_title(
+    store: &GraphStore,
+    title: &str,
+) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
+    let mut matches = store
+        .lookup_notes_by_title(title)
+        .with_context(|| format!("failed to look up notes with title '{title}'"))?;
+    if let Some(note) = matches.drain(..).next() {
+        return Ok(Some(note));
+    }
+
+    // Uses list_notes_lite to avoid loading full note bodies during the scan.
+    let Ok(all_notes) = store.list_notes_lite(None) else {
+        return Ok(None);
+    };
+    let needle = title.to_lowercase();
+    let wanted_slug = slug_normalize(title);
+    let stem_of = |path: &str| {
+        std::path::Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_lowercase())
+    };
+    let hit = all_notes
+        .iter()
+        .find(|n| n.title.to_lowercase() == needle || slug_normalize(&n.title) == wanted_slug)
+        .or_else(|| {
+            all_notes.iter().find(|n| {
+                stem_of(&n.file_path).is_some_and(|stem| {
+                    stem == needle || slug_normalize(&stem) == wanted_slug
+                })
+            })
+        });
+    match hit {
+        Some(hit) => Ok(store.lookup_note(&hit.uid).ok()),
+        None => Ok(None),
+    }
+}
+
 fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let target_uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
         uid.to_string()
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        let mut matches = store.lookup_notes_by_title(title)?;
-        // Fallback: case-insensitive + slug normalization.
-        // Uses list_notes_lite to avoid loading full note bodies during scan.
-        if matches.is_empty() {
-            let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes_lite(None)
-                && let Some(hit) = all_notes.iter().find(|n| {
-                    n.title.to_lowercase() == needle
-                        || slug_normalize(&n.title) == slug_normalize(title)
-                })
-                && let Ok(note) = store.lookup_note(&hit.uid)
-            {
-                matches.push(note);
-            }
-        }
-        match matches.into_iter().next() {
+        match resolve_note_by_title(store, title)? {
             Some(n) => n.uid,
             None => return Err(anyhow!("no note found with title '{title}'")),
         }
@@ -11036,8 +11067,14 @@ mod cache_dispatch_tests {
     // ── nw-C2: index-publication wait, classification, and status ───────
 
     /// A pid guaranteed not to name a live process: spawn a child and reap it.
+    ///
+    /// nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true and has
+    /// no /bin/true, so hardcoding the path panicked with NotFound and failed
+    /// four tests on every macOS machine while passing in Linux CI. This was
+    /// the third copy of this helper; the engine and daemon copies were fixed
+    /// in fd06ca94 and f3e2529c.
     fn reaped_child_pid() -> i32 {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id() as i32;
         child.wait().unwrap();
         pid

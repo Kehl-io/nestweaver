@@ -6640,15 +6640,51 @@ impl NestWeaverDaemon for DaemonService {
             let do_headings = scopes.headings;
 
             let (status, model) = self.state.embedding_runtime.snapshot();
-            let Some(model) = model else {
-                return Err(Status::failed_precondition(if status.error.is_empty() {
-                    format!("embedding is not ready (state: {})", status.state)
-                } else {
-                    format!(
-                        "embedding is not ready (state: {}): {}",
-                        status.state, status.error
+            let model = match model {
+                Some(model) => model,
+                None => {
+                    // nw-139: the daemon is the single writer, and since 6.3.0
+                    // the CLI refuses `embed --local` while the daemon holds
+                    // the write lock. So telling the operator to run it — which
+                    // is what the cache-only startup failure did — asked them
+                    // to stop the single writer and hand the lock to a second
+                    // process, the one thing the policy forbids. There was no
+                    // in-policy path to a working embedder on a cold cache.
+                    //
+                    // Seed it here instead. This is safe precisely because it
+                    // is NOT the startup path: the request is operator-
+                    // initiated, already admin-authenticated, and already holds
+                    // the write gate above, so no lock ever changes hands.
+                    // Startup stays CacheOnly, so booting never depends on
+                    // network reachability.
+                    //
+                    // A complete cache makes DownloadMissing a no-op, so a
+                    // failure for any other reason simply reproduces itself
+                    // below and reports the original diagnosis.
+                    tracing::info!(
+                        state = %status.state,
+                        "embedding model unavailable; attempting to seed the configured cache"
+                    );
+                    load_embedding_model_with_mode(
+                        &self.state,
+                        nestweaver_embed::ArtifactMode::DownloadMissing,
                     )
-                }));
+                    .await;
+                    let (status, model) = self.state.embedding_runtime.snapshot();
+                    match model {
+                        Some(model) => model,
+                        None => {
+                            return Err(Status::failed_precondition(if status.error.is_empty() {
+                                format!("embedding is not ready (state: {})", status.state)
+                            } else {
+                                format!(
+                                    "embedding is not ready (state: {}): {}",
+                                    status.state, status.error
+                                )
+                            }));
+                        }
+                    }
+                }
             };
             // The model the daemon actually loaded (startup preference: the
             // DB-recorded id wins, else the configured external/local model).
@@ -7944,6 +7980,55 @@ mod embedding_load_config_tests {
         );
     }
 
+    /// nw-139: startup must stay cache-only so booting never depends on
+    /// network reachability, while the operator-initiated path is allowed to
+    /// seed the cache — otherwise the only remediation for a cold cache was
+    /// `embed --local`, which takes the write lock the daemon holds and so
+    /// required handing the single-writer role to a second process.
+    #[test]
+    fn startup_is_cache_only_while_the_operator_path_may_seed() {
+        let observed = std::cell::Cell::new(None);
+        let record = |_: &nestweaver_embed::EmbedConfig,
+                      _: nestweaver_embed::DevicePolicy,
+                      mode: nestweaver_embed::ArtifactMode|
+         -> anyhow::Result<()> {
+            observed.set(Some(mode));
+            Ok(())
+        };
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: std::path::PathBuf::from("/nonexistent"),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        load_daemon_embedding_backend_with_mode(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
+            record,
+        )
+        .expect("recorder never fails");
+        assert_eq!(
+            observed.get(),
+            Some(nestweaver_embed::ArtifactMode::CacheOnly),
+            "daemon startup must never contact the network"
+        );
+
+        load_daemon_embedding_backend_with_mode(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::ArtifactMode::DownloadMissing,
+            record,
+        )
+        .expect("recorder never fails");
+        assert_eq!(
+            observed.get(),
+            Some(nestweaver_embed::ArtifactMode::DownloadMissing),
+            "the operator-initiated path must be able to seed the cache"
+        );
+    }
+
     #[test]
     fn daemon_embedding_startup_constructs_cached_model_offline() {
         let cache = tempfile::tempdir().expect("cache tempdir");
@@ -7955,9 +8040,10 @@ mod embedding_load_config_tests {
             external_model: None,
         };
 
-        let model = load_daemon_embedding_backend_with(
+        let model = load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .expect("daemon startup must construct a complete configured-cache model offline");
@@ -7986,9 +8072,10 @@ mod embedding_load_config_tests {
             external_model: None,
         };
 
-        let error = load_daemon_embedding_backend_with(
+        let error = load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .err()
@@ -8035,9 +8122,10 @@ mod embedding_load_config_tests {
         assert_eq!(cache_dir, cache.path());
 
         let load_config = embedding_load_config(&cfg, cache_dir.clone(), None);
-        let model = load_daemon_embedding_backend_with(
+        let model = load_daemon_embedding_backend_with_mode(
             &load_config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .expect("complete fixture cache must load");
@@ -8273,10 +8361,28 @@ fn daemon_embedding_device_policy(
     }
 }
 
+/// The artifact mode daemon STARTUP loads under.
+///
+/// Always cache-only: booting must never depend on network reachability, and
+/// a boot that silently downloads hundreds of megabytes is not a boot. Named
+/// rather than inlined so both the production call and the tests that pin this
+/// contract reference the same value (nw-139).
 #[cfg(feature = "embed")]
-fn load_daemon_embedding_backend_with<T, Load>(
+const fn daemon_startup_artifact_mode() -> nestweaver_embed::ArtifactMode {
+    nestweaver_embed::ArtifactMode::CacheOnly
+}
+
+/// Load the embedding backend under an explicit [`nestweaver_embed::ArtifactMode`].
+///
+/// Startup always uses `CacheOnly` — booting a daemon must never depend on
+/// network reachability, and that contract is pinned by
+/// `daemon_embedding_startup_constructs_cached_model_offline`. `DownloadMissing`
+/// is reachable only from an operator-initiated `Embed` RPC (nw-139).
+#[cfg(feature = "embed")]
+fn load_daemon_embedding_backend_with_mode<T, Load>(
     config: &nestweaver_embed::EmbedConfig,
     policy: nestweaver_embed::DevicePolicy,
+    mode: nestweaver_embed::ArtifactMode,
     load: Load,
 ) -> anyhow::Result<T>
 where
@@ -8286,7 +8392,7 @@ where
         nestweaver_embed::ArtifactMode,
     ) -> anyhow::Result<T>,
 {
-    load(config, policy, nestweaver_embed::ArtifactMode::CacheOnly)
+    load(config, policy, mode)
 }
 
 #[cfg(feature = "embed")]
@@ -8531,6 +8637,17 @@ fn log_embedding_ready(
 /// path can be exercised under Tokio; only the local backend has the main-thread requirement.
 #[cfg(feature = "embed")]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    load_embedding_model_with_mode(state, daemon_startup_artifact_mode()).await
+}
+
+/// Resolve, load and publish the embedding backend under an explicit artifact
+/// mode. See [`load_daemon_embedding_backend_with_mode`] for why only the
+/// operator-initiated path may pass `DownloadMissing`.
+#[cfg(feature = "embed")]
+async fn load_embedding_model_with_mode(
+    state: &std::sync::Arc<DaemonState>,
+    mode: nestweaver_embed::ArtifactMode,
+) {
     let cfg = state
         .instance_cfg
         .as_ref()
@@ -8599,9 +8716,10 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
         };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
-    let loaded = load_daemon_embedding_backend_with(
+    let loaded = load_daemon_embedding_backend_with_mode(
         &config,
         policy,
+        mode,
         nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
     );
     match loaded {
