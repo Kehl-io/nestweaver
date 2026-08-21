@@ -583,7 +583,9 @@ fn validate_digest(name: &str, value: &str) -> anyhow::Result<()> {
 /// It must keep working for a slot whose manifest is unreadable, which is
 /// precisely when an operator needs to stop the daemon.
 pub fn instance_anchor_database(db_path: &Path) -> PathBuf {
-    let is_graph = db_path.file_name().is_some_and(|n| n == PUBLICATION_GRAPH_FILE);
+    let is_graph = db_path
+        .file_name()
+        .is_some_and(|n| n == PUBLICATION_GRAPH_FILE);
     if !is_graph {
         return db_path.to_path_buf();
     }
@@ -723,8 +725,7 @@ pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<Slo
         }
     };
 
-    let mut retained: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut retained: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(pointer) = read_current(publication_root)? {
         retained.insert(
             pointer.publication_uuid.clone(),
@@ -740,9 +741,7 @@ pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<Slo
     for operation in &operations.operations {
         retained
             .entry(operation.plan.target_publication_uuid.clone())
-            .or_insert_with(|| {
-                format!("targeted by operation {}", operation.plan.operation_uuid)
-            });
+            .or_insert_with(|| format!("targeted by operation {}", operation.plan.operation_uuid));
     }
     // An unreadable journal cannot name its target, so nothing may be reclaimed
     // while one exists.
@@ -764,9 +763,9 @@ pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<Slo
         let path = entry.path();
         let bytes = directory_bytes(&path);
         let retained_because = retained.get(&publication_uuid).cloned().or_else(|| {
-            blocked_by_invalid.as_ref().map(|uuid| {
-                format!("unreadable operation journal {uuid} may still target it")
-            })
+            blocked_by_invalid
+                .as_ref()
+                .map(|uuid| format!("unreadable operation journal {uuid} may still target it"))
         });
         if retained_because.is_none() && !dry_run {
             std::fs::remove_dir_all(&path)
@@ -782,7 +781,9 @@ pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<Slo
             retained_because,
         });
     }
-    report.slots.sort_by(|a, b| a.publication_uuid.cmp(&b.publication_uuid));
+    report
+        .slots
+        .sort_by(|a, b| a.publication_uuid.cmp(&b.publication_uuid));
     Ok(report)
 }
 
@@ -940,16 +941,18 @@ pub fn compare_and_swap_current(
         // Permanent: the expected predecessor will never be CURRENT again, so
         // retrying this operation can only re-observe the same conflict
         // (nw-148).
-        return Err(crate::publication_operation::PermanentPublicationFailure(format!(
-            "CURRENT compare-and-swap conflict: expected {}, observed {}",
-            expected
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            observed
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        ))
-        .into());
+        return Err(
+            crate::publication_operation::PermanentPublicationFailure(format!(
+                "CURRENT compare-and-swap conflict: expected {}, observed {}",
+                expected
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                observed
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            ))
+            .into(),
+        );
     }
     let declared_previous = next
         .expected_previous_publication_uuid
@@ -1418,8 +1421,7 @@ mod tests {
         // becomes CURRENT first, then is superseded — which is what makes it
         // the retained rollback target.
         let lease = store.acquire_index_publication_lease().unwrap();
-        let first =
-            CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
+        let first = CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
         compare_and_swap_current(root, &lease, None, &first).unwrap();
         let pointer = CurrentPublicationPointer::new(
             &current_identity,
@@ -1485,9 +1487,9 @@ mod tests {
         // A base path, and anything that is not a slot graph, is untouched.
         assert_eq!(instance_anchor_database(base), base);
         for other in [
-            "/data/graph.lbug",                        // no slots/ ancestor
-            "/data/brain.lbug.publications/slots/x",    // not the graph file
-            "/data/other/slots/x/graph.lbug",           // root lacks the suffix
+            "/data/graph.lbug",                      // no slots/ ancestor
+            "/data/brain.lbug.publications/slots/x", // not the graph file
+            "/data/other/slots/x/graph.lbug",        // root lacks the suffix
         ] {
             assert_eq!(
                 instance_anchor_database(Path::new(other)),

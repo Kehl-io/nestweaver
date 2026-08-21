@@ -1192,7 +1192,6 @@ fn strip_obsidian_comments(text: &str) -> String {
 #[cfg(test)]
 mod tests {
 
-
     /// nw-164: links in the frontmatter block must reach the graph. 20% of the
     /// reference vault's links live there, including every backlog
     /// cross-reference, because the whole `items:` array is frontmatter.
@@ -1993,7 +1992,10 @@ mod tag_boundary_tests {
             "f5f5f5",
             "03a9f4",
         ] {
-            assert!(!tags.contains(&absent), "{absent} must not be a tag: {tags:?}");
+            assert!(
+                !tags.contains(&absent),
+                "{absent} must not be a tag: {tags:?}"
+            );
         }
         // A genuine tag, including one legitimately inside parentheses.
         assert!(tags.contains(&"project/nestweaver"), "got {tags:?}");

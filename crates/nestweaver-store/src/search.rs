@@ -2573,7 +2573,9 @@ mod tests {
         let identity = test_identity();
         let mut index = EmbeddingIndex::new();
         assert!(index.add_with_pipeline("a", vec![1.0, 0.0], &pipeline, false));
-        index.save_binary_v2(&path, &identity, 1, &pipeline).unwrap();
+        index
+            .save_binary_v2(&path, &identity, 1, &pipeline)
+            .unwrap();
 
         // Rewrite ONLY the envelope's count field, leaving the payload (and so
         // payload_blake3) untouched — exactly what a bit flip in that field does.

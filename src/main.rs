@@ -96,16 +96,16 @@ use nestweaver_engine::{
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges,
-    discover_cross_domain_links, embedding::generate_embeddings_batch, export_cypher,
-    export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
-    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
-    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
-    list_repos, list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
+    embedding::generate_embeddings_batch, export_cypher, export_graphml, export_in_memory_graph,
+    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
+    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
+    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
+    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
+    index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
+    load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
+    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
+    suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -4785,7 +4785,10 @@ enum PublicationCommands {
     },
     /// Reclaim publication slots that nothing can still reach
     Prune {
-        #[arg(long, help = "Report what would be reclaimed without deleting anything")]
+        #[arg(
+            long,
+            help = "Report what would be reclaimed without deleting anything"
+        )]
         dry_run: bool,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
@@ -16875,40 +16878,40 @@ fn render_read_symbols(
     res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
     json: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
-        if json {
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        } else {
-            for w in &res.symbols {
-                let tag = if w.is_neighbor { " [neighbor]" } else { "" };
-                println!(
-                    "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
-                    w.name, w.kind, w.path, w.start_line, w.end_line, tag
-                );
-                println!("{}", w.body);
-                println!();
-            }
-            for nf in &res.not_found {
-                eprintln!("not found: {nf}");
-            }
-            for a in &res.ambiguous {
-                eprintln!(
-                    "ambiguous: {} \u{2192} {} candidates (pass a UID)",
-                    a.query,
-                    a.candidate_uids.len()
-                );
-            }
-            if res.truncated {
-                eprintln!(
-                    "truncated: {} symbol(s) dropped for token budget",
-                    res.dropped.len()
-                );
-            }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    } else {
+        for w in &res.symbols {
+            let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+            println!(
+                "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+                w.name, w.kind, w.path, w.start_line, w.end_line, tag
+            );
+            println!("{}", w.body);
+            println!();
         }
-        // Exit 2 when targets were requested but none resolved to a symbol
-        // (consistent with `symbol`/`impact`) — or 3 when the failure was
-        // ambiguity, matching `symbol`'s exit-code contract. When at
-        // least one target resolves, succeed even if others were
-        // not-found/ambiguous.
+        for nf in &res.not_found {
+            eprintln!("not found: {nf}");
+        }
+        for a in &res.ambiguous {
+            eprintln!(
+                "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                a.query,
+                a.candidate_uids.len()
+            );
+        }
+        if res.truncated {
+            eprintln!(
+                "truncated: {} symbol(s) dropped for token budget",
+                res.dropped.len()
+            );
+        }
+    }
+    // Exit 2 when targets were requested but none resolved to a symbol
+    // (consistent with `symbol`/`impact`) — or 3 when the failure was
+    // ambiguity, matching `symbol`'s exit-code contract. When at
+    // least one target resolves, succeed even if others were
+    // not-found/ambiguous.
 
     // Exit 2 when targets were requested but none resolved to a symbol
     // (consistent with `symbol`/`impact`) — or 3 when the failure was
@@ -16945,14 +16948,12 @@ fn render_read_symbols(
 /// the caller already knows which command it ran.
 fn daemon_application_error(error: &anyhow::Error) -> Option<String> {
     let status = error.chain().find_map(|cause| {
-        cause
-            .downcast_ref::<tonic::Status>()
-            .filter(|status| {
-                !matches!(
-                    status.code(),
-                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-                )
-            })
+        cause.downcast_ref::<tonic::Status>().filter(|status| {
+            !matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        })
     })?;
     let message = status.message();
     let message = message
@@ -23338,9 +23339,8 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             // --force`, which exists for exactly this shape of problem.
             let mut revision = revision;
             if force && !invalid {
-                let state = nestweaver_engine::publication_operation::load_operation(
-                    &root, &operation,
-                )?;
+                let state =
+                    nestweaver_engine::publication_operation::load_operation(&root, &operation)?;
                 if state.cancel_requested
                     && state.phase
                         != nestweaver_engine::publication_operation::PublicationPhase::Cancelled

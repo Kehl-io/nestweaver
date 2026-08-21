@@ -4051,10 +4051,10 @@ sub b body
         let uid = vault_uid(
             "owned",
             // nw-138b: the directory-based indexer canonicalizes the vault root before
-                // deriving the uid (index_md.rs:202/251). Tests must do the same, or on
-                // macOS - where TMPDIR resolves through /private - they compute a
-                // different uid than the code under test. The reader-based variant does
-                // NOT canonicalize, so its tests must keep using the raw root.
+            // deriving the uid (index_md.rs:202/251). Tests must do the same, or on
+            // macOS - where TMPDIR resolves through /private - they compute a
+            // different uid than the code under test. The reader-based variant does
+            // NOT canonicalize, so its tests must keep using the raw root.
             &std::fs::canonicalize(&root)
                 .unwrap_or_else(|_| root.clone())
                 .to_string_lossy(),
@@ -4329,10 +4329,7 @@ mod link_resolution_tests {
             normalize_relative("workspaces/orbit/backlog", "../../../backlog").as_deref(),
             Some("backlog")
         );
-        assert_eq!(
-            normalize_relative("a/b", "./c").as_deref(),
-            Some("a/b/c")
-        );
+        assert_eq!(normalize_relative("a/b", "./c").as_deref(), Some("a/b/c"));
     }
 
     /// Escaping the vault root yields None rather than a path outside it.

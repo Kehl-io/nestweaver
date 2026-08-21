@@ -403,8 +403,7 @@ pub use process::{
 };
 pub use project::{
     ProjectMaterializationResult, detect_implicit_projects, detect_implicit_projects_with_mode,
-    materialize_projects,
-    materialize_projects_with_lease,
+    materialize_projects, materialize_projects_with_lease,
 };
 pub use publication::*;
 pub use publication_source::*;

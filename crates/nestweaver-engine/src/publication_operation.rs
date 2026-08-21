@@ -1268,9 +1268,10 @@ mod tests {
     /// never emitted.
     #[test]
     fn permanent_failures_are_distinguishable_from_retryable_ones() {
-        let permanent: anyhow::Error =
-            PermanentPublicationFailure("CURRENT compare-and-swap conflict: expected a, observed b".into())
-                .into();
+        let permanent: anyhow::Error = PermanentPublicationFailure(
+            "CURRENT compare-and-swap conflict: expected a, observed b".into(),
+        )
+        .into();
         assert!(PermanentPublicationFailure::is_permanent(&permanent));
         // The message must survive classification unchanged, since operators
         // and existing assertions read it.
@@ -1299,15 +1300,13 @@ mod tests {
         let state = create_operation(root, plan()).unwrap();
 
         // The worker is gone, so nothing ever acknowledges this.
-        let cancelled =
-            request_cancel(root, &state.plan.operation_uuid, state.revision).unwrap();
+        let cancelled = request_cancel(root, &state.plan.operation_uuid, state.revision).unwrap();
         assert!(cancelled.cancel_requested);
         assert_ne!(cancelled.phase, PublicationPhase::Cancelled);
 
         // Before: refused, and the message must now name the way out.
-        let error =
-            discard_operation(root, &cancelled.plan.operation_uuid, cancelled.revision)
-                .expect_err("an unacknowledged cancel is not directly discardable");
+        let error = discard_operation(root, &cancelled.plan.operation_uuid, cancelled.revision)
+            .expect_err("an unacknowledged cancel is not directly discardable");
         let message = error.to_string();
         assert!(
             message.contains("--force"),
@@ -1318,8 +1317,12 @@ mod tests {
         let acknowledged =
             acknowledge_cancel(root, &cancelled.plan.operation_uuid, cancelled.revision).unwrap();
         assert_eq!(acknowledged.phase, PublicationPhase::Cancelled);
-        discard_operation(root, &acknowledged.plan.operation_uuid, acknowledged.revision)
-            .expect("an acknowledged cancellation must be discardable");
+        discard_operation(
+            root,
+            &acknowledged.plan.operation_uuid,
+            acknowledged.revision,
+        )
+        .expect("an acknowledged cancellation must be discardable");
     }
 
     #[test]

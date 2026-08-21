@@ -2337,7 +2337,9 @@ mod tests {
         // serving the brain — the tool's own recovery advice was a no-op.
         let base = Path::new("/data/brain.lbug");
         let slot_graph = |uuid: &str| {
-            PathBuf::from(format!("/data/brain.lbug.publications/slots/{uuid}/graph.lbug"))
+            PathBuf::from(format!(
+                "/data/brain.lbug.publications/slots/{uuid}/graph.lbug"
+            ))
         };
         let before = slot_graph("550e8400-e29b-41d4-a716-446655440000");
         let after = slot_graph("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
@@ -2351,7 +2353,10 @@ mod tests {
         );
 
         // The same anchoring applies to every derived local-state path.
-        assert_eq!(socket_path(&instance_id_from_db_path(&after)), socket_path(&base_id));
+        assert_eq!(
+            socket_path(&instance_id_from_db_path(&after)),
+            socket_path(&base_id)
+        );
         assert_eq!(
             database_path_fingerprint(&after),
             database_path_fingerprint(base)

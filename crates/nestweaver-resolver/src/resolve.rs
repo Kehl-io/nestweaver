@@ -321,8 +321,8 @@ pub fn resolve_references_with_context(
             let bound_name = specifier
                 .rsplit([':', '/', '.'])
                 .find(|segment| !segment.is_empty());
-            let named: Option<&&RawSymbol> = bound_name
-                .and_then(|name| visible.iter().find(|candidate| candidate.name == name));
+            let named: Option<&&RawSymbol> =
+                bound_name.and_then(|name| visible.iter().find(|candidate| candidate.name == name));
 
             let exported: Vec<&RawSymbol> = match named {
                 Some(symbol) => vec![*symbol],
@@ -928,9 +928,7 @@ mod tests {
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
         let bogus: Vec<_> = edges
             .iter()
-            .filter(|e| {
-                e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:")
-            })
+            .filter(|e| e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:"))
             .collect();
         assert!(
             bogus.is_empty(),
@@ -1031,7 +1029,11 @@ mod tests {
         call.receiver = Some("nestweaver_engine::publication".to_string());
 
         let files = vec![
-            ("src/lib.rs".to_string(), vec![make_symbol("root", 1)], vec![]),
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("root", 1)],
+                vec![],
+            ),
             ("src/main.rs".to_string(), vec![caller], vec![call]),
             (
                 "src/publication.rs".to_string(),
@@ -1137,7 +1139,11 @@ mod tests {
         let files = vec![
             // `crate::` resolution walks up for a crate root, so the fixture
             // needs one or the import never resolves to a file at all.
-            ("src/lib.rs".to_string(), vec![make_symbol("root", 1)], vec![]),
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("root", 1)],
+                vec![],
+            ),
             (
                 "src/backup.rs".to_string(),
                 vec![make_symbol("backup_artifact_contract", 10)],

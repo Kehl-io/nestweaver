@@ -729,10 +729,9 @@ function hello(name) { return "Hello " + name; }
     /// discarded.
     #[test]
     fn a_mistyped_judgment_key_fails_to_parse_instead_of_scoring_zero() {
-        let good: JudgedQuery = serde_json::from_str(
-            r#"{"query":"rollback_current","relevance":{"sym:a":3}}"#,
-        )
-        .expect("a well-formed judgment must parse");
+        let good: JudgedQuery =
+            serde_json::from_str(r#"{"query":"rollback_current","relevance":{"sym:a":3}}"#)
+                .expect("a well-formed judgment must parse");
         assert_eq!(good.relevance.get("sym:a"), Some(&3));
 
         let error = serde_json::from_str::<JudgedQuery>(

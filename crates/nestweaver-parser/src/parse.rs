@@ -1314,7 +1314,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     })
 }
 
-
 /// Collect the LOCAL names bound by every `export { .. }` clause in a file.
 ///
 /// For `export { alpha, beta as default }` this yields {"alpha", "beta"} — the
@@ -6036,10 +6035,7 @@ mod macro_call_tests {
             .collect();
 
         for expected in ["rollback_current", "read_current"] {
-            assert!(
-                calls.contains(&expected),
-                "missing {expected} in {calls:?}"
-            );
+            assert!(calls.contains(&expected), "missing {expected} in {calls:?}");
         }
         // A bare identifier passed to a macro is NOT a call.
         assert!(
@@ -6134,7 +6130,11 @@ mod export_clause_tests {
         };
         assert_eq!(vis("_helper"), Visibility::Public, "named in export clause");
         assert_eq!(vis("plain"), Visibility::Public, "aliased as default");
-        assert_eq!(vis("direct"), Visibility::Public, "inline export, unchanged");
+        assert_eq!(
+            vis("direct"),
+            Visibility::Public,
+            "inline export, unchanged"
+        );
         assert_eq!(
             vis("untouched"),
             Visibility::Private,

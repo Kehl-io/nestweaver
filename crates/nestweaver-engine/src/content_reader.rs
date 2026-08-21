@@ -1317,7 +1317,10 @@ mod non_utf8_tests {
         // Valid JS with a stray Latin-1 byte in a comment, as in older sources.
         let mut bytes = b"// copyright \xA9 2004\nfunction cleanPaste() { return 1; }\n".to_vec();
         bytes.push(0xFF);
-        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
 
         let reader = FilesystemReader::new(dir.path());
         let source = reader

@@ -44,11 +44,7 @@ pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:
 /// must carry. Public so a caller that KNOWS the parameters can pass the
 /// expected value to [`GraphStore::load_pagerank_cache_expecting`] instead of
 /// letting the artifact vouch for itself (nw-147).
-pub fn pagerank_algorithm_fingerprint(
-    damping: f64,
-    iterations: u32,
-    scope: &GraphScope,
-) -> String {
+pub fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
     let mut digest = blake3::Hasher::new();
     digest.update(b"nestweaver-pagerank-scope-v2\0");
     digest.update(&damping.to_bits().to_le_bytes());
@@ -1110,9 +1106,7 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        let cancelled = cancel.map(|flag| {
-            move || flag.load(std::sync::atomic::Ordering::Acquire)
-        });
+        let cancelled = cancel.map(|flag| move || flag.load(std::sync::atomic::Ordering::Acquire));
         let results = nestweaver_algorithms::ppr::forward_push_ppr_cancellable(
             &cached.uids,
             &cached.adjacency,
@@ -1625,8 +1619,7 @@ mod tests {
         let reopened = GraphStore::open(&db).unwrap();
 
         // The parameters it was actually computed with: accepted.
-        let matching =
-            super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::code_only());
+        let matching = super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::code_only());
         reopened
             .load_pagerank_cache_expecting(&sidecar, Some(&matching))
             .expect("the fingerprint for the computed parameters must be accepted");
@@ -1634,9 +1627,11 @@ mod tests {
         // A DIFFERENT iteration count is a different artifact contract. Same
         // brain, same generation, same payload — only the parameters differ,
         // which is precisely the case the self-comparison could never see.
-        let mismatched =
-            super::pagerank_algorithm_fingerprint(0.85, 30, &GraphScope::code_only());
-        assert_ne!(matching, mismatched, "parameters must change the fingerprint");
+        let mismatched = super::pagerank_algorithm_fingerprint(0.85, 30, &GraphScope::code_only());
+        assert_ne!(
+            matching, mismatched,
+            "parameters must change the fingerprint"
+        );
         let error = reopened
             .load_pagerank_cache_expecting(&sidecar, Some(&mismatched))
             .expect_err("a sidecar computed with other parameters must be rejected");

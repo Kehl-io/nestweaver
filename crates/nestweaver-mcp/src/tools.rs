@@ -3724,7 +3724,11 @@ fn tool_schema_brain_search() -> Value {
 /// field to filter them on. Labelling them honestly is the fix; they remain
 /// legitimate hits.
 fn grouped_row_kind(uid: &str) -> &'static str {
-    if uid.starts_with("tag:") { "tag" } else { "note" }
+    if uid.starts_with("tag:") {
+        "tag"
+    } else {
+        "note"
+    }
 }
 
 fn tool_brain_search(
@@ -5386,9 +5390,8 @@ fn resolve_note_by_title(
         .find(|n| n.title.to_lowercase() == needle || slug_normalize(&n.title) == wanted_slug)
         .or_else(|| {
             all_notes.iter().find(|n| {
-                stem_of(&n.file_path).is_some_and(|stem| {
-                    stem == needle || slug_normalize(&stem) == wanted_slug
-                })
+                stem_of(&n.file_path)
+                    .is_some_and(|stem| stem == needle || slug_normalize(&stem) == wanted_slug)
             })
         });
     match hit {

@@ -353,7 +353,10 @@ mod tests {
         }
 
         // Fastify, which never matched at all.
-        assert_eq!(http_route_framework("fastify.get('/a', h)"), Some("fastify"));
+        assert_eq!(
+            http_route_framework("fastify.get('/a', h)"),
+            Some("fastify")
+        );
         assert_eq!(
             http_route_framework("fastify.route({ method: 'GET', url: '/a' })"),
             Some("fastify")

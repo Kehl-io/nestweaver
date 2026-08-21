@@ -167,8 +167,7 @@ pub fn parse_spec_file(path: &str, source: &str) -> Vec<SpecContract> {
 fn explain_openapi_error(source: &str, error: &str) -> String {
     let declared_31 = source.lines().take(40).any(|line| {
         let line = line.trim();
-        (line.starts_with("openapi:") || line.starts_with("\"openapi\""))
-            && line.contains("3.1")
+        (line.starts_with("openapi:") || line.starts_with("\"openapi\"")) && line.contains("3.1")
     });
     if declared_31 {
         format!(
@@ -232,9 +231,7 @@ fn parse_openapi_json(source: &str) -> Vec<SpecContract> {
 }
 
 /// The seven HTTP methods an OpenAPI path item can declare.
-const OPENAPI_VERBS: &[&str] = &[
-    "get", "put", "post", "delete", "options", "head", "patch",
-];
+const OPENAPI_VERBS: &[&str] = &["get", "put", "post", "delete", "options", "head", "patch"];
 
 /// Extract contracts from an OpenAPI document represented as generic JSON.
 ///
@@ -755,9 +752,7 @@ pub fn detect_handlers(
 const NODE_ROUTE_RECEIVERS: &[&str] = &["fastify", "app", "router", "server", "api"];
 
 /// HTTP methods a Node route registration can name.
-const NODE_ROUTE_VERBS: &[&str] = &[
-    "get", "post", "put", "patch", "delete", "head", "options",
-];
+const NODE_ROUTE_VERBS: &[&str] = &["get", "post", "put", "patch", "delete", "head", "options"];
 
 /// Parse one source line into `(verb, path)` when it registers a Node route.
 ///
