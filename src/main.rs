@@ -2505,8 +2505,9 @@ enum Commands {
         name: Option<String>,
         #[arg(
             long = "with-trigrams",
-            help = "Incrementally refresh trigram postings for changed repo/vault scopes to \
-                    accelerate `regex-search` (opt-in storage cost)"
+            help = "Refresh trigram postings for changed repo/vault scopes for THIS run, \
+                    whatever the config says. Set `[indexing] with_trigrams = true` to \
+                    enable it permanently (opt-in storage cost)"
         )]
         with_trigrams: bool,
         #[arg(
@@ -2518,7 +2519,8 @@ enum Commands {
         no_trigrams: bool,
         #[arg(
             long = "rebuild-trigrams",
-            help = "Force a full regex-v3 trigram rebuild instead of refreshing changed scopes"
+            help = "Force a full regex-v3 trigram rebuild instead of refreshing changed \
+                    scopes. Implies a refresh, so it does not need --with-trigrams"
         )]
         rebuild_trigrams: bool,
         #[arg(
@@ -4793,10 +4795,17 @@ enum PublicationCommands {
         db: Option<PathBuf>,
     },
     /// Reclaim publication slots that nothing can still reach
+    ///
+    /// Keeps the slot CURRENT selects, its retained predecessor (the one-step
+    /// rollback target), and any slot an in-flight operation targets. Takes the
+    /// publication-root lock, so it serializes against rebuild, rollback and
+    /// discard. A real run also requires a stopped daemon, since the daemon may
+    /// hold the selected graph open.
     Prune {
         #[arg(
             long,
-            help = "Report what would be reclaimed without deleting anything"
+            help = "Report what would be reclaimed without deleting anything, and \
+                    without requiring a stopped daemon"
         )]
         dry_run: bool,
         #[arg(long, help = "Publication root; defaults from --db")]
