@@ -1765,6 +1765,23 @@ impl GraphStore {
             // cleared during open and therefore has no adopted envelope. The
             // next successful embed must replace that file with a complete v2
             // base instead of appending deltas to an unusable foundation.
+            // A base that fails its payload checksum is NOT a foundation to
+            // append to. Before the checksum was deferred, such a file errored
+            // at load and was cleared, so it had no envelope and the comment
+            // above held automatically. It now loads structurally and KEEPS its
+            // envelope, so without this the flush appended a journal to an
+            // unusable base and compaction later refused to replace it —
+            // leaving semantic search dead forever while the error told the
+            // operator to re-embed.
+            if base_exists && idx.base_is_corrupt() {
+                if idx.overlay_len() == 0 {
+                    // Nothing new to write. Rewriting now would replace the
+                    // corrupt file with an EMPTY one and lose the UID list too,
+                    // so refuse and let the operator re-embed first.
+                    return Err(StoreError::EmbeddingArtifactCorrupt);
+                }
+                idx.discard_corrupt_base();
+            }
             let trusted_base_exists = base_exists && idx.artifact_envelope().is_some();
             if !trusted_base_exists {
                 idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
@@ -1976,9 +1993,21 @@ impl GraphStore {
 
     /// Perform a vector similarity search over the embedding index.
     /// Returns `(uid, cosine_similarity)` pairs sorted descending.
-    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
+    /// Returns `Err` for a corrupt embedding artifact.
+    ///
+    /// This used to `.expect()`, which was sound while `Cancelled` was the only
+    /// possible error and `cancel = None` made it unreachable. Adding
+    /// `EmbeddingArtifactCorrupt` broke that invariant: the publication startup
+    /// smoke calls this, so a corrupt artifact would PANIC there instead of
+    /// failing the smoke — bypassing the automatic rollback that a failed smoke
+    /// exists to trigger. Every other check in that smoke propagates with `?`;
+    /// this one now does too.
+    pub fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         self.vector_search_cancellable(query_embedding, limit, None)
-            .expect("vector_search with cancel=None cannot be cancelled")
     }
 
     /// Like [`vector_search`], but threads a cooperative cancellation flag into

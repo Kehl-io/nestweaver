@@ -316,12 +316,14 @@ fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyho
             "matcher": "Bash",
             "hooks": [{
                 "type": "command",
-                "command": format!(
-                    "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.command // empty'); \
+                // Not a `format!`: this string interpolates nothing, and a
+                // newer clippy rejects `useless_format` under -D warnings. The
+                // `{}` here are literal JSON braces, so they are NOT doubled —
+                // doubling only escapes them for a format string.
+                "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.command // empty'); \
                      if echo \"$CMD\" | grep -qE '(grep|rg|find|fd|ack|ag)\\s'; then \
-                       echo '{{\"additionalContext\": \"NestWeaver is indexed — prefer `brain_search` (searches code + notes) or `brain_context` (ranked structural context) over grep/find. Token savings: ~90% fewer tokens than file-by-file exploration.\"}}'; \
-                     fi",
-                )
+                       echo '{\"additionalContext\": \"NestWeaver is indexed — prefer `brain_search` (searches code + notes) or `brain_context` (ranked structural context) over grep/find. Token savings: ~90% fewer tokens than file-by-file exploration.\"}'; \
+                     fi"
             }]
         }));
     }

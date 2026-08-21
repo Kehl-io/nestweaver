@@ -3420,6 +3420,69 @@ mod semantic_leg_tests {
         assert!(result.degraded_components.is_empty());
     }
 
+    /// Review finding: the error tells operators to re-embed, so re-embedding
+    /// MUST actually repair the corpus. It did not.
+    ///
+    /// `flush_embedding_index` decides between rewriting the base and appending
+    /// a journal via `base_exists && artifact_envelope().is_some()`, and its
+    /// comment states the invariant it relies on: a corrupt file "is
+    /// deliberately cleared during open and therefore has no adopted
+    /// envelope". Deferring the checksum broke that — the corrupt file now
+    /// loads structurally and KEEPS its envelope, so flush appended a journal
+    /// on top of an unusable foundation and compaction then refused to replace
+    /// it. Semantic search stayed dead forever while the error said to
+    /// re-embed.
+    ///
+    /// This is the whole recovery loop, end to end.
+    #[test]
+    fn a_full_re_embed_repairs_a_corrupt_artifact_and_restores_semantic_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = crate::sidecar_path(&db, ".embeddings.bin");
+        {
+            let store = GraphStore::create(&db).unwrap();
+            store.insert_symbol(&payment_symbol()).unwrap();
+            store.set_embedding_metadata("test-model", 4).unwrap();
+            assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+            store.flush_embedding_index().unwrap();
+        }
+        let mut bytes = std::fs::read(&sidecar).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&sidecar, &bytes).unwrap();
+
+        // Corrupt: semantic search must be unavailable, and the row must read
+        // as un-embedded so a re-embed picks it up again.
+        {
+            let store = GraphStore::open(&db).unwrap();
+            assert!(
+                store.vector_search(&[0.0; 4], 1).is_err(),
+                "a corrupt artifact must fail closed"
+            );
+            assert!(
+                !store.has_embedding("sym:payment"),
+                "a corrupt row must read as un-embedded so a re-embed refills it"
+            );
+
+            // The re-embed itself.
+            assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+            store
+                .flush_embedding_index()
+                .expect("flushing a re-embed over a corrupt base must repair it");
+        }
+
+        // Reopen: the artifact must now be valid and semantic search must work.
+        let store = GraphStore::open(&db).unwrap();
+        let hits = store
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], 1)
+            .expect("a repaired artifact must serve semantic search");
+        assert_eq!(
+            hits.first().map(|(uid, _)| uid.as_str()),
+            Some("sym:payment"),
+            "the re-embedded vector must be searchable after repair"
+        );
+        assert!(store.has_embedding("sym:payment"));
+    }
+
     /// Review finding on nw-184: deferring the payload checksum to first use
     /// meant a CORRUPT sidecar loaded structurally, `store_has_embeddings`
     /// reported true, the semantic leg ran, the corrupt base was silently

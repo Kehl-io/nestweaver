@@ -9580,7 +9580,7 @@ function hello(name) { return "Hello " + name; }
         assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
         store.flush_embedding_index().unwrap();
         assert_eq!(
-            store.vector_search(&[1.0, 0.0], 1)[0].0,
+            store.vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
             removed_symbol_uid,
             "precondition: stale vector must displace the live result"
         );
@@ -9598,13 +9598,13 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let live_results = store.vector_search(&[1.0, 0.0], 1);
+        let live_results = store.vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(live_results[0].0, survivor_symbol_uid);
         assert!(!store.has_embedding(&removed_symbol_uid));
         assert!(store.has_embedding(&survivor_symbol_uid));
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1);
+        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(persisted_results[0].0, survivor_symbol_uid);
         assert!(!reopened.has_embedding(&removed_symbol_uid));
         assert!(reopened.has_embedding(&survivor_symbol_uid));

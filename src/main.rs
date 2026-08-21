@@ -14365,6 +14365,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
                 })?;
+            // nw-145 migration: these commands derive the ANCHORED identity
+            // directly, so on their own they cannot see a daemon that 6.3.0
+            // bound to the SELECTED-SLOT identity — `start` would fail to take
+            // the write lock it still holds, and `stop` would report nothing to
+            // stop. Autostart already retires it; the explicit commands have to
+            // as well, or the two disagree about which daemon exists.
+            //
+            // `status` is deliberately excluded: it is a read-only command and
+            // must not kill anything. It reports the orphan instead, below.
+            if matches!(
+                action,
+                DaemonAction::Start { .. } | DaemonAction::Stop { .. }
+            ) {
+                nestweaver_daemon::lifecycle::stop_selected_slot_identity_daemon(&db_path);
+            }
             // Don't pre-canonicalize — instance_id_from_db_path handles it
             // internally with consistent fallback for non-existent files.
             let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
@@ -15680,6 +15695,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             format_daemon_unreachable_status(
                                 owner, &db_path, &socket, &pidfile, &log_hint
                             )
+                        );
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // nw-145 migration: before declaring nothing is running,
+                    // check the pre-anchoring identity 6.3.0 would have used.
+                    // Announcing "not running" over a live, database-owning
+                    // daemon is the exact failure nw-145 exists to prevent.
+                    if let Some(pid) =
+                        nestweaver_daemon::lifecycle::selected_slot_identity_daemon_pid(&db_path)
+                    {
+                        println!(
+                            "Daemon is not running under this instance id, but pid {pid} is \
+                             still running under the pre-6.4 selected-slot identity and may \
+                             hold the database write lock. Run `nestweaver daemon --db {} \
+                             stop` to retire it, then start again.",
+                            db_path.display()
                         );
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -23323,6 +23354,8 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             db,
         } => {
             let root = root(explicit_root, db)?;
+            // Serialize against rebuild / rollback / prune on this same root.
+            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             // nw-146: request_cancel only sets `cancel_requested`; ONLY the
             // running worker calls acknowledge_cancel to reach phase Cancelled.
             // If that worker is gone, both discard paths refused — `--revision`
@@ -23389,23 +23422,20 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             // had just selected — the live graph.
             let base_db = db.clone().unwrap_or_else(default_db_path);
             let root = root(explicit_root, db)?;
+            // Cross-process exclusion against rebuild / rollback / discard,
+            // anchored to the ROOT being pruned — the one thing every
+            // publication operation shares.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             let report = if dry_run {
                 // A preview writes nothing, so it needs no exclusivity — and
                 // requiring a stopped daemon just to LOOK would make the safe
                 // option the inconvenient one.
-                let store = open_store(Some(&base_db))?;
-                let lease = store
-                    .acquire_index_publication_lease()
-                    .map_err(|e| anyhow::anyhow!("acquire index publication lease: {e}"))?;
-                nestweaver_engine::publication::prune_slots(&root, &lease, true)?
+                nestweaver_engine::publication::prune_slots(&root, &root_lock, true)?
             } else {
+                // A daemon may hold the SELECTED graph open, so quiesce it too
+                // before removing slots out from under it.
                 ensure_no_live_daemon_for_snapshot_build(&base_db)?;
-                let store = GraphStore::open(&base_db)
-                    .with_context(|| format!("open {} read-write", base_db.display()))?;
-                let lease = store
-                    .acquire_index_publication_lease()
-                    .map_err(|e| anyhow::anyhow!("acquire index publication lease: {e}"))?;
-                nestweaver_engine::publication::prune_slots(&root, &lease, false)?
+                nestweaver_engine::publication::prune_slots(&root, &root_lock, false)?
             };
             if report.slots.is_empty() {
                 println!("No publication slots found under {}", root.display());
@@ -23444,6 +23474,9 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
         PublicationCommands::Rollback { db, config, json } => {
             let (base_db, cfg) = resolve_base_db_with_config(db, config.as_deref())?;
             let root = nestweaver_engine::publication::default_publication_root(&base_db);
+            // Serialize against rebuild / discard / prune. Taken BEFORE reading
+            // CURRENT so the pointer this rollback acts on cannot move under it.
+            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             let current = nestweaver_engine::publication::read_current(&root)?
                 .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
             let predecessor_db = nestweaver_engine::publication::retained_predecessor_database(
@@ -23504,6 +23537,11 @@ fn run_publication_rebuild(
     let (base_db, cfg) = resolve_base_db_with_config(db, Some(config_path))?;
     let config = cfg.ok_or_else(|| anyhow::anyhow!("publication rebuild requires --config"))?;
     let publication_root = nestweaver_engine::publication::default_publication_root(&base_db);
+    // Serialize against rollback / discard / prune on this root. Held for the
+    // whole rebuild — including the cutover — so no concurrent operation can
+    // reclaim or reselect a slot this one is building.
+    let _root_lock =
+        nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root)?;
     let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
     if !incumbent_db.exists() {
         anyhow::bail!(
@@ -24154,7 +24192,9 @@ fn publication_startup_smoke(
     text_index.search("nestweaver", 1)?;
     store.regex_search("(?s).", None, None, Some(1), Some(1_000))?;
     if let Some(dimension) = store.embedding_index_dimension() {
-        store.vector_search(&vec![0.0; dimension], 1);
+        // Propagate, do not swallow: a corrupt embedding artifact must FAIL
+        // this smoke so the caller rolls back, not surface as a panic.
+        store.vector_search(&vec![0.0; dimension], 1)?;
     }
     Ok(())
 }

@@ -1152,7 +1152,7 @@ impl EmbeddingIndex {
     /// from "no semantic matches" — so it reported `semantic_applied: true`
     /// over zero contribution. Every read path now consults this and fails
     /// closed with `StoreError::EmbeddingArtifactCorrupt` instead.
-    fn base_is_corrupt(&self) -> bool {
+    pub(crate) fn base_is_corrupt(&self) -> bool {
         self.base
             .as_ref()
             .is_some_and(|base| !base.payload_intact())
@@ -1268,6 +1268,33 @@ impl EmbeddingIndex {
                 .count()
         });
         base_count + self.embeddings.len()
+    }
+
+    /// Vectors written since the mapped base — i.e. what a re-embed has
+    /// produced in this session.
+    pub(crate) fn overlay_len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// Drop a base that failed its payload checksum, keeping the overlay.
+    ///
+    /// Returns how many rows were lost. Those vectors are already unusable —
+    /// the payload they live in is corrupt — so this does not destroy anything
+    /// recoverable; it lets the next flush write a CLEAN base from the overlay
+    /// instead of appending a journal to an unusable foundation. Clearing the
+    /// envelope is what restores the `trusted_base_exists` invariant that
+    /// `flush_embedding_index` documents and depends on.
+    pub(crate) fn discard_corrupt_base(&mut self) -> usize {
+        let dropped = self.base.as_ref().map_or(0, |base| base.rows.len());
+        self.base = None;
+        self.artifact_envelope = None;
+        self.deleted_base_uids.clear();
+        tracing::error!(
+            dropped,
+            "embedding base failed its payload checksum; discarding it so a re-embed can \
+             rewrite a clean artifact. Those rows must be re-embedded to become searchable."
+        );
+        dropped
     }
 
     pub fn is_empty(&self) -> bool {

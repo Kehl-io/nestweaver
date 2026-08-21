@@ -644,6 +644,64 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
 
 /// Resolve the retained incumbent graph used to authorize activation rollback
 /// without consulting or opening the newly selected publication. `None`
+/// Cross-process exclusion for one publication root.
+///
+/// The `IndexPublicationLease` is an in-process coordinator — a `Mutex` plus a
+/// `Condvar` owned by a single `GraphStore`. Two processes, or even two stores
+/// opened in the same process, receive UNRELATED leases, so it cannot serialize
+/// anything across process boundaries. Nor can a database write lock stand in
+/// for it here: activation locks the SELECTED slot graph while a prune inspects
+/// the base, so the two lock different files and exclude nothing.
+///
+/// Anchoring the lock to the publication ROOT is what makes it correct, because
+/// the root is the one thing every publication operation shares — and it is
+/// also what makes `--root` safe, since the lock follows whichever root the
+/// caller actually operates on.
+///
+/// Held by rebuild, rollback, discard and prune. Released on drop.
+#[derive(Debug)]
+pub struct PublicationRootLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl PublicationRootLock {
+    /// Take the lock, or fail fast if another operation holds it.
+    ///
+    /// Deliberately non-blocking: a publication rebuild can run for minutes, and
+    /// a CLI that silently hangs behind one is worse than a CLI that says who is
+    /// holding it and exits.
+    pub fn acquire(publication_root: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(publication_root).with_context(|| {
+            format!(
+                "create publication root {} for locking",
+                publication_root.display()
+            )
+        })?;
+        let path = publication_root.join("LOCK");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open publication lock {}", path.display()))?;
+        file.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "another publication operation holds {} ({error}); wait for it to finish, \
+                 or check `nestweaver publication status`",
+                path.display()
+            )
+        })?;
+        Ok(Self { _file: file, path })
+    }
+
+    /// The lock file backing this guard, for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// One slot considered by [`prune_slots`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotDisposition {
@@ -712,15 +770,22 @@ fn directory_bytes(path: &Path) -> u64 {
 ///    conservative choice `discard_invalid_operation` already makes.
 pub fn prune_slots(
     publication_root: &Path,
-    lease: &nestweaver_store::IndexPublicationLease<'_>,
+    lock: &PublicationRootLock,
     dry_run: bool,
 ) -> anyhow::Result<SlotPruneReport> {
-    // Proof of exclusivity, not decoration. Every other mutation of this
-    // directory — compare_and_swap_current, the rebuild path — is serialized by
-    // this lease. A prune that skipped it could read CURRENT, have a cutover
-    // land, and then delete the slot that cutover had just selected. Requiring
-    // it in the SIGNATURE means a future caller cannot forget.
-    let _ = lease;
+    // Proof of CROSS-PROCESS exclusivity, in the signature so a caller cannot
+    // forget it. An earlier version took an `IndexPublicationLease` instead,
+    // which looked like exclusion but is not: that lease is an in-process
+    // Mutex/Condvar owned by one GraphStore, so a rebuild in another process
+    // holds an unrelated one. This lock is anchored to the same root being
+    // pruned, which is what actually serializes against rebuild, rollback and
+    // discard — and what stops a cutover landing between the CURRENT read below
+    // and the deletes further down, which would reclaim the slot that cutover
+    // had just selected.
+    debug_assert!(
+        lock.path().starts_with(publication_root),
+        "the lock must guard the root being pruned"
+    );
     let slots_dir = publication_root.join("slots");
     let entries = match std::fs::read_dir(&slots_dir) {
         Ok(entries) => entries,
@@ -1442,6 +1507,54 @@ mod tests {
     ///
     /// A slot whose operation is TERMINAL and which CURRENT no longer selects
     /// is exactly the superseded-slot leak nw-135 exists to close.
+    /// Review finding: the previous guard was an `IndexPublicationLease`,
+    /// which is an in-process Mutex/Condvar owned by ONE GraphStore — two
+    /// processes, or two stores in one process, get unrelated leases, so it
+    /// serialized nothing across processes. A database write lock cannot stand
+    /// in either: activation locks the SELECTED slot graph while a prune
+    /// inspects the base, so they lock different files.
+    ///
+    /// This proves the replacement is a real, root-anchored, cross-process
+    /// lock: a SECOND acquisition of the same root is refused, including from
+    /// another process.
+    #[test]
+    fn the_publication_root_lock_excludes_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("brain.lbug.publications");
+
+        let held = PublicationRootLock::acquire(&root).expect("first acquisition must succeed");
+        let error = PublicationRootLock::acquire(&root)
+            .expect_err("a second holder must be refused while the first lives");
+        assert!(
+            error.to_string().contains("another publication operation"),
+            "the refusal must name the contention: {error}"
+        );
+
+        // Cross-PROCESS, not merely cross-handle: a child that tries the same
+        // root must also be refused while this process holds it.
+        let probe = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "exec 9>>'{}' && flock -n 9 && echo FREE || echo HELD",
+                root.join("LOCK").display()
+            ))
+            .output();
+        if let Ok(probe) = probe {
+            let observed = String::from_utf8_lossy(&probe.stdout);
+            // `flock(1)` is absent on macOS; only assert where it exists.
+            if observed.contains("HELD") || observed.contains("FREE") {
+                assert!(
+                    observed.contains("HELD"),
+                    "another process must observe the lock as held: {observed}"
+                );
+            }
+        }
+
+        drop(held);
+        PublicationRootLock::acquire(&root)
+            .expect("the lock must be released when its guard drops");
+    }
+
     #[test]
     fn prune_reclaims_a_superseded_slot_whose_journal_survived_activation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1470,8 +1583,8 @@ mod tests {
         }
 
         // An in-flight (non-terminal) journal must still pin its slot.
-        let lease = store.acquire_index_publication_lease().unwrap();
-        let inflight = prune_slots(root, &lease, true).unwrap();
+        let lock = PublicationRootLock::acquire(root).unwrap();
+        let inflight = prune_slots(root, &lock, true).unwrap();
         assert_eq!(
             inflight.removed().count(),
             0,
@@ -1499,7 +1612,7 @@ mod tests {
             }
         }
 
-        let report = prune_slots(root, &lease, false).unwrap();
+        let report = prune_slots(root, &lock, false).unwrap();
         assert_eq!(
             report.removed().count(),
             3,
@@ -1546,15 +1659,15 @@ mod tests {
         drop(lease);
 
         // Dry run must report the orphan without touching the disk.
-        let lease = store.acquire_index_publication_lease().unwrap();
-        let preview = prune_slots(root, &lease, true).unwrap();
+        let lock = PublicationRootLock::acquire(root).unwrap();
+        let preview = prune_slots(root, &lock, true).unwrap();
         assert_eq!(preview.removed().count(), 1);
         assert!(
             slot_path(root, &orphan.publication_uuid).unwrap().exists(),
             "a dry run must not delete anything"
         );
 
-        let report = prune_slots(root, &lease, false).unwrap();
+        let report = prune_slots(root, &lock, false).unwrap();
         let removed: Vec<&str> = report
             .removed()
             .map(|slot| slot.publication_uuid.as_str())
@@ -1578,7 +1691,7 @@ mod tests {
 
         // Idempotent: a second pass finds nothing left to reclaim.
         assert_eq!(
-            prune_slots(root, &lease, false).unwrap().removed().count(),
+            prune_slots(root, &lock, false).unwrap().removed().count(),
             0
         );
     }

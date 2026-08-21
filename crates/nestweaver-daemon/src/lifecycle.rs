@@ -2247,6 +2247,32 @@ pub fn stop_selected_slot_identity_daemon(db_path: &Path) {
     retire_daemon_under_old_identity(&old_id, &new_id, "publication identity anchoring");
 }
 
+/// The pid of a daemon still running under the pre-anchoring, selected-slot
+/// identity, if one exists.
+///
+/// Read-only counterpart to [`stop_selected_slot_identity_daemon`], so a
+/// read-only command (`daemon status`) can REPORT the orphan instead of
+/// silently reporting "not running" about a process that still holds the
+/// database write lock — the nw-145 symptom, reappearing at the upgrade
+/// boundary.
+pub fn selected_slot_identity_daemon_pid(db_path: &Path) -> Option<i32> {
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let selected = nestweaver_engine::publication::resolve_selected_database(&anchor).ok()?;
+    if selected == anchor {
+        return None;
+    }
+    let old_id = instance_id_from_canonical_path(&canonical_db_path(&selected));
+    if old_id == instance_id_from_db_path(&anchor) {
+        return None;
+    }
+    let pid = std::fs::read_to_string(pidfile_path(&old_id))
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    (pid > 0 && unsafe { libc::kill(pid, 0) == 0 }).then_some(pid)
+}
+
 /// Stop and clean up a daemon left behind under a superseded instance id.
 ///
 /// Shared by every identity migration so a new one cannot get the shutdown
@@ -2897,6 +2923,56 @@ mod tests {
 
             assert!(!binding_path.exists());
             assert!(!runtime_dir(&old_id).exists());
+        });
+    }
+
+    /// Review finding: the previous test only proved the two hashes differ,
+    /// which does not show that a migration actually retires anything. This
+    /// exercises the shared runtime path — the same one both migrations use —
+    /// against seeded artifacts.
+    #[test]
+    fn retiring_a_superseded_identity_removes_its_runtime_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let old_id = "aaaabbbb";
+            let new_id = "ccccdddd";
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding(old_id, &binding).unwrap();
+            let binding_path = effective_config_binding_path(old_id);
+            assert!(binding_path.exists(), "fixture must seed the old binding");
+
+            retire_daemon_under_old_identity(old_id, new_id, "test migration");
+
+            assert!(
+                !binding_path.exists(),
+                "the superseded identity's config binding must be removed"
+            );
+            assert!(
+                !runtime_dir(old_id).exists(),
+                "the superseded identity's runtime dir must be removed"
+            );
+        });
+    }
+
+    /// Coinciding ids mean there is nothing to migrate, and the helper must
+    /// not touch a HEALTHY daemon's artifacts.
+    #[test]
+    fn retiring_is_a_no_op_when_the_identity_did_not_change() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let id = "eeeeffff";
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding(id, &binding).unwrap();
+            let binding_path = effective_config_binding_path(id);
+
+            retire_daemon_under_old_identity(id, id, "same identity");
+
+            assert!(
+                binding_path.exists(),
+                "an unchanged identity must not have its live artifacts reaped"
+            );
         });
     }
 

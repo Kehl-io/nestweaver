@@ -4572,12 +4572,19 @@ fn first_search_uid(db_path: &Path, query: &str) -> String {
         "search must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rows: serde_json::Value =
+    let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("search --json must emit valid JSON");
+    // `search --json` carries its own truncation contract: {results, returned,
+    // limit, truncated}. Accept the pre-6.4 bare array too, so this helper is
+    // not a second place that has to be updated in lockstep with the shape.
+    let rows = payload
+        .get("results")
+        .filter(|results| results.is_array())
+        .unwrap_or(&payload);
     rows.as_array()
         .and_then(|arr| arr.first())
         .and_then(|row| row["uid"].as_str())
-        .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {rows}"))
+        .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {payload}"))
         .to_string()
 }
 
