@@ -4152,7 +4152,20 @@ impl NestWeaverDaemon for DaemonService {
         }
         let state = self.state.clone();
         let force = req.force;
-        let with_trigrams = req.with_trigrams;
+        // Three-state trigram policy. A plain bool could not distinguish "the
+        // caller said no" from "the caller said nothing", so a configless
+        // `index` sent false and this handler honoured it — discarding the
+        // daemon's own `[indexing] with_trigrams = true`. UNSPECIFIED now means
+        // inherit, and the legacy bool is ORed in so a pre-6.4 client that sets
+        // it still forces a refresh.
+        let with_trigrams = resolve_trigram_policy(
+            req.trigram_policy(),
+            req.with_trigrams,
+            state
+                .instance_cfg
+                .as_ref()
+                .is_some_and(|config| config.indexing.with_trigrams),
+        );
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
@@ -8413,6 +8426,30 @@ fn seed_embedding_artifact_cache(
         nestweaver_embed::ArtifactMode::DownloadMissing,
     )?;
     Ok(cache_dir)
+}
+
+/// Resolve whether an IndexRepo request should refresh the trigram pre-filter.
+///
+/// A plain bool could not distinguish "the caller said no" from "the caller
+/// said nothing", so a configless `index` sent false and this handler honoured
+/// it — discarding the daemon's own `[indexing] with_trigrams = true`.
+/// UNSPECIFIED means inherit.
+///
+/// `legacy_with_trigrams` is ORed into the UNSPECIFIED branch so a pre-6.4
+/// client, which knows only the bool, still forces a refresh when it sets it.
+/// An explicit ENABLED/DISABLED always wins.
+fn resolve_trigram_policy(
+    policy: nestweaver_proto::TrigramPolicy,
+    legacy_with_trigrams: bool,
+    daemon_config_enabled: bool,
+) -> bool {
+    match policy {
+        nestweaver_proto::TrigramPolicy::Enabled => true,
+        nestweaver_proto::TrigramPolicy::Disabled => false,
+        nestweaver_proto::TrigramPolicy::Unspecified => {
+            legacy_with_trigrams || daemon_config_enabled
+        }
+    }
 }
 
 /// The artifact mode daemon STARTUP loads under.
@@ -18340,6 +18377,48 @@ mod boot_reconciliation_tests {
 
 #[cfg(test)]
 mod watch_path_allowed_tests {
+    use super::resolve_trigram_policy;
+
+    /// Every daemon-side precedence case for the trigram policy.
+    ///
+    /// The bool this replaced could not express "inherit", so a configless
+    /// `index` against a daemon configured with `[indexing] with_trigrams =
+    /// true` sent false and the daemon discarded its own configuration —
+    /// reproduced as `"trigram_refresh": null` while the same index with
+    /// `--config` refreshed a scope.
+    #[test]
+    fn trigram_policy_precedence_covers_every_daemon_case() {
+        use nestweaver_proto::TrigramPolicy::{Disabled, Enabled, Unspecified};
+
+        // Explicit ENABLED wins over everything, including a daemon that has
+        // the feature switched off.
+        assert!(resolve_trigram_policy(Enabled, false, false));
+        assert!(resolve_trigram_policy(Enabled, false, true));
+
+        // Explicit DISABLED wins too — this is what --no-trigrams must do
+        // against a daemon whose config enables it.
+        assert!(!resolve_trigram_policy(Disabled, true, true));
+        assert!(!resolve_trigram_policy(Disabled, false, true));
+
+        // UNSPECIFIED inherits the daemon's configuration. THIS is the case the
+        // bool could not represent.
+        assert!(
+            resolve_trigram_policy(Unspecified, false, true),
+            "a configless index must inherit the daemon's with_trigrams = true"
+        );
+        assert!(
+            !resolve_trigram_policy(Unspecified, false, false),
+            "a configless index must not refresh when the daemon has it off"
+        );
+
+        // A pre-6.4 client knows only the legacy bool; setting it must still
+        // force a refresh even though it sends no policy.
+        assert!(
+            resolve_trigram_policy(Unspecified, true, false),
+            "an old client's with_trigrams=true must still be honoured"
+        );
+    }
+
     use super::*;
     use nestweaver_engine::{RepoConfig, RepoType};
 

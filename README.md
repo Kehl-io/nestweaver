@@ -233,7 +233,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Trigram refresh follows `[indexing] with_trigrams`; `--with-trigrams` forces it on for one run, `--no-trigrams` off, `--rebuild-trigrams` forces a full v2 rebuild. |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Trigram refresh follows `[indexing] with_trigrams`; with no `--config` the daemon's own setting is inherited. `--with-trigrams` forces it on for one run, `--no-trigrams` off (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |

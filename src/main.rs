@@ -2513,6 +2513,10 @@ enum Commands {
         #[arg(
             long = "no-trigrams",
             conflicts_with = "with_trigrams",
+            // --rebuild-trigrams asks for a FULL rebuild, so pairing it with
+            // --no-trigrams is a contradiction. It used to be accepted and
+            // silently no-op, reporting success with no refresh performed.
+            conflicts_with = "rebuild_trigrams",
             help = "Skip the trigram refresh even when `[indexing] with_trigrams = true` \
                     is set in the config"
         )]
@@ -13987,17 +13991,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .as_ref()
                 .map(|cfg| cfg.indexing.limits())
                 .unwrap_or_default();
-            // Trigram policy. `[indexing] with_trigrams` sets the baseline so
-            // it does not have to be remembered on every invocation;
-            // `--with-trigrams` enables it for a one-off run, and
-            // `--no-trigrams` disables it for one even when the config enables
-            // it. `--rebuild-trigrams` implies a refresh is wanted, so it no
-            // longer has to be paired with `--with-trigrams`.
-            let config_with_trigrams = loaded_config
-                .as_ref()
-                .is_some_and(|cfg| cfg.indexing.with_trigrams);
-            let with_trigrams =
-                !no_trigrams && (with_trigrams || rebuild_trigrams || config_with_trigrams);
+            // Trigram policy, resolved to THREE states rather than a bool.
+            //
+            // Collapsing it to a bool lost the daemon's own configuration: a
+            // configless `index` sent `false`, and the daemon honoured that
+            // instead of its `[indexing] with_trigrams = true`. "The caller
+            // said no" and "the caller said nothing" have to be distinguishable
+            // across the RPC, exactly as `max_source_file_bytes` uses zero to
+            // mean "use your configured value".
+            //
+            // An explicit flag wins. Otherwise, naming a --config means that
+            // config decides; naming none defers to the daemon.
+            let trigram_policy = if no_trigrams {
+                nestweaver_proto::TrigramPolicy::Disabled
+            } else if with_trigrams || rebuild_trigrams {
+                nestweaver_proto::TrigramPolicy::Enabled
+            } else {
+                match loaded_config.as_ref() {
+                    Some(cfg) if cfg.indexing.with_trigrams => {
+                        nestweaver_proto::TrigramPolicy::Enabled
+                    }
+                    Some(_) => nestweaver_proto::TrigramPolicy::Disabled,
+                    None => nestweaver_proto::TrigramPolicy::Unspecified,
+                }
+            };
+            // The direct (non-daemon) path has no daemon to inherit from, so
+            // UNSPECIFIED resolves to off there.
+            let with_trigrams = matches!(trigram_policy, nestweaver_proto::TrigramPolicy::Enabled);
             // Create-operation: a --db in a not-yet-existing directory must
             // not fail with a bare OS error on either the daemon or the
             // direct path — create the parent directories up front.
@@ -14027,6 +14047,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     with_trigrams,
                     with_git_activity,
                     rebuild_trigrams,
+                    trigram_policy: trigram_policy as i32,
                     // Zero preserves an already-running daemon's configured
                     // policy when this invocation did not name a config.
                     max_source_file_bytes: if config.is_some() {

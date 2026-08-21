@@ -10166,6 +10166,11 @@ fn dispatch_add_source_via_daemon(
                 with_trigrams: false,
                 with_git_activity: false,
                 rebuild_trigrams: false,
+                // Inherit the daemon's `[indexing] with_trigrams`. This path has
+                // no flags to express a policy, so asserting "off" here would
+                // discard the operator's configuration exactly as the configless
+                // CLI path did.
+                trigram_policy: nestweaver_proto::TrigramPolicy::Unspecified as i32,
                 max_source_file_bytes: current_instance_config()
                     .map(|config| config.indexing.limits().max_source_file_bytes())
                     .unwrap_or(0),

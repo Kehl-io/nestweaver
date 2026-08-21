@@ -475,10 +475,19 @@ runs:
 
 | Invocation | Result |
 | --- | --- |
-| `index` with `with_trigrams = true` | refreshes |
-| `index --with-trigrams` | refreshes, whatever the config says |
-| `index --no-trigrams` | skips, even when the config enables it |
-| `index --rebuild-trigrams` | forces a full v2 rebuild; implies a refresh |
+| `index` with no `--config` | inherits the DAEMON's setting |
+| `index --config <path>` | that config decides |
+| `index --with-trigrams` | refreshes, whatever any config says |
+| `index --no-trigrams` | skips, even when a config enables it |
+| `index --rebuild-trigrams` | full rebuild; implies a refresh |
+| `index --no-trigrams --rebuild-trigrams` | rejected — contradictory |
+
+The first row matters: the policy is carried over the daemon RPC as a
+three-state value (inherit / on / off), not a bool. A bool could not
+distinguish "the caller said no" from "the caller said nothing", so a configless
+`index` against a daemon configured with `with_trigrams = true` used to send
+`false` and the daemon discarded its own configuration. The MCP index path
+inherits for the same reason — it has no flags with which to state a policy.
 
 A refresh failure never fails an otherwise successful index: a stale posting
 table is detected and bypassed at query time, so the cost is a slower
