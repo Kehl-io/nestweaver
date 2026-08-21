@@ -1873,19 +1873,83 @@ fn is_instance_dir_name(name: &str) -> bool {
 /// the only record tying an existing directory back to its database. Returns
 /// `None` when the line is absent or unparseable, which makes the directory
 /// unidentifiable and therefore undeletable.
-fn db_path_from_daemon_log(log: &str) -> Option<PathBuf> {
-    let line = log
-        .lines()
-        .find(|line| line.starts_with("[daemon] starting for "))?;
-    let rest = line.strip_prefix("[daemon] starting for ")?;
-    // A database path may itself contain " (instance ", so anchor on the LAST
-    // occurrence — the suffix this line format always ends with.
-    let end = rest.rfind(" (instance ")?;
-    let path = &rest[..end];
-    if path.is_empty() {
-        return None;
+/// The database a daemon booted against, read from its log directory.
+///
+/// The boot line can land in either of TWO files, and `gc` previously read
+/// only the first:
+///
+///   * `daemon.log` — launchd's stderr redirect, present only when the daemon
+///     was started from a plist;
+///   * `daemon.log.<YYYY-MM-DD>` — the tracing subscriber's daily rolling
+///     appender, which every daemon writes.
+///
+/// A daemon spawned WITHOUT launchd therefore has no undated `daemon.log` at
+/// all. On macOS that is every daemon started without a plist, so `gc` could
+/// not identify a single one: it reported live daemons as
+/// "database not identifiable from daemon.log" and never reached the
+/// write-lock ownership check that would have spared them. `log_hint` already
+/// documented this two-file split for operators; the sweep just never used it.
+///
+/// Dated files are tried newest-first, so a long-lived directory resolves from
+/// the most recent boot rather than a stale one.
+fn db_path_from_log_dir(log_dir: &Path) -> Option<PathBuf> {
+    let undated = std::fs::read_to_string(log_dir.join("daemon.log")).unwrap_or_default();
+    if let Some(db_path) = db_path_from_daemon_log(&undated) {
+        return Some(db_path);
     }
-    Some(PathBuf::from(path))
+    let mut dated: Vec<PathBuf> = std::fs::read_dir(log_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("daemon.log."))
+        })
+        .collect();
+    // Lexicographic order on `daemon.log.YYYY-MM-DD` is chronological.
+    dated.sort();
+    dated.iter().rev().find_map(|path| {
+        db_path_from_daemon_log(&std::fs::read_to_string(path).unwrap_or_default())
+    })
+}
+
+/// Extract the database path from a daemon boot line.
+///
+/// TWO formats exist, because two writers record the boot and they do not
+/// share a format:
+///
+///   * `[daemon] starting for <db> (instance <id>)` — written to stderr, which
+///     launchd captures into the undated `daemon.log`;
+///   * `<ts> INFO nestweaver_daemon::server: daemon process starting db=<db>
+///     instance=<id>` — written by the tracing subscriber into
+///     `daemon.log.<date>`.
+///
+/// Only the first was parsed, so `gc` could not identify a daemon that had no
+/// launchd stderr sink — on macOS, every daemon started without a plist. It
+/// reported them as unidentified and never reached the write-lock ownership
+/// check that spares a LIVE daemon.
+///
+/// Both formats put the path before a fixed suffix, and a path may itself
+/// contain that suffix, so both anchor on the LAST occurrence.
+fn db_path_from_daemon_log(log: &str) -> Option<PathBuf> {
+    log.lines().find_map(parse_daemon_boot_line)
+}
+
+fn parse_daemon_boot_line(line: &str) -> Option<PathBuf> {
+    if let Some(rest) = line.strip_prefix("[daemon] starting for ") {
+        let end = rest.rfind(" (instance ")?;
+        return non_empty_path(&rest[..end]);
+    }
+    // Tracing form: the fields trail the message, so slice between them.
+    let start = line.find("daemon process starting db=")?;
+    let rest = &line[start + "daemon process starting db=".len()..];
+    let end = rest.rfind(" instance=")?;
+    non_empty_path(&rest[..end])
+}
+
+fn non_empty_path(path: &str) -> Option<PathBuf> {
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn directory_size_bytes(dir: &Path) -> u64 {
@@ -2101,11 +2165,10 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
 
     // Phase 2: identify, test ownership, then reap from every root at once.
     for (name, locations) in candidates {
-        // The boot line lives in the state root's daemon.log, wherever the
-        // candidate itself was found.
-        let log =
-            std::fs::read_to_string(roots.state.join(&name).join("daemon.log")).unwrap_or_default();
-        let Some(db_path) = db_path_from_daemon_log(&log) else {
+        // The boot line lives in the state root's log directory, wherever the
+        // candidate itself was found — in `daemon.log` for a launchd-started
+        // daemon, or in `daemon.log.<date>` for any other.
+        let Some(db_path) = db_path_from_log_dir(&roots.state.join(&name)) else {
             report.unidentified.push(name);
             continue;
         };
@@ -2974,6 +3037,41 @@ mod tests {
                 "an unchanged identity must not have its live artifacts reaped"
             );
         });
+    }
+
+    /// `gc` identifies a daemon's database from its boot line, and TWO writers
+    /// record that boot in DIFFERENT formats: stderr (captured by launchd into
+    /// the undated `daemon.log`) and the tracing subscriber (into
+    /// `daemon.log.<date>`). Only the stderr form was parsed, so a daemon with
+    /// no launchd stderr sink — on macOS, every daemon started without a plist
+    /// — was reported "not identifiable" and never reached the write-lock check
+    /// that spares a LIVE daemon.
+    #[test]
+    fn a_daemon_boot_line_is_read_in_either_format() {
+        // stderr / launchd form.
+        assert_eq!(
+            db_path_from_daemon_log("[daemon] starting for /data/brain.lbug (instance abc)\n"),
+            Some(PathBuf::from("/data/brain.lbug"))
+        );
+        // tracing / rolling-appender form.
+        assert_eq!(
+            db_path_from_daemon_log(
+                "2026-08-21T05:25:56.892743Z  INFO nestweaver_daemon::server: \
+                 daemon process starting db=/data/brain.lbug instance=gcenv-44a308df\n"
+            ),
+            Some(PathBuf::from("/data/brain.lbug"))
+        );
+        // A path containing the suffix must still resolve: both formats anchor
+        // on the LAST occurrence.
+        assert_eq!(
+            db_path_from_daemon_log(
+                "... daemon process starting db=/data/weird instance=x/brain.lbug instance=abc\n"
+            ),
+            Some(PathBuf::from("/data/weird instance=x/brain.lbug"))
+        );
+        // Unrelated log content names no database.
+        assert_eq!(db_path_from_daemon_log("nothing to see here\n"), None);
+        assert_eq!(db_path_from_daemon_log(""), None);
     }
 
     #[test]

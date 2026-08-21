@@ -873,7 +873,40 @@ fn macos_autostart_temp_db_spawns_daemon_run_without_plist() {
     let db_path = dir.path().join("normal-start").join("test.lbug");
     let config_path = dir.path().join("nestweaver-instance.toml");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    std::fs::write(&config_path, "").unwrap();
+    // A VALID minimal config. This test is about plist behaviour, not config
+    // validation, and it previously wrote an EMPTY file — which
+    // `InstanceConfig` rightly rejects, since `instance_id` is deliberately
+    // required (an instance that defaults silently is what splits a graph
+    // across two instances). The test therefore failed on macOS for a reason
+    // unrelated to what it asserts, and Linux CI never ran it because it is
+    // #[cfg(target_os = "macos")].
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "autostart-temp-db"
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.path().join("snapshots").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
     let _guard = DaemonGuard::new(&db_path);
 
     let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);

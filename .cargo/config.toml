@@ -6,6 +6,23 @@
 # zstd link errors and skip daemon tests on Linux".
 LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
 
+# nw-137: bound the per-open virtual address reservation for anything cargo
+# runs (tests, `cargo run`). Each GraphStore open reserves address space
+# proportional to `max_db_size`, and the suite opens dozens concurrently at
+# default parallelism — which exhausted it and failed UNRELATED tests, most
+# often in snapshot::tests, with an mmap error that reads like a snapshot bug.
+# Every such failure passed in isolation, so it cost real signal: each full run
+# reported 1-4 spurious failures that had to be re-run individually to tell
+# them apart from regressions.
+#
+# 16 GiB is the value lbug itself uses for its own tests, with the comment
+# "it limits the number of databases which can be open in a single process".
+# Measured here: 3/3 clean runs with it, versus a flake within 3 runs without.
+#
+# NOT `force`, so a developer or a very large brain can raise it, and NOT set
+# for released binaries — cargo only injects this into processes it spawns.
+NESTWEAVER_LBUG_MAX_DB_SIZE = { value = "17179869184" }
+
 # No linker workaround is needed here, and none should be added. liblbug.a
 # vendors zstd, exports its ZSTD_* symbols, and is linked +whole-archive, so
 # every binary already carries a complete libzstd; Rust code reaches that one

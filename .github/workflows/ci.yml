@@ -106,6 +106,12 @@ jobs:
       # to unit tests; the ubuntu job still carries integration coverage.
       - name: Workspace unit tests (macOS portability gate)
         run: cargo test --locked --release --workspace --lib
+      # The --lib gate above did not cover INTEGRATION tests, and two of them
+      # were failing on macOS the whole time: one #[cfg(target_os = "macos")]
+      # test Linux CI can never run, and one gc test that passes on Linux but
+      # diverges on macOS. Both are fixed; this keeps them fixed.
+      - name: Daemon integration tests (macOS portability gate)
+        run: cargo test --locked --release --test daemon_test
       - name: Configure isolated smoke paths
         shell: bash
         run: |

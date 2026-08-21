@@ -458,6 +458,9 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 ///
 /// Overridable per-operator:
 ///   NESTWEAVER_LBUG_MAX_THREADS       engine thread-pool size (0 = library auto)
+///   NESTWEAVER_LBUG_MAX_DB_SIZE       max database size in bytes; also bounds the
+///                                     per-open virtual address reservation, so a
+///                                     smaller value allows more concurrent opens
 ///   NESTWEAVER_LBUG_BUFFER_POOL_BYTES buffer pool size in bytes (0 = auto);
 ///                                     a larger pool avoids eviction (and thus
 ///                                     the race) when the working set fits.
@@ -479,6 +482,16 @@ fn hardened_system_config() -> lbug::SystemConfig {
     let mut cfg = lbug::SystemConfig::default().max_num_threads(max_threads);
     if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
         cfg = cfg.buffer_pool_size(bytes);
+    }
+    // nw-137: each open reserves virtual address space proportional to
+    // `max_db_size`, so many concurrent opens exhaust it — the engine's own
+    // test config bounds this value with the comment "it limits the number of
+    // databases which can be open in a single process". Our test suite opens
+    // dozens of stores at default parallelism and hit exactly that, failing
+    // unrelated tests with an mmap error that reads like a snapshot bug.
+    // Overridable so a very large brain can raise it.
+    if let Some(bytes) = env_u64("NESTWEAVER_LBUG_MAX_DB_SIZE") {
+        cfg = cfg.max_db_size(bytes);
     }
     if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
         let on = !matches!(v.trim(), "0" | "false" | "off");
