@@ -170,9 +170,9 @@ pub struct SymbolSummaries {
     pub capped: bool,
 }
 
-/// Symbol-level summaries with the `target` filter pushed DOWN before the
-/// expensive per-symbol caller/callee queries, and a hard cap so an untargeted
-/// call over a large graph can't hang.
+/// Symbol-level summaries with the `target` filter pushed down before batched
+/// caller/callee retrieval, and a hard cap so an untargeted call over a large
+/// graph can't hang.
 ///
 /// - `target = Some(t)`: only symbols whose name or uid contains `t`
 ///   (case-insensitive) are summarized. The cap does not apply — a targeted
@@ -215,14 +215,20 @@ pub fn generate_symbol_summaries_bounded(
         capped = true;
     }
 
+    let selected_uids = symbols
+        .iter()
+        .map(|symbol| symbol.uid.clone())
+        .collect::<Vec<_>>();
+    let adjacency = store
+        .summary_adjacency_by_uid(&selected_uids)
+        .map_err(|error| anyhow::anyhow!("summary adjacency batch: {error}"))?;
     let mut summaries = Vec::with_capacity(symbols.len());
 
     for sym in &symbols {
-        let callers = store.callers_of(&sym.uid).unwrap_or_default();
-        let callees = store.callees_of(&sym.uid).unwrap_or_default();
-
-        let caller_names: Vec<&str> = callers.iter().map(|c| c.name.as_str()).collect();
-        let callee_names: Vec<&str> = callees.iter().map(|c| c.name.as_str()).collect();
+        let (caller_names, callee_names) = adjacency
+            .get(&sym.uid)
+            .map(|(callers, callees)| (callers.as_slice(), callees.as_slice()))
+            .unwrap_or_default();
 
         let content = format!(
             "{kind} {sig} | callers: [{callers}] | callees: [{callees}] | file: {file}:{line}",
@@ -784,6 +790,58 @@ mod tests {
         assert!(summaries[0].content.contains("src/main.js:10"));
         assert_eq!(summaries[0].level, SummaryLevel::Symbol);
         assert!(summaries[0].token_estimate > 0);
+    }
+
+    #[test]
+    fn symbol_summaries_batch_callers_and_callees_without_losing_semantics() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        let make_symbol = |uid: &str, name: &str| nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for symbol in [
+            make_symbol("caller", "caller_fn"),
+            make_symbol("target", "target_fn"),
+            make_symbol("callee", "callee_fn"),
+        ] {
+            store.insert_symbol(&symbol).unwrap();
+        }
+        for (source_uid, target_uid) in [("caller", "target"), ("target", "callee")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source_uid.to_string(),
+                    target_uid: target_uid.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let output = generate_symbol_summaries_bounded(&store, Some("target_fn"), 10).unwrap();
+        assert_eq!(output.summaries.len(), 1);
+        let content = &output.summaries[0].content;
+        assert!(content.contains("callers: [caller_fn]"), "{content}");
+        assert!(content.contains("callees: [callee_fn]"), "{content}");
     }
 
     #[test]

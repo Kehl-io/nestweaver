@@ -642,8 +642,6 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".publications")
 }
 
-/// Resolve the retained incumbent graph used to authorize activation rollback
-/// without consulting or opening the newly selected publication. `None`
 /// Cross-process exclusion for one publication root.
 ///
 /// The `IndexPublicationLease` is an in-process coordinator — a `Mutex` plus a
@@ -1109,6 +1107,20 @@ pub fn rollback_current(
     lease: &nestweaver_store::IndexPublicationLease<'_>,
     expected_current: &str,
 ) -> anyhow::Result<Option<CurrentPublicationPointer>> {
+    let root_lock = PublicationRootLock::acquire(publication_root)?;
+    rollback_current_under_lock(publication_root, lease, expected_current, &root_lock)
+}
+
+/// Roll back while the caller holds publication-root ownership across an
+/// external quiescence proof and this selector mutation. Daemon startup takes
+/// the same lock while resolving/opening CURRENT, closing the check-to-CAS
+/// race without coupling the engine to process-lifecycle implementation.
+pub fn rollback_current_under_lock(
+    publication_root: &Path,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+    expected_current: &str,
+    _root_lock: &PublicationRootLock,
+) -> anyhow::Result<Option<CurrentPublicationPointer>> {
     lease
         .ensure_clean_for_snapshot()
         .map_err(|error| anyhow::anyhow!("refusing CURRENT rollback from dirty graph: {error}"))?;
@@ -1361,6 +1373,27 @@ mod tests {
                 .is_none()
         );
         assert_eq!(resolve_selected_database(&base).unwrap(), base);
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn rollback_under_an_existing_root_lock_does_not_reacquire_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let incumbent = store.publication_identity().unwrap().unwrap();
+        let target = incumbent.next_publication().unwrap();
+        let pointer = write_resolvable_slot(&base, &target);
+        let root = default_publication_root(&base);
+        let root_lock = PublicationRootLock::acquire(&root).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+
+        assert!(
+            rollback_current_under_lock(&root, &lease, &pointer.publication_uuid, &root_lock,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(read_current(&root).unwrap().is_none());
         lease.release().unwrap();
     }
 

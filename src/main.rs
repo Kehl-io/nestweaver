@@ -2518,7 +2518,7 @@ enum Commands {
         no_trigrams: bool,
         #[arg(
             long = "rebuild-trigrams",
-            help = "Force a full v2 trigram rebuild instead of refreshing changed scopes"
+            help = "Force a full regex-v3 trigram rebuild instead of refreshing changed scopes"
         )]
         rebuild_trigrams: bool,
         #[arg(
@@ -4710,7 +4710,10 @@ enum SnapshotCommands {
 
 #[derive(Subcommand)]
 enum PublicationCommands {
-    /// Build, validate, and optionally activate a fresh publication from every indexed source
+    /// Build, validate, and optionally activate a complete fresh publication.
+    ///
+    /// Includes embeddings by contract; the global --no-embed flag is rejected
+    /// before any operation or slot is created.
     Rebuild {
         #[arg(
             long,
@@ -7440,14 +7443,15 @@ async fn restart_verified_live_under_lock(
     let locked_health = client.health_check().await.context(
         "could not revalidate live daemon after acquiring restart transaction lock; no shutdown was attempted",
     )?;
-    let prepared = nestweaver_client::prepare_restart(db_path, &locked_health, explicit_config)
-        .and_then(|prepared| {
+    let prepared =
+        nestweaver_client::prepare_explicit_restart(db_path, &locked_health, explicit_config)
+            .and_then(|prepared| {
             anyhow::ensure!(
                 prepared.config() == &expected_config,
                 "daemon effective config changed while waiting for the restart transaction lock; no shutdown was attempted"
             );
             Ok(prepared)
-        });
+            });
     drop(original);
 
     // Capture the incumbent's OWN effective config while it is still live, so
@@ -7608,8 +7612,11 @@ async fn restart_live_daemon_preserving_config(
     match nestweaver_client::DaemonClient::connect_existing(db_path).await {
         Ok(mut client) => {
             let original_health = client.health_check().await?;
-            let original =
-                nestweaver_client::prepare_restart(db_path, &original_health, explicit_config)?;
+            let original = nestweaver_client::prepare_explicit_restart(
+                db_path,
+                &original_health,
+                explicit_config,
+            )?;
             let expected_config = original.config().clone();
             let spawn_lock =
                 nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
@@ -7632,7 +7639,7 @@ async fn restart_live_daemon_preserving_config(
             {
                 let health = winner.health_check().await?;
                 let original =
-                    nestweaver_client::prepare_restart(db_path, &health, explicit_config)?;
+                    nestweaver_client::prepare_explicit_restart(db_path, &health, explicit_config)?;
                 let expected_config = original.config().clone();
                 return restart_verified_live_under_lock(
                     db_path,
@@ -10493,7 +10500,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
-        Commands::Publication { command } => run_publication(command).map(|c| (c, None)),
+        Commands::Publication { command } => run_publication(command, no_embed).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Config { command } => run_config(command),
@@ -14392,20 +14399,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
                 })?;
-            // nw-145 migration: these commands derive the ANCHORED identity
-            // directly, so on their own they cannot see a daemon that 6.3.0
-            // bound to the SELECTED-SLOT identity — `start` would fail to take
-            // the write lock it still holds, and `stop` would report nothing to
-            // stop. Autostart already retires it; the explicit commands have to
-            // as well, or the two disagree about which daemon exists.
-            //
-            // `status` is deliberately excluded: it is a read-only command and
-            // must not kill anything. It reports the orphan instead, below.
+            let selected_slot_legacy_id =
+                nestweaver_daemon::lifecycle::selected_slot_identity_instance_id(&db_path);
             if matches!(
-                action,
-                DaemonAction::Start { .. } | DaemonAction::Stop { .. }
+                &action,
+                DaemonAction::Start { .. }
+                    | DaemonAction::Stop { .. }
+                    | DaemonAction::Restart { .. }
             ) {
-                nestweaver_daemon::lifecycle::stop_selected_slot_identity_daemon(&db_path);
+                // Direct lifecycle commands must perform the same v6.3.0
+                // selected-slot identity migration as client autostart. Do it
+                // before resolving the anchored runtime paths so an invisible
+                // old daemon cannot retain the database lock.
+                nestweaver_daemon::lifecycle::retire_selected_slot_identity_daemon(&db_path)?;
             }
             // Don't pre-canonicalize — instance_id_from_db_path handles it
             // internally with consistent fallback for non-existent files.
@@ -14435,6 +14441,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let inherited_spawn_lock =
                         std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
                     let parent_driven_start = inherited_spawn_lock.is_some();
+                    // Never trust an ambient ownership hint. Re-publish it only
+                    // after `acquire_daemon_start_spawn_lock` verifies the exact
+                    // inherited locked descriptor below.
+                    nestweaver_daemon::lifecycle::clear_verified_nestweaver_managed_start();
                     // Held for its RAII effect on every platform; explicitly
                     // `.take()`n after daemonize only under
                     // `#[cfg(not(target_os = "macos"))]` below, so on macOS it
@@ -14444,6 +14454,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     #[cfg_attr(target_os = "macos", allow(unused_mut, unused_variables))]
                     let mut start_spawn_lock =
                         acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
+                    // Every successful `daemon start` owns a verified spawn
+                    // lock, whether invoked manually or by client autostart.
+                    // The non-macOS fork inherits this process-local marker;
+                    // launchd starts a fresh supervised process and therefore
+                    // deliberately does not inherit it.
+                    if start_spawn_lock.is_some() {
+                        nestweaver_daemon::lifecycle::mark_verified_nestweaver_managed_start();
+                    }
                     if track_interactions {
                         eprintln!(
                             "note: --track-interactions is an MCP flag, not a daemon flag. \
@@ -14867,14 +14885,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let db_path_abs = abs_for_daemon(&db_path);
                         let config_abs = effective_config.as_deref().map(abs_for_daemon);
                         let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
-                        let mut child = macos_temp_daemon_command(
+                        let mut child_command = macos_temp_daemon_command(
                             &executable,
                             &db_path_abs,
                             config_abs.as_deref(),
                             idle_timeout,
-                        )
-                        .spawn()
-                        .with_context(|| {
+                        );
+                        start_spawn_lock
+                            .as_ref()
+                            .context("temporary daemon start lost its verified spawn lock")?
+                            .configure_child_handoff(&mut child_command)?;
+                        let mut child = child_command.spawn().with_context(|| {
                             format!(
                                 "spawn temporary daemon process for {}",
                                 db_path_abs.display()
@@ -15242,6 +15263,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     acme_email,
                     acme_production,
                 } => {
+                    // A temporary macOS daemon is a fresh `daemon run` exec,
+                    // so the process-local ownership marker from `daemon
+                    // start` cannot cross the boundary. Accept ownership only
+                    // through the exact inherited, locked spawn-file
+                    // description; an ambient environment value without that
+                    // OS proof fails validation. launchd children receive no
+                    // handoff and remain explicitly supervisor-owned.
+                    nestweaver_daemon::lifecycle::clear_verified_nestweaver_managed_start();
+                    if let Some(inherited_fd) =
+                        std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV)
+                    {
+                        let verified =
+                            acquire_daemon_start_spawn_lock(&db_path, Some(inherited_fd))?
+                                .context(
+                                    "daemon run did not retain its verified parent spawn lock",
+                                )?;
+                        nestweaver_daemon::lifecycle::mark_verified_nestweaver_managed_start();
+                        verified.close_in_forked_child_without_unlock();
+                    }
                     if snapshot.is_some() && !server {
                         anyhow::bail!(
                             "--snapshot requires --server (a replica serves reads over TCP)"
@@ -15648,6 +15688,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Status => {
+                    if daemon_socket_reported_pid(&socket).is_none()
+                        && !pidfile_flock_held(&pidfile)
+                        && let Some(old_id) = selected_slot_legacy_id.as_deref()
+                    {
+                        let old_socket = nestweaver_daemon::socket_path(old_id);
+                        if let Some(pid) = daemon_socket_reported_pid(&old_socket) {
+                            println!(
+                                "Daemon is running under the superseded selected-slot identity (PID {pid})"
+                            );
+                            println!("  DB:     {}", db_path.display());
+                            println!("  Socket: {}", old_socket.display());
+                            println!(
+                                "  Action: run `nestweaver daemon --db {} stop`, then start it again to migrate the runtime identity",
+                                db_path.display()
+                            );
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                    }
                     // Check launchd first on macOS
                     #[cfg(target_os = "macos")]
                     if nestweaver_daemon::launchd::is_running(&instance_id) {
@@ -20998,22 +21056,31 @@ fn render_project_context_daemon_response(
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
+    let resp = brain_context_json_value(result, limit);
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_json::Value {
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
         "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": result.degraded_components,
     });
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
     }
 
     // Feature F7: surface PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
-
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
+    resp
 }
 
 /// Render the `project-context` JSON for the local (--no-daemon) path with
@@ -21031,6 +21098,29 @@ fn print_project_context_json(
     external_refs: &serde_json::Value,
     concise: bool,
 ) -> anyhow::Result<()> {
+    let resp = project_context_json_value(
+        project,
+        result,
+        limit,
+        tokens_used,
+        token_budget,
+        external_refs,
+        concise,
+    );
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_context_json_value(
+    project: &nestweaver_schema::Project,
+    result: &BrainContextResult,
+    limit: usize,
+    tokens_used: usize,
+    token_budget: usize,
+    external_refs: &serde_json::Value,
+    concise: bool,
+) -> serde_json::Value {
     // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
     // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
     // emitted full nodes regardless of response_format, diverging from the daemon path.
@@ -21056,9 +21146,14 @@ fn print_project_context_json(
         "connected": connected,
         "tokens_used": tokens_used,
         "token_budget": token_budget,
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": result.degraded_components,
     });
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
     }
     if !result.expansion_terms.is_empty() {
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
@@ -21066,8 +21161,60 @@ fn print_project_context_json(
     if !external_refs.is_null() {
         resp["external_refs"] = external_refs.clone();
     }
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
+    resp
+}
+
+#[cfg(test)]
+mod context_json_renderer_tests {
+    use super::*;
+
+    fn degraded_context() -> BrainContextResult {
+        BrainContextResult {
+            seeds: Vec::new(),
+            connected: Vec::new(),
+            unresolved_seeds: vec!["missing".to_string()],
+            expansion_terms: Vec::new(),
+            semantic_applied: false,
+            semantic_seed_count: 0,
+            degraded_components: vec!["semantic".to_string()],
+        }
+    }
+
+    #[test]
+    fn direct_brain_context_never_drops_semantic_honesty() {
+        let value = brain_context_json_value(&degraded_context(), 30);
+        assert_eq!(value["semantic_applied"], false);
+        assert_eq!(
+            value["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
+        assert_eq!(value["unresolved_seeds"], serde_json::json!(["missing"]));
+    }
+
+    #[test]
+    fn direct_project_context_never_drops_semantic_honesty() {
+        let project = nestweaver_schema::Project {
+            uid: "project:test".to_string(),
+            name: "test".to_string(),
+            summary: None,
+            instance_id: "default".to_string(),
+        };
+        let value = project_context_json_value(
+            &project,
+            &degraded_context(),
+            30,
+            0,
+            1_000,
+            &serde_json::Value::Null,
+            false,
+        );
+        assert_eq!(value["semantic_applied"], false);
+        assert_eq!(
+            value["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
+        assert_eq!(value["project_uid"], "project:test");
+    }
 }
 
 /// Generate embeddings for symbols, notes, and/or headings.
@@ -22962,6 +23109,16 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
     };
     daemon_check?;
 
+    // A pidfile is advisory runtime metadata and may be unlinked underneath a
+    // live daemon. The database lock is the durable ownership proof that
+    // survives that incident state. Rollback, prune, rebuild, and snapshot
+    // creation all require a quiescent graph, so only a provably free lock is
+    // safe; an indeterminate probe fails closed.
+    ensure_database_write_lock_quiesced(
+        db_path,
+        nestweaver_daemon::lifecycle::db_write_lock(db_path),
+    )?;
+
     // Standalone `code watch` and `brain watch` processes do not own a daemon
     // pidfile. They publish their PID in `<db>.lock`; apply the same fail-closed
     // quiescence check so snapshot build cannot race those writers either.
@@ -22989,6 +23146,32 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
             Ok(_) => Ok(()),
         },
     }
+}
+
+fn ensure_database_write_lock_quiesced(
+    db_path: &Path,
+    observed: nestweaver_daemon::lifecycle::DbWriteLock,
+) -> anyhow::Result<()> {
+    match observed {
+        nestweaver_daemon::lifecycle::DbWriteLock::Free => {}
+        nestweaver_daemon::lifecycle::DbWriteLock::Held { pid } => {
+            let owner = pid
+                .map(|value| format!(" by pid {value}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "the database write lock for {} is held{owner} — refusing an operation that \
+                 requires a quiescent graph. Stop the daemon or writer and retry.",
+                db_path.display(),
+            );
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Unknown => anyhow::bail!(
+            "the database write-lock state for {} could not be determined — refusing an \
+             operation that requires a quiescent graph. Stop the daemon or writer, verify the \
+             database is readable, and retry.",
+            db_path.display(),
+        ),
+    }
+    Ok(())
 }
 
 /// Run the MCP stdio server using HybridClient for query routing.
@@ -23262,7 +23445,7 @@ fn format_bytes(bytes: u64) -> String {
 // `snapshot build` never routes through a daemon: it guards for a quiesced DB
 // and reads the store directly (autospawning a RW daemon would trip that
 // guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
-fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
+fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Result<i32> {
     fn root(root: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         if root.is_some() && db.is_some() {
             anyhow::bail!("pass either --root or --db, not both");
@@ -23286,14 +23469,21 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             batch_size,
             no_activate,
             json,
-        } => run_publication_rebuild(
-            db,
-            &config,
-            operation.as_deref(),
-            batch_size,
-            !no_activate,
-            json,
-        ),
+        } => {
+            if no_embed {
+                anyhow::bail!(
+                    "--no-embed is incompatible with `publication rebuild`: a complete publication must contain a validated embedding artifact; rerun without --no-embed"
+                );
+            }
+            run_publication_rebuild(
+                db,
+                &config,
+                operation.as_deref(),
+                batch_size,
+                !no_activate,
+                json,
+            )
+        }
         PublicationCommands::Status {
             operation,
             root: explicit_root,
@@ -23503,11 +23693,25 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
         PublicationCommands::Rollback { db, config, json } => {
             let (base_db, cfg) = resolve_base_db_with_config(db, config.as_deref())?;
             let root = nestweaver_engine::publication::default_publication_root(&base_db);
-            // Serialize against rebuild / discard / prune. Taken BEFORE reading
-            // CURRENT so the pointer this rollback acts on cannot move under it.
-            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
+            // Hold selector ownership across the active-daemon proof and CAS.
+            // Daemon startup takes the same lock while resolving/opening
+            // CURRENT, so it cannot slip into the abandoned slot between the
+            // check and rollback.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             let current = nestweaver_engine::publication::read_current(&root)?
                 .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
+            // Derive the active slot path from the already validated selector
+            // without opening the graph. Rollback is the recovery path for a
+            // publication whose graph cannot be opened, so resolving it through
+            // `resolve_selected_database` here would make that exact failure
+            // impossible to recover from.
+            let selected_db =
+                nestweaver_engine::publication::slot_path(&root, &current.publication_uuid)?
+                    .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+            // Quiesce the graph that is serving requests before moving the
+            // selector away from it. Checking only the predecessor proves
+            // nothing about a live daemon still serving the abandoned slot.
+            ensure_no_live_daemon_for_snapshot_build(&selected_db)?;
             let predecessor_db = nestweaver_engine::publication::retained_predecessor_database(
                 &base_db,
                 current.expected_previous_publication_uuid.as_deref(),
@@ -23520,10 +23724,11 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
                 cfg.assert_expected_brain(&store)?;
             }
             let lease = store.acquire_index_publication_lease()?;
-            let selected = nestweaver_engine::publication::rollback_current(
+            let selected = nestweaver_engine::publication::rollback_current_under_lock(
                 &root,
                 &lease,
                 &current.publication_uuid,
+                &root_lock,
             )?;
             lease.release()?;
             if json {
@@ -23569,7 +23774,7 @@ fn run_publication_rebuild(
     // Serialize against rollback / discard / prune on this root. Held for the
     // whole rebuild — including the cutover — so no concurrent operation can
     // reclaim or reselect a slot this one is building.
-    let _root_lock =
+    let root_lock =
         nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root)?;
     let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
     if !incumbent_db.exists() {
@@ -24017,10 +24222,12 @@ fn run_publication_rebuild(
                                 )
                             },
                         )?;
-                        let rollback = nestweaver_engine::publication::rollback_current(
+                        let rollback =
+                            nestweaver_engine::publication::rollback_current_under_lock(
                             &publication_root,
                             &rollback_lease,
                             &state.plan.target_publication_uuid,
+                            &root_lock,
                         );
                         let release = rollback_lease.release();
                         return match (rollback, release) {
@@ -24221,9 +24428,7 @@ fn publication_startup_smoke(
     text_index.search("nestweaver", 1)?;
     store.regex_search("(?s).", None, None, Some(1), Some(1_000))?;
     if let Some(dimension) = store.embedding_index_dimension() {
-        // Propagate, do not swallow: a corrupt embedding artifact must FAIL
-        // this smoke so the caller rolls back, not surface as a panic.
-        store.vector_search(&vec![0.0; dimension], 1)?;
+        store.try_vector_search(&vec![0.0; dimension], 1)?;
     }
     Ok(())
 }
@@ -25484,6 +25689,30 @@ mod snapshot_build_guard_tests {
         std::fs::remove_file(&pidfile).unwrap();
         ensure_no_live_daemon_for_snapshot_build(&db)
             .expect("build permitted when no daemon is live");
+    }
+
+    #[test]
+    fn quiescence_requires_a_provably_free_database_write_lock() {
+        let db = PathBuf::from("/tmp/nestweaver-quiescence-contract.lbug");
+        ensure_database_write_lock_quiesced(&db, nestweaver_daemon::lifecycle::DbWriteLock::Free)
+            .expect("a provably free database is quiescent");
+
+        let held = ensure_database_write_lock_quiesced(
+            &db,
+            nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(42) },
+        )
+        .expect_err("a held database lock must block rollback and snapshot operations");
+        assert!(held.to_string().contains("pid 42"), "err was: {held}");
+
+        let unknown = ensure_database_write_lock_quiesced(
+            &db,
+            nestweaver_daemon::lifecycle::DbWriteLock::Unknown,
+        )
+        .expect_err("an indeterminate database lock must fail closed");
+        assert!(
+            unknown.to_string().contains("could not be determined"),
+            "err was: {unknown}"
+        );
     }
 
     /// A present-but-garbage pidfile must FAIL CLOSED: we can't confirm the

@@ -8904,7 +8904,25 @@ pub async fn run_server(
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let db_path = lifecycle::canonical_db_path(db_path);
+    let requested_db_path = lifecycle::canonical_db_path(db_path);
+    let base_db_path = nestweaver_engine::publication::instance_anchor_database(&requested_db_path);
+    let publication_root = nestweaver_engine::publication::default_publication_root(&base_db_path);
+    // Serialize CURRENT resolution plus GraphStore open with rollback/prune/CAS.
+    // Once the graph's write lock is held, a rollback owner can observe this
+    // daemon through the pidfile and refuse; releasing earlier would reopen the
+    // check-to-open race that leaves a daemon serving an abandoned slot.
+    let snapshot_replica = server_opts
+        .as_ref()
+        .and_then(|options| options.snapshot.as_ref())
+        .is_some();
+    let publication_root_lock = (!snapshot_replica)
+        .then(|| nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root))
+        .transpose()?;
+    let db_path = if snapshot_replica {
+        requested_db_path
+    } else {
+        nestweaver_engine::publication::resolve_selected_database(&base_db_path)?
+    };
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
@@ -9085,6 +9103,7 @@ pub async fn run_server(
             }
         }
     };
+    drop(publication_root_lock);
     if let Some(config) = instance_cfg.as_ref() {
         config.assert_expected_brain(&store).with_context(|| {
             format!(
@@ -9147,9 +9166,15 @@ pub async fn run_server(
     // unreadable, or malformed input is fatal in both UDS and network server
     // modes; otherwise a restart-time file race could silently demote the
     // instance to compiled-default identity and authorization.
-    let live_binding = lifecycle::EffectiveConfigBinding::new(
+    let lifecycle_owner = if lifecycle::is_verified_nestweaver_managed_start() {
+        lifecycle::DaemonLifecycleOwner::NestweaverManaged
+    } else {
+        lifecycle::DaemonLifecycleOwner::ExternalOrUnknown
+    };
+    let live_binding = lifecycle::EffectiveConfigBinding::new_with_lifecycle_owner(
         std::process::id(),
         live_binding_source(&effective_config),
+        lifecycle_owner,
     );
     lifecycle::write_effective_config_binding(&instance_id, &live_binding).with_context(|| {
         format!("publish effective-config binding for daemon instance {instance_id}")

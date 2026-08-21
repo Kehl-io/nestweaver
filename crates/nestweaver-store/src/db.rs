@@ -2006,16 +2006,20 @@ impl GraphStore {
 
     /// Perform a vector similarity search over the embedding index.
     /// Returns `(uid, cosine_similarity)` pairs sorted descending.
-    /// Returns `Err` for a corrupt embedding artifact.
     ///
-    /// This used to `.expect()`, which was sound while `Cancelled` was the only
-    /// possible error and `cancel = None` made it unreachable. Adding
-    /// `EmbeddingArtifactCorrupt` broke that invariant: the publication startup
-    /// smoke calls this, so a corrupt artifact would PANIC there instead of
-    /// failing the smoke — bypassing the automatic rollback that a failed smoke
-    /// exists to trigger. Every other check in that smoke propagates with `?`;
-    /// this one now does too.
-    pub fn vector_search(
+    /// Retained for source compatibility. New code should use
+    /// [`try_vector_search`](Self::try_vector_search) so artifact errors do not
+    /// become panics.
+    #[deprecated(note = "use try_vector_search so corrupt embedding artifacts are handled")]
+    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
+        self.try_vector_search(query_embedding, limit)
+            .expect("legacy vector_search cannot represent embedding artifact errors")
+    }
+
+    /// Fallible vector search that preserves corruption and I/O errors.
+    /// Publication startup smoke uses this path so corrupt artifacts trigger
+    /// rollback instead of unwinding past it.
+    pub fn try_vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
@@ -3534,6 +3538,28 @@ mod tests {
 
         let error = store.flush_embedding_index().unwrap_err();
         assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn graph_vector_search_returns_corrupt_artifact_error_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:live", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        drop(store);
+
+        let mut bytes = std::fs::read(&embedding_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&embedding_path, bytes).unwrap();
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert!(matches!(
+            reopened.try_vector_search(&[1.0, 0.0], 1),
+            Err(StoreError::EmbeddingArtifactCorrupt)
+        ));
     }
 
     #[test]

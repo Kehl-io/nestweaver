@@ -655,6 +655,9 @@ impl CodeWatcher {
             return Err(error).context("apply watcher contract derivation");
         }
 
+        nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, r_uid, false)
+            .context("mark watched regex scope dirty")?;
+
         store
             .commit_transaction(&txn)
             .context("commit code watcher batch transaction")?;

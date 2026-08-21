@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use lbug::Value;
 use nestweaver_schema::{
@@ -27,6 +27,9 @@ pub type TypedEdge = (String, String, String, f64, String);
 
 /// Combined symbols and edges for clustering algorithms.
 pub type CodeGraph = (Vec<SymbolBasic>, Vec<CodeEdge>);
+
+/// Caller and callee names keyed by symbol UID for batched summary rendering.
+pub type SummaryAdjacency = HashMap<String, (Vec<String>, Vec<String>)>;
 
 /// A single inbound wikilink to a target Note — the source side of the edge.
 #[derive(Debug, Clone, Serialize)]
@@ -598,6 +601,78 @@ impl GraphStore {
             .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Fetch caller and callee names for many symbols with a constant number
+    /// of query plans.
+    ///
+    /// Summary generation only needs names, not fully hydrated symbols. This
+    /// avoids issuing one inbound query plus three outbound queries per symbol
+    /// while retaining the same CALLS/IMPORTS/CROSS_REPO_LINK semantics as
+    /// [`callers_of`](Self::callers_of) and [`callees_of`](Self::callees_of).
+    pub fn summary_adjacency_by_uid(
+        &self,
+        uids: &[String],
+    ) -> Result<SummaryAdjacency, StoreError> {
+        let mut adjacency = HashMap::with_capacity(uids.len());
+        for uid in uids {
+            adjacency
+                .entry(uid.clone())
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+        }
+        if uids.is_empty() {
+            return Ok(adjacency);
+        }
+
+        let in_list = uids
+            .iter()
+            .map(|uid| format!("'{}'", uid.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.conn()?;
+
+        let callers_query = format!(
+            "UNWIND [{in_list}] AS want_uid \
+             MATCH (caller:Symbol)-[:CALLS]->(target:Symbol {{uid: want_uid}}) \
+             RETURN target.uid, caller.name"
+        );
+        let callers = conn
+            .query(&callers_query)
+            .map_err(|error| StoreError::Query(format!("summary callers batch: {error}")))?;
+        for row in callers {
+            let uid = extract_string(&row, 0)?;
+            let name = extract_string(&row, 1)?;
+            if let Some((names, _)) = adjacency.get_mut(&uid) {
+                names.push(name);
+            }
+        }
+
+        for edge_type in ["CALLS", "IMPORTS", "CROSS_REPO_LINK"] {
+            let callees_query = format!(
+                "UNWIND [{in_list}] AS want_uid \
+                 MATCH (source:Symbol {{uid: want_uid}})-[:{edge_type}]->(target:Symbol) \
+                 RETURN source.uid, target.name"
+            );
+            let callees = conn.query(&callees_query).map_err(|error| {
+                StoreError::Query(format!("summary {edge_type} batch: {error}"))
+            })?;
+            for row in callees {
+                let uid = extract_string(&row, 0)?;
+                let name = extract_string(&row, 1)?;
+                if let Some((_, names)) = adjacency.get_mut(&uid)
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+        }
+
+        for (callers, callees) in adjacency.values_mut() {
+            callers.sort();
+            callers.dedup();
+            callees.sort();
+        }
+        Ok(adjacency)
     }
 
     /// Returns the set of service UIDs that have at least one caller whose

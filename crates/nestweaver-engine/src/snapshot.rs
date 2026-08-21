@@ -1908,7 +1908,7 @@ mod tests {
         assert_eq!(replica.embedding_count(), 2);
         assert_eq!(replica.embedding_dimension().unwrap(), 3);
         assert_eq!(
-            replica.vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].0,
+            replica.try_vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].0,
             "sym:a"
         );
     }

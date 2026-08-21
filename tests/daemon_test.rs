@@ -2489,8 +2489,30 @@ credential_method = "gh"
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
 
-    // Explicit config bypasses the corrupt provenance value but still uses
-    // the already-verified live PID/pidfile ownership evidence.
+    // An explicit config resolves configuration intent, but it cannot prove
+    // lifecycle ownership. Corrupt provenance therefore fails before shutdown
+    // even when the operator supplies a config: otherwise a supervisor-owned
+    // daemon could be replaced by a detached process.
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .failure()
+        .stderr(contains("ownership could not be verified"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new_with_lifecycle_owner(
+            pid_preserved as u32,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_a.to_str().unwrap().to_string(),
+            },
+            nestweaver_daemon::lifecycle::DaemonLifecycleOwner::NestweaverManaged,
+        ),
+    )
+    .unwrap();
     daemon_action_cmd(&db_path, "restart")
         .arg("--config")
         .arg(&config_b)
@@ -4615,6 +4637,7 @@ fn first_search_uid(db_path: &Path, query: &str) -> String {
         .filter(|results| results.is_array())
         .unwrap_or(&payload);
     rows.as_array()
+        .or_else(|| rows.get("results").and_then(serde_json::Value::as_array))
         .and_then(|arr| arr.first())
         .and_then(|row| row["uid"].as_str())
         .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {payload}"))
