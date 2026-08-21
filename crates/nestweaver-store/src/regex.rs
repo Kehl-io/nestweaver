@@ -1096,7 +1096,9 @@ impl GraphStore {
             && !TRIGRAM_STALE_WARNED.swap(true, Ordering::Relaxed)
         {
             eprintln!(
-                "warning: {} regex shard(s) are unavailable or stale; scanning only those scopes — rerun `index --with-trigrams` to repair them",
+                "warning: {} regex shard(s) are unavailable or stale; scanning only those scopes — rerun \
+                 `index --with-trigrams` to repair them, or set `[indexing] with_trigrams = true` \
+                 so indexing keeps them fresh",
                 dirty_scopes.len()
             );
         } else if dirty_scopes.is_empty() {

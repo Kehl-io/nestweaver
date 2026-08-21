@@ -2510,8 +2510,14 @@ enum Commands {
         )]
         with_trigrams: bool,
         #[arg(
+            long = "no-trigrams",
+            conflicts_with = "with_trigrams",
+            help = "Skip the trigram refresh even when `[indexing] with_trigrams = true` \
+                    is set in the config"
+        )]
+        no_trigrams: bool,
+        #[arg(
             long = "rebuild-trigrams",
-            requires = "with_trigrams",
             help = "Force a full v2 trigram rebuild instead of refreshing changed scopes"
         )]
         rebuild_trigrams: bool,
@@ -11918,7 +11924,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             print_stale_index_note();
                         } else if res.scanned_fallback {
                             println!(
-                                "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                                "(no trigram pre-filter used — run `index --with-trigrams`, or set \
+                                 `[indexing] with_trigrams = true` in your config to keep it \
+                                 fresh automatically)"
                             );
                         }
                     }
@@ -11975,7 +11983,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     print_stale_index_note();
                 } else if res.scanned_fallback {
                     println!(
-                        "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                        "(no trigram pre-filter used — run `index --with-trigrams`, or set \
+                                 `[indexing] with_trigrams = true` in your config to keep it \
+                                 fresh automatically)"
                     );
                 }
             }
@@ -13930,6 +13940,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             name,
             with_trigrams,
+            no_trigrams,
             rebuild_trigrams,
             with_git_activity,
             config,
@@ -13948,13 +13959,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
             let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
-            let index_limits = match config.as_deref() {
-                Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
-                    .with_context(|| format!("failed to load config from {}", path.display()))?
-                    .indexing
-                    .limits(),
-                None => nestweaver_engine::index_limits::IndexLimits::default(),
+            let loaded_config = match config.as_deref() {
+                Some(path) => Some(
+                    nestweaver_engine::InstanceConfig::from_file(path).with_context(|| {
+                        format!("failed to load config from {}", path.display())
+                    })?,
+                ),
+                None => None,
             };
+            let index_limits = loaded_config
+                .as_ref()
+                .map(|cfg| cfg.indexing.limits())
+                .unwrap_or_default();
+            // Trigram policy. `[indexing] with_trigrams` sets the baseline so
+            // it does not have to be remembered on every invocation;
+            // `--with-trigrams` enables it for a one-off run, and
+            // `--no-trigrams` disables it for one even when the config enables
+            // it. `--rebuild-trigrams` implies a refresh is wanted, so it no
+            // longer has to be paired with `--with-trigrams`.
+            let config_with_trigrams = loaded_config
+                .as_ref()
+                .is_some_and(|cfg| cfg.indexing.with_trigrams);
+            let with_trigrams =
+                !no_trigrams && (with_trigrams || rebuild_trigrams || config_with_trigrams);
             // Create-operation: a --db in a not-yet-existing directory must
             // not fail with a bare OS error on either the daemon or the
             // direct path — create the parent directories up front.
@@ -17345,7 +17372,9 @@ fn pattern_count_from_tool_json(
 /// the signal in-band via the `stale_index` field instead.
 fn print_stale_index_note() {
     println!(
-        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with `index --with-trigrams`)"
+        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with \
+         `index --with-trigrams`, or set `[indexing] with_trigrams = true` so indexing keeps \
+         them fresh)"
     );
 }
 

@@ -10218,6 +10218,13 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.limits())
                 .unwrap_or_default();
+            // `[indexing] with_trigrams` — keeps the regex pre-filter fresh on
+            // the daemon's own background reindex, which previously never
+            // touched trigrams at all.
+            let worker_with_trigrams = state
+                .instance_cfg
+                .as_ref()
+                .is_some_and(|config| config.indexing.with_trigrams);
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -10243,7 +10250,8 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
-                    .with_index_limits(worker_index_limits);
+                    .with_index_limits(worker_index_limits)
+                    .with_trigram_refresh(worker_with_trigrams);
                 pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),

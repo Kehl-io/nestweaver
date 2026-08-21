@@ -454,9 +454,35 @@ their separate 1 MiB policy. Every policy skip is reported by `nestweaver
 index`; use `--json` for a typed terminal result or `--fail-on-skip` when CI
 must reject degraded coverage.
 
-`index --with-trigrams` incrementally refreshes only changed repository/vault
-scopes. Use `--rebuild-trigrams` with it for a one-time full v2 migration or
-repair.
+#### Trigram pre-filter
+
+`regex-search` uses a trigram posting table when one exists and falls back to a
+full scan otherwise. Set `with_trigrams` so indexing keeps that table fresh
+instead of relying on the flag being remembered on every run:
+
+```toml
+[indexing]
+with_trigrams = true
+```
+
+This applies everywhere sources are indexed — `nestweaver index`, the daemon's
+`IndexRepo`, and its background reindex, which previously never touched
+trigrams at all, so postings went stale as the graph moved and later
+`regex-search` calls silently paid for a full scan.
+
+Defaults to `false`, preserving the opt-in storage cost. Precedence for one-off
+runs:
+
+| Invocation | Result |
+| --- | --- |
+| `index` with `with_trigrams = true` | refreshes |
+| `index --with-trigrams` | refreshes, whatever the config says |
+| `index --no-trigrams` | skips, even when the config enables it |
+| `index --rebuild-trigrams` | forces a full v2 rebuild; implies a refresh |
+
+A refresh failure never fails an otherwise successful index: a stale posting
+table is detected and bypassed at query time, so the cost is a slower
+`regex-search`, not a wrong one.
 
 ## Manifest Parsing (automatic)
 
