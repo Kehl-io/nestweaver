@@ -684,6 +684,20 @@ impl GraphStore {
         Ok(states)
     }
 
+    /// Number of scopes with coalesced regex work waiting to be reconciled.
+    ///
+    /// This is the cheap pre-check the daemon's reconcile loop runs on every
+    /// tick so it only takes the write gate when there is something to do. A
+    /// full [`Self::refresh_trigram_index`] pass also garbage-collects retired
+    /// shard generations and repairs scopes whose metadata is missing, and
+    /// neither of those is visible here — that work is deliberately picked up
+    /// by the next pass that has outbox work anyway (an unreadable shard is
+    /// already fail-open at query time, so deferring its repair costs latency,
+    /// never correctness) plus one unconditional pass at daemon startup.
+    pub fn pending_regex_scope_count(&self) -> Result<usize, StoreError> {
+        Ok(self.regex_outbox_scopes()?.len())
+    }
+
     fn regex_outbox_scopes(&self) -> Result<HashSet<String>, StoreError> {
         let conn = self.conn()?;
         let rows = conn

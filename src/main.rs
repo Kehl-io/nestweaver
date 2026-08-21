@@ -2670,11 +2670,23 @@ enum Commands {
             help = "Comma-separated list of tool names to expose (default: all)"
         )]
         tools: Option<Vec<String>>,
+        /// Record interaction telemetry to a sidecar file for usage-based ranking.
+        ///
+        /// Three-state, like `--prf` over `[ranking] enable_prf`: passing
+        /// neither flag inherits `[ranking] track_interactions` from the
+        /// instance config, `--track-interactions` forces it on, and
+        /// `--no-track-interactions` forces it off. A plain bool could not
+        /// distinguish "the caller said no" from "the caller said nothing",
+        /// which is the same defect `resolve_trigram_policy` exists to fix.
         #[arg(
             long,
+            overrides_with = "no_track_interactions",
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
+        /// Do not record interaction telemetry, whatever the config says.
+        #[arg(long, overrides_with = "track_interactions")]
+        no_track_interactions: bool,
         /// Path to instance config (TOML) for [limits], [response], [ranking] settings.
         /// In daemon mode, the daemon's own --config takes precedence.
         #[arg(long)]
@@ -8396,6 +8408,25 @@ fn no_daemon_allowed() -> bool {
 /// `warn` is suppressed for the `daemon` subcommand: an autostarted daemon child
 /// inherits `NESTWEAVER_NO_DAEMON` from its parent, but it never bypasses (it *is*
 /// the server), so warning there just double-prints the parent's message.
+/// Resolve the three-state `--track-interactions` / `--no-track-interactions`
+/// pair against `[ranking] track_interactions`.
+///
+/// Absent flags INHERIT the config. A two-state bool could not distinguish "the
+/// caller said no" from "the caller said nothing", which is exactly why
+/// `resolve_trigram_policy` had to be widened to three states in 6.4.0; this
+/// flag has the identical shape, so it gets the identical treatment.
+///
+/// `overrides_with` on both flags means clap already collapses
+/// `--track-interactions --no-track-interactions` to whichever came last, so
+/// "both set" is last-wins rather than an error. The explicit-off branch is
+/// still checked first so that ordering can never resolve to on-by-accident.
+fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: bool) -> bool {
+    if force_off {
+        return false;
+    }
+    force_on || config_enabled
+}
+
 fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     let requested = no_daemon_flag || std::env::var_os("NESTWEAVER_NO_DAEMON").is_some();
     if !requested {
@@ -11522,6 +11553,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
+            no_track_interactions,
             config,
             no_daemon,
         } => {
@@ -11532,6 +11564,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-199: absent flags inherit `[ranking] track_interactions`, so
+            // the policy is a durable per-brain setting rather than something
+            // every generated `.mcp.json` has to remember. An explicit flag
+            // still wins in either direction.
+            let track_interactions = resolve_track_interactions(
+                track_interactions,
+                no_track_interactions,
+                config
+                    .as_deref()
+                    .and_then(|path| nestweaver_engine::InstanceConfig::from_file(path).ok())
+                    .is_some_and(|cfg| cfg.ranking.track_interactions),
+            );
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
@@ -27570,6 +27614,59 @@ mod stale_check_cli_tests {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod track_interactions_tests {
+    use super::*;
+
+    /// nw-199. The three states must be distinguishable; a two-state bool could
+    /// not tell "the caller said no" from "the caller said nothing", which is
+    /// the same defect `resolve_trigram_policy` was widened to fix.
+    #[test]
+    fn absent_flags_inherit_the_config() {
+        assert!(resolve_track_interactions(false, false, true));
+        assert!(!resolve_track_interactions(false, false, false));
+    }
+
+    #[test]
+    fn explicit_flags_override_the_config_in_both_directions() {
+        // Forced on against a config that says off.
+        assert!(resolve_track_interactions(true, false, false));
+        // Forced off against a config that says on — this is the direction a
+        // plain bool could never express.
+        assert!(!resolve_track_interactions(false, true, true));
+    }
+
+    /// clap collapses the pair via `overrides_with`, but the resolver is
+    /// checked directly too: explicit-off must never resolve to on.
+    #[test]
+    fn explicit_off_wins_if_both_somehow_arrive() {
+        assert!(!resolve_track_interactions(true, true, true));
+    }
+
+    #[test]
+    fn cli_accepts_both_flags() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for flag in ["--track-interactions", "--no-track-interactions"] {
+                    Cli::try_parse_from(["nestweaver", "mcp", flag])
+                        .unwrap_or_else(|e| panic!("{flag} must parse: {e}"));
+                }
+                // Last one wins rather than erroring, per `overrides_with`.
+                Cli::try_parse_from([
+                    "nestweaver",
+                    "mcp",
+                    "--track-interactions",
+                    "--no-track-interactions",
+                ])
+                .expect("both flags together must not be a hard error");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

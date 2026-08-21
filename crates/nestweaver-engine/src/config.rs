@@ -44,6 +44,28 @@ pub struct RankingConfig {
     /// flag and MCP `prf: true` argument override this per call.
     #[serde(default)]
     pub enable_prf: bool,
+    /// Record MCP interaction telemetry to the `<db>.interactions.json`
+    /// sidecar, which feeds usage-based ranking.
+    ///
+    /// Off by default, preserving the opt-in contract the generated setup guide
+    /// already promises ("Opt-in, local-only, records UIDs and timestamps only
+    /// — no content is captured"). The CLI `--track-interactions` /
+    /// `--no-track-interactions` flags override this per invocation, exactly as
+    /// `--prf` overrides [`Self::enable_prf`].
+    ///
+    /// This lives in config rather than existing only as a CLI flag because it
+    /// is a durable per-brain policy, and `nestweaver setup` regenerates every
+    /// `.mcp.json` it manages — so a flag hand-added to a generated config was
+    /// silently dropped on the next setup run, making the feature unreachable
+    /// through the supported install path.
+    ///
+    /// Note this is not merely label collection for a future reranker: the
+    /// scores feed `PprConfig::interaction_scores`, so enabling it changes live
+    /// ranking. The blend is deliberately capped (see the exploration floor in
+    /// `nestweaver-algorithms::ppr`), but it is a retrieval-behaviour change,
+    /// not just telemetry.
+    #[serde(default)]
+    pub track_interactions: bool,
     /// Substring patterns matched case-insensitively against a symbol's file
     /// path to deboost test/fixture code in `search_symbols_by_name` ranking.
     /// Override via `[ranking] test_path_patterns` in instance config.
@@ -100,6 +122,7 @@ impl Default for RankingConfig {
             dampen: Vec::new(),
             boost: Vec::new(),
             enable_prf: false,
+            track_interactions: false,
             test_path_patterns: default_test_path_patterns(),
             git_activity_weight: default_git_activity_weight(),
         }
@@ -275,6 +298,49 @@ pub struct SourceIndexingConfig {
     /// storage cost for anyone who has not asked for it.
     #[serde(default)]
     pub with_trigrams: bool,
+    /// How often the daemon's trigram reconcile loop drains the coalesced
+    /// `RegexScopeOutbox` and brings dirty scopes back to `ready`.
+    ///
+    /// Invalidation has always been universal and transactional — the store's
+    /// own write path marks a scope dirty inside the mutating transaction, so
+    /// no caller can forget. What was missing was an owner for the drain:
+    /// `refresh_trigram_index` was only ever called as a side effect of two
+    /// write handlers, so every other mutation path (the vault, both watchers)
+    /// enqueued work nobody drained. That is a transactional outbox with no
+    /// relay, and a level-triggered design invoked edge-triggered — a missed
+    /// edge became a permanently stale scope.
+    ///
+    /// The loop is the relay. Accepts a humanized duration (`"30s"`, `"5m"`);
+    /// `"0"` disables it, which leaves freshness to explicit
+    /// `index --with-trigrams` runs only. Gated on `with_trigrams`, which stays
+    /// the master switch for whether trigram acceleration is maintained at all.
+    ///
+    /// Analogous to Elasticsearch's `index.refresh_interval`: refresh is a
+    /// time-driven background operation deliberately decoupled from write
+    /// requests, because forcing one per write pays a fixed cost that has
+    /// nothing to do with how much changed.
+    #[serde(default = "default_trigram_reconcile_interval")]
+    pub trigram_reconcile_interval: String,
+}
+
+fn default_trigram_reconcile_interval() -> String {
+    "30s".to_string()
+}
+
+/// Parse `[indexing] trigram_reconcile_interval`.
+///
+/// [`parse_duration`] requires a unit suffix, so a bare `"0"` does not parse
+/// there. Disabling a periodic loop by writing `0` is the obvious thing an
+/// operator will type, so accept it here as an explicit zero. Both the load-time
+/// validator and [`SourceIndexingConfig::trigram_reconcile_period`] go through
+/// this one function, so "accepted by validation" and "understood at runtime"
+/// cannot drift apart.
+pub fn parse_reconcile_interval(s: &str) -> Option<std::time::Duration> {
+    let trimmed = s.trim();
+    if trimmed == "0" {
+        return Some(std::time::Duration::ZERO);
+    }
+    parse_duration(trimmed)
 }
 
 fn default_max_source_file_bytes() -> u64 {
@@ -286,11 +352,24 @@ impl Default for SourceIndexingConfig {
         Self {
             max_source_file_bytes: default_max_source_file_bytes(),
             with_trigrams: false,
+            trigram_reconcile_interval: default_trigram_reconcile_interval(),
         }
     }
 }
 
 impl SourceIndexingConfig {
+    /// Parsed reconcile interval. `None` means the loop is disabled — either
+    /// `with_trigrams` is off (nothing to maintain) or the interval is `"0"`.
+    /// `InstanceConfig` validates the string on load, so an unparseable value
+    /// fails config loading rather than silently disabling the reconciler here.
+    pub fn trigram_reconcile_period(&self) -> Option<std::time::Duration> {
+        if !self.with_trigrams {
+            return None;
+        }
+        let parsed = parse_reconcile_interval(&self.trigram_reconcile_interval)?;
+        (!parsed.is_zero()).then_some(parsed)
+    }
+
     pub fn limits(&self) -> crate::index_limits::IndexLimits {
         // InstanceConfig validates this during construction, so downstream
         // code never has to handle an invalid value.
@@ -945,6 +1024,17 @@ impl InstanceConfig {
             config.expected_brain_uuid = Some(parsed.to_string());
         }
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
+        // Fail config loading on an unparseable reconcile interval. Silently
+        // treating a typo as "disabled" would reintroduce exactly the failure
+        // this loop exists to remove: trigrams quietly going stale with no
+        // signal anywhere, which is only visible in `regex-search --json`.
+        if parse_reconcile_interval(&config.indexing.trigram_reconcile_interval).is_none() {
+            anyhow::bail!(
+                "[indexing] trigram_reconcile_interval: {:?} is not a duration \
+                 (expected e.g. \"30s\", \"5m\", or \"0\" to disable)",
+                config.indexing.trigram_reconcile_interval
+            );
+        }
         // Feature F6: clamp ranking-prior multipliers into bounds on load so
         // downstream code can trust the values without re-validating.
         config.ranking.clamp_multipliers();
@@ -2266,6 +2356,69 @@ url = "https://github.com/example/keep-me"
     /// `[indexing] with_trigrams` must be accepted, default off, and live in
     /// the top-level section rather than `[server.indexing]` — it describes how
     /// sources are indexed in every mode, not server scheduling.
+    #[test]
+    fn reconcile_interval_defaults_to_thirty_seconds_and_is_gated_on_with_trigrams() {
+        let off = SourceIndexingConfig::default();
+        assert_eq!(off.trigram_reconcile_interval, "30s");
+        // with_trigrams is the master switch: no maintenance, no loop.
+        assert_eq!(off.trigram_reconcile_period(), None);
+
+        let on = SourceIndexingConfig {
+            with_trigrams: true,
+            ..SourceIndexingConfig::default()
+        };
+        assert_eq!(
+            on.trigram_reconcile_period(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// A bare `0` is what an operator will type to turn a periodic loop off,
+    /// and `parse_duration` rejects it for lack of a unit suffix. Validation
+    /// and the runtime accessor must agree, or config would load and the loop
+    /// would then silently not run.
+    #[test]
+    fn reconcile_interval_accepts_bare_zero_as_disabled() {
+        assert_eq!(
+            parse_reconcile_interval("0"),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            parse_duration("0"),
+            None,
+            "the general parser still rejects it"
+        );
+
+        let disabled = SourceIndexingConfig {
+            with_trigrams: true,
+            trigram_reconcile_interval: "0".to_string(),
+            ..SourceIndexingConfig::default()
+        };
+        assert_eq!(disabled.trigram_reconcile_period(), None);
+    }
+
+    #[test]
+    fn reconcile_interval_rejects_a_typo_instead_of_silently_disabling() {
+        assert_eq!(parse_reconcile_interval("30 seconds"), None);
+        assert_eq!(parse_reconcile_interval("soon"), None);
+        assert_eq!(
+            parse_reconcile_interval("5m"),
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    /// nw-199: the durable policy lives in `[ranking]`, off by default, exactly
+    /// like `enable_prf`.
+    #[test]
+    fn ranking_config_track_interactions_defaults_off_and_parses() {
+        assert!(!RankingConfig::default().track_interactions);
+        let cfg: InstanceConfig = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n\n[ranking]\ntrack_interactions = true\n"
+        ))
+        .expect("config with track_interactions must parse");
+        assert!(cfg.ranking.track_interactions);
+    }
+
     #[test]
     fn indexing_config_accepts_with_trigrams_and_defaults_off() {
         // Absent → off, so existing configs keep today's opt-in behaviour and

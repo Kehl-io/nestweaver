@@ -1280,6 +1280,130 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
     });
 }
 
+/// Backoff for the trigram reconcile loop after consecutive failures.
+///
+/// Doubles from the configured period up to a ten-minute cap so a persistently
+/// unwritable shard cannot hot-loop the write gate. This is the same shape as
+/// the circuit breaker 6.4.0 added for watcher embedding, and it exists for the
+/// same reason: a background loop that retries a permanent failure at its
+/// normal cadence is indistinguishable from a busy-wait.
+fn trigram_reconcile_backoff(period: Duration, consecutive_failures: u32) -> Duration {
+    const MAX_BACKOFF: Duration = Duration::from_secs(600);
+    if consecutive_failures == 0 {
+        return period;
+    }
+    // Saturate the shift before it can overflow the multiplier.
+    let scaled = period.saturating_mul(1u32 << consecutive_failures.min(6));
+    // NOT `clamp(period, MAX_BACKOFF)`: `clamp` panics when min > max, which is
+    // exactly what a configured interval longer than the cap produces — a
+    // 1-hour reconcile interval would have panicked the loop on its first
+    // failure. Cap first, then never return less than the configured period.
+    scaled.min(MAX_BACKOFF).max(period)
+}
+
+/// The trigram reconcile loop — the relay for `RegexScopeOutbox`.
+///
+/// Invalidation is already universal and transactional: the store's own write
+/// path marks a scope dirty inside the mutating transaction, so every writer
+/// enqueues whether or not it knows trigrams exist. What was missing was
+/// anything that drained the queue. `refresh_trigram_index` was called only as
+/// a side effect of two write handlers, so the vault-refresh path and both file
+/// watchers enqueued work nobody ever picked up, and their scopes stayed dirty
+/// until an unrelated repo index happened to run.
+///
+/// This loop is the missing half of the outbox pattern. It is level-triggered:
+/// it reads current state (the outbox) rather than reacting to write events, so
+/// a missed or unobserved mutation is picked up on the next tick instead of
+/// being lost. That is what makes the fix structural — a write path added later
+/// cannot reintroduce the bug, because there is nothing for it to remember.
+async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
+    let mut shutdown = state.shutdown_tx.subscribe();
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
+    // `interval` yields its first tick immediately, and that first pass is
+    // deliberately unconditional: it catches everything enqueued while the
+    // daemon was down, and it is the pass most likely to run the shard garbage
+    // collection and missing-metadata repair that the cheap outbox pre-check
+    // below cannot see.
+    let mut force_full_pass = true;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => break,
+        }
+        // A drain waits on the write gate. Starting a reconcile now would
+        // extend someone's shutdown to buy freshness nobody is going to query.
+        if state.shutdown_started.load(Ordering::Relaxed) {
+            break;
+        }
+        if backoff_until.is_some_and(|until| Instant::now() < until) {
+            continue;
+        }
+
+        if !force_full_pass {
+            // Cheap read first: never take the write gate for an empty queue.
+            match state.store.pending_regex_scope_count() {
+                Ok(0) => continue,
+                Ok(pending) => tracing::debug!(pending, "trigram reconcile: work pending"),
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    backoff_until = Some(
+                        Instant::now() + trigram_reconcile_backoff(period, consecutive_failures),
+                    );
+                    tracing::warn!(%error, consecutive_failures, "trigram reconcile: outbox read failed");
+                    continue;
+                }
+            }
+        }
+
+        let lease = state.write_gate.lock("trigram_reconcile").await;
+        // Re-check after acquiring: the gate may have been held by the write a
+        // shutdown was draining, in which case we woke up into a drain.
+        if state.shutdown_started.load(Ordering::Relaxed) {
+            drop(lease);
+            break;
+        }
+        let reconcile_state = Arc::clone(&state);
+        let outcome =
+            tokio::task::spawn_blocking(move || reconcile_state.store.refresh_trigram_index(false))
+                .await;
+        drop(lease);
+
+        match outcome {
+            Ok(Ok(stats)) => {
+                consecutive_failures = 0;
+                backoff_until = None;
+                force_full_pass = false;
+                if stats.scopes_refreshed > 0 {
+                    tracing::info!(
+                        scopes_refreshed = stats.scopes_refreshed,
+                        nodes_changed = stats.nodes_changed,
+                        "trigram reconcile"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until =
+                    Some(Instant::now() + trigram_reconcile_backoff(period, consecutive_failures));
+                // The scope stays dirty and queries keep scanning it, so this
+                // costs latency and never correctness. Retry on the next tick.
+                tracing::warn!(%error, consecutive_failures, "trigram reconcile failed");
+            }
+            Err(join_error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until =
+                    Some(Instant::now() + trigram_reconcile_backoff(period, consecutive_failures));
+                tracing::error!(%join_error, "trigram reconcile task panicked");
+            }
+        }
+    }
+    tracing::debug!("trigram reconcile loop stopped");
+}
+
 /// The SIGTERM handler task: route every SIGTERM into [`begin_shutdown_drain`].
 ///
 /// LOOPS DELIBERATELY. This used to `recv()` exactly once and return, which
@@ -4155,17 +4279,21 @@ impl NestWeaverDaemon for DaemonService {
         // Three-state trigram policy. A plain bool could not distinguish "the
         // caller said no" from "the caller said nothing", so a configless
         // `index` sent false and this handler honoured it — discarding the
-        // daemon's own `[indexing] with_trigrams = true`. UNSPECIFIED now means
-        // inherit, and the legacy bool is ORed in so a pre-6.4 client that sets
-        // it still forces a refresh.
-        let with_trigrams = resolve_trigram_policy(
-            req.trigram_policy(),
-            req.with_trigrams,
-            state
-                .instance_cfg
-                .as_ref()
-                .is_some_and(|config| config.indexing.with_trigrams),
-        );
+        // daemon's own `[indexing] with_trigrams = true`. The legacy bool is
+        // still ORed in so a pre-6.4 client that sets it forces a refresh.
+        // nw-198: an index no longer drains the outbox just because the daemon
+        // is configured to maintain trigrams. Maintenance is the reconcile
+        // loop's job now, so `daemon_config_enabled` is deliberately FALSE
+        // here: an UNSPECIFIED request inherits nothing and does no inline
+        // refresh, and the loop picks the enqueued scopes up on its next tick.
+        //
+        // Explicit intent still wins, which is what CI and scripted reindex
+        // need: `--with-trigrams` forces an inline refresh, `--no-trigrams`
+        // forces none, and `--rebuild-trigrams` still forces a full rebuild.
+        // That is the `refresh=wait_for` split — the caller who genuinely needs
+        // synchronous freshness asks for it, and nobody else pays a fixed
+        // per-index cost that has nothing to do with how much changed.
+        let with_trigrams = resolve_trigram_policy(req.trigram_policy(), req.with_trigrams, false);
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
@@ -9509,6 +9637,29 @@ pub async fn run_server(
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
     tokio::spawn(watch_sigterm(Arc::clone(&state)));
 
+    // The trigram reconcile loop. Spawned in EVERY writable daemon mode, not
+    // just server mode: the local daemon is exactly where the vault refresh and
+    // the file watchers run, and those are the paths whose enqueued work had no
+    // drain. A read-only replica has no business writing shards.
+    if !read_only {
+        match state
+            .instance_cfg
+            .as_ref()
+            .and_then(|config| config.indexing.trigram_reconcile_period())
+        {
+            Some(period) => {
+                tracing::info!(
+                    interval_secs = period.as_secs(),
+                    "trigram reconcile loop enabled"
+                );
+                tokio::spawn(run_trigram_reconciler(Arc::clone(&state), period));
+            }
+            None => tracing::debug!(
+                "trigram reconcile loop disabled ([indexing] with_trigrams off, or interval 0)"
+            ),
+        }
+    }
+
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
 
@@ -10280,13 +10431,6 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.limits())
                 .unwrap_or_default();
-            // `[indexing] with_trigrams` — keeps the regex pre-filter fresh on
-            // the daemon's own background reindex, which previously never
-            // touched trigrams at all.
-            let worker_with_trigrams = state
-                .instance_cfg
-                .as_ref()
-                .is_some_and(|config| config.indexing.with_trigrams);
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -10312,8 +10456,8 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
-                    .with_index_limits(worker_index_limits)
-                    .with_trigram_refresh(worker_with_trigrams);
+                    .with_index_limits(worker_index_limits);
+
                 pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),
@@ -17455,6 +17599,137 @@ external_model = "unavailable-test-model"
     /// dropped the registration while leaving Tokio's `sigaction` installed, so
     /// the process went permanently deaf to SIGTERM — later signals were neither
     /// delivered nor able to default-terminate it.
+    #[test]
+    fn trigram_reconcile_backoff_grows_then_caps() {
+        let period = Duration::from_secs(30);
+        // No failures: the loop runs at its configured cadence.
+        assert_eq!(trigram_reconcile_backoff(period, 0), period);
+        // Each consecutive failure doubles the wait...
+        assert_eq!(
+            trigram_reconcile_backoff(period, 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            trigram_reconcile_backoff(period, 2),
+            Duration::from_secs(120)
+        );
+        // ...up to a hard ceiling, so a permanently broken shard neither
+        // hot-loops the write gate nor backs off to never retrying at all.
+        assert_eq!(
+            trigram_reconcile_backoff(period, 30),
+            Duration::from_secs(600)
+        );
+        // A period longer than the cap is never shortened by the backoff.
+        let long = Duration::from_secs(3600);
+        assert_eq!(trigram_reconcile_backoff(long, 5), long);
+    }
+
+    /// The whole point of nw-198: a mutation that reaches the store enqueues
+    /// outbox work, and the reconcile loop drains it WITHOUT any writer having
+    /// asked it to. If this regresses, a write path can go stale silently.
+    #[tokio::test]
+    async fn reconciler_drains_the_outbox_with_no_writer_involvement() {
+        let state = test_state_with_writer();
+        // Drive a REAL public write. `insert_symbol` marks its repo scope dirty
+        // inside the same transaction, which is the invariant the whole design
+        // rests on — so this test exercises enqueue-then-drain end to end
+        // rather than poking the outbox directly. No index RPC, no watcher, no
+        // explicit `--with-trigrams`: nothing here asks for a reconcile.
+        state
+            .store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:reconcile-test:1".to_string(),
+                name: "reconcile_me".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:reconcile-test".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn reconcile_me()".to_string(),
+                summary: None,
+                content_hash: "hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert_symbol");
+        assert!(
+            state.store.pending_regex_scope_count().unwrap() > 0,
+            "precondition: the outbox must have work"
+        );
+
+        let handle = tokio::spawn(run_trigram_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(20),
+        ));
+
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if state.store.pending_regex_scope_count().unwrap_or(1) == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        state.shutdown_started.store(true, Ordering::Relaxed);
+        let _ = state.shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(
+            drained,
+            "the reconcile loop must drain enqueued scopes on its own"
+        );
+    }
+
+    /// The loop must not start a reconcile once a drain has begun: the drain
+    /// waits on the write gate, so starting one would extend someone's
+    /// shutdown to buy freshness nobody is going to query.
+    #[tokio::test]
+    async fn reconciler_stops_when_shutdown_starts() {
+        let state = test_state_with_writer();
+        state.shutdown_started.store(true, Ordering::Relaxed);
+
+        let handle = tokio::spawn(run_trigram_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(10),
+        ));
+
+        let stopped = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            stopped.is_ok(),
+            "the loop must exit promptly once shutdown_started is set"
+        );
+    }
+
+    /// A shutdown broadcast with no `shutdown_started` flag must also stop it,
+    /// so the task cannot outlive the daemon it belongs to.
+    #[tokio::test]
+    async fn reconciler_stops_on_shutdown_broadcast() {
+        let state = test_state_with_writer();
+        let handle = tokio::spawn(run_trigram_reconciler(
+            Arc::clone(&state),
+            // Long period: the only thing that can end this is the broadcast.
+            Duration::from_secs(3600),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = state.shutdown_tx.send(true);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_ok(),
+            "the loop must exit on a shutdown broadcast"
+        );
+    }
+
     #[tokio::test]
     async fn sigterm_does_not_broadcast_while_a_write_is_in_flight() {
         let state = test_state_with_writer();

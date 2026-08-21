@@ -182,18 +182,49 @@ fn which_exists(cmd: &str) -> bool {
 
 // ── Per-tool setup ────────────────────────────────────────────────────────────
 
+/// The instance config this database is bound to, if one is known.
+///
+/// nw-199: a generated `.mcp.json` used to carry only `mcp --db <db>`, so an
+/// MCP server started from it could never see instance.toml — which made the
+/// entire `mcp --config` surface (`[limits]`, `[response]`, `[ranking]`) dead
+/// through the supported install path. Any policy that lives in config was
+/// therefore unreachable, and hand-adding a flag to a generated file was
+/// pointless because the next `setup` run regenerates it.
+///
+/// This asks the same question the daemon asks on a configless start: what
+/// config was last successfully used for this database? Reusing the daemon's
+/// own persisted intent means setup cannot bind a config the daemon would
+/// disagree with, and it needs no new flag to thread through every caller.
+fn bound_config_path(db_path: &Path) -> Option<String> {
+    let record = nestweaver_daemon::lifecycle::read_last_successful_config(db_path).ok()?;
+    // Only offer a path that still exists: writing a --config pointing at a
+    // deleted file would turn every MCP start into a hard config-load failure,
+    // which is strictly worse than the no-config behaviour it replaces.
+    std::path::Path::new(&record.config_path)
+        .is_file()
+        .then_some(record.config_path)
+}
+
 fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    let args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
+    let mut args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
+    if let Some(config) = bound_config_path(Path::new(db_str)) {
+        args.push("--config".to_string());
+        args.push(config);
+    }
     serde_json::json!(args)
 }
 
 fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    let args = vec![
+    let mut args = vec![
         "mcp".to_string(),
         "--lite".to_string(),
         "--db".to_string(),
         db_str.to_string(),
     ];
+    if let Some(config) = bound_config_path(Path::new(db_str)) {
+        args.push("--config".to_string());
+        args.push(config);
+    }
     serde_json::json!(args)
 }
 
