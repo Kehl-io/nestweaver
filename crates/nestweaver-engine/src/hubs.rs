@@ -4,7 +4,8 @@
 //! edges) and/or high PageRank. Hubs represent central abstractions that
 //! many parts of the codebase depend on.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use anyhow::{Context, Result};
 use nestweaver_store::GraphStore;
@@ -79,44 +80,89 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
     let ga_active = store.has_git_activity();
     let ga_weight = store.git_activity_weight();
 
-    // Build hub nodes.
-    let mut hubs: Vec<HubNode> = symbols
-        .iter()
-        .enumerate()
-        .map(|(i, sym)| {
-            let total = in_degree[i] + out_degree[i];
-            let base = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
-            let pagerank = if ga_active {
-                base * nestweaver_store::git_activity_multiplier(
-                    store.git_activity_score(&sym.file_path),
-                    ga_weight,
-                )
-            } else {
-                base
-            };
+    // nw-179: select the top N with a bounded heap instead of materializing and
+    // sorting the whole corpus. The previous shape built a HubNode -- three
+    // String clones each -- for every symbol (~580k allocations at 193k
+    // symbols), sorted all of them, then threw away all but `top_n`. Cost was
+    // independent of what the caller asked for: `--top 10` and `--top 1000`
+    // both took ~5s. Now only the survivors are materialized, so the work is
+    // O(n log k) with k allocations rather than O(n log n) with n.
+    if top_n == 0 {
+        return Ok(vec![]);
+    }
+
+    /// Sort key for one candidate: degree first, PageRank as the tie-break,
+    /// with the symbol index last so the ordering is total and stable.
+    #[derive(PartialEq)]
+    struct HubKey {
+        total_degree: usize,
+        pagerank: f64,
+        index: usize,
+    }
+    impl Eq for HubKey {}
+    impl Ord for HubKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.total_degree
+                .cmp(&other.total_degree)
+                // f64 is not Ord; total_cmp gives a total order without
+                // unwrap_or(Equal) silently collapsing NaN into ties.
+                .then_with(|| self.pagerank.total_cmp(&other.pagerank))
+                // Lower index wins a full tie, matching the previous stable sort.
+                .then_with(|| other.index.cmp(&self.index))
+        }
+    }
+    impl PartialOrd for HubKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    // Min-heap of the best `top_n` seen so far: the weakest survivor sits on
+    // top, so admitting a candidate is one comparison.
+    let mut best: BinaryHeap<Reverse<HubKey>> = BinaryHeap::with_capacity(top_n);
+    for (index, sym) in symbols.iter().enumerate() {
+        let base = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
+        let pagerank = if ga_active {
+            base * nestweaver_store::git_activity_multiplier(
+                store.git_activity_score(&sym.file_path),
+                ga_weight,
+            )
+        } else {
+            base
+        };
+        let key = HubKey {
+            total_degree: in_degree[index] + out_degree[index],
+            pagerank,
+            index,
+        };
+        if best.len() < top_n {
+            best.push(Reverse(key));
+        } else if best.peek().is_some_and(|weakest| key > weakest.0) {
+            best.pop();
+            best.push(Reverse(key));
+        }
+    }
+
+    // Drain into descending order, then materialize strings for survivors only.
+    let mut ranked: Vec<HubKey> = best.into_iter().map(|Reverse(key)| key).collect();
+    ranked.sort_by(|a, b| b.cmp(a));
+    let hubs: Vec<HubNode> = ranked
+        .into_iter()
+        .map(|key| {
+            let sym = &symbols[key.index];
             HubNode {
                 uid: sym.uid.clone(),
                 name: sym.name.clone(),
                 file_path: sym.file_path.clone(),
-                in_degree: in_degree[i],
-                out_degree: out_degree[i],
-                total_degree: total,
-                pagerank_score: pagerank,
+                in_degree: in_degree[key.index],
+                out_degree: out_degree[key.index],
+                total_degree: key.total_degree,
+                pagerank_score: key.pagerank,
                 cluster_id: None,
             }
         })
         .collect();
 
-    // Sort by total degree descending, break ties by PageRank descending.
-    hubs.sort_by(|a, b| {
-        b.total_degree.cmp(&a.total_degree).then_with(|| {
-            b.pagerank_score
-                .partial_cmp(&a.pagerank_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-
-    hubs.truncate(top_n);
     Ok(hubs)
 }
 
@@ -209,6 +255,46 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         let hubs = find_hub_nodes(&store, 10).unwrap();
         assert!(hubs.is_empty());
+    }
+
+    /// nw-179: the bounded heap must select the SAME set, in the same order, as
+    /// sorting everything and truncating. A min-heap with the comparison the
+    /// wrong way round silently returns the WEAKEST n, which every existing
+    /// test above would still pass.
+    #[test]
+    fn bounded_selection_matches_a_full_sort() {
+        let store = GraphStore::in_memory().unwrap();
+        // 12 symbols with deliberately uneven, non-monotonic degrees.
+        for i in 0..12 {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("s{i}"),
+                    &format!("sym{i}"),
+                    "src/a.rs",
+                ))
+                .unwrap();
+        }
+        // Give s3 the most edges, then s7, then s1 — deliberately not in uid order.
+        let plan: &[(&str, usize)] = &[("s3", 5), ("s7", 4), ("s1", 3), ("s9", 2), ("s5", 1)];
+        for (target, count) in plan {
+            for n in 0..*count {
+                let src = format!("s{}", (n + 10) % 12);
+                store.insert_edge(&make_edge(&src, target)).unwrap();
+            }
+        }
+
+        let all = find_hub_nodes(&store, 12).unwrap();
+        let expected: Vec<&str> = all.iter().take(3).map(|h| h.uid.as_str()).collect();
+        let top3 = find_hub_nodes(&store, 3).unwrap();
+        let actual: Vec<&str> = top3.iter().map(|h| h.uid.as_str()).collect();
+        assert_eq!(
+            actual, expected,
+            "top-3 must equal the first 3 of the full ranking"
+        );
+        assert!(
+            top3[0].total_degree >= top3[1].total_degree,
+            "results must be in descending degree order"
+        );
     }
 
     #[test]

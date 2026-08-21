@@ -47,7 +47,11 @@ use crate::rerank::{DEFAULT_TOP_N, rerank, select_reranker};
 ///
 /// Loadable from JSON (`Vec<JudgedQuery>`) or JSONL (one object per line) via
 /// [`load_judged_queries`].
+// nw-159 (secondary): `deny_unknown_fields` so a mistyped key — "relevant"
+// instead of "relevance" — fails to parse instead of being swallowed by
+// `serde(default)` and letting the harness print a confident 0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JudgedQuery {
     /// The query / seed string fed into hybrid retrieval.
     pub query: String,
@@ -281,7 +285,23 @@ fn ranked_uids_for_query(
             DEFAULT_TOP_N,
         );
     }
-    Ok(result.connected.into_iter().map(|n| n.uid).collect())
+    // nw-159: `seeds` used to be discarded, so a judgment naming the exact UID
+    // the query resolves to scored ndcg10 0.0 / mrr 0.0 / p_at_5 0.0 — the
+    // symbol WAS retrieved, just as a seed rather than a connected node. Every
+    // find-definition-style judgment was structurally unreachable, so the
+    // harness under-reported retrieval quality by construction.
+    //
+    // Seeds rank FIRST: they are the exact matches the query resolved to, so
+    // any relevance ordering that placed them below traversal results would be
+    // wrong. Deduplicated, because a seed can also appear in `connected`.
+    let mut seen = std::collections::HashSet::new();
+    Ok(result
+        .seeds
+        .into_iter()
+        .chain(result.connected)
+        .map(|n| n.uid)
+        .filter(|uid| seen.insert(uid.clone()))
+        .collect())
 }
 
 /// Run the full evaluation over `queries` and aggregate to an [`EvalReport`].
@@ -703,6 +723,27 @@ function hello(name) { return "Hello " + name; }
     /// run — it is scored 0 (with a warning) and the remaining queries are
     /// still evaluated. Regression test: `run_eval` used to propagate the
     /// seed-resolution error via `?`, failing the entire report.
+    /// nw-159 (secondary): a mistyped judgment key used to be swallowed by
+    /// `serde(default)`, leaving `relevance` empty — and the harness then
+    /// printed a confident 0.0 for a query whose judgments it had silently
+    /// discarded.
+    #[test]
+    fn a_mistyped_judgment_key_fails_to_parse_instead_of_scoring_zero() {
+        let good: JudgedQuery =
+            serde_json::from_str(r#"{"query":"rollback_current","relevance":{"sym:a":3}}"#)
+                .expect("a well-formed judgment must parse");
+        assert_eq!(good.relevance.get("sym:a"), Some(&3));
+
+        let error = serde_json::from_str::<JudgedQuery>(
+            r#"{"query":"rollback_current","relevant":{"sym:a":3}}"#,
+        )
+        .expect_err("a mistyped key must be rejected, not silently ignored");
+        assert!(
+            error.to_string().contains("relevant"),
+            "the error must name the offending key: {error}"
+        );
+    }
+
     #[test]
     fn run_eval_scores_unresolvable_query_zero_and_continues() {
         use crate::index::index_directory_in_memory;

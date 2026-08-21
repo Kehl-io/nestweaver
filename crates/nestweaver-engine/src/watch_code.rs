@@ -112,22 +112,28 @@ impl CodeWatcher {
         self
     }
 
-    /// Install an external RAII lease acquired once around each published
-    /// mutation batch, including the inline after-change callback.
-    pub fn with_mutation_lease_factory(mut self, factory: WatchMutationLeaseFactory) -> Self {
-        self.mutation_lease_factory = Some(factory);
-        self
-    }
-
-    #[cfg(test)]
+    // Used only by `one_code_edit_settles_after_one_hot_batch`, which is
+    // `#[cfg(target_os = "linux")]` because it depends on inotify coalescing
+    // behaviour. macOS clippy therefore sees these as dead and, under
+    // `-D warnings`, they were DELETED in 01c585b8 — which broke the Linux
+    // build outright. The platform gate has to match the test's, not the
+    // platform the lint happened to run on.
+    #[cfg(all(test, target_os = "linux"))]
     fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
         self.debounce = Duration::from_millis(debounce_ms);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
         self.ready_signal = Some(ready);
+        self
+    }
+
+    /// Install an external RAII lease acquired once around each published
+    /// mutation batch, including the inline after-change callback.
+    pub fn with_mutation_lease_factory(mut self, factory: WatchMutationLeaseFactory) -> Self {
+        self.mutation_lease_factory = Some(factory);
         self
     }
 
@@ -648,6 +654,9 @@ impl CodeWatcher {
             }
             return Err(error).context("apply watcher contract derivation");
         }
+
+        nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, r_uid, false)
+            .context("mark watched regex scope dirty")?;
 
         store
             .commit_transaction(&txn)
@@ -1250,10 +1259,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
 
-        // Corrupt b.js with invalid UTF-8 so `read_to_string` fails.
+        // nw-190: invalid UTF-8 is now decoded lossily and is NOT a read
+        // failure, so it can no longer stand in for one. Use genuinely
+        // binary content (a NUL byte), which the reader refuses with a
+        // typed BinarySource -- the property under test is that a file the
+        // reader cannot handle skips before publication and preserves the
+        // previously indexed symbols.
         std::fs::write(
             canonical_root.join("src/b.js"),
-            b"export function alpha() { return \xff\xfe; }\n",
+            b"export function alpha() { return 1; }\n\x00binary",
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");

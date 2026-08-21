@@ -1219,11 +1219,39 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                             None
                         };
 
+                    // Strategy 4: qualifying path of a scoped call (nw-152).
+                    // `a::b::c()` and `A.b.c()` parse as a scoped/qualified
+                    // function node whose `path` (or `scope`) field is the
+                    // qualifier. The .scm captures only the trailing identifier,
+                    // so without this the qualifier is lost and the resolver has
+                    // nothing but a bare name to work with -- which is why a
+                    // fully-qualified call with no matching `use` resolved to
+                    // nothing at all.
+                    let from_scoped_path = if from_function_child.is_none()
+                        && from_direct_object.is_none()
+                        && from_receiver_field.is_none()
+                    {
+                        node.child_by_field_name("function")
+                            .filter(|f| {
+                                let k = f.kind();
+                                k.contains("scoped") || k.contains("qualified")
+                            })
+                            .and_then(|f| {
+                                f.child_by_field_name("path")
+                                    .or_else(|| f.child_by_field_name("scope"))
+                            })
+                            .and_then(|p| p.utf8_text(source_bytes).ok())
+                            .map(|s| arena.alloc_str(s) as &str)
+                    } else {
+                        None
+                    };
+
                     // Convert the chosen arena-backed &str to an owned String only once,
                     // at the point where we need it for RawReference.
                     from_function_child
                         .or(from_direct_object)
                         .or(from_receiver_field)
+                        .or(from_scoped_path)
                         .map(|s| s.to_string())
                 } else {
                     None
@@ -1241,6 +1269,40 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // nw-151: recover calls written inside Rust macro bodies.
+    if lang == Language::Rust {
+        collect_rust_macro_calls(tree.root_node(), source_bytes, &mut references);
+    }
+
+    // nw-155: promote symbols named in an `export { .. }` clause to Public.
+    //
+    // has_export_ancestor only recognises the INLINE form, where the declaration
+    // is nested under an export_statement. The list form is a separate statement
+    // elsewhere in the file, so `function _init() {}` + `export { _init as
+    // default }` left _init marked Private -- and dead_code::infer_confidence
+    // returns High for anything private, so a module's DEFAULT EXPORT was
+    // reported as high-confidence dead code. All 154 high-confidence results on
+    // the reference graph were of this shape.
+    if matches!(
+        lang,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    ) {
+        let exported = collect_export_clause_names(tree.root_node(), source_bytes);
+        if !exported.is_empty() {
+            for symbol in &mut symbols {
+                if symbol.visibility == Visibility::Private
+                    && exported.contains(symbol.name.as_str())
+                {
+                    symbol.visibility = Visibility::Public;
+                }
+            }
+        }
+    }
+
     // Type extraction: walk the same tree with type-specific queries
     let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
 
@@ -1250,6 +1312,96 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         references,
         type_bindings,
     })
+}
+
+/// Collect the LOCAL names bound by every `export { .. }` clause in a file.
+///
+/// For `export { alpha, beta as default }` this yields {"alpha", "beta"} — the
+/// local name is what identifies the declaration, not the exported alias.
+fn collect_export_clause_names<'a>(
+    node: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<&'a str> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "export_specifier"
+            && let Some(local) = current.child_by_field_name("name")
+            && let Ok(text) = local.utf8_text(source_bytes)
+        {
+            names.insert(text);
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    names
+}
+
+/// Emit CALL references for calls written inside Rust macro bodies (nw-151).
+///
+/// tree-sitter-rust parses macro arguments as an opaque `token_tree`, so
+/// nothing inside `assert!(..)` is ever a `call_expression` and the .scm
+/// captures only the macro's own name. In Rust test suites assertions are the
+/// dominant call site, which hollowed out the whole test-to-code call graph
+/// that `affected-tests` is built on: of `rollback_current`'s four callers,
+/// the three that call it only inside `assert!` produced no edge at all.
+///
+/// Inside a `token_tree` a call is an `identifier` whose next sibling is a
+/// `token_tree` -- `foo(..)` parses as `(identifier) (token_tree ..)`. A bare
+/// identifier with no following token_tree (a variable passed to `println!`)
+/// is correctly not treated as a call.
+///
+/// This is deliberately shallow: it recovers the call NAME, leaving the normal
+/// resolver priority chain to decide what it points at. A tuple-struct pattern
+/// such as `Some(x)` in `matches!` also matches this shape; it resolves like
+/// any other bare name, and against std types resolves to nothing.
+fn collect_rust_macro_calls(
+    node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "macro_invocation" {
+            let mut inner = child.walk();
+            for part in child.children(&mut inner) {
+                if part.kind() == "token_tree" {
+                    collect_calls_in_token_tree(part, source_bytes, references);
+                }
+            }
+        }
+        collect_rust_macro_calls(child, source_bytes, references);
+    }
+}
+
+fn collect_calls_in_token_tree(
+    tree_node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut cursor = tree_node.walk();
+    let children: Vec<tree_sitter::Node<'_>> = tree_node.children(&mut cursor).collect();
+    for (index, child) in children.iter().enumerate() {
+        if child.kind() == "identifier"
+            && children
+                .get(index + 1)
+                .is_some_and(|next| next.kind() == "token_tree")
+            && let Ok(name) = child.utf8_text(source_bytes)
+        {
+            references.push(RawReference {
+                name: name.to_string(),
+                kind: ReferenceKind::Call,
+                start_line: child.start_position().row as u32 + 1,
+                context: String::new(),
+                receiver: None,
+            });
+        }
+        if child.kind() == "token_tree" {
+            collect_calls_in_token_tree(*child, source_bytes, references);
+        }
+    }
 }
 
 // ── type extraction helpers ────────────────────────────────────────────────
@@ -5860,5 +6012,141 @@ fn main() {
             parsed.type_bindings
         );
         assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+}
+#[cfg(test)]
+mod macro_call_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-151: assertions are the dominant call site in Rust test suites, and
+    /// tree-sitter parses macro arguments as an opaque token_tree, so calls
+    /// inside `assert!(..)` produced no CALLS edge at all. That hollowed out
+    /// the test-to-code graph `affected-tests` depends on.
+    #[test]
+    fn calls_inside_macro_bodies_are_recovered() {
+        let src = "fn t() {\n    assert!(rollback_current(&a, &b).is_ok());\n    assert_eq!(read_current(&r), None);\n    println!(\"{}\", plain_variable);\n}\n";
+        let parsed = parse_source(Path::new("src/t.rs"), src).expect("parses");
+        let calls: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        for expected in ["rollback_current", "read_current"] {
+            assert!(calls.contains(&expected), "missing {expected} in {calls:?}");
+        }
+        // A bare identifier passed to a macro is NOT a call.
+        assert!(
+            !calls.contains(&"plain_variable"),
+            "a non-call identifier must not become a call: {calls:?}"
+        );
+    }
+
+    /// The recovered call must carry the line it appears on, not the macro's.
+    #[test]
+    fn a_recovered_macro_call_keeps_its_own_line() {
+        let src = "fn t() {\n\n\n    assert!(deep_call());\n}\n";
+        let parsed = parse_source(Path::new("src/t.rs"), src).expect("parses");
+        let call = parsed
+            .references
+            .iter()
+            .find(|r| r.name == "deep_call")
+            .expect("recovered call");
+        assert_eq!(call.start_line, 4);
+    }
+}
+#[cfg(test)]
+mod js_const_scope_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-150: a block-scoped const is not addressable from outside its block,
+    /// so it must not become a graph symbol. Indexing them made
+    /// `const where = {..}`, declared inside an else-branch, the single
+    /// most-depended-on symbol in a 193k-symbol graph.
+    #[test]
+    fn only_module_scope_consts_become_symbols() {
+        let src = concat!(
+            "const moduleLevel = { a: 1 };\n",
+            "export const exported = { b: 2 };\n",
+            "function handler(x) {\n",
+            "  if (x) {\n",
+            "    const blockLocal = { class_id: x };\n",
+            "    return blockLocal;\n",
+            "  }\n",
+            "  const functionLocal = 3;\n",
+            "  return functionLocal;\n",
+            "}\n",
+        );
+        let parsed = parse_source(Path::new("src/a.js"), src).expect("parses");
+        let consts: Vec<&str> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Constant)
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(consts.contains(&"moduleLevel"), "got {consts:?}");
+        assert!(consts.contains(&"exported"), "got {consts:?}");
+        assert!(
+            !consts.contains(&"blockLocal"),
+            "a block-local const must not be a symbol: {consts:?}"
+        );
+        assert!(
+            !consts.contains(&"functionLocal"),
+            "a function-local const must not be a symbol: {consts:?}"
+        );
+    }
+}
+#[cfg(test)]
+mod export_clause_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// nw-155: `export { .. }` is a separate statement from the declaration, so
+    /// has_export_ancestor never saw it and the symbol stayed Private. Since
+    /// dead_code::infer_confidence returns High for anything private, a module's
+    /// DEFAULT EXPORT was reported as high-confidence dead code -- all 154
+    /// high-confidence results on the reference graph were of this shape.
+    #[test]
+    fn export_clause_names_become_public() {
+        let src = concat!(
+            "function _helper() { return 1; }\n",
+            "function plain() { return 2; }\n",
+            "function untouched() { return 3; }\n",
+            "export function direct() { return 4; }\n",
+            "export { _helper, plain as default };\n",
+        );
+        let parsed = parse_source(Path::new("src/w.js"), src).expect("parses");
+        let vis = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .visibility
+        };
+        assert_eq!(vis("_helper"), Visibility::Public, "named in export clause");
+        assert_eq!(vis("plain"), Visibility::Public, "aliased as default");
+        assert_eq!(
+            vis("direct"),
+            Visibility::Public,
+            "inline export, unchanged"
+        );
+        assert_eq!(
+            vis("untouched"),
+            Visibility::Private,
+            "a symbol that is genuinely not exported must stay Private"
+        );
+    }
+
+    /// A file with no export clause must be completely unaffected.
+    #[test]
+    fn a_file_without_an_export_clause_is_unchanged() {
+        let parsed =
+            parse_source(Path::new("src/w.js"), "function solo() { return 1; }\n").expect("parses");
+        assert_eq!(parsed.symbols[0].visibility, Visibility::Private);
     }
 }

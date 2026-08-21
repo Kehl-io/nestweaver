@@ -96,16 +96,16 @@ use nestweaver_engine::{
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embeddings_batch, export_cypher,
-    export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
-    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
-    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
-    list_repos, list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
+    embedding::generate_embeddings_batch, export_cypher, export_graphml, export_in_memory_graph,
+    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
+    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
+    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
+    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
+    index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
+    load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
+    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
+    suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -2505,14 +2505,26 @@ enum Commands {
         name: Option<String>,
         #[arg(
             long = "with-trigrams",
-            help = "Incrementally refresh trigram postings for changed repo/vault scopes to \
-                    accelerate `regex-search` (opt-in storage cost)"
+            help = "Refresh trigram postings for changed repo/vault scopes for THIS run, \
+                    whatever the config says. Set `[indexing] with_trigrams = true` to \
+                    enable it permanently (opt-in storage cost)"
         )]
         with_trigrams: bool,
         #[arg(
+            long = "no-trigrams",
+            conflicts_with = "with_trigrams",
+            // --rebuild-trigrams asks for a FULL rebuild, so pairing it with
+            // --no-trigrams is a contradiction. It used to be accepted and
+            // silently no-op, reporting success with no refresh performed.
+            conflicts_with = "rebuild_trigrams",
+            help = "Skip the trigram refresh even when `[indexing] with_trigrams = true` \
+                    is set in the config"
+        )]
+        no_trigrams: bool,
+        #[arg(
             long = "rebuild-trigrams",
-            requires = "with_trigrams",
-            help = "Force a full v2 trigram rebuild instead of refreshing changed scopes"
+            help = "Force a full regex-v3 trigram rebuild instead of refreshing changed \
+                    scopes. Implies a refresh, so it does not need --with-trigrams"
         )]
         rebuild_trigrams: bool,
         #[arg(
@@ -2826,6 +2838,18 @@ enum Commands {
             help = "Resolution parameter (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
         )]
         resolution: Option<f64>,
+        #[arg(
+            long,
+            default_value_t = 50,
+            help = "Maximum communities to report; 0 = all"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Maximum members listed per community; 0 = all"
+        )]
+        members: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2859,8 +2883,12 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
-        #[arg(long, help = "Approximate token limit for output")]
-        token_budget: Option<usize>,
+        #[arg(
+            long,
+            default_value_t = 20_000,
+            help = "Approximate token limit for output; 0 = unlimited"
+        )]
+        token_budget: usize,
         #[arg(
             long,
             visible_alias = "name",
@@ -2909,10 +2937,16 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
-    /// Detect implicit projects from vault structure and code patterns
+    /// Detect implicit projects from vault structure. WRITES Project nodes and
+    /// project→note edges to the graph; use --dry-run to preview.
     DetectImplicitProjects {
         #[arg(long, help = "Path to vault directory")]
         vault: PathBuf,
+        #[arg(
+            long,
+            help = "Report what would be created without writing to the graph"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Path to the database file")]
         db: Option<PathBuf>,
     },
@@ -4682,7 +4716,10 @@ enum SnapshotCommands {
 
 #[derive(Subcommand)]
 enum PublicationCommands {
-    /// Build, validate, and optionally activate a fresh publication from every indexed source
+    /// Build, validate, and optionally activate a complete fresh publication.
+    ///
+    /// Includes embeddings by contract; the global --no-embed flag is rejected
+    /// before any operation or slot is created.
     Rebuild {
         #[arg(
             long,
@@ -4748,6 +4785,33 @@ enum PublicationCommands {
             help = "Discard an unreadable journal without deleting any publication slot"
         )]
         invalid: bool,
+        #[arg(
+            long,
+            conflicts_with = "invalid",
+            help = "Acknowledge a requested-but-unacknowledged cancellation first. \
+                    Use when the worker that would have acknowledged it is gone \
+                    (crash, Ctrl-C, --no-activate) and its staged slot is stranded"
+        )]
+        force: bool,
+        #[arg(long, help = "Publication root; defaults from --db")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Database path used to derive the publication root")]
+        db: Option<PathBuf>,
+    },
+    /// Reclaim publication slots that nothing can still reach
+    ///
+    /// Keeps the slot CURRENT selects, its retained predecessor (the one-step
+    /// rollback target), and any slot an in-flight operation targets. Takes the
+    /// publication-root lock, so it serializes against rebuild, rollback and
+    /// discard. A real run also requires a stopped daemon, since the daemon may
+    /// hold the selected graph open.
+    Prune {
+        #[arg(
+            long,
+            help = "Report what would be reclaimed without deleting anything, and \
+                    without requiring a stopped daemon"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Publication root; defaults from --db")]
         root: Option<PathBuf>,
         #[arg(long, help = "Database path used to derive the publication root")]
@@ -6426,6 +6490,10 @@ fn daemon_stop_lock_holder_target_with(
 /// evidence while breaking for renamed or symlinked installs. The conjunction
 /// that carries the weight is: the `daemon` subcommand, and names THIS
 /// database.
+// Called only from the Linux `/proc`-based probe below, but kept
+// compiled everywhere so its unit tests run on every platform
+// (nw-136).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
     if !argv_runs_daemon_subcommand(argv) {
         return false;
@@ -6533,6 +6601,10 @@ fn process_argv(_pid: i32) -> Option<Vec<String>> {
 /// `db_path`, else `None`. A stale pidfile PID may have been recycled by an
 /// unrelated process — callers must NOT signal the PID when this returns
 /// `None`.
+// Called only from the Linux `/proc`-based probe below, but kept
+// compiled everywhere so its unit tests run on every platform
+// (nw-136).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<Vec<String>> {
     let argv = process_argv(pid)?;
     argv_is_our_daemon(&argv, db_path).then_some(argv)
@@ -7384,14 +7456,15 @@ async fn restart_verified_live_under_lock(
     let locked_health = client.health_check().await.context(
         "could not revalidate live daemon after acquiring restart transaction lock; no shutdown was attempted",
     )?;
-    let prepared = nestweaver_client::prepare_restart(db_path, &locked_health, explicit_config)
-        .and_then(|prepared| {
+    let prepared =
+        nestweaver_client::prepare_explicit_restart(db_path, &locked_health, explicit_config)
+            .and_then(|prepared| {
             anyhow::ensure!(
                 prepared.config() == &expected_config,
                 "daemon effective config changed while waiting for the restart transaction lock; no shutdown was attempted"
             );
             Ok(prepared)
-        });
+            });
     drop(original);
 
     // Capture the incumbent's OWN effective config while it is still live, so
@@ -7552,8 +7625,11 @@ async fn restart_live_daemon_preserving_config(
     match nestweaver_client::DaemonClient::connect_existing(db_path).await {
         Ok(mut client) => {
             let original_health = client.health_check().await?;
-            let original =
-                nestweaver_client::prepare_restart(db_path, &original_health, explicit_config)?;
+            let original = nestweaver_client::prepare_explicit_restart(
+                db_path,
+                &original_health,
+                explicit_config,
+            )?;
             let expected_config = original.config().clone();
             let spawn_lock =
                 nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
@@ -7576,7 +7652,7 @@ async fn restart_live_daemon_preserving_config(
             {
                 let health = winner.health_check().await?;
                 let original =
-                    nestweaver_client::prepare_restart(db_path, &health, explicit_config)?;
+                    nestweaver_client::prepare_explicit_restart(db_path, &health, explicit_config)?;
                 let expected_config = original.config().clone();
                 return restart_verified_live_under_lock(
                     db_path,
@@ -8004,6 +8080,30 @@ fn search_truncation_note(returned: usize, limit: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Wrap a `search --json` payload with its truncation contract.
+///
+/// nw-187: both JSON paths emitted a BARE ARRAY, so the human path printed
+/// "(limit N reached — there may be more matches)" while `--json` returned an
+/// indistinguishable N-element list. That is the path ~/brain/CLAUDE.md tells
+/// subagents to prefer for token efficiency, so the recommended path was
+/// precisely the one that hid truncation. The MCP tools have always reported
+/// total/returned.
+///
+/// `truncated` is limit-reached, matching `search_truncation_note`: the
+/// backend returns at most `limit` rows and does not report a corpus total, so
+/// "returned == limit" is the only truncation signal available. It can be a
+/// false positive when the corpus holds exactly `limit` matches — reporting a
+/// possible truncation is the safe direction.
+fn search_json_payload(results: serde_json::Value, limit: usize) -> serde_json::Value {
+    let returned = results.as_array().map(|rows| rows.len()).unwrap_or(0);
+    serde_json::json!({
+        "results": results,
+        "returned": returned,
+        "limit": limit,
+        "truncated": search_truncation_note(returned, limit).is_some(),
+    })
 }
 
 fn print_search_truncation_note(returned: usize, limit: usize) {
@@ -9937,8 +10037,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Vec<Summary> output the daemon shape cannot reproduce.
             if use_daemon && !json {
                 let mut args = serde_json::json!({ "level": level });
-                if let Some(tb) = token_budget {
-                    args["token_budget"] = serde_json::json!(tb);
+                if token_budget > 0 {
+                    args["token_budget"] = serde_json::json!(token_budget);
                 }
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
@@ -9997,17 +10097,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
-            let display: Vec<Summary> = if let Some(budget) = token_budget {
-                truncate_to_budget(&after_filter, budget)
+            // nw-182: `--token-budget` existed but defaulted to UNBOUNDED, so
+            // `summary --level file --json` emitted 8.3 MB — output
+            // proportional to the corpus, not the question — and this is
+            // exposed as an MCP tool where that is a context-window bomb. A
+            // default budget bounds it; `--token-budget 0` still returns
+            // everything.
+            let total = after_filter.len();
+            let display: Vec<Summary> = if token_budget == 0 {
+                after_filter
+            } else {
+                truncate_to_budget(&after_filter, token_budget)
                     .into_iter()
                     .cloned()
                     .collect()
-            } else {
-                after_filter
             };
+            let truncated = display.len() < total;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&display)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "summaries": display,
+                        "total": total,
+                        "returned": display.len(),
+                        "truncated": truncated,
+                    }))?
+                );
             } else if display.is_empty() {
                 println!("No summaries generated (graph may be empty).");
             } else {
@@ -10030,6 +10146,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Clusters {
             resolution,
+            limit,
+            members,
             json,
             db,
             config: config_opt,
@@ -10122,14 +10240,46 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // built at a different resolution would answer a question the caller
             // did not ask. With an explicit --resolution the check needs no
             // store at all, which is the fully-instant case the help describes.
-            if let Ok(Some(cached)) = load_clusters(&db_path)
-                && let Some(requested) = resolution
-                && (cached.resolution - requested).abs() < f64::EPSILON
+            // nw-157: this gate used to require an EXPLICIT --resolution, so
+            // a bare `clusters` short-circuited the let-chain, missed its own
+            // cache, and recomputed plus rewrote a 65 MB sidecar on every run
+            // (1.89s vs 0.155s with --resolution 0.3 — the same answer, since
+            // the default IS 0.3 on this graph). The cache must be compared
+            // against the EFFECTIVE resolution, not the requested one.
+            //
+            // Deriving the default needs the symbol count, hence the store; an
+            // explicit --resolution still needs no store at all, preserving the
+            // fully-instant case `--help` describes.
+            let cached = load_clusters(&db_path).ok().flatten();
+            let mut opened: Option<std::mem::ManuallyDrop<_>> = None;
+            let mut symbol_count: Option<usize> = None;
+            let effective_resolution = match resolution {
+                Some(requested) => requested,
+                None => {
+                    let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
+                    // Adaptive resolution: pick a sensible default based on
+                    // graph size. Large graphs (>10 K symbols) benefit from
+                    // lower resolution to avoid the explosion of tiny
+                    // communities that resolution=1.0 produces.
+                    let count = store.count_symbols().unwrap_or(0);
+                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };
+                    symbol_count = Some(count);
+                    opened = Some(store);
+                    adaptive
+                }
+            };
+
+            // Reuse is gated on the resolution MATCHING, because the sidecar
+            // holds whichever resolution was computed last: serving a cache
+            // built at a different resolution would answer a question the
+            // caller did not ask.
+            if let Some(cached) = cached
+                && (cached.resolution - effective_resolution).abs() < f64::EPSILON
             {
                 out.status(&format!(
-                    "Using cached clusters (resolution={requested}) from sidecar."
+                    "Using cached clusters (resolution={effective_resolution}) from sidecar."
                 ));
-                print_clusters_output(&cached, json)?;
+                print_clusters_output(&cached, json, limit, members)?;
                 return Ok((EXIT_SUCCESS, None));
             }
 
@@ -10139,15 +10289,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // catch_unwind prevents the Drop panic from aborting the
             // process (exit code 101).
             let output = {
-                let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-
-                // Adaptive resolution: pick a sensible default based on
-                // graph size.  Large graphs (>10 K symbols) benefit from
-                // lower resolution to avoid the explosion of tiny
-                // communities that resolution=1.0 produces.
-                let sym_count = store.count_symbols().unwrap_or(0);
-                let effective_resolution =
-                    resolution.unwrap_or(if sym_count > 10_000 { 0.3 } else { 0.5 });
+                let store = match opened {
+                    Some(store) => store,
+                    None => std::mem::ManuallyDrop::new(open_store(Some(&db_path))?),
+                };
+                let sym_count = match symbol_count {
+                    Some(count) => count,
+                    None => store.count_symbols().unwrap_or(0),
+                };
 
                 out.status(&format!(
                     "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
@@ -10167,7 +10316,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 o
             };
 
-            print_clusters_output(&output, json)?;
+            print_clusters_output(&output, json, limit, members)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -10364,7 +10513,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
-        Commands::Publication { command } => run_publication(command).map(|c| (c, None)),
+        Commands::Publication { command } => run_publication(command, no_embed).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Config { command } => run_config(command),
@@ -10880,17 +11029,43 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // shape; the advisory banner stays silent on a trivial (empty) diff.
             if changed_files.is_empty() && !sarif {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "changed_symbols": [],
-                            "affected_symbols": [],
-                            "affected_clusters": [],
-                            "breaking_changes": [],
-                            "risk_level": "Low",
-                            "summary": "No changed files detected.",
-                        }))?
-                    );
+                    // nw-158: this path used to hand-build a partial object
+                    // omitting `status`, `gate_state`, `coverage`,
+                    // `blind_spots`, `notifications` and `_meta` — the very
+                    // fields the MCP tool description tells consumers to read
+                    // BEFORE trusting a green result. A gate keying on
+                    // `gate_state != "ok"` saw undefined and passed, and the
+                    // empty-diff run is exactly the run that reports "Low".
+                    //
+                    // Serialize the REAL type so the contract cannot drift from
+                    // the populated path again. An empty diff is an analysis
+                    // that ran to completion over nothing: Complete and Ok are
+                    // the honest values, not the conservative DegradedUnknown
+                    // default that exists for old results with no field.
+                    let empty = nestweaver_engine::blast_radius::BlastRadiusResult {
+                        changed_symbols: Vec::new(),
+                        affected_symbols: Vec::new(),
+                        affected_symbol_count: 0,
+                        affected_clusters: Vec::new(),
+                        risk_level: RiskLevel::Low,
+                        summary: "No changed files detected.".to_string(),
+                        org_wide: None,
+                        status: nestweaver_engine::blast_radius::AnalysisStatus::Complete,
+                        notifications: Vec::new(),
+                        gate_state: nestweaver_engine::blast_radius::GateState::Ok,
+                        coverage: nestweaver_engine::blast_radius::Coverage::default(),
+                        blind_spots: Vec::new(),
+                        cochanged_files: Vec::new(),
+                        analysis_direction: "over-approximate".to_string(),
+                    };
+                    let mut payload = serde_json::to_value(&empty)?;
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "breaking_changes".to_string(),
+                            serde_json::to_value(&breaking_changes)?,
+                        );
+                    }
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
                 }
                 // Advisory banner: silent when trivial (nothing to review).
                 return Ok((EXIT_SUCCESS, None));
@@ -11623,7 +11798,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // the same JSON whether or not the daemon is up.
                         let payload = unwrap_hybrid_payload(value);
                         let count = payload.as_array().map(|a| a.len()).unwrap_or(0);
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&search_json_payload(payload, limit))?
+                        );
                         let stats = format!(
                             "{count} symbols in {} (via hybrid)",
                             format_elapsed(t0.elapsed())
@@ -11653,7 +11831,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let candidates = search_symbols(&store, &query, limit)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&candidates)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&search_json_payload(
+                        serde_json::to_value(&candidates)?,
+                        limit
+                    ))?
+                );
             } else if candidates.is_empty() {
                 println!("No symbols found matching '{query}'.");
             } else {
@@ -11760,7 +11944,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             print_stale_index_note();
                         } else if res.scanned_fallback {
                             println!(
-                                "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                                "(no trigram pre-filter used — run `index --with-trigrams`, or set \
+                                 `[indexing] with_trigrams = true` in your config to keep it \
+                                 fresh automatically)"
                             );
                         }
                     }
@@ -11817,7 +12003,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     print_stale_index_note();
                 } else if res.scanned_fallback {
                     println!(
-                        "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                        "(no trigram pre-filter used — run `index --with-trigrams`, or set \
+                                 `[indexing] with_trigrams = true` in your config to keep it \
+                                 fresh automatically)"
                     );
                 }
             }
@@ -11945,19 +12133,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args =
-                    read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "read_symbols",
-                    args,
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
-                }
+            // nw-186: this branch used to print raw pretty JSON and return
+            // EXIT_SUCCESS unconditionally, so `--json`, `-q` and `--plain`
+            // were all dead on the daemon path and a not-found or ambiguous
+            // read exited 0 — scripts gating on exit status saw success. Parse
+            // the response back into the same type the local path produces and
+            // fall through to the one shared render + exit block below.
+            let daemon_result: Option<nestweaver_engine::read_symbols::ReadSymbolsResult> =
+                if use_daemon {
+                    let args =
+                        read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
+                    match try_hybrid_json_rpc_checked(
+                        true,
+                        &db_path,
+                        config.as_deref(),
+                        "read_symbols",
+                        args,
+                    )? {
+                        Some(value) => Some(serde_json::from_value(value).context(
+                            "daemon returned a read_symbols payload this CLI cannot parse",
+                        )?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+
+            if let Some(res) = daemon_result {
+                return render_read_symbols(&res, json);
             }
 
             let store = open_store(Some(&db_path))?;
@@ -11978,47 +12181,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 neighbors,
                 token_budget,
             );
-            if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
-            } else {
-                for w in &res.symbols {
-                    let tag = if w.is_neighbor { " [neighbor]" } else { "" };
-                    println!(
-                        "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
-                        w.name, w.kind, w.path, w.start_line, w.end_line, tag
-                    );
-                    println!("{}", w.body);
-                    println!();
-                }
-                for nf in &res.not_found {
-                    eprintln!("not found: {nf}");
-                }
-                for a in &res.ambiguous {
-                    eprintln!(
-                        "ambiguous: {} \u{2192} {} candidates (pass a UID)",
-                        a.query,
-                        a.candidate_uids.len()
-                    );
-                }
-                if res.truncated {
-                    eprintln!(
-                        "truncated: {} symbol(s) dropped for token budget",
-                        res.dropped.len()
-                    );
-                }
-            }
-            // Exit 2 when targets were requested but none resolved to a symbol
-            // (consistent with `symbol`/`impact`) — or 3 when the failure was
-            // ambiguity, matching `symbol`'s exit-code contract. When at
-            // least one target resolves, succeed even if others were
-            // not-found/ambiguous.
-            if !targets.is_empty() && res.symbols.is_empty() {
-                if !res.ambiguous.is_empty() {
-                    return Ok((EXIT_AMBIGUOUS, None));
-                }
-                return Ok((EXIT_NOT_FOUND, None));
-            }
-            Ok((EXIT_SUCCESS, None))
+            render_read_symbols(&res, json)
         }
         Commands::Symbol {
             name_or_uid,
@@ -13713,7 +13876,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::DetectImplicitProjects { vault, db } => {
+        Commands::DetectImplicitProjects { vault, dry_run, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
             if !vault.exists() || !vault.is_dir() {
@@ -13722,7 +13885,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // nw-161: NOT taken for --dry-run. The daemon RPC has no dry-run
+            // parameter, so routing a preview through it would perform the very
+            // writes the flag exists to avoid — the same shape as nw-186, where
+            // a daemon branch silently ignored the caller's flags. The local
+            // path opens read-only, so a preview cannot write by construction.
+            if use_daemon && !dry_run {
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory.
                 let vault_abs = abs_for_daemon(&vault);
@@ -13753,10 +13921,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let instance_id = "default";
             let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
 
-            let detected = detect_implicit_projects(&store, &vault, &vault_uid, instance_id)?;
+            let detected = nestweaver_engine::detect_implicit_projects_with_mode(
+                &store,
+                &vault,
+                &vault_uid,
+                instance_id,
+                dry_run,
+            )?;
 
             if detected.is_empty() {
-                println!("No implicit projects detected in {}", vault.display());
+                println!(
+                    "No implicit projects detected in {} (looked under {})",
+                    vault.display(),
+                    nestweaver_engine::project::PROJECT_CONTAINER_DIRS.join(", ")
+                );
+            } else if dry_run {
+                println!(
+                    "Would create {} implicit project(s) (dry run — nothing written):",
+                    detected.len()
+                );
+                for slug in &detected {
+                    println!("  {slug}");
+                }
             } else {
                 println!("Detected {} implicit project(s):", detected.len());
                 for slug in &detected {
@@ -13774,6 +13960,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             name,
             with_trigrams,
+            no_trigrams,
             rebuild_trigrams,
             with_git_activity,
             config,
@@ -13792,13 +13979,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
             let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
-            let index_limits = match config.as_deref() {
-                Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
-                    .with_context(|| format!("failed to load config from {}", path.display()))?
-                    .indexing
-                    .limits(),
-                None => nestweaver_engine::index_limits::IndexLimits::default(),
+            let loaded_config = match config.as_deref() {
+                Some(path) => Some(
+                    nestweaver_engine::InstanceConfig::from_file(path).with_context(|| {
+                        format!("failed to load config from {}", path.display())
+                    })?,
+                ),
+                None => None,
             };
+            let index_limits = loaded_config
+                .as_ref()
+                .map(|cfg| cfg.indexing.limits())
+                .unwrap_or_default();
+            // Trigram policy, resolved to THREE states rather than a bool.
+            //
+            // Collapsing it to a bool lost the daemon's own configuration: a
+            // configless `index` sent `false`, and the daemon honoured that
+            // instead of its `[indexing] with_trigrams = true`. "The caller
+            // said no" and "the caller said nothing" have to be distinguishable
+            // across the RPC, exactly as `max_source_file_bytes` uses zero to
+            // mean "use your configured value".
+            //
+            // An explicit flag wins. Otherwise, naming a --config means that
+            // config decides; naming none defers to the daemon.
+            let trigram_policy = if no_trigrams {
+                nestweaver_proto::TrigramPolicy::Disabled
+            } else if with_trigrams || rebuild_trigrams {
+                nestweaver_proto::TrigramPolicy::Enabled
+            } else {
+                match loaded_config.as_ref() {
+                    Some(cfg) if cfg.indexing.with_trigrams => {
+                        nestweaver_proto::TrigramPolicy::Enabled
+                    }
+                    Some(_) => nestweaver_proto::TrigramPolicy::Disabled,
+                    None => nestweaver_proto::TrigramPolicy::Unspecified,
+                }
+            };
+            // The direct (non-daemon) path has no daemon to inherit from, so
+            // UNSPECIFIED resolves to off there.
+            let with_trigrams = matches!(trigram_policy, nestweaver_proto::TrigramPolicy::Enabled);
             // Create-operation: a --db in a not-yet-existing directory must
             // not fail with a bare OS error on either the daemon or the
             // direct path — create the parent directories up front.
@@ -13828,6 +14047,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     with_trigrams,
                     with_git_activity,
                     rebuild_trigrams,
+                    trigram_policy: trigram_policy as i32,
                     // Zero preserves an already-running daemon's configured
                     // policy when this invocation did not name a config.
                     max_source_file_bytes: if config.is_some() {
@@ -14209,6 +14429,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
                 })?;
+            let selected_slot_legacy_id =
+                nestweaver_daemon::lifecycle::selected_slot_identity_instance_id(&db_path);
+            if matches!(
+                &action,
+                DaemonAction::Start { .. }
+                    | DaemonAction::Stop { .. }
+                    | DaemonAction::Restart { .. }
+            ) {
+                // Direct lifecycle commands must perform the same v6.3.0
+                // selected-slot identity migration as client autostart. Do it
+                // before resolving the anchored runtime paths so an invisible
+                // old daemon cannot retain the database lock.
+                nestweaver_daemon::lifecycle::retire_selected_slot_identity_daemon(&db_path)?;
+            }
             // Don't pre-canonicalize — instance_id_from_db_path handles it
             // internally with consistent fallback for non-existent files.
             let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
@@ -14237,8 +14471,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let inherited_spawn_lock =
                         std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
                     let parent_driven_start = inherited_spawn_lock.is_some();
+                    // Never trust an ambient ownership hint. Re-publish it only
+                    // after `acquire_daemon_start_spawn_lock` verifies the exact
+                    // inherited locked descriptor below.
+                    nestweaver_daemon::lifecycle::clear_verified_nestweaver_managed_start();
+                    // Held for its RAII effect on every platform; explicitly
+                    // `.take()`n after daemonize only under
+                    // `#[cfg(not(target_os = "macos"))]` below, so on macOS it
+                    // is never read and needs no `mut`. Scoped to macOS rather
+                    // than blanket-allowed so a genuinely unused lock on Linux
+                    // still fails the build (nw-136).
+                    #[cfg_attr(target_os = "macos", allow(unused_mut, unused_variables))]
                     let mut start_spawn_lock =
                         acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
+                    // Every successful `daemon start` owns a verified spawn
+                    // lock, whether invoked manually or by client autostart.
+                    // The non-macOS fork inherits this process-local marker;
+                    // launchd starts a fresh supervised process and therefore
+                    // deliberately does not inherit it.
+                    if start_spawn_lock.is_some() {
+                        nestweaver_daemon::lifecycle::mark_verified_nestweaver_managed_start();
+                    }
                     if track_interactions {
                         eprintln!(
                             "note: --track-interactions is an MCP flag, not a daemon flag. \
@@ -14662,14 +14915,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let db_path_abs = abs_for_daemon(&db_path);
                         let config_abs = effective_config.as_deref().map(abs_for_daemon);
                         let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
-                        let mut child = macos_temp_daemon_command(
+                        let mut child_command = macos_temp_daemon_command(
                             &executable,
                             &db_path_abs,
                             config_abs.as_deref(),
                             idle_timeout,
-                        )
-                        .spawn()
-                        .with_context(|| {
+                        );
+                        start_spawn_lock
+                            .as_ref()
+                            .context("temporary daemon start lost its verified spawn lock")?
+                            .configure_child_handoff(&mut child_command)?;
+                        let mut child = child_command.spawn().with_context(|| {
                             format!(
                                 "spawn temporary daemon process for {}",
                                 db_path_abs.display()
@@ -15037,6 +15293,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     acme_email,
                     acme_production,
                 } => {
+                    // A temporary macOS daemon is a fresh `daemon run` exec,
+                    // so the process-local ownership marker from `daemon
+                    // start` cannot cross the boundary. Accept ownership only
+                    // through the exact inherited, locked spawn-file
+                    // description; an ambient environment value without that
+                    // OS proof fails validation. launchd children receive no
+                    // handoff and remain explicitly supervisor-owned.
+                    nestweaver_daemon::lifecycle::clear_verified_nestweaver_managed_start();
+                    if let Some(inherited_fd) =
+                        std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV)
+                    {
+                        let verified =
+                            acquire_daemon_start_spawn_lock(&db_path, Some(inherited_fd))?
+                                .context(
+                                    "daemon run did not retain its verified parent spawn lock",
+                                )?;
+                        nestweaver_daemon::lifecycle::mark_verified_nestweaver_managed_start();
+                        verified.close_in_forked_child_without_unlock();
+                    }
                     if snapshot.is_some() && !server {
                         anyhow::bail!(
                             "--snapshot requires --server (a replica serves reads over TCP)"
@@ -15443,6 +15718,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Status => {
+                    if daemon_socket_reported_pid(&socket).is_none()
+                        && !pidfile_flock_held(&pidfile)
+                        && let Some(old_id) = selected_slot_legacy_id.as_deref()
+                    {
+                        let old_socket = nestweaver_daemon::socket_path(old_id);
+                        if let Some(pid) = daemon_socket_reported_pid(&old_socket) {
+                            println!(
+                                "Daemon is running under the superseded selected-slot identity (PID {pid})"
+                            );
+                            println!("  DB:     {}", db_path.display());
+                            println!("  Socket: {}", old_socket.display());
+                            println!(
+                                "  Action: run `nestweaver daemon --db {} stop`, then start it again to migrate the runtime identity",
+                                db_path.display()
+                            );
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                    }
                     // Check launchd first on macOS
                     #[cfg(target_os = "macos")]
                     if nestweaver_daemon::launchd::is_running(&instance_id) {
@@ -15517,6 +15810,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             format_daemon_unreachable_status(
                                 owner, &db_path, &socket, &pidfile, &log_hint
                             )
+                        );
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // nw-145 migration: before declaring nothing is running,
+                    // check the pre-anchoring identity 6.3.0 would have used.
+                    // Announcing "not running" over a live, database-owning
+                    // daemon is the exact failure nw-145 exists to prevent.
+                    if let Some(pid) =
+                        nestweaver_daemon::lifecycle::selected_slot_identity_daemon_pid(&db_path)
+                    {
+                        println!(
+                            "Daemon is not running under this instance id, but pid {pid} is \
+                             still running under the pre-6.4 selected-slot identity and may \
+                             hold the database write lock. Run `nestweaver daemon --db {} \
+                             stop` to retire it, then start again.",
+                            db_path.display()
                         );
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -15979,30 +16288,34 @@ fn resolve_uid_with_repo_filter(
     repo_filter: Option<&str>,
 ) -> anyhow::Result<ResolveResult> {
     let result = resolve_uid(store, name_or_uid)?;
-    match (&result, repo_filter) {
-        (ResolveResult::Ambiguous(candidates), Some(filter)) => {
-            let filter_lower = filter.to_lowercase();
+    let Some(filter) = repo_filter else {
+        return Ok(result);
+    };
 
-            // Build a repo_uid → display_name map for matching
-            let repos = list_repos(store, None)?;
-            let repo_names: std::collections::HashMap<String, String> = repos
-                .iter()
-                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-                .collect();
+    let filter_lower = filter.to_lowercase();
+    // Build a repo_uid → display_name map for matching
+    let repos = list_repos(store, None)?;
+    let repo_names: std::collections::HashMap<String, String> = repos
+        .iter()
+        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+        .collect();
+    let matches_filter = |s: &Symbol| -> bool {
+        // Match by repo display name (primary — supports --name overrides)
+        if let Some(name) = repo_names.get(&s.repo_uid)
+            && name.to_lowercase().contains(&filter_lower)
+        {
+            return true;
+        }
+        // Fallback: file_path prefix or UID substring
+        s.file_path.to_lowercase().starts_with(&filter_lower)
+            || s.uid.to_lowercase().contains(&filter_lower)
+    };
 
+    match &result {
+        ResolveResult::Ambiguous(candidates) => {
             let filtered: Vec<Symbol> = candidates
                 .iter()
-                .filter(|s| {
-                    // Match by repo display name (primary — supports --name overrides)
-                    if let Some(name) = repo_names.get(&s.repo_uid)
-                        && name.to_lowercase().contains(&filter_lower)
-                    {
-                        return true;
-                    }
-                    // Fallback: file_path prefix or UID substring
-                    s.file_path.to_lowercase().starts_with(&filter_lower)
-                        || s.uid.to_lowercase().contains(&filter_lower)
-                })
+                .filter(|s| matches_filter(s))
                 .cloned()
                 .collect();
             match filtered.len() {
@@ -16011,7 +16324,30 @@ fn resolve_uid_with_repo_filter(
                 _ => Ok(ResolveResult::Ambiguous(filtered)),
             }
         }
-        _ => Ok(result),
+        // nw-154: apply the filter to a UNIQUELY-resolving name too.
+        //
+        // This arm previously fell through a `_ => Ok(result)` catch-all, so
+        // --repo was silently ignored for any name that resolved uniquely —
+        // including a repo UID that does not exist. `impact <sym>` with no
+        // filter, with a bogus filter, and with a filter naming a repo that
+        // does not contain the symbol all returned byte-identical results and
+        // exit 0. A CI gate scoped to one repo therefore analysed the whole
+        // graph and passed.
+        ResolveResult::Found(uid) => {
+            let symbols = store
+                .lookup_symbols_by_uids(std::slice::from_ref(uid))
+                .map_err(|e| anyhow::anyhow!("resolve repo filter for {uid}: {e}"))?;
+            match symbols.first() {
+                Some(symbol) if matches_filter(symbol) => Ok(result),
+                // Resolved, but outside the requested repo: report not-found
+                // rather than returning an unfiltered answer.
+                Some(_) => Ok(ResolveResult::NotFound),
+                // Could not re-read the symbol to verify. Do not silently drop
+                // a real result on a lookup failure.
+                None => Ok(result),
+            }
+        }
+        ResolveResult::NotFound => Ok(result),
     }
 }
 
@@ -16680,6 +17016,139 @@ fn ensure_direct_store_fallback_allowed(
     }
 }
 
+/// Render a `read_symbols` result and compute its exit code.
+///
+/// Shared by the daemon and direct paths so `--json` and the exit-code
+/// contract cannot diverge between them (nw-186).
+fn render_read_symbols(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+    json: bool,
+) -> anyhow::Result<(i32, Option<String>)> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    } else {
+        for w in &res.symbols {
+            let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+            println!(
+                "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+                w.name, w.kind, w.path, w.start_line, w.end_line, tag
+            );
+            println!("{}", w.body);
+            println!();
+        }
+        for nf in &res.not_found {
+            eprintln!("not found: {nf}");
+        }
+        for a in &res.ambiguous {
+            eprintln!(
+                "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                a.query,
+                a.candidate_uids.len()
+            );
+        }
+        if res.truncated {
+            eprintln!(
+                "truncated: {} symbol(s) dropped for token budget",
+                res.dropped.len()
+            );
+        }
+    }
+    // Exit 2 when targets were requested but none resolved to a symbol
+    // (consistent with `symbol`/`impact`) — or 3 when the failure was
+    // ambiguity, matching `symbol`'s exit-code contract. When at
+    // least one target resolves, succeed even if others were
+    // not-found/ambiguous.
+
+    // Exit 2 when targets were requested but none resolved to a symbol
+    // (consistent with `symbol`/`impact`) — or 3 when the failure was
+    // ambiguity, matching `symbol`'s exit-code contract. When at least one
+    // target resolves, succeed even if others were not-found/ambiguous.
+    //
+    // `not_found`/`ambiguous` stand in for "targets were requested": a result
+    // carrying either had targets that failed to resolve.
+    if res.symbols.is_empty() && !(res.not_found.is_empty() && res.ambiguous.is_empty()) {
+        if !res.ambiguous.is_empty() {
+            return Ok((EXIT_AMBIGUOUS, None));
+        }
+        return Ok((EXIT_NOT_FOUND, None));
+    }
+    Ok((EXIT_SUCCESS, None))
+}
+
+/// The daemon's own application-level message, when a failed RPC was
+/// *answered* rather than unreachable.
+///
+/// nw-170: try_hybrid_json_rpc_checked treated every `hybrid.query` error as a
+/// transport or config failure, so a typo'd note title came back as "refusing
+/// direct fallback ... deliberately reset with `nestweaver daemon start
+/// --reset`" and exit 1. `backlinks "Home"`, `cross-repo-contracts note_get`
+/// and `project-context zzz-nonexistent` all told the user their daemon was
+/// wedged when it had answered perfectly.
+///
+/// The presence of a `tonic::Status` in the error chain is the discriminator:
+/// the daemon received the call and replied. `Unavailable` is excluded because
+/// that is precisely the code for "I cannot serve this", and `DeadlineExceeded`
+/// because a cancelled query genuinely may be worth retrying elsewhere.
+///
+/// The `tool <name> failed: ` prefix that `tool_error` adds is stripped, since
+/// the caller already knows which command it ran.
+fn daemon_application_error(error: &anyhow::Error) -> Option<String> {
+    let status = error.chain().find_map(|cause| {
+        cause.downcast_ref::<tonic::Status>().filter(|status| {
+            !matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        })
+    })?;
+    let message = status.message();
+    let message = message
+        .split_once(" failed: ")
+        .filter(|(head, _)| head.starts_with("tool "))
+        .map_or(message, |(_, tail)| tail);
+    (!message.is_empty()).then(|| message.to_string())
+}
+
+/// Env knob for the client-side RPC ceiling, in seconds. `0` disables it.
+const RPC_TIMEOUT_ENV: &str = "NESTWEAVER_RPC_TIMEOUT_SECS";
+
+/// Default client-side ceiling on a daemon RPC.
+///
+/// Deliberately generous. This is a backstop against a wedged or
+/// indefinitely-blocked daemon, not a latency target — a value tight enough to
+/// be a performance guard would turn slow-but-succeeding queries on a large
+/// graph into failures.
+const RPC_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the CLI will wait for a daemon RPC before giving up.
+///
+/// nw-162: there was no client-side bound at all. `--max-millis` is enforced
+/// SERVER-side and does not bound the client's wall clock, so a daemon that
+/// stopped responding parked the CLI in `Runtime::block_on` indefinitely — one
+/// observed `regex-search` ran 8m38s before being killed, with every tokio
+/// worker idle awaiting a response that never arrived.
+///
+/// When the caller passed `--max-millis`, the server has been asked to answer
+/// within that budget, so the client waits that long plus a margin for
+/// transport and scheduling; anything beyond means the daemon is not honouring
+/// its own deadline. Otherwise the generous default applies.
+fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
+    if let Some(seconds) = std::env::var(RPC_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        // An explicit 0 opts out entirely, for debugging a slow daemon.
+        return (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+    }
+    let budget = args
+        .get("max_millis")
+        .and_then(serde_json::Value::as_u64)
+        .map(|ms| {
+            std::time::Duration::from_millis(ms).saturating_add(std::time::Duration::from_secs(30))
+        });
+    Some(budget.unwrap_or(RPC_TIMEOUT_DEFAULT))
+}
+
 fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
@@ -16738,9 +17207,31 @@ fn try_hybrid_json_rpc_checked(
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
-        Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
+        Ok(mut hybrid) => match rt.block_on(async {
+            match daemon_rpc_timeout(&args) {
+                Some(budget) => tokio::time::timeout(budget, hybrid.query(rpc_name, &args))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "daemon did not answer {rpc_name} within {}s; it may be wedged or \
+                             saturated. Raise or disable the ceiling with {RPC_TIMEOUT_ENV} \
+                             (0 disables), and see `nestweaver daemon --db {} status`.",
+                            budget.as_secs(),
+                            db_path.display()
+                        ))
+                    }),
+                None => hybrid.query(rpc_name, &args).await,
+            }
+        }) {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
+                // nw-170: the daemon answered — "no note found with title
+                // 'Home'" is a valid answer, not a daemon failure. There is
+                // nothing to fall back FROM, so surface it as-is instead of
+                // recommending a daemon reset.
+                if let Some(message) = daemon_application_error(&e) {
+                    return Err(anyhow::anyhow!("{message}"));
+                }
                 ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
                     format!("hybrid query {rpc_name} failed ({e:#}); refusing direct fallback")
                 })?;
@@ -16969,7 +17460,9 @@ fn pattern_count_from_tool_json(
 /// the signal in-band via the `stale_index` field instead.
 fn print_stale_index_note() {
     println!(
-        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with `index --with-trigrams`)"
+        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with \
+         `index --with-trigrams`, or set `[indexing] with_trigrams = true` so indexing keeps \
+         them fresh)"
     );
 }
 
@@ -17168,6 +17661,15 @@ fn run_brain(
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
                 };
+                // nw-192: the daemon formats only a COUNT into its terminal
+                // message ("...; N eligible file(s) skipped"), while the
+                // direct path below prints "  {path} - {reason}" per file.
+                // IndexProgress has carried the per-file `skipped_files` all
+                // along and `index` already prints them; only this vault path
+                // dropped them on the floor. A reporter saw 210 of 1,244 .md
+                // files skipped with no way to learn why, because the daemon
+                // serves this by default.
+                let mut skipped_files: Vec<nestweaver_proto::IndexSkipDetail> = Vec::new();
                 rt.block_on(async {
                     let stream = client.inner_mut().index_vault(req).await?.into_inner();
                     consume_cli_index_progress(stream, |progress| {
@@ -17182,9 +17684,24 @@ fn run_brain(
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
+                        // REPLACE, don't extend: the daemon emits the same
+                        // full list on more than one phase message, so
+                        // accumulating double-counted every skip.
+                        if !progress.skipped_files.is_empty() {
+                            skipped_files = progress.skipped_files.clone();
+                        }
                     })
                     .await
                 })?;
+                if !skipped_files.is_empty() {
+                    out.status(&format!("Skipped {} file(s):", skipped_files.len()));
+                    for file in &skipped_files {
+                        out.status(&format!(
+                            "  {} — {}: {}",
+                            file.path, file.reason_code, file.detail
+                        ));
+                    }
+                }
                 return Ok((EXIT_SUCCESS, None));
             }
 
@@ -19836,29 +20353,89 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
 ///
 /// Shared so the cached and freshly-computed paths cannot drift (nw-075): the
 /// whole point of serving a cache is that the caller cannot tell the difference.
+/// Bound a clustering result for output, reporting what was dropped.
+///
+/// nw-182: `clusters --json` emitted 65 MB with no `--limit` flag at all —
+/// output proportional to the CORPUS, not to the result. It is also exposed as
+/// an MCP tool, where that is a context-window bomb rather than an answer. The
+/// MCP tool already truncated member lists at 20; the CLI did not.
+///
+/// Truncation is reported rather than silent: `total_communities` vs
+/// `returned_communities`, and a per-community `returned_members`, so a caller
+/// can tell a small graph from a truncated view. `0` means unlimited for both
+/// bounds, so the previous full output is still reachable.
+fn bounded_clusters_payload(
+    output: &nestweaver_engine::ClusteringOutput,
+    limit: usize,
+    members: usize,
+) -> serde_json::Value {
+    let total = output.communities.len();
+    let take = if limit == 0 { total } else { limit.min(total) };
+    let communities: Vec<serde_json::Value> = output.communities[..take]
+        .iter()
+        .map(|community| {
+            let member_total = community.members.len();
+            let member_take = if members == 0 {
+                member_total
+            } else {
+                members.min(member_total)
+            };
+            serde_json::json!({
+                "id": community.id,
+                "name": community.name,
+                "cohesion": community.cohesion,
+                "member_count": community.member_count,
+                "members": &community.members[..member_take],
+                "returned_members": member_take,
+                "members_truncated": member_take < member_total,
+                "key_files": community.key_files,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "resolution": output.resolution,
+        "modularity": output.modularity,
+        "communities": communities,
+        "total_communities": total,
+        "returned_communities": take,
+        "truncated": take < total,
+    })
+}
+
 fn print_clusters_output(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
+    limit: usize,
+    members: usize,
 ) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(output)?);
-    } else if output.communities.is_empty() {
-        println!("No communities detected (graph may be empty or fully disconnected).");
-    } else {
         println!(
-            "Clusters ({}, modularity={:.4}):\n",
-            output.communities.len(),
-            output.modularity
+            "{}",
+            serde_json::to_string_pretty(&bounded_clusters_payload(output, limit, members))?
         );
-        for c in &output.communities {
-            println!(
-                "  [{:>3}] {} ({} members, cohesion={:.2})",
-                c.id, c.name, c.member_count, c.cohesion
-            );
-            for f in &c.key_files {
-                println!("        {f}");
-            }
+        return Ok(());
+    }
+    if output.communities.is_empty() {
+        println!("No communities detected (graph may be empty or fully disconnected).");
+        return Ok(());
+    }
+    let total = output.communities.len();
+    let take = if limit == 0 { total } else { limit.min(total) };
+    println!("Clusters ({total}, modularity={:.4}):\n", output.modularity);
+    for c in &output.communities[..take] {
+        println!(
+            "  [{:>3}] {} ({} members, cohesion={:.2})",
+            c.id, c.name, c.member_count, c.cohesion
+        );
+        for f in &c.key_files {
+            println!("        {f}");
         }
+    }
+    if take < total {
+        println!(
+            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
+            total - take
+        );
     }
     Ok(())
 }
@@ -20509,22 +21086,31 @@ fn render_project_context_daemon_response(
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
+    let resp = brain_context_json_value(result, limit);
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_json::Value {
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
         "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": result.degraded_components,
     });
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
     }
 
     // Feature F7: surface PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
-
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
+    resp
 }
 
 /// Render the `project-context` JSON for the local (--no-daemon) path with
@@ -20542,6 +21128,29 @@ fn print_project_context_json(
     external_refs: &serde_json::Value,
     concise: bool,
 ) -> anyhow::Result<()> {
+    let resp = project_context_json_value(
+        project,
+        result,
+        limit,
+        tokens_used,
+        token_budget,
+        external_refs,
+        concise,
+    );
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_context_json_value(
+    project: &nestweaver_schema::Project,
+    result: &BrainContextResult,
+    limit: usize,
+    tokens_used: usize,
+    token_budget: usize,
+    external_refs: &serde_json::Value,
+    concise: bool,
+) -> serde_json::Value {
     // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
     // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
     // emitted full nodes regardless of response_format, diverging from the daemon path.
@@ -20567,9 +21176,14 @@ fn print_project_context_json(
         "connected": connected,
         "tokens_used": tokens_used,
         "token_budget": token_budget,
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": result.degraded_components,
     });
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
     }
     if !result.expansion_terms.is_empty() {
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
@@ -20577,8 +21191,60 @@ fn print_project_context_json(
     if !external_refs.is_null() {
         resp["external_refs"] = external_refs.clone();
     }
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
+    resp
+}
+
+#[cfg(test)]
+mod context_json_renderer_tests {
+    use super::*;
+
+    fn degraded_context() -> BrainContextResult {
+        BrainContextResult {
+            seeds: Vec::new(),
+            connected: Vec::new(),
+            unresolved_seeds: vec!["missing".to_string()],
+            expansion_terms: Vec::new(),
+            semantic_applied: false,
+            semantic_seed_count: 0,
+            degraded_components: vec!["semantic".to_string()],
+        }
+    }
+
+    #[test]
+    fn direct_brain_context_never_drops_semantic_honesty() {
+        let value = brain_context_json_value(&degraded_context(), 30);
+        assert_eq!(value["semantic_applied"], false);
+        assert_eq!(
+            value["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
+        assert_eq!(value["unresolved_seeds"], serde_json::json!(["missing"]));
+    }
+
+    #[test]
+    fn direct_project_context_never_drops_semantic_honesty() {
+        let project = nestweaver_schema::Project {
+            uid: "project:test".to_string(),
+            name: "test".to_string(),
+            summary: None,
+            instance_id: "default".to_string(),
+        };
+        let value = project_context_json_value(
+            &project,
+            &degraded_context(),
+            30,
+            0,
+            1_000,
+            &serde_json::Value::Null,
+            false,
+        );
+        assert_eq!(value["semantic_applied"], false);
+        assert_eq!(
+            value["degraded_components"],
+            serde_json::json!(["semantic"])
+        );
+        assert_eq!(value["project_uid"], "project:test");
+    }
 }
 
 /// Generate embeddings for symbols, notes, and/or headings.
@@ -22473,6 +23139,16 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
     };
     daemon_check?;
 
+    // A pidfile is advisory runtime metadata and may be unlinked underneath a
+    // live daemon. The database lock is the durable ownership proof that
+    // survives that incident state. Rollback, prune, rebuild, and snapshot
+    // creation all require a quiescent graph, so only a provably free lock is
+    // safe; an indeterminate probe fails closed.
+    ensure_database_write_lock_quiesced(
+        db_path,
+        nestweaver_daemon::lifecycle::db_write_lock(db_path),
+    )?;
+
     // Standalone `code watch` and `brain watch` processes do not own a daemon
     // pidfile. They publish their PID in `<db>.lock`; apply the same fail-closed
     // quiescence check so snapshot build cannot race those writers either.
@@ -22500,6 +23176,32 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
             Ok(_) => Ok(()),
         },
     }
+}
+
+fn ensure_database_write_lock_quiesced(
+    db_path: &Path,
+    observed: nestweaver_daemon::lifecycle::DbWriteLock,
+) -> anyhow::Result<()> {
+    match observed {
+        nestweaver_daemon::lifecycle::DbWriteLock::Free => {}
+        nestweaver_daemon::lifecycle::DbWriteLock::Held { pid } => {
+            let owner = pid
+                .map(|value| format!(" by pid {value}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "the database write lock for {} is held{owner} — refusing an operation that \
+                 requires a quiescent graph. Stop the daemon or writer and retry.",
+                db_path.display(),
+            );
+        }
+        nestweaver_daemon::lifecycle::DbWriteLock::Unknown => anyhow::bail!(
+            "the database write-lock state for {} could not be determined — refusing an \
+             operation that requires a quiescent graph. Stop the daemon or writer, verify the \
+             database is readable, and retry.",
+            db_path.display(),
+        ),
+    }
+    Ok(())
 }
 
 /// Run the MCP stdio server using HybridClient for query routing.
@@ -22773,7 +23475,7 @@ fn format_bytes(bytes: u64) -> String {
 // `snapshot build` never routes through a daemon: it guards for a quiesced DB
 // and reads the store directly (autospawning a RW daemon would trip that
 // guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
-fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
+fn run_publication(command: PublicationCommands, no_embed: bool) -> anyhow::Result<i32> {
     fn root(root: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         if root.is_some() && db.is_some() {
             anyhow::bail!("pass either --root or --db, not both");
@@ -22797,14 +23499,21 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             batch_size,
             no_activate,
             json,
-        } => run_publication_rebuild(
-            db,
-            &config,
-            operation.as_deref(),
-            batch_size,
-            !no_activate,
-            json,
-        ),
+        } => {
+            if no_embed {
+                anyhow::bail!(
+                    "--no-embed is incompatible with `publication rebuild`: a complete publication must contain a validated embedding artifact; rerun without --no-embed"
+                );
+            }
+            run_publication_rebuild(
+                db,
+                &config,
+                operation.as_deref(),
+                batch_size,
+                !no_activate,
+                json,
+            )
+        }
         PublicationCommands::Status {
             operation,
             root: explicit_root,
@@ -22889,10 +23598,49 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             operation,
             revision,
             invalid,
+            force,
             root: explicit_root,
             db,
         } => {
             let root = root(explicit_root, db)?;
+            // Serialize against rebuild / rollback / prune on this same root.
+            let _root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
+            // nw-146: request_cancel only sets `cancel_requested`; ONLY the
+            // running worker calls acknowledge_cancel to reach phase Cancelled.
+            // If that worker is gone, both discard paths refused — `--revision`
+            // with "only a cancelled or failed staging operation may be
+            // discarded", `--invalid` with "journal is readable" — and the
+            // staged slot, a full graph copy, was stranded with no CLI path to
+            // reclaim it. An escape existed via `publication rebuild
+            // --operation`, but neither message named it and it needs --config.
+            //
+            // Acknowledging is gated behind an explicit --force rather than
+            // done automatically: the journal records no worker pid, so
+            // "nobody is running" cannot be PROVEN, and auto-acknowledging
+            // could race a live worker mid-write. This mirrors `repair
+            // --force`, which exists for exactly this shape of problem.
+            let mut revision = revision;
+            if force && !invalid {
+                let state =
+                    nestweaver_engine::publication_operation::load_operation(&root, &operation)?;
+                if state.cancel_requested
+                    && state.phase
+                        != nestweaver_engine::publication_operation::PublicationPhase::Cancelled
+                    && state.failure.is_none()
+                {
+                    let acknowledged =
+                        nestweaver_engine::publication_operation::acknowledge_cancel(
+                            &root,
+                            &operation,
+                            revision.unwrap_or(state.revision),
+                        )?;
+                    println!(
+                        "Acknowledged the pending cancellation of {operation} (revision {} → {})",
+                        state.revision, acknowledged.revision
+                    );
+                    revision = Some(acknowledged.revision);
+                }
+            }
             if invalid {
                 nestweaver_engine::publication_operation::discard_invalid_operation(
                     &root, &operation,
@@ -22910,11 +23658,90 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             }
             Ok(EXIT_SUCCESS)
         }
+        PublicationCommands::Prune {
+            dry_run,
+            root: explicit_root,
+            db,
+        } => {
+            // Reclaiming slots mutates the publication directory, so it takes
+            // the same exclusivity every other mutation here does: no live
+            // daemon, plus the index-publication lease held ACROSS the
+            // enumerate-and-delete. Without both, a cutover landing between
+            // reading CURRENT and deleting could reclaim the slot that cutover
+            // had just selected — the live graph.
+            let base_db = db.clone().unwrap_or_else(default_db_path);
+            let root = root(explicit_root, db)?;
+            // Cross-process exclusion against rebuild / rollback / discard,
+            // anchored to the ROOT being pruned — the one thing every
+            // publication operation shares.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
+            let report = if dry_run {
+                // A preview writes nothing, so it needs no exclusivity — and
+                // requiring a stopped daemon just to LOOK would make the safe
+                // option the inconvenient one.
+                nestweaver_engine::publication::prune_slots(&root, &root_lock, true)?
+            } else {
+                // A daemon may hold the SELECTED graph open, so quiesce it too
+                // before removing slots out from under it.
+                ensure_no_live_daemon_for_snapshot_build(&base_db)?;
+                nestweaver_engine::publication::prune_slots(&root, &root_lock, false)?
+            };
+            if report.slots.is_empty() {
+                println!("No publication slots found under {}", root.display());
+                return Ok(EXIT_SUCCESS);
+            }
+            for slot in report.retained() {
+                println!(
+                    "  keep   {}  {:>9}  ({})",
+                    slot.publication_uuid,
+                    format_bytes(slot.bytes),
+                    slot.retained_because.as_deref().unwrap_or("retained")
+                );
+            }
+            for slot in report.removed() {
+                println!(
+                    "  {} {}  {:>9}",
+                    if dry_run { "would " } else { "remove" },
+                    slot.publication_uuid,
+                    format_bytes(slot.bytes)
+                );
+            }
+            let removed = report.removed().count();
+            if dry_run {
+                println!(
+                    "{removed} slot(s), {} reclaimable — re-run without --dry-run to reclaim",
+                    format_bytes(report.removed_bytes)
+                );
+            } else {
+                println!(
+                    "Reclaimed {removed} slot(s), {}",
+                    format_bytes(report.removed_bytes)
+                );
+            }
+            Ok(EXIT_SUCCESS)
+        }
         PublicationCommands::Rollback { db, config, json } => {
             let (base_db, cfg) = resolve_base_db_with_config(db, config.as_deref())?;
             let root = nestweaver_engine::publication::default_publication_root(&base_db);
+            // Hold selector ownership across the active-daemon proof and CAS.
+            // Daemon startup takes the same lock while resolving/opening
+            // CURRENT, so it cannot slip into the abandoned slot between the
+            // check and rollback.
+            let root_lock = nestweaver_engine::publication::PublicationRootLock::acquire(&root)?;
             let current = nestweaver_engine::publication::read_current(&root)?
                 .ok_or_else(|| anyhow::anyhow!("no selected publication to roll back"))?;
+            // Derive the active slot path from the already validated selector
+            // without opening the graph. Rollback is the recovery path for a
+            // publication whose graph cannot be opened, so resolving it through
+            // `resolve_selected_database` here would make that exact failure
+            // impossible to recover from.
+            let selected_db =
+                nestweaver_engine::publication::slot_path(&root, &current.publication_uuid)?
+                    .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+            // Quiesce the graph that is serving requests before moving the
+            // selector away from it. Checking only the predecessor proves
+            // nothing about a live daemon still serving the abandoned slot.
+            ensure_no_live_daemon_for_snapshot_build(&selected_db)?;
             let predecessor_db = nestweaver_engine::publication::retained_predecessor_database(
                 &base_db,
                 current.expected_previous_publication_uuid.as_deref(),
@@ -22927,10 +23754,11 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
                 cfg.assert_expected_brain(&store)?;
             }
             let lease = store.acquire_index_publication_lease()?;
-            let selected = nestweaver_engine::publication::rollback_current(
+            let selected = nestweaver_engine::publication::rollback_current_under_lock(
                 &root,
                 &lease,
                 &current.publication_uuid,
+                &root_lock,
             )?;
             lease.release()?;
             if json {
@@ -22973,6 +23801,11 @@ fn run_publication_rebuild(
     let (base_db, cfg) = resolve_base_db_with_config(db, Some(config_path))?;
     let config = cfg.ok_or_else(|| anyhow::anyhow!("publication rebuild requires --config"))?;
     let publication_root = nestweaver_engine::publication::default_publication_root(&base_db);
+    // Serialize against rollback / discard / prune on this root. Held for the
+    // whole rebuild — including the cutover — so no concurrent operation can
+    // reclaim or reselect a slot this one is building.
+    let root_lock =
+        nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root)?;
     let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
     if !incumbent_db.exists() {
         anyhow::bail!(
@@ -23419,10 +24252,12 @@ fn run_publication_rebuild(
                                 )
                             },
                         )?;
-                        let rollback = nestweaver_engine::publication::rollback_current(
+                        let rollback =
+                            nestweaver_engine::publication::rollback_current_under_lock(
                             &publication_root,
                             &rollback_lease,
                             &state.plan.target_publication_uuid,
+                            &root_lock,
                         );
                         let release = rollback_lease.release();
                         return match (rollback, release) {
@@ -23475,13 +24310,21 @@ fn run_publication_rebuild(
             ) && !latest.phase.is_terminal()
                 && latest.failure.is_none()
             {
+                // nw-148: this used to hardcode `true`. The flag drives
+                // resume_operation, which refuses non-retryable failures, so
+                // marking a permanently-failed operation retryable removed the
+                // only signal telling an operator to discard and start fresh —
+                // and sent them into a retry loop that fails identically.
+                let retryable =
+                    !nestweaver_engine::publication_operation::PermanentPublicationFailure::
+                        is_permanent(&error);
                 let _ = nestweaver_engine::publication_operation::record_failure(
                     &publication_root,
                     &operation_uuid,
                     latest.revision,
                     "publication_rebuild_failed",
                     format!("{error:#}"),
-                    true,
+                    retryable,
                 );
                 return Err(error);
             } else {
@@ -23615,7 +24458,7 @@ fn publication_startup_smoke(
     text_index.search("nestweaver", 1)?;
     store.regex_search("(?s).", None, None, Some(1), Some(1_000))?;
     if let Some(dimension) = store.embedding_index_dimension() {
-        store.vector_search(&vec![0.0; dimension], 1);
+        store.try_vector_search(&vec![0.0; dimension], 1)?;
     }
     Ok(())
 }
@@ -24187,6 +25030,31 @@ mod abs_for_daemon_tests {
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("direct start contender should proceed after readiness owner releases");
         contender.join().unwrap();
+    }
+
+    /// nw-162: the CLI had no client-side bound on a daemon RPC, so a wedged
+    /// daemon parked it in `block_on` indefinitely.
+    #[test]
+    fn daemon_rpc_timeout_derives_a_bound_from_the_server_budget() {
+        let bare = serde_json::json!({});
+        assert_eq!(daemon_rpc_timeout(&bare), Some(RPC_TIMEOUT_DEFAULT));
+
+        // --max-millis asks the SERVER to answer within a budget; the client
+        // waits that long plus a transport margin, not forever.
+        let budgeted = serde_json::json!({ "max_millis": 5000 });
+        let bound = daemon_rpc_timeout(&budgeted).expect("a budgeted call is still bounded");
+        assert!(
+            bound > std::time::Duration::from_millis(5000),
+            "the client must allow more than the server budget, got {bound:?}"
+        );
+        assert!(
+            bound < RPC_TIMEOUT_DEFAULT,
+            "a small server budget must not inherit the full default, got {bound:?}"
+        );
+
+        // A non-numeric budget must never panic or silently disable the bound.
+        let junk = serde_json::json!({ "max_millis": "soon" });
+        assert_eq!(daemon_rpc_timeout(&junk), Some(RPC_TIMEOUT_DEFAULT));
     }
 
     #[test]
@@ -24851,6 +25719,30 @@ mod snapshot_build_guard_tests {
         std::fs::remove_file(&pidfile).unwrap();
         ensure_no_live_daemon_for_snapshot_build(&db)
             .expect("build permitted when no daemon is live");
+    }
+
+    #[test]
+    fn quiescence_requires_a_provably_free_database_write_lock() {
+        let db = PathBuf::from("/tmp/nestweaver-quiescence-contract.lbug");
+        ensure_database_write_lock_quiesced(&db, nestweaver_daemon::lifecycle::DbWriteLock::Free)
+            .expect("a provably free database is quiescent");
+
+        let held = ensure_database_write_lock_quiesced(
+            &db,
+            nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(42) },
+        )
+        .expect_err("a held database lock must block rollback and snapshot operations");
+        assert!(held.to_string().contains("pid 42"), "err was: {held}");
+
+        let unknown = ensure_database_write_lock_quiesced(
+            &db,
+            nestweaver_daemon::lifecycle::DbWriteLock::Unknown,
+        )
+        .expect_err("an indeterminate database lock must fail closed");
+        assert!(
+            unknown.to_string().contains("could not be determined"),
+            "err was: {unknown}"
+        );
     }
 
     /// A present-but-garbage pidfile must FAIL CLOSED: we can't confirm the

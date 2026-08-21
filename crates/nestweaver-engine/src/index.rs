@@ -1155,9 +1155,17 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                 // them from the committed sidecar so in-process readers keep
                 // the scope the disk now holds; a lazy refill would be
                 // `code_only()`, narrower than a unified publication.
-                if pagerank_scope.is_some()
-                    && let Err(error) =
-                        store.load_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
+                // nw-147: this caller KNOWS the parameters it just computed
+                // with (compute_pagerank above uses 0.85 / 20 over this exact
+                // scope), so it can verify the sidecar's algorithm fingerprint
+                // instead of letting the artifact vouch for itself.
+                if let Some(scope) = pagerank_scope
+                    && let Err(error) = store.load_pagerank_cache_expecting(
+                        &crate::sidecar_path(db_path, ".pagerank.json"),
+                        Some(&nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+                            0.85, 20, scope,
+                        )),
+                    )
                 {
                     tracing::warn!(
                         "fresh PageRank sidecar could not be reloaded after marker retirement: \
@@ -2961,7 +2969,30 @@ where
                 let controller_framework = hint_by_index
                     .values()
                     .find(|h| h.role == "controller")
-                    .map(|h| h.framework.clone());
+                    .map(|h| h.framework.clone())
+                    .or_else(|| {
+                        // nw-160: Express and Fastify have no controller CLASS —
+                        // routes are registered inside function bodies, so their
+                        // hints carry role "handler". Requiring "controller"
+                        // meant those files never became handler files and no
+                        // HTTP contract was ever minted from them.
+                        hint_by_index
+                            .values()
+                            .find(|h| {
+                                h.role == "handler"
+                                    && matches!(h.framework.as_str(), "express" | "fastify")
+                            })
+                            .map(|h| h.framework.clone())
+                            .or_else(|| {
+                                // The signature-based hint cannot see a route
+                                // registered inside a function BODY, so recover
+                                // it from the retained source.
+                                source
+                                    .as_deref()
+                                    .and_then(crate::contracts::detect_node_route_framework)
+                                    .map(str::to_string)
+                            })
+                    });
                 let mut handler_file = controller_framework.map(|framework| {
                     let class_signature = raw_symbols
                         .iter()
@@ -5170,6 +5201,8 @@ fn incremental_index_with_name_and_io(
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
+        .with_context(|| "mark incremental regex scope dirty")?;
 
     store
         .commit_transaction(&txn)
@@ -5421,6 +5454,8 @@ where
 
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
+        .with_context(|| "mark server incremental regex scope dirty")?;
     store
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
@@ -6412,11 +6447,14 @@ mod tests {
     /// wait for it (which reaps the zombie), and return its now-free pid.
     /// `kill(pid, 0)` then reports ESRCH deterministically.
     fn reaped_child_pid() -> i32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true
+        // and has no /bin/true, so hardcoding the path panicked with
+        // NotFound on every macOS machine while passing in Linux CI.
+        let mut child = std::process::Command::new("true")
             .spawn()
-            .expect("spawn /bin/true");
+            .expect("spawn true");
         let pid = child.id() as i32;
-        child.wait().expect("reap /bin/true");
+        child.wait().expect("reap true");
         assert!(
             !crate::index_publication::process_is_alive(pid),
             "a reaped child must not read as alive"
@@ -9546,7 +9584,7 @@ function hello(name) { return "Hello " + name; }
         assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
         store.flush_embedding_index().unwrap();
         assert_eq!(
-            store.vector_search(&[1.0, 0.0], 1)[0].0,
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
             removed_symbol_uid,
             "precondition: stale vector must displace the live result"
         );
@@ -9564,13 +9602,13 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let live_results = store.vector_search(&[1.0, 0.0], 1);
+        let live_results = store.try_vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(live_results[0].0, survivor_symbol_uid);
         assert!(!store.has_embedding(&removed_symbol_uid));
         assert!(store.has_embedding(&survivor_symbol_uid));
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1);
+        let persisted_results = reopened.try_vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(persisted_results[0].0, survivor_symbol_uid);
         assert!(!reopened.has_embedding(&removed_symbol_uid));
         assert!(reopened.has_embedding(&survivor_symbol_uid));
@@ -11478,9 +11516,12 @@ function hello(name) { return "Hello " + name; }
         let repo_url = "https://example.com/transient-read";
         index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
 
-        fs::write(repo.join("main.rs"), [0xff, 0xfe, 0xfd]).unwrap();
+        // nw-190: invalid UTF-8 now decodes lossily and is no longer a read
+        // failure, so it cannot stand in for one. Use genuinely binary content
+        // (a NUL byte), which the reader refuses with a typed BinarySource.
+        fs::write(repo.join("main.rs"), [0x00, 0xfe, 0xfd]).unwrap();
         git(&["add", "main.rs"]);
-        git(&["commit", "-q", "-m", "invalid-utf8"]);
+        git(&["commit", "-q", "-m", "binary-source"]);
         let error = incremental_index_with_name_and_limits(
             &repo,
             &db_path,
@@ -12098,6 +12139,42 @@ function hello(name) { return "Hello " + name; }
             json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
             "sidecar must contain scores"
         );
+    }
+
+    #[test]
+    fn incremental_code_change_dirties_regex_scope_and_widens_without_losing_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("regex-dirty.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "function originalNeedle() {}\n").unwrap();
+
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/regex", None)
+            .unwrap();
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store.refresh_trigram_index(true).unwrap();
+            let clean = store
+                .regex_search("originalNeedle", None, None, None, None)
+                .unwrap();
+            assert_eq!(clean.dirty_scopes, 0);
+            assert_eq!(clean.results.len(), 1);
+        }
+
+        fs::write(
+            repo.join("main.js"),
+            "function originalNeedle() {}\nfunction watchedRegressionNeedle() {}\n",
+        )
+        .unwrap();
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/regex", None)
+            .unwrap();
+
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        let widened = store
+            .regex_search("watchedRegressionNeedle", None, None, None, None)
+            .unwrap();
+        assert_eq!(widened.dirty_scopes, 1);
+        assert_eq!(widened.results.len(), 1);
     }
 
     #[test]

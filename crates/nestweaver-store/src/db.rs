@@ -33,12 +33,9 @@ pub(crate) struct PprGraphCached {
     pub intent: Option<QueryIntent>,
     /// Ordered list of all node UIDs in scope.
     pub uids: Vec<String>,
-    /// Maps uid → index in `uids`.
-    pub uid_to_idx: HashMap<String, usize>,
-    /// For each node v, the list of `(u, weight)` incoming edges.
-    pub incoming: Vec<Vec<(usize, f64)>>,
-    /// Sum of all outgoing edge weights per node (pre-normalisation denominator).
-    pub out_weight: Vec<f64>,
+    /// Adjacency in the exact shape `forward_push_ppr` borrows, so a reader can
+    /// hand it straight to the algorithm instead of rebuilding one per call.
+    pub adjacency: nestweaver_algorithms::graph::AdjacencyData,
 }
 
 #[derive(Default)]
@@ -297,7 +294,10 @@ pub struct GraphStore {
     /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
     /// graph has not changed between index refreshes.
-    pub(crate) ppr_graph_cache: Mutex<Option<PprGraphCached>>,
+    /// Held behind an `Arc` so a reader can bump a refcount and release the
+    /// lock, rather than deep-copying a corpus-sized adjacency on every call
+    /// (nw-180). Mirrors `symbol_name_cache`.
+    pub(crate) ppr_graph_cache: Mutex<Option<std::sync::Arc<PprGraphCached>>>,
     /// Cached full symbol table for `search_symbols_by_name`. Keyed on
     /// `graph_generation`; stale entries are discarded on any reindex.
     /// Avoids full-table scans on every seed-resolution call for brain_context,
@@ -458,6 +458,9 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 ///
 /// Overridable per-operator:
 ///   NESTWEAVER_LBUG_MAX_THREADS       engine thread-pool size (0 = library auto)
+///   NESTWEAVER_LBUG_MAX_DB_SIZE       max database size in bytes; also bounds the
+///                                     per-open virtual address reservation, so a
+///                                     smaller value allows more concurrent opens
 ///   NESTWEAVER_LBUG_BUFFER_POOL_BYTES buffer pool size in bytes (0 = auto);
 ///                                     a larger pool avoids eviction (and thus
 ///                                     the race) when the working set fits.
@@ -479,6 +482,16 @@ fn hardened_system_config() -> lbug::SystemConfig {
     let mut cfg = lbug::SystemConfig::default().max_num_threads(max_threads);
     if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
         cfg = cfg.buffer_pool_size(bytes);
+    }
+    // nw-137: each open reserves virtual address space proportional to
+    // `max_db_size`, so many concurrent opens exhaust it — the engine's own
+    // test config bounds this value with the comment "it limits the number of
+    // databases which can be open in a single process". Our test suite opens
+    // dozens of stores at default parallelism and hit exactly that, failing
+    // unrelated tests with an mmap error that reads like a snapshot bug.
+    // Overridable so a very large brain can raise it.
+    if let Some(bytes) = env_u64("NESTWEAVER_LBUG_MAX_DB_SIZE") {
+        cfg = cfg.max_db_size(bytes);
     }
     if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
         let on = !matches!(v.trim(), "0" | "false" | "off");
@@ -1765,6 +1778,23 @@ impl GraphStore {
             // cleared during open and therefore has no adopted envelope. The
             // next successful embed must replace that file with a complete v2
             // base instead of appending deltas to an unusable foundation.
+            // A base that fails its payload checksum is NOT a foundation to
+            // append to. Before the checksum was deferred, such a file errored
+            // at load and was cleared, so it had no envelope and the comment
+            // above held automatically. It now loads structurally and KEEPS its
+            // envelope, so without this the flush appended a journal to an
+            // unusable base and compaction later refused to replace it —
+            // leaving semantic search dead forever while the error told the
+            // operator to re-embed.
+            if base_exists && idx.base_is_corrupt() {
+                if idx.overlay_len() == 0 {
+                    // Nothing new to write. Rewriting now would replace the
+                    // corrupt file with an EMPTY one and lose the UID list too,
+                    // so refuse and let the operator re-embed first.
+                    return Err(StoreError::EmbeddingArtifactCorrupt);
+                }
+                idx.discard_corrupt_base();
+            }
             let trusted_base_exists = base_exists && idx.artifact_envelope().is_some();
             if !trusted_base_exists {
                 idx.save_binary_v2(&path, &identity, self.graph_generation(), &pipeline)
@@ -1975,13 +2005,28 @@ impl GraphStore {
     }
 
     /// Perform a vector similarity search over the embedding index.
-    /// Returns `(uid, cosine_similarity)` pairs sorted descending.
-    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
+    /// Returns `(uid, cosine_similarity)` pairs sorted descending, or `Err` for
+    /// a corrupt embedding artifact.
+    ///
+    /// The infallible `vector_search` that used to sit here was removed rather
+    /// than left deprecated. It could not represent
+    /// `EmbeddingArtifactCorrupt`, so it `.expect()`ed — and the publication
+    /// startup smoke calls this path, where a panic would unwind past the
+    /// rollback a failed smoke exists to trigger. Deprecation labels that
+    /// hazard; it does not remove it, and `#[allow(deprecated)]` or a build
+    /// without `-D warnings` reopens it. Nothing called it, and these crates
+    /// are not published to crates.io (the release pipeline ships an npm
+    /// binary wrapper), so there was no external source compatibility to keep.
+    pub fn try_vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         self.vector_search_cancellable(query_embedding, limit, None)
-            .expect("vector_search with cancel=None cannot be cancelled")
     }
 
-    /// Like [`vector_search`], but threads a cooperative cancellation flag into
+    /// Like [`try_vector_search`](Self::try_vector_search), but threads a
+    /// cooperative cancellation flag into
     /// the parallel embedding scan. `cancel = None` is the original behavior;
     /// a tripped flag yields `Err(StoreError::Cancelled(_))` rather than a
     /// silently-truncated (and cacheable) empty result.
@@ -2000,13 +2045,13 @@ impl GraphStore {
 
     /// Perform a filtered vector similarity search over the embedding index.
     /// Only embeddings whose UID contains `uid_prefix` are considered.
-    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    /// When `uid_prefix` is `None`, behaves identically to `try_vector_search`.
     pub fn vector_search_filtered(
         &self,
         query_embedding: &[f32],
         limit: usize,
         uid_prefix: Option<&str>,
-    ) -> Vec<(String, f64)> {
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let idx = self
             .embedding_index
             .lock()
@@ -3492,6 +3537,28 @@ mod tests {
 
         let error = store.flush_embedding_index().unwrap_err();
         assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn graph_vector_search_returns_corrupt_artifact_error_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding("symbol:live", vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        let embedding_path = store.embedding_sidecar_path().unwrap();
+        drop(store);
+
+        let mut bytes = std::fs::read(&embedding_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&embedding_path, bytes).unwrap();
+
+        let reopened = GraphStore::open_read_only(&db_path).unwrap();
+        assert!(matches!(
+            reopened.try_vector_search(&[1.0, 0.0], 1),
+            Err(StoreError::EmbeddingArtifactCorrupt)
+        ));
     }
 
     #[test]

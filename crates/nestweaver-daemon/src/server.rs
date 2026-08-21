@@ -4152,7 +4152,20 @@ impl NestWeaverDaemon for DaemonService {
         }
         let state = self.state.clone();
         let force = req.force;
-        let with_trigrams = req.with_trigrams;
+        // Three-state trigram policy. A plain bool could not distinguish "the
+        // caller said no" from "the caller said nothing", so a configless
+        // `index` sent false and this handler honoured it — discarding the
+        // daemon's own `[indexing] with_trigrams = true`. UNSPECIFIED now means
+        // inherit, and the legacy bool is ORed in so a pre-6.4 client that sets
+        // it still forces a refresh.
+        let with_trigrams = resolve_trigram_policy(
+            req.trigram_policy(),
+            req.with_trigrams,
+            state
+                .instance_cfg
+                .as_ref()
+                .is_some_and(|config| config.indexing.with_trigrams),
+        );
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
@@ -6640,15 +6653,58 @@ impl NestWeaverDaemon for DaemonService {
             let do_headings = scopes.headings;
 
             let (status, model) = self.state.embedding_runtime.snapshot();
-            let Some(model) = model else {
-                return Err(Status::failed_precondition(if status.error.is_empty() {
-                    format!("embedding is not ready (state: {})", status.state)
-                } else {
-                    format!(
-                        "embedding is not ready (state: {}): {}",
-                        status.state, status.error
-                    )
-                }));
+            let model = match model {
+                Some(model) => model,
+                None => {
+                    // nw-139: the daemon is the single writer, and since 6.3.0
+                    // the CLI refuses `embed --local` while the daemon holds
+                    // the write lock. So telling the operator to run it — which
+                    // is what the cache-only startup failure did — asked them
+                    // to stop the single writer and hand the lock to a second
+                    // process, the one thing the policy forbids. There was no
+                    // in-policy path to a working embedder on a cold cache.
+                    //
+                    // Seed it here instead. This is safe precisely because it
+                    // is NOT the startup path: the request is operator-
+                    // initiated, already admin-authenticated, and already holds
+                    // the write gate above, so no lock ever changes hands.
+                    // Startup stays CacheOnly, so booting never depends on
+                    // network reachability.
+                    //
+                    // A complete cache makes DownloadMissing a no-op, so a
+                    // failure for any other reason simply reproduces itself
+                    // below and reports the original diagnosis.
+                    tracing::info!(
+                        state = %status.state,
+                        "embedding model unavailable; seeding the configured artifact cache"
+                    );
+                    // Download the missing artifacts ONLY. Constructing the
+                    // model here would run it on a tokio worker, and a local
+                    // backend must be loaded on the main block_on thread or
+                    // MTLCompilerService is unreachable and Metal silently
+                    // degrades to CPU — the regression `load_embedding_model`
+                    // documents and asserts against. Seeding is pure network
+                    // and disk I/O, so it is safe from any thread.
+                    let outcome = seed_embedding_artifact_cache(&self.state);
+                    let detail = if status.error.is_empty() {
+                        format!("embedding is not ready (state: {})", status.state)
+                    } else {
+                        format!(
+                            "embedding is not ready (state: {}): {}",
+                            status.state, status.error
+                        )
+                    };
+                    return Err(Status::failed_precondition(match outcome {
+                        Ok(cache_dir) => format!(
+                            "{detail}. The missing model artifacts have now been downloaded \
+                             into {} by the daemon itself, so the write lock never changed \
+                             hands. Restart the daemon to load them \
+                             (`nestweaver daemon restart`), then re-run this command.",
+                            cache_dir.display()
+                        ),
+                        Err(error) => format!("{detail}. Seeding the cache failed: {error:#}"),
+                    }));
+                }
             };
             // The model the daemon actually loaded (startup preference: the
             // DB-recorded id wins, else the configured external/local model).
@@ -7843,7 +7899,9 @@ mod embedding_load_config_tests {
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
             modules: snapshot_dir.join("modules.json"),
-            sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
+            sentence_transformer_config: Some(
+                snapshot_dir.join("config_sentence_transformers.json"),
+            ),
             transformer_config: snapshot_dir.join("sentence_bert_config.json"),
             pooling_config: snapshot_dir.join("1_Pooling/config.json"),
             dense_modules: Vec::new(),
@@ -7860,7 +7918,10 @@ mod embedding_load_config_tests {
         )
         .expect("write modules fixture");
         std::fs::write(
-            &artifacts.sentence_transformer_config,
+            artifacts
+                .sentence_transformer_config
+                .as_ref()
+                .expect("fixture publishes a sentence-transformer config"),
             r#"{"similarity_fn_name":"cosine"}"#,
         )
         .expect("write sentence-transformer fixture");
@@ -7939,6 +8000,61 @@ mod embedding_load_config_tests {
         );
     }
 
+    /// nw-139: startup must stay cache-only so booting never depends on
+    /// network reachability, while the operator-initiated path is allowed to
+    /// seed the cache — otherwise the only remediation for a cold cache was
+    /// `embed --local`, which takes the write lock the daemon holds and so
+    /// required handing the single-writer role to a second process.
+    #[test]
+    fn startup_is_cache_only_while_the_operator_path_may_seed() {
+        let observed = std::cell::Cell::new(None);
+        let record = |_: &nestweaver_embed::EmbedConfig,
+                      _: nestweaver_embed::DevicePolicy,
+                      mode: nestweaver_embed::ArtifactMode|
+         -> anyhow::Result<()> {
+            observed.set(Some(mode));
+            Ok(())
+        };
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: std::path::PathBuf::from("/nonexistent"),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        load_daemon_embedding_backend_with_mode(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
+            record,
+        )
+        .expect("recorder never fails");
+        assert_eq!(
+            observed.get(),
+            Some(nestweaver_embed::ArtifactMode::CacheOnly),
+            "daemon startup must never contact the network"
+        );
+
+        // The operator-initiated path seeds through DownloadMissing, but does
+        // so by resolving ARTIFACTS ONLY (seed_embedding_artifact_cache) —
+        // never by constructing the model, which must stay on the main
+        // block_on thread or a local backend loses Metal. This pins that the
+        // mode is reachable; the thread contract is enforced by the
+        // debug_assert in load_embedding_model itself.
+        load_daemon_embedding_backend_with_mode(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::ArtifactMode::DownloadMissing,
+            record,
+        )
+        .expect("recorder never fails");
+        assert_eq!(
+            observed.get(),
+            Some(nestweaver_embed::ArtifactMode::DownloadMissing),
+            "the seeding mode must remain reachable"
+        );
+    }
+
     #[test]
     fn daemon_embedding_startup_constructs_cached_model_offline() {
         let cache = tempfile::tempdir().expect("cache tempdir");
@@ -7950,9 +8066,10 @@ mod embedding_load_config_tests {
             external_model: None,
         };
 
-        let model = load_daemon_embedding_backend_with(
+        let model = load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .expect("daemon startup must construct a complete configured-cache model offline");
@@ -7981,9 +8098,10 @@ mod embedding_load_config_tests {
             external_model: None,
         };
 
-        let error = load_daemon_embedding_backend_with(
+        let error = load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .err()
@@ -8030,9 +8148,10 @@ mod embedding_load_config_tests {
         assert_eq!(cache_dir, cache.path());
 
         let load_config = embedding_load_config(&cfg, cache_dir.clone(), None);
-        let model = load_daemon_embedding_backend_with(
+        let model = load_daemon_embedding_backend_with_mode(
             &load_config,
             nestweaver_embed::DevicePolicy::Cpu,
+            daemon_startup_artifact_mode(),
             nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
         .expect("complete fixture cache must load");
@@ -8268,10 +8387,93 @@ fn daemon_embedding_device_policy(
     }
 }
 
+/// Download any missing local model artifacts into the configured cache.
+///
+/// nw-139: the daemon is the single writer, and since 6.3.0 the CLI refuses
+/// `embed --local` while the daemon holds the write lock — so the cache-only
+/// startup failure told operators to do the one thing the policy forbids.
+/// Seeding here removes that dead end without any lock changing hands.
+///
+/// Deliberately resolves ARTIFACTS ONLY and never constructs the model: this
+/// runs on a tokio worker, and a local backend loaded off the main block_on
+/// thread loses Metal. The caller therefore reports success as "restart to
+/// load", not as readiness.
 #[cfg(feature = "embed")]
-fn load_daemon_embedding_backend_with<T, Load>(
+fn seed_embedding_artifact_cache(
+    state: &std::sync::Arc<DaemonState>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let cfg = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.embedding.clone())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        cfg.external_endpoint.is_none(),
+        "an external embedding backend does not use the local artifact cache"
+    );
+    let cache_dir =
+        embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path)
+            .map_err(|error| anyhow::anyhow!("resolve embedding cache directory: {error}"))?;
+    let stored_model_id = state
+        .store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(id, _)| id);
+    let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
+    nestweaver_embed::resolve_model_artifacts(
+        &config,
+        nestweaver_embed::ArtifactMode::DownloadMissing,
+    )?;
+    Ok(cache_dir)
+}
+
+/// Resolve whether an IndexRepo request should refresh the trigram pre-filter.
+///
+/// A plain bool could not distinguish "the caller said no" from "the caller
+/// said nothing", so a configless `index` sent false and this handler honoured
+/// it — discarding the daemon's own `[indexing] with_trigrams = true`.
+/// UNSPECIFIED means inherit.
+///
+/// `legacy_with_trigrams` is ORed into the UNSPECIFIED branch so a pre-6.4
+/// client, which knows only the bool, still forces a refresh when it sets it.
+/// An explicit ENABLED/DISABLED always wins.
+fn resolve_trigram_policy(
+    policy: nestweaver_proto::TrigramPolicy,
+    legacy_with_trigrams: bool,
+    daemon_config_enabled: bool,
+) -> bool {
+    match policy {
+        nestweaver_proto::TrigramPolicy::Enabled => true,
+        nestweaver_proto::TrigramPolicy::Disabled => false,
+        nestweaver_proto::TrigramPolicy::Unspecified => {
+            legacy_with_trigrams || daemon_config_enabled
+        }
+    }
+}
+
+/// The artifact mode daemon STARTUP loads under.
+///
+/// Always cache-only: booting must never depend on network reachability, and
+/// a boot that silently downloads hundreds of megabytes is not a boot. Named
+/// rather than inlined so both the production call and the tests that pin this
+/// contract reference the same value (nw-139).
+#[cfg(feature = "embed")]
+const fn daemon_startup_artifact_mode() -> nestweaver_embed::ArtifactMode {
+    nestweaver_embed::ArtifactMode::CacheOnly
+}
+
+/// Load the embedding backend under an explicit [`nestweaver_embed::ArtifactMode`].
+///
+/// Startup always uses `CacheOnly` — booting a daemon must never depend on
+/// network reachability, and that contract is pinned by
+/// `daemon_embedding_startup_constructs_cached_model_offline`. `DownloadMissing`
+/// is reachable only from an operator-initiated `Embed` RPC (nw-139).
+#[cfg(feature = "embed")]
+fn load_daemon_embedding_backend_with_mode<T, Load>(
     config: &nestweaver_embed::EmbedConfig,
     policy: nestweaver_embed::DevicePolicy,
+    mode: nestweaver_embed::ArtifactMode,
     load: Load,
 ) -> anyhow::Result<T>
 where
@@ -8281,7 +8483,7 @@ where
         nestweaver_embed::ArtifactMode,
     ) -> anyhow::Result<T>,
 {
-    load(config, policy, nestweaver_embed::ArtifactMode::CacheOnly)
+    load(config, policy, mode)
 }
 
 #[cfg(feature = "embed")]
@@ -8526,6 +8728,17 @@ fn log_embedding_ready(
 /// path can be exercised under Tokio; only the local backend has the main-thread requirement.
 #[cfg(feature = "embed")]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    load_embedding_model_with_mode(state, daemon_startup_artifact_mode()).await
+}
+
+/// Resolve, load and publish the embedding backend under an explicit artifact
+/// mode. See [`load_daemon_embedding_backend_with_mode`] for why only the
+/// operator-initiated path may pass `DownloadMissing`.
+#[cfg(feature = "embed")]
+async fn load_embedding_model_with_mode(
+    state: &std::sync::Arc<DaemonState>,
+    mode: nestweaver_embed::ArtifactMode,
+) {
     let cfg = state
         .instance_cfg
         .as_ref()
@@ -8594,9 +8807,10 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
         };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
-    let loaded = load_daemon_embedding_backend_with(
+    let loaded = load_daemon_embedding_backend_with_mode(
         &config,
         policy,
+        mode,
         nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
     );
     match loaded {
@@ -8727,7 +8941,25 @@ pub async fn run_server(
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let db_path = lifecycle::canonical_db_path(db_path);
+    let requested_db_path = lifecycle::canonical_db_path(db_path);
+    let base_db_path = nestweaver_engine::publication::instance_anchor_database(&requested_db_path);
+    let publication_root = nestweaver_engine::publication::default_publication_root(&base_db_path);
+    // Serialize CURRENT resolution plus GraphStore open with rollback/prune/CAS.
+    // Once the graph's write lock is held, a rollback owner can observe this
+    // daemon through the pidfile and refuse; releasing earlier would reopen the
+    // check-to-open race that leaves a daemon serving an abandoned slot.
+    let snapshot_replica = server_opts
+        .as_ref()
+        .and_then(|options| options.snapshot.as_ref())
+        .is_some();
+    let publication_root_lock = (!snapshot_replica)
+        .then(|| nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root))
+        .transpose()?;
+    let db_path = if snapshot_replica {
+        requested_db_path
+    } else {
+        nestweaver_engine::publication::resolve_selected_database(&base_db_path)?
+    };
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
@@ -8908,6 +9140,7 @@ pub async fn run_server(
             }
         }
     };
+    drop(publication_root_lock);
     if let Some(config) = instance_cfg.as_ref() {
         config.assert_expected_brain(&store).with_context(|| {
             format!(
@@ -8970,9 +9203,15 @@ pub async fn run_server(
     // unreadable, or malformed input is fatal in both UDS and network server
     // modes; otherwise a restart-time file race could silently demote the
     // instance to compiled-default identity and authorization.
-    let live_binding = lifecycle::EffectiveConfigBinding::new(
+    let lifecycle_owner = if lifecycle::is_verified_nestweaver_managed_start() {
+        lifecycle::DaemonLifecycleOwner::NestweaverManaged
+    } else {
+        lifecycle::DaemonLifecycleOwner::ExternalOrUnknown
+    };
+    let live_binding = lifecycle::EffectiveConfigBinding::new_with_lifecycle_owner(
         std::process::id(),
         live_binding_source(&effective_config),
+        lifecycle_owner,
     );
     lifecycle::write_effective_config_binding(&instance_id, &live_binding).with_context(|| {
         format!("publish effective-config binding for daemon instance {instance_id}")
@@ -10041,6 +10280,13 @@ pub async fn run_server(
                 .as_ref()
                 .map(|config| config.indexing.limits())
                 .unwrap_or_default();
+            // `[indexing] with_trigrams` — keeps the regex pre-filter fresh on
+            // the daemon's own background reindex, which previously never
+            // touched trigrams at all.
+            let worker_with_trigrams = state
+                .instance_cfg
+                .as_ref()
+                .is_some_and(|config| config.indexing.with_trigrams);
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -10066,7 +10312,8 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types)
-                    .with_index_limits(worker_index_limits);
+                    .with_index_limits(worker_index_limits)
+                    .with_trigram_refresh(worker_with_trigrams);
                 pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),
@@ -15890,7 +16137,13 @@ credential_method = "gh"
         );
     }
 
-    #[cfg(unix)]
+    /// Requires a filesystem that permits non-UTF-8 filenames. Linux ext4 and
+    /// tmpfs do; APFS enforces UTF-8 and refuses the `create` outright with
+    /// EILSEQ, so the fixture cannot even be built on macOS. The guard under
+    /// test canonicalizes before checking UTF-8, which means the path must
+    /// really exist — there is no way to reach the check without the file.
+    /// Gated rather than deleted: the rejection still matters on Linux (nw-194).
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn production_config_loader_rejects_non_utf8_config_provenance() {
         use std::ffi::OsString;
@@ -17786,11 +18039,14 @@ mod boot_reconciliation_tests {
     /// (reaping the zombie), and return its now-free pid, so `kill(pid, 0)`
     /// reports ESRCH deterministically.
     fn reaped_child_pid() -> i32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // nw-138: resolve `true` via PATH. macOS ships it at /usr/bin/true
+        // and has no /bin/true, so hardcoding the path panicked with
+        // NotFound on every macOS machine while passing in Linux CI.
+        let mut child = std::process::Command::new("true")
             .spawn()
-            .expect("spawn /bin/true");
+            .expect("spawn true");
         let pid = child.id() as i32;
-        child.wait().expect("reap /bin/true");
+        child.wait().expect("reap true");
         assert!(
             !nestweaver_engine::index_publication::process_is_alive(pid),
             "a reaped child must not read as alive"
@@ -18121,6 +18377,48 @@ mod boot_reconciliation_tests {
 
 #[cfg(test)]
 mod watch_path_allowed_tests {
+    use super::resolve_trigram_policy;
+
+    /// Every daemon-side precedence case for the trigram policy.
+    ///
+    /// The bool this replaced could not express "inherit", so a configless
+    /// `index` against a daemon configured with `[indexing] with_trigrams =
+    /// true` sent false and the daemon discarded its own configuration —
+    /// reproduced as `"trigram_refresh": null` while the same index with
+    /// `--config` refreshed a scope.
+    #[test]
+    fn trigram_policy_precedence_covers_every_daemon_case() {
+        use nestweaver_proto::TrigramPolicy::{Disabled, Enabled, Unspecified};
+
+        // Explicit ENABLED wins over everything, including a daemon that has
+        // the feature switched off.
+        assert!(resolve_trigram_policy(Enabled, false, false));
+        assert!(resolve_trigram_policy(Enabled, false, true));
+
+        // Explicit DISABLED wins too — this is what --no-trigrams must do
+        // against a daemon whose config enables it.
+        assert!(!resolve_trigram_policy(Disabled, true, true));
+        assert!(!resolve_trigram_policy(Disabled, false, true));
+
+        // UNSPECIFIED inherits the daemon's configuration. THIS is the case the
+        // bool could not represent.
+        assert!(
+            resolve_trigram_policy(Unspecified, false, true),
+            "a configless index must inherit the daemon's with_trigrams = true"
+        );
+        assert!(
+            !resolve_trigram_policy(Unspecified, false, false),
+            "a configless index must not refresh when the daemon has it off"
+        );
+
+        // A pre-6.4 client knows only the legacy bool; setting it must still
+        // force a refresh even though it sends no policy.
+        assert!(
+            resolve_trigram_policy(Unspecified, true, false),
+            "an old client's with_trigrams=true must still be honoured"
+        );
+    }
+
     use super::*;
     use nestweaver_engine::{RepoConfig, RepoType};
 

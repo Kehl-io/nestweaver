@@ -583,7 +583,9 @@ mod tests {
         // let `daemon stop` print "still running and still serving reads" about
         // a process launchd had just SIGKILLed. The CLI must give up watching
         // STRICTLY BEFORE launchd kills.
-        assert!(
+        // A `const` assertion, so violating the invariant fails the BUILD
+        // rather than one test run — the value is known at compile time.
+        const _: () = assert!(
             LAUNCHD_EXIT_TIMEOUT_BUFFER_SECS > 30,
             "launchd's deadline must be strictly later than the CLI's stop grace \
              (STOP_GRACE_BUFFER_SECS = 30 in src/main.rs), or the CLI reports on \

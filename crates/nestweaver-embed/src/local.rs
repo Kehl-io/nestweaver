@@ -23,7 +23,15 @@ pub struct ModelArtifacts {
     pub tokenizer: PathBuf,
     pub weights: PathBuf,
     pub modules: PathBuf,
-    pub sentence_transformer_config: PathBuf,
+    /// `config_sentence_transformers.json`, when the model publishes one.
+    ///
+    /// nw-140: it is genuinely optional. Its only field this crate reads is
+    /// `similarity_fn_name`, which already defaults to cosine, yet resolving
+    /// it unconditionally hard-failed every model that omits it — including
+    /// thenlper/gte-base, thenlper/gte-large and intfloat/e5-base-v2, whose
+    /// HuggingFace listings carry modules.json, sentence_bert_config.json and
+    /// 1_Pooling/config.json but not this file.
+    pub sentence_transformer_config: Option<PathBuf>,
     pub transformer_config: PathBuf,
     pub pooling_config: PathBuf,
     pub dense_modules: Vec<DenseArtifacts>,
@@ -262,17 +270,29 @@ fn snapshot_revision(path: &std::path::Path) -> Option<String> {
 fn module_fingerprint(artifacts: &ModelArtifacts) -> Result<String> {
     let mut digest = Sha256::new();
     for (name, path) in [
-        ("modules.json", &artifacts.modules),
+        ("modules.json", Some(&artifacts.modules)),
         (
             "config_sentence_transformers.json",
-            &artifacts.sentence_transformer_config,
+            artifacts.sentence_transformer_config.as_ref(),
         ),
-        ("sentence_bert_config.json", &artifacts.transformer_config),
-        ("pooling/config.json", &artifacts.pooling_config),
+        (
+            "sentence_bert_config.json",
+            Some(&artifacts.transformer_config),
+        ),
+        ("pooling/config.json", Some(&artifacts.pooling_config)),
     ] {
         digest.update(name.as_bytes());
         digest.update([0]);
-        digest.update(std::fs::read(path)?);
+        match path {
+            Some(path) => digest.update(std::fs::read(path)?),
+            // nw-140: an ABSENT optional artifact must hash differently from a
+            // present-but-empty one, and differently from a later cache that
+            // gains the file. Otherwise a partially-populated cache could adopt
+            // the cosine default silently and still match a fingerprint built
+            // when the file was present. A distinct sentinel makes that a
+            // fingerprint change, which forces a re-embed instead.
+            None => digest.update(b"\x00<absent>"),
+        }
         digest.update([0xff]);
     }
     for (index, dense) in artifacts.dense_modules.iter().enumerate() {
@@ -332,7 +352,10 @@ impl std::fmt::Display for MissingModelArtifactError {
         write!(
             formatter,
             "required embedding artifact '{}' for model '{}' is missing from configured cache '{}'; \
-             run `nestweaver embed --local --model-id {} --cache-dir {}` to download missing model files into that cache",
+             run `nestweaver embed` — the daemon seeds this cache itself, so the write lock never \
+             changes hands. With no daemon running, \
+             `nestweaver embed --local --model-id {} --cache-dir {}` downloads them directly \
+             (a deliberate one-off: it takes the write lock, so the daemon must be stopped first).",
             self.filename,
             self.model_id,
             self.cache_dir.display(),
@@ -392,6 +415,25 @@ fn resolve_model_artifacts_with_builder(
             })
     };
 
+    // Distinguishes "this model does not publish the file" (Ok(None)) from a
+    // real transport or permission failure (Err). Only a genuine
+    // entry-not-found is downgraded.
+    let resolve_optional = |filename: &str| -> Result<Option<PathBuf>> {
+        match repo
+            .download_file()
+            .filename(filename)
+            .local_files_only(mode == ArtifactMode::CacheOnly)
+            .send()
+        {
+            Ok(path) => Ok(Some(path)),
+            Err(HFError::LocalEntryNotFound { .. } | HFError::EntryNotFound { .. }) => Ok(None),
+            Err(source) => Err(anyhow::Error::new(source).context(format!(
+                "failed to resolve optional embedding artifact '{filename}' for model '{}'",
+                config.model_id
+            ))),
+        }
+    };
+
     let modules = resolve("modules.json")?;
     let module_descriptors: Vec<SentenceTransformerModule> =
         serde_json::from_slice(&std::fs::read(&modules)?)
@@ -442,7 +484,7 @@ fn resolve_model_artifacts_with_builder(
         tokenizer: resolve(&module_file(&transformer.path, "tokenizer.json"))?,
         weights: resolve(&module_file(&transformer.path, "model.safetensors"))?,
         modules,
-        sentence_transformer_config: resolve("config_sentence_transformers.json")?,
+        sentence_transformer_config: resolve_optional("config_sentence_transformers.json")?,
         transformer_config: resolve(&module_file(&transformer.path, "sentence_bert_config.json"))?,
         pooling_config: resolve(&module_file(&pooling.path, "config.json"))?,
         dense_modules,
@@ -523,7 +565,15 @@ impl LocalModel {
         let modules: Vec<SentenceTransformerModule> =
             serde_json::from_slice(&std::fs::read(&artifacts.modules)?)?;
         let sentence_config: SentenceTransformerConfig =
-            serde_json::from_slice(&std::fs::read(&artifacts.sentence_transformer_config)?)?;
+            match &artifacts.sentence_transformer_config {
+                Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+                // nw-140: absent means "model publishes no similarity
+                // override", which is the cosine default the match below
+                // already applies.
+                None => SentenceTransformerConfig {
+                    similarity_fn_name: None,
+                },
+            };
         let transformer_config: TransformerConfig =
             serde_json::from_slice(&std::fs::read(&artifacts.transformer_config)?)?;
         anyhow::ensure!(
@@ -625,13 +675,16 @@ impl LocalModel {
             )
         })?;
         for path in [
-            &artifacts.config,
-            &artifacts.tokenizer,
-            &artifacts.modules,
-            &artifacts.sentence_transformer_config,
-            &artifacts.transformer_config,
-            &artifacts.pooling_config,
-        ] {
+            Some(&artifacts.config),
+            Some(&artifacts.tokenizer),
+            Some(&artifacts.modules),
+            artifacts.sentence_transformer_config.as_ref(),
+            Some(&artifacts.transformer_config),
+            Some(&artifacts.pooling_config),
+        ]
+        .into_iter()
+        .flatten()
+        {
             anyhow::ensure!(
                 snapshot_revision(path).as_deref() == Some(revision.as_str()),
                 "embedding artifacts came from mixed model revisions"
@@ -1002,20 +1055,25 @@ mod tests {
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
             modules: snapshot_dir.join("modules.json"),
-            sentence_transformer_config: snapshot_dir.join("config_sentence_transformers.json"),
+            sentence_transformer_config: Some(
+                snapshot_dir.join("config_sentence_transformers.json"),
+            ),
             transformer_config: snapshot_dir.join("sentence_bert_config.json"),
             pooling_config: snapshot_dir.join("1_Pooling/config.json"),
             dense_modules: Vec::new(),
         };
         std::fs::create_dir_all(snapshot_dir.join("1_Pooling")).expect("create pooling module");
         for path in [
-            &artifacts.config,
-            &artifacts.tokenizer,
-            &artifacts.weights,
-            &artifacts.sentence_transformer_config,
-            &artifacts.transformer_config,
-            &artifacts.pooling_config,
-        ] {
+            Some(&artifacts.config),
+            Some(&artifacts.tokenizer),
+            Some(&artifacts.weights),
+            artifacts.sentence_transformer_config.as_ref(),
+            Some(&artifacts.transformer_config),
+            Some(&artifacts.pooling_config),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if path.file_name().and_then(|name| name.to_str()) != omitted {
                 std::fs::write(path, b"fixture").expect("write cached artifact");
             }
@@ -1047,6 +1105,51 @@ mod tests {
         .expect("a complete configured cache must resolve with an unreachable endpoint");
 
         assert_eq!(actual, expected);
+    }
+
+    /// nw-140: `config_sentence_transformers.json` is optional. Models that
+    /// omit it — thenlper/gte-base, thenlper/gte-large, intfloat/e5-base-v2 —
+    /// used to fail to load entirely, because the only field this crate reads
+    /// from it (`similarity_fn_name`) already defaults to cosine.
+    #[test]
+    fn a_model_without_a_sentence_transformers_config_still_resolves() {
+        let cache = TestDir::new("no-sentence-config");
+        let expected =
+            write_cached_artifacts(cache.path(), Some("config_sentence_transformers.json"));
+
+        let actual = resolve_model_artifacts_with_builder(
+            &test_config(cache.path()),
+            ArtifactMode::CacheOnly,
+            HFClient::builder().endpoint("http://127.0.0.1:9"),
+        )
+        .expect("a model that publishes no sentence-transformers config must still resolve");
+
+        assert_eq!(
+            actual.sentence_transformer_config, None,
+            "an absent optional artifact must resolve to None, not error"
+        );
+        assert_eq!(actual.modules, expected.modules);
+        assert_eq!(actual.weights, expected.weights);
+
+        // The absence must be visible in the pipeline fingerprint, so a cache
+        // that later gains the file does not silently reuse embeddings
+        // produced under the cosine default.
+        let with_config = ModelArtifacts {
+            sentence_transformer_config: Some(
+                cache.path().join("config_sentence_transformers.json"),
+            ),
+            ..actual.clone()
+        };
+        std::fs::write(
+            with_config.sentence_transformer_config.as_ref().unwrap(),
+            br#"{"similarity_fn_name":"cosine"}"#,
+        )
+        .expect("write sentence-transformer config");
+        assert_ne!(
+            module_fingerprint(&actual).expect("fingerprint without the config"),
+            module_fingerprint(&with_config).expect("fingerprint with the config"),
+            "an absent optional artifact must not fingerprint like a present one"
+        );
     }
 
     #[test]
@@ -1084,10 +1187,14 @@ mod tests {
                 cache_dir: PathBuf::from(cache_dir),
             }
             .to_string();
+            // Select the `--local` invocation by content, not by position:
+            // the remediation now leads with `nestweaver embed` (the in-policy
+            // daemon path, nw-139), and it is the --local form whose model-id
+            // and cache-dir arguments this test exists to shell-quote.
             let command = remediation
                 .split('`')
-                .nth(1)
-                .expect("remediation must contain a shell command");
+                .find(|candidate| candidate.contains("--local"))
+                .expect("remediation must contain the --local shell command");
             let script = format!("set -- {command}; printf '%s\\n%s\\n%s\\n' \"$#\" \"$5\" \"$7\"");
             let output = Command::new("sh")
                 .args(["-c", &script])
@@ -1164,7 +1271,7 @@ mod tests {
             tokenizer: PathBuf::from("resolved-tokenizer"),
             weights: PathBuf::from("resolved-weights"),
             modules: PathBuf::from("resolved-modules"),
-            sentence_transformer_config: PathBuf::from("resolved-sentence-config"),
+            sentence_transformer_config: Some(PathBuf::from("resolved-sentence-config")),
             transformer_config: PathBuf::from("resolved-transformer-config"),
             pooling_config: PathBuf::from("resolved-pooling-config"),
             dense_modules: Vec::new(),

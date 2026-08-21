@@ -52,6 +52,20 @@ pub enum StoreError {
     /// LOUD error is what stops a corrupted value being returned silently.
     #[error("corrupt value at column {column}: {reason}")]
     CorruptValue { column: usize, reason: String },
+    /// The mapped embedding artifact failed its payload checksum, so none of
+    /// its vectors can be trusted.
+    ///
+    /// Surfaced as a distinct LOUD error for the same reason as
+    /// [`StoreError::RankingUnavailable`]: a corrupt base must degrade
+    /// semantic search VISIBLY. Returning an empty result instead is
+    /// indistinguishable from "this corpus has no semantic matches", and the
+    /// caller then reports `semantic_applied: true` over zero contribution —
+    /// exactly the silent success the deferred-verification change (nw-184)
+    /// introduced.
+    #[error(
+        "embedding artifact payload failed its checksum; semantic search is unavailable until a re-embed"
+    )]
+    EmbeddingArtifactCorrupt,
 }
 
 impl StoreError {
@@ -68,7 +82,8 @@ impl StoreError {
             | StoreError::RankingUnavailable
             | StoreError::PresentationLimitExceeded { .. }
             | StoreError::Cancelled(_)
-            | StoreError::CorruptValue { .. } => false,
+            | StoreError::CorruptValue { .. }
+            | StoreError::EmbeddingArtifactCorrupt => false,
         }
     }
 

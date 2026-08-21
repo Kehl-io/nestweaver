@@ -138,6 +138,13 @@ Everything above describes what **this process** does with SIGTERM. A supervisor
 that SIGKILLs on its own timer still does so, at its own deadline, and the
 daemon cannot extend or refuse it. Concretely:
 
+Daemon startup also records lifecycle ownership. A process forked by
+`nestweaver daemon start` is NestWeaver-managed and may be replaced
+automatically after a client/server version mismatch. A foreground,
+systemd-owned, launchd-owned, or older daemon with unknown provenance is never
+shut down and replaced by a detached process; the client fails before shutdown
+and names the supervisor/manual restart commands instead.
+
 ### Linux, `daemon start` — **fully fixed**
 
 This repo ships **no systemd unit** and no service-installer command. On Linux

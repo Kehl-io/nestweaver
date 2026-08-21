@@ -161,6 +161,9 @@ by an error message the tool can print, so they belong somewhere findable.
 | `NESTWEAVER_LBUG_MAX_THREADS` | 1 | Engine thread-pool size. `1` closes the nw-073 eviction-vs-read race; raise only if you measure a query-latency cost. |
 | `NESTWEAVER_LBUG_BUFFER_POOL_BYTES` | auto | Buffer pool size. A larger pool avoids eviction when the working set fits. |
 | `NESTWEAVER_LBUG_AUTO_CHECKPOINT` | on | `0`/`false` defers auto-checkpoints; reduces the #678 corruption trigger during bulk load. |
+| `NESTWEAVER_LBUG_MAX_DB_SIZE` | engine default | Max database size in bytes. Also bounds the VIRTUAL ADDRESS RESERVATION each open takes, so a smaller value allows more concurrent opens — lbug's own test config bounds it for exactly that reason. `.cargo/config.toml` pins 16 GiB for anything cargo runs, because the suite opens dozens of stores at default parallelism and exhausted address space, failing unrelated tests with an mmap error (nw-137). Raise it for a brain approaching the bound. |
+| `NESTWEAVER_RPC_TIMEOUT_SECS` | 300 | Client-side ceiling on a daemon RPC; `0` disables. `--max-millis` is enforced SERVER-side and does not bound the client's wall clock, so without this a daemon that accepted the connection and then stopped answering parked the CLI indefinitely (nw-162). With `--max-millis` the ceiling is that budget plus a transport margin. |
+| `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` | 3000 | How long a ranked query waits out an in-flight index publication before failing closed. Named in the error message itself, so it must be discoverable here. |
 | `NESTWEAVER_CRASH_REPORT_DIRS` | platform | Extra directories scanned by `diagnostics capabilities` for nw-073 crash recurrence. |
 | `NESTWEAVER_GIT_CLONE_TIMEOUT_SECS` / `NESTWEAVER_GIT_NET_TIMEOUT_SECS` | — | Bounds on git clone / network operations during pull. |
 

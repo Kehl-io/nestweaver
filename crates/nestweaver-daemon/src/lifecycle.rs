@@ -14,6 +14,24 @@ static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Process-local proof that this daemon was started through NestWeaver's
+/// managed `daemon start` path. Unlike an environment variable, an external
+/// supervisor cannot accidentally inherit or forge this marker. The command
+/// sets it only after acquiring or validating the locked spawn descriptor.
+static VERIFIED_NESTWEAVER_MANAGED_START: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn mark_verified_nestweaver_managed_start() {
+    VERIFIED_NESTWEAVER_MANAGED_START.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn clear_verified_nestweaver_managed_start() {
+    VERIFIED_NESTWEAVER_MANAGED_START.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_verified_nestweaver_managed_start() -> bool {
+    VERIFIED_NESTWEAVER_MANAGED_START.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Process-wide lock serializing every test that swaps OR durably reads the
 /// XDG/socket-fallback env vars. Defined at module level (not inside the
@@ -47,6 +65,21 @@ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
     ))
 }
 
+/// Canonical path to use when *naming* a brain's local state.
+///
+/// Identity must survive a publication cutover, so it is anchored to the
+/// stable base database rather than the currently-selected slot. See
+/// [`nestweaver_engine::publication::instance_anchor_database`] (nw-145).
+///
+/// Deliberately NOT used by the write-lock probe, which must open the real
+/// selected graph, nor by [`legacy_instance_id_from_db_path`], which has to
+/// reproduce a historical hash exactly in order to clean up after it.
+fn identity_db_path(db_path: &Path) -> PathBuf {
+    canonical_db_path(&nestweaver_engine::publication::instance_anchor_database(
+        db_path,
+    ))
+}
+
 /// Full, stable identity of a database path for persistent local state.
 ///
 /// Unlike [`instance_id_from_db_path`], this is never truncated for a unix
@@ -56,7 +89,7 @@ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
 pub fn database_path_fingerprint(db_path: &Path) -> String {
     use sha2::{Digest, Sha256};
 
-    let canonical = canonical_db_path(db_path);
+    let canonical = identity_db_path(db_path);
     let canonical = if canonical.is_absolute() {
         canonical
     } else {
@@ -244,6 +277,20 @@ pub enum EffectiveConfigBindingSource {
     CompiledDefaults,
 }
 
+/// The authority responsible for keeping a daemon alive.
+///
+/// Only `NestweaverManaged` authorizes in-client version replacement. This
+/// covers manual and automatic `daemon start`, both of which prove the spawn
+/// lock before forking. Foreground and supervisor-owned daemons must be
+/// restarted by their owner so a detached process cannot escape it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLifecycleOwner {
+    NestweaverManaged,
+    #[default]
+    ExternalOrUnknown,
+}
+
 /// Versioned daemon-owned live binding between an instance, PID, and its
 /// effective configuration. This record is meaningful only while `pid` still
 /// identifies the daemon holding the corresponding pidfile lock.
@@ -252,14 +299,29 @@ pub struct EffectiveConfigBinding {
     pub version: u32,
     pub pid: u32,
     pub effective_config: EffectiveConfigBindingSource,
+    #[serde(default)]
+    pub lifecycle_owner: DaemonLifecycleOwner,
 }
 
 impl EffectiveConfigBinding {
     pub fn new(pid: u32, effective_config: EffectiveConfigBindingSource) -> Self {
+        Self::new_with_lifecycle_owner(
+            pid,
+            effective_config,
+            DaemonLifecycleOwner::ExternalOrUnknown,
+        )
+    }
+
+    pub fn new_with_lifecycle_owner(
+        pid: u32,
+        effective_config: EffectiveConfigBindingSource,
+        lifecycle_owner: DaemonLifecycleOwner,
+    ) -> Self {
         Self {
             version: EFFECTIVE_CONFIG_BINDING_VERSION,
             pid,
             effective_config,
+            lifecycle_owner,
         }
     }
 }
@@ -406,7 +468,15 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
 /// For a human-readable label (parent-dir + hash), use
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    let canonical = canonical_db_path(db_path);
+    instance_id_from_canonical_path(&identity_db_path(db_path))
+}
+
+/// Hash an ALREADY-canonical path into an instance id.
+///
+/// Extracted so an identity migration can reproduce a superseded id exactly —
+/// `stop_selected_slot_identity_daemon` needs the pre-anchoring hash of the
+/// SELECTED path — without duplicating the digest and drifting from it.
+fn instance_id_from_canonical_path(canonical: &Path) -> String {
     // Use SHA-256 for a stable hash that won't change across Rust versions.
     // DefaultHasher (SipHash) is explicitly documented as not portable.
     use sha2::{Digest, Sha256};
@@ -425,7 +495,7 @@ pub fn instance_id_from_db_path(db_path: &Path) -> String {
 /// Never use this in path construction — use [`instance_id_from_db_path`]
 /// (the bare 8-char hash) to keep socket paths short.
 pub fn instance_label_from_db_path(db_path: &Path) -> String {
-    let canonical = canonical_db_path(db_path);
+    let canonical = identity_db_path(db_path);
     let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
@@ -821,6 +891,22 @@ pub fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<
 }
 
 fn persistent_state_root() -> PathBuf {
+    // Honour an explicitly-set $XDG_STATE_HOME on EVERY platform, mirroring
+    // what `runtime_dir` already does with $XDG_RUNTIME_DIR a few hundred
+    // lines up. `dirs::state_dir()` returns the variable on Linux but `None`
+    // on macOS, which has no XDG state concept, so relying on it alone meant
+    // the variable was silently ignored there.
+    //
+    // That inconsistency was not only a portability wart: the daemon GC tests
+    // set $XDG_STATE_HOME to a tempdir and seed instance directories under it,
+    // so on macOS they wrote into the developer's REAL
+    // ~/.local/state/nestweaver/ while asserting against the tempdir. Seven
+    // tests failed for that reason, and the fixtures they leaked
+    // (`abcdabcd`, `aaaaaaaa`, `ffffffff`, ...) accumulated in the user's
+    // state directory — the same directory nw-129 tracks for leaks (nw-194).
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(xdg).join("nestweaver");
+    }
     dirs::state_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
@@ -1834,19 +1920,83 @@ fn is_instance_dir_name(name: &str) -> bool {
 /// the only record tying an existing directory back to its database. Returns
 /// `None` when the line is absent or unparseable, which makes the directory
 /// unidentifiable and therefore undeletable.
-fn db_path_from_daemon_log(log: &str) -> Option<PathBuf> {
-    let line = log
-        .lines()
-        .find(|line| line.starts_with("[daemon] starting for "))?;
-    let rest = line.strip_prefix("[daemon] starting for ")?;
-    // A database path may itself contain " (instance ", so anchor on the LAST
-    // occurrence — the suffix this line format always ends with.
-    let end = rest.rfind(" (instance ")?;
-    let path = &rest[..end];
-    if path.is_empty() {
-        return None;
+/// The database a daemon booted against, read from its log directory.
+///
+/// The boot line can land in either of TWO files, and `gc` previously read
+/// only the first:
+///
+///   * `daemon.log` — launchd's stderr redirect, present only when the daemon
+///     was started from a plist;
+///   * `daemon.log.<YYYY-MM-DD>` — the tracing subscriber's daily rolling
+///     appender, which every daemon writes.
+///
+/// A daemon spawned WITHOUT launchd therefore has no undated `daemon.log` at
+/// all. On macOS that is every daemon started without a plist, so `gc` could
+/// not identify a single one: it reported live daemons as
+/// "database not identifiable from daemon.log" and never reached the
+/// write-lock ownership check that would have spared them. `log_hint` already
+/// documented this two-file split for operators; the sweep just never used it.
+///
+/// Dated files are tried newest-first, so a long-lived directory resolves from
+/// the most recent boot rather than a stale one.
+fn db_path_from_log_dir(log_dir: &Path) -> Option<PathBuf> {
+    let undated = std::fs::read_to_string(log_dir.join("daemon.log")).unwrap_or_default();
+    if let Some(db_path) = db_path_from_daemon_log(&undated) {
+        return Some(db_path);
     }
-    Some(PathBuf::from(path))
+    let mut dated: Vec<PathBuf> = std::fs::read_dir(log_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("daemon.log."))
+        })
+        .collect();
+    // Lexicographic order on `daemon.log.YYYY-MM-DD` is chronological.
+    dated.sort();
+    dated.iter().rev().find_map(|path| {
+        db_path_from_daemon_log(&std::fs::read_to_string(path).unwrap_or_default())
+    })
+}
+
+/// Extract the database path from a daemon boot line.
+///
+/// TWO formats exist, because two writers record the boot and they do not
+/// share a format:
+///
+///   * `[daemon] starting for <db> (instance <id>)` — written to stderr, which
+///     launchd captures into the undated `daemon.log`;
+///   * `<ts> INFO nestweaver_daemon::server: daemon process starting db=<db>
+///     instance=<id>` — written by the tracing subscriber into
+///     `daemon.log.<date>`.
+///
+/// Only the first was parsed, so `gc` could not identify a daemon that had no
+/// launchd stderr sink — on macOS, every daemon started without a plist. It
+/// reported them as unidentified and never reached the write-lock ownership
+/// check that spares a LIVE daemon.
+///
+/// Both formats put the path before a fixed suffix, and a path may itself
+/// contain that suffix, so both anchor on the LAST occurrence.
+fn db_path_from_daemon_log(log: &str) -> Option<PathBuf> {
+    log.lines().find_map(parse_daemon_boot_line)
+}
+
+fn parse_daemon_boot_line(line: &str) -> Option<PathBuf> {
+    if let Some(rest) = line.strip_prefix("[daemon] starting for ") {
+        let end = rest.rfind(" (instance ")?;
+        return non_empty_path(&rest[..end]);
+    }
+    // Tracing form: the fields trail the message, so slice between them.
+    let start = line.find("daemon process starting db=")?;
+    let rest = &line[start + "daemon process starting db=".len()..];
+    let end = rest.rfind(" instance=")?;
+    non_empty_path(&rest[..end])
+}
+
+fn non_empty_path(path: &str) -> Option<PathBuf> {
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn directory_size_bytes(dir: &Path) -> u64 {
@@ -2062,11 +2212,10 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
 
     // Phase 2: identify, test ownership, then reap from every root at once.
     for (name, locations) in candidates {
-        // The boot line lives in the state root's daemon.log, wherever the
-        // candidate itself was found.
-        let log =
-            std::fs::read_to_string(roots.state.join(&name).join("daemon.log")).unwrap_or_default();
-        let Some(db_path) = db_path_from_daemon_log(&log) else {
+        // The boot line lives in the state root's log directory, wherever the
+        // candidate itself was found — in `daemon.log` for a launchd-started
+        // daemon, or in `daemon.log.<date>` for any other.
+        let Some(db_path) = db_path_from_log_dir(&roots.state.join(&name)) else {
             report.unidentified.push(name);
             continue;
         };
@@ -2102,7 +2251,7 @@ fn gc_orphaned_daemon_dirs_in(roots: &DaemonGcRoots) -> std::io::Result<DaemonGc
             continue;
         }
 
-        if !(is_temp_db_path(&db_path) || !db_path.exists()) {
+        if !is_temp_db_path(&db_path) && db_path.exists() {
             report.kept.push(name);
             continue;
         }
@@ -2176,33 +2325,159 @@ pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
 pub fn stop_legacy_hash_daemon(db_path: &Path) {
     let new_id = instance_id_from_db_path(db_path);
     let old_id = legacy_instance_id_from_db_path(db_path);
-
-    // If the hashes happen to collide, nothing to migrate.
-    if new_id == old_id {
-        return;
+    if let Err(error) = retire_daemon_under_old_identity(&old_id, &new_id, "hash algorithm upgrade")
+    {
+        tracing::warn!(%error, "could not retire daemon under the legacy hash identity");
     }
+}
 
+/// Stop a daemon bound to the pre-anchoring, SELECTED-SLOT instance id.
+///
+/// nw-145 moved instance identity from the selected path to the stable base
+/// path. That is the same class of change as the DefaultHasher → SHA-256 move
+/// above, and it has the same upgrade hazard: a daemon started by 6.3.0 while a
+/// CURRENT pointer existed bound itself to the SLOT-derived id. After the
+/// upgrade the new code computes the BASE id, so that daemon is unreachable at
+/// the new socket path while still holding the database write lock — and
+/// `daemon stop` reports nothing to stop. That is precisely the orphaning
+/// nw-145 exists to prevent, reintroduced at the upgrade boundary.
+///
+/// Resolution is best-effort and deliberately tolerant: a brain that never cut
+/// over resolves to its own base path and returns immediately, and an
+/// unreadable CURRENT is not a reason to fail a daemon start.
+pub fn stop_selected_slot_identity_daemon(db_path: &Path) {
+    if let Err(error) = retire_selected_slot_identity_daemon(db_path) {
+        tracing::warn!(%error, "could not retire daemon under the selected-slot identity");
+    }
+}
+
+/// Fallible selected-slot migration for direct lifecycle commands. Unlike the
+/// best-effort autostart compatibility hook, this refuses to let a command
+/// claim success while a verified old owner is still draining or its identity
+/// cannot be proved safely.
+pub fn retire_selected_slot_identity_daemon(db_path: &Path) -> anyhow::Result<()> {
+    let Some(old_id) = selected_slot_identity_instance_id(db_path) else {
+        return Ok(());
+    };
+    let new_id = instance_id_from_db_path(db_path);
+    retire_daemon_under_old_identity(&old_id, &new_id, "publication identity anchoring")
+}
+
+/// Return the pre-anchoring selected-slot identity when a publication is
+/// active. This read-only probe lets direct lifecycle commands report the same
+/// legacy owner that autostart migrates instead of claiming no daemon exists.
+pub fn selected_slot_identity_instance_id(db_path: &Path) -> Option<String> {
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let root = nestweaver_engine::publication::default_publication_root(&anchor);
+    let current = nestweaver_engine::publication::read_current(&root).ok()??;
+    // Identity recovery must not open or validate the selected graph: a corrupt
+    // slot is exactly when an operator most needs `daemon stop` to find its
+    // runtime owner.
+    let selected = nestweaver_engine::publication::slot_path(&root, &current.publication_uuid)
+        .ok()?
+        .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+    let new_id = instance_id_from_db_path(&anchor);
+    // The pre-fix identity: the SELECTED path, hashed WITHOUT the anchor step.
+    let old_id = instance_id_from_canonical_path(&canonical_db_path(&selected));
+    (old_id != new_id).then_some(old_id)
+}
+
+/// The pid of a daemon still running under the pre-anchoring, selected-slot
+/// identity, if one exists.
+///
+/// Read-only counterpart to [`stop_selected_slot_identity_daemon`], so a
+/// read-only command (`daemon status`) can REPORT the orphan instead of
+/// silently reporting "not running" about a process that still holds the
+/// database write lock — the nw-145 symptom, reappearing at the upgrade
+/// boundary.
+pub fn selected_slot_identity_daemon_pid(db_path: &Path) -> Option<i32> {
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let selected = nestweaver_engine::publication::resolve_selected_database(&anchor).ok()?;
+    if selected == anchor {
+        return None;
+    }
+    let old_id = instance_id_from_canonical_path(&canonical_db_path(&selected));
+    if old_id == instance_id_from_db_path(&anchor) {
+        return None;
+    }
+    let pid = std::fs::read_to_string(pidfile_path(&old_id))
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    (pid > 0 && unsafe { libc::kill(pid, 0) == 0 }).then_some(pid)
+}
+
+/// Stop and clean up a daemon left behind under a superseded instance id.
+///
+/// Shared by every identity migration so a new one cannot get the shutdown
+/// sequence subtly wrong: verified SIGTERM, bounded drain, unload the launchd
+/// plist, then remove runtime artifacts only after ownership is released.
+fn retire_daemon_under_old_identity(
+    old_id: &str,
+    new_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    // If the ids happen to coincide, nothing to migrate.
+    if new_id == old_id {
+        return Ok(());
+    }
+    let old_id = old_id.to_string();
+    let new_id = new_id.to_string();
     let old_pid_path = pidfile_path(&old_id);
     let old_sock_path = socket_path(&old_id);
     let old_binding_path = effective_config_binding_path(&old_id);
     let old_rt_dir = runtime_dir(&old_id);
 
     if !old_pid_path.exists() && !old_sock_path.exists() && !old_binding_path.exists() {
-        return;
+        return Ok(());
     }
 
-    // Try to read the PID and stop the old daemon gracefully.
-    if let Ok(content) = std::fs::read_to_string(&old_pid_path)
-        && let Ok(pid) = content.trim().parse::<i32>()
-        && pid > 0
-    {
+    // Prefer kernel socket-peer identity; fall back to a pidfile only when its
+    // exact inode is still flock-owned and the daemon-owned live binding names
+    // the same PID. A numeric pidfile alone may be stale/recycled and never
+    // authorizes a signal.
+    let socket_pid = std::os::unix::net::UnixStream::connect(&old_sock_path)
+        .ok()
+        .and_then(|stream| unix_socket_peer_pid(&stream));
+    let pidfile_pid = std::fs::read_to_string(&old_pid_path)
+        .ok()
+        .and_then(|content| content.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0);
+    let pidfile_owned = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&old_pid_path)
+        .ok()
+        .is_some_and(|file| {
+            let acquired = unsafe {
+                libc::flock(
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                ) == 0
+            };
+            if acquired {
+                unsafe {
+                    libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN);
+                }
+            }
+            !acquired
+        });
+    let bound_pid = pidfile_pid.filter(|pid| {
+        pidfile_owned
+            && read_effective_config_binding_for_verified_pid(&old_id, *pid as u32).is_ok()
+    });
+    let verified_pid = socket_pid.or(bound_pid);
+
+    if let Some(pid) = verified_pid {
         let alive = unsafe { libc::kill(pid, 0) == 0 };
         if alive {
             tracing::info!(
                 pid,
                 old_id = %old_id,
                 new_id = %new_id,
-                "stopping legacy daemon (hash algorithm upgrade)"
+                reason,
+                "stopping daemon under superseded instance identity"
             );
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
@@ -2216,23 +2491,22 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             if unsafe { libc::kill(pid, 0) == 0 } {
-                tracing::warn!(
-                    pid,
-                    "legacy daemon did not exit after SIGTERM, sending SIGKILL"
+                anyhow::bail!(
+                    "daemon PID {pid} under superseded identity {old_id} is still draining after SIGTERM; its runtime ownership was left intact"
                 );
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
+    } else if socket_pid.is_some() || pidfile_owned {
+        anyhow::bail!(
+            "superseded daemon runtime {old_id} is owned but its PID identity could not be verified during {reason}; refusing to signal or clean it"
+        );
     }
 
     // Unload the old launchd plist on macOS if it exists.
     let old_plist = launchd_plist_path(&old_id);
     if old_plist.exists() {
         let label = launchd_label(&old_id);
-        tracing::info!(label = %label, "unloading legacy launchd plist");
+        tracing::info!(label = %label, "unloading launchd plist for the superseded identity");
         let _ = std::process::Command::new("launchctl")
             .args([
                 "bootout",
@@ -2248,6 +2522,7 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
     let _ = std::fs::remove_file(&old_pid_path);
     let _ = std::fs::remove_file(&old_binding_path);
     let _ = std::fs::remove_dir(&old_rt_dir);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2295,6 +2570,125 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    /// Review finding on nw-145: anchoring identity to the base path is the
+    /// same class of change as the DefaultHasher → SHA-256 move, and needs the
+    /// same upgrade migration. A daemon started by 6.3.0 while a CURRENT
+    /// pointer existed is bound to the SELECTED-SLOT id; after the upgrade the
+    /// new code computes the BASE id and cannot reach it, so it keeps holding
+    /// the write lock while `daemon stop` reports nothing to stop.
+    ///
+    /// This pins the two ids the migration must bridge. Without a publication
+    /// they coincide and the migration is a no-op, which is what keeps it from
+    /// touching an ordinary install.
+    #[test]
+    fn the_superseded_slot_identity_differs_from_the_anchored_one() {
+        let base = Path::new("/data/brain.lbug");
+        let selected = PathBuf::from(
+            "/data/brain.lbug.publications/slots/550e8400-e29b-41d4-a716-446655440000/graph.lbug",
+        );
+
+        // What this build computes, for both paths: the anchored id.
+        let anchored = instance_id_from_db_path(base);
+        assert_eq!(instance_id_from_db_path(&selected), anchored);
+
+        // What 6.3.0 computed for a selected slot: the un-anchored hash of the
+        // SELECTED path. It must differ, or there would be nothing to migrate
+        // and an orphaned daemon would be unreachable forever.
+        let superseded = instance_id_from_canonical_path(&canonical_db_path(&selected));
+        assert_ne!(
+            superseded, anchored,
+            "the pre-anchoring id must differ, otherwise the migration is dead code"
+        );
+
+        // And it must be exactly the un-anchored hash — not some third value —
+        // or the migration would look for a daemon that never existed.
+        assert_eq!(
+            superseded,
+            instance_id_from_canonical_path(&canonical_db_path(&selected))
+        );
+
+        // A brain that never cut over resolves to itself: no migration, no
+        // risk of retiring a healthy daemon on an ordinary install.
+        assert_eq!(
+            instance_id_from_canonical_path(&canonical_db_path(base)),
+            anchored
+        );
+    }
+
+    #[test]
+    fn direct_lifecycle_probe_finds_selected_slot_identity_without_opening_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let root = nestweaver_engine::publication::default_publication_root(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            publication_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        let pointer = nestweaver_engine::publication::CurrentPublicationPointer::new(
+            &identity,
+            None,
+            "a".repeat(64),
+        )
+        .unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            serde_json::to_vec(&pointer).unwrap(),
+        )
+        .unwrap();
+
+        let selected = nestweaver_engine::publication::slot_path(&root, &identity.publication_uuid)
+            .unwrap()
+            .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+        let expected = instance_id_from_canonical_path(&canonical_db_path(&selected));
+        assert_eq!(
+            selected_slot_identity_instance_id(&base).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(!selected.exists(), "the probe must not require the graph");
+    }
+
+    #[test]
+    fn daemon_identity_survives_a_publication_cutover() {
+        // nw-145: identity used to be derived from the selected path, so a
+        // cutover renamed the daemon. `daemon status`/`daemon stop --db
+        // <base>` then computed an id no running daemon had ever bound, and
+        // reported "Daemon is not running" while one was demonstrably
+        // serving the brain — the tool's own recovery advice was a no-op.
+        let base = Path::new("/data/brain.lbug");
+        let slot_graph = |uuid: &str| {
+            PathBuf::from(format!(
+                "/data/brain.lbug.publications/slots/{uuid}/graph.lbug"
+            ))
+        };
+        let before = slot_graph("550e8400-e29b-41d4-a716-446655440000");
+        let after = slot_graph("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+
+        let base_id = instance_id_from_db_path(base);
+        assert_eq!(instance_id_from_db_path(&before), base_id);
+        assert_eq!(
+            instance_id_from_db_path(&after),
+            base_id,
+            "a cutover to a new slot must not rename the daemon"
+        );
+
+        // The same anchoring applies to every derived local-state path.
+        assert_eq!(
+            socket_path(&instance_id_from_db_path(&after)),
+            socket_path(&base_id)
+        );
+        assert_eq!(
+            database_path_fingerprint(&after),
+            database_path_fingerprint(base)
+        );
+
+        // A different brain is still a different daemon.
+        assert_ne!(
+            instance_id_from_db_path(Path::new("/data/other.lbug")),
+            base_id
+        );
     }
 
     #[test]
@@ -2736,6 +3130,91 @@ mod tests {
         });
     }
 
+    /// Review finding: the previous test only proved the two hashes differ,
+    /// which does not show that a migration actually retires anything. This
+    /// exercises the shared runtime path — the same one both migrations use —
+    /// against seeded artifacts.
+    #[test]
+    fn retiring_a_superseded_identity_removes_its_runtime_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let old_id = "aaaabbbb";
+            let new_id = "ccccdddd";
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding(old_id, &binding).unwrap();
+            let binding_path = effective_config_binding_path(old_id);
+            assert!(binding_path.exists(), "fixture must seed the old binding");
+
+            retire_daemon_under_old_identity(old_id, new_id, "test migration").unwrap();
+
+            assert!(
+                !binding_path.exists(),
+                "the superseded identity's config binding must be removed"
+            );
+            assert!(
+                !runtime_dir(old_id).exists(),
+                "the superseded identity's runtime dir must be removed"
+            );
+        });
+    }
+
+    /// Coinciding ids mean there is nothing to migrate, and the helper must
+    /// not touch a HEALTHY daemon's artifacts.
+    #[test]
+    fn retiring_is_a_no_op_when_the_identity_did_not_change() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let id = "eeeeffff";
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding(id, &binding).unwrap();
+            let binding_path = effective_config_binding_path(id);
+
+            retire_daemon_under_old_identity(id, id, "same identity").unwrap();
+
+            assert!(
+                binding_path.exists(),
+                "an unchanged identity must not have its live artifacts reaped"
+            );
+        });
+    }
+
+    /// `gc` identifies a daemon's database from its boot line, and TWO writers
+    /// record that boot in DIFFERENT formats: stderr (captured by launchd into
+    /// the undated `daemon.log`) and the tracing subscriber (into
+    /// `daemon.log.<date>`). Only the stderr form was parsed, so a daemon with
+    /// no launchd stderr sink — on macOS, every daemon started without a plist
+    /// — was reported "not identifiable" and never reached the write-lock check
+    /// that spares a LIVE daemon.
+    #[test]
+    fn a_daemon_boot_line_is_read_in_either_format() {
+        // stderr / launchd form.
+        assert_eq!(
+            db_path_from_daemon_log("[daemon] starting for /data/brain.lbug (instance abc)\n"),
+            Some(PathBuf::from("/data/brain.lbug"))
+        );
+        // tracing / rolling-appender form.
+        assert_eq!(
+            db_path_from_daemon_log(
+                "2026-08-21T05:25:56.892743Z  INFO nestweaver_daemon::server: \
+                 daemon process starting db=/data/brain.lbug instance=gcenv-44a308df\n"
+            ),
+            Some(PathBuf::from("/data/brain.lbug"))
+        );
+        // A path containing the suffix must still resolve: both formats anchor
+        // on the LAST occurrence.
+        assert_eq!(
+            db_path_from_daemon_log(
+                "... daemon process starting db=/data/weird instance=x/brain.lbug instance=abc\n"
+            ),
+            Some(PathBuf::from("/data/weird instance=x/brain.lbug"))
+        );
+        // Unrelated log content names no database.
+        assert_eq!(db_path_from_daemon_log("nothing to see here\n"), None);
+        assert_eq!(db_path_from_daemon_log(""), None);
+    }
+
     #[test]
     fn instance_id_is_8_hex_chars() {
         let path = Path::new("/home/user/.local/share/nestweaver/my-brain/brain.lbug");
@@ -3039,6 +3518,24 @@ mod tests {
     /// Sweep roots agreeing with the `with_xdg_state_and_runtime` overrides,
     /// with a SCRATCH socket-fallback root. Tests must never run the sweep
     /// against the operator's real `/tmp/nw-sock-<uid>`.
+    /// A path that really exists and is provably outside every temp prefix
+    /// [`is_temp_db_path`] recognises, for tests that need a stand-in "real
+    /// database" the sweep must keep.
+    ///
+    /// `CARGO_MANIFEST_DIR` is NOT safe for this: a git worktree checked out
+    /// under /tmp — routine when reviewing a branch — makes the manifest
+    /// directory itself match `is_temp_db_path`, so the guard assertion failed
+    /// for a reason that had nothing to do with the behaviour under test
+    /// (nw-194). The sweep only calls `.exists()`, so any stable system file
+    /// serves.
+    fn stable_non_temp_path() -> PathBuf {
+        ["/bin/sh", "/usr/bin/env", "/etc/hosts"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.exists() && !is_temp_db_path(candidate))
+            .expect("no stable non-temp system file found")
+    }
+
     fn scratch_gc_roots(state: &Path, runtime: &Path, fallback: &Path) -> DaemonGcRoots {
         DaemonGcRoots {
             state: state.join("nestweaver"),
@@ -3165,8 +3662,7 @@ mod tests {
             // outside any tempdir — a `tempfile::tempdir()` lives under /tmp, so
             // the temp rule would reap it and this case would prove nothing.
             // The sweep only calls `.exists()`, so any stable real file serves.
-            let live_db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-            assert!(live_db.exists() && !is_temp_db_path(&live_db));
+            let live_db = stable_non_temp_path();
             seed_state_dir("cccccccc", live_db.to_str().unwrap());
             let rt_c = seed_runtime_dir("cccccccc");
             let fb_c = seed_fallback_dir(fallback.path(), "cccccccc");
@@ -3880,8 +4376,7 @@ mod tests {
         let fallback = tempfile::tempdir().unwrap();
         with_state_runtime_and_fallback(state.path(), runtime.path(), fallback.path(), || {
             // Any stable path outside the temp roots serves as a real database.
-            let db = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-            assert!(db.exists() && !is_temp_db_path(&db));
+            let db = stable_non_temp_path();
             seed_state_dir("ccccdddd", db.to_str().unwrap());
             let rt = seed_runtime_dir("ccccdddd");
             let fb = seed_fallback_dir(fallback.path(), "ccccdddd");

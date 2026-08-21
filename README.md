@@ -233,7 +233,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Trigram refresh follows `[indexing] with_trigrams`; with no `--config` the daemon's own setting is inherited. `--with-trigrams` forces it on for one run, `--no-trigrams` off (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
@@ -243,7 +243,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `detect-changes` | Run the MCP-compatible changed-file impact contract directly from the CLI, including risk, gate state, status, and blind spots |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
 | `read-symbols` | Read a symbol's source span |
-| `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh with `index --with-trigrams`) |
+| `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh with `index --with-trigrams`, or set `[indexing] with_trigrams = true` so indexing keeps the pre-filter fresh automatically) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
 | `investigate-expand` | Drill into investigate bundle entries — full body plus immediate neighbours |
@@ -291,6 +291,8 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `publication cancel` | Request cooperative cancellation at an exact observed journal revision |
 | `publication discard` | Remove failed staging at an exact revision, or safely discard only an invalid journal |
 | `publication rollback` | Switch back one step to the retained predecessor while the daemon is stopped |
+| `repair` | Reconcile an index publication abandoned by a crashed indexer. While `<db>.index-dirty` exists every ranked query fails closed; this removes the stale PageRank sidecar, advances the generation, clears the marker and recomputes. Refuses a marker it cannot prove abandoned unless `--force`, and never overrides a live writer |
+| `publication prune` | Reclaim slots nothing can still reach. Keeps the slot `CURRENT` selects, its retained predecessor (the one-step rollback target), and any slot an in-flight operation targets; `--dry-run` previews. Takes the publication-root lock, so it serializes against rebuild/rollback/discard |
 
 The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 [publication rebuild and recovery guide](docs/guide/publication-rebuild.md).

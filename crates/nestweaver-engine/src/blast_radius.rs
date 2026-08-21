@@ -759,8 +759,30 @@ pub fn analyze_blast_radius(
             Ok(Some(clustering)) => {
                 affected_clusters = compute_affected_clusters(&clustering, &all_affected_uids);
             }
-            // No clustering computed for this graph — legitimate, not a failure.
-            Ok(None) => {}
+            // nw-156: an ABSENT sidecar is legitimate (nobody ran `clusters`
+            // yet — the default state on a fresh install), but its effect on
+            // the answer is identical to the Err arm below: the cluster-count
+            // risk boost silently does not apply. Measured on this graph,
+            // `blast-radius --files publication.rs --depth 2` reported
+            // affected_cluster_count 0 without the sidecar and 32 with it, and
+            // resolver_generation.rs scored MEDIUM with it and LOW without —
+            // with byte-identical notifications either way. Nothing disclosed
+            // that a risk dimension was missing.
+            //
+            // Disclosed as a Note, and deliberately WITHOUT escalating status:
+            // derive_gate_state maps any non-Complete status to
+            // DegradedUnknown, so escalating here would gate every fresh
+            // install as unknown and break CI for the default state rather
+            // than informing it.
+            Ok(None) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Note,
+                    message: "no cluster data for this graph — cluster-based risk is not \
+                              included; run `nestweaver clusters` to compute it"
+                        .to_string(),
+                    descriptor: "clusters-not-computed".to_string(),
+                });
+            }
             // A cluster read error silently drops the cluster-count risk boost,
             // which would under-report risk on an otherwise "Complete" run — the
             // exact silent-degradation this analysis exists to surface.

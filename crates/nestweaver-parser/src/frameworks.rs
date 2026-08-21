@@ -138,19 +138,61 @@ fn detect_express_nextjs(
         }
     }
     for (i, sym) in symbols.iter().enumerate() {
-        if sym.signature.contains("app.get(")
-            || sym.signature.contains("app.post(")
-            || sym.signature.contains("router.")
-        {
+        if let Some(framework) = http_route_framework(&sym.signature) {
             hints.push((
                 i,
                 FrameworkHint {
-                    framework: "express".into(),
+                    framework: framework.into(),
                     role: "handler".into(),
                 },
             ));
         }
     }
+}
+
+/// HTTP methods a Node route registration can name.
+const HTTP_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "all",
+];
+
+/// Receivers that route registrations are called on, and the framework each
+/// implies.
+const ROUTE_RECEIVERS: &[(&str, &str)] = &[
+    ("fastify", "fastify"),
+    ("app", "express"),
+    ("router", "express"),
+    ("server", "express"),
+    ("api", "express"),
+];
+
+/// The framework whose route registration `signature` looks like, if any.
+///
+/// nw-160: this matched exactly three literal substrings — `app.get(`,
+/// `app.post(` and `router.`. Across 40 indexed repos that produced ONE HTTP
+/// contract in the entire org graph, while coyote-measurement/server alone has
+/// 412 Fastify route registrations. `fastify.get(` never matched, and neither
+/// did plain Express `app.put(` / `app.delete(` / `app.patch(`. The knock-on
+/// was that `contracts drift` reported declared_not_implemented 0 vacuously.
+///
+/// The broad `router.` prefix is deliberately KEPT alongside the verb-specific
+/// patterns: narrowing it to verbs would drop `router.use(` and `router.param(`
+/// registrations that already matched, trading one coverage gap for another.
+fn http_route_framework(signature: &str) -> Option<&'static str> {
+    if signature.contains("router.") {
+        return Some("express");
+    }
+    for (receiver, framework) in ROUTE_RECEIVERS {
+        // `fastify.route({ method: 'GET', ... })` and `app.route('/x')`.
+        if signature.contains(&format!("{receiver}.route(")) {
+            return Some(framework);
+        }
+        for verb in HTTP_VERBS {
+            if signature.contains(&format!("{receiver}.{verb}(")) {
+                return Some(framework);
+            }
+        }
+    }
+    None
 }
 
 fn detect_rails(symbols: &[RawSymbol], file_path: &str, hints: &mut Vec<(usize, FrameworkHint)>) {
@@ -289,6 +331,40 @@ mod tests {
         let hints = detect_frameworks(&symbols, "app/controllers/users_controller.rb", "ruby");
         assert!(!hints.is_empty());
         assert_eq!(hints[0].1.framework, "rails");
+    }
+
+    /// nw-160: only `app.get(`, `app.post(` and `router.` matched, so Fastify
+    /// was entirely invisible and even Express PUT/DELETE/PATCH were missed.
+    /// Across 40 repos that produced ONE HTTP contract in the whole org graph.
+    #[test]
+    fn http_route_detection_covers_fastify_and_every_express_verb() {
+        // Previously matched — must keep matching.
+        assert_eq!(http_route_framework("app.get('/a', h)"), Some("express"));
+        assert_eq!(http_route_framework("app.post('/a', h)"), Some("express"));
+        assert_eq!(http_route_framework("router.use(mw)"), Some("express"));
+
+        // Express verbs that were silently missed.
+        for verb in ["put", "delete", "patch", "head", "options", "all"] {
+            assert_eq!(
+                http_route_framework(&format!("app.{verb}('/a', h)")),
+                Some("express"),
+                "app.{verb}( must register as a route"
+            );
+        }
+
+        // Fastify, which never matched at all.
+        assert_eq!(
+            http_route_framework("fastify.get('/a', h)"),
+            Some("fastify")
+        );
+        assert_eq!(
+            http_route_framework("fastify.route({ method: 'GET', url: '/a' })"),
+            Some("fastify")
+        );
+
+        // Not a route registration.
+        assert_eq!(http_route_framework("appointment.getTotal()"), None);
+        assert_eq!(http_route_framework("const x = compute(app)"), None);
     }
 
     #[test]

@@ -146,9 +146,51 @@ struct EmbeddingBase {
     rows: Vec<EmbeddingBaseRow>,
     row_by_uid: HashMap<String, usize>,
     dimension: usize,
+    /// Byte range of the checksummed payload within `bytes`, retained so the
+    /// integrity check can run after load instead of during it (nw-184).
+    payload_range: std::ops::Range<usize>,
+    /// `payload_blake3` from the artifact envelope.
+    expected_payload_blake3: String,
+    /// Memoized result of the full-payload checksum. `OnceLock` so the hash
+    /// runs at most once per process and stays usable behind `&self`.
+    payload_verified: std::sync::OnceLock<bool>,
 }
 
 impl EmbeddingBase {
+    /// Verify the full payload checksum, at most once per process.
+    ///
+    /// nw-184: this hash used to run inside `load_binary_v2_storage`, so every
+    /// `GraphStore` open faulted in and hashed the entire embeddings sidecar.
+    /// On this project's own brain that file is 647 MB and the hash measured
+    /// ~345 ms of the 419 ms store open (boots without the file: 63-84 ms).
+    /// Because `load_embedding_index` runs in all four `GraphStore`
+    /// constructors including `open_read_only`, and v6.3.0 opens the selected
+    /// graph read-only on every CLI invocation once a CURRENT pointer exists,
+    /// every command paid that cost before doing any work — while the vast
+    /// majority never read a single vector.
+    ///
+    /// Deferring to first vector access is what comparable systems do: Lucene
+    /// stores a CRC32 footer but only verifies it in `checkIntegrity()` (run
+    /// at merge and by CheckIndex, not on open), and RocksDB verifies
+    /// per-block checksums when a block is actually read. The structural
+    /// checks that bound allocation and catch truncation stay eager, since
+    /// they are O(header) — only the O(payload) hash moves.
+    fn payload_intact(&self) -> bool {
+        *self.payload_verified.get_or_init(|| {
+            let payload = &self.bytes.as_ref()[self.payload_range.clone()];
+            let actual = blake3::hash(payload);
+            let intact = actual.to_hex().as_str() == self.expected_payload_blake3;
+            if !intact {
+                tracing::error!(
+                    expected = %self.expected_payload_blake3,
+                    actual = %actual.to_hex(),
+                    "embedding v2 payload checksum mismatch; ignoring the mapped base"
+                );
+            }
+            intact
+        })
+    }
+
     fn contains(&self, uid: &str) -> bool {
         self.row_by_uid.contains_key(uid)
     }
@@ -697,6 +739,17 @@ impl EmbeddingIndex {
     ) -> Result<EmbeddingArtifactEnvelopeV2, anyhow::Error> {
         use std::io::Write;
         pipeline.validate().map_err(anyhow::Error::msg)?;
+        // nw-184: the base checksum is verified lazily on read, but the write
+        // path must stay fail-closed — re-publishing an unverified base would
+        // launder corruption into a freshly computed checksum that then looks
+        // authoritative. This path reads every vector anyway, so verifying
+        // here costs nothing extra.
+        if let Some(base) = &self.base {
+            anyhow::ensure!(
+                base.payload_intact(),
+                "embedding v2 payload checksum mismatch"
+            );
+        }
         let entries = self.snapshot_entries();
         let dimension = self.dimension().unwrap_or(0);
         anyhow::ensure!(
@@ -793,13 +846,45 @@ impl EmbeddingIndex {
             "embedding envelope pipeline dimension mismatch"
         );
         let payload = &data[16 + envelope_len..];
+        // Captured before `storage` is moved into the base below.
+        let payload_end = data.len();
         anyhow::ensure!(
             payload.len() as u64 == envelope.uid_table_bytes + envelope.vector_bytes,
             "embedding v2 payload length mismatch"
         );
+        // nw-184: the full-payload blake3 is NOT computed here. It is deferred
+        // to the first vector access; see `EmbeddingBase::payload_intact`.
+        // Everything below is O(header) or O(uid table) and stays eager.
+        // nw-143: `count` lives in the envelope, which is NOT covered by
+        // payload_blake3 above — only the payload after it is. Feeding an
+        // untrusted length straight to Vec::with_capacity turns one edited or
+        // bit-rotted 8-byte field into an unbounded allocation, and Rust's
+        // alloc error handler ABORTS the process (uncatchable), taking down
+        // search, brain status, backup save and snapshot build alike (CWE-789).
+        //
+        // Both bounds are derivable from bytes already proven present, so this
+        // costs nothing: every uid needs at least a 2-byte length plus 1 byte,
+        // and the vector region pins the count exactly.
+        let dimension_bytes = (envelope.dimension as u64)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| anyhow::anyhow!("embedding envelope has zero dimension"))?;
         anyhow::ensure!(
-            blake3::hash(payload).to_hex().as_str() == envelope.payload_blake3,
-            "embedding v2 payload checksum mismatch"
+            envelope.vector_bytes.is_multiple_of(dimension_bytes),
+            "embedding vector region {} is not a multiple of the row size {dimension_bytes}",
+            envelope.vector_bytes
+        );
+        anyhow::ensure!(
+            envelope.count == envelope.vector_bytes / dimension_bytes,
+            "implausible embedding count {}: vector region holds {} rows",
+            envelope.count,
+            envelope.vector_bytes / dimension_bytes
+        );
+        anyhow::ensure!(
+            envelope.count <= envelope.uid_table_bytes / 3,
+            "implausible embedding count {}: uid table is only {} bytes",
+            envelope.count,
+            envelope.uid_table_bytes
         );
         let uid_end = envelope.uid_table_bytes as usize;
         let mut offset = 0usize;
@@ -845,6 +930,9 @@ impl EmbeddingIndex {
                 rows,
                 row_by_uid,
                 dimension,
+                payload_range: (16 + envelope_len)..payload_end,
+                expected_payload_blake3: envelope.payload_blake3.clone(),
+                payload_verified: std::sync::OnceLock::new(),
             }),
             deleted_base_uids: HashSet::new(),
             force_cleared: false,
@@ -1041,28 +1129,54 @@ impl EmbeddingIndex {
         Ok(())
     }
 
-    /// Return the top-`limit` (uid, similarity) pairs sorted descending.
+    /// Return the top-`limit` (uid, similarity) pairs sorted descending, or
+    /// `Err` for a corrupt embedding artifact.
     ///
     /// Uses rayon for parallel iteration and assumes stored embeddings are
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
-    pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
+    ///
+    /// See [`GraphStore::try_vector_search`] for why the infallible variant was
+    /// removed instead of deprecated.
+    ///
+    /// [`GraphStore::try_vector_search`]: crate::db::GraphStore::try_vector_search
+    pub fn try_vector_search(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         self.vector_search_cancellable(query_vec, limit, None)
-            .expect("vector_search with cancel=None cannot be cancelled")
     }
 
-    /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
+    /// Like [`try_vector_search`](Self::try_vector_search), but cooperatively
+    /// bails when `cancel` trips (a
     /// query timeout or client disconnect). Once tripped, per-embedding scoring
     /// is skipped so the parallel scan drains cheaply, then the whole call
     /// returns `Err(StoreError::Cancelled(_))` — a cancelled computation is
     /// *incomplete*, distinct from a legitimately empty result, so no caller
     /// mistakes the truncated scan for a real answer (or caches it).
     /// `cancel = None` never trips and is byte-for-byte the original behavior.
+    /// True when a mapped base exists but FAILED its payload checksum.
+    ///
+    /// Review finding on nw-184: dropping the base silently turned a corrupt
+    /// artifact into an empty result, which the caller could not tell apart
+    /// from "no semantic matches" — so it reported `semantic_applied: true`
+    /// over zero contribution. Every read path now consults this and fails
+    /// closed with `StoreError::EmbeddingArtifactCorrupt` instead.
+    pub(crate) fn base_is_corrupt(&self) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|base| !base.payload_intact())
+    }
+
     pub fn vector_search_cancellable(
         &self,
         query_vec: &[f32],
         limit: usize,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        if self.base_is_corrupt() {
+            return Err(StoreError::EmbeddingArtifactCorrupt);
+        }
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
@@ -1107,6 +1221,10 @@ impl EmbeddingIndex {
             .base
             .as_ref()
             .filter(|base| base.dimension == query_vec.len())
+            // nw-184: the payload checksum is verified here, on first use,
+            // rather than at open. A base that fails is dropped, so a corrupt
+            // sidecar yields overlay-only results instead of wrong vectors.
+            .filter(|base| base.payload_intact())
             .map(|base| {
                 base.rows
                     .par_iter()
@@ -1162,6 +1280,33 @@ impl EmbeddingIndex {
         base_count + self.embeddings.len()
     }
 
+    /// Vectors written since the mapped base — i.e. what a re-embed has
+    /// produced in this session.
+    pub(crate) fn overlay_len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// Drop a base that failed its payload checksum, keeping the overlay.
+    ///
+    /// Returns how many rows were lost. Those vectors are already unusable —
+    /// the payload they live in is corrupt — so this does not destroy anything
+    /// recoverable; it lets the next flush write a CLEAN base from the overlay
+    /// instead of appending a journal to an unusable foundation. Clearing the
+    /// envelope is what restores the `trusted_base_exists` invariant that
+    /// `flush_embedding_index` documents and depends on.
+    pub(crate) fn discard_corrupt_base(&mut self) -> usize {
+        let dropped = self.base.as_ref().map_or(0, |base| base.rows.len());
+        self.base = None;
+        self.artifact_envelope = None;
+        self.deleted_base_uids.clear();
+        tracing::error!(
+            dropped,
+            "embedding base failed its payload checksum; discarding it so a re-embed can \
+             rewrite a clean artifact. Those rows must be re-embedded to become searchable."
+        );
+        dropped
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1180,21 +1325,24 @@ impl EmbeddingIndex {
             .or_else(|| self.base.as_ref().map(|base| base.dimension))
     }
 
-    /// Like `vector_search`, but pre-filters embeddings whose UID contains `uid_prefix`.
-    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    /// Like `try_vector_search`, but pre-filters embeddings whose UID contains
+    /// `uid_prefix`. When `uid_prefix` is `None`, behaves identically to it.
     pub fn vector_search_filtered(
         &self,
         query_vec: &[f32],
         limit: usize,
         uid_prefix: Option<&str>,
-    ) -> Vec<(String, f64)> {
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        if self.base_is_corrupt() {
+            return Err(StoreError::EmbeddingArtifactCorrupt);
+        }
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
             .sum::<f64>()
             .sqrt();
         if query_norm == 0.0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let overlay_heap = self
@@ -1226,6 +1374,10 @@ impl EmbeddingIndex {
             .base
             .as_ref()
             .filter(|base| base.dimension == query_vec.len())
+            // nw-184: the payload checksum is verified here, on first use,
+            // rather than at open. A base that fails is dropped, so a corrupt
+            // sidecar yields overlay-only results instead of wrong vectors.
+            .filter(|base| base.payload_intact())
             .map(|base| {
                 base.rows
                     .par_iter()
@@ -1255,7 +1407,7 @@ impl EmbeddingIndex {
             })
             .unwrap_or_default();
 
-        finish_top(merge_top(overlay_heap, base_heap, limit))
+        Ok(finish_top(merge_top(overlay_heap, base_heap, limit)))
     }
 
     /// Look up the embedding for a given UID.
@@ -1266,7 +1418,14 @@ impl EmbeddingIndex {
         if self.deleted_base_uids.contains(uid) {
             return None;
         }
-        let base = self.base.as_ref()?;
+        // nw-184: never hand back a vector from an unverified payload.
+        //
+        // Deliberately `None` rather than an error, unlike the search paths:
+        // this feeds `has_embedding`, which gates embed-pass eligibility, so
+        // reporting "no embedding" for a corrupt row is what makes a re-embed
+        // RESTORE it. The search paths fail closed instead, because there an
+        // empty answer is indistinguishable from "no matches".
+        let base = self.base.as_ref().filter(|base| base.payload_intact())?;
         base.row_by_uid.get(uid).map(|row| base.vector_at(*row))
     }
 
@@ -2039,7 +2198,7 @@ mod tests {
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
         let query = vec![1.0_f32, 0.0, 0.0];
-        let results = idx.vector_search(&query, 10);
+        let results = idx.try_vector_search(&query, 10).unwrap();
         // The matching-dim vector scores ~1.0; the mismatched one is absent.
         let right = results.iter().find(|(u, _)| u == "sym:right").unwrap();
         assert!((right.1 - 1.0).abs() < 1e-6, "got {}", right.1);
@@ -2056,7 +2215,9 @@ mod tests {
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
 
-        let results = idx.vector_search_filtered(&[1.0, 0.0, 0.0], 10, Some("sym:"));
+        let results = idx
+            .vector_search_filtered(&[1.0, 0.0, 0.0], 10, Some("sym:"))
+            .expect("a healthy index must not fail closed");
         assert_eq!(results.len(), 1, "only matching dimensions may be scored");
         assert_eq!(results[0].0, "sym:right");
     }
@@ -2111,7 +2272,7 @@ mod tests {
         assert!(idx.add("b", vec![0.9, 0.1, 0.0], false));
         assert!(idx.add("c", vec![0.0, 0.0, 1.0], false));
 
-        let results = idx.vector_search(&[1.0, 0.0, 0.0], 2);
+        let results = idx.try_vector_search(&[1.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "a");
         assert_eq!(results[1].0, "b");
@@ -2123,7 +2284,7 @@ mod tests {
         for i in 0..10 {
             assert!(idx.add(&format!("sym:{i}"), vec![i as f32, 0.0], false));
         }
-        let results = idx.vector_search(&[1.0, 0.0], 3);
+        let results = idx.try_vector_search(&[1.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -2140,7 +2301,7 @@ mod tests {
 
         let loaded = EmbeddingIndex::load(&path).unwrap();
         assert_eq!(loaded.len(), 1);
-        let results = loaded.vector_search(&v, 1);
+        let results = loaded.try_vector_search(&v, 1).unwrap();
         assert_eq!(results[0].0, "sym:test");
         assert!((results[0].1 - 1.0).abs() < 1e-5);
     }
@@ -2261,13 +2422,58 @@ mod tests {
         assert_eq!(loaded.get("sym:alpha"), Some(vec![0.1, 0.2, 0.3]));
         assert_eq!(loaded.get("sym:beta"), Some(vec![0.4, 0.5, 0.6]));
 
+        // nw-184: the payload checksum is verified on first vector access,
+        // not at load, so that a `GraphStore` open does not hash the whole
+        // sidecar. The guarantee that matters is unchanged: a corrupt payload
+        // never yields a vector, and re-publishing it is refused.
         let mut corrupt = std::fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 0xff;
-        let error = match EmbeddingIndex::load_binary_v2_bytes(&corrupt) {
-            Ok(_) => panic!("corrupt embedding payload must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("checksum mismatch"));
+        let corrupt = EmbeddingIndex::load_binary_v2_bytes(&corrupt)
+            .expect("structural load succeeds; the payload hash is deferred");
+
+        assert_eq!(
+            corrupt.get("sym:alpha"),
+            None,
+            "a corrupt base must not serve vectors"
+        );
+        // Both search paths must FAIL CLOSED, not return an empty result: an
+        // empty Ok is indistinguishable from "no semantic matches", and the
+        // caller then reports semantic_applied over zero contribution.
+        assert!(
+            matches!(
+                corrupt.vector_search_filtered(&[0.1, 0.2, 0.3], 10, None),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "a corrupt base must fail closed, not answer empty"
+        );
+        assert!(
+            matches!(
+                corrupt.vector_search_cancellable(&[0.1, 0.2, 0.3], 10, None),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "the cancellable path must fail closed too"
+        );
+        assert!(
+            matches!(
+                corrupt.try_vector_search(&[0.1, 0.2, 0.3], 10),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "the convenience path must propagate corruption too"
+        );
+
+        // The write path stays fail-closed: republishing an unverified base
+        // would launder corruption into a freshly computed checksum.
+        let republish = corrupt.save_binary_v2(
+            &dir.path().join("republished.bin"),
+            &identity,
+            42,
+            &pipeline,
+        );
+        let error = republish.expect_err("republishing a corrupt base must fail");
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2438,6 +2644,46 @@ mod tests {
         assert!(compacted.has_embedding("second"));
     }
 
+    /// nw-143: `count` is outside payload_blake3's coverage, so a tampered or
+    /// bit-rotted field must be rejected as an ERROR, never fed to
+    /// Vec::with_capacity (which aborts the process, uncatchably).
+    #[test]
+    fn an_implausible_embedding_count_is_rejected_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poisoned.bin");
+        let pipeline = test_pipeline("model-a", 2);
+        let identity = test_identity();
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add_with_pipeline("a", vec![1.0, 0.0], &pipeline, false));
+        index
+            .save_binary_v2(&path, &identity, 1, &pipeline)
+            .unwrap();
+
+        // Rewrite ONLY the envelope's count field, leaving the payload (and so
+        // payload_blake3) untouched — exactly what a bit flip in that field does.
+        let data = std::fs::read(&path).unwrap();
+        let envelope_len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&data[16..16 + envelope_len]).unwrap();
+        envelope["count"] = serde_json::json!(2_u64.pow(42));
+        let re_encoded = serde_json::to_vec(&envelope).unwrap();
+        let mut poisoned = Vec::new();
+        poisoned.extend_from_slice(&data[0..8]);
+        poisoned.extend_from_slice(&(re_encoded.len() as u64).to_le_bytes());
+        poisoned.extend_from_slice(&re_encoded);
+        poisoned.extend_from_slice(&data[16 + envelope_len..]);
+        std::fs::write(&path, &poisoned).unwrap();
+
+        let error = match EmbeddingIndex::load_binary_v2(&path) {
+            Ok(_) => panic!("a 2^42 count must be rejected, not allocated"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("implausible embedding count"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn producer_patch_version_does_not_invalidate_a_compatible_base() {
         let dir = tempfile::tempdir().unwrap();
@@ -2532,8 +2778,11 @@ mod tests {
                 .then_with(|| left.0.cmp(&right.0))
         });
         oracle.truncate(3);
-        assert_eq!(index.vector_search(&query, 3), oracle);
-        assert_eq!(index.vector_search(&query, 0), Vec::<(String, f64)>::new());
+        assert_eq!(index.try_vector_search(&query, 3).unwrap(), oracle);
+        assert_eq!(
+            index.try_vector_search(&query, 0).unwrap(),
+            Vec::<(String, f64)>::new()
+        );
     }
 
     #[test]

@@ -44,6 +44,39 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn publication_rebuild_rejects_no_embed_before_config_or_operation_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    let missing_config = dir.path().join("missing.toml");
+
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["publication", "rebuild", "--config"])
+        .arg(&missing_config)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(contains(
+            "--no-embed is incompatible with `publication rebuild`",
+        ));
+
+    assert!(!db.exists());
+    assert!(!nestweaver_engine::publication::default_publication_root(&db).exists());
+
+    // The global flag is irrelevant to read-only publication commands. This
+    // guards against attaching the validation to the wrong match arm.
+    let root = dir.path().join("empty-publications");
+    std::fs::create_dir_all(&root).unwrap();
+    nestweaver_cmd()
+        .arg("--no-embed")
+        .args(["publication", "status", "--root"])
+        .arg(&root)
+        .assert()
+        .success();
+}
+
+#[test]
 fn mcp_help_hides_deprecated_flag_and_invalid_allowlists_fail_early() {
     nestweaver_cmd()
         .args(["mcp", "--help"])

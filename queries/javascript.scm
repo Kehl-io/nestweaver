@@ -36,13 +36,30 @@
 (field_definition
   property: (property_identifier) @name) @definition.property
 
-; Const declarations (non-function values)
-(lexical_declaration
-  kind: "const"
-  (variable_declarator
-    name: (identifier) @name
-    value: (_) @_val)
-  (#not-match? @_val "^(\\(|function|class)")) @definition.const
+; Const declarations (non-function values), MODULE SCOPE ONLY.
+;
+; nw-150: this previously matched at any nesting depth, so a block-local
+; `const where = { class_id: ... }` inside an else-branch became a
+; first-class graph symbol -- and, once call resolution bound `.where(..)`
+; method calls to it, the single most-depended-on symbol in a 193k-symbol
+; graph. Anchoring to `program`/`export_statement` keeps exported and
+; module-level constants (which are genuine API surface) while excluding
+; function- and block-locals, which are not addressable from outside.
+(program
+  (lexical_declaration
+    kind: "const"
+    (variable_declarator
+      name: (identifier) @name
+      value: (_) @_val)
+    (#not-match? @_val "^(\\(|function|class)")) @definition.const)
+
+(export_statement
+  (lexical_declaration
+    kind: "const"
+    (variable_declarator
+      name: (identifier) @name
+      value: (_) @_val)
+    (#not-match? @_val "^(\\(|function|class)")) @definition.const)
 
 ; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
 ; describe('name', fn). Captured as a definition so the calls inside the

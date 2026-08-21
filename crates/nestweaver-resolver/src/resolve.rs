@@ -294,14 +294,40 @@ pub fn resolve_references_with_context(
                 None => continue,
             };
 
-            let exported: Vec<&RawSymbol> = target_symbols
+            let visible: Vec<&RawSymbol> = target_symbols
                 .iter()
                 .filter(|s| !matches!(s.visibility, Visibility::Private))
                 .collect();
 
-            if exported.is_empty() {
+            if visible.is_empty() {
                 continue;
             }
+
+            // nw-153: honour the import's named binding. A specifier that names
+            // one item -- `use crate::publication::ArtifactKind` -- must produce
+            // ONE edge to that item, not one edge per symbol in the target file.
+            //
+            // The fan-out made backup_artifact_contract, whose body contains a
+            // single `use`, an importer of all 64 symbols in publication.rs
+            // including rollback_current and compare_and_swap_current. That is
+            // why `impact rollback_current` surfaced unrelated backup code while
+            // missing its real callers.
+            //
+            // The bound name is the specifier's last path segment. Languages
+            // whose specifier names a MODULE rather than an item (JS `./helper`,
+            // Python `os.path`) will not match a symbol, and those keep the
+            // existing every-visible-symbol behaviour so connectivity is
+            // unchanged for them.
+            let bound_name = specifier
+                .rsplit([':', '/', '.'])
+                .find(|segment| !segment.is_empty());
+            let named: Option<&&RawSymbol> =
+                bound_name.and_then(|name| visible.iter().find(|candidate| candidate.name == name));
+
+            let exported: Vec<&RawSymbol> = match named {
+                Some(symbol) => vec![*symbol],
+                None => visible,
+            };
 
             let confidence = confidence_score(MatchType::ImportResolved, language);
 
@@ -524,6 +550,57 @@ fn resolve_single_reference(
 
     let candidates = symbol_map.get(effective_name.as_str());
 
+    // Priority 1.5: explicit path qualifier (nw-152).
+    //
+    // The .scm captures only the trailing identifier of a scoped call, so
+    // `nestweaver_engine::publication::read_current(..)` arrived here as the
+    // bare name `read_current`. With no `use` for that module in the file, it
+    // matched nothing in the tiers below and fell through to
+    // `unresolved:read_current` at confidence 0.0 -- the edge was dropped
+    // entirely. Resolution accuracy therefore depended on which UNRELATED types
+    // a file happened to import.
+    //
+    // The parser now records the qualifier as the reference receiver, so prefer
+    // a candidate whose file stem matches the qualifier's last module segment.
+    //
+    // Gated on the qualifier containing `::` so this only fires for a genuine
+    // multi-segment path. A bare receiver -- a JS variable in `store.method()`,
+    // or the type in `HashMap::new()` -- is excluded, because matching those
+    // against a same-named file would invent edges rather than recover them.
+    if let Some(qualifier) = reference.receiver.as_deref()
+        && qualifier.contains("::")
+        && let Some(syms) = &candidates
+        && let Some(module) = qualifier.rsplit("::").find(|segment| !segment.is_empty())
+    {
+        let mut qualified: Vec<_> = syms
+            .iter()
+            .filter(|(candidate_file, _)| {
+                candidate_file
+                    .rsplit('/')
+                    .next()
+                    .and_then(|base| base.split('.').next())
+                    .is_some_and(|stem| stem == module)
+            })
+            .collect();
+        qualified.sort_by_key(|(path, _)| *path);
+        if let Some((candidate_file, sym)) = qualified.into_iter().next() {
+            let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
+            let confidence = confidence_score(MatchType::ImportResolved, language);
+            return Some(ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type,
+                confidence,
+                link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "path_qualified".to_string(),
+                    weight: confidence,
+                    note: Some(format!("{qualifier}::{name}")),
+                }],
+            });
+        }
+    }
+
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
@@ -575,12 +652,49 @@ fn resolve_single_reference(
     }
 
     // Priority 4: Same package/directory
+    //
+    // nw-150: for a METHOD call this fallback invents edges. `knex.where(..)`
+    // is captured as a call to the bare name `where`, and binding that to
+    // whatever same-named symbol happens to sit in a sibling file made a
+    // block-scoped `const where = {..}` the single most-depended-on symbol in a
+    // 193k-symbol graph (in_degree 1048), with 524 CALLS "dependents" that were
+    // Knex query-builder calls in files that never import it. It poisoned hubs,
+    // bridges, PageRank and repo-map alike.
+    //
+    // A value receiver is only evidence for a target if it plausibly denotes
+    // it, so require the candidate's file stem to match the receiver. A path
+    // receiver (containing `::`) is already handled by the qualified tier
+    // above, and a receiver-less plain call keeps the original behaviour.
+    let value_receiver = reference
+        .receiver
+        .as_deref()
+        .filter(|receiver| !receiver.contains("::"));
     let same_dir = parent_dir(file_path);
     if let Some(syms) = &candidates {
         let mut same_pkg: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, _)| {
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
+            })
+            .filter(|(candidate_file, _)| match value_receiver {
+                // Compare against the receiver's LAST segment so a chained
+                // receiver still matches: `self.store.query()` -> `store` ->
+                // store.rs. `knex.where()` -> `knex`, which does not match the
+                // unrelated file that happened to declare a local `where`.
+                Some(receiver) => {
+                    let denoted = receiver
+                        .rsplit(['.', ':'])
+                        .find(|segment| !segment.is_empty());
+                    let stem = candidate_file
+                        .rsplit('/')
+                        .next()
+                        .and_then(|base| base.split('.').next());
+                    match (denoted, stem) {
+                        (Some(denoted), Some(stem)) => stem == denoted,
+                        _ => false,
+                    }
+                }
+                None => true,
             })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
@@ -787,6 +901,67 @@ mod tests {
         );
     }
 
+    /// nw-150: a method call must not bind to an unrelated same-named symbol
+    /// just because it sits in a sibling file.
+    ///
+    /// Real case: `knex.where({..})` in a test file was captured as a call to
+    /// the bare name `where` and bound to `const where = {..}` -- a block-local
+    /// inside an else-branch of an unrelated resolver. That made it the single
+    /// most-depended-on symbol in a 193k-symbol graph (in_degree 1048, 524
+    /// bogus CALLS dependents) and poisoned hubs, bridges and PageRank.
+    #[test]
+    fn a_method_call_does_not_bind_to_an_unrelated_same_named_symbol() {
+        let mut caller = make_symbol("checkin_test", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("where", ReferenceKind::Call, 20);
+        call.receiver = Some("knex".to_string());
+
+        let files = vec![
+            ("src/checkin.test.js".to_string(), vec![caller], vec![call]),
+            // Sibling file declaring a same-named symbol it has nothing to do with.
+            (
+                "src/setVideoViewStatus.js".to_string(),
+                vec![make_symbol("where", 84)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let bogus: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:"))
+            .collect();
+        assert!(
+            bogus.is_empty(),
+            "knex.where() must not resolve to an unrelated local: {bogus:?}"
+        );
+    }
+
+    /// The gate must still allow a receiver that genuinely denotes the file.
+    #[test]
+    fn a_method_call_still_resolves_when_the_receiver_names_the_file() {
+        let mut caller = make_symbol("handler", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("connect", ReferenceKind::Call, 20);
+        call.receiver = Some("database".to_string());
+
+        let files = vec![
+            ("src/handler.js".to_string(), vec![caller], vec![call]),
+            (
+                "src/database.js".to_string(),
+                vec![make_symbol("connect", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/database.js", "connect", 5);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "database.connect() should still resolve to database.js"
+        );
+    }
+
     #[test]
     fn python_gets_lower_confidence_than_java() {
         // Both have an import-resolved call, but Python confidence < Java confidence
@@ -839,6 +1014,87 @@ mod tests {
         );
     }
 
+    /// nw-152: a fully-qualified call with no matching `use` must still
+    /// resolve. Real case: src/main.rs calls
+    /// `nestweaver_engine::publication::read_current(..)` with no `use` for
+    /// that module, so the edge was dropped and `impact read_current` reported
+    /// zero callers in main.rs -- while a sibling call to a DIFFERENT module
+    /// resolved fine purely because an unrelated type from it was imported.
+    #[test]
+    fn a_fully_qualified_call_resolves_without_a_matching_use() {
+        let mut caller = make_symbol("run_publication_rebuild", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("read_current", ReferenceKind::Call, 20);
+        // The parser records the qualifying path as the receiver.
+        call.receiver = Some("nestweaver_engine::publication".to_string());
+
+        let files = vec![
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("root", 1)],
+                vec![],
+            ),
+            ("src/main.rs".to_string(), vec![caller], vec![call]),
+            (
+                "src/publication.rs".to_string(),
+                vec![make_symbol("read_current", 5)],
+                vec![],
+            ),
+            // A decoy with the same symbol name in an unrelated module: the
+            // qualifier must pick publication.rs, not this one.
+            (
+                "src/other.rs".to_string(),
+                vec![make_symbol("read_current", 5)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "expected one CALLS edge, got {calls:?}");
+        let expected = symbol_uid("repo:test:abc", "src/publication.rs", "read_current", 5);
+        assert_eq!(
+            calls[0].target_uid, expected,
+            "the qualifier must select publication.rs over the same-named decoy"
+        );
+        assert!(
+            !calls[0].target_uid.starts_with("unresolved:"),
+            "a qualified call must not fall through to unresolved"
+        );
+    }
+
+    /// The qualifier tier must NOT fire for a bare receiver: a JS
+    /// `store.method()` receiver is a variable, not a module path, and
+    /// matching it against a same-named file would invent edges.
+    #[test]
+    fn a_bare_receiver_does_not_trigger_path_qualified_resolution() {
+        let mut caller = make_symbol("handler", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("where", ReferenceKind::Call, 20);
+        call.receiver = Some("knex".to_string());
+
+        let files = vec![
+            ("src/main.js".to_string(), vec![caller], vec![call]),
+            (
+                "src/knex.js".to_string(),
+                vec![make_symbol("where", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let qualified: Vec<_> = edges
+            .iter()
+            .filter(|e| e.evidence.iter().any(|ev| ev.kind == "path_qualified"))
+            .collect();
+        assert!(
+            qualified.is_empty(),
+            "a bare receiver must not resolve via the path-qualified tier: {qualified:?}"
+        );
+    }
+
     #[test]
     fn no_enclosing_symbol_skips_reference() {
         // A reference at line 1 with no symbols before it
@@ -869,6 +1125,67 @@ mod tests {
     /// Genuine per-symbol import attribution — linking only the symbols that
     /// actually reference the imported binding — is tracked separately; it
     /// needs reference matching this pass does not do.
+    ///
+    /// nw-153: a `use` INSIDE a function body must resolve to the one symbol
+    /// it names, not fan out to every symbol in the target file.
+    ///
+    /// Real case: backup_artifact_contract contains exactly one import,
+    /// `use crate::publication::ArtifactKind;`, and acquired 64 IMPORTS
+    /// out-edges into publication.rs -- including rollback_current and
+    /// compare_and_swap_current. That is why `impact rollback_current`
+    /// returned unrelated backup code while missing its real callers.
+    #[test]
+    fn a_named_import_inside_a_function_resolves_to_the_named_symbol_only() {
+        let files = vec![
+            // `crate::` resolution walks up for a crate root, so the fixture
+            // needs one or the import never resolves to a file at all.
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("root", 1)],
+                vec![],
+            ),
+            (
+                "src/backup.rs".to_string(),
+                vec![make_symbol("backup_artifact_contract", 10)],
+                vec![make_ref(
+                    "crate::publication::ArtifactKind",
+                    ReferenceKind::Import,
+                    12,
+                )],
+            ),
+            (
+                "src/publication.rs".to_string(),
+                vec![
+                    make_symbol("ArtifactKind", 1),
+                    make_symbol("rollback_current", 20),
+                    make_symbol("compare_and_swap_current", 40),
+                    make_symbol("read_current", 60),
+                    make_symbol("slot_path", 80),
+                ],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert_eq!(
+            import_edges.len(),
+            1,
+            "one named import must yield one edge, not one per symbol in the \
+             target file; got: {import_edges:?}"
+        );
+        // UIDs are hashed, so compare against the computed uid for the symbol
+        // the specifier actually names rather than substring-matching.
+        let expected = symbol_uid("repo:test:abc", "src/publication.rs", "ArtifactKind", 1);
+        assert_eq!(
+            import_edges[0].target_uid, expected,
+            "the edge must point at the imported name, not another symbol in the file"
+        );
+    }
+
     #[test]
     fn top_level_import_creates_one_file_level_proxy_edge() {
         let files = vec![

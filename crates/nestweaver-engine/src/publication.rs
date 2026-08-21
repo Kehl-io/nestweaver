@@ -22,8 +22,19 @@ pub const PRESERVED_STATE_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-
 
 /// Validate a live PageRank envelope before a sealed publication describes
 /// it, returning the exact schema and algorithm/scope fingerprint carried by
-/// the payload. This prevents snapshot and backup manifests from laundering a
-/// foreign, stale, corrupt, or generically-labelled ranking sidecar.
+/// the payload.
+///
+/// Identity, producer version and source generation ARE checked against the
+/// caller's expectations, so a foreign, stale or corrupt sidecar is rejected.
+///
+/// The algorithm fingerprint is NOT: this function's whole job is to discover
+/// which parameters the payload declares, so it has no independent expectation
+/// to compare against, and the prefix check below is the only enforcement.
+/// nw-147: the previous doc claimed this also caught a "generically-labelled"
+/// sidecar, which the self-comparison never did. A same-brain, same-generation
+/// artifact computed with different damping/iterations/scope still passes here;
+/// closing that needs the envelope to record the parameters themselves so the
+/// fingerprint can be recomputed from them rather than trusted.
 pub(crate) fn pagerank_artifact_contract(
     bytes: &[u8],
     identity: &nestweaver_store::PublicationIdentity,
@@ -45,6 +56,8 @@ pub(crate) fn pagerank_artifact_contract(
             envelope.algorithm_fingerprint
         );
     }
+    // Self-comparison, deliberately and now documented: see the note above on
+    // why this function has no independent expectation (nw-147).
     let fingerprint = envelope.algorithm_fingerprint.clone();
     let _: std::collections::HashMap<String, f64> =
         envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
@@ -552,6 +565,61 @@ fn validate_digest(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Map a database path back to the stable anchor that names its brain.
+///
+/// This is the syntactic inverse of [`resolve_selected_database`]: given a
+/// selected slot graph `<base>.publications/slots/<uuid>/graph.lbug` it
+/// returns `<base>`, and it returns any other path unchanged.
+///
+/// Local state that identifies a *brain* — daemon instance ids, socket and
+/// pidfile paths, log directories — must be derived from this anchor rather
+/// than from the selected path. A publication cutover moves `CURRENT` to a
+/// new slot, so a selected path is not a stable name: deriving identity from
+/// it renames the daemon out from under itself on every cutover, orphaning
+/// the running process and making `daemon status`/`daemon stop` report a
+/// different instance than the one actually serving the brain (nw-145).
+///
+/// This is deliberately syntactic: no filesystem access, no CURRENT read.
+/// It must keep working for a slot whose manifest is unreadable, which is
+/// precisely when an operator needs to stop the daemon.
+pub fn instance_anchor_database(db_path: &Path) -> PathBuf {
+    let is_graph = db_path
+        .file_name()
+        .is_some_and(|n| n == PUBLICATION_GRAPH_FILE);
+    if !is_graph {
+        return db_path.to_path_buf();
+    }
+    // <root>/slots/<uuid>/graph.lbug — require the `slots` component so an
+    // unrelated file that happens to be named graph.lbug is left alone.
+    let Some(slot_dir) = db_path.parent() else {
+        return db_path.to_path_buf();
+    };
+    let Some(slots_dir) = slot_dir.parent() else {
+        return db_path.to_path_buf();
+    };
+    if slots_dir.file_name() != Some(std::ffi::OsStr::new("slots")) {
+        return db_path.to_path_buf();
+    }
+    let Some(root) = slots_dir.parent() else {
+        return db_path.to_path_buf();
+    };
+    // The root is `sidecar_path(base, ".publications")`, i.e. the suffix is
+    // appended to the whole base path, so strip it from the OS string rather
+    // than treating it as a file extension.
+    let root_os = root.as_os_str().as_encoded_bytes();
+    match root_os.strip_suffix(b".publications") {
+        Some(base) if !base.is_empty() => {
+            // SAFETY: `base` is a prefix of bytes returned by
+            // `as_encoded_bytes` split at an ASCII boundary, which the
+            // documented safety contract of `from_encoded_bytes_unchecked`
+            // permits.
+            let base = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(base) };
+            PathBuf::from(base)
+        }
+        _ => db_path.to_path_buf(),
+    }
+}
+
 pub fn current_pointer_path(publication_root: &Path) -> PathBuf {
     publication_root.join("CURRENT")
 }
@@ -574,8 +642,243 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".publications")
 }
 
-/// Resolve the retained incumbent graph used to authorize activation rollback
-/// without consulting or opening the newly selected publication. `None`
+/// Cross-process exclusion for one publication root.
+///
+/// The `IndexPublicationLease` is an in-process coordinator — a `Mutex` plus a
+/// `Condvar` owned by a single `GraphStore`. Two processes, or even two stores
+/// opened in the same process, receive UNRELATED leases, so it cannot serialize
+/// anything across process boundaries. Nor can a database write lock stand in
+/// for it here: activation locks the SELECTED slot graph while a prune inspects
+/// the base, so the two lock different files and exclude nothing.
+///
+/// Anchoring the lock to the publication ROOT is what makes it correct, because
+/// the root is the one thing every publication operation shares — and it is
+/// also what makes `--root` safe, since the lock follows whichever root the
+/// caller actually operates on.
+///
+/// Held by rebuild, rollback, discard and prune. Released on drop.
+#[derive(Debug)]
+pub struct PublicationRootLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl PublicationRootLock {
+    /// Take the lock, or fail fast if another operation holds it.
+    ///
+    /// Deliberately non-blocking: a publication rebuild can run for minutes, and
+    /// a CLI that silently hangs behind one is worse than a CLI that says who is
+    /// holding it and exits.
+    pub fn acquire(publication_root: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(publication_root).with_context(|| {
+            format!(
+                "create publication root {} for locking",
+                publication_root.display()
+            )
+        })?;
+        let path = publication_root.join("LOCK");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open publication lock {}", path.display()))?;
+        file.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "another publication operation holds {} ({error}); wait for it to finish, \
+                 or check `nestweaver publication status`",
+                path.display()
+            )
+        })?;
+        Ok(Self { _file: file, path })
+    }
+
+    /// The lock file backing this guard, for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// One slot considered by [`prune_slots`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotDisposition {
+    pub publication_uuid: String,
+    pub bytes: u64,
+    /// `None` when the slot is reclaimable; `Some(reason)` when it is retained.
+    pub retained_because: Option<String>,
+}
+
+/// What a [`prune_slots`] pass found and (unless `dry_run`) removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotPruneReport {
+    pub slots: Vec<SlotDisposition>,
+    pub removed_bytes: u64,
+    pub dry_run: bool,
+}
+
+impl SlotPruneReport {
+    pub fn removed(&self) -> impl Iterator<Item = &SlotDisposition> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.retained_because.is_none())
+    }
+    pub fn retained(&self) -> impl Iterator<Item = &SlotDisposition> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.retained_because.is_some())
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => total += directory_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0)
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Reclaim publication slots that nothing can still reach.
+///
+/// nw-135: the `slots` directory was never ENUMERATED anywhere in the repo —
+/// no GC, no retention sweep, no orphan detection. `discard_operation` refuses
+/// anything not cancelled-or-failed, so a slot from a SUCCESSFUL rebuild could
+/// never be removed in-tool at all. Measured on a scratch root, four rebuilds
+/// left all four full slots on disk forever; on the real brain a slot is
+/// ~1.2 GB, which is roughly 55 rebuilds to exhaustion.
+///
+/// Three things are retained, and nothing else is:
+///
+/// 1. The slot CURRENT selects — deleting it would destroy the live graph.
+/// 2. Its retained predecessor, which the documented one-step rollback
+///    contract needs. Exactly one predecessor is required; every slot beyond
+///    that is pure leak.
+/// 3. Any slot targeted by an operation journal that still exists, including
+///    unreadable ones. A journal we cannot parse cannot tell us which slot it
+///    targeted, so every slot stays until that journal is discarded — the same
+///    conservative choice `discard_invalid_operation` already makes.
+pub fn prune_slots(
+    publication_root: &Path,
+    lock: &PublicationRootLock,
+    dry_run: bool,
+) -> anyhow::Result<SlotPruneReport> {
+    // Proof of CROSS-PROCESS exclusivity, in the signature so a caller cannot
+    // forget it. An earlier version took an `IndexPublicationLease` instead,
+    // which looked like exclusion but is not: that lease is an in-process
+    // Mutex/Condvar owned by one GraphStore, so a rebuild in another process
+    // holds an unrelated one. This lock is anchored to the same root being
+    // pruned, which is what actually serializes against rebuild, rollback and
+    // discard — and what stops a cutover landing between the CURRENT read below
+    // and the deletes further down, which would reclaim the slot that cutover
+    // had just selected.
+    debug_assert!(
+        lock.path().starts_with(publication_root),
+        "the lock must guard the root being pruned"
+    );
+    let slots_dir = publication_root.join("slots");
+    let entries = match std::fs::read_dir(&slots_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SlotPruneReport {
+                dry_run,
+                ..Default::default()
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read slots {}", slots_dir.display()));
+        }
+    };
+
+    let mut retained: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(pointer) = read_current(publication_root)? {
+        retained.insert(
+            pointer.publication_uuid.clone(),
+            "selected by CURRENT".to_string(),
+        );
+        if let Some(previous) = pointer.expected_previous_publication_uuid.as_ref() {
+            retained
+                .entry(previous.clone())
+                .or_insert_with(|| "retained predecessor for one-step rollback".to_string());
+        }
+    }
+    let operations = crate::publication_operation::list_operations(publication_root)?;
+    for operation in &operations.operations {
+        // Only IN-FLIGHT work pins a slot. A terminal journal (Activated or
+        // Cancelled) describes work that is over, and its slot's liveness is
+        // then decided solely by CURRENT and the retained predecessor above.
+        //
+        // Pinning terminal journals too was the original bug here: journals
+        // survive activation — only discard_operation removes one, and it
+        // refuses anything not cancelled-or-failed — so EVERY published slot
+        // kept a journal naming it, every slot was retained, and the prune
+        // reclaimed nothing at all. That is exactly the superseded-slot leak
+        // nw-135 exists to close, so the retention rule cancelled out the
+        // feature.
+        if operation.phase.is_terminal() {
+            continue;
+        }
+        retained
+            .entry(operation.plan.target_publication_uuid.clone())
+            .or_insert_with(|| {
+                format!(
+                    "targeted by in-flight operation {} ({:?})",
+                    operation.plan.operation_uuid, operation.phase
+                )
+            });
+    }
+    // An unreadable journal cannot name its target, so nothing may be reclaimed
+    // while one exists.
+    let blocked_by_invalid = operations
+        .invalid_operations
+        .first()
+        .map(|invalid| invalid.operation_uuid.clone());
+
+    let mut report = SlotPruneReport {
+        dry_run,
+        ..Default::default()
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let publication_uuid = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let bytes = directory_bytes(&path);
+        let retained_because = retained.get(&publication_uuid).cloned().or_else(|| {
+            blocked_by_invalid
+                .as_ref()
+                .map(|uuid| format!("unreadable operation journal {uuid} may still target it"))
+        });
+        if retained_because.is_none() && !dry_run {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("remove slot {}", path.display()))?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path)?;
+        }
+        if retained_because.is_none() {
+            report.removed_bytes += bytes;
+        }
+        report.slots.push(SlotDisposition {
+            publication_uuid,
+            bytes,
+            retained_because,
+        });
+    }
+    report
+        .slots
+        .sort_by(|a, b| a.publication_uuid.cmp(&b.publication_uuid));
+    Ok(report)
+}
+
 /// denotes the implicit base database used before the first cutover.
 pub fn retained_predecessor_database(
     base_db_path: &Path,
@@ -727,14 +1030,20 @@ pub fn compare_and_swap_current(
         .map(|value| parse_uuid("expected current publication_uuid", value))
         .transpose()?;
     if observed != expected {
-        anyhow::bail!(
-            "CURRENT compare-and-swap conflict: expected {}, observed {}",
-            expected
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            observed
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
+        // Permanent: the expected predecessor will never be CURRENT again, so
+        // retrying this operation can only re-observe the same conflict
+        // (nw-148).
+        return Err(
+            crate::publication_operation::PermanentPublicationFailure(format!(
+                "CURRENT compare-and-swap conflict: expected {}, observed {}",
+                expected
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                observed
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            ))
+            .into(),
         );
     }
     let declared_previous = next
@@ -797,6 +1106,20 @@ pub fn rollback_current(
     publication_root: &Path,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
     expected_current: &str,
+) -> anyhow::Result<Option<CurrentPublicationPointer>> {
+    let root_lock = PublicationRootLock::acquire(publication_root)?;
+    rollback_current_under_lock(publication_root, lease, expected_current, &root_lock)
+}
+
+/// Roll back while the caller holds publication-root ownership across an
+/// external quiescence proof and this selector mutation. Daemon startup takes
+/// the same lock while resolving/opening CURRENT, closing the check-to-CAS
+/// race without coupling the engine to process-lifecycle implementation.
+pub fn rollback_current_under_lock(
+    publication_root: &Path,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+    expected_current: &str,
+    _root_lock: &PublicationRootLock,
 ) -> anyhow::Result<Option<CurrentPublicationPointer>> {
     lease
         .ensure_clean_for_snapshot()
@@ -1054,6 +1377,27 @@ mod tests {
     }
 
     #[test]
+    fn rollback_under_an_existing_root_lock_does_not_reacquire_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let incumbent = store.publication_identity().unwrap().unwrap();
+        let target = incumbent.next_publication().unwrap();
+        let pointer = write_resolvable_slot(&base, &target);
+        let root = default_publication_root(&base);
+        let root_lock = PublicationRootLock::acquire(&root).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+
+        assert!(
+            rollback_current_under_lock(&root, &lease, &pointer.publication_uuid, &root_lock,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(read_current(&root).unwrap().is_none());
+        lease.release().unwrap();
+    }
+
+    #[test]
     fn rollback_does_not_open_the_failed_selected_graph() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("brain.lbug");
@@ -1179,6 +1523,237 @@ mod tests {
         assert!(error.contains("compare-and-swap conflict"), "{error}");
         assert_eq!(read_current(dir.path()).unwrap(), Some(next));
         lease.release().unwrap();
+    }
+
+    /// nw-135: nothing in the repo ever enumerated `slots/`. discard_operation
+    /// refuses anything not cancelled-or-failed, so a slot from a SUCCESSFUL
+    /// rebuild could never be removed in-tool — four rebuilds left four full
+    /// slots on disk forever, ~1.2 GB each on the real brain.
+    ///
+    /// The dangerous direction is over-deletion, so this pins what is KEPT.
+    /// Review finding: journals SURVIVE activation — only discard_operation
+    /// removes one, and it refuses anything not cancelled-or-failed. Retaining
+    /// every slot named by a surviving journal therefore pinned every slot ever
+    /// published, and the prune reclaimed nothing at all on a real root, while
+    /// its original test passed only because its fixture wrote slots with no
+    /// journals.
+    ///
+    /// A slot whose operation is TERMINAL and which CURRENT no longer selects
+    /// is exactly the superseded-slot leak nw-135 exists to close.
+    /// Review finding: the previous guard was an `IndexPublicationLease`,
+    /// which is an in-process Mutex/Condvar owned by ONE GraphStore — two
+    /// processes, or two stores in one process, get unrelated leases, so it
+    /// serialized nothing across processes. A database write lock cannot stand
+    /// in either: activation locks the SELECTED slot graph while a prune
+    /// inspects the base, so they lock different files.
+    ///
+    /// This proves the replacement is a real, root-anchored, cross-process
+    /// lock: a SECOND acquisition of the same root is refused, including from
+    /// another process.
+    #[test]
+    fn the_publication_root_lock_excludes_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("brain.lbug.publications");
+
+        let held = PublicationRootLock::acquire(&root).expect("first acquisition must succeed");
+        let error = PublicationRootLock::acquire(&root)
+            .expect_err("a second holder must be refused while the first lives");
+        assert!(
+            error.to_string().contains("another publication operation"),
+            "the refusal must name the contention: {error}"
+        );
+
+        // Cross-PROCESS, not merely cross-handle: a child that tries the same
+        // root must also be refused while this process holds it.
+        let probe = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "exec 9>>'{}' && flock -n 9 && echo FREE || echo HELD",
+                root.join("LOCK").display()
+            ))
+            .output();
+        if let Ok(probe) = probe {
+            let observed = String::from_utf8_lossy(&probe.stdout);
+            // `flock(1)` is absent on macOS; only assert where it exists.
+            if observed.contains("HELD") || observed.contains("FREE") {
+                assert!(
+                    observed.contains("HELD"),
+                    "another process must observe the lock as held: {observed}"
+                );
+            }
+        }
+
+        drop(held);
+        PublicationRootLock::acquire(&root)
+            .expect("the lock must be released when its guard drops");
+    }
+
+    #[test]
+    fn prune_reclaims_a_superseded_slot_whose_journal_survived_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let mut identity = store.publication_identity().unwrap().unwrap();
+
+        // Three publications created the way the rebuild path creates them:
+        // create_operation FIRST, then the slot.
+        let mut uuids = Vec::new();
+        for _ in 0..3 {
+            let plan = crate::publication_operation::PublicationOperationPlan {
+                operation_uuid: uuid::Uuid::new_v4().to_string(),
+                brain_uuid: identity.brain_uuid.clone(),
+                target_publication_uuid: identity.publication_uuid.clone(),
+                expected_current_publication_uuid: None,
+                input_fingerprint: "f".repeat(64),
+                producer_version: "6.3.0".to_string(),
+                publication_format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+                created_unix_millis: 1,
+            };
+            let created = crate::publication_operation::create_operation(root, plan).unwrap();
+            let _ = write_slot(root, &identity);
+            uuids.push((identity.clone(), created));
+            identity = identity.next_publication().unwrap();
+        }
+
+        // An in-flight (non-terminal) journal must still pin its slot.
+        let lock = PublicationRootLock::acquire(root).unwrap();
+        let inflight = prune_slots(root, &lock, true).unwrap();
+        assert_eq!(
+            inflight.removed().count(),
+            0,
+            "operations still in flight must pin every slot they target"
+        );
+
+        // Drive all three to a terminal phase, as a successful publication does.
+        for (_, created) in &uuids {
+            let mut state =
+                crate::publication_operation::load_operation(root, &created.plan.operation_uuid)
+                    .unwrap();
+            while !state.phase.is_terminal() {
+                state = crate::publication_operation::request_cancel(
+                    root,
+                    &state.plan.operation_uuid,
+                    state.revision,
+                )
+                .unwrap();
+                state = crate::publication_operation::acknowledge_cancel(
+                    root,
+                    &state.plan.operation_uuid,
+                    state.revision,
+                )
+                .unwrap();
+            }
+        }
+
+        let report = prune_slots(root, &lock, false).unwrap();
+        assert_eq!(
+            report.removed().count(),
+            3,
+            "terminal journals must not pin superseded slots: {:?}",
+            report
+                .retained()
+                .map(|s| s.retained_because.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_current_its_predecessor_and_journal_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+
+        let predecessor = store.publication_identity().unwrap().unwrap();
+        let predecessor_digest = write_slot(root, &predecessor);
+        let current_identity = predecessor.next_publication().unwrap();
+        let current_digest = write_slot(root, &current_identity);
+        let orphan = current_identity.next_publication().unwrap();
+        let _ = write_slot(root, &orphan);
+
+        // Two cutovers, as the real flow performs them: the predecessor
+        // becomes CURRENT first, then is superseded — which is what makes it
+        // the retained rollback target.
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let first = CurrentPublicationPointer::new(&predecessor, None, predecessor_digest).unwrap();
+        compare_and_swap_current(root, &lease, None, &first).unwrap();
+        let pointer = CurrentPublicationPointer::new(
+            &current_identity,
+            Some(predecessor.publication_uuid.clone()),
+            current_digest,
+        )
+        .unwrap();
+        compare_and_swap_current(
+            root,
+            &lease,
+            Some(predecessor.publication_uuid.as_str()),
+            &pointer,
+        )
+        .unwrap();
+        drop(lease);
+
+        // Dry run must report the orphan without touching the disk.
+        let lock = PublicationRootLock::acquire(root).unwrap();
+        let preview = prune_slots(root, &lock, true).unwrap();
+        assert_eq!(preview.removed().count(), 1);
+        assert!(
+            slot_path(root, &orphan.publication_uuid).unwrap().exists(),
+            "a dry run must not delete anything"
+        );
+
+        let report = prune_slots(root, &lock, false).unwrap();
+        let removed: Vec<&str> = report
+            .removed()
+            .map(|slot| slot.publication_uuid.as_str())
+            .collect();
+        assert_eq!(removed, vec![orphan.publication_uuid.as_str()]);
+
+        // The live graph and the one-step rollback target both survive.
+        assert!(
+            slot_path(root, &current_identity.publication_uuid)
+                .unwrap()
+                .exists(),
+            "the slot CURRENT selects must never be reclaimed"
+        );
+        assert!(
+            slot_path(root, &predecessor.publication_uuid)
+                .unwrap()
+                .exists(),
+            "the retained predecessor backs the documented one-step rollback"
+        );
+        assert!(!slot_path(root, &orphan.publication_uuid).unwrap().exists());
+
+        // Idempotent: a second pass finds nothing left to reclaim.
+        assert_eq!(
+            prune_slots(root, &lock, false).unwrap().removed().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn instance_anchor_inverts_slot_selection_and_leaves_other_paths_alone() {
+        let base = Path::new("/data/brain.lbug");
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let selected = slot_path(&default_publication_root(base), uuid)
+            .expect("valid uuid")
+            .join(PUBLICATION_GRAPH_FILE);
+
+        // The inverse of resolve_selected_database: a selected slot graph
+        // maps back to the base that names the brain.
+        assert_eq!(instance_anchor_database(&selected), base);
+
+        // A base path, and anything that is not a slot graph, is untouched.
+        assert_eq!(instance_anchor_database(base), base);
+        for other in [
+            "/data/graph.lbug",                      // no slots/ ancestor
+            "/data/brain.lbug.publications/slots/x", // not the graph file
+            "/data/other/slots/x/graph.lbug",        // root lacks the suffix
+        ] {
+            assert_eq!(
+                instance_anchor_database(Path::new(other)),
+                Path::new(other),
+                "unrelated path rewritten: {other}"
+            );
+        }
     }
 
     #[test]

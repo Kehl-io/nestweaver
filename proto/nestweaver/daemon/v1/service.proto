@@ -27,10 +27,26 @@ message ShutdownResponse {
 
 // ─── Indexing ────────────────────────────────────────────────────────
 
+// Whether this request wants the trigram pre-filter refreshed.
+//
+// A plain bool could not distinguish "the caller said no" from "the caller
+// said nothing", so a configless `index` sent false and the daemon honoured it
+// — discarding its own `[indexing] with_trigrams = true`. UNSPECIFIED is the
+// third state that makes deferring to the daemon expressible, mirroring how
+// `max_source_file_bytes` already uses zero to mean "use your configured
+// value".
+enum TrigramPolicy {
+  TRIGRAM_POLICY_UNSPECIFIED = 0;  // inherit the daemon's configured policy
+  TRIGRAM_POLICY_ENABLED = 1;      // force on for this request
+  TRIGRAM_POLICY_DISABLED = 2;     // force off for this request
+}
+
 message IndexRepoRequest {
   string repo_path = 1;
   string name = 2;
   bool force = 3;
+  // Superseded by `trigram_policy`. Retained so a pre-6.4 client that sets it
+  // still forces a refresh; the daemon ORs it into the UNSPECIFIED branch.
   bool with_trigrams = 4;
   bool with_git_activity = 5;
   string instance_id = 6;  // nw-019: logical instance for the indexed data. Empty = daemon decides (config name, else runtime hash).
@@ -38,6 +54,8 @@ message IndexRepoRequest {
   // Validated client policy. Zero asks the daemon to use its configured/default
   // value; non-zero must remain within the daemon's hard safety bounds.
   uint64 max_source_file_bytes = 8;
+  // Three-state trigram policy; see TrigramPolicy.
+  TrigramPolicy trigram_policy = 9;
 }
 
 message IndexVaultRequest {

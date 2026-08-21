@@ -24,7 +24,7 @@ use regex_syntax::hir::literal::Extractor;
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
-use crate::error::StoreError;
+use crate::error::{CancelReason, StoreError};
 use crate::regex_index::{
     REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardDocument,
     RegexShardMetadata,
@@ -43,6 +43,11 @@ pub const CANDIDATE_CAP: usize = 200_000;
 
 /// Default wall-clock budget for a single search, in milliseconds.
 pub const DEFAULT_MAX_MILLIS: u64 = 2000;
+
+/// Do not start a graph-hydration phase when less than this budget remains.
+/// Ladybug queries cannot be interrupted mid-call, so admission control keeps
+/// tiny deadlines from launching work that is already certain to outlive them.
+const PHASE_ADMISSION_MILLIS: u64 = 5;
 
 /// Maximum accepted regex pattern length, in bytes. A longer pattern is rejected
 /// before compilation so an untrusted client cannot force a large compile just
@@ -255,6 +260,12 @@ struct Candidate {
     start_line: u32,
 }
 
+#[derive(Clone, Copy)]
+struct CandidateLimits<'a> {
+    cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    max_candidates: usize,
+}
+
 #[derive(Debug, Clone)]
 struct RegexGraphScopeState {
     desired_epoch: u64,
@@ -309,15 +320,23 @@ fn trigrams(s: &str) -> HashSet<String> {
     out
 }
 
-/// Extract the set of trigrams that any matching text MUST contain, expressed
-/// as an AND-of-ORs (CNF): the outer Vec is ANDed, each inner set is ORed.
+/// Extract the trigram condition any matching text must satisfy, expressed as
+/// an OR-of-ANDs (DNF): the outer Vec is ORed, each inner set is ANDed.
 ///
-/// The literal extractor already resolves alternations into alternative
-/// literals: for `(alpha|beta)` it yields both `alpha` and `beta`, and a match
-/// needs only ONE of them. All extracted literals are therefore unioned into
-/// a single OR clause. ANDing them per literal (the earlier behavior)
-/// required every alternation branch to appear in the same text and silently
-/// dropped real matches.
+/// This is the standard trigram-index construction (Russ Cox, "Regular
+/// Expression Matching with a Trigram Index"):
+///   trigrams("abcd") = "abc" AND "bcd"   -- conjuncts WITHIN one literal
+///   match(e1|e2)     = match(e1) OR match(e2)  -- alternatives ACROSS branches
+///
+/// The literal extractor resolves alternations into alternative literals: for
+/// `(alpha|beta)` it yields both, and a match needs only ONE of them — so each
+/// literal becomes its own branch. Merging every literal's trigrams into a
+/// single OR clause (nw-142) made a document match on any ONE shared trigram,
+/// which selected ~40% of the corpus for a 20-character identifier. ANDing
+/// ACROSS branches (the behavior before that) was equally wrong: it required
+/// every alternation branch to appear in the same text and dropped real
+/// matches. Per-branch conjunction, cross-branch disjunction is the shape that
+/// is both correct and selective.
 ///
 /// Returns `None` when the regex has no usable required literals (e.g. `.{4,}`,
 /// leading `.*`) or when ANY literal yields no trigrams (e.g. an alternation
@@ -338,11 +357,11 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
         return None;
     }
 
-    // Union every literal's trigrams into ONE OR clause: the literals are
-    // alternatives (a match needs any one of them), not conjuncts. A literal
-    // shorter than 3 chars yields no trigrams → that branch cannot constrain
-    // the search, so the whole prefilter is unusable.
-    let mut clause: HashSet<String> = HashSet::new();
+    // One branch per literal. Within a branch the trigrams are conjuncts; the
+    // branches themselves are alternatives. A literal shorter than 3 chars
+    // yields no trigrams → that branch cannot constrain the search, and since a
+    // match may take that branch, the whole prefilter is unusable.
+    let mut branches: Vec<HashSet<String>> = Vec::new();
     for lit in literals {
         // Inexact literals are prefixes/fragments; their trigrams are still a
         // necessary condition for the branch, so they remain usable.
@@ -352,12 +371,12 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
             // This alternation branch has no usable trigram → cannot prefilter.
             return None;
         }
-        clause.extend(tg);
+        branches.push(tg);
     }
-    if clause.is_empty() {
+    if branches.is_empty() {
         return None;
     }
-    Some(vec![clause])
+    Some(branches)
 }
 
 impl GraphStore {
@@ -368,7 +387,7 @@ impl GraphStore {
         Ok(self.refresh_trigram_index(false)?.postings_added)
     }
 
-    /// Force a one-time full rebuild using the stable v2 schema.
+    /// Force a one-time full rebuild using the current regex-v3 schema.
     pub fn rebuild_trigram_index(&self) -> Result<TrigramRefreshStats, StoreError> {
         self.refresh_trigram_index(true)
     }
@@ -489,7 +508,19 @@ impl GraphStore {
                 }
             };
             let one_scope = HashSet::from([scope_uid.clone()]);
-            let mut candidates = self.collect_candidates_for_scopes(&one_scope, None, None)?;
+            let mut candidates = self
+                .collect_candidates_for_scopes(
+                    &one_scope,
+                    None,
+                    None,
+                    Instant::now(),
+                    u64::MAX,
+                    CandidateLimits {
+                        cancel: None,
+                        max_candidates: usize::MAX,
+                    },
+                )?
+                .0;
             candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
             let digest = candidate_digest(&candidates);
             let prior = existing.get(&scope_uid);
@@ -702,7 +733,19 @@ impl GraphStore {
         &self,
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
-    ) -> Result<Vec<Candidate>, StoreError> {
+        start: Instant,
+        deadline_ms: u64,
+        limits: CandidateLimits<'_>,
+    ) -> Result<(Vec<Candidate>, Option<RegexTruncationReason>), StoreError> {
+        let interrupted = || -> Result<bool, StoreError> {
+            if limits
+                .cancel
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return Err(StoreError::Cancelled(CancelReason::Timeout));
+            }
+            Ok(elapsed_millis(start) >= deadline_ms)
+        };
         let want_kind = |k: &str| -> bool {
             match kinds {
                 None => true,
@@ -716,11 +759,17 @@ impl GraphStore {
         // file_path for the location, so build a note_uid -> path map once.
         if want_kind("Section") {
             let notes = self.list_notes(None)?;
+            if interrupted()? {
+                return Ok((out, Some(RegexTruncationReason::Deadline)));
+            }
             let note_path: HashMap<String, (String, String)> = notes
                 .into_iter()
                 .map(|n| (n.uid, (n.file_path, n.vault_uid)))
                 .collect();
             for s in self.list_all_sections()? {
+                if interrupted()? {
+                    return Ok((out, Some(RegexTruncationReason::Deadline)));
+                }
                 if s.text_content.is_empty() {
                     continue;
                 }
@@ -730,6 +779,9 @@ impl GraphStore {
                     && !path.starts_with(prefix)
                 {
                     continue;
+                }
+                if out.len() >= limits.max_candidates {
+                    return Ok((out, Some(RegexTruncationReason::CandidateCap)));
                 }
                 out.push(Candidate {
                     uid: s.uid,
@@ -751,6 +803,9 @@ impl GraphStore {
         // Notes — index the title (the section body carries the rest).
         if want_kind("Note") {
             for n in self.list_notes(None)? {
+                if interrupted()? {
+                    return Ok((out, Some(RegexTruncationReason::Deadline)));
+                }
                 if n.title.is_empty() {
                     continue;
                 }
@@ -758,6 +813,9 @@ impl GraphStore {
                     && !n.file_path.starts_with(prefix)
                 {
                     continue;
+                }
+                if out.len() >= limits.max_candidates {
+                    return Ok((out, Some(RegexTruncationReason::CandidateCap)));
                 }
                 out.push(Candidate {
                     uid: n.uid,
@@ -776,6 +834,9 @@ impl GraphStore {
         // Symbols — signature text.
         if want_kind("Symbol") {
             for sym in self.list_all_symbols()? {
+                if interrupted()? {
+                    return Ok((out, Some(RegexTruncationReason::Deadline)));
+                }
                 if sym.signature.is_empty() {
                     continue;
                 }
@@ -785,6 +846,9 @@ impl GraphStore {
                     continue;
                 }
                 let location = format!("{}:{}", sym.file_path, sym.start_line);
+                if out.len() >= limits.max_candidates {
+                    return Ok((out, Some(RegexTruncationReason::CandidateCap)));
+                }
                 out.push(Candidate {
                     uid: sym.uid,
                     scope_uid: sym.repo_uid,
@@ -798,7 +862,10 @@ impl GraphStore {
             }
         }
 
-        Ok(out)
+        Ok((
+            out,
+            interrupted()?.then_some(RegexTruncationReason::Deadline),
+        ))
     }
 
     /// Collect fallback/rebuild text only for explicitly selected source
@@ -808,7 +875,19 @@ impl GraphStore {
         scopes: &HashSet<String>,
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
-    ) -> Result<Vec<Candidate>, StoreError> {
+        start: Instant,
+        deadline_ms: u64,
+        limits: CandidateLimits<'_>,
+    ) -> Result<(Vec<Candidate>, Option<RegexTruncationReason>), StoreError> {
+        let interrupted = || -> Result<bool, StoreError> {
+            if limits
+                .cancel
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return Err(StoreError::Cancelled(CancelReason::Timeout));
+            }
+            Ok(elapsed_millis(start) >= deadline_ms)
+        };
         let want_kind = |kind: &str| {
             kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
         };
@@ -820,12 +899,21 @@ impl GraphStore {
         ordered.sort();
         let mut candidates = Vec::new();
         for scope_uid in ordered {
+            if interrupted()? {
+                return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+            }
             if want_kind("Symbol") {
                 for symbol in self.lookup_symbols_by_repo(&scope_uid)? {
+                    if interrupted()? {
+                        return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                    }
                     if symbol.signature.is_empty()
                         || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
                     {
                         continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
                     candidates.push(Candidate {
                         uid: symbol.uid,
@@ -840,16 +928,25 @@ impl GraphStore {
                 }
             }
             let notes = self.list_notes(Some(&scope_uid))?;
+            if interrupted()? {
+                return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+            }
             let note_paths: HashMap<_, _> = notes
                 .iter()
                 .map(|note| (note.uid.clone(), note.file_path.clone()))
                 .collect();
             if want_kind("Note") {
                 for note in notes {
+                    if interrupted()? {
+                        return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                    }
                     if note.title.is_empty()
                         || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
                     {
                         continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
                     candidates.push(Candidate {
                         uid: note.uid,
@@ -864,11 +961,34 @@ impl GraphStore {
                 }
             }
             if want_kind("Section") {
-                let mut sections = Vec::new();
-                for note_uid in note_paths.keys() {
-                    sections.extend(self.sections_in_note(note_uid)?);
-                }
+                // nw-134: one bulk query per scope, not one per note.
+                //
+                // The previous loop called sections_in_note() for every note in
+                // the scope. That filters on `note_uid`, which is NOT the primary
+                // key and has no index, so lbug cannot rewrite it to a
+                // PRIMARY_KEY_SCAN -- each call was a FULL Section-table scan. On a
+                // ~1,050-note vault that is ~1,050 full scans where the pre-existing
+                // collect_candidates() did exactly one.
+                //
+                // This is the path a dirty scope takes, so it is what both reported
+                // "regex-search returns 0 results" cases were actually paying: a
+                // watched vault edit dirties the vault scope, and collecting its
+                // candidates consumed the whole time budget before any regex ran.
+                //
+                // NOT list_sections_by_vault: that traverses NOTE_HAS_SECTION, and
+                // the edge is not guaranteed. write.rs:3022 deletes by the note_uid
+                // PROPERTY precisely to catch "fragments whose NOTE_HAS_SECTION edge
+                // is missing", so an edge traversal would silently drop those
+                // sections. Ownership lives on the property; scan once and filter by
+                // this scope's notes in memory.
+                let sections = self.list_all_sections()?;
                 for section in sections {
+                    if interrupted()? {
+                        return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                    }
+                    if !note_paths.contains_key(&section.note_uid) {
+                        continue;
+                    }
                     if section.text_content.is_empty() {
                         continue;
                     }
@@ -878,6 +998,9 @@ impl GraphStore {
                         .unwrap_or_default();
                     if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
                         continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
                     candidates.push(Candidate {
                         uid: section.uid,
@@ -896,7 +1019,10 @@ impl GraphStore {
                 }
             }
         }
-        Ok(candidates)
+        Ok((
+            candidates,
+            interrupted()?.then_some(RegexTruncationReason::Deadline),
+        ))
     }
 
     /// Hydrate only derived-index hits, in bounded primary-key batches.
@@ -905,7 +1031,19 @@ impl GraphStore {
         uids: &HashSet<String>,
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
-    ) -> Result<Vec<Candidate>, StoreError> {
+        start: Instant,
+        deadline_ms: u64,
+        limits: CandidateLimits<'_>,
+    ) -> Result<(Vec<Candidate>, Option<RegexTruncationReason>), StoreError> {
+        let interrupted = || -> Result<bool, StoreError> {
+            if limits
+                .cancel
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return Err(StoreError::Cancelled(CancelReason::Timeout));
+            }
+            Ok(elapsed_millis(start) >= deadline_ms)
+        };
         let want_kind = |kind: &str| {
             kinds.is_none_or(|values| values.iter().any(|value| value.eq_ignore_ascii_case(kind)))
         };
@@ -913,55 +1051,86 @@ impl GraphStore {
         ordered.sort();
         let mut candidates = Vec::new();
         if want_kind("Symbol") {
-            for symbol in self.lookup_symbols_by_uids(&ordered)? {
-                if symbol.signature.is_empty()
-                    || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
-                {
-                    continue;
+            for chunk in ordered.chunks(256) {
+                if interrupted()? {
+                    return Ok((candidates, Some(RegexTruncationReason::Deadline)));
                 }
-                candidates.push(Candidate {
-                    uid: symbol.uid,
-                    scope_uid: symbol.repo_uid,
-                    text_hash: text_hash(&symbol.signature),
-                    kind: "Symbol".to_string(),
-                    title: symbol.name,
-                    location: format!("{}:{}", symbol.file_path, symbol.start_line),
-                    text: symbol.signature,
-                    start_line: symbol.start_line,
-                });
+                for symbol in self.lookup_symbols_by_uids(chunk)? {
+                    if symbol.signature.is_empty()
+                        || path_prefix.is_some_and(|prefix| !symbol.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
+                    }
+                    candidates.push(Candidate {
+                        uid: symbol.uid,
+                        scope_uid: symbol.repo_uid,
+                        text_hash: text_hash(&symbol.signature),
+                        kind: "Symbol".to_string(),
+                        title: symbol.name,
+                        location: format!("{}:{}", symbol.file_path, symbol.start_line),
+                        text: symbol.signature,
+                        start_line: symbol.start_line,
+                    });
+                }
             }
         }
         if want_kind("Note") {
-            for note in self.lookup_notes_by_uids(&ordered)? {
-                if note.title.is_empty()
-                    || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
-                {
-                    continue;
+            for chunk in ordered.chunks(256) {
+                if interrupted()? {
+                    return Ok((candidates, Some(RegexTruncationReason::Deadline)));
                 }
-                candidates.push(Candidate {
-                    uid: note.uid,
-                    scope_uid: note.vault_uid,
-                    text_hash: text_hash(&note.title),
-                    kind: "Note".to_string(),
-                    title: note.title.clone(),
-                    location: note.file_path,
-                    text: note.title,
-                    start_line: 1,
-                });
+                for note in self.lookup_notes_by_uids(chunk)? {
+                    if note.title.is_empty()
+                        || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
+                    }
+                    candidates.push(Candidate {
+                        uid: note.uid,
+                        scope_uid: note.vault_uid,
+                        text_hash: text_hash(&note.title),
+                        kind: "Note".to_string(),
+                        title: note.title.clone(),
+                        location: note.file_path,
+                        text: note.title,
+                        start_line: 1,
+                    });
+                }
             }
         }
         if want_kind("Section") {
-            let sections = self.lookup_sections_by_uids(&ordered)?;
+            let mut sections = Vec::new();
+            for chunk in ordered.chunks(256) {
+                if interrupted()? {
+                    return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                }
+                sections.extend(self.lookup_sections_by_uids(chunk)?);
+            }
             let note_uids: Vec<_> = sections
                 .iter()
                 .map(|section| section.note_uid.clone())
                 .collect();
-            let note_paths: HashMap<_, _> = self
-                .lookup_notes_by_uids(&note_uids)?
-                .into_iter()
-                .map(|note| (note.uid, (note.file_path, note.vault_uid)))
-                .collect();
+            let mut note_paths = HashMap::new();
+            for chunk in note_uids.chunks(256) {
+                if interrupted()? {
+                    return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                }
+                note_paths.extend(
+                    self.lookup_notes_by_uids(chunk)?
+                        .into_iter()
+                        .map(|note| (note.uid, (note.file_path, note.vault_uid))),
+                );
+            }
             for section in sections {
+                if interrupted()? {
+                    return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                }
                 if section.text_content.is_empty() {
                     continue;
                 }
@@ -971,6 +1140,9 @@ impl GraphStore {
                     .unwrap_or_default();
                 if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
                     continue;
+                }
+                if candidates.len() >= limits.max_candidates {
+                    return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                 }
                 candidates.push(Candidate {
                     uid: section.uid,
@@ -988,21 +1160,40 @@ impl GraphStore {
                 });
             }
         }
-        Ok(candidates)
+        Ok((
+            candidates,
+            interrupted()?.then_some(RegexTruncationReason::Deadline),
+        ))
     }
 
     fn regex_v3_candidate_uids(
         &self,
         clauses: &[HashSet<String>],
-    ) -> Result<TrigramPrefilterPlan, StoreError> {
+        start: Instant,
+        deadline_ms: u64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
+        let interrupted = || -> Result<bool, StoreError> {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(StoreError::Cancelled(CancelReason::Timeout));
+            }
+            Ok(elapsed_millis(start) >= deadline_ms)
+        };
+        if interrupted()? {
+            return Ok(None);
+        }
         let Some(root) = self.regex_sidecar_root() else {
-            return Ok(TrigramPrefilterPlan {
+            let dirty_scopes = self.active_regex_scopes()?;
+            if interrupted()? {
+                return Ok(None);
+            }
+            return Ok(Some(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
                 ready_scopes: HashSet::new(),
-                dirty_scopes: self.active_regex_scopes()?,
+                dirty_scopes,
                 error_scopes: HashSet::new(),
                 has_index: false,
-            });
+            }));
         };
         let index = RegexIndex::with_reader_pool(root, self.regex_reader_pool.clone());
         let identity = self.publication_identity()?.ok_or_else(|| {
@@ -1016,6 +1207,9 @@ impl GraphStore {
         let mut error_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
         for scope_uid in active_scopes {
+            if interrupted()? {
+                return Ok(None);
+            }
             let Some(state) = states.get(&scope_uid) else {
                 dirty_scopes.insert(scope_uid);
                 continue;
@@ -1068,19 +1262,28 @@ impl GraphStore {
             && !TRIGRAM_STALE_WARNED.swap(true, Ordering::Relaxed)
         {
             eprintln!(
-                "warning: {} regex shard(s) are unavailable or stale; scanning only those scopes — rerun `index --with-trigrams` to repair them",
+                "warning: {} regex shard(s) are unavailable or stale; scanning only those scopes — rerun \
+                 `index --with-trigrams` to repair them, or set `[indexing] with_trigrams = true` \
+                 so indexing keeps them fresh",
                 dirty_scopes.len()
             );
         } else if dirty_scopes.is_empty() {
             TRIGRAM_STALE_WARNED.store(false, Ordering::Relaxed);
         }
-        Ok(TrigramPrefilterPlan {
+        // A single shard lookup may consume the remaining budget. Re-check
+        // before handing a seemingly usable plan to hydration; otherwise a
+        // one-scope corpus can overrun during planning and still launch the
+        // most expensive phase.
+        if interrupted()? {
+            return Ok(None);
+        }
+        Ok(Some(TrigramPrefilterPlan {
             matching_ready_uids,
             ready_scopes,
             dirty_scopes,
             error_scopes,
             has_index,
-        })
+        }))
     }
 
     /// First-party regex search over indexed text with an optional trigram
@@ -1098,6 +1301,22 @@ impl GraphStore {
         limit: Option<usize>,
         max_millis: Option<u64>,
     ) -> Result<RegexSearchResult, StoreError> {
+        self.regex_search_cancellable(pattern, path_prefix, kinds, limit, max_millis, None)
+    }
+
+    /// Regex search with cooperative cancellation across every phase.
+    /// Internal `max_millis` exhaustion returns an honestly truncated result;
+    /// an RPC/client cancellation returns `StoreError::Cancelled` so it cannot
+    /// be cached or mistaken for a complete empty answer.
+    pub fn regex_search_cancellable(
+        &self,
+        pattern: &str,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        limit: Option<usize>,
+        max_millis: Option<u64>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<RegexSearchResult, StoreError> {
         if let Some(l) = limit
             && l > SEARCH_PRESENTATION_LIMIT_MAX
         {
@@ -1109,13 +1328,28 @@ impl GraphStore {
         let deadline_ms = max_millis.unwrap_or(DEFAULT_MAX_MILLIS);
         let start = Instant::now();
         let limit = limit.unwrap_or(usize::MAX);
+        let check_cancel = || {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                Err(StoreError::Cancelled(CancelReason::Timeout))
+            } else {
+                Ok(())
+            }
+        };
+        check_cancel()?;
 
         let planning_started = Instant::now();
         let clauses = required_trigram_clauses(pattern);
-        let plan = match &clauses {
-            Some(clauses) => Some(self.regex_v3_candidate_uids(clauses)?),
-            None => None,
+        let (plan, mut planning_deadline) = match &clauses {
+            Some(clauses) => {
+                match self.regex_v3_candidate_uids(clauses, start, deadline_ms, cancel)? {
+                    Some(plan) => (Some(plan), false),
+                    None => (None, true),
+                }
+            }
+            None => (None, elapsed_millis(start) >= deadline_ms),
         };
+        planning_deadline |=
+            elapsed_millis(start).saturating_add(PHASE_ADMISSION_MILLIS) >= deadline_ms;
         let planning_ms = elapsed_millis(planning_started);
         let scanned_fallback = plan
             .as_ref()
@@ -1130,19 +1364,63 @@ impl GraphStore {
             .as_ref()
             .map_or(0, |plan| plan.matching_ready_uids.len());
 
+        check_cancel()?;
         let hydration_started = Instant::now();
-        let (mut candidates, hydrated_candidates) = match &plan {
-            Some(plan) => {
-                let mut candidates =
-                    self.collect_candidates_for_scopes(&plan.dirty_scopes, path_prefix, kinds)?;
-                let hydrated =
-                    self.load_candidates_by_uid(&plan.matching_ready_uids, path_prefix, kinds)?;
-                let hydrated_candidates = hydrated.len();
-                candidates.extend(hydrated);
-                (candidates, hydrated_candidates)
+        let mut hydration_stop = None;
+        let (mut candidates, hydrated_candidates) = if planning_deadline {
+            (Vec::new(), 0)
+        } else {
+            match &plan {
+                Some(plan) => {
+                    let (mut candidates, fallback_stop) = self.collect_candidates_for_scopes(
+                        &plan.dirty_scopes,
+                        path_prefix,
+                        kinds,
+                        start,
+                        deadline_ms,
+                        CandidateLimits {
+                            cancel,
+                            max_candidates: CANDIDATE_CAP,
+                        },
+                    )?;
+                    let (mut hydrated, hydrated_stop) = self.load_candidates_by_uid(
+                        &plan.matching_ready_uids,
+                        path_prefix,
+                        kinds,
+                        start,
+                        deadline_ms,
+                        CandidateLimits {
+                            cancel,
+                            max_candidates: CANDIDATE_CAP,
+                        },
+                    )?;
+                    hydration_stop = fallback_stop.or(hydrated_stop);
+                    let remaining = CANDIDATE_CAP.saturating_sub(candidates.len());
+                    if hydrated.len() > remaining {
+                        hydrated.truncate(remaining);
+                        hydration_stop = Some(RegexTruncationReason::CandidateCap);
+                    }
+                    let hydrated_candidates = hydrated.len();
+                    candidates.extend(hydrated);
+                    (candidates, hydrated_candidates)
+                }
+                None => {
+                    let (candidates, stop) = self.collect_candidates(
+                        path_prefix,
+                        kinds,
+                        start,
+                        deadline_ms,
+                        CandidateLimits {
+                            cancel,
+                            max_candidates: CANDIDATE_CAP,
+                        },
+                    )?;
+                    hydration_stop = stop;
+                    (candidates, 0)
+                }
             }
-            None => (self.collect_candidates(path_prefix, kinds)?, 0),
         };
+        check_cancel()?;
         candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
         let hydration_ms = elapsed_millis(hydration_started);
 
@@ -1151,12 +1429,21 @@ impl GraphStore {
         // ONLY when the scan actually stops early, so `truncated:true` with an
         // empty `results` now genuinely means "incomplete scan" rather than
         // "the match was ordered past a 5000 cap and never scanned" (nw-076).
-        let mut truncated = false;
-        let mut truncation_reason = None;
+        let elapsed_deadline = elapsed_millis(start) >= deadline_ms;
+        let mut truncated = planning_deadline || hydration_stop.is_some() || elapsed_deadline;
+        let mut truncation_reason = if planning_deadline || elapsed_deadline {
+            Some(RegexTruncationReason::Deadline)
+        } else {
+            hydration_stop
+        };
         let mut results = Vec::new();
         let mut scanned_candidates = 0usize;
         let verification_started = Instant::now();
         for (i, c) in candidates.iter().enumerate() {
+            check_cancel()?;
+            if truncated {
+                break;
+            }
             if start.elapsed().as_millis() as u64 > deadline_ms {
                 truncated = true;
                 truncation_reason = Some(RegexTruncationReason::Deadline);
@@ -1257,7 +1544,7 @@ impl GraphStore {
             let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
             let plan = match &clauses {
-                Some(clauses) => Some(self.regex_v3_candidate_uids(clauses)?),
+                Some(clauses) => self.regex_v3_candidate_uids(clauses, started, u64::MAX, None)?,
                 None => None,
             };
             let planning_ms = elapsed_millis(planning_started);
@@ -1271,15 +1558,50 @@ impl GraphStore {
             let hydration_started = Instant::now();
             let (candidates, hydrated_candidates) = match &plan {
                 Some(plan) => {
-                    let mut candidates =
-                        self.collect_candidates_for_scopes(&plan.dirty_scopes, path_prefix, kinds)?;
-                    let hydrated =
-                        self.load_candidates_by_uid(&plan.matching_ready_uids, path_prefix, kinds)?;
+                    let mut candidates = self
+                        .collect_candidates_for_scopes(
+                            &plan.dirty_scopes,
+                            path_prefix,
+                            kinds,
+                            started,
+                            u64::MAX,
+                            CandidateLimits {
+                                cancel: None,
+                                max_candidates: usize::MAX,
+                            },
+                        )?
+                        .0;
+                    let hydrated = self
+                        .load_candidates_by_uid(
+                            &plan.matching_ready_uids,
+                            path_prefix,
+                            kinds,
+                            started,
+                            u64::MAX,
+                            CandidateLimits {
+                                cancel: None,
+                                max_candidates: usize::MAX,
+                            },
+                        )?
+                        .0;
                     let hydrated_candidates = hydrated.len();
                     candidates.extend(hydrated);
                     (candidates, hydrated_candidates)
                 }
-                None => (self.collect_candidates(path_prefix, kinds)?, 0),
+                None => (
+                    self.collect_candidates(
+                        path_prefix,
+                        kinds,
+                        started,
+                        u64::MAX,
+                        CandidateLimits {
+                            cancel: None,
+                            max_candidates: usize::MAX,
+                        },
+                    )?
+                    .0,
+                    0,
+                ),
             };
             let hydration_ms = elapsed_millis(hydration_started);
             let verification_started = Instant::now();
@@ -1352,6 +1674,8 @@ fn line_and_snippet(text: &str, match_start: usize) -> (u32, String) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     /// nw-097: an empty result that is empty only because the scan budget ran
     /// out must SAY so. Previously the MCP tool attached this note itself, so a
     /// CLI `--json` caller received `{"results": [], "truncated": true}` with
@@ -1376,6 +1700,33 @@ mod tests {
         }
         .with_scan_budget_note();
         assert_eq!(r.note.as_deref(), Some(SCAN_BUDGET_NOTE));
+    }
+
+    #[test]
+    fn regex_deadline_stops_before_candidate_hydration() {
+        let store = GraphStore::in_memory().unwrap();
+        populate_store(&store);
+        let result = store
+            .regex_search("authenticateUser", None, None, None, Some(0))
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(
+            result.truncation_reason,
+            Some(RegexTruncationReason::Deadline)
+        );
+        assert_eq!(result.hydrated_candidates, 0);
+        assert_eq!(result.scanned_candidates, 0);
+    }
+
+    #[test]
+    fn regex_external_cancellation_is_an_error_not_an_empty_result() {
+        let store = GraphStore::in_memory().unwrap();
+        populate_store(&store);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let error = store
+            .regex_search_cancellable("authenticateUser", None, None, None, None, Some(&cancel))
+            .unwrap_err();
+        assert!(error.is_cancelled(), "{error}");
     }
 
     /// A genuinely exhaustive empty search HAS established that nothing matches,
@@ -1441,6 +1792,49 @@ mod tests {
     /// `fresh_index_observation_rearms_stale_warning_latch` under load (seen
     /// on CI). Every stale-observation test must hold this lock too.
     static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// nw-142: within ONE literal the trigrams are CONJUNCTS - a match must
+    /// contain all of them. Only across alternation branches are they
+    /// alternatives. Unioning everything into one OR clause makes the
+    /// prefilter select any document sharing a single common trigram.
+    ///
+    /// Reference: Russ Cox, "Regular Expression Matching with a Trigram Index":
+    ///   trigrams("abcd") = "abc" AND "bcd"
+    ///   match(e1|e2)     = match(e1) OR match(e2)
+    #[test]
+    fn a_single_literal_yields_one_conjunctive_branch() {
+        let branches = required_trigram_clauses("rollback_current").expect("usable literal");
+        assert_eq!(
+            branches.len(),
+            1,
+            "a plain string is ONE alternation branch, got {branches:?}"
+        );
+        // "rollback_current" is 16 chars -> 14 distinct trigrams, all required.
+        assert_eq!(branches[0], trigrams("rollback_current"));
+        assert!(
+            branches[0].len() > 5,
+            "a 16-char literal must contribute many required trigrams, got {}",
+            branches[0].len()
+        );
+    }
+
+    #[test]
+    fn alternation_yields_one_branch_per_literal() {
+        let branches = required_trigram_clauses("(alpha|bravo)").expect("usable literals");
+        assert_eq!(branches.len(), 2, "two branches expected, got {branches:?}");
+        let sets: Vec<_> = branches.iter().collect();
+        assert!(sets.contains(&&trigrams("alpha")));
+        assert!(sets.contains(&&trigrams("bravo")));
+        // The branches must NOT be merged into one set.
+        assert_ne!(branches[0], branches[1]);
+    }
+
+    /// A branch with no usable trigram cannot constrain the search, so the
+    /// whole prefilter must be abandoned rather than silently narrowed.
+    #[test]
+    fn a_branch_without_trigrams_disables_the_prefilter() {
+        assert!(required_trigram_clauses("(alpha|xy)").is_none());
+    }
 
     fn store_with_text() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();

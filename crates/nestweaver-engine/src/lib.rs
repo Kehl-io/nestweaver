@@ -402,8 +402,8 @@ pub use process::{
     detect_changes_impact, trace_processes,
 };
 pub use project::{
-    ProjectMaterializationResult, detect_implicit_projects, materialize_projects,
-    materialize_projects_with_lease,
+    ProjectMaterializationResult, detect_implicit_projects, detect_implicit_projects_with_mode,
+    materialize_projects, materialize_projects_with_lease,
 };
 pub use publication::*;
 pub use publication_source::*;

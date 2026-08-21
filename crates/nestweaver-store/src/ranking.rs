@@ -28,7 +28,7 @@ use std::io::Write;
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
-use nestweaver_algorithms::ppr::{PprConfig, forward_push_ppr};
+use nestweaver_algorithms::ppr::PprConfig;
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,11 @@ pub const PAGERANK_ARTIFACT_KIND: &str = "ranking";
 pub const PAGERANK_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:";
 
-fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
+/// The algorithm/scope fingerprint an artifact computed with these parameters
+/// must carry. Public so a caller that KNOWS the parameters can pass the
+/// expected value to [`GraphStore::load_pagerank_cache_expecting`] instead of
+/// letting the artifact vouch for itself (nw-147).
+pub fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
     let mut digest = blake3::Hasher::new();
     digest.update(b"nestweaver-pagerank-scope-v2\0");
     digest.update(&damping.to_bits().to_le_bytes());
@@ -954,6 +958,33 @@ impl GraphStore {
         scope: &GraphScope,
         intent: Option<QueryIntent>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.personalized_pagerank_with_intent_cancellable(
+            seed_uids,
+            damping,
+            max_iterations,
+            scope,
+            intent,
+            None,
+        )
+    }
+
+    /// [`Self::personalized_pagerank_with_intent`] that abandons the push loop
+    /// when `cancel` trips.
+    ///
+    /// nw-181: this module had NO cancellation. The daemon has tripped a cancel
+    /// flag on client disconnect since 2026-07-02 and traverse/search/db all
+    /// poll it, but PPR — the expensive part of brain_context — ran to
+    /// completion regardless, leaving the daemon burning 135 seconds of CPU
+    /// after every client had been killed.
+    pub fn personalized_pagerank_with_intent_cancellable(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let _flight = self
             .pagerank_compute_lock
             .lock()
@@ -1031,38 +1062,41 @@ impl GraphStore {
                 .ppr_graph_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(PprGraphCached {
+            *guard = Some(std::sync::Arc::new(PprGraphCached {
                 generation: current_gen,
                 scope_hash: s_hash,
                 intent,
                 uids,
-                uid_to_idx,
-                incoming,
-                out_weight,
-            });
+                adjacency: AdjacencyData {
+                    uid_to_idx,
+                    incoming,
+                    out_weight,
+                },
+            }));
         }
 
         // Step 3: read from cache (guaranteed populated).
-        let guard = self
-            .ppr_graph_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let cached = guard
-            .as_ref()
-            .expect("ppr_graph_cache must be Some after fill");
+        //
+        // nw-180: take an Arc handle rather than deep-copying. This path used to
+        // clone a corpus-sized HashMap, Vec<String> and edge list on EVERY call
+        // -- including cache HITS -- purely to scope the lock, which put a ~2s
+        // floor under every brain_context for ~5 KB of output. forward_push_ppr
+        // borrows both, so a refcount bump is all that is needed to release the
+        // lock before the iterative computation.
+        let cached = {
+            let guard = self
+                .ppr_graph_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::sync::Arc::clone(
+                guard
+                    .as_ref()
+                    .expect("ppr_graph_cache must be Some after fill"),
+            )
+        };
 
         // Use the interaction scores already read for the cache key above.
         let interaction_scores = interaction_scores_for_key;
-
-        let adjacency = AdjacencyData {
-            uid_to_idx: cached.uid_to_idx.clone(),
-            incoming: cached.incoming.clone(),
-            out_weight: cached.out_weight.clone(),
-        };
-
-        let uids = cached.uids.clone();
-        // Release the lock before running the iterative PPR computation.
-        drop(guard);
 
         let config = PprConfig {
             damping: effective_damping,
@@ -1072,7 +1106,17 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        let results = forward_push_ppr(&uids, &adjacency, seed_uids, &config);
+        let cancelled = cancel.map(|flag| move || flag.load(std::sync::atomic::Ordering::Acquire));
+        let results = nestweaver_algorithms::ppr::forward_push_ppr_cancellable(
+            &cached.uids,
+            &cached.adjacency,
+            seed_uids,
+            &config,
+            cancelled
+                .as_ref()
+                .map(|predicate| predicate as &dyn Fn() -> bool),
+        )
+        .ok_or(StoreError::Cancelled(crate::error::CancelReason::Timeout))?;
 
         {
             let mut cache = self
@@ -1161,6 +1205,12 @@ impl GraphStore {
     /// Persist the in-memory PageRank cache to a JSON sidecar file at `path`.
     ///
     /// If the cache is empty (PageRank has not been computed yet), this is a no-op.
+    /// A dirty index publication is ALSO a no-op returning `Ok(())`, not an
+    /// error: the sidecar may not correspond to the committed graph, so
+    /// skipping the write is the correct outcome rather than a failure. This is
+    /// the deliberate exception to the rule that every dirty-publication guard
+    /// in this module returns `StoreError::RankingUnavailable` — query paths
+    /// fail closed, cache I/O silently skips (nw-133).
     /// If the final parent-directory sync fails, the complete new cache may
     /// already be canonical even though crash durability of the rename could
     /// not be confirmed.
@@ -1267,7 +1317,38 @@ impl GraphStore {
     /// Load the PageRank cache from a JSON sidecar file at `path`.
     ///
     /// If the file does not exist, this is a no-op.
+    /// A dirty index publication is ALSO a no-op returning `Ok(())`, not an
+    /// error: a sidecar written before the in-flight publication may predate
+    /// the committed graph, so declining to load it is the correct outcome.
+    /// See [`Self::save_pagerank_cache`] for why cache I/O is the deliberate
+    /// exception to this module's fail-closed guard contract (nw-133).
     pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        self.load_pagerank_cache_expecting(path, None)
+    }
+
+    /// [`Self::load_pagerank_cache`] with an explicit expected algorithm/scope
+    /// fingerprint.
+    ///
+    /// nw-147: the validation used to clone the fingerprint OUT of the envelope
+    /// and pass it back in as the expected value, so the equality check in
+    /// `ArtifactEnvelope::validate_and_decode` compared the field to itself.
+    /// Only the `nestweaver-pagerank-v2:` prefix was ever enforced; the BLAKE3
+    /// suffix over (damping, iterations, scope) was taken on trust, and every
+    /// other artifact type passes a real constant. A caller that knows which
+    /// parameters it wants should pass `Some(expected)` — see
+    /// [`pagerank_algorithm_fingerprint`].
+    ///
+    /// `None` keeps prefix-only checking, for the callers that genuinely cannot
+    /// know the parameters. That path still validates publication identity,
+    /// producer version and source generation, so a foreign or stale sidecar is
+    /// rejected; what it cannot detect is a same-brain, same-generation sidecar
+    /// computed with DIFFERENT damping/iterations/scope. Fully closing that
+    /// needs the envelope to record the parameters themselves.
+    pub fn load_pagerank_cache_expecting(
+        &self,
+        path: &std::path::Path,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<(), StoreError> {
         let _flight = self
             .pagerank_compute_lock
             .lock()
@@ -1304,7 +1385,12 @@ impl GraphStore {
                         .to_string(),
                 )
             })?;
-            let fingerprint = envelope.algorithm_fingerprint.clone();
+            // nw-147: prefer the caller's expected value; fall back to the
+            // artifact's own only when the caller could not supply one.
+            let fingerprint = match expected_fingerprint {
+                Some(expected) => expected.to_string(),
+                None => envelope.algorithm_fingerprint.clone(),
+            };
             let scores: HashMap<String, f64> =
                 envelope.validate_and_decode(crate::artifact_envelope::ArtifactExpectation {
                     artifact_kind: PAGERANK_ARTIFACT_KIND,
@@ -1511,6 +1597,48 @@ mod tests {
         let reopened = GraphStore::open(&db).unwrap();
         reopened.load_pagerank_cache(&sidecar).unwrap();
         assert_eq!(reopened.pagerank_scores().unwrap().get("A"), Some(&1.0));
+    }
+
+    /// nw-147: the algorithm fingerprint used to be cloned out of the envelope
+    /// and passed back in as the EXPECTED value, so the equality check compared
+    /// the field to itself and only the version prefix was ever enforced. A
+    /// caller that knows its parameters can now supply the real expectation.
+    #[test]
+    fn pagerank_sidecar_rejects_a_mismatched_algorithm_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_symbol(&make_symbol("A", "alpha")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open(&db).unwrap();
+
+        // The parameters it was actually computed with: accepted.
+        let matching = super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::code_only());
+        reopened
+            .load_pagerank_cache_expecting(&sidecar, Some(&matching))
+            .expect("the fingerprint for the computed parameters must be accepted");
+
+        // A DIFFERENT iteration count is a different artifact contract. Same
+        // brain, same generation, same payload — only the parameters differ,
+        // which is precisely the case the self-comparison could never see.
+        let mismatched = super::pagerank_algorithm_fingerprint(0.85, 30, &GraphScope::code_only());
+        assert_ne!(
+            matching, mismatched,
+            "parameters must change the fingerprint"
+        );
+        let error = reopened
+            .load_pagerank_cache_expecting(&sidecar, Some(&mismatched))
+            .expect_err("a sidecar computed with other parameters must be rejected");
+        assert!(
+            error.to_string().contains("fingerprint"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

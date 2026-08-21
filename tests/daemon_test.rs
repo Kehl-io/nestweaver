@@ -873,7 +873,40 @@ fn macos_autostart_temp_db_spawns_daemon_run_without_plist() {
     let db_path = dir.path().join("normal-start").join("test.lbug");
     let config_path = dir.path().join("nestweaver-instance.toml");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    std::fs::write(&config_path, "").unwrap();
+    // A VALID minimal config. This test is about plist behaviour, not config
+    // validation, and it previously wrote an EMPTY file — which
+    // `InstanceConfig` rightly rejects, since `instance_id` is deliberately
+    // required (an instance that defaults silently is what splits a graph
+    // across two instances). The test therefore failed on macOS for a reason
+    // unrelated to what it asserts, and Linux CI never ran it because it is
+    // #[cfg(target_os = "macos")].
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "autostart-temp-db"
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.path().join("snapshots").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
     let _guard = DaemonGuard::new(&db_path);
 
     let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
@@ -2456,8 +2489,30 @@ credential_method = "gh"
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
 
-    // Explicit config bypasses the corrupt provenance value but still uses
-    // the already-verified live PID/pidfile ownership evidence.
+    // An explicit config resolves configuration intent, but it cannot prove
+    // lifecycle ownership. Corrupt provenance therefore fails before shutdown
+    // even when the operator supplies a config: otherwise a supervisor-owned
+    // daemon could be replaced by a detached process.
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .failure()
+        .stderr(contains("ownership could not be verified"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new_with_lifecycle_owner(
+            pid_preserved as u32,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_a.to_str().unwrap().to_string(),
+            },
+            nestweaver_daemon::lifecycle::DaemonLifecycleOwner::NestweaverManaged,
+        ),
+    )
+    .unwrap();
     daemon_action_cmd(&db_path, "restart")
         .arg("--config")
         .arg(&config_b)
@@ -4572,12 +4627,20 @@ fn first_search_uid(db_path: &Path, query: &str) -> String {
         "search must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rows: serde_json::Value =
+    let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("search --json must emit valid JSON");
+    // `search --json` carries its own truncation contract: {results, returned,
+    // limit, truncated}. Accept the pre-6.4 bare array too, so this helper is
+    // not a second place that has to be updated in lockstep with the shape.
+    let rows = payload
+        .get("results")
+        .filter(|results| results.is_array())
+        .unwrap_or(&payload);
     rows.as_array()
+        .or_else(|| rows.get("results").and_then(serde_json::Value::as_array))
         .and_then(|arr| arr.first())
         .and_then(|row| row["uid"].as_str())
-        .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {rows}"))
+        .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {payload}"))
         .to_string()
 }
 

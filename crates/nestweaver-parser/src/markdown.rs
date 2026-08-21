@@ -189,7 +189,7 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     let word_count = u32::try_from(body.split_whitespace().count()).unwrap_or(u32::MAX);
 
     // 7. Extract headings and sections from the body; annotate callout types.
-    let headings = extract_headings(body);
+    let mut headings = extract_headings(body);
     let mut sections = extract_sections(body, &headings);
     for sec in sections.iter_mut() {
         sec.callout_type = extract_callout_type(&sec.text);
@@ -206,6 +206,11 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     // 8. Extract wikilinks per section + tags (inline + frontmatter).
     let mut wikilinks = extract_wikilinks(&sections);
     wikilinks.extend(extract_md_links(body, &sections));
+    // Frontmatter links attach to the preamble section; see
+    // extract_frontmatter_wikilinks for why they cannot be note-scoped today.
+    if !sections.is_empty() {
+        wikilinks.extend(extract_frontmatter_wikilinks(&frontmatter_json, 0));
+    }
     let mut tags = extract_inline_tags(&sections);
     tags.extend(extract_frontmatter_tags(&frontmatter_json));
 
@@ -217,6 +222,43 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
 
     // 11. Obsidian block references (`^block-id`).
     let block_refs = extract_block_refs(body);
+
+    // nw-185: shift every line number from body-relative to FILE-absolute.
+    //
+    // Headings and sections were built against `body`, which excludes the
+    // frontmatter block, but every consumer renders them as `file:line` --
+    // regex.rs computes `file_line = start_line + line_in_text - 1` and prints
+    // it as a location. The result was short by exactly the frontmatter length
+    // and self-contradictory: a hit reported at line 32 quoted text that lives
+    // at line 43. The offset was baked into stored data, so the heading UID of
+    // a note whose H1 sits at file line 12 ended in `:2`.
+    //
+    // Shifting here, once, keeps all the body-relative slicing above correct
+    // while making everything that leaves this function file-absolute.
+    let frontmatter_lines = source.lines().count() - body.lines().count();
+    if frontmatter_lines > 0 {
+        let shift = frontmatter_lines as u32;
+        for heading in &mut headings {
+            heading.start_line += shift;
+            heading.end_line += shift;
+        }
+        for section in &mut sections {
+            section.start_line += shift;
+            section.end_line += shift;
+        }
+        for wikilink in &mut wikilinks {
+            // Frontmatter links are recorded with line 0 (no body line); leave
+            // them alone rather than inventing a position.
+            if wikilink.line > 0 {
+                wikilink.line += shift;
+            }
+        }
+        for tag in &mut tags {
+            if tag.line > 0 {
+                tag.line += shift;
+            }
+        }
+    }
 
     Ok(ParsedNote {
         path: rel_path.to_string(),
@@ -579,84 +621,100 @@ fn kind_from_path(rel_path: &str) -> NoteKind {
 /// dep-light and to handle escapes / nesting predictably. We do NOT match
 /// inside fenced code blocks (```...```) or inline code (`...`) — those
 /// are not real wikilinks.
+/// Parse every `[[wikilink]]` / `![[transclusion]]` on one line into `out`.
+///
+/// Shared by body-section extraction and frontmatter extraction so the two
+/// cannot drift on alias, anchor or cross-vault-prefix handling.
+fn push_wikilinks_from_line(
+    line_text: &str,
+    section_idx: usize,
+    line: u32,
+    out: &mut Vec<RawWikilink>,
+) {
+    let bytes = line_text.as_bytes();
+    let mut col = 0usize;
+    while col < bytes.len() {
+        // Look for `[[` or `![[`.
+        let (transclude, start) = if col + 2 < bytes.len()
+            && bytes[col] == b'!'
+            && bytes[col + 1] == b'['
+            && bytes[col + 2] == b'['
+        {
+            (true, col + 3)
+        } else if col + 1 < bytes.len() && bytes[col] == b'[' && bytes[col + 1] == b'[' {
+            (false, col + 2)
+        } else {
+            col += 1;
+            continue;
+        };
+        // Find the matching `]]`.
+        let Some(end) = find_close(bytes, start) else {
+            col = start;
+            continue;
+        };
+        let inside = &line_text[start..end];
+        // Newlines inside an unclosed wikilink? Skip.
+        if inside.contains('\n') {
+            col = start;
+            continue;
+        }
+        let (target_part, display) = match inside.split_once('|') {
+            Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
+            None => (inside.trim().to_string(), None),
+        };
+        if target_part.is_empty() {
+            col = end + 2;
+            continue;
+        }
+        let (target, anchor) = match target_part.split_once('#') {
+            Some((t, a)) => (t.trim().to_string(), Some(a.trim().to_string())),
+            None => (target_part, None),
+        };
+        if target.is_empty() {
+            col = end + 2;
+            continue;
+        }
+        // Detect cross-vault prefix: [[vault:target]]
+        // Only split on `:` if it appears before any `/` (path separator).
+        let (vault_prefix, resolved_target) = {
+            let slash_pos = target.find('/').unwrap_or(usize::MAX);
+            if let Some(colon_pos) = target.find(':') {
+                if colon_pos < slash_pos && colon_pos > 1 {
+                    (
+                        Some(target[..colon_pos].to_string()),
+                        target[colon_pos + 1..].to_string(),
+                    )
+                } else {
+                    (None, target)
+                }
+            } else {
+                (None, target)
+            }
+        };
+        out.push(RawWikilink {
+            target: resolved_target,
+            heading_anchor: anchor,
+            display,
+            transclude,
+            section_idx,
+            line,
+            vault_prefix,
+        });
+        col = end + 2;
+    }
+}
+
 fn extract_wikilinks(sections: &[RawSection]) -> Vec<RawWikilink> {
     let mut out = Vec::new();
     for (sec_idx, sec) in sections.iter().enumerate() {
         let stripped = strip_code(&sec.text);
         for (line_offset, line_text) in stripped.lines().enumerate() {
-            let mut bytes = line_text.as_bytes();
-            let mut col = 0usize;
-            while col < bytes.len() {
-                // Look for `[[` or `![[`.
-                let (transclude, start) = if col + 2 < bytes.len()
-                    && bytes[col] == b'!'
-                    && bytes[col + 1] == b'['
-                    && bytes[col + 2] == b'['
-                {
-                    (true, col + 3)
-                } else if col + 1 < bytes.len() && bytes[col] == b'[' && bytes[col + 1] == b'[' {
-                    (false, col + 2)
-                } else {
-                    col += 1;
-                    continue;
-                };
-                // Find the matching `]]`.
-                let Some(end) = find_close(bytes, start) else {
-                    col = start;
-                    continue;
-                };
-                let inside = &line_text[start..end];
-                // Newlines inside an unclosed wikilink? Skip.
-                if inside.contains('\n') {
-                    col = start;
-                    continue;
-                }
-                let (target_part, display) = match inside.split_once('|') {
-                    Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
-                    None => (inside.trim().to_string(), None),
-                };
-                if target_part.is_empty() {
-                    col = end + 2;
-                    continue;
-                }
-                let (target, anchor) = match target_part.split_once('#') {
-                    Some((t, a)) => (t.trim().to_string(), Some(a.trim().to_string())),
-                    None => (target_part, None),
-                };
-                if target.is_empty() {
-                    col = end + 2;
-                    continue;
-                }
-                // Detect cross-vault prefix: [[vault:target]]
-                // Only split on `:` if it appears before any `/` (path separator).
-                let (vault_prefix, resolved_target) = {
-                    let slash_pos = target.find('/').unwrap_or(usize::MAX);
-                    if let Some(colon_pos) = target.find(':') {
-                        if colon_pos < slash_pos && colon_pos > 1 {
-                            (
-                                Some(target[..colon_pos].to_string()),
-                                target[colon_pos + 1..].to_string(),
-                            )
-                        } else {
-                            (None, target)
-                        }
-                    } else {
-                        (None, target)
-                    }
-                };
-                out.push(RawWikilink {
-                    target: resolved_target,
-                    heading_anchor: anchor,
-                    display,
-                    transclude,
-                    section_idx: sec_idx,
-                    line: sec.start_line + line_offset as u32,
-                    vault_prefix,
-                });
-                col = end + 2;
-                // Advance the slice for the next iteration of the outer loop.
-                bytes = line_text.as_bytes();
-            }
+            push_wikilinks_from_line(
+                line_text,
+                sec_idx,
+                sec.start_line + line_offset as u32,
+                &mut out,
+            );
         }
     }
     out
@@ -750,13 +808,20 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
             // supports non-ASCII tags, and a truncated stem can collide with an
             // unrelated real tag (nw-116).
             let mut prev: Option<char> = None;
+            let mut prev2: Option<char> = None;
             let mut chars = line_text.char_indices().peekable();
             while let Some((idx, ch)) = chars.next() {
                 let is_boundary = match prev {
                     None => true,
                     Some(p) => matches!(p, ' ' | '\t' | '(' | '[' | ',' | ';'),
                 };
-                if ch == '#' && is_boundary {
+                // nw-167: `](#` opens a markdown in-page link, not a tag.
+                // Accepting `(` as a boundary turned every table-of-contents
+                // entry into one: all 46 anchor targets in the reference vault
+                // were indexed as tags (#1-document-purpose ... #the-verdict),
+                // distorting top_tags, the tag graph and every `tags=` filter.
+                let is_markdown_anchor = prev == Some('(') && prev2 == Some(']');
+                if ch == '#' && is_boundary && !is_markdown_anchor {
                     let start = idx + ch.len_utf8();
                     let mut end = start;
                     while let Some(&(j, c)) = chars.peek() {
@@ -771,7 +836,19 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                         let name = line_text[start..end].to_lowercase();
                         // Skip bare `#` (no name), pure-numeric tags like #1 (often markdown
                         // issue refs), and trailing-hyphen artefacts.
-                        if !name.is_empty() && name.chars().any(|c| c.is_alphabetic()) {
+                        //
+                        // nw-167: also skip hex colours written in prose, e.g.
+                        // `(#F5F5F5)` or `(#03a9f4)` -- 91 of the reference
+                        // vault's 659 tags were colour literals. Requiring a
+                        // digit keeps word-shaped tags that happen to be all
+                        // hex letters, such as `#abc` or `#faced`.
+                        let is_hex_colour = matches!(name.len(), 3 | 6 | 8)
+                            && name.chars().all(|c| c.is_ascii_hexdigit())
+                            && name.chars().any(|c| c.is_ascii_digit());
+                        if !name.is_empty()
+                            && name.chars().any(|c| c.is_alphabetic())
+                            && !is_hex_colour
+                        {
                             out.push(RawTag {
                                 name,
                                 source: TagSource::Inline,
@@ -779,10 +856,12 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                                 line: sec.start_line + line_offset as u32,
                             });
                         }
+                        prev2 = None;
                         prev = line_text[start..end].chars().next_back();
                         continue;
                     }
                 }
+                prev2 = prev;
                 prev = Some(ch);
             }
         }
@@ -792,6 +871,60 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
 
 /// Pull tags from frontmatter `tags:` — accepts an array of strings OR a
 /// single string (Obsidian + Jekyll variants).
+/// Extract `[[wikilinks]]` from every string value in the frontmatter block.
+///
+/// nw-164: frontmatter links were invisible to the graph because
+/// `extract_wikilinks` only walks body sections. That silently dropped 403 of
+/// this vault's 2019 links (20%), 237 of them in `Workspaces/*/Backlog.md`
+/// where the whole `items:` array — and so every backlog cross-reference —
+/// lives inside frontmatter. It also contradicted the vault's own documented
+/// convention of linking related notes via a `related:` frontmatter field.
+///
+/// ATTRIBUTION: the WIKILINK_TO_NOTE / WIKILINK_TO_HEADING rel tables are
+/// declared `FROM Section`, so a link must originate from a section. A
+/// frontmatter link has no section of its own, so it is attributed to the
+/// note's first section (the preamble). Representing these as note-scoped
+/// edges would need a new `FROM Note` rel table plus a migration; that is a
+/// schema decision, not a parser fix. A note with no sections at all
+/// therefore still cannot carry frontmatter links — callers already skip
+/// out-of-range section indices.
+///
+/// Every string value is walked recursively rather than only known link
+/// fields, so nested structures (a `related:` inside an `items:` array) are
+/// covered without hardcoding field names. `[[...]]` syntax is specific
+/// enough that this does not produce false positives.
+fn extract_frontmatter_wikilinks(
+    frontmatter: &serde_json::Value,
+    section_idx: usize,
+) -> Vec<RawWikilink> {
+    fn walk(value: &serde_json::Value, section_idx: usize, out: &mut Vec<RawWikilink>) {
+        match value {
+            serde_json::Value::String(text) => {
+                for line in text.lines() {
+                    // Frontmatter has no meaningful body line number; 0 marks
+                    // "from the frontmatter block", matching how frontmatter
+                    // tags are recorded.
+                    push_wikilinks_from_line(line, section_idx, 0, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, section_idx, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    walk(item, section_idx, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(frontmatter, section_idx, &mut out);
+    out
+}
+
 fn extract_frontmatter_tags(frontmatter: &serde_json::Value) -> Vec<RawTag> {
     let mut out = Vec::new();
     let Some(value) = frontmatter.get("tags") else {
@@ -1058,6 +1191,40 @@ fn strip_obsidian_comments(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// nw-164: links in the frontmatter block must reach the graph. 20% of the
+    /// reference vault's links live there, including every backlog
+    /// cross-reference, because the whole `items:` array is frontmatter.
+    #[test]
+    fn frontmatter_wikilinks_are_extracted() {
+        let source = concat!(
+            "---\n",
+            "title: Example\n",
+            "related:\n",
+            "  - \"[[target-one]]\"\n",
+            "  - \"[[target-two|alias]]\"\n",
+            "items:\n",
+            "  - id: x-1\n",
+            "    note: \"see [[nested-target]] for detail\"\n",
+            "---\n",
+            "\n",
+            "Body text linking [[body-target]].\n",
+        );
+        let parsed = parse_markdown("example.md", source).expect("parses");
+        let targets: Vec<&str> = parsed.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        for expected in ["target-one", "target-two", "nested-target", "body-target"] {
+            assert!(
+                targets.contains(&expected),
+                "missing {expected} in {targets:?}"
+            );
+        }
+        let aliased = parsed
+            .wikilinks
+            .iter()
+            .find(|w| w.target == "target-two")
+            .expect("aliased link");
+        assert_eq!(aliased.display.as_deref(), Some("alias"));
+    }
     use super::*;
 
     #[test]
@@ -1240,11 +1407,29 @@ top 2 body
     }
 
     #[test]
-    fn frontmatter_does_not_shift_heading_line_numbers() {
-        // Body line 1 = "# After FM", regardless of frontmatter length.
+    fn heading_line_numbers_are_file_absolute() {
+        // nw-185: REVERSES the previous contract, which made this body-relative
+        // ("body line 1 = the first heading, regardless of frontmatter length").
+        //
+        // Nothing slices content by these numbers -- read_symbols excludes
+        // notes, and note_get returns stored section text -- but every consumer
+        // RENDERS them as `file:line`. regex.rs computes
+        // `file_line = start_line + line_in_text - 1` and prints it as a
+        // location, so results were short by exactly the frontmatter length and
+        // self-contradictory: a hit reported at line 32 quoted text living at
+        // line 43. Code symbols are already file-absolute, so notes now match.
         let src = "---\ntitle: x\nfoo: bar\nbaz: qux\n---\n# After FM\nbody\n";
         let note = parse_markdown("x.md", src).unwrap();
         assert_eq!(note.headings.len(), 1);
+        assert_eq!(
+            note.headings[0].start_line, 6,
+            "5 frontmatter lines + the heading on file line 6"
+        );
+    }
+
+    #[test]
+    fn a_note_without_frontmatter_is_unshifted() {
+        let note = parse_markdown("x.md", "# Top\nbody\n").unwrap();
         assert_eq!(note.headings[0].start_line, 1);
     }
 
@@ -1779,5 +1964,51 @@ top 2 body
             !parsed.sections.iter().any(|s| s.is_adr_section),
             "regular sections should not be ADR"
         );
+    }
+}
+#[cfg(test)]
+mod tag_boundary_tests {
+    use super::*;
+
+    /// nw-167: `](#anchor)` is a markdown in-page link, and `(#F5F5F5)` is a
+    /// colour literal. Neither is a tag. Accepting `(` as a tag boundary made
+    /// all 46 anchor targets and 91 colour literals in the reference vault into
+    /// tags -- roughly 20% of the tag namespace.
+    #[test]
+    fn markdown_anchors_and_hex_colours_are_not_tags() {
+        let source = concat!(
+            "# Doc\n",
+            "\n",
+            "See [Section 3.4](#34-the-datum-trap) and [TOC](#1-document-purpose).\n",
+            "The accent is (#F5F5F5) and the link colour is (#03a9f4).\n",
+            "A real tag: #project/nestweaver and (#inline-in-parens) counts too.\n",
+        );
+        let parsed = parse_markdown("doc.md", source).expect("parses");
+        let tags: Vec<&str> = parsed.tags.iter().map(|t| t.name.as_str()).collect();
+
+        for absent in [
+            "34-the-datum-trap",
+            "1-document-purpose",
+            "f5f5f5",
+            "03a9f4",
+        ] {
+            assert!(
+                !tags.contains(&absent),
+                "{absent} must not be a tag: {tags:?}"
+            );
+        }
+        // A genuine tag, including one legitimately inside parentheses.
+        assert!(tags.contains(&"project/nestweaver"), "got {tags:?}");
+        assert!(tags.contains(&"inline-in-parens"), "got {tags:?}");
+    }
+
+    /// The hex-colour guard must require a digit, so word-shaped tags that
+    /// happen to be all hex letters survive.
+    #[test]
+    fn all_letter_hex_shaped_tags_survive() {
+        let parsed = parse_markdown("doc.md", "# D\n\nTags: #abc and #faced\n").expect("parses");
+        let tags: Vec<&str> = parsed.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(tags.contains(&"abc"), "got {tags:?}");
+        assert!(tags.contains(&"faced"), "got {tags:?}");
     }
 }

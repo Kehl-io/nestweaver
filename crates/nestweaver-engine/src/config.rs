@@ -259,6 +259,22 @@ pub struct InstanceConfig {
 pub struct SourceIndexingConfig {
     #[serde(default = "default_max_source_file_bytes")]
     pub max_source_file_bytes: u64,
+    /// Keep the regex trigram pre-filter fresh as part of indexing.
+    ///
+    /// `regex-search` uses a trigram posting table when one exists and falls
+    /// back to a full scan otherwise. The only way to build or refresh it was
+    /// `index --with-trigrams`, remembered on every manual run: nothing in the
+    /// daemon's background reindex, the code watcher or the vault watcher
+    /// touched trigrams at all, so postings went stale as the graph moved and
+    /// later `regex-search` calls silently paid for a full scan.
+    ///
+    /// Lives here rather than under `[server.indexing]` because it describes
+    /// how sources are indexed in EVERY mode, not server scheduling.
+    ///
+    /// Defaults to `false`, preserving the existing opt-in behaviour and its
+    /// storage cost for anyone who has not asked for it.
+    #[serde(default)]
+    pub with_trigrams: bool,
 }
 
 fn default_max_source_file_bytes() -> u64 {
@@ -269,6 +285,7 @@ impl Default for SourceIndexingConfig {
     fn default() -> Self {
         Self {
             max_source_file_bytes: default_max_source_file_bytes(),
+            with_trigrams: false,
         }
     }
 }
@@ -2244,6 +2261,31 @@ url = "https://github.com/example/keep-me"
                 .iter()
                 .any(|repo| repo.url == "https://github.com/example/keep-me")
         );
+    }
+
+    /// `[indexing] with_trigrams` must be accepted, default off, and live in
+    /// the top-level section rather than `[server.indexing]` — it describes how
+    /// sources are indexed in every mode, not server scheduling.
+    #[test]
+    fn indexing_config_accepts_with_trigrams_and_defaults_off() {
+        // Absent → off, so existing configs keep today's opt-in behaviour and
+        // nobody starts paying the storage cost unasked.
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(!cfg.indexing.with_trigrams);
+
+        // Present → honoured, and coexisting with the limit already in this
+        // section.
+        let toml = format!(
+            "{MINIMAL_TOML}\n\n[indexing]\nwith_trigrams = true\nmax_source_file_bytes = 4096\n"
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert!(cfg.indexing.with_trigrams);
+        assert_eq!(cfg.indexing.max_source_file_bytes, 4096);
+
+        // Explicit false is respected, not just treated as absent.
+        let off = format!("{MINIMAL_TOML}\n\n[indexing]\nwith_trigrams = false\n");
+        let cfg = InstanceConfig::from_toml_str(&off).expect("should parse");
+        assert!(!cfg.indexing.with_trigrams);
     }
 
     #[test]

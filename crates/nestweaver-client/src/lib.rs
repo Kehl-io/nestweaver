@@ -493,12 +493,83 @@ fn adoption_lock_verdict(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRequest {
+    AutomaticReplacement,
+    ExplicitCommand,
+}
+
+fn restart_ownership_allowed(
+    owner: nestweaver_daemon::lifecycle::DaemonLifecycleOwner,
+    request: RestartRequest,
+    verified_platform_supervisor: bool,
+) -> bool {
+    owner == nestweaver_daemon::lifecycle::DaemonLifecycleOwner::NestweaverManaged
+        || (request == RestartRequest::ExplicitCommand && verified_platform_supervisor)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_supervisor_matches(db_path: &Path, instance_id: &str) -> bool {
+    if !nestweaver_daemon::launchd::is_running(instance_id) {
+        return false;
+    }
+    let plist = nestweaver_daemon::lifecycle::launchd_plist_path(instance_id);
+    let Ok(contents) = std::fs::read_to_string(plist) else {
+        return false;
+    };
+    let Some(plist_db) = nestweaver_daemon::launchd::parse_db_path_from_plist(&contents) else {
+        return false;
+    };
+    nestweaver_daemon::lifecycle::canonical_db_path(&plist_db)
+        == nestweaver_daemon::lifecycle::canonical_db_path(db_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_supervisor_matches(_db_path: &Path, _instance_id: &str) -> bool {
+    false
+}
+
 /// Capture trustworthy live daemon ownership and configuration before any
-/// shutdown request. Callers must not shut down when this returns an error.
+/// automatic version-replacement shutdown request. Callers must not shut down
+/// when this returns an error.
 pub fn prepare_restart(
     db_path: &Path,
     health: &nestweaver_proto::HealthCheckResponse,
     explicit_config: Option<&Path>,
+) -> Result<PreparedRestart> {
+    prepare_restart_for(
+        db_path,
+        health,
+        explicit_config,
+        RestartRequest::AutomaticReplacement,
+    )
+}
+
+/// Prepare a user-requested `daemon restart`.
+///
+/// Automatic replacement remains limited to NestWeaver-managed detached
+/// daemons. An explicit command may also restart a daemon whose launchd job and
+/// plist are both verified to target this exact database; the restart command
+/// preserves that supervisor route instead of replacing it with a detached
+/// process.
+pub fn prepare_explicit_restart(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+    explicit_config: Option<&Path>,
+) -> Result<PreparedRestart> {
+    prepare_restart_for(
+        db_path,
+        health,
+        explicit_config,
+        RestartRequest::ExplicitCommand,
+    )
+}
+
+fn prepare_restart_for(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+    explicit_config: Option<&Path>,
+    request: RestartRequest,
 ) -> Result<PreparedRestart> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let prepared = (|| {
@@ -508,12 +579,23 @@ pub fn prepare_restart(
             health.instance_id
         );
         let pidfile = open_verified_live_pidfile(&instance_id, health.pid)?;
-        let config = select_restart_config(explicit_config, || {
-            nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
-                &instance_id,
-                health.pid,
-            )
-        })?;
+        let binding = nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
+            &instance_id,
+            health.pid,
+        )?;
+        let verified_platform_supervisor = launchd_supervisor_matches(db_path, &instance_id);
+        anyhow::ensure!(
+            restart_ownership_allowed(
+                binding.lifecycle_owner,
+                request,
+                verified_platform_supervisor
+            ),
+            "daemon PID {} is supervisor-managed, foreground, or has unknown lifecycle ownership; refusing to shut it down and replace it with a detached process. Restart it through its supervisor (for systemd: `systemctl --user restart nestweaver`; for launchd: `launchctl kickstart -k gui/$(id -u)/{}`), or stop it and run `nestweaver daemon --db {} start`",
+            health.pid,
+            nestweaver_daemon::lifecycle::launchd_label(&instance_id),
+            db_path.display()
+        );
+        let config = select_restart_config(explicit_config, || Ok(binding))?;
         Ok(PreparedRestart {
             config,
             daemon_pid: health.pid,
@@ -530,8 +612,10 @@ fn restart_prepare_result<T>(db_path: &Path, prepared: Result<T>) -> Result<T> {
     prepared.with_context(|| {
         format!(
             "refusing automatic daemon restart because its live configuration and ownership could not be verified. \
-             The daemon has not been shut down. Re-run this command with --config <path>, or restart it manually \
-             with `nestweaver daemon --db {} restart --config <path>`",
+             The daemon has not been shut down. Restart it through its supervisor. If it is intentionally \
+             NestWeaver-managed, run `nestweaver daemon --db {} stop`, verify that it exits, then run \
+             `nestweaver daemon --db {} start --config <path>`",
+            db_path.display(),
             db_path.display()
         )
     })
@@ -1651,7 +1735,10 @@ credential_method = "gh"
             ),
         )
         .unwrap_err();
-        assert!(format!("{old_daemon:#}").contains("restart it manually"));
+        assert!(
+            format!("{old_daemon:#}").contains("Restart it through its supervisor"),
+            "{old_daemon:#}"
+        );
     }
 
     #[test]
@@ -2161,6 +2248,79 @@ credential_method = "gh"
             let _ =
                 fs::remove_dir_all(nestweaver_daemon::lifecycle::runtime_dir(&self.instance_id));
         }
+    }
+
+    #[test]
+    fn version_replacement_requires_verified_nestweaver_ownership() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = RuntimeDirFixture::new(&dir);
+        let pid = std::process::id();
+        fs::write(&fixture.pidfile, format!("{pid}\n")).unwrap();
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.pidfile)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let health = health_for(pid, &fixture.instance_id);
+
+        let external = nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+            pid,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults,
+        );
+        nestweaver_daemon::lifecycle::write_effective_config_binding(
+            &fixture.instance_id,
+            &external,
+        )
+        .unwrap();
+        let refusal = prepare_restart(&fixture.db, &health, None).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("refusing to shut it down"),
+            "{refusal:#}"
+        );
+
+        let autostart =
+            nestweaver_daemon::lifecycle::EffectiveConfigBinding::new_with_lifecycle_owner(
+                pid,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults,
+                nestweaver_daemon::lifecycle::DaemonLifecycleOwner::NestweaverManaged,
+            );
+        nestweaver_daemon::lifecycle::write_effective_config_binding(
+            &fixture.instance_id,
+            &autostart,
+        )
+        .unwrap();
+        let prepared = prepare_restart(&fixture.db, &health, None)
+            .expect("a live, attested NestWeaver-managed owner may be replaced");
+        assert_eq!(prepared.daemon_pid, pid);
+    }
+
+    #[test]
+    fn only_an_explicit_command_may_use_verified_platform_supervisor_ownership() {
+        use nestweaver_daemon::lifecycle::DaemonLifecycleOwner;
+
+        assert!(restart_ownership_allowed(
+            DaemonLifecycleOwner::NestweaverManaged,
+            RestartRequest::AutomaticReplacement,
+            false,
+        ));
+        assert!(!restart_ownership_allowed(
+            DaemonLifecycleOwner::ExternalOrUnknown,
+            RestartRequest::AutomaticReplacement,
+            true,
+        ));
+        assert!(restart_ownership_allowed(
+            DaemonLifecycleOwner::ExternalOrUnknown,
+            RestartRequest::ExplicitCommand,
+            true,
+        ));
+        assert!(!restart_ownership_allowed(
+            DaemonLifecycleOwner::ExternalOrUnknown,
+            RestartRequest::ExplicitCommand,
+            false,
+        ));
     }
 
     #[test]

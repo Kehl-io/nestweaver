@@ -1248,7 +1248,11 @@ impl GraphStore {
         Ok(())
     }
 
-    fn mark_regex_scope_dirty_on(
+    /// Advance a regex scope's desired epoch in the caller's transaction.
+    ///
+    /// Bulk and incremental writers must use this variant so the graph
+    /// mutation and its derived-index invalidation commit atomically.
+    pub fn mark_regex_scope_dirty_on(
         conn: &lbug::Connection<'_>,
         scope_uid: &str,
         tombstone: bool,

@@ -444,6 +444,32 @@ pub fn activate_operation(
 /// Select a validated publication but leave the journal in `Activating` so
 /// the caller can run a startup/read smoke against the exact path that
 /// `CURRENT` resolves. A failed smoke may roll the pointer back before the
+/// A publication failure that retrying cannot fix.
+///
+/// nw-148: the rebuild path recorded a hardcoded `retryable = true` for every
+/// failure, including ones that can never succeed on retry — a lost CURRENT
+/// compare-and-swap (the expected predecessor will never be CURRENT again) and
+/// a slot artifact that fails digest validation (a retry revalidates the same
+/// corrupt bytes and fails identically). Because the flag drives
+/// `resume_operation`, which refuses non-retryable failures, marking everything
+/// retryable removed the only signal that would tell an operator to discard and
+/// start fresh.
+///
+/// A marker type rather than string matching on the message, so the raise site
+/// owns the classification and it cannot drift when wording changes.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PermanentPublicationFailure(pub String);
+
+impl PermanentPublicationFailure {
+    /// True when `error` (or any of its sources) is permanent.
+    pub fn is_permanent(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.is::<PermanentPublicationFailure>())
+    }
+}
+
 /// operation is made terminal.
 pub fn select_operation(
     publication_root: &Path,
@@ -646,7 +672,24 @@ pub fn discard_operation(
         );
     }
     if state.phase != PublicationPhase::Cancelled && state.failure.is_none() {
-        anyhow::bail!("only a cancelled or failed staging operation may be discarded");
+        // nw-146: name the escape. A cancellation that was REQUESTED but never
+        // acknowledged (its worker crashed, was Ctrl-C'd, or ran
+        // --no-activate) lands here, and the old message left the operator
+        // with no next step while a full graph copy stayed on disk.
+        if state.cancel_requested {
+            anyhow::bail!(
+                "publication operation {} has a cancellation requested but not acknowledged \
+                 (phase {:?}) — no worker is left to acknowledge it. Re-run with --force to \
+                 acknowledge and discard in one step.",
+                state.plan.operation_uuid,
+                state.phase
+            );
+        }
+        anyhow::bail!(
+            "only a cancelled or failed staging operation may be discarded (phase {:?}); \
+             cancel it first with `nestweaver publication cancel`",
+            state.phase
+        );
     }
     if crate::publication::read_current(publication_root)?.is_some_and(|pointer| {
         uuid_equal(
@@ -708,7 +751,8 @@ pub fn discard_invalid_operation(
         })?;
         nestweaver_store::durable_sidecar::sync_parent_directory_durable(&operation_dir)?;
         anyhow::bail!(
-            "publication operation journal is readable; discard it with an exact --revision"
+            "publication operation journal is readable; discard it with an exact --revision \
+             (add --force if a cancellation was requested but never acknowledged)"
         );
     }
     std::fs::remove_dir_all(&tombstone)?;
@@ -770,10 +814,12 @@ fn validate_target_slot(
             anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
         })?;
         if byte_size != descriptor.byte_size || digest != descriptor.blake3 {
-            anyhow::bail!(
+            // Permanent: a retry revalidates the same bytes (nw-148).
+            return Err(PermanentPublicationFailure(format!(
                 "target artifact {} failed size or digest validation",
                 descriptor.path
-            );
+            ))
+            .into());
         }
     }
     Ok(crate::hash::blake3_hex_bytes(&bytes))
@@ -1214,6 +1260,69 @@ mod tests {
         create_operation(dir.path(), plan.clone()).unwrap();
         let error = discard_invalid_operation(dir.path(), &plan.operation_uuid).unwrap_err();
         assert!(error.to_string().contains("journal is readable"));
+    }
+
+    /// nw-148: a hardcoded `retryable = true` marked permanently-failed
+    /// operations as retryable, and the flag drives resume_operation — so the
+    /// one signal that would tell an operator to discard and start fresh was
+    /// never emitted.
+    #[test]
+    fn permanent_failures_are_distinguishable_from_retryable_ones() {
+        let permanent: anyhow::Error = PermanentPublicationFailure(
+            "CURRENT compare-and-swap conflict: expected a, observed b".into(),
+        )
+        .into();
+        assert!(PermanentPublicationFailure::is_permanent(&permanent));
+        // The message must survive classification unchanged, since operators
+        // and existing assertions read it.
+        assert!(permanent.to_string().contains("compare-and-swap conflict"));
+
+        // Wrapped in context, as the rebuild path propagates it.
+        let wrapped = permanent.context("publication rebuild failed");
+        assert!(
+            PermanentPublicationFailure::is_permanent(&wrapped),
+            "classification must survive context wrapping"
+        );
+
+        // An ordinary transient failure stays retryable.
+        let transient = anyhow::anyhow!("connection reset while streaming artifact");
+        assert!(!PermanentPublicationFailure::is_permanent(&transient));
+    }
+
+    /// nw-146: `request_cancel` only sets the flag; only the RUNNING worker
+    /// acknowledges it. When that worker is gone, both discard paths refused
+    /// and the staged slot — a full graph copy — was stranded with no CLI
+    /// route to reclaim it.
+    #[test]
+    fn an_unacknowledged_cancel_is_discardable_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = create_operation(root, plan()).unwrap();
+
+        // The worker is gone, so nothing ever acknowledges this.
+        let cancelled = request_cancel(root, &state.plan.operation_uuid, state.revision).unwrap();
+        assert!(cancelled.cancel_requested);
+        assert_ne!(cancelled.phase, PublicationPhase::Cancelled);
+
+        // Before: refused, and the message must now name the way out.
+        let error = discard_operation(root, &cancelled.plan.operation_uuid, cancelled.revision)
+            .expect_err("an unacknowledged cancel is not directly discardable");
+        let message = error.to_string();
+        assert!(
+            message.contains("--force"),
+            "the refusal must name the escape: {message}"
+        );
+
+        // --force path: acknowledge, then discard.
+        let acknowledged =
+            acknowledge_cancel(root, &cancelled.plan.operation_uuid, cancelled.revision).unwrap();
+        assert_eq!(acknowledged.phase, PublicationPhase::Cancelled);
+        discard_operation(
+            root,
+            &acknowledged.plan.operation_uuid,
+            acknowledged.revision,
+        )
+        .expect("an acknowledged cancellation must be discardable");
     }
 
     #[test]
