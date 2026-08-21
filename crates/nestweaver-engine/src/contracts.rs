@@ -700,8 +700,114 @@ pub fn detect_handlers(
     match framework {
         "spring" => detect_spring_handlers(source, symbols),
         "nestjs" => detect_nestjs_handlers(source, symbols),
+        "express" | "fastify" => detect_node_route_handlers(source, symbols),
         _ => Vec::new(),
     }
+}
+
+/// Receivers a Node route registration is called on.
+const NODE_ROUTE_RECEIVERS: &[&str] = &["fastify", "app", "router", "server", "api"];
+
+/// HTTP methods a Node route registration can name.
+const NODE_ROUTE_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options",
+];
+
+/// Parse one source line into `(verb, path)` when it registers a Node route.
+///
+/// Matches `<receiver>.<verb>('<path>', …)`. `fastify.route({ method: 'GET',
+/// url: '/x' })` is deliberately NOT handled: its verb and path are object
+/// properties that a line-oriented scan cannot read reliably, and a guess there
+/// would manufacture false drift in both directions.
+fn parse_node_route(line: &str) -> Option<(String, String)> {
+    for receiver in NODE_ROUTE_RECEIVERS {
+        for verb in NODE_ROUTE_VERBS {
+            let needle = format!("{receiver}.{verb}(");
+            let Some(at) = line.find(&needle) else {
+                continue;
+            };
+            // Reject a longer identifier ending in the receiver name, so
+            // `myapp.get(` and `heatmap.get(` are not read as routes.
+            if at > 0 {
+                let prev = line[..at].chars().next_back().unwrap_or(' ');
+                if prev.is_alphanumeric() || prev == '_' || prev == '$' {
+                    continue;
+                }
+            }
+            let path = first_string_arg(&line[at + needle.len() - 1..])?;
+            if !path.starts_with('/') {
+                continue;
+            }
+            return Some((verb.to_uppercase(), normalize_http_path(&path)));
+        }
+    }
+    None
+}
+
+/// The Node framework whose route registrations appear in `source`, if any.
+///
+/// nw-160: the parser's `detect_frameworks` only sees symbol SIGNATURES, and a
+/// route registration lives in a function BODY — `export function
+/// registerRoutes()` never contains `fastify.get(`. So the hint could not fire
+/// for the common shape, and the file never became a handler file. This is the
+/// same source-recovery route `detect_nestjs_controller_index` already takes
+/// for `@Controller`, which the TS parser likewise drops.
+pub fn detect_node_route_framework(source: &str) -> Option<&'static str> {
+    let mut fallback = None;
+    for line in source.lines() {
+        if parse_node_route(line).is_none() {
+            continue;
+        }
+        // A file mixing both is reported as fastify, since an Express app
+        // object is often present in a Fastify codebase but not vice versa.
+        if line.contains("fastify.") {
+            return Some("fastify");
+        }
+        fallback = Some("express");
+    }
+    fallback
+}
+
+/// Mint HTTP contracts from Express/Fastify route registrations.
+///
+/// nw-160: HTTP contracts were minted ONLY from Spring and NestJS decorators,
+/// so across 40 indexed repos the whole org graph held exactly one HTTP
+/// contract while coyote-measurement/server alone has 412 Fastify route
+/// registrations. `contracts drift` therefore reported declared_not_implemented
+/// 0 vacuously, and the http-api links declared in instance.toml could never be
+/// corroborated by contract evidence.
+///
+/// Unlike a decorator, a route registration sits INSIDE a function body, so one
+/// symbol commonly owns several routes. Each registration is attributed to the
+/// nearest enclosing symbol — the last one declared at or above its line.
+fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<HandlerMatch> {
+    let mut out = Vec::new();
+    for (offset, line) in source.lines().enumerate() {
+        let line_no = (offset + 1) as u32;
+        let Some((verb, path)) = parse_node_route(line) else {
+            continue;
+        };
+        let owner = symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.start_line <= line_no)
+            .max_by_key(|(_, symbol)| symbol.start_line)
+            .map(|(index, _)| index);
+        let Some(symbol_index) = owner else {
+            continue;
+        };
+        out.push(HandlerMatch {
+            symbol_index,
+            contract: SpecContract {
+                kind: "http".to_string(),
+                verb: Some(verb),
+                path: Some(path),
+                operation_id: None,
+            },
+            confidence: 1.0,
+        });
+    }
+    out
 }
 
 /// Maximum number of source lines above a method declaration we scan looking
@@ -2136,6 +2242,64 @@ type Query {
         assert_eq!(get.confidence, 1.0);
     }
 
+    /// nw-160: HTTP contracts were minted only from Spring/NestJS decorators,
+    /// so 412 Fastify route registrations in one repo produced zero contracts.
+    #[test]
+    fn node_route_registrations_become_http_contracts() {
+        let source = "\
+export function registerRoutes() {
+  fastify.get('/health', h);
+  fastify.post('/oauth/token', h);
+  app.delete('/item/:id', h);
+}
+export function unrelated() {
+  const total = heatmap.get('x');
+  myapp.get('not-a-route');
+}
+";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "registerRoutes".into(),
+                signature: "export function registerRoutes()".into(),
+                start_line: 1,
+            },
+            HandlerSymbol {
+                name: "unrelated".into(),
+                signature: "export function unrelated()".into(),
+                start_line: 6,
+            },
+        ];
+
+        let matches = detect_handlers("fastify", source, &symbols);
+        let found: Vec<(String, String)> = matches
+            .iter()
+            .map(|m| {
+                (
+                    m.contract.verb.clone().unwrap(),
+                    m.contract.path.clone().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("GET".to_string(), "/health".to_string()),
+                ("POST".to_string(), "/oauth/token".to_string()),
+                // normalize_http_path canonicalises the param so a Fastify
+                // `:id` and an OpenAPI `{id}` compare equal.
+                ("DELETE".to_string(), "/item/{}".to_string()),
+            ]
+        );
+
+        // All three belong to the enclosing function, not the later one.
+        assert!(matches.iter().all(|m| m.symbol_index == 0));
+
+        // `heatmap.get(` and `myapp.get(` must not be read as routes: a longer
+        // identifier ending in a receiver name is not that receiver, and a
+        // non-slash first argument is not a path.
+        assert_eq!(matches.len(), 3);
+    }
+
     #[test]
     fn nestjs_handler_match_with_controller_prefix() {
         let class_sig = "@Controller('approvals') export class ApprovalsController";
@@ -2438,6 +2602,7 @@ mod openapi_version_tests {
     }
 
     /// A genuinely malformed 3.0 document keeps its original error, unchanged.
+
     #[test]
     fn a_malformed_30_document_is_not_mislabelled() {
         let error = parse_spec_file_strict("openapi.yaml", "openapi: [unfinished")

@@ -2969,7 +2969,30 @@ where
                 let controller_framework = hint_by_index
                     .values()
                     .find(|h| h.role == "controller")
-                    .map(|h| h.framework.clone());
+                    .map(|h| h.framework.clone())
+                    .or_else(|| {
+                        // nw-160: Express and Fastify have no controller CLASS —
+                        // routes are registered inside function bodies, so their
+                        // hints carry role "handler". Requiring "controller"
+                        // meant those files never became handler files and no
+                        // HTTP contract was ever minted from them.
+                        hint_by_index
+                            .values()
+                            .find(|h| {
+                                h.role == "handler"
+                                    && matches!(h.framework.as_str(), "express" | "fastify")
+                            })
+                            .map(|h| h.framework.clone())
+                            .or_else(|| {
+                                // The signature-based hint cannot see a route
+                                // registered inside a function BODY, so recover
+                                // it from the retained source.
+                                source
+                                    .as_deref()
+                                    .and_then(crate::contracts::detect_node_route_framework)
+                                    .map(str::to_string)
+                            })
+                    });
                 let mut handler_file = controller_framework.map(|framework| {
                     let class_signature = raw_symbols
                         .iter()
