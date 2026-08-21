@@ -2005,20 +2005,18 @@ impl GraphStore {
     }
 
     /// Perform a vector similarity search over the embedding index.
-    /// Returns `(uid, cosine_similarity)` pairs sorted descending.
+    /// Returns `(uid, cosine_similarity)` pairs sorted descending, or `Err` for
+    /// a corrupt embedding artifact.
     ///
-    /// Retained for source compatibility. New code should use
-    /// [`try_vector_search`](Self::try_vector_search) so artifact errors do not
-    /// become panics.
-    #[deprecated(note = "use try_vector_search so corrupt embedding artifacts are handled")]
-    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
-        self.try_vector_search(query_embedding, limit)
-            .expect("legacy vector_search cannot represent embedding artifact errors")
-    }
-
-    /// Fallible vector search that preserves corruption and I/O errors.
-    /// Publication startup smoke uses this path so corrupt artifacts trigger
-    /// rollback instead of unwinding past it.
+    /// The infallible `vector_search` that used to sit here was removed rather
+    /// than left deprecated. It could not represent
+    /// `EmbeddingArtifactCorrupt`, so it `.expect()`ed — and the publication
+    /// startup smoke calls this path, where a panic would unwind past the
+    /// rollback a failed smoke exists to trigger. Deprecation labels that
+    /// hazard; it does not remove it, and `#[allow(deprecated)]` or a build
+    /// without `-D warnings` reopens it. Nothing called it, and these crates
+    /// are not published to crates.io (the release pipeline ships an npm
+    /// binary wrapper), so there was no external source compatibility to keep.
     pub fn try_vector_search(
         &self,
         query_embedding: &[f32],
@@ -2027,7 +2025,8 @@ impl GraphStore {
         self.vector_search_cancellable(query_embedding, limit, None)
     }
 
-    /// Like [`vector_search`], but threads a cooperative cancellation flag into
+    /// Like [`try_vector_search`](Self::try_vector_search), but threads a
+    /// cooperative cancellation flag into
     /// the parallel embedding scan. `cancel = None` is the original behavior;
     /// a tripped flag yields `Err(StoreError::Cancelled(_))` rather than a
     /// silently-truncated (and cacheable) empty result.
@@ -2046,7 +2045,7 @@ impl GraphStore {
 
     /// Perform a filtered vector similarity search over the embedding index.
     /// Only embeddings whose UID contains `uid_prefix` are considered.
-    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    /// When `uid_prefix` is `None`, behaves identically to `try_vector_search`.
     pub fn vector_search_filtered(
         &self,
         query_embedding: &[f32],

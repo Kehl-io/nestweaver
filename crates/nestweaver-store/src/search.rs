@@ -1129,17 +1129,16 @@ impl EmbeddingIndex {
         Ok(())
     }
 
-    /// Return the top-`limit` (uid, similarity) pairs sorted descending.
+    /// Return the top-`limit` (uid, similarity) pairs sorted descending, or
+    /// `Err` for a corrupt embedding artifact.
     ///
     /// Uses rayon for parallel iteration and assumes stored embeddings are
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
-    #[deprecated(note = "use try_vector_search so corrupt embedding artifacts are handled")]
-    pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
-        self.try_vector_search(query_vec, limit)
-            .expect("legacy vector_search cannot represent embedding artifact errors")
-    }
-
-    /// Fallible vector search that preserves corruption and I/O errors.
+    ///
+    /// See [`GraphStore::try_vector_search`] for why the infallible variant was
+    /// removed instead of deprecated.
+    ///
+    /// [`GraphStore::try_vector_search`]: crate::db::GraphStore::try_vector_search
     pub fn try_vector_search(
         &self,
         query_vec: &[f32],
@@ -1148,7 +1147,8 @@ impl EmbeddingIndex {
         self.vector_search_cancellable(query_vec, limit, None)
     }
 
-    /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
+    /// Like [`try_vector_search`](Self::try_vector_search), but cooperatively
+    /// bails when `cancel` trips (a
     /// query timeout or client disconnect). Once tripped, per-embedding scoring
     /// is skipped so the parallel scan drains cheaply, then the whole call
     /// returns `Err(StoreError::Cancelled(_))` — a cancelled computation is
@@ -1325,8 +1325,8 @@ impl EmbeddingIndex {
             .or_else(|| self.base.as_ref().map(|base| base.dimension))
     }
 
-    /// Like `vector_search`, but pre-filters embeddings whose UID contains `uid_prefix`.
-    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    /// Like `try_vector_search`, but pre-filters embeddings whose UID contains
+    /// `uid_prefix`. When `uid_prefix` is `None`, behaves identically to it.
     pub fn vector_search_filtered(
         &self,
         query_vec: &[f32],
