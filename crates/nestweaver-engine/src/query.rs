@@ -3455,7 +3455,7 @@ mod semantic_leg_tests {
         {
             let store = GraphStore::open(&db).unwrap();
             assert!(
-                store.vector_search(&[0.0; 4], 1).is_err(),
+                store.try_vector_search(&[0.0; 4], 1).is_err(),
                 "a corrupt artifact must fail closed"
             );
             assert!(
@@ -3473,7 +3473,7 @@ mod semantic_leg_tests {
         // Reopen: the artifact must now be valid and semantic search must work.
         let store = GraphStore::open(&db).unwrap();
         let hits = store
-            .vector_search(&[1.0, 0.0, 0.0, 0.0], 1)
+            .try_vector_search(&[1.0, 0.0, 0.0, 0.0], 1)
             .expect("a repaired artifact must serve semantic search");
         assert_eq!(
             hits.first().map(|(uid, _)| uid.as_str()),

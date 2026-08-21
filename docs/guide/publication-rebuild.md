@@ -21,6 +21,11 @@ revalidates the inputs before the atomic switch. Interaction history is copied
 only for stable graph UIDs that still exist; the sealed preservation receipt
 reports captured, imported, and deliberately pruned counts and checksums.
 
+`--no-embed` is intentionally incompatible with `publication rebuild` and is
+rejected before an operation or slot is created. A publication is a complete,
+validated release unit; use an ordinary non-publication index when an
+embedding-free development graph is required.
+
 The command prints its operation UUID immediately. A failure or interruption
 leaves the incumbent selected. Inspect and resume the same staging work with:
 
@@ -88,6 +93,11 @@ switching back to the abandoned publication; a later successful activation
 establishes a new one-step predecessor. Keep the predecessor until the new
 release has passed normal workload verification and a fresh backup has been
 taken.
+
+Rollback proves the currently selected graph is quiescent before changing
+`CURRENT`; an idle predecessor alone is not sufficient. Selector changes and
+destructive slot pruning also share a publication-root filesystem lock, so
+separate processes cannot select and reclaim the same slot concurrently.
 
 ## Failure behavior
 

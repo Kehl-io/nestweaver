@@ -1543,7 +1543,7 @@ fn dispatch_uncached(
         "blast_radius" => tool_blast_radius(store, args, cancel, visible),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
-        "regex_search" => tool_regex_search(store, args),
+        "regex_search" => tool_regex_search(store, args, cancel),
         "count_patterns" => tool_count_patterns(store, args),
         "brain_broken_links" => tool_brain_broken_links(store, args),
         "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
@@ -2445,7 +2445,11 @@ fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_regex_search(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let pattern = args
         .get("pattern")
         .or_else(|| args.get("query"))
@@ -2470,7 +2474,14 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
 
     let res = store
-        .regex_search(pattern, path_prefix, kinds.as_deref(), limit, max_millis)
+        .regex_search_cancellable(
+            pattern,
+            path_prefix,
+            kinds.as_deref(),
+            limit,
+            max_millis,
+            cancel,
+        )
         .map_err(|e| anyhow!("regex_search: {e}"))?;
     // nw-097: the note now rides on RegexSearchResult itself, attached by the
     // store, so the CLI and daemon paths carry it too. This tool used to bolt it
@@ -3904,21 +3915,20 @@ fn tool_brain_search(
         let matched_entities = groups.len();
         // Parity with the Tantivy path: detailed note rows carry their vault
         // (resolved from the note list already fetched above).
-        let note_vaults: HashMap<&str, &str> = notes
+        let note_sources: HashMap<&str, (&str, &str)> = notes
             .iter()
-            .map(|n| (n.uid.as_str(), n.vault_uid.as_str()))
+            .map(|n| (n.uid.as_str(), (n.vault_uid.as_str(), n.file_path.as_str())))
             .collect();
         let rows: Vec<Value> = note_order
             .iter()
             .take(limit)
             .filter_map(|nuid| groups.get(nuid))
             .map(|g| {
-                if concise {
+                let mut row = if concise {
                     json!({
                         "uid": g.note_uid,
                         "kind": grouped_row_kind(&g.note_uid),
                         "title": g.best_title,
-                        "matched_headings": g.matched_headings,
                     })
                 } else {
                     json!({
@@ -3926,10 +3936,21 @@ fn tool_brain_search(
                         "kind": grouped_row_kind(&g.note_uid),
                         "title": g.best_title,
                         "score": g.best_score,
-                        "vault_uid": note_vaults.get(g.note_uid.as_str()).copied().unwrap_or_default(),
-                        "matched_headings": g.matched_headings,
                     })
+                };
+                if let Some((vault_uid, file_path)) = note_sources.get(g.note_uid.as_str()).copied()
+                {
+                    if !vault_uid.is_empty() {
+                        row["vault_uid"] = json!(vault_uid);
+                    }
+                    if !file_path.is_empty() {
+                        row["location"] = json!(file_path);
+                    }
                 }
+                if !g.matched_headings.is_empty() {
+                    row["matched_headings"] = json!(g.matched_headings);
+                }
+                row
             })
             .collect();
 
@@ -4371,12 +4392,11 @@ fn group_search_hits_by_note(
         .take(limit)
         .filter_map(|nuid| groups.get(nuid))
         .map(|g| {
-            if concise {
+            let mut row = if concise {
                 json!({
                     "uid": g.note_uid,
                     "kind": grouped_row_kind(&g.note_uid),
                     "title": g.best_title,
-                    "matched_headings": g.matched_headings,
                 })
             } else {
                 json!({
@@ -4384,11 +4404,18 @@ fn group_search_hits_by_note(
                     "kind": grouped_row_kind(&g.note_uid),
                     "title": g.best_title,
                     "score": g.best_score,
-                    "location": g.file_path,
-                    "vault_uid": g.vault_uid,
-                    "matched_headings": g.matched_headings,
                 })
+            };
+            if !g.file_path.is_empty() {
+                row["location"] = json!(g.file_path);
             }
+            if !g.vault_uid.is_empty() {
+                row["vault_uid"] = json!(g.vault_uid);
+            }
+            if !g.matched_headings.is_empty() {
+                row["matched_headings"] = json!(g.matched_headings);
+            }
+            row
         })
         .collect();
     Ok(GroupedNoteResults { rows, total })
@@ -5056,6 +5083,35 @@ mod brain_search_total_contract_tests {
             grouped.rows[0]["matched_headings"],
             json!(["Shared", "Other"])
         );
+    }
+
+    #[test]
+    fn local_brain_search_omits_empty_optional_arrays_like_daemon_route() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:title-only", "Titleonlyneedle"))
+            .unwrap();
+        let hit = nestweaver_store::SearchHit {
+            uid: "note:title-only".to_string(),
+            kind: "note".to_string(),
+            title: "Titleonlyneedle".to_string(),
+            vault_uid: "vlt:test".to_string(),
+            note_uid: "note:title-only".to_string(),
+            score: 1.0,
+        };
+
+        for concise in [false, true] {
+            let grouped = group_search_hits_by_note(
+                &store,
+                std::slice::from_ref(&hit),
+                SearchTotal::exact(1),
+                10,
+                concise,
+            )
+            .unwrap();
+            assert!(grouped.rows[0].get("matched_headings").is_none());
+            assert_eq!(grouped.rows[0]["vault_uid"], "vlt:test");
+        }
     }
 
     #[test]
@@ -12398,9 +12454,13 @@ mod arg_alias_tests {
         // A bogus kind used to filter out every candidate and return empty
         // results; now it is an error naming the advertised kinds.
         let store = GraphStore::in_memory().unwrap();
-        let err = tool_regex_search(&store, json!({ "pattern": "x", "kinds": ["Function"] }))
-            .unwrap_err()
-            .to_string();
+        let err = tool_regex_search(
+            &store,
+            json!({ "pattern": "x", "kinds": ["Function"] }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("unknown kind 'Function'") && err.contains("Section, Note, Symbol"),
             "{err}"
@@ -12414,6 +12474,7 @@ mod arg_alias_tests {
         tool_regex_search(
             &store,
             json!({ "pattern": "x", "kinds": ["section", "NOTE"] }),
+            None,
         )
         .expect("case-insensitive advertised kinds must be accepted");
     }
@@ -12469,7 +12530,9 @@ mod arg_alias_tests {
         // is a scan-cost lever, not a query.
         let store = GraphStore::in_memory().unwrap();
         for args in [json!({ "pattern": "" }), json!({ "pattern": "   " })] {
-            let err = tool_regex_search(&store, args).unwrap_err().to_string();
+            let err = tool_regex_search(&store, args, None)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("empty pattern"), "{err}");
         }
     }

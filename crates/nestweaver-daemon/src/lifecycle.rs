@@ -14,6 +14,24 @@ static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Process-local proof that this daemon was started through NestWeaver's
+/// managed `daemon start` path. Unlike an environment variable, an external
+/// supervisor cannot accidentally inherit or forge this marker. The command
+/// sets it only after acquiring or validating the locked spawn descriptor.
+static VERIFIED_NESTWEAVER_MANAGED_START: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn mark_verified_nestweaver_managed_start() {
+    VERIFIED_NESTWEAVER_MANAGED_START.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn clear_verified_nestweaver_managed_start() {
+    VERIFIED_NESTWEAVER_MANAGED_START.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_verified_nestweaver_managed_start() -> bool {
+    VERIFIED_NESTWEAVER_MANAGED_START.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Process-wide lock serializing every test that swaps OR durably reads the
 /// XDG/socket-fallback env vars. Defined at module level (not inside the
@@ -259,6 +277,20 @@ pub enum EffectiveConfigBindingSource {
     CompiledDefaults,
 }
 
+/// The authority responsible for keeping a daemon alive.
+///
+/// Only `NestweaverManaged` authorizes in-client version replacement. This
+/// covers manual and automatic `daemon start`, both of which prove the spawn
+/// lock before forking. Foreground and supervisor-owned daemons must be
+/// restarted by their owner so a detached process cannot escape it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLifecycleOwner {
+    NestweaverManaged,
+    #[default]
+    ExternalOrUnknown,
+}
+
 /// Versioned daemon-owned live binding between an instance, PID, and its
 /// effective configuration. This record is meaningful only while `pid` still
 /// identifies the daemon holding the corresponding pidfile lock.
@@ -267,14 +299,29 @@ pub struct EffectiveConfigBinding {
     pub version: u32,
     pub pid: u32,
     pub effective_config: EffectiveConfigBindingSource,
+    #[serde(default)]
+    pub lifecycle_owner: DaemonLifecycleOwner,
 }
 
 impl EffectiveConfigBinding {
     pub fn new(pid: u32, effective_config: EffectiveConfigBindingSource) -> Self {
+        Self::new_with_lifecycle_owner(
+            pid,
+            effective_config,
+            DaemonLifecycleOwner::ExternalOrUnknown,
+        )
+    }
+
+    pub fn new_with_lifecycle_owner(
+        pid: u32,
+        effective_config: EffectiveConfigBindingSource,
+        lifecycle_owner: DaemonLifecycleOwner,
+    ) -> Self {
         Self {
             version: EFFECTIVE_CONFIG_BINDING_VERSION,
             pid,
             effective_config,
+            lifecycle_owner,
         }
     }
 }
@@ -2278,7 +2325,10 @@ pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
 pub fn stop_legacy_hash_daemon(db_path: &Path) {
     let new_id = instance_id_from_db_path(db_path);
     let old_id = legacy_instance_id_from_db_path(db_path);
-    retire_daemon_under_old_identity(&old_id, &new_id, "hash algorithm upgrade");
+    if let Err(error) = retire_daemon_under_old_identity(&old_id, &new_id, "hash algorithm upgrade")
+    {
+        tracing::warn!(%error, "could not retire daemon under the legacy hash identity");
+    }
 }
 
 /// Stop a daemon bound to the pre-anchoring, SELECTED-SLOT instance id.
@@ -2296,18 +2346,40 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
 /// over resolves to its own base path and returns immediately, and an
 /// unreadable CURRENT is not a reason to fail a daemon start.
 pub fn stop_selected_slot_identity_daemon(db_path: &Path) {
-    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
-    let Ok(selected) = nestweaver_engine::publication::resolve_selected_database(&anchor) else {
-        return;
-    };
-    // No publication in play — the pre-fix id equals the new one.
-    if selected == anchor {
-        return;
+    if let Err(error) = retire_selected_slot_identity_daemon(db_path) {
+        tracing::warn!(%error, "could not retire daemon under the selected-slot identity");
     }
+}
+
+/// Fallible selected-slot migration for direct lifecycle commands. Unlike the
+/// best-effort autostart compatibility hook, this refuses to let a command
+/// claim success while a verified old owner is still draining or its identity
+/// cannot be proved safely.
+pub fn retire_selected_slot_identity_daemon(db_path: &Path) -> anyhow::Result<()> {
+    let Some(old_id) = selected_slot_identity_instance_id(db_path) else {
+        return Ok(());
+    };
+    let new_id = instance_id_from_db_path(db_path);
+    retire_daemon_under_old_identity(&old_id, &new_id, "publication identity anchoring")
+}
+
+/// Return the pre-anchoring selected-slot identity when a publication is
+/// active. This read-only probe lets direct lifecycle commands report the same
+/// legacy owner that autostart migrates instead of claiming no daemon exists.
+pub fn selected_slot_identity_instance_id(db_path: &Path) -> Option<String> {
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let root = nestweaver_engine::publication::default_publication_root(&anchor);
+    let current = nestweaver_engine::publication::read_current(&root).ok()??;
+    // Identity recovery must not open or validate the selected graph: a corrupt
+    // slot is exactly when an operator most needs `daemon stop` to find its
+    // runtime owner.
+    let selected = nestweaver_engine::publication::slot_path(&root, &current.publication_uuid)
+        .ok()?
+        .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
     let new_id = instance_id_from_db_path(&anchor);
     // The pre-fix identity: the SELECTED path, hashed WITHOUT the anchor step.
     let old_id = instance_id_from_canonical_path(&canonical_db_path(&selected));
-    retire_daemon_under_old_identity(&old_id, &new_id, "publication identity anchoring");
+    (old_id != new_id).then_some(old_id)
 }
 
 /// The pid of a daemon still running under the pre-anchoring, selected-slot
@@ -2339,12 +2411,16 @@ pub fn selected_slot_identity_daemon_pid(db_path: &Path) -> Option<i32> {
 /// Stop and clean up a daemon left behind under a superseded instance id.
 ///
 /// Shared by every identity migration so a new one cannot get the shutdown
-/// sequence subtly wrong: SIGTERM, bounded wait, SIGKILL, unload the launchd
-/// plist, then remove the runtime artifacts.
-fn retire_daemon_under_old_identity(old_id: &str, new_id: &str, reason: &str) {
+/// sequence subtly wrong: verified SIGTERM, bounded drain, unload the launchd
+/// plist, then remove runtime artifacts only after ownership is released.
+fn retire_daemon_under_old_identity(
+    old_id: &str,
+    new_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
     // If the ids happen to coincide, nothing to migrate.
     if new_id == old_id {
-        return;
+        return Ok(());
     }
     let old_id = old_id.to_string();
     let new_id = new_id.to_string();
@@ -2354,14 +2430,46 @@ fn retire_daemon_under_old_identity(old_id: &str, new_id: &str, reason: &str) {
     let old_rt_dir = runtime_dir(&old_id);
 
     if !old_pid_path.exists() && !old_sock_path.exists() && !old_binding_path.exists() {
-        return;
+        return Ok(());
     }
 
-    // Try to read the PID and stop the old daemon gracefully.
-    if let Ok(content) = std::fs::read_to_string(&old_pid_path)
-        && let Ok(pid) = content.trim().parse::<i32>()
-        && pid > 0
-    {
+    // Prefer kernel socket-peer identity; fall back to a pidfile only when its
+    // exact inode is still flock-owned and the daemon-owned live binding names
+    // the same PID. A numeric pidfile alone may be stale/recycled and never
+    // authorizes a signal.
+    let socket_pid = std::os::unix::net::UnixStream::connect(&old_sock_path)
+        .ok()
+        .and_then(|stream| unix_socket_peer_pid(&stream));
+    let pidfile_pid = std::fs::read_to_string(&old_pid_path)
+        .ok()
+        .and_then(|content| content.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0);
+    let pidfile_owned = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&old_pid_path)
+        .ok()
+        .is_some_and(|file| {
+            let acquired = unsafe {
+                libc::flock(
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                ) == 0
+            };
+            if acquired {
+                unsafe {
+                    libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN);
+                }
+            }
+            !acquired
+        });
+    let bound_pid = pidfile_pid.filter(|pid| {
+        pidfile_owned
+            && read_effective_config_binding_for_verified_pid(&old_id, *pid as u32).is_ok()
+    });
+    let verified_pid = socket_pid.or(bound_pid);
+
+    if let Some(pid) = verified_pid {
         let alive = unsafe { libc::kill(pid, 0) == 0 };
         if alive {
             tracing::info!(
@@ -2383,16 +2491,15 @@ fn retire_daemon_under_old_identity(old_id: &str, new_id: &str, reason: &str) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             if unsafe { libc::kill(pid, 0) == 0 } {
-                tracing::warn!(
-                    pid,
-                    "daemon under the superseded identity did not exit after SIGTERM, sending SIGKILL"
+                anyhow::bail!(
+                    "daemon PID {pid} under superseded identity {old_id} is still draining after SIGTERM; its runtime ownership was left intact"
                 );
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
+    } else if socket_pid.is_some() || pidfile_owned {
+        anyhow::bail!(
+            "superseded daemon runtime {old_id} is owned but its PID identity could not be verified during {reason}; refusing to signal or clean it"
+        );
     }
 
     // Unload the old launchd plist on macOS if it exists.
@@ -2415,6 +2522,7 @@ fn retire_daemon_under_old_identity(old_id: &str, new_id: &str, reason: &str) {
     let _ = std::fs::remove_file(&old_pid_path);
     let _ = std::fs::remove_file(&old_binding_path);
     let _ = std::fs::remove_dir(&old_rt_dir);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2507,6 +2615,39 @@ mod tests {
             instance_id_from_canonical_path(&canonical_db_path(base)),
             anchored
         );
+    }
+
+    #[test]
+    fn direct_lifecycle_probe_finds_selected_slot_identity_without_opening_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let root = nestweaver_engine::publication::default_publication_root(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            publication_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        let pointer = nestweaver_engine::publication::CurrentPublicationPointer::new(
+            &identity,
+            None,
+            "a".repeat(64),
+        )
+        .unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            serde_json::to_vec(&pointer).unwrap(),
+        )
+        .unwrap();
+
+        let selected = nestweaver_engine::publication::slot_path(&root, &identity.publication_uuid)
+            .unwrap()
+            .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE);
+        let expected = instance_id_from_canonical_path(&canonical_db_path(&selected));
+        assert_eq!(
+            selected_slot_identity_instance_id(&base).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(!selected.exists(), "the probe must not require the graph");
     }
 
     #[test]
@@ -3005,7 +3146,7 @@ mod tests {
             let binding_path = effective_config_binding_path(old_id);
             assert!(binding_path.exists(), "fixture must seed the old binding");
 
-            retire_daemon_under_old_identity(old_id, new_id, "test migration");
+            retire_daemon_under_old_identity(old_id, new_id, "test migration").unwrap();
 
             assert!(
                 !binding_path.exists(),
@@ -3030,7 +3171,7 @@ mod tests {
             write_effective_config_binding(id, &binding).unwrap();
             let binding_path = effective_config_binding_path(id);
 
-            retire_daemon_under_old_identity(id, id, "same identity");
+            retire_daemon_under_old_identity(id, id, "same identity").unwrap();
 
             assert!(
                 binding_path.exists(),

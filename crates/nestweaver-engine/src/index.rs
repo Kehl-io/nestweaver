@@ -5201,6 +5201,8 @@ fn incremental_index_with_name_and_io(
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
+        .with_context(|| "mark incremental regex scope dirty")?;
 
     store
         .commit_transaction(&txn)
@@ -5452,6 +5454,8 @@ where
 
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
+    nestweaver_store::GraphStore::mark_regex_scope_dirty_on(&txn, &r_uid, false)
+        .with_context(|| "mark server incremental regex scope dirty")?;
     store
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
@@ -9580,7 +9584,7 @@ function hello(name) { return "Hello " + name; }
         assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
         store.flush_embedding_index().unwrap();
         assert_eq!(
-            store.vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
             removed_symbol_uid,
             "precondition: stale vector must displace the live result"
         );
@@ -9598,13 +9602,13 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
 
-        let live_results = store.vector_search(&[1.0, 0.0], 1).unwrap();
+        let live_results = store.try_vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(live_results[0].0, survivor_symbol_uid);
         assert!(!store.has_embedding(&removed_symbol_uid));
         assert!(store.has_embedding(&survivor_symbol_uid));
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1).unwrap();
+        let persisted_results = reopened.try_vector_search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(persisted_results[0].0, survivor_symbol_uid);
         assert!(!reopened.has_embedding(&removed_symbol_uid));
         assert!(reopened.has_embedding(&survivor_symbol_uid));
@@ -12135,6 +12139,42 @@ function hello(name) { return "Hello " + name; }
             json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
             "sidecar must contain scores"
         );
+    }
+
+    #[test]
+    fn incremental_code_change_dirties_regex_scope_and_widens_without_losing_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("regex-dirty.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "function originalNeedle() {}\n").unwrap();
+
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/regex", None)
+            .unwrap();
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store.refresh_trigram_index(true).unwrap();
+            let clean = store
+                .regex_search("originalNeedle", None, None, None, None)
+                .unwrap();
+            assert_eq!(clean.dirty_scopes, 0);
+            assert_eq!(clean.results.len(), 1);
+        }
+
+        fs::write(
+            repo.join("main.js"),
+            "function originalNeedle() {}\nfunction watchedRegressionNeedle() {}\n",
+        )
+        .unwrap();
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/regex", None)
+            .unwrap();
+
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        let widened = store
+            .regex_search("watchedRegressionNeedle", None, None, None, None)
+            .unwrap();
+        assert_eq!(widened.dirty_scopes, 1);
+        assert_eq!(widened.results.len(), 1);
     }
 
     #[test]

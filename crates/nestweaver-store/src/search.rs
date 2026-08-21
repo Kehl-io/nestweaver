@@ -1133,9 +1133,19 @@ impl EmbeddingIndex {
     ///
     /// Uses rayon for parallel iteration and assumes stored embeddings are
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
+    #[deprecated(note = "use try_vector_search so corrupt embedding artifacts are handled")]
     pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
+        self.try_vector_search(query_vec, limit)
+            .expect("legacy vector_search cannot represent embedding artifact errors")
+    }
+
+    /// Fallible vector search that preserves corruption and I/O errors.
+    pub fn try_vector_search(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         self.vector_search_cancellable(query_vec, limit, None)
-            .expect("vector_search with cancel=None cannot be cancelled")
     }
 
     /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
@@ -2188,7 +2198,7 @@ mod tests {
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
         let query = vec![1.0_f32, 0.0, 0.0];
-        let results = idx.vector_search(&query, 10);
+        let results = idx.try_vector_search(&query, 10).unwrap();
         // The matching-dim vector scores ~1.0; the mismatched one is absent.
         let right = results.iter().find(|(u, _)| u == "sym:right").unwrap();
         assert!((right.1 - 1.0).abs() < 1e-6, "got {}", right.1);
@@ -2262,7 +2272,7 @@ mod tests {
         assert!(idx.add("b", vec![0.9, 0.1, 0.0], false));
         assert!(idx.add("c", vec![0.0, 0.0, 1.0], false));
 
-        let results = idx.vector_search(&[1.0, 0.0, 0.0], 2);
+        let results = idx.try_vector_search(&[1.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "a");
         assert_eq!(results[1].0, "b");
@@ -2274,7 +2284,7 @@ mod tests {
         for i in 0..10 {
             assert!(idx.add(&format!("sym:{i}"), vec![i as f32, 0.0], false));
         }
-        let results = idx.vector_search(&[1.0, 0.0], 3);
+        let results = idx.try_vector_search(&[1.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -2291,7 +2301,7 @@ mod tests {
 
         let loaded = EmbeddingIndex::load(&path).unwrap();
         assert_eq!(loaded.len(), 1);
-        let results = loaded.vector_search(&v, 1);
+        let results = loaded.try_vector_search(&v, 1).unwrap();
         assert_eq!(results[0].0, "sym:test");
         assert!((results[0].1 - 1.0).abs() < 1e-5);
     }
@@ -2442,6 +2452,13 @@ mod tests {
                 Err(StoreError::EmbeddingArtifactCorrupt)
             ),
             "the cancellable path must fail closed too"
+        );
+        assert!(
+            matches!(
+                corrupt.try_vector_search(&[0.1, 0.2, 0.3], 10),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "the convenience path must propagate corruption too"
         );
 
         // The write path stays fail-closed: republishing an unverified base
@@ -2761,8 +2778,11 @@ mod tests {
                 .then_with(|| left.0.cmp(&right.0))
         });
         oracle.truncate(3);
-        assert_eq!(index.vector_search(&query, 3), oracle);
-        assert_eq!(index.vector_search(&query, 0), Vec::<(String, f64)>::new());
+        assert_eq!(index.try_vector_search(&query, 3).unwrap(), oracle);
+        assert_eq!(
+            index.try_vector_search(&query, 0).unwrap(),
+            Vec::<(String, f64)>::new()
+        );
     }
 
     #[test]
