@@ -2826,6 +2826,18 @@ enum Commands {
             help = "Resolution parameter (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
         )]
         resolution: Option<f64>,
+        #[arg(
+            long,
+            default_value_t = 50,
+            help = "Maximum communities to report; 0 = all"
+        )]
+        limit: usize,
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Maximum members listed per community; 0 = all"
+        )]
+        members: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2859,8 +2871,12 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
-        #[arg(long, help = "Approximate token limit for output")]
-        token_budget: Option<usize>,
+        #[arg(
+            long,
+            default_value_t = 20_000,
+            help = "Approximate token limit for output; 0 = unlimited"
+        )]
+        token_budget: usize,
         #[arg(
             long,
             visible_alias = "name",
@@ -9992,8 +10008,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Vec<Summary> output the daemon shape cannot reproduce.
             if use_daemon && !json {
                 let mut args = serde_json::json!({ "level": level });
-                if let Some(tb) = token_budget {
-                    args["token_budget"] = serde_json::json!(tb);
+                if token_budget > 0 {
+                    args["token_budget"] = serde_json::json!(token_budget);
                 }
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
@@ -10052,17 +10068,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
-            let display: Vec<Summary> = if let Some(budget) = token_budget {
-                truncate_to_budget(&after_filter, budget)
+            // nw-182: `--token-budget` existed but defaulted to UNBOUNDED, so
+            // `summary --level file --json` emitted 8.3 MB — output
+            // proportional to the corpus, not the question — and this is
+            // exposed as an MCP tool where that is a context-window bomb. A
+            // default budget bounds it; `--token-budget 0` still returns
+            // everything.
+            let total = after_filter.len();
+            let display: Vec<Summary> = if token_budget == 0 {
+                after_filter
+            } else {
+                truncate_to_budget(&after_filter, token_budget)
                     .into_iter()
                     .cloned()
                     .collect()
-            } else {
-                after_filter
             };
+            let truncated = display.len() < total;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&display)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "summaries": display,
+                        "total": total,
+                        "returned": display.len(),
+                        "truncated": truncated,
+                    }))?
+                );
             } else if display.is_empty() {
                 println!("No summaries generated (graph may be empty).");
             } else {
@@ -10085,6 +10117,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Clusters {
             resolution,
+            limit,
+            members,
             json,
             db,
             config: config_opt,
@@ -10216,7 +10250,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 out.status(&format!(
                     "Using cached clusters (resolution={effective_resolution}) from sidecar."
                 ));
-                print_clusters_output(&cached, json)?;
+                print_clusters_output(&cached, json, limit, members)?;
                 return Ok((EXIT_SUCCESS, None));
             }
 
@@ -10253,7 +10287,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 o
             };
 
-            print_clusters_output(&output, json)?;
+            print_clusters_output(&output, json, limit, members)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -20170,29 +20204,89 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
 ///
 /// Shared so the cached and freshly-computed paths cannot drift (nw-075): the
 /// whole point of serving a cache is that the caller cannot tell the difference.
+/// Bound a clustering result for output, reporting what was dropped.
+///
+/// nw-182: `clusters --json` emitted 65 MB with no `--limit` flag at all —
+/// output proportional to the CORPUS, not to the result. It is also exposed as
+/// an MCP tool, where that is a context-window bomb rather than an answer. The
+/// MCP tool already truncated member lists at 20; the CLI did not.
+///
+/// Truncation is reported rather than silent: `total_communities` vs
+/// `returned_communities`, and a per-community `returned_members`, so a caller
+/// can tell a small graph from a truncated view. `0` means unlimited for both
+/// bounds, so the previous full output is still reachable.
+fn bounded_clusters_payload(
+    output: &nestweaver_engine::ClusteringOutput,
+    limit: usize,
+    members: usize,
+) -> serde_json::Value {
+    let total = output.communities.len();
+    let take = if limit == 0 { total } else { limit.min(total) };
+    let communities: Vec<serde_json::Value> = output.communities[..take]
+        .iter()
+        .map(|community| {
+            let member_total = community.members.len();
+            let member_take = if members == 0 {
+                member_total
+            } else {
+                members.min(member_total)
+            };
+            serde_json::json!({
+                "id": community.id,
+                "name": community.name,
+                "cohesion": community.cohesion,
+                "member_count": community.member_count,
+                "members": &community.members[..member_take],
+                "returned_members": member_take,
+                "members_truncated": member_take < member_total,
+                "key_files": community.key_files,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "resolution": output.resolution,
+        "modularity": output.modularity,
+        "communities": communities,
+        "total_communities": total,
+        "returned_communities": take,
+        "truncated": take < total,
+    })
+}
+
 fn print_clusters_output(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
+    limit: usize,
+    members: usize,
 ) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(output)?);
-    } else if output.communities.is_empty() {
-        println!("No communities detected (graph may be empty or fully disconnected).");
-    } else {
         println!(
-            "Clusters ({}, modularity={:.4}):\n",
-            output.communities.len(),
-            output.modularity
+            "{}",
+            serde_json::to_string_pretty(&bounded_clusters_payload(output, limit, members))?
         );
-        for c in &output.communities {
-            println!(
-                "  [{:>3}] {} ({} members, cohesion={:.2})",
-                c.id, c.name, c.member_count, c.cohesion
-            );
-            for f in &c.key_files {
-                println!("        {f}");
-            }
+        return Ok(());
+    }
+    if output.communities.is_empty() {
+        println!("No communities detected (graph may be empty or fully disconnected).");
+        return Ok(());
+    }
+    let total = output.communities.len();
+    let take = if limit == 0 { total } else { limit.min(total) };
+    println!("Clusters ({total}, modularity={:.4}):\n", output.modularity);
+    for c in &output.communities[..take] {
+        println!(
+            "  [{:>3}] {} ({} members, cohesion={:.2})",
+            c.id, c.name, c.member_count, c.cohesion
+        );
+        for f in &c.key_files {
+            println!("        {f}");
         }
+    }
+    if take < total {
+        println!(
+            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
+            total - take
+        );
     }
     Ok(())
 }
