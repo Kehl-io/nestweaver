@@ -54,6 +54,65 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [6.4.0](https://github.com/Kehl-io/nestweaver/compare/v6.3.0...v6.4.0) (2026-08-21)
+
+
+### Features
+
+* **config:** accept trigram refresh through `[indexing] with_trigrams` ([19a2ff5](https://github.com/Kehl-io/nestweaver/commit/19a2ff5675cb5073b9f9636a7655df325c1125b1))
+* **publication:** reclaim slots nothing can still reach ([27714be](https://github.com/Kehl-io/nestweaver/commit/27714be40d363e666fd37fea2d2cb051bd549948))
+
+
+### Bug Fixes
+
+* address four review findings, all confirmed real ([6f045e0](https://github.com/Kehl-io/nestweaver/commit/6f045e05545e27e6eb272f0286de8e361d3c95d3))
+* address second review round — cross-process lock, corruption recovery, migration reach ([26a6e3a](https://github.com/Kehl-io/nestweaver/commit/26a6e3ab0e75a9c9b05b4551cf1b12cd2af5c10e))
+* **blast-radius:** disclose when cluster data is absent, not just when it fails ([1560bbc](https://github.com/Kehl-io/nestweaver/commit/1560bbc81649c64c058cf406d3f97f835378e8ac))
+* **brain add:** surface per-file skip reasons on the daemon path ([9f4d034](https://github.com/Kehl-io/nestweaver/commit/9f4d034e31ae1cf42bc0b62e87e7258aca961f0d))
+* **cli:** bound clusters and summary output, and report what was dropped ([4a05074](https://github.com/Kehl-io/nestweaver/commit/4a0507418934dc9c768e67fb508e2fa1c7a1da10))
+* **cli:** bound daemon RPCs with a client-side timeout ([386d976](https://github.com/Kehl-io/nestweaver/commit/386d9760490b0722bb6629158c211759bf97009f))
+* close six CLI and vault contract defects ([9bc2050](https://github.com/Kehl-io/nestweaver/commit/9bc20509f7ce9816ba15b11686e0d2156da3d827))
+* **contracts:** index OpenAPI 3.1 specs instead of aborting on them ([862946e](https://github.com/Kehl-io/nestweaver/commit/862946eb63606ad3063461f7b868312424472ffa))
+* **contracts:** mint HTTP contracts from Express and Fastify routes ([ecda521](https://github.com/Kehl-io/nestweaver/commit/ecda52117ff3990d9961788372aa836270db0bb7))
+* **daemon:** anchor instance identity to the base db so a cutover cannot orphan the daemon ([a9d91b2](https://github.com/Kehl-io/nestweaver/commit/a9d91b20efc4a56dd29de1b5fc9261e052e8cd07))
+* **daemon:** make the daemon test suite pass on macOS, and gate it in CI ([f3e2529](https://github.com/Kehl-io/nestweaver/commit/f3e2529c77055f79439facd426df6b1c157d8a0c))
+* **dead-code:** stop reporting exported symbols as high-confidence dead code ([90dfa3e](https://github.com/Kehl-io/nestweaver/commit/90dfa3eb2573b28722994c02e43df01230706e64))
+* **embed:** treat config_sentence_transformers.json as the optional artifact it is ([8f85604](https://github.com/Kehl-io/nestweaver/commit/8f85604b147477ed4e5c8841d1f66755ae3dbf58))
+* **eval:** score seeds, and reject mistyped judgment keys ([4c4672f](https://github.com/Kehl-io/nestweaver/commit/4c4672f0adf04eef68ce0ac84002a025d60a41b1))
+* harden publication and query lifecycle regressions ([d0de9fe](https://github.com/Kehl-io/nestweaver/commit/d0de9fe743a6afa0d7dc3270df3b3ea5fa230f9c))
+* harden publication and query lifecycle regressions ([c7d513d](https://github.com/Kehl-io/nestweaver/commit/c7d513d784174621fc4237fecd2ad0f13eba8750))
+* **impact:** apply --repo to uniquely-resolving names, not just ambiguous ones ([a0e1662](https://github.com/Kehl-io/nestweaver/commit/a0e1662aa64b8a641a3d1533cdfcbea9d683f245))
+* **indexing:** survive non-UTF-8 sources; explain OpenAPI 3.1 failures ([c0d6475](https://github.com/Kehl-io/nestweaver/commit/c0d6475afa317436a052b25c9f2bed55cb47f6ae))
+* **lint:** make `clippy --workspace --all-targets -D warnings` pass on macOS ([01c585b](https://github.com/Kehl-io/nestweaver/commit/01c585b8a2c67e9e3e3235bbd6dbb6806b294317))
+* **parser:** index only module-scope JS consts, not block-locals ([8c059e1](https://github.com/Kehl-io/nestweaver/commit/8c059e1ba7c011c3979ec2fadf65839f1630d1cd))
+* **parser:** index wikilinks in YAML frontmatter ([aa2e7de](https://github.com/Kehl-io/nestweaver/commit/aa2e7debf96a9053e31e95357a46bb55e057f9ec))
+* **parser:** recover calls written inside Rust macro bodies ([5a453b9](https://github.com/Kehl-io/nestweaver/commit/5a453b9594bbd722cfcfdff518f0ccd74808337d))
+* **parser:** report note line numbers as file-absolute, not body-relative ([1074a86](https://github.com/Kehl-io/nestweaver/commit/1074a865a1bd668875db640597e6cf7f33d96720))
+* **parser:** stop indexing markdown anchors and hex colours as tags ([b50c8eb](https://github.com/Kehl-io/nestweaver/commit/b50c8ebf758635106725939da6ebda94088da9ab))
+* **pr-impact:** emit the full contract on the empty-diff path ([1bc33ea](https://github.com/Kehl-io/nestweaver/commit/1bc33ea2b1669e90efd433be4d717cb2978396f0))
+* **projects:** recognise the Workspaces layout, and stop writing silently ([b1b40eb](https://github.com/Kehl-io/nestweaver/commit/b1b40eb49ef820beda82af14032aed5407baf617))
+* **publication:** give an unacknowledged cancellation a way out ([5d84db2](https://github.com/Kehl-io/nestweaver/commit/5d84db24357e67d2c33bde35dc41edb74f563298))
+* **publication:** verify the PageRank fingerprint, and classify permanent failures ([0a804e4](https://github.com/Kehl-io/nestweaver/commit/0a804e4f542955361b164872809ab2354b3112ee))
+* **ranking:** let PPR abandon work for a disconnected client ([b5f48f7](https://github.com/Kehl-io/nestweaver/commit/b5f48f718e693d2de2730851fc900da588257c2d))
+* **regex:** AND a literal's trigrams instead of ORing them ([e09f1e7](https://github.com/Kehl-io/nestweaver/commit/e09f1e7d1949405d86630dcb522935911164e456))
+* **resolver:** resolve a named import to the symbol it names ([b96a13a](https://github.com/Kehl-io/nestweaver/commit/b96a13a1ee9909698a766f30de48249168676995))
+* **resolver:** resolve fully-qualified calls without a matching use ([69dc065](https://github.com/Kehl-io/nestweaver/commit/69dc06576826d6a5c9600480204f813d4d4a90aa))
+* **resolver:** stop method calls binding to unrelated same-named symbols ([0ed3d77](https://github.com/Kehl-io/nestweaver/commit/0ed3d7700b5a4167e6542bf421f129b00875bdd0))
+* **robustness:** stop sizing allocations from untrusted lengths ([72a75cd](https://github.com/Kehl-io/nestweaver/commit/72a75cd7b11462756a1ff45b700eea2ae91c40b7))
+* **tests:** repair the two pre-existing macOS integration failures, and nw-137 ([508fc54](https://github.com/Kehl-io/nestweaver/commit/508fc54df542d2933b727f0d76f6b65f8aca7236))
+* **trigrams:** carry the policy across the daemon RPC as three states, not a bool ([753f124](https://github.com/Kehl-io/nestweaver/commit/753f12468fcb93ee594002908456aa8a97abfb05))
+* v6.3.0 hardening — close every ready high/medium bug ([195a895](https://github.com/Kehl-io/nestweaver/commit/195a89551b7d12cd75d2b6f0d76d8ed2648fff9d))
+* **vault:** resolve .md-suffixed and path-qualified wikilinks ([889b593](https://github.com/Kehl-io/nestweaver/commit/889b593d30afbae1ca8b6a180b616c61f63de30f))
+
+
+### Performance Improvements
+
+* **hubs:** select top-N with a bounded heap instead of sorting the corpus ([f2c8f67](https://github.com/Kehl-io/nestweaver/commit/f2c8f671ed96aeeb1ee1041251870447ef9ee886))
+* **ranking:** hand PPR an Arc handle instead of deep-copying the graph ([818b721](https://github.com/Kehl-io/nestweaver/commit/818b7218915798006ec07c801f34f9588f7ecdde))
+* **regex:** collect a scope's sections with one scan, not one query per note ([7415ef6](https://github.com/Kehl-io/nestweaver/commit/7415ef69a3068e80604124d47d5373bfa90b1e09))
+* **store:** defer the embeddings payload checksum to first vector access ([c5a1844](https://github.com/Kehl-io/nestweaver/commit/c5a1844b87c96efe000322fd2c7e0922bad05eda))
+* **store:** hydrate UIDs through the primary-key index, not an OR chain ([d69ddfa](https://github.com/Kehl-io/nestweaver/commit/d69ddfa528349a79b384e54f8b5b52a6f9512047))
+
 ## [6.3.0](https://github.com/Kehl-io/nestweaver/compare/v6.2.0...v6.3.0) (2026-08-20)
 
 
