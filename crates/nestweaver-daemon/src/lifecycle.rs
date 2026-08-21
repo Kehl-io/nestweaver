@@ -421,7 +421,15 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
 /// For a human-readable label (parent-dir + hash), use
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    let canonical = identity_db_path(db_path);
+    instance_id_from_canonical_path(&identity_db_path(db_path))
+}
+
+/// Hash an ALREADY-canonical path into an instance id.
+///
+/// Extracted so an identity migration can reproduce a superseded id exactly —
+/// `stop_selected_slot_identity_daemon` needs the pre-anchoring hash of the
+/// SELECTED path — without duplicating the digest and drifting from it.
+fn instance_id_from_canonical_path(canonical: &Path) -> String {
     // Use SHA-256 for a stable hash that won't change across Rust versions.
     // DefaultHasher (SipHash) is explicitly documented as not portable.
     use sha2::{Digest, Sha256};
@@ -2207,12 +2215,50 @@ pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
 pub fn stop_legacy_hash_daemon(db_path: &Path) {
     let new_id = instance_id_from_db_path(db_path);
     let old_id = legacy_instance_id_from_db_path(db_path);
+    retire_daemon_under_old_identity(&old_id, &new_id, "hash algorithm upgrade");
+}
 
-    // If the hashes happen to collide, nothing to migrate.
+/// Stop a daemon bound to the pre-anchoring, SELECTED-SLOT instance id.
+///
+/// nw-145 moved instance identity from the selected path to the stable base
+/// path. That is the same class of change as the DefaultHasher → SHA-256 move
+/// above, and it has the same upgrade hazard: a daemon started by 6.3.0 while a
+/// CURRENT pointer existed bound itself to the SLOT-derived id. After the
+/// upgrade the new code computes the BASE id, so that daemon is unreachable at
+/// the new socket path while still holding the database write lock — and
+/// `daemon stop` reports nothing to stop. That is precisely the orphaning
+/// nw-145 exists to prevent, reintroduced at the upgrade boundary.
+///
+/// Resolution is best-effort and deliberately tolerant: a brain that never cut
+/// over resolves to its own base path and returns immediately, and an
+/// unreadable CURRENT is not a reason to fail a daemon start.
+pub fn stop_selected_slot_identity_daemon(db_path: &Path) {
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let Ok(selected) = nestweaver_engine::publication::resolve_selected_database(&anchor) else {
+        return;
+    };
+    // No publication in play — the pre-fix id equals the new one.
+    if selected == anchor {
+        return;
+    }
+    let new_id = instance_id_from_db_path(&anchor);
+    // The pre-fix identity: the SELECTED path, hashed WITHOUT the anchor step.
+    let old_id = instance_id_from_canonical_path(&canonical_db_path(&selected));
+    retire_daemon_under_old_identity(&old_id, &new_id, "publication identity anchoring");
+}
+
+/// Stop and clean up a daemon left behind under a superseded instance id.
+///
+/// Shared by every identity migration so a new one cannot get the shutdown
+/// sequence subtly wrong: SIGTERM, bounded wait, SIGKILL, unload the launchd
+/// plist, then remove the runtime artifacts.
+fn retire_daemon_under_old_identity(old_id: &str, new_id: &str, reason: &str) {
+    // If the ids happen to coincide, nothing to migrate.
     if new_id == old_id {
         return;
     }
-
+    let old_id = old_id.to_string();
+    let new_id = new_id.to_string();
     let old_pid_path = pidfile_path(&old_id);
     let old_sock_path = socket_path(&old_id);
     let old_binding_path = effective_config_binding_path(&old_id);
@@ -2233,7 +2279,8 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
                 pid,
                 old_id = %old_id,
                 new_id = %new_id,
-                "stopping legacy daemon (hash algorithm upgrade)"
+                reason,
+                "stopping daemon under superseded instance identity"
             );
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
@@ -2249,7 +2296,7 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
             if unsafe { libc::kill(pid, 0) == 0 } {
                 tracing::warn!(
                     pid,
-                    "legacy daemon did not exit after SIGTERM, sending SIGKILL"
+                    "daemon under the superseded identity did not exit after SIGTERM, sending SIGKILL"
                 );
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
@@ -2263,7 +2310,7 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
     let old_plist = launchd_plist_path(&old_id);
     if old_plist.exists() {
         let label = launchd_label(&old_id);
-        tracing::info!(label = %label, "unloading legacy launchd plist");
+        tracing::info!(label = %label, "unloading launchd plist for the superseded identity");
         let _ = std::process::Command::new("launchctl")
             .args([
                 "bootout",
@@ -2326,6 +2373,51 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    /// Review finding on nw-145: anchoring identity to the base path is the
+    /// same class of change as the DefaultHasher → SHA-256 move, and needs the
+    /// same upgrade migration. A daemon started by 6.3.0 while a CURRENT
+    /// pointer existed is bound to the SELECTED-SLOT id; after the upgrade the
+    /// new code computes the BASE id and cannot reach it, so it keeps holding
+    /// the write lock while `daemon stop` reports nothing to stop.
+    ///
+    /// This pins the two ids the migration must bridge. Without a publication
+    /// they coincide and the migration is a no-op, which is what keeps it from
+    /// touching an ordinary install.
+    #[test]
+    fn the_superseded_slot_identity_differs_from_the_anchored_one() {
+        let base = Path::new("/data/brain.lbug");
+        let selected = PathBuf::from(
+            "/data/brain.lbug.publications/slots/550e8400-e29b-41d4-a716-446655440000/graph.lbug",
+        );
+
+        // What this build computes, for both paths: the anchored id.
+        let anchored = instance_id_from_db_path(base);
+        assert_eq!(instance_id_from_db_path(&selected), anchored);
+
+        // What 6.3.0 computed for a selected slot: the un-anchored hash of the
+        // SELECTED path. It must differ, or there would be nothing to migrate
+        // and an orphaned daemon would be unreachable forever.
+        let superseded = instance_id_from_canonical_path(&canonical_db_path(&selected));
+        assert_ne!(
+            superseded, anchored,
+            "the pre-anchoring id must differ, otherwise the migration is dead code"
+        );
+
+        // And it must be exactly the un-anchored hash — not some third value —
+        // or the migration would look for a daemon that never existed.
+        assert_eq!(
+            superseded,
+            instance_id_from_canonical_path(&canonical_db_path(&selected))
+        );
+
+        // A brain that never cut over resolves to itself: no migration, no
+        // risk of retiring a healthy daemon on an ordinary install.
+        assert_eq!(
+            instance_id_from_canonical_path(&canonical_db_path(base)),
+            anchored
+        );
     }
 
     #[test]

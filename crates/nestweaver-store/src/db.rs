@@ -2006,7 +2006,7 @@ impl GraphStore {
         query_embedding: &[f32],
         limit: usize,
         uid_prefix: Option<&str>,
-    ) -> Vec<(String, f64)> {
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let idx = self
             .embedding_index
             .lock()

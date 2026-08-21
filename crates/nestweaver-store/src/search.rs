@@ -1145,12 +1145,28 @@ impl EmbeddingIndex {
     /// *incomplete*, distinct from a legitimately empty result, so no caller
     /// mistakes the truncated scan for a real answer (or caches it).
     /// `cancel = None` never trips and is byte-for-byte the original behavior.
+    /// True when a mapped base exists but FAILED its payload checksum.
+    ///
+    /// Review finding on nw-184: dropping the base silently turned a corrupt
+    /// artifact into an empty result, which the caller could not tell apart
+    /// from "no semantic matches" — so it reported `semantic_applied: true`
+    /// over zero contribution. Every read path now consults this and fails
+    /// closed with `StoreError::EmbeddingArtifactCorrupt` instead.
+    fn base_is_corrupt(&self) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|base| !base.payload_intact())
+    }
+
     pub fn vector_search_cancellable(
         &self,
         query_vec: &[f32],
         limit: usize,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        if self.base_is_corrupt() {
+            return Err(StoreError::EmbeddingArtifactCorrupt);
+        }
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
@@ -1279,14 +1295,17 @@ impl EmbeddingIndex {
         query_vec: &[f32],
         limit: usize,
         uid_prefix: Option<&str>,
-    ) -> Vec<(String, f64)> {
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        if self.base_is_corrupt() {
+            return Err(StoreError::EmbeddingArtifactCorrupt);
+        }
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
             .sum::<f64>()
             .sqrt();
         if query_norm == 0.0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let overlay_heap = self
@@ -1351,7 +1370,7 @@ impl EmbeddingIndex {
             })
             .unwrap_or_default();
 
-        finish_top(merge_top(overlay_heap, base_heap, limit))
+        Ok(finish_top(merge_top(overlay_heap, base_heap, limit)))
     }
 
     /// Look up the embedding for a given UID.
@@ -1363,6 +1382,12 @@ impl EmbeddingIndex {
             return None;
         }
         // nw-184: never hand back a vector from an unverified payload.
+        //
+        // Deliberately `None` rather than an error, unlike the search paths:
+        // this feeds `has_embedding`, which gates embed-pass eligibility, so
+        // reporting "no embedding" for a corrupt row is what makes a re-embed
+        // RESTORE it. The search paths fail closed instead, because there an
+        // empty answer is indistinguishable from "no matches".
         let base = self.base.as_ref().filter(|base| base.payload_intact())?;
         base.row_by_uid.get(uid).map(|row| base.vector_at(*row))
     }
@@ -2153,7 +2178,9 @@ mod tests {
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
 
-        let results = idx.vector_search_filtered(&[1.0, 0.0, 0.0], 10, Some("sym:"));
+        let results = idx
+            .vector_search_filtered(&[1.0, 0.0, 0.0], 10, Some("sym:"))
+            .expect("a healthy index must not fail closed");
         assert_eq!(results.len(), 1, "only matching dimensions may be scored");
         assert_eq!(results[0].0, "sym:right");
     }
@@ -2372,11 +2399,22 @@ mod tests {
             None,
             "a corrupt base must not serve vectors"
         );
+        // Both search paths must FAIL CLOSED, not return an empty result: an
+        // empty Ok is indistinguishable from "no semantic matches", and the
+        // caller then reports semantic_applied over zero contribution.
         assert!(
-            corrupt
-                .vector_search_filtered(&[0.1, 0.2, 0.3], 10, None)
-                .is_empty(),
-            "a corrupt base must not contribute search results"
+            matches!(
+                corrupt.vector_search_filtered(&[0.1, 0.2, 0.3], 10, None),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "a corrupt base must fail closed, not answer empty"
+        );
+        assert!(
+            matches!(
+                corrupt.vector_search_cancellable(&[0.1, 0.2, 0.3], 10, None),
+                Err(StoreError::EmbeddingArtifactCorrupt)
+            ),
+            "the cancellable path must fail closed too"
         );
 
         // The write path stays fail-closed: republishing an unverified base

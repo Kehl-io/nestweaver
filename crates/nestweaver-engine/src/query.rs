@@ -3331,7 +3331,13 @@ mod semantic_leg_tests {
 
     fn store_with_symbol() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
-        let symbol = Symbol {
+        store.insert_symbol(&payment_symbol()).unwrap();
+        store
+    }
+
+    /// The fixture symbol both the in-memory and file-backed helpers insert.
+    fn payment_symbol() -> Symbol {
+        Symbol {
             uid: "sym:payment".to_string(),
             name: "Payment".to_string(),
             kind: SymbolKind::Function,
@@ -3350,9 +3356,7 @@ mod semantic_leg_tests {
             type_info: None,
             framework_hint: None,
             canonical_id: None,
-        };
-        store.insert_symbol(&symbol).unwrap();
-        store
+        }
     }
 
     fn run_context(
@@ -3414,6 +3418,52 @@ mod semantic_leg_tests {
         );
         assert!(result.semantic_applied);
         assert!(result.degraded_components.is_empty());
+    }
+
+    /// Review finding on nw-184: deferring the payload checksum to first use
+    /// meant a CORRUPT sidecar loaded structurally, `store_has_embeddings`
+    /// reported true, the semantic leg ran, the corrupt base was silently
+    /// dropped, and `vector_knn_all` returned Ok(vec![]) — so the result
+    /// claimed `semantic_applied: true` over zero contribution. Before the
+    /// deferral, the load simply failed and the leg was skipped.
+    ///
+    /// A corrupt artifact must degrade EXACTLY like an unavailable model.
+    #[test]
+    fn a_corrupt_embedding_artifact_degrades_semantic_instead_of_claiming_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = crate::sidecar_path(&db, ".embeddings.bin");
+        {
+            let store = GraphStore::create(&db).unwrap();
+            store.insert_symbol(&payment_symbol()).unwrap();
+            store.set_embedding_metadata("test-model", 4).unwrap();
+            assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+            store.flush_embedding_index().unwrap();
+        }
+        assert!(sidecar.exists(), "fixture must produce a v2 sidecar");
+
+        // Flip the last payload byte: structurally intact, checksum broken.
+        let mut bytes = std::fs::read(&sidecar).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&sidecar, &bytes).unwrap();
+
+        let store = GraphStore::open(&db).unwrap();
+        let model = CountingEmbed { calls: 0.into() };
+        let result = run_context(&store, Some(&model), 0.35);
+
+        assert!(
+            !result.semantic_applied,
+            "a corrupt artifact must not report semantic_applied"
+        );
+        assert_eq!(
+            result.degraded_components,
+            ["semantic"],
+            "the degradation must be disclosed to the caller"
+        );
+        assert!(
+            !result.seeds.is_empty() || !result.connected.is_empty(),
+            "graph/PPR results must still survive a corrupt embedding artifact"
+        );
     }
 
     #[test]

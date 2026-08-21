@@ -23381,8 +23381,32 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             root: explicit_root,
             db,
         } => {
+            // Reclaiming slots mutates the publication directory, so it takes
+            // the same exclusivity every other mutation here does: no live
+            // daemon, plus the index-publication lease held ACROSS the
+            // enumerate-and-delete. Without both, a cutover landing between
+            // reading CURRENT and deleting could reclaim the slot that cutover
+            // had just selected — the live graph.
+            let base_db = db.clone().unwrap_or_else(default_db_path);
             let root = root(explicit_root, db)?;
-            let report = nestweaver_engine::publication::prune_slots(&root, dry_run)?;
+            let report = if dry_run {
+                // A preview writes nothing, so it needs no exclusivity — and
+                // requiring a stopped daemon just to LOOK would make the safe
+                // option the inconvenient one.
+                let store = open_store(Some(&base_db))?;
+                let lease = store
+                    .acquire_index_publication_lease()
+                    .map_err(|e| anyhow::anyhow!("acquire index publication lease: {e}"))?;
+                nestweaver_engine::publication::prune_slots(&root, &lease, true)?
+            } else {
+                ensure_no_live_daemon_for_snapshot_build(&base_db)?;
+                let store = GraphStore::open(&base_db)
+                    .with_context(|| format!("open {} read-write", base_db.display()))?;
+                let lease = store
+                    .acquire_index_publication_lease()
+                    .map_err(|e| anyhow::anyhow!("acquire index publication lease: {e}"))?;
+                nestweaver_engine::publication::prune_slots(&root, &lease, false)?
+            };
             if report.slots.is_empty() {
                 println!("No publication slots found under {}", root.display());
                 return Ok(EXIT_SUCCESS);

@@ -35,5 +35,5 @@ pub fn vector_knn_filtered(
     limit: usize,
     scope: Option<&str>,
 ) -> Result<Vec<(String, f64)>, anyhow::Error> {
-    Ok(store.vector_search_filtered(query_embedding, limit, scope))
+    Ok(store.vector_search_filtered(query_embedding, limit, scope)?)
 }

@@ -14,9 +14,12 @@ DB="${NESTWEAVER_DB:-./nestweaver.lbug}"
 TERM=$(echo "$COMMAND" | grep -oE '"[^"]+"|[^ ]+$' | tail -1 | tr -d '"')
 if [ -n "$TERM" ]; then
   RESULTS=$(nestweaver search "$TERM" --json --db "$DB" 2>/dev/null || true)
-  if [ -n "$RESULTS" ] && [ "$RESULTS" != "[]" ]; then
+  # `nestweaver search --json` returns {"results": [...]} on 6.4+ and a bare
+  # array before it. Normalise so this hook works against either binary.
+  ROWS=$(printf '%s' "$RESULTS" | jq -c 'if type == "object" then (.results // []) else . end' 2>/dev/null || printf '[]')
+  if [ "$(printf '%s' "$ROWS" | jq 'length')" -gt 0 ]; then
     echo "--- NestWeaver Graph Results ---" >&2
-    echo "$RESULTS" | jq -r '.[0:3] | .[] | "  \(.name) @ \(.file_path):\(.start_line)"' >&2
+    printf '%s' "$ROWS" | jq -r '.[0:3] | .[] | "  \(.name) @ \(.file_path):\(.start_line)"' >&2
     echo "--------------------------------" >&2
   fi
 fi

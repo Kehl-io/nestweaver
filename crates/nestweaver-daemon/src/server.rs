@@ -6663,27 +6663,34 @@ impl NestWeaverDaemon for DaemonService {
                     // below and reports the original diagnosis.
                     tracing::info!(
                         state = %status.state,
-                        "embedding model unavailable; attempting to seed the configured cache"
+                        "embedding model unavailable; seeding the configured artifact cache"
                     );
-                    load_embedding_model_with_mode(
-                        &self.state,
-                        nestweaver_embed::ArtifactMode::DownloadMissing,
-                    )
-                    .await;
-                    let (status, model) = self.state.embedding_runtime.snapshot();
-                    match model {
-                        Some(model) => model,
-                        None => {
-                            return Err(Status::failed_precondition(if status.error.is_empty() {
-                                format!("embedding is not ready (state: {})", status.state)
-                            } else {
-                                format!(
-                                    "embedding is not ready (state: {}): {}",
-                                    status.state, status.error
-                                )
-                            }));
-                        }
-                    }
+                    // Download the missing artifacts ONLY. Constructing the
+                    // model here would run it on a tokio worker, and a local
+                    // backend must be loaded on the main block_on thread or
+                    // MTLCompilerService is unreachable and Metal silently
+                    // degrades to CPU — the regression `load_embedding_model`
+                    // documents and asserts against. Seeding is pure network
+                    // and disk I/O, so it is safe from any thread.
+                    let outcome = seed_embedding_artifact_cache(&self.state);
+                    let detail = if status.error.is_empty() {
+                        format!("embedding is not ready (state: {})", status.state)
+                    } else {
+                        format!(
+                            "embedding is not ready (state: {}): {}",
+                            status.state, status.error
+                        )
+                    };
+                    return Err(Status::failed_precondition(match outcome {
+                        Ok(cache_dir) => format!(
+                            "{detail}. The missing model artifacts have now been downloaded \
+                             into {} by the daemon itself, so the write lock never changed \
+                             hands. Restart the daemon to load them \
+                             (`nestweaver daemon restart`), then re-run this command.",
+                            cache_dir.display()
+                        ),
+                        Err(error) => format!("{detail}. Seeding the cache failed: {error:#}"),
+                    }));
                 }
             };
             // The model the daemon actually loaded (startup preference: the
@@ -8015,6 +8022,12 @@ mod embedding_load_config_tests {
             "daemon startup must never contact the network"
         );
 
+        // The operator-initiated path seeds through DownloadMissing, but does
+        // so by resolving ARTIFACTS ONLY (seed_embedding_artifact_cache) —
+        // never by constructing the model, which must stay on the main
+        // block_on thread or a local backend loses Metal. This pins that the
+        // mode is reachable; the thread contract is enforced by the
+        // debug_assert in load_embedding_model itself.
         load_daemon_embedding_backend_with_mode(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
@@ -8025,7 +8038,7 @@ mod embedding_load_config_tests {
         assert_eq!(
             observed.get(),
             Some(nestweaver_embed::ArtifactMode::DownloadMissing),
-            "the operator-initiated path must be able to seed the cache"
+            "the seeding mode must remain reachable"
         );
     }
 
@@ -8359,6 +8372,47 @@ fn daemon_embedding_device_policy(
         }
         nestweaver_engine::config::EmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
     }
+}
+
+/// Download any missing local model artifacts into the configured cache.
+///
+/// nw-139: the daemon is the single writer, and since 6.3.0 the CLI refuses
+/// `embed --local` while the daemon holds the write lock — so the cache-only
+/// startup failure told operators to do the one thing the policy forbids.
+/// Seeding here removes that dead end without any lock changing hands.
+///
+/// Deliberately resolves ARTIFACTS ONLY and never constructs the model: this
+/// runs on a tokio worker, and a local backend loaded off the main block_on
+/// thread loses Metal. The caller therefore reports success as "restart to
+/// load", not as readiness.
+#[cfg(feature = "embed")]
+fn seed_embedding_artifact_cache(
+    state: &std::sync::Arc<DaemonState>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let cfg = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.embedding.clone())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        cfg.external_endpoint.is_none(),
+        "an external embedding backend does not use the local artifact cache"
+    );
+    let cache_dir =
+        embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path)
+            .map_err(|error| anyhow::anyhow!("resolve embedding cache directory: {error}"))?;
+    let stored_model_id = state
+        .store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(id, _)| id);
+    let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
+    nestweaver_embed::resolve_model_artifacts(
+        &config,
+        nestweaver_embed::ArtifactMode::DownloadMissing,
+    )?;
+    Ok(cache_dir)
 }
 
 /// The artifact mode daemon STARTUP loads under.

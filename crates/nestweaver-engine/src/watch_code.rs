@@ -112,6 +112,24 @@ impl CodeWatcher {
         self
     }
 
+    // Used only by `one_code_edit_settles_after_one_hot_batch`, which is
+    // `#[cfg(target_os = "linux")]` because it depends on inotify coalescing
+    // behaviour. macOS clippy therefore sees these as dead and, under
+    // `-D warnings`, they were DELETED in 01c585b8 — which broke the Linux
+    // build outright. The platform gate has to match the test's, not the
+    // platform the lint happened to run on.
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
+        self.debounce = Duration::from_millis(debounce_ms);
+        self
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
+        self.ready_signal = Some(ready);
+        self
+    }
+
     /// Install an external RAII lease acquired once around each published
     /// mutation batch, including the inline after-change callback.
     pub fn with_mutation_lease_factory(mut self, factory: WatchMutationLeaseFactory) -> Self {

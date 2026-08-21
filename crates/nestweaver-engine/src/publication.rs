@@ -710,7 +710,17 @@ fn directory_bytes(path: &Path) -> u64 {
 ///    unreadable ones. A journal we cannot parse cannot tell us which slot it
 ///    targeted, so every slot stays until that journal is discarded — the same
 ///    conservative choice `discard_invalid_operation` already makes.
-pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<SlotPruneReport> {
+pub fn prune_slots(
+    publication_root: &Path,
+    lease: &nestweaver_store::IndexPublicationLease<'_>,
+    dry_run: bool,
+) -> anyhow::Result<SlotPruneReport> {
+    // Proof of exclusivity, not decoration. Every other mutation of this
+    // directory — compare_and_swap_current, the rebuild path — is serialized by
+    // this lease. A prune that skipped it could read CURRENT, have a cutover
+    // land, and then delete the slot that cutover had just selected. Requiring
+    // it in the SIGNATURE means a future caller cannot forget.
+    let _ = lease;
     let slots_dir = publication_root.join("slots");
     let entries = match std::fs::read_dir(&slots_dir) {
         Ok(entries) => entries,
@@ -739,9 +749,28 @@ pub fn prune_slots(publication_root: &Path, dry_run: bool) -> anyhow::Result<Slo
     }
     let operations = crate::publication_operation::list_operations(publication_root)?;
     for operation in &operations.operations {
+        // Only IN-FLIGHT work pins a slot. A terminal journal (Activated or
+        // Cancelled) describes work that is over, and its slot's liveness is
+        // then decided solely by CURRENT and the retained predecessor above.
+        //
+        // Pinning terminal journals too was the original bug here: journals
+        // survive activation — only discard_operation removes one, and it
+        // refuses anything not cancelled-or-failed — so EVERY published slot
+        // kept a journal naming it, every slot was retained, and the prune
+        // reclaimed nothing at all. That is exactly the superseded-slot leak
+        // nw-135 exists to close, so the retention rule cancelled out the
+        // feature.
+        if operation.phase.is_terminal() {
+            continue;
+        }
         retained
             .entry(operation.plan.target_publication_uuid.clone())
-            .or_insert_with(|| format!("targeted by operation {}", operation.plan.operation_uuid));
+            .or_insert_with(|| {
+                format!(
+                    "targeted by in-flight operation {} ({:?})",
+                    operation.plan.operation_uuid, operation.phase
+                )
+            });
     }
     // An unreadable journal cannot name its target, so nothing may be reclaimed
     // while one exists.
@@ -1404,6 +1433,84 @@ mod tests {
     /// slots on disk forever, ~1.2 GB each on the real brain.
     ///
     /// The dangerous direction is over-deletion, so this pins what is KEPT.
+    /// Review finding: journals SURVIVE activation — only discard_operation
+    /// removes one, and it refuses anything not cancelled-or-failed. Retaining
+    /// every slot named by a surviving journal therefore pinned every slot ever
+    /// published, and the prune reclaimed nothing at all on a real root, while
+    /// its original test passed only because its fixture wrote slots with no
+    /// journals.
+    ///
+    /// A slot whose operation is TERMINAL and which CURRENT no longer selects
+    /// is exactly the superseded-slot leak nw-135 exists to close.
+    #[test]
+    fn prune_reclaims_a_superseded_slot_whose_journal_survived_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let mut identity = store.publication_identity().unwrap().unwrap();
+
+        // Three publications created the way the rebuild path creates them:
+        // create_operation FIRST, then the slot.
+        let mut uuids = Vec::new();
+        for _ in 0..3 {
+            let plan = crate::publication_operation::PublicationOperationPlan {
+                operation_uuid: uuid::Uuid::new_v4().to_string(),
+                brain_uuid: identity.brain_uuid.clone(),
+                target_publication_uuid: identity.publication_uuid.clone(),
+                expected_current_publication_uuid: None,
+                input_fingerprint: "f".repeat(64),
+                producer_version: "6.3.0".to_string(),
+                publication_format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+                created_unix_millis: 1,
+            };
+            let created = crate::publication_operation::create_operation(root, plan).unwrap();
+            let _ = write_slot(root, &identity);
+            uuids.push((identity.clone(), created));
+            identity = identity.next_publication().unwrap();
+        }
+
+        // An in-flight (non-terminal) journal must still pin its slot.
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let inflight = prune_slots(root, &lease, true).unwrap();
+        assert_eq!(
+            inflight.removed().count(),
+            0,
+            "operations still in flight must pin every slot they target"
+        );
+
+        // Drive all three to a terminal phase, as a successful publication does.
+        for (_, created) in &uuids {
+            let mut state =
+                crate::publication_operation::load_operation(root, &created.plan.operation_uuid)
+                    .unwrap();
+            while !state.phase.is_terminal() {
+                state = crate::publication_operation::request_cancel(
+                    root,
+                    &state.plan.operation_uuid,
+                    state.revision,
+                )
+                .unwrap();
+                state = crate::publication_operation::acknowledge_cancel(
+                    root,
+                    &state.plan.operation_uuid,
+                    state.revision,
+                )
+                .unwrap();
+            }
+        }
+
+        let report = prune_slots(root, &lease, false).unwrap();
+        assert_eq!(
+            report.removed().count(),
+            3,
+            "terminal journals must not pin superseded slots: {:?}",
+            report
+                .retained()
+                .map(|s| s.retained_because.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn prune_keeps_current_its_predecessor_and_journal_targets() {
         let dir = tempfile::tempdir().unwrap();
@@ -1439,14 +1546,15 @@ mod tests {
         drop(lease);
 
         // Dry run must report the orphan without touching the disk.
-        let preview = prune_slots(root, true).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let preview = prune_slots(root, &lease, true).unwrap();
         assert_eq!(preview.removed().count(), 1);
         assert!(
             slot_path(root, &orphan.publication_uuid).unwrap().exists(),
             "a dry run must not delete anything"
         );
 
-        let report = prune_slots(root, false).unwrap();
+        let report = prune_slots(root, &lease, false).unwrap();
         let removed: Vec<&str> = report
             .removed()
             .map(|slot| slot.publication_uuid.as_str())
@@ -1469,7 +1577,10 @@ mod tests {
         assert!(!slot_path(root, &orphan.publication_uuid).unwrap().exists());
 
         // Idempotent: a second pass finds nothing left to reclaim.
-        assert_eq!(prune_slots(root, false).unwrap().removed().count(), 0);
+        assert_eq!(
+            prune_slots(root, &lease, false).unwrap().removed().count(),
+            0
+        );
     }
 
     #[test]

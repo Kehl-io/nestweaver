@@ -397,6 +397,14 @@ fn ensure_daemon_impl(
     // new daemon can acquire the DB write lock.
     nestweaver_daemon::lifecycle::stop_legacy_hash_daemon(db_path);
 
+    // Same hazard, different superseded identity: nw-145 anchored instance ids
+    // to the stable base path, so a daemon started by 6.3.0 while a CURRENT
+    // pointer existed is bound to the SELECTED-SLOT id. It still holds the DB
+    // write lock and is unreachable at the new socket path, so retire it here
+    // too — otherwise the upgrade reintroduces exactly the orphaning nw-145
+    // exists to prevent.
+    nestweaver_daemon::lifecycle::stop_selected_slot_identity_daemon(db_path);
+
     // Also check for a legacy daemon that may hold the DB write lock at an
     // old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR which varies
     // across launchers on macOS). If found, shut it down so the new daemon
