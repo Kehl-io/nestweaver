@@ -175,9 +175,44 @@ pub fn forward_push_ppr(
     seed_uids: &[String],
     config: &PprConfig,
 ) -> Vec<(String, f64)> {
+    forward_push_ppr_cancellable(uids, adjacency, seed_uids, config, None)
+        .expect("an uncancellable run cannot be cancelled")
+}
+
+/// How often the push loop polls for cancellation.
+///
+/// A power of two so the check is a mask, and large enough that the branch is
+/// noise next to the work between checks.
+const CANCEL_POLL_INTERVAL: usize = 1024;
+
+/// [`forward_push_ppr`] that can abandon the push loop when `cancel` returns
+/// true. `None` means the caller was cancelled; partial scores are never
+/// returned, because a truncated push is a WRONG ranking rather than a
+/// coarser one.
+///
+/// nw-181: ranking carried no cancellation at all. The daemon has tripped a
+/// cancel flag on client disconnect since 2026-07-02, and traverse/search/db
+/// all poll it, but PPR — the expensive part of brain_context on a
+/// 193k-symbol graph — ran to completion regardless. That is what left the
+/// daemon burning 135 seconds of continuous CPU after every client had been
+/// killed, so back-to-back agent queries queued behind work nobody was
+/// waiting for.
+pub fn forward_push_ppr_cancellable(
+    uids: &[String],
+    adjacency: &AdjacencyData,
+    seed_uids: &[String],
+    config: &PprConfig,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Option<Vec<(String, f64)>> {
+    // Check once up front: a client that disconnected before the work started
+    // should not pay for building the outgoing edge list either, and a short
+    // run can converge before the first in-loop poll.
+    if cancel.is_some_and(|cancel| cancel()) {
+        return None;
+    }
     let n = uids.len();
     if n == 0 {
-        return vec![];
+        return Some(vec![]);
     }
 
     let seed_set: HashSet<usize> = seed_uids
@@ -187,7 +222,7 @@ pub fn forward_push_ppr(
 
     let seed_count = seed_set.len();
     if seed_count == 0 {
-        return vec![];
+        return Some(vec![]);
     }
 
     // -- Build outgoing edge list from incoming edges --
@@ -261,6 +296,16 @@ pub fn forward_push_ppr(
         if push_count > max_pushes {
             break;
         }
+        // nw-181: abandon the push loop when the client is gone. Polled on an
+        // interval so the branch costs nothing measurable, and reported as
+        // None rather than partial scores — a truncated push is a WRONG
+        // ranking, not a coarser one.
+        if push_count % CANCEL_POLL_INTERVAL == 0
+            && let Some(cancel) = cancel
+            && cancel()
+        {
+            return None;
+        }
 
         let r_v = residual[v];
         if r_v.abs() < r_max {
@@ -308,7 +353,7 @@ pub fn forward_push_ppr(
         .collect();
 
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results
+    Some(results)
 }
 
 #[cfg(test)]
@@ -851,6 +896,64 @@ mod tests {
             overlap >= take * 7 / 10,
             "Expected >= 70% overlap in top-{take}, got {overlap}/{take}. \
              PI top: {pi_top:?}, FP top: {fp_top:?}"
+        );
+    }
+
+    /// nw-181: PPR had no cancellation, so a disconnected client's push loop
+    /// ran to completion — 135 seconds of daemon CPU after every client had
+    /// been killed.
+    #[test]
+    fn a_cancelled_push_loop_abandons_instead_of_returning_partial_scores() {
+        // Big enough that the loop passes the poll interval more than once.
+        let n = 20_000;
+        let uids: Vec<String> = (0..n).map(|i| format!("sym:{i}")).collect();
+        let mut incoming = vec![Vec::new(); n];
+        for i in 1..n {
+            incoming[i].push((i - 1, 1.0));
+            incoming[i - 1].push((i, 1.0));
+        }
+        let uid_to_idx = uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| (uid.clone(), i))
+            .collect();
+        let mut out_weight = vec![0.0; n];
+        for edges in &incoming {
+            for &(u, w) in edges {
+                out_weight[u] += w;
+            }
+        }
+        let adjacency = AdjacencyData {
+            incoming,
+            uid_to_idx,
+            out_weight,
+        };
+        let config = PprConfig::default();
+        let seeds = vec![uids[0].clone()];
+
+        // Uncancelled: a real ranking comes back.
+        let full = forward_push_ppr_cancellable(&uids, &adjacency, &seeds, &config, None)
+            .expect("an uncancelled run must produce scores");
+        assert!(!full.is_empty());
+
+        // Already cancelled: None, never a truncated ranking.
+        let always = || true;
+        let cancelled = forward_push_ppr_cancellable(
+            &uids,
+            &adjacency,
+            &seeds,
+            &config,
+            Some(&always as &dyn Fn() -> bool),
+        );
+        assert!(
+            cancelled.is_none(),
+            "a cancelled push must report cancellation, not partial scores"
+        );
+
+        // The uncancellable wrapper is unaffected.
+        assert_eq!(
+            forward_push_ppr(&uids, &adjacency, &seeds, &config).len(),
+            full.len()
         );
     }
 

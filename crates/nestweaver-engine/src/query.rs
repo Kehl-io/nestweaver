@@ -1636,8 +1636,18 @@ pub fn build_brain_context_hybrid_with_aliases(
 
     // Run unified PPR with optional intent tuning.
     let damping = intent.map_or(0.85, |i| i.damping());
+    // nw-181: this path already carries the daemon's disconnect/timeout flag,
+    // so hand it to PPR — the most expensive stage — instead of letting a
+    // 193k-node push loop run for a client that is already gone.
     let ppr = store
-        .personalized_pagerank_with_intent(&seed_uids, damping, 20, &GraphScope::unified(), intent)
+        .personalized_pagerank_with_intent_cancellable(
+            &seed_uids,
+            damping,
+            20,
+            &GraphScope::unified(),
+            intent,
+            cancel.map(|flag| flag.as_ref()),
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────

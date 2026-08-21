@@ -28,7 +28,7 @@ use std::io::Write;
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
-use nestweaver_algorithms::ppr::{PprConfig, forward_push_ppr};
+use nestweaver_algorithms::ppr::PprConfig;
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -962,6 +962,33 @@ impl GraphStore {
         scope: &GraphScope,
         intent: Option<QueryIntent>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.personalized_pagerank_with_intent_cancellable(
+            seed_uids,
+            damping,
+            max_iterations,
+            scope,
+            intent,
+            None,
+        )
+    }
+
+    /// [`Self::personalized_pagerank_with_intent`] that abandons the push loop
+    /// when `cancel` trips.
+    ///
+    /// nw-181: this module had NO cancellation. The daemon has tripped a cancel
+    /// flag on client disconnect since 2026-07-02 and traverse/search/db all
+    /// poll it, but PPR — the expensive part of brain_context — ran to
+    /// completion regardless, leaving the daemon burning 135 seconds of CPU
+    /// after every client had been killed.
+    pub fn personalized_pagerank_with_intent_cancellable(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let _flight = self
             .pagerank_compute_lock
             .lock()
@@ -1083,7 +1110,19 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        let results = forward_push_ppr(&cached.uids, &cached.adjacency, seed_uids, &config);
+        let cancelled = cancel.map(|flag| {
+            move || flag.load(std::sync::atomic::Ordering::Acquire)
+        });
+        let results = nestweaver_algorithms::ppr::forward_push_ppr_cancellable(
+            &cached.uids,
+            &cached.adjacency,
+            seed_uids,
+            &config,
+            cancelled
+                .as_ref()
+                .map(|predicate| predicate as &dyn Fn() -> bool),
+        )
+        .ok_or(StoreError::Cancelled(crate::error::CancelReason::Timeout))?;
 
         {
             let mut cache = self
