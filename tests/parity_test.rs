@@ -657,9 +657,15 @@ fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
     assert_eq!(daemon_without_disk_access.stdout, direct_json.stdout);
     assert!(daemon_without_disk_access.stderr.is_empty());
     assert!(!daemon_error_without_fallback.status.success());
-    let error = String::from_utf8_lossy(&daemon_error_without_fallback.stderr);
-    assert!(error.contains("no indexed repo matches --repo 'definitely-unknown'"));
-    assert!(error.contains("refusing direct-store fallback"));
+    let error = flatten_diagnostic(&daemon_error_without_fallback.stderr);
+    assert!(
+        error.contains("no indexed repo matches --repo 'definitely-unknown'"),
+        "daemon error must name the unmatched repo; got: {error}"
+    );
+    assert!(
+        error.contains("refusing direct-store fallback"),
+        "daemon error must refuse the fallback; got: {error}"
+    );
     assert!(!error.contains("cross_repo_contracts"));
 
     let explicit_empty = run_via_daemon(
@@ -667,9 +673,15 @@ fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
         &["contracts", "list", "--repo", "", "--json"],
     );
     assert!(!explicit_empty.status.success());
-    let empty_error = String::from_utf8_lossy(&explicit_empty.stderr);
-    assert!(empty_error.contains("no indexed repo matches --repo ''"));
-    assert!(empty_error.contains("refusing direct-store fallback"));
+    let empty_error = flatten_diagnostic(&explicit_empty.stderr);
+    assert!(
+        empty_error.contains("no indexed repo matches --repo ''"),
+        "explicit-empty error must name the empty repo; got: {empty_error}"
+    );
+    assert!(
+        empty_error.contains("refusing direct-store fallback"),
+        "explicit-empty error must refuse the fallback; got: {empty_error}"
+    );
 }
 
 /// nw-108: `dead-code`'s daemon branch printed the RPC response verbatim with
@@ -678,6 +690,26 @@ fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
 /// the daemon was up. The text renderer was never missing; it was simply not
 /// reached. This is the nw-097 divergence family, and the reason it survived is
 /// that `dead-code` was not in this file.
+/// Flatten a rendered `miette` diagnostic for substring assertions.
+///
+/// The renderer hard-wraps to the terminal width and prefixes continuation
+/// lines with a `│` gutter, so a message the code emits as one string arrives
+/// split across lines: `"no\n  │ indexed repo matches --repo 'definitely-\n  │
+/// unknown'"`. Asserting on the raw bytes therefore tests the renderer's
+/// current wrap width rather than the contract under test — the same assertion
+/// passes or fails depending on how wide the box happens to be.
+///
+/// Strip the gutter and collapse all whitespace to single spaces so the
+/// assertions below check what they mean to check: that the error names the
+/// repo and refuses the fallback.
+fn flatten_diagnostic(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Replace generated bundle IDs with a fixed placeholder.
 ///
 /// `investigate` mints a fresh `bndl_<hex>` per invocation, so its stdout is

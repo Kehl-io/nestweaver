@@ -8420,6 +8420,134 @@ fn no_daemon_allowed() -> bool {
 /// `--track-interactions --no-track-interactions` to whichever came last, so
 /// "both set" is last-wins rather than an error. The explicit-off branch is
 /// still checked first so that ordering can never resolve to on-by-accident.
+/// `daemon gc` — sweep orphaned daemon runtime state.
+///
+/// Deliberately takes NO database path. It sweeps orphaned launch agents and
+/// orphaned per-instance directories under all three roots, sparing live
+/// instances by ownership proof (database write lock, pidfile lock) rather than
+/// by matching a database. Requiring `--db` made the one command meant to clean
+/// up after departed databases refuse to run without naming a live one, and
+/// contradicted its own `--help`, which lists `--db` as optional.
+fn run_daemon_gc() -> Result<(i32, Option<String>), anyhow::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
+        if report.removed.is_empty() {
+            println!(
+                "No orphaned launch agents found ({} kept, {} spared).",
+                report.kept.len(),
+                report.spared.len()
+            );
+        } else {
+            println!(
+                "Removed {} orphaned launch agent(s); kept {} live, spared {}.",
+                report.removed.len(),
+                report.kept.len(),
+                report.spared.len()
+            );
+            for label in &report.removed {
+                println!("  removed: {label}");
+            }
+        }
+        // A live daemon still holds the pidfile lock even though its
+        // DB path is currently missing (e.g. an unmounted volume) —
+        // reaping it would kill a healthy daemon, so it was spared.
+        for label in &report.spared {
+            println!("  spared (live daemon, DB path missing): {label}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    println!("No launch agents to sweep (launchd is macOS-only).");
+
+    // Per-instance directories accumulate under THREE roots on
+    // every platform (state logs, $XDG_RUNTIME_DIR, and the
+    // /tmp socket fallback): one set is created whenever a
+    // daemon auto-spawns, and nothing removed it when the
+    // database went away. Sweeping only the state root while
+    // reporting "clean" was the actual defect.
+    let report = nestweaver_daemon::lifecycle::gc_orphaned_daemon_dirs()
+        .context("sweep orphaned daemon directories")?;
+    let count_in = |root: nestweaver_daemon::lifecycle::GcRoot| {
+        report.removed.iter().filter(|(r, _)| *r == root).count()
+    };
+    if report.removed.is_empty() {
+        println!(
+            "No orphaned daemon directories found ({} kept, {} spared, {} unidentified).",
+            report.kept.len(),
+            report.spared.len(),
+            report.unidentified.len()
+        );
+    } else {
+        println!(
+            "Removed {} orphaned daemon director(ies), reclaiming {} \
+             ({} state, {} runtime, {} socket-fallback); \
+             kept {}, spared {}, {} unidentified.",
+            report.removed.len(),
+            format_bytes(report.reclaimed_bytes),
+            count_in(nestweaver_daemon::lifecycle::GcRoot::PersistentState),
+            count_in(nestweaver_daemon::lifecycle::GcRoot::RuntimeDir),
+            count_in(nestweaver_daemon::lifecycle::GcRoot::SocketFallback),
+            report.kept.len(),
+            report.spared.len(),
+            report.unidentified.len()
+        );
+    }
+    // A squatted fallback root is skipped, never swept — say so
+    // rather than letting "clean" imply it was checked.
+    if report.socket_fallback_root_untrusted {
+        println!(
+            "  skipped: the /tmp socket fallback root is not a directory owned \
+             by this user (possible squat) — left for its owner or root."
+        );
+    }
+    // Report each proof as its own fact. They are not exclusive
+    // — a healthy daemon holds BOTH its database write lock and
+    // its pidfile flock — so no line may be computed by
+    // subtracting one list from another, and an empty list says
+    // nothing at all rather than printing a zero.
+    if !report.spared_database_write_lock.is_empty() {
+        println!(
+            "  spared (database write lock held): {}",
+            report.spared_database_write_lock.len()
+        );
+        for (instance, pid) in &report.spared_database_write_lock {
+            match pid {
+                Some(pid) => println!("    {instance}: held by PID {pid}"),
+                None => {
+                    println!("    {instance}: held, but the kernel named no holder")
+                }
+            }
+        }
+    }
+    if !report.spared_pidfile_lock.is_empty() {
+        println!(
+            "  spared (pidfile lock held): {}",
+            report.spared_pidfile_lock.len()
+        );
+    }
+    // NOT evidence of ownership — evidence that we could not
+    // tell. Kept on its own line so it can never be read as
+    // "something holds this".
+    if !report.spared_database_unreadable.is_empty() {
+        println!(
+            "  spared (database lock state unreadable — spared conservatively): {}",
+            report.spared_database_unreadable.len()
+        );
+    }
+    // Surfaced rather than folded into "kept": these are
+    // instances the sweep could not identify, so they will
+    // never be reclaimed until something can name their
+    // database. Silence here would be the same dishonesty this
+    // item exists to fix.
+    if !report.unidentified.is_empty() {
+        println!(
+            "  left alone (database not identifiable from daemon.log): {}",
+            report.unidentified.len()
+        );
+    }
+    Ok((EXIT_SUCCESS, None))
+}
+
 fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: bool) -> bool {
     if force_off {
         return false;
@@ -14463,6 +14591,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::Daemon { action, db } => {
+            // `gc` is database-independent and must resolve BEFORE the shared
+            // db_path requirement below.
+            //
+            // It sweeps orphaned launch agents and orphaned per-instance
+            // directories across all three roots, sparing live instances by
+            // ownership proof (database write lock, pidfile lock) rather than by
+            // matching a database path — `gc_orphaned_agents` and
+            // `gc_orphaned_daemon_dirs` take no arguments at all. Requiring
+            // --db was therefore asking for a value the command never reads,
+            // and its own --help documents --db as optional (no default, no
+            // required marker), so the failure contradicted the help text. The
+            // user-visible symptom: the one command whose whole purpose is
+            // cleaning up after databases that no longer exist could not run
+            // without naming a database that does.
+            if matches!(action, DaemonAction::Gc) {
+                return run_daemon_gc();
+            }
             let db_path = db
                 .or_else(|| {
                     std::env::var("NESTWEAVER_DB")
@@ -15879,126 +16024,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                     Ok((EXIT_SUCCESS, None))
                 }
-                DaemonAction::Gc => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
-                        if report.removed.is_empty() {
-                            println!(
-                                "No orphaned launch agents found ({} kept, {} spared).",
-                                report.kept.len(),
-                                report.spared.len()
-                            );
-                        } else {
-                            println!(
-                                "Removed {} orphaned launch agent(s); kept {} live, spared {}.",
-                                report.removed.len(),
-                                report.kept.len(),
-                                report.spared.len()
-                            );
-                            for label in &report.removed {
-                                println!("  removed: {label}");
-                            }
-                        }
-                        // A live daemon still holds the pidfile lock even though its
-                        // DB path is currently missing (e.g. an unmounted volume) —
-                        // reaping it would kill a healthy daemon, so it was spared.
-                        for label in &report.spared {
-                            println!("  spared (live daemon, DB path missing): {label}");
-                        }
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    println!("No launch agents to sweep (launchd is macOS-only).");
-
-                    // Per-instance directories accumulate under THREE roots on
-                    // every platform (state logs, $XDG_RUNTIME_DIR, and the
-                    // /tmp socket fallback): one set is created whenever a
-                    // daemon auto-spawns, and nothing removed it when the
-                    // database went away. Sweeping only the state root while
-                    // reporting "clean" was the actual defect.
-                    let report = nestweaver_daemon::lifecycle::gc_orphaned_daemon_dirs()
-                        .context("sweep orphaned daemon directories")?;
-                    let count_in = |root: nestweaver_daemon::lifecycle::GcRoot| {
-                        report.removed.iter().filter(|(r, _)| *r == root).count()
-                    };
-                    if report.removed.is_empty() {
-                        println!(
-                            "No orphaned daemon directories found ({} kept, {} spared, {} unidentified).",
-                            report.kept.len(),
-                            report.spared.len(),
-                            report.unidentified.len()
-                        );
-                    } else {
-                        println!(
-                            "Removed {} orphaned daemon director(ies), reclaiming {} \
-                             ({} state, {} runtime, {} socket-fallback); \
-                             kept {}, spared {}, {} unidentified.",
-                            report.removed.len(),
-                            format_bytes(report.reclaimed_bytes),
-                            count_in(nestweaver_daemon::lifecycle::GcRoot::PersistentState),
-                            count_in(nestweaver_daemon::lifecycle::GcRoot::RuntimeDir),
-                            count_in(nestweaver_daemon::lifecycle::GcRoot::SocketFallback),
-                            report.kept.len(),
-                            report.spared.len(),
-                            report.unidentified.len()
-                        );
-                    }
-                    // A squatted fallback root is skipped, never swept — say so
-                    // rather than letting "clean" imply it was checked.
-                    if report.socket_fallback_root_untrusted {
-                        println!(
-                            "  skipped: the /tmp socket fallback root is not a directory owned \
-                             by this user (possible squat) — left for its owner or root."
-                        );
-                    }
-                    // Report each proof as its own fact. They are not exclusive
-                    // — a healthy daemon holds BOTH its database write lock and
-                    // its pidfile flock — so no line may be computed by
-                    // subtracting one list from another, and an empty list says
-                    // nothing at all rather than printing a zero.
-                    if !report.spared_database_write_lock.is_empty() {
-                        println!(
-                            "  spared (database write lock held): {}",
-                            report.spared_database_write_lock.len()
-                        );
-                        for (instance, pid) in &report.spared_database_write_lock {
-                            match pid {
-                                Some(pid) => println!("    {instance}: held by PID {pid}"),
-                                None => {
-                                    println!("    {instance}: held, but the kernel named no holder")
-                                }
-                            }
-                        }
-                    }
-                    if !report.spared_pidfile_lock.is_empty() {
-                        println!(
-                            "  spared (pidfile lock held): {}",
-                            report.spared_pidfile_lock.len()
-                        );
-                    }
-                    // NOT evidence of ownership — evidence that we could not
-                    // tell. Kept on its own line so it can never be read as
-                    // "something holds this".
-                    if !report.spared_database_unreadable.is_empty() {
-                        println!(
-                            "  spared (database lock state unreadable — spared conservatively): {}",
-                            report.spared_database_unreadable.len()
-                        );
-                    }
-                    // Surfaced rather than folded into "kept": these are
-                    // instances the sweep could not identify, so they will
-                    // never be reclaimed until something can name their
-                    // database. Silence here would be the same dishonesty this
-                    // item exists to fix.
-                    if !report.unidentified.is_empty() {
-                        println!(
-                            "  left alone (database not identifiable from daemon.log): {}",
-                            report.unidentified.len()
-                        );
-                    }
-                    Ok((EXIT_SUCCESS, None))
-                }
-
+                DaemonAction::Gc => run_daemon_gc(),
                 DaemonAction::Restart {
                     idle_timeout,
                     config,

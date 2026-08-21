@@ -4118,3 +4118,46 @@ fn list_projects_fails_on_a_missing_database() {
         );
     }
 }
+
+/// `daemon gc` must not require a database.
+///
+/// It sweeps orphaned launch agents and orphaned per-instance directories,
+/// sparing live instances by ownership proof (write lock, pidfile lock) rather
+/// than by matching a database path — the underlying `gc_orphaned_agents` and
+/// `gc_orphaned_daemon_dirs` take no arguments. Requiring `--db` made the one
+/// command whose purpose is cleaning up after databases that no longer exist
+/// refuse to run without naming one that does, and contradicted its own
+/// `--help`, which lists `--db` as optional with no default.
+#[test]
+fn daemon_gc_runs_without_a_database() {
+    let output = nestweaver_cmd()
+        .args(["daemon", "gc"])
+        .env_remove("NESTWEAVER_DB")
+        .output()
+        .expect("daemon gc must run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("No database path provided"),
+        "daemon gc must not demand a database it never reads; got: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "daemon gc must succeed with no --db and no NESTWEAVER_DB; stderr: {stderr}"
+    );
+}
+
+/// The help text is the contract the previous behaviour broke, so pin it: if
+/// `--db` ever becomes genuinely required here, the help must say so.
+#[test]
+fn daemon_gc_help_presents_db_as_optional() {
+    let output = nestweaver_cmd()
+        .args(["daemon", "gc", "--help"])
+        .output()
+        .expect("daemon gc --help must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--db"), "help must mention --db");
+    assert!(
+        !stdout.contains("required"),
+        "daemon gc --help presents --db as optional; keep behaviour and help in step"
+    );
+}

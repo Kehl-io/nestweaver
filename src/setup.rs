@@ -205,27 +205,34 @@ fn bound_config_path(db_path: &Path) -> Option<String> {
         .then_some(record.config_path)
 }
 
-fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    let mut args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
+/// THE single source of truth for the argv every generated MCP registration
+/// gets. Every per-tool writer must go through this.
+///
+/// It is a function rather than three literals because the duplication is what
+/// caused the bug: `--config` was added to the JSON writers while the Codex
+/// TOML writer kept its own hardcoded `["mcp", "--db", "{}"]` literal, so Codex
+/// silently kept emitting a config-less registration. `generated_registrations_
+/// all_carry_the_bound_config` pins that they cannot drift apart again.
+fn mcp_arg_vec(db_str: &str, lite: bool) -> Vec<String> {
+    let mut args = vec!["mcp".to_string()];
+    if lite {
+        args.push("--lite".to_string());
+    }
+    args.push("--db".to_string());
+    args.push(db_str.to_string());
     if let Some(config) = bound_config_path(Path::new(db_str)) {
         args.push("--config".to_string());
         args.push(config);
     }
-    serde_json::json!(args)
+    args
+}
+
+fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
+    serde_json::json!(mcp_arg_vec(db_str, false))
 }
 
 fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    let mut args = vec![
-        "mcp".to_string(),
-        "--lite".to_string(),
-        "--db".to_string(),
-        db_str.to_string(),
-    ];
-    if let Some(config) = bound_config_path(Path::new(db_str)) {
-        args.push("--config".to_string());
-        args.push(config);
-    }
-    serde_json::json!(args)
+    serde_json::json!(mcp_arg_vec(db_str, true))
 }
 
 fn setup_claude_code(
@@ -411,8 +418,12 @@ fn setup_codex(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), a
     let db_str = db_path.to_string_lossy();
     let config_path = base.join(".codex/config.toml");
     let toml_section = format!(
-        "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"{}\"]\n",
-        db_str
+        "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [{}]\n",
+        mcp_arg_vec(&db_str, false)
+            .iter()
+            .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let merged = append_toml_if_missing(&config_path, "mcp_servers.nestweaver", &toml_section)?;
 
@@ -1278,5 +1289,60 @@ mod setup_base_dir_tests {
             std::fs::read_to_string(mcp_path).unwrap(),
             primary_before_retry
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_arg_source_of_truth_tests {
+    use super::*;
+
+    /// nw-199 follow-up, from a user report: `--config` was added to the JSON
+    /// writers while the Codex writer kept its own hardcoded
+    /// `["mcp", "--db", "{}"]` literal, so Codex alone kept emitting a
+    /// config-less registration — the exact drift the single builder exists to
+    /// prevent. Grep the source: no writer may hand-roll the argv.
+    #[test]
+    fn no_writer_hand_rolls_the_mcp_argv() {
+        // Build the needle from pieces so this detector does not match its own
+        // source line — the joined form never appears literally in this file.
+        let needle = ["\"mcp\"", "\"--db\""].join(", ");
+        let escaped = needle.replace('"', "\\\"");
+        let source = include_str!("setup.rs");
+        // Stop before this test module so the assertion message and the needle
+        // pieces cannot themselves be flagged.
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+
+        let mut offenders = Vec::new();
+        for (n, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if line.contains(&needle) || line.contains(&escaped) {
+                offenders.push(format!("{}: {}", n + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "every generated MCP registration must come from `mcp_arg_vec`, so a flag \
+             added once reaches every tool. Hand-rolled argv found:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Lite and full registrations differ only by `--lite`; both must carry the
+    /// same db and (when one is bound) the same config.
+    #[test]
+    fn lite_and_full_argv_agree_except_for_the_lite_flag() {
+        let full = mcp_arg_vec("/tmp/does-not-exist.lbug", false);
+        let lite = mcp_arg_vec("/tmp/does-not-exist.lbug", true);
+        assert_eq!(full[0], "mcp");
+        assert_eq!(lite[0], "mcp");
+        assert_eq!(lite[1], "--lite");
+        assert_eq!(&full[1..], &lite[2..]);
+        assert!(full.contains(&"--db".to_string()));
     }
 }
