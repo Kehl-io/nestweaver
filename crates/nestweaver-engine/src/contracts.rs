@@ -159,16 +159,11 @@ pub fn parse_spec_file(path: &str, source: &str) -> Vec<SpecContract> {
 ///
 /// Turn an OpenAPI deserialization failure into something actionable (nw-191).
 ///
-/// The `openapiv3` crate models OpenAPI 3.0 only — its own documentation states
-/// it "does not cover OpenAPI v3.1 which was an incompatible change". 3.1
-/// dropped the `nullable` keyword in favour of `type` accepting an ARRAY with
-/// `null` as a member, so a valid 3.1 document fails with a raw serde message
-/// like "components.schemas: invalid type: sequence, expected a string" — which
-/// says nothing about the real cause being the spec VERSION.
-///
-/// Detect the declared version and say so. This does not make 3.1 parse; it
-/// stops the operator from debugging their schema when the parser is the
-/// problem.
+/// 3.1 documents PARSE now — extraction reads only paths/verbs/operationId,
+/// which is version-independent — so this no longer fires for a well-formed
+/// 3.1 spec. It is retained for a document that fails for some OTHER reason
+/// while also declaring 3.1, where naming the version keeps an operator from
+/// chasing the version when the real fault is elsewhere in the file.
 fn explain_openapi_error(source: &str, error: &str) -> String {
     let declared_31 = source.lines().take(40).any(|line| {
         let line = line.trim();
@@ -195,12 +190,12 @@ pub(crate) fn parse_spec_file_strict(
     source: &str,
 ) -> Result<Vec<SpecContract>, String> {
     match spec_kind(path) {
-        Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source)
-            .map(|spec| openapi_contracts(&spec))
-            .map_err(|error| explain_openapi_error(source, &error.to_string())),
-        Some(SpecFileKind::OpenApiJson) => serde_json::from_str::<openapiv3::OpenAPI>(source)
-            .map(|spec| openapi_contracts(&spec))
-            .map_err(|error| explain_openapi_error(source, &error.to_string())),
+        Some(SpecFileKind::OpenApiYaml) => openapi_document(source, false)
+            .and_then(|doc| openapi_contracts_from_value(&doc))
+            .map_err(|error| explain_openapi_error(source, &error)),
+        Some(SpecFileKind::OpenApiJson) => openapi_document(source, true)
+            .and_then(|doc| openapi_contracts_from_value(&doc))
+            .map_err(|error| explain_openapi_error(source, &error)),
         Some(SpecFileKind::Proto) => protox_parse::parse(path, source)
             .map(|_| parse_proto(path, source))
             .map_err(|error| error.to_string()),
@@ -217,8 +212,8 @@ pub(crate) fn parse_spec_file_strict(
 }
 
 fn parse_openapi_yaml(source: &str) -> Vec<SpecContract> {
-    match serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source) {
-        Ok(spec) => openapi_contracts(&spec),
+    match openapi_document(source, false).and_then(|doc| openapi_contracts_from_value(&doc)) {
+        Ok(contracts) => contracts,
         Err(e) => {
             tracing::debug!("OpenAPI YAML parse failed: {e}");
             Vec::new()
@@ -227,8 +222,8 @@ fn parse_openapi_yaml(source: &str) -> Vec<SpecContract> {
 }
 
 fn parse_openapi_json(source: &str) -> Vec<SpecContract> {
-    match serde_json::from_str::<openapiv3::OpenAPI>(source) {
-        Ok(spec) => openapi_contracts(&spec),
+    match openapi_document(source, true).and_then(|doc| openapi_contracts_from_value(&doc)) {
+        Ok(contracts) => contracts,
         Err(e) => {
             tracing::debug!("OpenAPI JSON parse failed: {e}");
             Vec::new()
@@ -236,36 +231,87 @@ fn parse_openapi_json(source: &str) -> Vec<SpecContract> {
     }
 }
 
-fn openapi_contracts(spec: &openapiv3::OpenAPI) -> Vec<SpecContract> {
+/// The seven HTTP methods an OpenAPI path item can declare.
+const OPENAPI_VERBS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch",
+];
+
+/// Extract contracts from an OpenAPI document represented as generic JSON.
+///
+/// nw-191: this used to deserialize into `openapiv3::OpenAPI`, a 3.0-ONLY
+/// model, so a spec declaring `openapi: 3.1.0` failed to parse and — in strict
+/// mode — aborted the entire repository index. 3.1 removed `nullable` in favour
+/// of type arrays and adopted the 2020-12 JSON Schema dialect, so a 3.1
+/// document is genuinely not a 3.0 document and no amount of leniency in the
+/// 3.0 model would read one.
+///
+/// Adding the `oas3` crate would have meant carrying two OpenAPI models and
+/// dispatching between them. It is unnecessary: contract extraction reads only
+/// `paths.<path>.<verb>.operationId`, and THAT structure is byte-identical
+/// across Swagger 2.0, OpenAPI 3.0 and OpenAPI 3.1 — every difference between
+/// those versions lives in the schema portion, which this never touches.
+/// Parsing the document as generic JSON therefore supports all three and drops
+/// a version constraint rather than adding one.
+///
+/// `$ref` path items are skipped, as before, and `x-` extension keys are
+/// ignored.
+fn openapi_contracts_from_value(doc: &serde_json::Value) -> Result<Vec<SpecContract>, String> {
+    // Require a version marker so an arbitrary YAML/JSON file that happens to
+    // sit at an OpenAPI-shaped path is not silently read as a spec.
+    let declares_version = doc.get("openapi").and_then(|v| v.as_str()).is_some()
+        || doc.get("swagger").and_then(|v| v.as_str()).is_some();
+    if !declares_version {
+        return Err("document declares neither `openapi:` nor `swagger:`".to_string());
+    }
+    let Some(paths) = doc.get("paths") else {
+        // A spec with no paths declares no HTTP contracts. That is valid.
+        return Ok(Vec::new());
+    };
+    let Some(paths) = paths.as_object() else {
+        return Err("`paths` is not an object".to_string());
+    };
+
     let mut out = Vec::new();
-    for (raw_path, item) in spec.paths.iter() {
-        let path_item = match item {
-            openapiv3::ReferenceOr::Item(pi) => pi,
-            // We don't follow $ref path items (rare); skip them.
-            openapiv3::ReferenceOr::Reference { .. } => continue,
+    for (raw_path, item) in paths {
+        if raw_path.starts_with("x-") {
+            continue;
+        }
+        let Some(item) = item.as_object() else {
+            continue;
         };
+        // We don't follow $ref path items (rare); skip them.
+        if item.contains_key("$ref") {
+            continue;
+        }
         let norm = normalize_http_path(raw_path);
-        let ops: [(&str, &Option<openapiv3::Operation>); 7] = [
-            ("GET", &path_item.get),
-            ("PUT", &path_item.put),
-            ("POST", &path_item.post),
-            ("DELETE", &path_item.delete),
-            ("OPTIONS", &path_item.options),
-            ("HEAD", &path_item.head),
-            ("PATCH", &path_item.patch),
-        ];
-        for (verb, op) in ops {
-            if let Some(operation) = op {
-                out.push(SpecContract {
-                    kind: "http".to_string(),
-                    verb: Some(verb.to_string()),
-                    path: Some(norm.clone()),
-                    operation_id: operation.operation_id.clone(),
-                });
+        for verb in OPENAPI_VERBS {
+            let Some(operation) = item.get(*verb) else {
+                continue;
+            };
+            if !operation.is_object() {
+                continue;
             }
+            out.push(SpecContract {
+                kind: "http".to_string(),
+                verb: Some(verb.to_uppercase()),
+                path: Some(norm.clone()),
+                operation_id: operation
+                    .get("operationId")
+                    .and_then(|id| id.as_str())
+                    .map(ToOwned::to_owned),
+            });
         }
     }
-    out
+    Ok(out)
+}
+
+/// Parse an OpenAPI document from YAML or JSON into generic JSON.
+fn openapi_document(source: &str, json: bool) -> Result<serde_json::Value, String> {
+    if json {
+        serde_json::from_str(source).map_err(|error| error.to_string())
+    } else {
+        serde_yaml_ng::from_str(source).map_err(|error| error.to_string())
+    }
 }
 
 /// Convert a protobuf RPC name to the Rust method identifier tonic generates.
@@ -2575,29 +2621,72 @@ paths:
 mod openapi_version_tests {
     use super::parse_spec_file_strict;
 
-    /// nw-191: a 3.1 document must fail with a message naming the real cause.
-    /// The raw serde error ("invalid type: sequence, expected a string") sends
-    /// the operator to debug their schema when the parser is the problem.
+    /// nw-191: an OpenAPI 3.1 document used to abort the whole repository
+    /// index in strict mode, because extraction deserialized into
+    /// `openapiv3::OpenAPI`, a 3.0-only model that cannot read a 3.1 type
+    /// array. Contract extraction reads only paths/verbs/operationId, which is
+    /// identical across versions, so 3.1 now parses like any other spec.
     #[test]
-    fn an_openapi_31_document_reports_the_version_as_the_cause() {
+    fn an_openapi_31_document_parses_and_yields_its_contracts() {
         let spec = concat!(
             "openapi: 3.1.0\n",
             "info:\n  title: t\n  version: '1'\n",
-            "paths: {}\n",
+            "paths:\n",
+            "  /things/{id}:\n",
+            "    get:\n      operationId: getThing\n",
+            "    delete:\n      operationId: deleteThing\n",
             "components:\n",
             "  schemas:\n",
             "    Thing:\n",
+            // The exact 3.1 construct the 3.0 model choked on.
             "      type: [string, \"null\"]\n",
         );
-        let error = parse_spec_file_strict("docs/api/openapi.yaml", spec)
-            .expect_err("3.1 type arrays are not supported by the 3.0 parser");
-        assert!(
-            error.contains("OpenAPI 3.1"),
-            "error must name the version as the cause: {error}"
+        let contracts = parse_spec_file_strict("docs/api/openapi.yaml", spec)
+            .expect("a 3.1 document must parse");
+        let mut found: Vec<(String, String, String)> = contracts
+            .iter()
+            .map(|c| {
+                (
+                    c.verb.clone().unwrap_or_default(),
+                    c.path.clone().unwrap_or_default(),
+                    c.operation_id.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("DELETE".into(), "/things/{}".into(), "deleteThing".into()),
+                ("GET".into(), "/things/{}".into(), "getThing".into()),
+            ]
         );
+    }
+
+    /// The same extraction must keep working for 3.0 and for Swagger 2.0,
+    /// whose paths/verbs/operationId shape is identical.
+    #[test]
+    fn openapi_30_and_swagger_20_still_extract() {
+        for version in ["openapi: 3.0.3", "swagger: '2.0'"] {
+            let spec = format!(
+                "{version}\ninfo:\n  title: t\n  version: '1'\npaths:\n  /a:\n    post:\n      operationId: mk\n"
+            );
+            let contracts = parse_spec_file_strict("openapi.yaml", &spec)
+                .unwrap_or_else(|error| panic!("{version} must parse: {error}"));
+            assert_eq!(contracts.len(), 1, "{version}");
+            assert_eq!(contracts[0].operation_id.as_deref(), Some("mk"));
+        }
+    }
+
+    /// A YAML file that is not a spec at all must not be read as one just
+    /// because it sits at an OpenAPI-shaped path.
+    #[test]
+    fn a_document_without_a_version_marker_is_rejected() {
+        let error = parse_spec_file_strict("openapi.yaml", "paths:\n  /a:\n    get: {}\n")
+            .expect_err("a document declaring no version is not a spec");
         assert!(
-            error.contains("type: [string"),
-            "error should show the 3.1 construct: {error}"
+            error.contains("openapi") || error.contains("swagger"),
+            "error must say what was missing: {error}"
         );
     }
 
