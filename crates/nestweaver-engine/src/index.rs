@@ -1742,7 +1742,7 @@ fn tiered_change_check(
 
     // file_meta returns None for bare-repo readers (no mtime available).
     // In that case, always fall through to read + hash.
-    let (mtime_nanos, size_bytes) = match reader.file_meta(rel)? {
+    let (mtime_nanos, size_bytes) = match reader.file_meta_nanos(rel)? {
         Some((m, s)) => (m, s),
         None => {
             // No filesystem metadata (e.g. GitBareReader) — read and hash. The
@@ -1801,10 +1801,13 @@ fn tiered_change_check(
         // permanently.
         //
         // The precision was always available and simply discarded — measured on
-        // APFS, five consecutive fast writes gave ONE whole second but FIVE
-        // distinct nanosecond stamps. Keeping it shrinks the ambiguous window
-        // from ~1s to ~1ns, which is the difference between "a fast editor hits
-        // this routinely" and "two writes must land in the same nanosecond".
+        // APFS, 200 rapid writes gave ONE whole second but 200 DISTINCT
+        // nanosecond stamps. How much that buys is PLATFORM-DEPENDENT: on Linux
+        // the VFS stamps mtime from a coarse clock updated once per jiffy, so
+        // the window there narrows to ~1-10ms rather than to ~1ns (see
+        // `ContentReader::file_meta_nanos` for the detail and sources). Either way it
+        // is 100-1000x narrower than one second, which is the difference
+        // between "a fast editor hits this routinely" and "you have to try".
         //
         // Size stays in the check alongside it. That is the standard quick
         // check — rsync transfers when size OR mtime differs, and Git compares
@@ -1813,14 +1816,15 @@ fn tiered_change_check(
         // filesystem with coarser timestamps than APFS, size still catches
         // every size-changing edit.
         //
-        // Git's "racily clean" residue — an edit inside the SAME nanosecond
-        // that also leaves the size identical — is not closed here and cannot
+        // Git's "racily clean" residue — an edit inside the same timestamp tick
+        // that ALSO leaves the size identical — is not closed here and cannot
         // be closed from `cached.mtime_nanos` alone: for an unchanged file it
         // matches by definition, so hashing on match would re-read the whole
         // tree every run. Closing it needs a per-run index timestamp, the way
-        // Git bounds its window by the index file's own mtime. At nanosecond
-        // granularity the window is small enough that this is a theoretical
-        // remainder rather than the routine data loss it was at one second.
+        // Git bounds its window by the index file's own mtime. The residue is
+        // now bounded by the platform tick (per-write on APFS, ~1 jiffy on
+        // Linux) rather than by a full second, which turns routine data loss
+        // into a narrow remainder.
         if cached.mtime_nanos == mtime_nanos && cached.size_bytes == size_bytes {
             return Ok(ChangeVerdict::Unchanged);
         }
@@ -4149,13 +4153,13 @@ fn collect_contract_derivation_inputs(
             continue;
         }
         if reader
-            .file_meta(&rel_path)
+            .file_meta_nanos(&rel_path)
             .context("read contract input metadata")?
             .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
             tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
             let observed_bytes = reader
-                .file_meta(&rel_path)
+                .file_meta_nanos(&rel_path)
                 .ok()
                 .flatten()
                 .map(|(_, size)| size)
@@ -4379,7 +4383,7 @@ pub(crate) fn watcher_contract_input_snapshot(
             continue;
         }
         if reader
-            .file_meta(&rel_path)
+            .file_meta_nanos(&rel_path)
             .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
             .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
@@ -5550,7 +5554,7 @@ fn prepare_incremental_file(
     }
 
     if let Some((_, observed_bytes)) = reader
-        .file_meta(rel_path)
+        .file_meta_nanos(rel_path)
         .with_context(|| format!("stat {}", abs_path.display()))?
         && observed_bytes > reader.max_source_file_bytes()
     {
@@ -6384,7 +6388,7 @@ mod tests {
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("large.rs")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(None)
             }
             fn root(&self) -> &Path {
@@ -8040,7 +8044,7 @@ function hello(name) { return "Hello " + name; }
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("HugeController.java")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(Some((
                     0,
                     crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES + 1,
@@ -8082,7 +8086,7 @@ function hello(name) { return "Hello " + name; }
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("unreadable.py")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 panic!("irrelevant language must be filtered before metadata")
             }
             fn root(&self) -> &Path {
@@ -10685,7 +10689,7 @@ function hello(name) { return "Hello " + name; }
             Ok(Vec::new())
         }
 
-        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+        fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
             Ok(None)
         }
 
@@ -11862,6 +11866,15 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    /// Also the fail-safe that makes unconditional sub-second mtimes safe here
+    /// (nw-200).
+    ///
+    /// Git ships `USE_NSEC` off by default and its Makefile warns against it on
+    /// CEPH/CIFS/NTFS/UDF, because some filesystems report a sub-second field
+    /// that moves when nothing changed. This test is why that caution does not
+    /// transfer: a jittering timestamp lands here, the content hash compares
+    /// equal, and the verdict is Unchanged. Over-sensitivity costs one read; it
+    /// cannot produce a wrong answer.
     fn tiered_check_same_size_different_mtime_falls_through_to_hash() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("hello.js");
@@ -12050,7 +12063,7 @@ function hello(name) { return "Hello " + name; }
             Ok(vec![PathBuf::from("src/lib.rs")])
         }
 
-        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+        fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
             Ok(None)
         }
 
@@ -12256,7 +12269,7 @@ function hello(name) { return "Hello " + name; }
     /// A real edit made inside the same whole second as the cached mtime must
     /// still be indexed.
     ///
-    /// `file_meta` truncates timestamps with `as_secs()`, so an mtime-only Tier 1
+    /// `file_meta_nanos` truncates timestamps with `as_secs()`, so an mtime-only Tier 1
     /// check cannot see such an edit — and because the cached mtime then keeps
     /// matching, the file stays misclassified on every LATER index too. It never
     /// self-heals; only a further mtime change recovers it. Verified end to end
@@ -12324,6 +12337,59 @@ function hello(name) { return "Hello " + name; }
             "a same-second edit that changes the file size must still be indexed; \
              an mtime-only Tier 1 check misses it permanently"
         );
+    }
+
+    /// A nanosecond mtime must survive the JSON sidecar EXACTLY.
+    ///
+    /// Nanoseconds since the epoch are ~1.79e18, well above 2^53 — the largest
+    /// integer an IEEE-754 double represents exactly. Any step that routes the
+    /// value through an f64 silently truncates the low ~63ns, and a corrupted
+    /// low digit is indistinguishable from a real edit: the file would be
+    /// re-parsed forever, or worse, compare equal to the wrong thing.
+    ///
+    /// serde_json parses integer literals straight into `u64`, so this holds —
+    /// but it holds by a property of the serializer, not by anything in this
+    /// module, which is exactly the kind of assumption worth pinning.
+    #[test]
+    fn nanosecond_mtimes_round_trip_through_the_sidecar_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+
+        // A realistic present-day stamp, and the extremes.
+        for mtime_nanos in [1_787_363_596_798_003_519u64, u64::MAX, (1u64 << 53) + 1] {
+            let mut repos = HashMap::new();
+            let mut files = FileMetaCache::new();
+            files.insert(
+                "src/main.rs".to_string(),
+                CachedFileMeta {
+                    mtime_nanos,
+                    size_bytes: 42,
+                    content_hash: "h".to_string(),
+                },
+            );
+            repos.insert("repo:precision".to_string(), files);
+            let sidecar = FileMetaSidecar {
+                version: FILEMETA_VERSION,
+                repos,
+            };
+            save_filemeta_sidecar(&sidecar, &path).unwrap();
+
+            let loaded = load_filemeta_sidecar(&path);
+            let got = loaded.repos["repo:precision"]["src/main.rs"].mtime_nanos;
+            assert_eq!(
+                got, mtime_nanos,
+                "nanosecond mtime must survive the sidecar exactly; a lossy \
+                 round-trip is indistinguishable from a real edit"
+            );
+
+            // And prove the on-disk form is an integer literal, not a float:
+            // `1.787363596798e18` would parse back lossily.
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains(&format!("\"mtime_nanos\":{mtime_nanos}")),
+                "sidecar must store the raw integer, got: {raw}"
+            );
+        }
     }
 
     /// The v2 -> v3 upgrade must FAIL OPEN, not reinterpret.

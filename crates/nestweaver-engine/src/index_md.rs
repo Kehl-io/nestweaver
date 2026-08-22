@@ -460,15 +460,32 @@ fn index_markdown_since_with_reader(
         .map(|note| note.uid.clone())
         .collect::<std::collections::HashSet<_>>();
 
-    // NANOSECONDS, to match `ContentReader::file_meta` (nw-200). Both sides of
-    // the comparison below must use the same unit; leaving this in seconds
-    // while the reader returns nanoseconds would make every file look newer
-    // than `since` and silently disable the filter entirely.
+    // NANOSECONDS, to match `ContentReader::file_meta_nanos` (nw-200) — but FLOORED
+    // TO THE SECOND first.
+    //
+    // Both sides must share a unit, and naively converting `since` to exact
+    // nanoseconds is not enough: a filesystem whose mtime granularity is
+    // coarser than the caller's clock stamps a write performed AFTER `since`
+    // with a value slightly BEFORE it. On Linux the VFS stamps mtime from a
+    // clock "updated every jiffy" (Documentation/filesystems/multigrain-ts.rst),
+    // so a note written microseconds after `since` can carry an mtime up to a
+    // jiffy earlier and be silently skipped — the exact miss this filter exists
+    // to prevent.
+    //
+    // Flooring restores the previous behaviour, where BOTH sides were truncated
+    // to whole seconds and anything written within `since`'s second compared
+    // greater-or-equal. The error is deliberately one-sided: flooring can only
+    // ever include a few extra notes, which costs a re-parse, and can never
+    // exclude one that was genuinely written after the threshold.
+    //
+    // The file CACHE keeps full nanosecond precision — that is what closes the
+    // same-second edit bug. This coarsening applies only to the `--since`
+    // threshold, where inclusiveness beats sharpness.
     let since_nanos = since
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64;
+        .as_secs()
+        .saturating_mul(1_000_000_000);
 
     let all_files = reader.list_files()?;
 
@@ -499,7 +516,7 @@ fn index_markdown_since_with_reader(
 
         // Parse changed files now. Unchanged sources are read later only when
         // the affected-source closure shows their outgoing links may change.
-        let changed = match reader.file_meta(&rel_path) {
+        let changed = match reader.file_meta_nanos(&rel_path) {
             Ok(Some((mtime_nanos, file_size))) => {
                 if file_size > MAX_NOTE_SIZE_BYTES {
                     if existing_note_uids.contains(&n_uid) {
@@ -1410,7 +1427,7 @@ where
         }
 
         // Size guard.
-        if let Ok(Some((_, size))) = reader.file_meta(&rel_path)
+        if let Ok(Some((_, size))) = reader.file_meta_nanos(&rel_path)
             && size > MAX_NOTE_SIZE_BYTES
         {
             skipped.push(SkippedFile {
@@ -1498,7 +1515,7 @@ where
                 ));
             }
         };
-        // `file_meta` is unavailable for bare Git readers. Enforce the note
+        // `file_meta_nanos` is unavailable for bare Git readers. Enforce the note
         // policy again on the returned content so any reader implementation
         // remains policy-correct even when it cannot preflight metadata.
         if source.len() as u64 > MAX_NOTE_SIZE_BYTES {
@@ -3261,7 +3278,7 @@ sub b body
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("notes/test.md")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(None)
             }
             fn root(&self) -> &Path {
@@ -3275,7 +3292,7 @@ sub b body
         let reader = MockBareReader;
         let files = reader.list_files().unwrap();
         assert_eq!(files.len(), 1);
-        let meta = reader.file_meta(&files[0]).unwrap();
+        let meta = reader.file_meta_nanos(&files[0]).unwrap();
         assert!(meta.is_none());
         let content = reader.read_file(&files[0]).unwrap();
         assert!(content.contains("# Test Note"));
@@ -3609,6 +3626,48 @@ sub b body
     /// The incremental (`--since`) refresh path must advance AND persist
     /// the graph generation, so a later process (or the daemon) observes the
     /// bump and distrusts the stale trigram postings.
+    #[test]
+    fn since_threshold_still_matches_a_coarse_granularity_mtime() {
+        // A filesystem whose mtime granularity is coarser than the caller's
+        // clock stamps a write performed AFTER `since` with a value slightly
+        // BEFORE it. On Linux the VFS stamps mtime from a clock updated once
+        // per jiffy, so this is the normal case there, not an exotic one — and
+        // it is invisible on APFS, where mtimes are per-write precise.
+        //
+        // Comparing exact nanoseconds on both sides silently skipped such a
+        // note. Flooring the threshold to the second restores the inclusive
+        // window the seconds-based comparison always had.
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
+        let db_path = root.join("brain.lbug");
+        index_markdown_directory(&root, &db_path, "default", "v").unwrap();
+
+        let note = root.join("a.md");
+        fs::write(&note, "# A\n\nbeta body rewritten\n").unwrap();
+
+        // `since` is captured with full precision AFTER the write...
+        let since = std::time::SystemTime::now();
+        // ...and the filesystem reports the write floored to its second, i.e.
+        // BEFORE `since`. Exactly the coarse-granularity case.
+        let coarse = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(
+                since
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        let handle = fs::OpenOptions::new().write(true).open(&note).unwrap();
+        handle
+            .set_times(fs::FileTimes::new().set_modified(coarse))
+            .unwrap();
+
+        let res = index_markdown_directory_since(&root, &db_path, "default", "v", since).unwrap();
+        assert_eq!(
+            res.notes_updated, 1,
+            "a note written after `since` must not be skipped because the \
+             filesystem reported its mtime at coarser granularity"
+        );
+    }
+
     #[test]
     fn since_refresh_advances_and_persists_generation_on_in_place_edit() {
         let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
@@ -3967,8 +4026,8 @@ sub b body
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 self.inner.list_files()
             }
-            fn file_meta(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
-                self.inner.file_meta(rel_path)
+            fn file_meta_nanos(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                self.inner.file_meta_nanos(rel_path)
             }
             fn root(&self) -> &Path {
                 self.inner.root()
