@@ -1777,15 +1777,39 @@ fn tiered_change_check(
     }
 
     if let Some(cached) = cache.get(rel_path) {
-        // Tier 1: mtime unchanged → skip.
-        if cached.mtime_secs == mtime_secs {
+        // Tier 1: mtime AND size unchanged → skip.
+        //
+        // Size is part of this check, not just mtime. `file_meta` truncates the
+        // timestamp to WHOLE SECONDS (`as_secs()`), so every edit landing in the
+        // same second as the one already cached is invisible to an mtime-only
+        // comparison — and because the cached mtime then still matches, the file
+        // stays misclassified on EVERY later index too. It never self-heals; only
+        // a further mtime change recovers it. Reproduced end to end: index a
+        // repo, edit a file inside the same second (size 35 -> 78 bytes), and the
+        // new symbol is absent from the graph permanently.
+        //
+        // Comparing size closes every size-changing edit for free — `size_bytes`
+        // is already in hand from `file_meta`, and a genuinely unchanged file
+        // still short-circuits here with no read. This is the standard quick
+        // check: rsync transfers when size OR mtime differs, and Git compares
+        // `st_size` alongside `st_mtime` precisely because mtime alone is
+        // insufficient (Documentation/technical/racy-git.txt).
+        //
+        // What remains is Git's "racily clean" case: a same-second edit that
+        // leaves the size identical. Git bounds that window by the INDEX file's
+        // timestamp and re-hashes only entries inside it. The same bound cannot
+        // be had from `cached.mtime_secs` alone — for unchanged files it matches
+        // by definition, so hashing on match would re-read the whole tree every
+        // run. Closing it needs a per-run index timestamp; tracked separately.
+        if cached.mtime_secs == mtime_secs && cached.size_bytes == size_bytes {
             return Ok(ChangeVerdict::Unchanged);
         }
 
-        // Tier 2: mtime changed but size unchanged → fall through to hash check.
-        // Same-size edits are common, so we cannot skip based on size alone.
+        // Tier 2: mtime or size changed → fall through to hash check. A
+        // same-size edit is common, so size alone is not enough to declare a
+        // change either; the hash below is what decides.
 
-        // Tier 3: mtime differs → read file, compute hash, compare.
+        // Tier 3: read file, compute hash, compare.
         let source = enforce_actual_size(
             reader
                 .read_file(rel)
@@ -12201,6 +12225,79 @@ function hello(name) { return "Hello " + name; }
             .unwrap();
         assert_eq!(widened.dirty_scopes, 1);
         assert_eq!(widened.results.len(), 1);
+    }
+
+    /// A real edit made inside the same whole second as the cached mtime must
+    /// still be indexed.
+    ///
+    /// `file_meta` truncates timestamps with `as_secs()`, so an mtime-only Tier 1
+    /// check cannot see such an edit — and because the cached mtime then keeps
+    /// matching, the file stays misclassified on every LATER index too. It never
+    /// self-heals; only a further mtime change recovers it. Verified end to end
+    /// before the fix: a 35 -> 78 byte edit inside one second left the new symbol
+    /// permanently absent from the graph.
+    ///
+    /// Both canonical quick checks compare size for this reason — rsync
+    /// transfers when size OR mtime differs, and Git compares `st_size`
+    /// alongside `st_mtime` (Documentation/technical/racy-git.txt).
+    ///
+    /// The mtime is pinned rather than raced so the condition is exercised on
+    /// every run, not only when the clock cooperates.
+    #[test]
+    fn same_second_edit_that_changes_size_is_not_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("same-second.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let file = repo.join("main.js");
+
+        // One fixed instant for BOTH writes: the cached mtime and the post-edit
+        // mtime are then identical whole seconds, by construction.
+        let pinned = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000);
+        let pin = |path: &std::path::Path| {
+            let handle = fs::OpenOptions::new().write(true).open(path).unwrap();
+            handle
+                .set_times(fs::FileTimes::new().set_modified(pinned))
+                .unwrap();
+        };
+
+        fs::write(&file, "function beforeEdit() {}\n").unwrap();
+        pin(&file);
+        incremental_index_with_name(
+            &repo,
+            &db_path,
+            "test",
+            "https://example.com/same-sec",
+            None,
+        )
+        .unwrap();
+
+        // A genuine edit that changes the file's size, pinned to the SAME second.
+        fs::write(
+            &file,
+            "function beforeEdit() {}\nfunction afterSameSecondEdit() {}\n",
+        )
+        .unwrap();
+        pin(&file);
+        incremental_index_with_name(
+            &repo,
+            &db_path,
+            "test",
+            "https://example.com/same-sec",
+            None,
+        )
+        .unwrap();
+
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        let found = store
+            .regex_search("afterSameSecondEdit", None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            found.results.len(),
+            1,
+            "a same-second edit that changes the file size must still be indexed; \
+             an mtime-only Tier 1 check misses it permanently"
+        );
     }
 
     #[test]
