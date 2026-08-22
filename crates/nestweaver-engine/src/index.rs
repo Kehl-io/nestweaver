@@ -78,7 +78,7 @@ pub struct IndexResult {
 //
 // Sidecar file: `<db>.filemeta.json`
 //
-// On each index run we store (mtime_secs, size_bytes, content_hash) per file.
+// On each index run we store (mtime_nanos, size_bytes, content_hash) per file.
 // Before reading & hashing a file we check:
 //   Tier 1 – mtime unchanged → skip (near-zero cost stat)
 //   Tier 2 – mtime changed but size unchanged → skip (likely identical)
@@ -87,7 +87,12 @@ pub struct IndexResult {
 /// Per-file metadata cached between indexing runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFileMeta {
-    pub mtime_secs: u64,
+    /// NANOSECONDS since the Unix epoch, not seconds.
+    ///
+    /// Renamed from `mtime_nanos` deliberately (nw-200): the units changed, and
+    /// a rename makes every call site fail to compile rather than silently
+    /// comparing nanoseconds against a value someone still believes is seconds.
+    pub mtime_nanos: u64,
     pub size_bytes: u64,
     pub content_hash: String,
 }
@@ -95,15 +100,21 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Sidecar format version. v2 = per-repo keying (nw-022). v1 (implicit,
-/// unversioned flat map) fails deserialization and loads as empty — a
-/// deliberate fail-open that costs one full re-index and can never
-/// mis-classify a file.
+/// Sidecar format version. v3 = nanosecond mtimes (nw-200). v2 = per-repo
+/// keying (nw-022). v1 (implicit, unversioned flat map) fails deserialization
+/// and loads as empty — a deliberate fail-open that costs one full re-index and
+/// can never mis-classify a file.
+///
+/// v2 -> v3 MUST be a version bump rather than a silent field reinterpretation:
+/// a v2 entry holds SECONDS in the field v3 reads as NANOSECONDS. Reusing it
+/// would make every cached file compare as changed-by-nine-orders-of-magnitude
+/// on the first run and, worse, would be indistinguishable from a real edit.
+/// Failing the load and re-indexing once is the honest outcome.
 ///
 /// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
 /// bumping the other (both sidecars must be invalidated together), enforced
 /// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
-pub const FILEMETA_VERSION: u32 = 2;
+pub const FILEMETA_VERSION: u32 = 3;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
 /// repo uid, then repo-relative path. Two repos sharing one DB can never
@@ -1694,7 +1705,22 @@ fn merge_save_filemeta(
 /// Outcome of the tiered change detection for a single file.
 enum ChangeVerdict {
     /// File is unchanged — skip re-indexing it.
-    Unchanged,
+    Unchanged {
+        /// Set when the stat MOVED but the content hash matched.
+        ///
+        /// Carrying the old entry forward in that case re-reads and re-hashes
+        /// the file on every subsequent index, forever, because the cached
+        /// stat never catches up to what the filesystem reports. That happens
+        /// routinely: a `git checkout` that rewrites identical content, a
+        /// formatter whose output is unchanged, a `touch`, or a filesystem
+        /// whose sub-second field jitters (the case Git names when it ships
+        /// `USE_NSEC` off by default).
+        ///
+        /// Storing the observed stat with the SAME hash makes the next run
+        /// short-circuit at Tier 1. Git does the same thing — it refreshes the
+        /// cached stat when content compares equal.
+        refreshed: Option<CachedFileMeta>,
+    },
     /// File is new or changed — `source` contains the file content and
     /// `content_hash` is the freshly-computed BLAKE3 hex digest.
     Changed {
@@ -1731,7 +1757,7 @@ fn tiered_change_check(
 
     // file_meta returns None for bare-repo readers (no mtime available).
     // In that case, always fall through to read + hash.
-    let (mtime_secs, size_bytes) = match reader.file_meta(rel)? {
+    let (mtime_nanos, size_bytes) = match reader.file_meta_nanos(rel)? {
         Some((m, s)) => (m, s),
         None => {
             // No filesystem metadata (e.g. GitBareReader) — read and hash. The
@@ -1746,11 +1772,13 @@ fn tiered_change_check(
             if let Some(cached) = cache.get(rel_path)
                 && content_hash == cached.content_hash
             {
-                return Ok(ChangeVerdict::Unchanged);
+                // No filesystem stat exists on this path, so there is nothing
+                // to refresh.
+                return Ok(ChangeVerdict::Unchanged { refreshed: None });
             }
             return Ok(ChangeVerdict::Changed {
                 meta: CachedFileMeta {
-                    mtime_secs: 0,
+                    mtime_nanos: 0,
                     size_bytes: source.len() as u64,
                     content_hash: content_hash.clone(),
                 },
@@ -1779,30 +1807,43 @@ fn tiered_change_check(
     if let Some(cached) = cache.get(rel_path) {
         // Tier 1: mtime AND size unchanged → skip.
         //
-        // Size is part of this check, not just mtime. `file_meta` truncates the
-        // timestamp to WHOLE SECONDS (`as_secs()`), so every edit landing in the
-        // same second as the one already cached is invisible to an mtime-only
-        // comparison — and because the cached mtime then still matches, the file
-        // stays misclassified on EVERY later index too. It never self-heals; only
-        // a further mtime change recovers it. Reproduced end to end: index a
-        // repo, edit a file inside the same second (size 35 -> 78 bytes), and the
-        // new symbol is absent from the graph permanently.
+        // The timestamp is NANOSECONDS (nw-200). It used to be truncated to
+        // whole seconds, and that truncation was the defect: every edit landing
+        // in the same second as the value already cached compared equal, so the
+        // file was classified Unchanged — and because the cached value kept
+        // matching, it stayed misclassified on EVERY later index. It never
+        // self-healed; only a further mtime change recovered it. Reproduced end
+        // to end through the CLI before the fix: index a repo, edit a file
+        // inside the same second, and the new symbol was absent from the graph
+        // permanently.
         //
-        // Comparing size closes every size-changing edit for free — `size_bytes`
-        // is already in hand from `file_meta`, and a genuinely unchanged file
-        // still short-circuits here with no read. This is the standard quick
-        // check: rsync transfers when size OR mtime differs, and Git compares
-        // `st_size` alongside `st_mtime` precisely because mtime alone is
-        // insufficient (Documentation/technical/racy-git.txt).
+        // The precision was always available and simply discarded — measured on
+        // APFS, 200 rapid writes gave ONE whole second but 200 DISTINCT
+        // nanosecond stamps. How much that buys is PLATFORM-DEPENDENT: on Linux
+        // the VFS stamps mtime from a coarse clock updated once per jiffy, so
+        // the window there narrows to ~1-10ms rather than to ~1ns (see
+        // `ContentReader::file_meta_nanos` for the detail and sources). Either way it
+        // is 100-1000x narrower than one second, which is the difference
+        // between "a fast editor hits this routinely" and "you have to try".
         //
-        // What remains is Git's "racily clean" case: a same-second edit that
-        // leaves the size identical. Git bounds that window by the INDEX file's
-        // timestamp and re-hashes only entries inside it. The same bound cannot
-        // be had from `cached.mtime_secs` alone — for unchanged files it matches
-        // by definition, so hashing on match would re-read the whole tree every
-        // run. Closing it needs a per-run index timestamp; tracked separately.
-        if cached.mtime_secs == mtime_secs && cached.size_bytes == size_bytes {
-            return Ok(ChangeVerdict::Unchanged);
+        // Size stays in the check alongside it. That is the standard quick
+        // check — rsync transfers when size OR mtime differs, and Git compares
+        // `st_size` alongside `st_mtime` because mtime alone is insufficient
+        // (Documentation/technical/racy-git.txt). Belt and braces: on a
+        // filesystem with coarser timestamps than APFS, size still catches
+        // every size-changing edit.
+        //
+        // Git's "racily clean" residue — an edit inside the same timestamp tick
+        // that ALSO leaves the size identical — is not closed here and cannot
+        // be closed from `cached.mtime_nanos` alone: for an unchanged file it
+        // matches by definition, so hashing on match would re-read the whole
+        // tree every run. Closing it needs a per-run index timestamp, the way
+        // Git bounds its window by the index file's own mtime. The residue is
+        // now bounded by the platform tick (per-write on APFS, ~1 jiffy on
+        // Linux) rather than by a full second, which turns routine data loss
+        // into a narrow remainder.
+        if cached.mtime_nanos == mtime_nanos && cached.size_bytes == size_bytes {
+            return Ok(ChangeVerdict::Unchanged { refreshed: None });
         }
 
         // Tier 2: mtime or size changed → fall through to hash check. A
@@ -1817,14 +1858,21 @@ fn tiered_change_check(
         )?;
         let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
-            // Content identical despite mtime/size change — unchanged for the
-            // graph. No need to re-parse. (The caller will carry forward the
-            // cached entry.)
-            return Ok(ChangeVerdict::Unchanged);
+            // Content identical despite a stat change — unchanged for the
+            // graph, so no re-parse. But hand back the OBSERVED stat: without
+            // it the cached stat never catches up and this file is re-read and
+            // re-hashed on every index from now on.
+            return Ok(ChangeVerdict::Unchanged {
+                refreshed: Some(CachedFileMeta {
+                    mtime_nanos,
+                    size_bytes,
+                    content_hash,
+                }),
+            });
         }
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
-                mtime_secs,
+                mtime_nanos,
                 size_bytes,
                 content_hash: content_hash.clone(),
             },
@@ -1841,7 +1889,7 @@ fn tiered_change_check(
         let content_hash = content_hash_hex(&source);
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
-                mtime_secs,
+                mtime_nanos,
                 size_bytes,
                 content_hash: content_hash.clone(),
             },
@@ -2677,6 +2725,10 @@ where
     enum ParseOutcome {
         Unchanged {
             rel_path: String,
+            /// Observed stat when it moved but content matched — see
+            /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
+            /// entry so the next run short-circuits at Tier 1.
+            refreshed: Option<CachedFileMeta>,
         },
         Skipped(SkippedFile),
         /// Transient I/O/parser failure. The full publication must abort;
@@ -2704,6 +2756,7 @@ where
             symbols: Vec<RawSymbol>,
             references: Vec<RawReference>,
             type_bindings: Vec<AstTypeBinding>,
+            refreshed: Option<CachedFileMeta>,
         },
     }
 
@@ -2748,7 +2801,7 @@ where
         // Tiered change detection.
         let (source, content_hash, file_meta) =
             match tiered_change_check(reader, &display_name, cache) {
-                Ok(ChangeVerdict::Unchanged) => {
+                Ok(ChangeVerdict::Unchanged { refreshed }) => {
                     parse_pb.inc(1);
                     // Check parsed cache: if we have cached symbols for this
                     // file's content hash, return CachedParsed so symbols are
@@ -2762,10 +2815,12 @@ where
                             symbols: cached_parse.symbols.clone(),
                             references: cached_parse.references.clone(),
                             type_bindings: cached_parse.type_bindings.clone(),
+                            refreshed,
                         };
                     }
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
+                        refreshed,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -2886,13 +2941,18 @@ where
 
     for outcome in outcomes {
         match outcome {
-            ParseOutcome::Unchanged { rel_path } => {
+            ParseOutcome::Unchanged {
+                rel_path,
+                refreshed,
+            } => {
                 present_files.insert(rel_path.clone());
-                // Carry forward the existing cache entry.
-                if let (Some(ref mut new_cache), Some(cached)) =
-                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                // Carry the cache entry forward — but prefer the REFRESHED stat
+                // when the content matched despite a moved mtime/size. Storing
+                // the stale one re-hashes this file on every future index.
+                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
+                    && let Some(entry) = refreshed.or_else(|| cache.get(&rel_path).cloned())
                 {
-                    new_cache.insert(rel_path, cached.clone());
+                    new_cache.insert(rel_path, entry);
                 }
                 files_unchanged += 1;
             }
@@ -2901,13 +2961,14 @@ where
                 symbols: raw_symbols,
                 references: raw_references,
                 type_bindings: raw_type_bindings,
+                refreshed,
             } => {
                 present_files.insert(rel_path.clone());
-                // Carry forward the existing filemeta cache entry (file is unchanged).
-                if let (Some(ref mut new_cache), Some(cached)) =
-                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                // Same as above: the refreshed stat wins when present.
+                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
+                    && let Some(entry) = refreshed.or_else(|| cache.get(&rel_path).cloned())
                 {
-                    new_cache.insert(rel_path.clone(), cached.clone());
+                    new_cache.insert(rel_path.clone(), entry);
                 }
                 files_unchanged += 1;
                 // Feed cached symbols/references into the resolver so cross-file
@@ -4129,13 +4190,13 @@ fn collect_contract_derivation_inputs(
             continue;
         }
         if reader
-            .file_meta(&rel_path)
+            .file_meta_nanos(&rel_path)
             .context("read contract input metadata")?
             .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
             tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
             let observed_bytes = reader
-                .file_meta(&rel_path)
+                .file_meta_nanos(&rel_path)
                 .ok()
                 .flatten()
                 .map(|(_, size)| size)
@@ -4359,7 +4420,7 @@ pub(crate) fn watcher_contract_input_snapshot(
             continue;
         }
         if reader
-            .file_meta(&rel_path)
+            .file_meta_nanos(&rel_path)
             .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
             .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
         {
@@ -5530,7 +5591,7 @@ fn prepare_incremental_file(
     }
 
     if let Some((_, observed_bytes)) = reader
-        .file_meta(rel_path)
+        .file_meta_nanos(rel_path)
         .with_context(|| format!("stat {}", abs_path.display()))?
         && observed_bytes > reader.max_source_file_bytes()
     {
@@ -6364,7 +6425,7 @@ mod tests {
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("large.rs")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(None)
             }
             fn root(&self) -> &Path {
@@ -8020,7 +8081,7 @@ function hello(name) { return "Hello " + name; }
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("HugeController.java")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(Some((
                     0,
                     crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES + 1,
@@ -8062,7 +8123,7 @@ function hello(name) { return "Hello " + name; }
             fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
                 Ok(vec![PathBuf::from("unreadable.py")])
             }
-            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+            fn file_meta_nanos(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 panic!("irrelevant language must be filtered before metadata")
             }
             fn root(&self) -> &Path {
@@ -10665,7 +10726,7 @@ function hello(name) { return "Hello " + name; }
             Ok(Vec::new())
         }
 
-        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+        fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
             Ok(None)
         }
 
@@ -11803,9 +11864,9 @@ function hello(name) { return "Hello " + name; }
                 assert!(source.contains("function hello"));
                 assert!(!content_hash.is_empty());
                 assert!(meta.size_bytes > 0);
-                assert!(meta.mtime_secs > 0);
+                assert!(meta.mtime_nanos > 0);
             }
-            ChangeVerdict::Unchanged => panic!("expected Changed for new file"),
+            ChangeVerdict::Unchanged { .. } => panic!("expected Changed for new file"),
         }
     }
 
@@ -11817,7 +11878,7 @@ function hello(name) { return "Hello " + name; }
         fs::write(&file_path, content).unwrap();
 
         let fs_meta = fs::metadata(&file_path).unwrap();
-        let mtime_secs = fs_meta
+        let mtime_nanos = fs_meta
             .modified()
             .unwrap()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -11828,7 +11889,7 @@ function hello(name) { return "Hello " + name; }
         cache.insert(
             "hello.js".to_string(),
             CachedFileMeta {
-                mtime_secs,
+                mtime_nanos,
                 size_bytes: fs_meta.len(),
                 content_hash: content_hash_hex(content),
             },
@@ -11836,12 +11897,21 @@ function hello(name) { return "Hello " + name; }
 
         let reader = crate::content_reader::FilesystemReader::new(dir.path());
         match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
-            ChangeVerdict::Unchanged => {} // expected
+            ChangeVerdict::Unchanged { .. } => {} // expected
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged for same mtime"),
         }
     }
 
     #[test]
+    /// Also the fail-safe that makes unconditional sub-second mtimes safe here
+    /// (nw-200).
+    ///
+    /// Git ships `USE_NSEC` off by default and its Makefile warns against it on
+    /// CEPH/CIFS/NTFS/UDF, because some filesystems report a sub-second field
+    /// that moves when nothing changed. This test is why that caution does not
+    /// transfer: a jittering timestamp lands here, the content hash compares
+    /// equal, and the verdict is Unchanged. Over-sensitivity costs one read; it
+    /// cannot produce a wrong answer.
     fn tiered_check_same_size_different_mtime_falls_through_to_hash() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("hello.js");
@@ -11856,7 +11926,7 @@ function hello(name) { return "Hello " + name; }
         cache.insert(
             "hello.js".to_string(),
             CachedFileMeta {
-                mtime_secs: 1, // different from actual mtime
+                mtime_nanos: 1, // different from actual mtime
                 size_bytes: fs_meta.len(),
                 content_hash: content_hash_hex(content),
             },
@@ -11864,7 +11934,7 @@ function hello(name) { return "Hello " + name; }
 
         let reader = crate::content_reader::FilesystemReader::new(dir.path());
         match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
-            ChangeVerdict::Unchanged => {} // expected — hash matches, so unchanged
+            ChangeVerdict::Unchanged { .. } => {} // expected — hash matches, so unchanged
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged when hash matches"),
         }
 
@@ -11873,7 +11943,7 @@ function hello(name) { return "Hello " + name; }
         cache2.insert(
             "hello.js".to_string(),
             CachedFileMeta {
-                mtime_secs: 1,
+                mtime_nanos: 1,
                 size_bytes: fs_meta.len(),
                 content_hash: content_hash_hex("different content!"),
             },
@@ -11881,7 +11951,7 @@ function hello(name) { return "Hello " + name; }
 
         match tiered_change_check(&reader, "hello.js", &cache2).unwrap() {
             ChangeVerdict::Changed { .. } => {} // expected — hash differs
-            ChangeVerdict::Unchanged => {
+            ChangeVerdict::Unchanged { .. } => {
                 panic!("expected Changed when hash differs despite same size")
             }
         }
@@ -11899,7 +11969,7 @@ function hello(name) { return "Hello " + name; }
         cache.insert(
             "hello.js".to_string(),
             CachedFileMeta {
-                mtime_secs: 1,
+                mtime_nanos: 1,
                 size_bytes: 5, // clearly different from actual file
                 content_hash: content_hash_hex("old content"),
             },
@@ -11915,7 +11985,7 @@ function hello(name) { return "Hello " + name; }
                 assert!(source.contains("return 42"));
                 assert_eq!(content_hash, content_hash_hex(new_content));
             }
-            ChangeVerdict::Unchanged => panic!("expected Changed for different-size file"),
+            ChangeVerdict::Unchanged { .. } => panic!("expected Changed for different-size file"),
         }
     }
 
@@ -11931,7 +12001,7 @@ function hello(name) { return "Hello " + name; }
             .insert(
                 "main.js".into(),
                 CachedFileMeta {
-                    mtime_secs: 1,
+                    mtime_nanos: 1,
                     size_bytes: 2,
                     content_hash: "h1".into(),
                 },
@@ -11949,7 +12019,7 @@ function hello(name) { return "Hello " + name; }
         let path = dir.path().join("db.lbug.filemeta.json");
         fs::write(
             &path,
-            r#"{"main.js":{"mtime_secs":5,"size_bytes":10,"content_hash":"abc"}}"#,
+            r#"{"main.js":{"mtime_nanos":5,"size_bytes":10,"content_hash":"abc"}}"#,
         )
         .unwrap();
         let loaded = load_filemeta_sidecar(&path);
@@ -11974,9 +12044,15 @@ function hello(name) { return "Hello " + name; }
         // fail-open to empty — full re-index, never a mis-classification.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.lbug.filemeta.json");
+        // Derived from the constant, never hardcoded: a literal one-above-current
+        // silently becomes a SAME-version test the moment the version is bumped,
+        // which is exactly what happened at v2 -> v3 (nw-200).
+        let future = FILEMETA_VERSION + 1;
         fs::write(
             &path,
-            r#"{"version":3,"repos":{"repo:test:aaaa":{"main.js":{"mtime_secs":1,"size_bytes":2,"content_hash":"h1"}}}}"#,
+            format!(
+                r#"{{"version":{future},"repos":{{"repo:test:aaaa":{{"main.js":{{"mtime_nanos":1,"size_bytes":2,"content_hash":"h1"}}}}}}}}"#
+            ),
         )
         .unwrap();
         let loaded = load_filemeta_sidecar(&path);
@@ -12000,7 +12076,7 @@ function hello(name) { return "Hello " + name; }
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains(r#""version":2"#),
+                .contains(&format!(r#""version":{FILEMETA_VERSION}"#)),
             "a default-constructed sidecar must serialize with the current version"
         );
         let loaded = load_filemeta_sidecar(&path);
@@ -12024,7 +12100,7 @@ function hello(name) { return "Hello " + name; }
             Ok(vec![PathBuf::from("src/lib.rs")])
         }
 
-        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+        fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
             Ok(None)
         }
 
@@ -12193,7 +12269,7 @@ function hello(name) { return "Hello " + name; }
         // Advance the mtime explicitly instead of relying on the two writes
         // straddling a wall-clock second.
         //
-        // `tiered_change_check` Tier 1 is `cached.mtime_secs == mtime_secs ->
+        // `tiered_change_check` Tier 1 is `cached.mtime_nanos == mtime_nanos ->
         // Unchanged`, at WHOLE-SECOND granularity and short-circuiting before
         // any content hash. When both writes land in the same second the edit
         // is classified unchanged, nothing is re-indexed, no scope is dirtied,
@@ -12230,7 +12306,7 @@ function hello(name) { return "Hello " + name; }
     /// A real edit made inside the same whole second as the cached mtime must
     /// still be indexed.
     ///
-    /// `file_meta` truncates timestamps with `as_secs()`, so an mtime-only Tier 1
+    /// `file_meta_nanos` truncates timestamps with `as_secs()`, so an mtime-only Tier 1
     /// check cannot see such an edit — and because the cached mtime then keeps
     /// matching, the file stays misclassified on every LATER index too. It never
     /// self-heals; only a further mtime change recovers it. Verified end to end
@@ -12297,6 +12373,237 @@ function hello(name) { return "Hello " + name; }
             1,
             "a same-second edit that changes the file size must still be indexed; \
              an mtime-only Tier 1 check misses it permanently"
+        );
+    }
+
+    /// A moved stat with identical content must REFRESH the cache, not leave it
+    /// stale.
+    ///
+    /// Carrying the old entry forward means the cached stat never catches up to
+    /// what the filesystem reports, so the file is re-read and re-hashed on
+    /// every index from then on — permanently. This happens routinely: a
+    /// `git checkout` that rewrites identical content, a formatter whose output
+    /// is unchanged, a `touch`, or a filesystem whose sub-second field jitters.
+    #[test]
+    fn a_content_match_after_a_moved_stat_refreshes_the_cached_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hello.js");
+        let content = "function hello() {}";
+        fs::write(&file_path, content).unwrap();
+
+        let fs_meta = fs::metadata(&file_path).unwrap();
+        let observed_nanos = fs_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let size_bytes = fs_meta.len();
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
+
+        // Cache holds a DIFFERENT stat for byte-identical content — the
+        // touch / checkout / jitter shape.
+        let mut cache = FileMetaCache::new();
+        cache.insert(
+            "hello.js".to_string(),
+            CachedFileMeta {
+                mtime_nanos: observed_nanos.wrapping_sub(999_999),
+                size_bytes,
+                content_hash: content_hash_hex(content),
+            },
+        );
+
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
+            ChangeVerdict::Unchanged { refreshed } => {
+                let refreshed = refreshed.expect(
+                    "a content match after a moved stat must hand back the observed stat, \
+                     otherwise the file re-hashes on every future index",
+                );
+                assert_eq!(refreshed.mtime_nanos, observed_nanos);
+                assert_eq!(refreshed.size_bytes, size_bytes);
+                assert_eq!(
+                    refreshed.content_hash,
+                    content_hash_hex(content),
+                    "the hash is unchanged — only the stat advances"
+                );
+            }
+            ChangeVerdict::Changed { .. } => {
+                panic!("identical content must not be reported as a change")
+            }
+        }
+
+        // And the no-op case must NOT claim a refresh.
+        let mut fresh = FileMetaCache::new();
+        fresh.insert(
+            "hello.js".to_string(),
+            CachedFileMeta {
+                mtime_nanos: observed_nanos,
+                size_bytes,
+                content_hash: content_hash_hex(content),
+            },
+        );
+        match tiered_change_check(&reader, "hello.js", &fresh).unwrap() {
+            ChangeVerdict::Unchanged { refreshed } => assert!(
+                refreshed.is_none(),
+                "an untouched file short-circuits at Tier 1 with nothing to refresh"
+            ),
+            ChangeVerdict::Changed { .. } => panic!("expected Unchanged"),
+        }
+    }
+
+    /// A nanosecond mtime must survive the JSON sidecar EXACTLY.
+    ///
+    /// Nanoseconds since the epoch are ~1.79e18, well above 2^53 — the largest
+    /// integer an IEEE-754 double represents exactly. Any step that routes the
+    /// value through an f64 silently truncates the low ~63ns, and a corrupted
+    /// low digit is indistinguishable from a real edit: the file would be
+    /// re-parsed forever, or worse, compare equal to the wrong thing.
+    ///
+    /// serde_json parses integer literals straight into `u64`, so this holds —
+    /// but it holds by a property of the serializer, not by anything in this
+    /// module, which is exactly the kind of assumption worth pinning.
+    #[test]
+    fn nanosecond_mtimes_round_trip_through_the_sidecar_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+
+        // A realistic present-day stamp, and the extremes.
+        for mtime_nanos in [1_787_363_596_798_003_519u64, u64::MAX, (1u64 << 53) + 1] {
+            let mut repos = HashMap::new();
+            let mut files = FileMetaCache::new();
+            files.insert(
+                "src/main.rs".to_string(),
+                CachedFileMeta {
+                    mtime_nanos,
+                    size_bytes: 42,
+                    content_hash: "h".to_string(),
+                },
+            );
+            repos.insert("repo:precision".to_string(), files);
+            let sidecar = FileMetaSidecar {
+                version: FILEMETA_VERSION,
+                repos,
+            };
+            save_filemeta_sidecar(&sidecar, &path).unwrap();
+
+            let loaded = load_filemeta_sidecar(&path);
+            let got = loaded.repos["repo:precision"]["src/main.rs"].mtime_nanos;
+            assert_eq!(
+                got, mtime_nanos,
+                "nanosecond mtime must survive the sidecar exactly; a lossy \
+                 round-trip is indistinguishable from a real edit"
+            );
+
+            // And prove the on-disk form is an integer literal, not a float:
+            // `1.787363596798e18` would parse back lossily.
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains(&format!("\"mtime_nanos\":{mtime_nanos}")),
+                "sidecar must store the raw integer, got: {raw}"
+            );
+        }
+    }
+
+    /// The v2 -> v3 upgrade must FAIL OPEN, not reinterpret.
+    ///
+    /// A v2 entry stores SECONDS in the field v3 reads as NANOSECONDS. Silently
+    /// reusing it would compare a real timestamp against one nine orders of
+    /// magnitude smaller — every file would look changed on the first run, and
+    /// a genuinely stale entry would be indistinguishable from a real edit. The
+    /// version bump makes the load fail and the cache come back empty, which
+    /// costs one full re-index and can never mis-classify a file.
+    #[test]
+    fn a_v2_sidecar_is_discarded_rather_than_reinterpreted_as_nanoseconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("upgrade.lbug");
+        let sidecar_path = crate::sidecar_path(&db_path, ".filemeta.json");
+
+        // A v2 sidecar whose mtime field holds SECONDS, as v2 wrote it.
+        let legacy = serde_json::json!({
+            "version": 2,
+            "repos": {
+                "repo:legacy": {
+                    "src/main.js": {
+                        "mtime_nanos": 1_500_000,
+                        "size_bytes": 18,
+                        "content_hash": "deadbeef"
+                    }
+                }
+            }
+        });
+        fs::write(&sidecar_path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let loaded = load_filemeta_sidecar(&sidecar_path);
+        assert_eq!(
+            loaded.version, FILEMETA_VERSION,
+            "a stale sidecar must be replaced with a current-version one"
+        );
+        assert!(
+            loaded.repos.is_empty(),
+            "a v2 sidecar must be discarded, not carried forward with seconds in \
+             a nanoseconds field: {:?}",
+            loaded.repos
+        );
+    }
+
+    /// nw-200: a same-second edit that leaves the file size IDENTICAL must
+    /// still be indexed.
+    ///
+    /// This is the half the size comparison cannot catch. With second-
+    /// granularity timestamps it was routine silent data loss: the edit
+    /// compared equal on both mtime and size, the file was classified
+    /// Unchanged, and because the cached value kept matching it stayed wrong on
+    /// every later index — recovered only by a further mtime change.
+    ///
+    /// Keeping nanoseconds closes it. Both writes here are pinned to the same
+    /// WHOLE SECOND but different nanoseconds, which is exactly what a fast
+    /// editor produces (measured on APFS: five consecutive writes, one whole
+    /// second, five distinct nanosecond stamps).
+    #[test]
+    fn same_second_same_size_edit_is_not_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("same-nanos.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let file = repo.join("main.js");
+
+        // Same second, different nanosecond — the realistic fast-edit shape.
+        let base_secs = 1_500_000u64;
+        let pin = |path: &std::path::Path, nanos: u32| {
+            let handle = fs::OpenOptions::new().write(true).open(path).unwrap();
+            let when =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(base_secs, nanos);
+            handle
+                .set_times(fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        };
+
+        // Byte-for-byte identical LENGTH, different content: `aaa` -> `bbb`.
+        fs::write(&file, "function aaa() {}\n").unwrap();
+        pin(&file, 1_000);
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/nanos", None)
+            .unwrap();
+
+        fs::write(&file, "function bbb() {}\n").unwrap();
+        pin(&file, 2_000);
+        assert_eq!(
+            fs::metadata(&file).unwrap().len(),
+            18,
+            "the two revisions must be the same size for this test to mean anything"
+        );
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/nanos", None)
+            .unwrap();
+
+        let store = GraphStore::open_read_only(&db_path).unwrap();
+        let found = store
+            .regex_search("function bbb", None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            found.results.len(),
+            1,
+            "a same-second, same-size edit must still be indexed; second-granularity \
+             timestamps missed it permanently"
         );
     }
 

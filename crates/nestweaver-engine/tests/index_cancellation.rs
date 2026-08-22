@@ -104,8 +104,8 @@ impl ContentReader for CountingReader {
     fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
         self.inner.list_files()
     }
-    fn file_meta(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
-        self.inner.file_meta(rel_path)
+    fn file_meta_nanos(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+        self.inner.file_meta_nanos(rel_path)
     }
     fn root(&self) -> &Path {
         self.inner.root()

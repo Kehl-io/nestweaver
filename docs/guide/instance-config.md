@@ -257,6 +257,37 @@ nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE" --f
 nestweaver daemon --db "$DB" start --config "$CONFIG"
 ```
 
+#### `[ranking]` — Retrieval ranking policy
+
+```toml
+[ranking]
+track_interactions = false   # default
+enable_prf = false           # default
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `track_interactions` | `false` | Record MCP interaction telemetry to the `<db>.interactions.json` sidecar, which feeds usage-based ranking. Local-only: UIDs and timestamps, no content. The CLI `--track-interactions` / `--no-track-interactions` flags override it per invocation; passing neither inherits this value. |
+| `enable_prf` | `false` | Pseudo-relevance-feedback query expansion on BM25 searches. The CLI `--prf` flag and MCP `prf: true` override per call. |
+| `dampen` / `boost` | — | Path-glob priors on result relevance. |
+| `test_path_patterns` | built-in list | Substrings that deboost test/fixture paths in symbol-name ranking. |
+| `git_activity_weight` | `1.2` | Weight of the git-activity recency rescale on `pagerank_score`. Applies only when a `<db>.gitactivity.json` sidecar exists. |
+
+`track_interactions` lives here rather than existing only as a CLI flag because
+it is a durable per-brain policy, and `nestweaver setup` regenerates every
+`.mcp.json` it manages — so a flag hand-added to a generated config was dropped
+on the next setup run, leaving the feature unreachable through the supported
+install path. Setting it here reaches every generated registration at once.
+
+Note this is not only telemetry: the recorded scores feed PPR personalization,
+so enabling it changes retrieval output. The blend is deliberately capped (an
+exploration floor limits interaction history to a small fraction of the
+personalization mass, with sublinear scoring, time decay, and invalidation on
+content change), but treat it as a ranking change rather than pure logging.
+
+For a generated MCP registration to see any of this, it must be started with
+`--config`. `nestweaver setup` emits that automatically.
+
 #### `[git]`
 
 How to authenticate git operations.
@@ -437,6 +468,58 @@ redefine core properties).
 extra_node_properties = { Symbol = { team_owner = "string", deprecated = "bool" } }
 ```
 
+### Change detection
+
+Indexing skips a file when its cached metadata proves it has not changed. That
+check compares the file's **modification time in nanoseconds** and its **size**;
+only when one of those moves is the file read and content-hashed.
+
+Both parts matter, and neither is redundant:
+
+- **Nanoseconds.** The timestamp used to be truncated to whole seconds, so any
+  edit landing in the same second as the cached value compared equal and the
+  file was classified unchanged. Because the cached value then kept matching, it
+  stayed misclassified on every later index — it never self-healed; only a
+  further mtime change recovered it.
+- **Size.** How much sub-second precision you actually get is platform-
+  dependent. On macOS/APFS it is effectively per-write (measured: 200 rapid
+  writes, 200 distinct stamps). On Linux the VFS stamps mtime from a clock
+  updated once per jiffy, so the granularity there is ~1–10ms depending on
+  `CONFIG_HZ`, not 1ns. On filesystems with no sub-second field at all (HFS+,
+  ext3, FAT, some network mounts) it stays whole seconds. Size is what still
+  catches size-changing edits on every one of those.
+
+What remains uncovered is an edit inside a single timestamp tick that also
+leaves the size byte-for-byte identical — Git's "racily clean" case. Bounding it
+completely requires a per-run index timestamp, the way Git bounds its window by
+the index file's own mtime.
+
+An over-sensitive timestamp is safe here. If a filesystem reports a sub-second
+value that moves when nothing changed, the file falls through to the content
+hash, compares equal, and is reported unchanged — it costs a read, not a wrong
+answer. (This is why Git's caution about `USE_NSEC` on CEPH/CIFS/NTFS/UDF does
+not transfer: there, an erroneous value makes Git report a file dirty.) The
+observed stat is then written back, so the file is not re-hashed on every
+subsequent index.
+
+#### Upgrading
+
+The change-detection sidecar (`<db>.filemeta.json`) is versioned, and the
+nanosecond change moves it to **v3**. A v2 entry stores seconds in the field v3
+reads as nanoseconds, so it is **discarded rather than reinterpreted** —
+reusing it would be indistinguishable from a real edit.
+
+**The first index after upgrading is therefore a full re-index of every existing
+database.** This is a deliberate fail-open: it costs one re-index and can never
+mis-classify a file. `resolution_cache::CACHE_VERSION` is bumped in lockstep for
+the same reason. Embeddings are keyed separately and are **not** invalidated, so
+no re-embed is required.
+
+Integrators implementing `ContentReader` should note the trait method is now
+`file_meta_nanos` and must return nanoseconds. It was renamed because the tuple
+shape did not change: an implementation still returning seconds would otherwise
+compile, write seconds into a valid v3 cache, and silently keep the bug.
+
 ### `[indexing]` (optional)
 
 Source code and Markdown notes have independent size policies. Source files
@@ -465,10 +548,9 @@ instead of relying on the flag being remembered on every run:
 with_trigrams = true
 ```
 
-This applies everywhere sources are indexed — `nestweaver index`, the daemon's
-`IndexRepo`, and its background reindex, which previously never touched
-trigrams at all, so postings went stale as the graph moved and later
-`regex-search` calls silently paid for a full scan.
+`with_trigrams` is the master switch for whether trigram acceleration is
+maintained at all. **It no longer means "refresh during indexing."** Maintenance
+is owned by a reconcile loop in the daemon; see below.
 
 Defaults to `false`, preserving the opt-in storage cost. Precedence for one-off
 runs:
@@ -492,6 +574,45 @@ inherits for the same reason — it has no flags with which to state a policy.
 A refresh failure never fails an otherwise successful index: a stale posting
 table is detected and bypassed at query time, so the cost is a slower
 `regex-search`, not a wrong one.
+
+##### Who refreshes trigrams
+
+The daemon runs a **reconcile loop** that drains pending trigram work on an
+interval. Writers do not refresh; they only enqueue.
+
+```toml
+[indexing]
+with_trigrams = true
+trigram_reconcile_interval = "30s"   # default; "0" disables the loop
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `trigram_reconcile_interval` | `"30s"` | How often the daemon drains pending trigram work. Humanized duration (`"30s"`, `"5m"`); a bare `"0"` disables the loop. Gated on `with_trigrams`. An unparseable value fails config loading rather than silently disabling maintenance. |
+
+This is why the loop exists rather than each writer refreshing. Invalidation was
+already universal and transactional — the store's own write path marks a scope
+dirty inside the mutating transaction, so no caller can forget. What was missing
+was anything that *drained* that queue: the refresh ran only as a side effect of
+two write handlers, so the vault-refresh path and both file watchers enqueued
+work nobody picked up, and their scopes stayed dirty until an unrelated repo
+index happened to run. That is a transactional outbox with no relay, and a
+level-triggered design invoked edge-triggered.
+
+Consequences worth knowing:
+
+- **An index no longer refreshes trigrams implicitly.** Explicit intent still
+  wins: `index --with-trigrams` and `--rebuild-trigrams` refresh inline, which
+  is what CI and scripted reindex want. `--no-trigrams` still forces none.
+- **The direct (`--local` / `--no-daemon`) path still refreshes inline**, because
+  no daemon exists there to drain for it.
+- **The file watchers need no trigram handling at all.** They mutate, the
+  mutation enqueues, the loop drains. Refreshing per watcher batch would run a
+  punishing duty cycle: refresh cost is dominated by fixed overhead (measured
+  ~918ms for 2 changed nodes) while the watcher debounces into ~2s batches.
+- Inspect the current state with `regex-search --json`, which reports
+  `ready_scopes`, `dirty_scopes`, `error_scopes`, `stale_index` and
+  `scanned_fallback`.
 
 ## Manifest Parsing (automatic)
 

@@ -2505,9 +2505,11 @@ enum Commands {
         name: Option<String>,
         #[arg(
             long = "with-trigrams",
-            help = "Refresh trigram postings for changed repo/vault scopes for THIS run, \
-                    whatever the config says. Set `[indexing] with_trigrams = true` to \
-                    enable it permanently (opt-in storage cost)"
+            help = "Refresh trigram postings INLINE for this run, whatever the config \
+                    says. Use it when the index must be current before the command \
+                    returns (CI, scripted reindex). Ongoing maintenance does not need \
+                    it: with `[indexing] with_trigrams = true` the daemon's reconcile \
+                    loop drains pending work every `trigram_reconcile_interval`"
         )]
         with_trigrams: bool,
         #[arg(
@@ -2517,8 +2519,10 @@ enum Commands {
             // --no-trigrams is a contradiction. It used to be accepted and
             // silently no-op, reporting success with no refresh performed.
             conflicts_with = "rebuild_trigrams",
-            help = "Skip the trigram refresh even when `[indexing] with_trigrams = true` \
-                    is set in the config"
+            help = "Skip the inline trigram refresh for this run. An index does not \
+                    refresh implicitly any more — the daemon's reconcile loop owns \
+                    maintenance — so this suppresses an otherwise-requested inline \
+                    refresh, not the loop"
         )]
         no_trigrams: bool,
         #[arg(
@@ -8421,6 +8425,8 @@ fn no_daemon_allowed() -> bool {
 /// "both set" is last-wins rather than an error. The explicit-off branch is
 /// still checked first so that ordering can never resolve to on-by-accident.
 /// `daemon gc` — sweep orphaned daemon runtime state.
+///
+/// `--db` / `NESTWEAVER_DB` are accepted and IGNORED: the sweep is global.
 ///
 /// Deliberately takes NO database path. It sweeps orphaned launch agents and
 /// orphaned per-instance directories under all three roots, sparing live

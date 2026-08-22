@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// Paired with `index::FILEMETA_VERSION`: bumping one requires bumping the
 /// other (both sidecars must be invalidated together), enforced by
 /// `tests::cache_version_moves_with_filemeta_version`.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// Maximum number of transitive reverse-dependency hops expanded when deciding
 /// which files to re-resolve after a change. Shared by the local cache-based

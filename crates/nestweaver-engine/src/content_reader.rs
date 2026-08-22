@@ -66,9 +66,62 @@ pub trait ContentReader: Send + Sync {
     fn list_files(&self) -> Result<Vec<PathBuf>>;
 
     /// Return filesystem metadata for change detection.
-    /// For FilesystemReader: `Some((mtime_secs, size_bytes))`.
+    ///
+    /// NAMED `_nanos` on purpose. The tuple shape `(u64, u64)` is unchanged
+    /// from the seconds-based version, so an external implementation that kept
+    /// returning seconds would still COMPILE — it would write seconds into a
+    /// valid v3 cache and silently retain the same-second miss this release
+    /// exists to fix. Since the sidecar format is already breaking, the rename
+    /// is what forces such an implementation to be looked at rather than
+    /// quietly carried forward.
+    /// For FilesystemReader: `Some((mtime_nanos, size_bytes))`.
     /// For GitBareReader: returns `None` (uses commit SHA instead of mtime).
-    fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>>;
+    ///
+    /// The timestamp is NANOSECONDS since the Unix epoch, not seconds.
+    ///
+    /// It used to be seconds, and the truncation was the bug (nw-200): every
+    /// edit landing in the same wall-clock second as the one already cached
+    /// compared equal, so the file was classified Unchanged and — because the
+    /// cached value kept matching — stayed misclassified on every later index.
+    /// It never self-healed; only a further mtime change recovered it.
+    ///
+    /// The precision was always there to use. Measured on APFS, 200 rapid
+    /// writes produced ONE distinct whole second but 200 DISTINCT nanosecond
+    /// stamps (min delta ~33us, zero consecutive collisions). `SystemTime`
+    /// carries it; `as_secs()` threw it away.
+    ///
+    /// HOW MUCH THIS BUYS IS PLATFORM-DEPENDENT — do not read "nanoseconds" as
+    /// "one-nanosecond resolution":
+    ///
+    /// - macOS/APFS: effectively per-write, as measured above.
+    /// - Linux ext4/btrfs/xfs: the VFS stamps mtime from a COARSE clock
+    ///   "updated every jiffy, so any change that happens within that jiffy
+    ///   will end up with the same timestamp" (Documentation/filesystems/
+    ///   multigrain-ts.rst). That is 1-10ms depending on CONFIG_HZ, not 1ns.
+    ///   Multigrain timestamps address it but were reverted before 6.6-rc3 and
+    ///   only landed in 6.13.
+    /// - Coarse or synthetic timestamps (HFS+, ext3, FAT, some network mounts):
+    ///   the sub-second field may be permanently zero, leaving second
+    ///   granularity.
+    ///
+    /// So the ambiguity window narrows from ~1s to ~1 jiffy on Linux and to
+    /// ~per-write on macOS. That is why the size comparison in
+    /// `tiered_change_check` STAYS: on any platform where the sub-second field
+    /// is coarse or absent, size is what still catches size-changing edits.
+    /// Removing it because "we have nanoseconds now" would regress every such
+    /// platform back to the original bug.
+    ///
+    /// Git reaches the opposite conclusion for its own use (`USE_NSEC` is off
+    /// by default, and its Makefile says not to enable it on CEPH/CIFS/NTFS/
+    /// UDF). The difference is the failure mode, not the facts: an erroneous
+    /// sub-second value makes Git report a file dirty, whereas here it only
+    /// sends the file to the Tier 3 content hash, which compares equal and
+    /// returns Unchanged. Over-sensitivity costs a read here; it cannot produce
+    /// a wrong answer.
+    ///
+    /// `u64` nanoseconds since 1970 saturate in the year 2554, which is not a
+    /// horizon this cache needs to survive.
+    fn file_meta_nanos(&self, rel_path: &Path) -> Result<Option<(u64, u64)>>;
 
     /// The root path (for constructing absolute paths in parsers that need them).
     fn root(&self) -> &Path;
@@ -198,15 +251,18 @@ impl ContentReader for FilesystemReader {
         Ok(files)
     }
 
-    fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>> {
+    fn file_meta_nanos(&self, rel_path: &Path) -> Result<Option<(u64, u64)>> {
         let abs = self.repo_path.join(rel_path);
         let meta = std::fs::metadata(&abs)?;
+        // Nanoseconds, deliberately. See the trait doc: truncating to seconds
+        // here is what made same-second edits permanently invisible (nw-200).
         let mtime = meta
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
         Ok(Some((mtime, meta.len())))
     }
 
@@ -673,7 +729,7 @@ impl ContentReader for GitBareReader {
         Ok(files)
     }
 
-    fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>> {
+    fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>> {
         // Bare repos have no filesystem mtime. Return None so callers
         // (tiered_change_check, index_md) use content-hash or always-process paths.
         Ok(None)
@@ -748,11 +804,11 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_reader_file_meta() {
+    fn filesystem_reader_file_meta_nanos() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("test.rs"), "hello").unwrap();
         let reader = FilesystemReader::new(dir.path());
-        let meta = reader.file_meta(Path::new("test.rs")).unwrap();
+        let meta = reader.file_meta_nanos(Path::new("test.rs")).unwrap();
         assert!(meta.is_some());
         let (mtime, size) = meta.unwrap();
         assert!(mtime > 0);
@@ -763,7 +819,7 @@ mod tests {
     fn filesystem_reader_file_exists_false_for_missing() {
         let dir = TempDir::new().unwrap();
         let reader = FilesystemReader::new(dir.path());
-        let meta = reader.file_meta(Path::new("missing.rs"));
+        let meta = reader.file_meta_nanos(Path::new("missing.rs"));
         assert!(meta.is_err());
     }
 
@@ -928,10 +984,10 @@ mod tests {
     }
 
     #[test]
-    fn git_bare_reader_file_meta() {
+    fn git_bare_reader_file_meta_nanos() {
         let (_tmp, bare, sha) = setup_bare_repo(&[("hello.txt", "world")]);
         let reader = GitBareReader::new(&bare, &sha);
-        let meta = reader.file_meta(Path::new("hello.txt")).unwrap();
+        let meta = reader.file_meta_nanos(Path::new("hello.txt")).unwrap();
         assert!(
             meta.is_none(),
             "GitBareReader should return None (no filesystem mtime)"
@@ -942,7 +998,7 @@ mod tests {
     fn git_bare_reader_file_meta_missing() {
         let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
         let reader = GitBareReader::new(&bare, &sha);
-        let meta = reader.file_meta(Path::new("missing.txt")).unwrap();
+        let meta = reader.file_meta_nanos(Path::new("missing.txt")).unwrap();
         assert!(
             meta.is_none(),
             "GitBareReader returns None for all paths (no filesystem mtime)"

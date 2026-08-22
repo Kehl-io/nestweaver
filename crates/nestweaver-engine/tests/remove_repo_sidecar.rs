@@ -133,7 +133,7 @@ fn slice_drop_is_uid_scoped() {
     a_files.insert(
         "a.js".into(),
         CachedFileMeta {
-            mtime_secs: 1,
+            mtime_nanos: 1,
             size_bytes: 2,
             content_hash: "ha".into(),
         },
@@ -142,7 +142,7 @@ fn slice_drop_is_uid_scoped() {
     b_files.insert(
         "b.js".into(),
         CachedFileMeta {
-            mtime_secs: 3,
+            mtime_nanos: 3,
             size_bytes: 4,
             content_hash: "hb".into(),
         },
