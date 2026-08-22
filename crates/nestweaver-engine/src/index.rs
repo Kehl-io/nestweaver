@@ -12166,6 +12166,32 @@ function hello(name) { return "Hello " + name; }
             "function originalNeedle() {}\nfunction watchedRegressionNeedle() {}\n",
         )
         .unwrap();
+        // Advance the mtime explicitly instead of relying on the two writes
+        // straddling a wall-clock second.
+        //
+        // `tiered_change_check` Tier 1 is `cached.mtime_secs == mtime_secs ->
+        // Unchanged`, at WHOLE-SECOND granularity and short-circuiting before
+        // any content hash. When both writes land in the same second the edit
+        // is classified unchanged, nothing is re-indexed, no scope is dirtied,
+        // and this test fails with `dirty_scopes: 0`. That is timing, not
+        // behaviour: the faster the build, the likelier the collision, so it
+        // passed in debug and failed under `--release` on CI.
+        //
+        // Pinning the mtime forward makes the test assert what it means to
+        // assert — that an incremental CONTENT change dirties the regex scope —
+        // rather than incidentally asserting that the clock ticked.
+        {
+            let path = repo.join("main.js");
+            // Advance relative to the file's OWN mtime, not to `now`: that is
+            // strictly monotonic by construction, so the new mtime is always a
+            // different whole second from the one the first index cached, no
+            // matter how fast the machine or where the clock happens to sit.
+            let current = fs::metadata(&path).unwrap().modified().unwrap();
+            let advanced = current + std::time::Duration::from_secs(10);
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(advanced))
+                .unwrap();
+        }
         incremental_index_with_name(&repo, &db_path, "test", "https://example.com/regex", None)
             .unwrap();
 
