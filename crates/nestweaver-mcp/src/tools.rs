@@ -12064,7 +12064,7 @@ mod cache_dispatch_tests {
         s.repos.entry("repo:t:aaaa".into()).or_default().insert(
             "main.js".into(),
             nestweaver_engine::CachedFileMeta {
-                mtime_secs: 1,
+                mtime_nanos: 1,
                 size_bytes: 1,
                 content_hash: "h".into(),
             },
@@ -12077,7 +12077,7 @@ mod cache_dispatch_tests {
         s.repos.entry("repo:t:bbbb".into()).or_default().insert(
             "main.js".into(),
             nestweaver_engine::CachedFileMeta {
-                mtime_secs: 1,
+                mtime_nanos: 1,
                 size_bytes: 1,
                 content_hash: "h".into(),
             },

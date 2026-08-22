@@ -129,7 +129,7 @@ fn sidecar_deleted_with_one_changed_file_keeps_edge_multiplicities() {
     sane_baseline(&baseline);
 
     // Change helper.js without changing its symbol or edge set (comment only).
-    // The sleep guarantees an mtime_secs delta so tiered change detection
+    // The sleep guarantees an mtime delta so tiered change detection
     // cannot skip the file as mtime-identical.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(

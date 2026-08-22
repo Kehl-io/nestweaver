@@ -66,8 +66,24 @@ pub trait ContentReader: Send + Sync {
     fn list_files(&self) -> Result<Vec<PathBuf>>;
 
     /// Return filesystem metadata for change detection.
-    /// For FilesystemReader: `Some((mtime_secs, size_bytes))`.
+    /// For FilesystemReader: `Some((mtime_nanos, size_bytes))`.
     /// For GitBareReader: returns `None` (uses commit SHA instead of mtime).
+    ///
+    /// The timestamp is NANOSECONDS since the Unix epoch, not seconds.
+    ///
+    /// It used to be seconds, and the truncation was the bug (nw-200): every
+    /// edit landing in the same wall-clock second as the one already cached
+    /// compared equal, so the file was classified Unchanged and — because the
+    /// cached value kept matching — stayed misclassified on every later index.
+    /// It never self-healed; only a further mtime change recovered it.
+    ///
+    /// The precision was always there to use. Measured on APFS, five
+    /// consecutive fast writes produced ONE distinct whole second but FIVE
+    /// distinct nanosecond stamps. `SystemTime` carries it; `as_secs()` threw
+    /// it away.
+    ///
+    /// `u64` nanoseconds since 1970 saturate in the year 2554, which is not a
+    /// horizon this cache needs to survive.
     fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>>;
 
     /// The root path (for constructing absolute paths in parsers that need them).
@@ -201,12 +217,15 @@ impl ContentReader for FilesystemReader {
     fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>> {
         let abs = self.repo_path.join(rel_path);
         let meta = std::fs::metadata(&abs)?;
+        // Nanoseconds, deliberately. See the trait doc: truncating to seconds
+        // here is what made same-second edits permanently invisible (nw-200).
         let mtime = meta
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
         Ok(Some((mtime, meta.len())))
     }
 

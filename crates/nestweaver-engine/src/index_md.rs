@@ -460,10 +460,15 @@ fn index_markdown_since_with_reader(
         .map(|note| note.uid.clone())
         .collect::<std::collections::HashSet<_>>();
 
-    let since_secs = since
+    // NANOSECONDS, to match `ContentReader::file_meta` (nw-200). Both sides of
+    // the comparison below must use the same unit; leaving this in seconds
+    // while the reader returns nanoseconds would make every file look newer
+    // than `since` and silently disable the filter entirely.
+    let since_nanos = since
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
 
     let all_files = reader.list_files()?;
 
@@ -495,7 +500,7 @@ fn index_markdown_since_with_reader(
         // Parse changed files now. Unchanged sources are read later only when
         // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta(&rel_path) {
-            Ok(Some((mtime_secs, file_size))) => {
+            Ok(Some((mtime_nanos, file_size))) => {
                 if file_size > MAX_NOTE_SIZE_BYTES {
                     if existing_note_uids.contains(&n_uid) {
                         return Err(anyhow::anyhow!(
@@ -505,7 +510,7 @@ fn index_markdown_since_with_reader(
                     tracing::warn!("skipping oversized file: {}", rel_path_str);
                     continue;
                 }
-                mtime_secs >= since_secs
+                mtime_nanos >= since_nanos
             }
             Ok(None) => true, // bare repo: no mtime, process unconditionally
             Err(error) => {
