@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::io::Write as IoWrite;
 use std::path::Path;
 
@@ -199,14 +200,22 @@ fn which_exists(cmd: &str) -> bool {
 /// config was last successfully used for this database? Reusing the daemon's
 /// own persisted intent means setup cannot bind a config the daemon would
 /// disagree with, and it needs no new flag to thread through every caller.
-fn bound_config_path(db_path: &Path, base: &Path) -> Option<String> {
+fn bound_config_path(db_path: &Path, base: &Path) -> Result<Option<String>, anyhow::Error> {
     // 1. What the daemon actually last used for this database. Authoritative
     //    when present, because setup then cannot bind a config the daemon would
     //    disagree with.
     if let Ok(record) = nestweaver_daemon::lifecycle::read_last_successful_config(db_path)
         && Path::new(&record.config_path).is_file()
     {
-        return Some(record.config_path);
+        nestweaver_engine::InstanceConfig::from_file(Path::new(&record.config_path)).with_context(
+            || {
+                format!(
+                    "validate the persisted NestWeaver config binding {}",
+                    record.config_path
+                )
+            },
+        )?;
+        return Ok(Some(record.config_path));
     }
 
     // 2. Fall back to discovery from the directory being configured.
@@ -217,18 +226,46 @@ fn bound_config_path(db_path: &Path, base: &Path) -> Option<String> {
     // so relying on it alone silently emitted a config-less registration in the
     // exact case that matters most. Look where an instance config actually
     // lives relative to the tree being set up.
-    for candidate in [
-        base.join(".nestweaver/instance.toml"),
-        base.join("instance.toml"),
-    ] {
-        if candidate.is_file() {
-            return candidate
-                .canonicalize()
-                .ok()
-                .map(|path| path.display().to_string());
+    // `.nestweaver/` is our namespace. A file there is explicit operator
+    // intent, so accepting defaults after it fails to parse would silently
+    // discard configuration the user expected us to honor.
+    let explicit_candidate = base.join(".nestweaver/instance.toml");
+    if explicit_candidate.is_file() {
+        nestweaver_engine::InstanceConfig::from_file(&explicit_candidate).with_context(|| {
+            format!(
+                "{} is the NestWeaver instance config for this setup, but it is invalid",
+                explicit_candidate.display()
+            )
+        })?;
+        return explicit_candidate
+            .canonicalize()
+            .with_context(|| format!("canonicalize config path {}", explicit_candidate.display()))
+            .map(|path| Some(path.display().to_string()));
+    }
+
+    // A bare `instance.toml` is only a compatibility heuristic and may belong
+    // to another tool. Use it when it parses as a complete NestWeaver config;
+    // otherwise disclose the skipped candidate and continue without binding
+    // it instead of making an unrelated file break setup.
+    let bare_candidate = base.join("instance.toml");
+    if bare_candidate.is_file() {
+        match nestweaver_engine::InstanceConfig::from_file(&bare_candidate) {
+            Ok(_) => {
+                return bare_candidate
+                    .canonicalize()
+                    .with_context(|| {
+                        format!("canonicalize config path {}", bare_candidate.display())
+                    })
+                    .map(|path| Some(path.display().to_string()));
+            }
+            Err(error) => eprintln!(
+                "warning: ignoring bare config candidate {} because it is not a valid \
+                 NestWeaver instance config: {error:#}",
+                bare_candidate.display()
+            ),
         }
     }
-    None
+    Ok(None)
 }
 
 /// THE single source of truth for the argv every generated MCP registration
@@ -239,26 +276,26 @@ fn bound_config_path(db_path: &Path, base: &Path) -> Option<String> {
 /// TOML writer kept its own hardcoded `["mcp", "--db", "{}"]` literal, so Codex
 /// silently kept emitting a config-less registration. `generated_registrations_
 /// all_carry_the_bound_config` pins that they cannot drift apart again.
-fn mcp_arg_vec(db_str: &str, base: &Path, lite: bool) -> Vec<String> {
+fn mcp_arg_vec(db_str: &str, base: &Path, lite: bool) -> Result<Vec<String>, anyhow::Error> {
     let mut args = vec!["mcp".to_string()];
     if lite {
         args.push("--lite".to_string());
     }
     args.push("--db".to_string());
     args.push(db_str.to_string());
-    if let Some(config) = bound_config_path(Path::new(db_str), base) {
+    if let Some(config) = bound_config_path(Path::new(db_str), base)? {
         args.push("--config".to_string());
         args.push(config);
     }
-    args
+    Ok(args)
 }
 
-fn mcp_args(db_str: &str, base: &Path) -> serde_json::Value {
-    serde_json::json!(mcp_arg_vec(db_str, base, false))
+fn mcp_args(db_str: &str, base: &Path) -> Result<serde_json::Value, anyhow::Error> {
+    Ok(serde_json::json!(mcp_arg_vec(db_str, base, false)?))
 }
 
-fn mcp_args_lite(db_str: &str, base: &Path) -> serde_json::Value {
-    serde_json::json!(mcp_arg_vec(db_str, base, true))
+fn mcp_args_lite(db_str: &str, base: &Path) -> Result<serde_json::Value, anyhow::Error> {
+    Ok(serde_json::json!(mcp_arg_vec(db_str, base, true)?))
 }
 
 fn setup_claude_code(
@@ -271,7 +308,7 @@ fn setup_claude_code(
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&mcp_path, "nestweaver", &mcp_config)?;
 
@@ -403,7 +440,7 @@ fn setup_cursor(db_path: &Path, force_overwrite: bool, base: &Path) -> Result<()
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args_lite(&db_str, base)
+        "args": mcp_args_lite(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -439,13 +476,13 @@ fn setup_codex(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let config_path = base.join(".codex/config.toml");
     let toml_section = format!(
         "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [{}]\n",
-        mcp_arg_vec(&db_str, base, false)
+        mcp_arg_vec(&db_str, base, false)?
             .iter()
             .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let merged = append_toml_if_missing(&config_path, "mcp_servers.nestweaver", &toml_section)?;
+    let merged = merge_codex_mcp(&config_path, &toml_section)?;
 
     let agents_path = base.join("AGENTS.md");
     let agents_status = if agents_path.exists() {
@@ -483,7 +520,7 @@ fn setup_windsurf(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
 
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&config_path, "nestweaver", &mcp_config)?;
 
@@ -506,7 +543,7 @@ fn setup_jetbrains(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".junie/mcp/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -529,7 +566,7 @@ fn setup_vscode(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".vscode/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -552,7 +589,7 @@ fn setup_gemini(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(
         &base.join(".gemini/settings.json"),
@@ -579,7 +616,7 @@ fn setup_copilot(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(
         &base.join(".github/copilot-mcp.json"),
@@ -652,7 +689,7 @@ fn setup_kiro(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".kiro/settings.json"), "nestweaver", &mcp_config)?;
 
@@ -675,7 +712,7 @@ fn setup_continue(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(
         &base.join(".continue/config.json"),
@@ -702,7 +739,7 @@ fn setup_cline(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(
         &base.join(".cline/settings.json"),
@@ -729,7 +766,7 @@ fn setup_opencode(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(
         &base.join(".opencode/config.json"),
@@ -756,7 +793,7 @@ fn setup_trae(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".trae/config.json"), "nestweaver", &mcp_config)?;
 
@@ -778,7 +815,7 @@ fn setup_devin(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join("devin.json"), "nestweaver", &mcp_config)?;
 
@@ -801,7 +838,7 @@ fn setup_hermes(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, base)
+        "args": mcp_args(&db_str, base)?
     });
     let merged = merge_json_mcp(&base.join(".hermes/config.json"), "nestweaver", &mcp_config)?;
 
@@ -929,63 +966,90 @@ fn merge_json_mcp(
     Ok(false)
 }
 
-/// Append a TOML section to a file only if the section marker is not already present.
-/// Returns `true` if the content was appended, `false` if it was already there.
-fn append_toml_if_missing(
-    path: &Path,
-    section: &str,
-    content: &str,
-) -> Result<bool, anyhow::Error> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.contains(section) {
-        // The section is present but may predate `--config`. Reconcile that one
-        // line rather than returning unchanged: a Codex registration written
-        // before `--config` existed otherwise kept its old argv forever, and
-        // re-running `setup` — the obvious remedy — was a silent no-op.
-        //
-        // Rewrite ONLY when the existing args lack `--config` and the content
-        // we would write has one, so a hand-edited section is left alone.
-        if let Some(desired) = content
-            .lines()
-            .find(|line| line.trim_start().starts_with("args = ["))
-            && desired.contains("--config")
+/// Merge the generated Codex MCP registration without replacing user-owned
+/// arguments. Returns `true` when the section was added or reconciled.
+fn merge_codex_mcp(path: &Path, content: &str) -> Result<bool, anyhow::Error> {
+    let desired = content
+        .parse::<toml_edit::DocumentMut>()
+        .context("parse generated Codex MCP configuration")?;
+    let desired_args = desired
+        .get("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|servers| servers.get("nestweaver"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|server| server.get("args"))
+        .and_then(toml_edit::Item::as_array)
+        .ok_or_else(|| anyhow::anyhow!("generated Codex MCP configuration has no args array"))?;
+    let desired_config = desired_args
+        .iter()
+        .position(|value| value.as_str() == Some("--config"))
+        .and_then(|index| desired_args.get(index + 1))
+        .and_then(toml_edit::Value::as_str);
+
+    if !path.exists() {
+        std::fs::write(path, content)?;
+        return Ok(true);
+    }
+
+    let existing = std::fs::read_to_string(path)?;
+    let mut document = existing
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("{} contains invalid TOML", path.display()))?;
+    let server_exists = document
+        .get("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|servers| servers.get("nestweaver"))
+        .is_some();
+    if !server_exists {
+        let mut appended = existing;
+        if !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push_str(content.trim_start_matches('\n'));
+        std::fs::write(path, appended)?;
+        return Ok(true);
+    }
+
+    let Some(desired_config) = desired_config else {
+        return Ok(false);
+    };
+    let args = document
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|servers| servers.get_mut("nestweaver"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|server| server.get_mut("args"))
+        .and_then(toml_edit::Item::as_array_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "[mcp_servers.nestweaver] in {} must contain an args array",
+                path.display()
+            )
+        })?;
+
+    if let Some(config_index) = args
+        .iter()
+        .position(|value| value.as_str() == Some("--config"))
+    {
+        if args
+            .get(config_index + 1)
+            .and_then(toml_edit::Value::as_str)
+            .is_none()
         {
-            let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
-            // `section` arrives unbracketed ("mcp_servers.nestweaver") while the
-            // file carries the table header "[mcp_servers.nestweaver]".
-            let header = format!("[{section}]");
-            let section_at = lines.iter().position(|line| line.trim() == header);
-            if let Some(start) = section_at {
-                // Stay inside this section: stop at the next table header.
-                let end = lines[start + 1..]
-                    .iter()
-                    .position(|line| line.trim_start().starts_with('['))
-                    .map(|offset| start + 1 + offset)
-                    .unwrap_or(lines.len());
-                if let Some(args_at) = lines[start..end]
-                    .iter()
-                    .position(|line| line.trim_start().starts_with("args = ["))
-                    .map(|offset| start + offset)
-                    && !lines[args_at].contains("--config")
-                {
-                    lines[args_at] = desired.to_string();
-                    let mut rewritten = lines.join("\n");
-                    if existing.ends_with('\n') {
-                        rewritten.push('\n');
-                    }
-                    std::fs::write(path, rewritten)?;
-                    eprintln!("  (added missing flag: --config)");
-                    return Ok(true);
-                }
-            }
+            anyhow::bail!(
+                "[mcp_servers.nestweaver] in {} has --config without a path",
+                path.display()
+            );
         }
         return Ok(false);
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
+
+    // Add only the missing pair. `--tools`, `--lite`, a custom `--db`, comments,
+    // and multiline formatting remain owned by the user.
+    args.push("--config");
+    args.push(desired_config);
+    std::fs::write(path, document.to_string())?;
+    eprintln!("  (added missing flag: --config)");
     Ok(true)
 }
 
@@ -1437,22 +1501,74 @@ mod mcp_arg_source_of_truth_tests {
         std::fs::create_dir_all(base.join(".nestweaver")).unwrap();
         std::fs::write(
             base.join(".nestweaver/instance.toml"),
-            "instance_id = \"x\"\n",
+            include_str!("../examples/minimal-instance.toml"),
         )
         .unwrap();
 
         let db = base.join("never-started.lbug");
-        let found = bound_config_path(&db, base).expect("config must be discovered from base");
+        let found = bound_config_path(&db, base)
+            .expect("config discovery must succeed")
+            .expect("config must be discovered from base");
         assert!(
             found.ends_with("instance.toml"),
             "expected the instance config, got {found}"
         );
         assert!(
             mcp_arg_vec(&db.display().to_string(), base, false)
+                .unwrap()
                 .iter()
                 .any(|a| a == "--config"),
             "a fresh registration must carry --config"
         );
+    }
+
+    /// A config inside NestWeaver's own namespace is explicit operator intent.
+    /// Setup must fail visibly instead of silently discarding an invalid file
+    /// the user expected it to honor.
+    #[test]
+    fn fresh_setup_rejects_an_invalid_explicit_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".nestweaver")).unwrap();
+        let config = base.join(".nestweaver/instance.toml");
+        std::fs::write(&config, "title = \"not a NestWeaver config\"\n").unwrap();
+
+        let error = bound_config_path(&base.join("fresh.lbug"), base).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&config.display().to_string()));
+        assert!(message.contains("invalid"));
+    }
+
+    /// The root-level filename is ambiguous and may belong to another tool.
+    /// An invalid candidate there is disclosed but must not break setup.
+    #[test]
+    fn fresh_setup_skips_an_invalid_bare_config_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("instance.toml"),
+            "title = \"another tool owns this\"\n",
+        )
+        .unwrap();
+
+        let found = bound_config_path(&base.join("fresh.lbug"), base)
+            .expect("an unrelated bare config must not break setup");
+        assert_eq!(found, None);
+    }
+
+    /// The compatibility filename remains supported when it proves itself by
+    /// parsing as a complete NestWeaver instance config.
+    #[test]
+    fn fresh_setup_accepts_a_valid_bare_config_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let config = base.join("instance.toml");
+        std::fs::write(&config, include_str!("../examples/minimal-instance.toml")).unwrap();
+
+        let found = bound_config_path(&base.join("fresh.lbug"), base)
+            .expect("config discovery must succeed")
+            .expect("a valid bare config must remain discoverable");
+        assert_eq!(found, config.canonicalize().unwrap().display().to_string());
     }
 
     /// Upgrade path: an EXISTING registration must gain `--config`.
@@ -1497,18 +1613,41 @@ mod mcp_arg_source_of_truth_tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\"]\n",
+            r#"
+[mcp_servers.nestweaver]
+command = "nestweaver"
+args = [
+    "mcp",
+    "--lite",
+    "--db",
+    "/custom-db", # preserve this deliberate binding
+    "--tools",
+    "brain_search,brain_context",
+]
+"#,
         )
         .unwrap();
 
         let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\", \"--config\", \"/cfg/instance.toml\"]\n";
-        append_toml_if_missing(&path, "mcp_servers.nestweaver", desired).unwrap();
+        merge_codex_mcp(&path, desired).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
             written.contains("--config"),
             "an existing Codex section must be reconciled: {written}"
         );
+        for preserved in [
+            "--lite",
+            "--tools",
+            "brain_search,brain_context",
+            "/custom-db",
+            "preserve this deliberate binding",
+        ] {
+            assert!(
+                written.contains(preserved),
+                "reconciliation removed user-owned {preserved:?}: {written}"
+            );
+        }
         // Exactly one section — reconciled in place, not appended twice.
         assert_eq!(written.matches("[mcp_servers.nestweaver]").count(), 1);
     }
@@ -1520,8 +1659,8 @@ mod mcp_arg_source_of_truth_tests {
         // A base with no instance config, so neither carries --config and the
         // comparison isolates the --lite difference.
         let empty = tempfile::tempdir().unwrap();
-        let full = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), false);
-        let lite = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), true);
+        let full = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), false).unwrap();
+        let lite = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), true).unwrap();
         assert_eq!(full[0], "mcp");
         assert_eq!(lite[0], "mcp");
         assert_eq!(lite[1], "--lite");

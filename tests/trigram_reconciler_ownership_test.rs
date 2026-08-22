@@ -128,3 +128,41 @@ fn the_watchers_never_touch_trigrams() {
         }
     }
 }
+
+/// The reconcile task handle must stay owned until the graceful-shutdown drain.
+/// A previous edit awaited it during startup, before the task was even spawned,
+/// leaving the real shutdown path free to unlink runtime files while a
+/// `spawn_blocking` trigram write was still in flight.
+#[test]
+fn the_reconciler_is_drained_before_shutdown_unlinks_runtime_files() {
+    let source =
+        std::fs::read_to_string(repo_root().join("crates/nestweaver-daemon/src/server.rs"))
+            .expect("daemon server source must be readable");
+
+    let spawn = source
+        .find("tokio::spawn(run_trigram_reconciler")
+        .expect("the daemon must spawn the trigram reconciler");
+    let shutdown_cleanup = source
+        .find("daemon shutting down, cleaning up")
+        .expect("the daemon must have a graceful-shutdown cleanup phase");
+    let drain = source
+        .find("draining trigram reconcile loop before exit")
+        .expect("the daemon must drain the trigram reconciler");
+    let socket_unlink = source[drain..]
+        .find("remove_file(&sock_path)")
+        .map(|offset| drain + offset)
+        .expect("shutdown cleanup must unlink the daemon socket");
+
+    assert!(
+        spawn < shutdown_cleanup && shutdown_cleanup < drain && drain < socket_unlink,
+        "reconciler ownership order must be spawn -> shutdown cleanup -> drain -> unlink; \
+         got spawn={spawn}, cleanup={shutdown_cleanup}, drain={drain}, unlink={socket_unlink}"
+    );
+    assert_eq!(
+        source
+            .matches("draining trigram reconcile loop before exit")
+            .count(),
+        1,
+        "the reconciler handle must have exactly one drain owner"
+    );
+}

@@ -4115,6 +4115,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml_edit",
  "tonic",
  "tonic-prost",
  "tracing",

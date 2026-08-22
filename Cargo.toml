@@ -100,6 +100,7 @@ thiserror = { workspace = true }
 owo-colors = "4"
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml_edit = "0.25"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
