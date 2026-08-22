@@ -1705,7 +1705,22 @@ fn merge_save_filemeta(
 /// Outcome of the tiered change detection for a single file.
 enum ChangeVerdict {
     /// File is unchanged — skip re-indexing it.
-    Unchanged,
+    Unchanged {
+        /// Set when the stat MOVED but the content hash matched.
+        ///
+        /// Carrying the old entry forward in that case re-reads and re-hashes
+        /// the file on every subsequent index, forever, because the cached
+        /// stat never catches up to what the filesystem reports. That happens
+        /// routinely: a `git checkout` that rewrites identical content, a
+        /// formatter whose output is unchanged, a `touch`, or a filesystem
+        /// whose sub-second field jitters (the case Git names when it ships
+        /// `USE_NSEC` off by default).
+        ///
+        /// Storing the observed stat with the SAME hash makes the next run
+        /// short-circuit at Tier 1. Git does the same thing — it refreshes the
+        /// cached stat when content compares equal.
+        refreshed: Option<CachedFileMeta>,
+    },
     /// File is new or changed — `source` contains the file content and
     /// `content_hash` is the freshly-computed BLAKE3 hex digest.
     Changed {
@@ -1757,7 +1772,9 @@ fn tiered_change_check(
             if let Some(cached) = cache.get(rel_path)
                 && content_hash == cached.content_hash
             {
-                return Ok(ChangeVerdict::Unchanged);
+                // No filesystem stat exists on this path, so there is nothing
+                // to refresh.
+                return Ok(ChangeVerdict::Unchanged { refreshed: None });
             }
             return Ok(ChangeVerdict::Changed {
                 meta: CachedFileMeta {
@@ -1826,7 +1843,7 @@ fn tiered_change_check(
         // Linux) rather than by a full second, which turns routine data loss
         // into a narrow remainder.
         if cached.mtime_nanos == mtime_nanos && cached.size_bytes == size_bytes {
-            return Ok(ChangeVerdict::Unchanged);
+            return Ok(ChangeVerdict::Unchanged { refreshed: None });
         }
 
         // Tier 2: mtime or size changed → fall through to hash check. A
@@ -1841,10 +1858,17 @@ fn tiered_change_check(
         )?;
         let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
-            // Content identical despite mtime/size change — unchanged for the
-            // graph. No need to re-parse. (The caller will carry forward the
-            // cached entry.)
-            return Ok(ChangeVerdict::Unchanged);
+            // Content identical despite a stat change — unchanged for the
+            // graph, so no re-parse. But hand back the OBSERVED stat: without
+            // it the cached stat never catches up and this file is re-read and
+            // re-hashed on every index from now on.
+            return Ok(ChangeVerdict::Unchanged {
+                refreshed: Some(CachedFileMeta {
+                    mtime_nanos,
+                    size_bytes,
+                    content_hash,
+                }),
+            });
         }
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
@@ -2701,6 +2725,10 @@ where
     enum ParseOutcome {
         Unchanged {
             rel_path: String,
+            /// Observed stat when it moved but content matched — see
+            /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
+            /// entry so the next run short-circuits at Tier 1.
+            refreshed: Option<CachedFileMeta>,
         },
         Skipped(SkippedFile),
         /// Transient I/O/parser failure. The full publication must abort;
@@ -2728,6 +2756,7 @@ where
             symbols: Vec<RawSymbol>,
             references: Vec<RawReference>,
             type_bindings: Vec<AstTypeBinding>,
+            refreshed: Option<CachedFileMeta>,
         },
     }
 
@@ -2772,7 +2801,7 @@ where
         // Tiered change detection.
         let (source, content_hash, file_meta) =
             match tiered_change_check(reader, &display_name, cache) {
-                Ok(ChangeVerdict::Unchanged) => {
+                Ok(ChangeVerdict::Unchanged { refreshed }) => {
                     parse_pb.inc(1);
                     // Check parsed cache: if we have cached symbols for this
                     // file's content hash, return CachedParsed so symbols are
@@ -2786,10 +2815,12 @@ where
                             symbols: cached_parse.symbols.clone(),
                             references: cached_parse.references.clone(),
                             type_bindings: cached_parse.type_bindings.clone(),
+                            refreshed,
                         };
                     }
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
+                        refreshed,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -2910,13 +2941,18 @@ where
 
     for outcome in outcomes {
         match outcome {
-            ParseOutcome::Unchanged { rel_path } => {
+            ParseOutcome::Unchanged {
+                rel_path,
+                refreshed,
+            } => {
                 present_files.insert(rel_path.clone());
-                // Carry forward the existing cache entry.
-                if let (Some(ref mut new_cache), Some(cached)) =
-                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                // Carry the cache entry forward — but prefer the REFRESHED stat
+                // when the content matched despite a moved mtime/size. Storing
+                // the stale one re-hashes this file on every future index.
+                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
+                    && let Some(entry) = refreshed.or_else(|| cache.get(&rel_path).cloned())
                 {
-                    new_cache.insert(rel_path, cached.clone());
+                    new_cache.insert(rel_path, entry);
                 }
                 files_unchanged += 1;
             }
@@ -2925,13 +2961,14 @@ where
                 symbols: raw_symbols,
                 references: raw_references,
                 type_bindings: raw_type_bindings,
+                refreshed,
             } => {
                 present_files.insert(rel_path.clone());
-                // Carry forward the existing filemeta cache entry (file is unchanged).
-                if let (Some(ref mut new_cache), Some(cached)) =
-                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                // Same as above: the refreshed stat wins when present.
+                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
+                    && let Some(entry) = refreshed.or_else(|| cache.get(&rel_path).cloned())
                 {
-                    new_cache.insert(rel_path.clone(), cached.clone());
+                    new_cache.insert(rel_path.clone(), entry);
                 }
                 files_unchanged += 1;
                 // Feed cached symbols/references into the resolver so cross-file
@@ -11829,7 +11866,7 @@ function hello(name) { return "Hello " + name; }
                 assert!(meta.size_bytes > 0);
                 assert!(meta.mtime_nanos > 0);
             }
-            ChangeVerdict::Unchanged => panic!("expected Changed for new file"),
+            ChangeVerdict::Unchanged { .. } => panic!("expected Changed for new file"),
         }
     }
 
@@ -11860,7 +11897,7 @@ function hello(name) { return "Hello " + name; }
 
         let reader = crate::content_reader::FilesystemReader::new(dir.path());
         match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
-            ChangeVerdict::Unchanged => {} // expected
+            ChangeVerdict::Unchanged { .. } => {} // expected
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged for same mtime"),
         }
     }
@@ -11897,7 +11934,7 @@ function hello(name) { return "Hello " + name; }
 
         let reader = crate::content_reader::FilesystemReader::new(dir.path());
         match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
-            ChangeVerdict::Unchanged => {} // expected — hash matches, so unchanged
+            ChangeVerdict::Unchanged { .. } => {} // expected — hash matches, so unchanged
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged when hash matches"),
         }
 
@@ -11914,7 +11951,7 @@ function hello(name) { return "Hello " + name; }
 
         match tiered_change_check(&reader, "hello.js", &cache2).unwrap() {
             ChangeVerdict::Changed { .. } => {} // expected — hash differs
-            ChangeVerdict::Unchanged => {
+            ChangeVerdict::Unchanged { .. } => {
                 panic!("expected Changed when hash differs despite same size")
             }
         }
@@ -11948,7 +11985,7 @@ function hello(name) { return "Hello " + name; }
                 assert!(source.contains("return 42"));
                 assert_eq!(content_hash, content_hash_hex(new_content));
             }
-            ChangeVerdict::Unchanged => panic!("expected Changed for different-size file"),
+            ChangeVerdict::Unchanged { .. } => panic!("expected Changed for different-size file"),
         }
     }
 
@@ -12337,6 +12374,82 @@ function hello(name) { return "Hello " + name; }
             "a same-second edit that changes the file size must still be indexed; \
              an mtime-only Tier 1 check misses it permanently"
         );
+    }
+
+    /// A moved stat with identical content must REFRESH the cache, not leave it
+    /// stale.
+    ///
+    /// Carrying the old entry forward means the cached stat never catches up to
+    /// what the filesystem reports, so the file is re-read and re-hashed on
+    /// every index from then on — permanently. This happens routinely: a
+    /// `git checkout` that rewrites identical content, a formatter whose output
+    /// is unchanged, a `touch`, or a filesystem whose sub-second field jitters.
+    #[test]
+    fn a_content_match_after_a_moved_stat_refreshes_the_cached_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hello.js");
+        let content = "function hello() {}";
+        fs::write(&file_path, content).unwrap();
+
+        let fs_meta = fs::metadata(&file_path).unwrap();
+        let observed_nanos = fs_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let size_bytes = fs_meta.len();
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
+
+        // Cache holds a DIFFERENT stat for byte-identical content — the
+        // touch / checkout / jitter shape.
+        let mut cache = FileMetaCache::new();
+        cache.insert(
+            "hello.js".to_string(),
+            CachedFileMeta {
+                mtime_nanos: observed_nanos.wrapping_sub(999_999),
+                size_bytes,
+                content_hash: content_hash_hex(content),
+            },
+        );
+
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
+            ChangeVerdict::Unchanged { refreshed } => {
+                let refreshed = refreshed.expect(
+                    "a content match after a moved stat must hand back the observed stat, \
+                     otherwise the file re-hashes on every future index",
+                );
+                assert_eq!(refreshed.mtime_nanos, observed_nanos);
+                assert_eq!(refreshed.size_bytes, size_bytes);
+                assert_eq!(
+                    refreshed.content_hash,
+                    content_hash_hex(content),
+                    "the hash is unchanged — only the stat advances"
+                );
+            }
+            ChangeVerdict::Changed { .. } => {
+                panic!("identical content must not be reported as a change")
+            }
+        }
+
+        // And the no-op case must NOT claim a refresh.
+        let mut fresh = FileMetaCache::new();
+        fresh.insert(
+            "hello.js".to_string(),
+            CachedFileMeta {
+                mtime_nanos: observed_nanos,
+                size_bytes,
+                content_hash: content_hash_hex(content),
+            },
+        );
+        match tiered_change_check(&reader, "hello.js", &fresh).unwrap() {
+            ChangeVerdict::Unchanged { refreshed } => assert!(
+                refreshed.is_none(),
+                "an untouched file short-circuits at Tier 1 with nothing to refresh"
+            ),
+            ChangeVerdict::Changed { .. } => panic!("expected Unchanged"),
+        }
     }
 
     /// A nanosecond mtime must survive the JSON sidecar EXACTLY.

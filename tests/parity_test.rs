@@ -710,6 +710,34 @@ fn flatten_diagnostic(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/// Drop the semantic-availability note before comparing direct and daemon output.
+///
+/// That note is a DELIBERATE difference between the two paths, not an accident:
+/// the direct path passes no embedding model, so `semantic_applied` is always
+/// false there and the note always prints, while the daemon prints it only when
+/// its own embedding state says semantic retrieval was unavailable. nw-120 added
+/// it precisely so a reader can tell which path produced a ranking.
+///
+/// Asserting byte-equality across that note therefore tests the daemon's
+/// embedding-probe state, not renderer parity. The probe is cached and
+/// time-bounded, so the assertion passed only while the fixture happened to
+/// leave the daemon without semantic too — a flake confirmed on main, not
+/// introduced here.
+///
+/// Strip the note and keep everything else strict: renderer parity is what this
+/// suite is for, and the note has its own coverage below.
+fn strip_semantic_note(bytes: &[u8]) -> String {
+    redact_bundle_ids(bytes)
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with("note: semantic retrieval unavailable")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Replace generated bundle IDs with a fixed placeholder.
 ///
 /// `investigate` mints a fresh `bndl_<hex>` per invocation, so its stdout is
@@ -752,9 +780,18 @@ fn parity_investigate_human_direct_vs_daemon() {
         "investigate (human): exit code diverged"
     );
     assert_eq!(
-        redact_bundle_ids(&direct.stdout),
-        redact_bundle_ids(&daemon.stdout),
+        strip_semantic_note(&direct.stdout),
+        strip_semantic_note(&daemon.stdout),
         "investigate (human): stdout diverged between direct and daemon mode"
+    );
+
+    // The note itself is still pinned, on the path whose behaviour is
+    // deterministic: the direct path passes no embedding model, so it must
+    // always disclose that the ranking was lexical.
+    let direct_text = String::from_utf8_lossy(&direct.stdout);
+    assert!(
+        direct_text.contains("note: semantic retrieval unavailable"),
+        "the direct path has no embedding model and must say so; got: {direct_text}"
     );
 }
 
