@@ -4130,9 +4130,24 @@ fn list_projects_fails_on_a_missing_database() {
 /// `--help`, which lists `--db` as optional with no default.
 #[test]
 fn daemon_gc_runs_without_a_database() {
+    // `gc` is DESTRUCTIVE: it sweeps orphaned per-instance directories under the
+    // state root, the runtime root and the /tmp socket-fallback root. Run
+    // unisolated it would operate on the developer's (or the CI runner's) real
+    // roots and could reclaim a concurrently-running daemon's directories — the
+    // exact class of interference that shows up elsewhere as a vanished socket.
+    //
+    // Point all three roots at one scratch tree, which is the same isolation
+    // `daemon_test.rs` uses and which `NESTWEAVER_SOCK_FALLBACK_DIR` exists for.
+    let scratch = tempfile::tempdir().expect("scratch dir");
     let output = nestweaver_cmd()
         .args(["daemon", "gc"])
         .env_remove("NESTWEAVER_DB")
+        .env("XDG_STATE_HOME", scratch.path().join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.path().join("runtime"))
+        .env(
+            "NESTWEAVER_SOCK_FALLBACK_DIR",
+            scratch.path().join("fallback"),
+        )
         .output()
         .expect("daemon gc must run");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4150,8 +4165,15 @@ fn daemon_gc_runs_without_a_database() {
 /// `--db` ever becomes genuinely required here, the help must say so.
 #[test]
 fn daemon_gc_help_presents_db_as_optional() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
     let output = nestweaver_cmd()
         .args(["daemon", "gc", "--help"])
+        .env("XDG_STATE_HOME", scratch.path().join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.path().join("runtime"))
+        .env(
+            "NESTWEAVER_SOCK_FALLBACK_DIR",
+            scratch.path().join("fallback"),
+        )
         .output()
         .expect("daemon gc --help must run");
     let stdout = String::from_utf8_lossy(&output.stdout);

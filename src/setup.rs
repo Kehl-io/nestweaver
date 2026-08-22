@@ -28,27 +28,26 @@ fn print_setup_banner(db_path: &Path) {
 fn configure_tool(
     name: &str,
     db_path: &Path,
-    allow_writes: bool,
     force_overwrite: bool,
     base: &Path,
 ) -> Result<(), anyhow::Error> {
     match name {
-        "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite, base)?,
-        "cursor" => setup_cursor(db_path, allow_writes, force_overwrite, base)?,
-        "codex" => setup_codex(db_path, allow_writes, base)?,
-        "windsurf" => setup_windsurf(db_path, allow_writes)?,
-        "jetbrains" => setup_jetbrains(db_path, allow_writes, base)?,
-        "vscode" => setup_vscode(db_path, allow_writes, base)?,
-        "gemini" => setup_gemini(db_path, allow_writes, base)?,
-        "copilot" => setup_copilot(db_path, allow_writes, base)?,
-        "aider" => setup_aider(db_path, allow_writes, base)?,
-        "kiro" => setup_kiro(db_path, allow_writes, base)?,
-        "continue" => setup_continue(db_path, allow_writes, base)?,
-        "cline" => setup_cline(db_path, allow_writes, base)?,
-        "opencode" => setup_opencode(db_path, allow_writes, base)?,
-        "trae" => setup_trae(db_path, allow_writes, base)?,
-        "devin" => setup_devin(db_path, allow_writes, base)?,
-        "hermes" => setup_hermes(db_path, allow_writes, base)?,
+        "claude-code" => setup_claude_code(db_path, force_overwrite, base)?,
+        "cursor" => setup_cursor(db_path, force_overwrite, base)?,
+        "codex" => setup_codex(db_path, base)?,
+        "windsurf" => setup_windsurf(db_path, base)?,
+        "jetbrains" => setup_jetbrains(db_path, base)?,
+        "vscode" => setup_vscode(db_path, base)?,
+        "gemini" => setup_gemini(db_path, base)?,
+        "copilot" => setup_copilot(db_path, base)?,
+        "aider" => setup_aider(db_path, base)?,
+        "kiro" => setup_kiro(db_path, base)?,
+        "continue" => setup_continue(db_path, base)?,
+        "cline" => setup_cline(db_path, base)?,
+        "opencode" => setup_opencode(db_path, base)?,
+        "trae" => setup_trae(db_path, base)?,
+        "devin" => setup_devin(db_path, base)?,
+        "hermes" => setup_hermes(db_path, base)?,
         _ => {}
     }
     Ok(())
@@ -58,7 +57,12 @@ pub fn run_setup(
     tool: Option<&str>,
     db_path: &Path,
     force_all: bool,
-    allow_writes: bool,
+    // Accepted for CLI compatibility and deliberately unused: `--allow-writes`
+    // has had no effect on any generated registration for some time, and the
+    // per-tool writers threaded it purely to discard it. Kept as a parameter so
+    // the existing (hidden, deprecated) flag still parses rather than becoming
+    // a hard error for anyone who still passes it.
+    _allow_writes: bool,
     force_overwrite: bool,
     base: &Path,
 ) -> Result<(), anyhow::Error> {
@@ -80,7 +84,7 @@ pub fn run_setup(
         }
 
         any_configured = true;
-        configure_tool(t.name, db_path, allow_writes, force_overwrite, base)?;
+        configure_tool(t.name, db_path, force_overwrite, base)?;
     }
 
     if let Some(specific) = tool
@@ -195,14 +199,36 @@ fn which_exists(cmd: &str) -> bool {
 /// config was last successfully used for this database? Reusing the daemon's
 /// own persisted intent means setup cannot bind a config the daemon would
 /// disagree with, and it needs no new flag to thread through every caller.
-fn bound_config_path(db_path: &Path) -> Option<String> {
-    let record = nestweaver_daemon::lifecycle::read_last_successful_config(db_path).ok()?;
-    // Only offer a path that still exists: writing a --config pointing at a
-    // deleted file would turn every MCP start into a hard config-load failure,
-    // which is strictly worse than the no-config behaviour it replaces.
-    std::path::Path::new(&record.config_path)
-        .is_file()
-        .then_some(record.config_path)
+fn bound_config_path(db_path: &Path, base: &Path) -> Option<String> {
+    // 1. What the daemon actually last used for this database. Authoritative
+    //    when present, because setup then cannot bind a config the daemon would
+    //    disagree with.
+    if let Ok(record) = nestweaver_daemon::lifecycle::read_last_successful_config(db_path)
+        && Path::new(&record.config_path).is_file()
+    {
+        return Some(record.config_path);
+    }
+
+    // 2. Fall back to discovery from the directory being configured.
+    //
+    // The daemon record only exists AFTER a daemon has successfully started
+    // with a `--config`. On a genuinely fresh install — `setup` run before any
+    // index, which is the order the install docs describe — there is no record,
+    // so relying on it alone silently emitted a config-less registration in the
+    // exact case that matters most. Look where an instance config actually
+    // lives relative to the tree being set up.
+    for candidate in [
+        base.join(".nestweaver/instance.toml"),
+        base.join("instance.toml"),
+    ] {
+        if candidate.is_file() {
+            return candidate
+                .canonicalize()
+                .ok()
+                .map(|path| path.display().to_string());
+        }
+    }
+    None
 }
 
 /// THE single source of truth for the argv every generated MCP registration
@@ -213,31 +239,30 @@ fn bound_config_path(db_path: &Path) -> Option<String> {
 /// TOML writer kept its own hardcoded `["mcp", "--db", "{}"]` literal, so Codex
 /// silently kept emitting a config-less registration. `generated_registrations_
 /// all_carry_the_bound_config` pins that they cannot drift apart again.
-fn mcp_arg_vec(db_str: &str, lite: bool) -> Vec<String> {
+fn mcp_arg_vec(db_str: &str, base: &Path, lite: bool) -> Vec<String> {
     let mut args = vec!["mcp".to_string()];
     if lite {
         args.push("--lite".to_string());
     }
     args.push("--db".to_string());
     args.push(db_str.to_string());
-    if let Some(config) = bound_config_path(Path::new(db_str)) {
+    if let Some(config) = bound_config_path(Path::new(db_str), base) {
         args.push("--config".to_string());
         args.push(config);
     }
     args
 }
 
-fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    serde_json::json!(mcp_arg_vec(db_str, false))
+fn mcp_args(db_str: &str, base: &Path) -> serde_json::Value {
+    serde_json::json!(mcp_arg_vec(db_str, base, false))
 }
 
-fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
-    serde_json::json!(mcp_arg_vec(db_str, true))
+fn mcp_args_lite(db_str: &str, base: &Path) -> serde_json::Value {
+    serde_json::json!(mcp_arg_vec(db_str, base, true))
 }
 
 fn setup_claude_code(
     db_path: &Path,
-    allow_writes: bool,
     force_overwrite: bool,
     base: &Path,
 ) -> Result<(), anyhow::Error> {
@@ -246,7 +271,7 @@ fn setup_claude_code(
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&mcp_path, "nestweaver", &mcp_config)?;
 
@@ -373,17 +398,12 @@ fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyho
     Ok("hooks installed")
 }
 
-fn setup_cursor(
-    db_path: &Path,
-    allow_writes: bool,
-    force_overwrite: bool,
-    base: &Path,
-) -> Result<(), anyhow::Error> {
+fn setup_cursor(db_path: &Path, force_overwrite: bool, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".cursor"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args_lite(&db_str, allow_writes)
+        "args": mcp_args_lite(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -413,13 +433,13 @@ fn setup_cursor(
     Ok(())
 }
 
-fn setup_codex(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_codex(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".codex"))?;
     let db_str = db_path.to_string_lossy();
     let config_path = base.join(".codex/config.toml");
     let toml_section = format!(
         "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [{}]\n",
-        mcp_arg_vec(&db_str, false)
+        mcp_arg_vec(&db_str, base, false)
             .iter()
             .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect::<Vec<_>>()
@@ -452,7 +472,7 @@ fn setup_codex(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), a
     Ok(())
 }
 
-fn setup_windsurf(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_windsurf(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
     let config_path = home.join(".codeium/windsurf/mcp_config.json");
@@ -463,7 +483,7 @@ fn setup_windsurf(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Erro
 
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&config_path, "nestweaver", &mcp_config)?;
 
@@ -481,12 +501,12 @@ fn setup_windsurf(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-fn setup_jetbrains(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_jetbrains(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".junie/mcp"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".junie/mcp/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -504,12 +524,12 @@ fn setup_jetbrains(db_path: &Path, allow_writes: bool, base: &Path) -> Result<()
     Ok(())
 }
 
-fn setup_vscode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_vscode(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".vscode"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".vscode/mcp.json"), "nestweaver", &mcp_config)?;
 
@@ -527,12 +547,12 @@ fn setup_vscode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), a
     Ok(())
 }
 
-fn setup_gemini(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_gemini(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".gemini"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(
         &base.join(".gemini/settings.json"),
@@ -554,12 +574,12 @@ fn setup_gemini(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), a
     Ok(())
 }
 
-fn setup_copilot(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_copilot(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".github"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(
         &base.join(".github/copilot-mcp.json"),
@@ -592,7 +612,7 @@ fn setup_copilot(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), 
     Ok(())
 }
 
-fn setup_aider(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_aider(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let config_path = base.join(".aider.conf.yml");
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
@@ -627,12 +647,12 @@ fn setup_aider(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), a
     Ok(())
 }
 
-fn setup_kiro(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_kiro(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".kiro"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".kiro/settings.json"), "nestweaver", &mcp_config)?;
 
@@ -650,12 +670,12 @@ fn setup_kiro(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), any
     Ok(())
 }
 
-fn setup_continue(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_continue(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".continue"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(
         &base.join(".continue/config.json"),
@@ -677,12 +697,12 @@ fn setup_continue(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(),
     Ok(())
 }
 
-fn setup_cline(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_cline(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".cline"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(
         &base.join(".cline/settings.json"),
@@ -704,12 +724,12 @@ fn setup_cline(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), an
     Ok(())
 }
 
-fn setup_opencode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_opencode(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".opencode"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(
         &base.join(".opencode/config.json"),
@@ -731,12 +751,12 @@ fn setup_opencode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(),
     Ok(())
 }
 
-fn setup_trae(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_trae(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".trae"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".trae/config.json"), "nestweaver", &mcp_config)?;
 
@@ -754,11 +774,11 @@ fn setup_trae(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), any
     Ok(())
 }
 
-fn setup_devin(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_devin(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join("devin.json"), "nestweaver", &mcp_config)?;
 
@@ -776,12 +796,12 @@ fn setup_devin(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), an
     Ok(())
 }
 
-fn setup_hermes(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+fn setup_hermes(db_path: &Path, base: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(base.join(".hermes"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
-        "args": mcp_args(&db_str, allow_writes)
+        "args": mcp_args(&db_str, base)
     });
     let merged = merge_json_mcp(&base.join(".hermes/config.json"), "nestweaver", &mcp_config)?;
 
@@ -808,6 +828,18 @@ fn merge_json_mcp(
     server_name: &str,
     config: &serde_json::Value,
 ) -> Result<bool, anyhow::Error> {
+    // The canonical argv is already in `config`; read the desired `--config`
+    // out of it rather than threading it through every per-tool caller.
+    let desired_config = config
+        .get("args")
+        .and_then(|a| a.as_array())
+        .and_then(|args| {
+            args.iter()
+                .position(|a| a.as_str() == Some("--config"))
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)?;
         match serde_json::from_str(&content) {
@@ -846,8 +878,16 @@ fn merge_json_mcp(
         }
     }
 
-    // Server already exists — check for and strip deprecated args.
+    // Server already exists.
+    //
+    // Reconcile it rather than leaving it alone. This branch used to only PRUNE
+    // deprecated flags, so a registration written before `--config` existed kept
+    // its old argv forever: every upgrade path silently stayed config-less, and
+    // re-running `setup` — the obvious remedy — changed nothing. Additive only,
+    // so a hand-tuned `--lite`, `--tools` or a deliberately different `--db` is
+    // preserved; the sole thing added is a `--config` the entry does not have.
     let mut stripped: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
     {
         let root_obj = root
             .as_object_mut()
@@ -866,14 +906,23 @@ fn merge_json_mcp(
                 }
                 !is_deprecated
             });
+            let has_config = args.iter().any(|arg| arg.as_str() == Some("--config"));
+            if !has_config && let Some(config) = desired_config.as_deref() {
+                args.push(serde_json::Value::String("--config".to_string()));
+                args.push(serde_json::Value::String(config.to_string()));
+                added.push("--config".to_string());
+            }
         }
     }
 
-    if !stripped.is_empty() {
+    if !stripped.is_empty() || !added.is_empty() {
         let json = serde_json::to_string_pretty(&root)?;
         std::fs::write(path, json)?;
         for flag in &stripped {
             eprintln!("  (stripped deprecated flag: {flag})");
+        }
+        for flag in &added {
+            eprintln!("  (added missing flag: {flag})");
         }
     }
 
@@ -889,6 +938,47 @@ fn append_toml_if_missing(
 ) -> Result<bool, anyhow::Error> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     if existing.contains(section) {
+        // The section is present but may predate `--config`. Reconcile that one
+        // line rather than returning unchanged: a Codex registration written
+        // before `--config` existed otherwise kept its old argv forever, and
+        // re-running `setup` — the obvious remedy — was a silent no-op.
+        //
+        // Rewrite ONLY when the existing args lack `--config` and the content
+        // we would write has one, so a hand-edited section is left alone.
+        if let Some(desired) = content
+            .lines()
+            .find(|line| line.trim_start().starts_with("args = ["))
+            && desired.contains("--config")
+        {
+            let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+            // `section` arrives unbracketed ("mcp_servers.nestweaver") while the
+            // file carries the table header "[mcp_servers.nestweaver]".
+            let header = format!("[{section}]");
+            let section_at = lines.iter().position(|line| line.trim() == header);
+            if let Some(start) = section_at {
+                // Stay inside this section: stop at the next table header.
+                let end = lines[start + 1..]
+                    .iter()
+                    .position(|line| line.trim_start().starts_with('['))
+                    .map(|offset| start + 1 + offset)
+                    .unwrap_or(lines.len());
+                if let Some(args_at) = lines[start..end]
+                    .iter()
+                    .position(|line| line.trim_start().starts_with("args = ["))
+                    .map(|offset| start + offset)
+                    && !lines[args_at].contains("--config")
+                {
+                    lines[args_at] = desired.to_string();
+                    let mut rewritten = lines.join("\n");
+                    if existing.ends_with('\n') {
+                        rewritten.push('\n');
+                    }
+                    std::fs::write(path, rewritten)?;
+                    eprintln!("  (added missing flag: --config)");
+                    return Ok(true);
+                }
+            }
+        }
         return Ok(false);
     }
     let mut file = std::fs::OpenOptions::new()
@@ -1124,7 +1214,7 @@ fn run_auto_setup_for_tools(
     let mut configured = Vec::new();
     let mut failures = Vec::new();
     for &name in to_configure {
-        match configure_tool(name, db_path, false, false, base) {
+        match configure_tool(name, db_path, false, base) {
             Ok(()) => configured.push(name),
             Err(error) => failures.push(format!("{name}: {error:#}")),
         }
@@ -1276,7 +1366,7 @@ mod setup_base_dir_tests {
         std::fs::write(&rules_path, "blocks directory creation").unwrap();
         let db = tmp.path().join("test.lbug");
 
-        setup_cursor(&db, false, false, &base).unwrap_err();
+        setup_cursor(&db, false, &base).unwrap_err();
         let mcp_path = base.join(".cursor/mcp.json");
         let primary_before_retry = std::fs::read_to_string(&mcp_path).unwrap();
         assert!(!rules_path.join("nestweaver.mdc").exists());
@@ -1333,12 +1423,105 @@ mod mcp_arg_source_of_truth_tests {
         );
     }
 
+    /// Fresh first run: `setup` before any daemon has ever started must still
+    /// find the instance config.
+    ///
+    /// `bound_config_path` originally consulted only the daemon's persisted
+    /// binding, which does not exist until a daemon has successfully started
+    /// with a `--config`. The install docs run `setup` BEFORE the first index,
+    /// so the common case emitted a config-less registration.
+    #[test]
+    fn fresh_setup_discovers_the_config_without_a_daemon_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".nestweaver")).unwrap();
+        std::fs::write(
+            base.join(".nestweaver/instance.toml"),
+            "instance_id = \"x\"\n",
+        )
+        .unwrap();
+
+        let db = base.join("never-started.lbug");
+        let found = bound_config_path(&db, base).expect("config must be discovered from base");
+        assert!(
+            found.ends_with("instance.toml"),
+            "expected the instance config, got {found}"
+        );
+        assert!(
+            mcp_arg_vec(&db.display().to_string(), base, false)
+                .iter()
+                .any(|a| a == "--config"),
+            "a fresh registration must carry --config"
+        );
+    }
+
+    /// Upgrade path: an EXISTING registration must gain `--config`.
+    ///
+    /// This branch used to only prune deprecated flags, so a config written
+    /// before `--config` existed kept its old argv forever and re-running
+    /// `setup` was a silent no-op.
+    #[test]
+    fn existing_json_registration_gains_the_missing_config_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"nestweaver":{"command":"nestweaver","args":["mcp","--db","/db"]}}}"#,
+        )
+        .unwrap();
+
+        let desired = serde_json::json!({
+            "command": "nestweaver",
+            "args": ["mcp", "--db", "/db", "--config", "/cfg/instance.toml"]
+        });
+        merge_json_mcp(&path, "nestweaver", &desired).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let args = written["mcpServers"]["nestweaver"]["args"]
+            .as_array()
+            .unwrap();
+        assert!(
+            args.iter().any(|a| a == "--config"),
+            "an existing registration must be reconciled, not left stale: {args:?}"
+        );
+        // Additive only — the original db argument survives untouched.
+        assert!(args.iter().any(|a| a == "/db"));
+    }
+
+    /// Same upgrade path for the Codex TOML writer, which returned unchanged
+    /// the moment the section existed.
+    #[test]
+    fn existing_codex_section_gains_the_missing_config_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\"]\n",
+        )
+        .unwrap();
+
+        let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\", \"--config\", \"/cfg/instance.toml\"]\n";
+        append_toml_if_missing(&path, "mcp_servers.nestweaver", desired).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("--config"),
+            "an existing Codex section must be reconciled: {written}"
+        );
+        // Exactly one section — reconciled in place, not appended twice.
+        assert_eq!(written.matches("[mcp_servers.nestweaver]").count(), 1);
+    }
+
     /// Lite and full registrations differ only by `--lite`; both must carry the
     /// same db and (when one is bound) the same config.
     #[test]
     fn lite_and_full_argv_agree_except_for_the_lite_flag() {
-        let full = mcp_arg_vec("/tmp/does-not-exist.lbug", false);
-        let lite = mcp_arg_vec("/tmp/does-not-exist.lbug", true);
+        // A base with no instance config, so neither carries --config and the
+        // comparison isolates the --lite difference.
+        let empty = tempfile::tempdir().unwrap();
+        let full = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), false);
+        let lite = mcp_arg_vec("/tmp/does-not-exist.lbug", empty.path(), true);
         assert_eq!(full[0], "mcp");
         assert_eq!(lite[0], "mcp");
         assert_eq!(lite[1], "--lite");

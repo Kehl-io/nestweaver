@@ -969,6 +969,14 @@ pub struct DaemonState {
     /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
     /// in-flight index write is allowed to finish rather than being abandoned.
     pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Join handle for the trigram reconcile loop.
+    ///
+    /// Retained for the same reason as `worker_handle`: the reconcile performs a
+    /// blocking store write on a `spawn_blocking` thread, which cannot be
+    /// aborted. Shutdown removes the socket and pidfile after awaiting these
+    /// handles, so a discarded handle would let that teardown race a write in
+    /// progress — against a store that is not crash-safe (nw-126).
+    pub trigram_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Handle to the `serve_ui` web-server task plus the port it is bound
     /// to, aborted by `stop_ui` so the listen port is released when the CLI
     /// exits (LOW: ui port leak). The port is tracked so a repeated
@@ -1334,11 +1342,6 @@ async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
             _ = tick.tick() => {}
             _ = shutdown.changed() => break,
         }
-        // A drain waits on the write gate. Starting a reconcile now would
-        // extend someone's shutdown to buy freshness nobody is going to query.
-        if state.shutdown_started.load(Ordering::Relaxed) {
-            break;
-        }
         if backoff_until.is_some_and(|until| Instant::now() < until) {
             continue;
         }
@@ -1359,13 +1362,24 @@ async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
             }
         }
 
-        let lease = state.write_gate.lock("trigram_reconcile").await;
-        // Re-check after acquiring: the gate may have been held by the write a
-        // shutdown was draining, in which case we woke up into a drain.
-        if state.shutdown_started.load(Ordering::Relaxed) {
-            drop(lease);
+        // Admission guard BEFORE the write gate, in that order, exactly as the
+        // RPC write paths do.
+        //
+        // This is not merely a shutdown check. `ConnectionGuard::write` is what
+        // increments `active_writes`, and `active_writes` is what the shutdown
+        // drain and the idle timeout both read to decide whether anything is
+        // still writing. A hand-rolled `shutdown_started` check would leave this
+        // write INVISIBLE to both: shutdown could broadcast and unlink the
+        // socket and pidfile while a `spawn_blocking` reconcile — which cannot
+        // be aborted — was still writing to a store that is not crash-safe.
+        //
+        // Taking the guard also refuses admission once a drain has begun, which
+        // is the behaviour the hand-rolled check was reaching for, but atomic
+        // with the counter rather than racing it.
+        let Ok(_admission) = ConnectionGuard::write(&state) else {
             break;
-        }
+        };
+        let lease = state.write_gate.lock("trigram_reconcile").await;
         let reconcile_state = Arc::clone(&state);
         let outcome =
             tokio::task::spawn_blocking(move || reconcile_state.store.refresh_trigram_index(false))
@@ -9497,6 +9511,7 @@ pub async fn run_server(
         admin_token,
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
+        trigram_reconciler_handle: std::sync::Mutex::new(None),
         ui_server: std::sync::Mutex::new(None),
     });
 
@@ -9589,6 +9604,20 @@ pub async fn run_server(
         .with_context(|| format!("create runtime dir: {}", sock_dir.display()))?;
 
     let sock_path = lifecycle::socket_path(&instance_id);
+    // Await the reconcile loop for the same reason as the worker pool above: its
+    // `spawn_blocking` store write cannot be aborted, and everything below this
+    // point unlinks the socket and pidfile. Exiting while that write is in
+    // flight is precisely the crash the shutdown design exists to avoid.
+    let reconciler_handle = state
+        .trigram_reconciler_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = reconciler_handle {
+        tracing::info!("draining trigram reconcile loop before exit");
+        let _ = handle.await;
+    }
+
     let _ = std::fs::remove_file(&sock_path);
 
     // The single-owner instance lock (pidfile flock) was already claimed above,
@@ -9652,7 +9681,12 @@ pub async fn run_server(
                     interval_secs = period.as_secs(),
                     "trigram reconcile loop enabled"
                 );
-                tokio::spawn(run_trigram_reconciler(Arc::clone(&state), period));
+                let reconciler_handle =
+                    tokio::spawn(run_trigram_reconciler(Arc::clone(&state), period));
+                *state
+                    .trigram_reconciler_handle
+                    .lock()
+                    .expect("trigram_reconciler_handle mutex poisoned") = Some(reconciler_handle);
             }
             None => tracing::debug!(
                 "trigram reconcile loop disabled ([indexing] with_trigrams off, or interval 0)"
@@ -15860,6 +15894,7 @@ mod startup_helper_tests {
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            trigram_reconciler_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -15941,6 +15976,7 @@ credential_method = "gh"
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            trigram_reconciler_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -17686,6 +17722,75 @@ external_model = "unavailable-test-model"
         assert!(
             drained,
             "the reconcile loop must drain enqueued scopes on its own"
+        );
+    }
+
+    /// The reconcile write must be VISIBLE to the shutdown drain and to the
+    /// idle timeout.
+    ///
+    /// Both read `active_writes`, which only `ConnectionGuard::write`
+    /// increments. A reconcile that took the write gate without that guard was
+    /// invisible to both, so shutdown could broadcast and unlink the socket and
+    /// pidfile while an unabortable `spawn_blocking` write was still running
+    /// against a store that is not crash-safe (nw-126).
+    #[tokio::test]
+    async fn reconciler_write_is_counted_in_active_writes() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:counted:1".to_string(),
+                name: "counted".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:counted".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn counted()".to_string(),
+                summary: None,
+                content_hash: "hash".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert_symbol");
+
+        let observer = Arc::clone(&state);
+        let peak = tokio::spawn(async move {
+            let mut peak = 0u32;
+            for _ in 0..600 {
+                peak = peak.max(observer.active_writes.load(Ordering::Relaxed));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            peak
+        });
+
+        let handle = tokio::spawn(run_trigram_reconciler(
+            Arc::clone(&state),
+            Duration::from_millis(10),
+        ));
+        // Let it complete at least one reconcile.
+        for _ in 0..200 {
+            if state.store.pending_regex_scope_count().unwrap_or(1) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let observed = peak.await.unwrap_or(0);
+
+        state.shutdown_started.store(true, Ordering::Relaxed);
+        let _ = state.shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(
+            observed > 0,
+            "a reconcile must raise active_writes so the drain and the idle \
+             timeout can see it; observed peak was {observed}"
         );
     }
 
