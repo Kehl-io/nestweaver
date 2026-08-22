@@ -9604,20 +9604,6 @@ pub async fn run_server(
         .with_context(|| format!("create runtime dir: {}", sock_dir.display()))?;
 
     let sock_path = lifecycle::socket_path(&instance_id);
-    // Await the reconcile loop for the same reason as the worker pool above: its
-    // `spawn_blocking` store write cannot be aborted, and everything below this
-    // point unlinks the socket and pidfile. Exiting while that write is in
-    // flight is precisely the crash the shutdown design exists to avoid.
-    let reconciler_handle = state
-        .trigram_reconciler_handle
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    if let Some(handle) = reconciler_handle {
-        tracing::info!("draining trigram reconcile loop before exit");
-        let _ = handle.await;
-    }
-
     let _ = std::fs::remove_file(&sock_path);
 
     // The single-owner instance lock (pidfile flock) was already claimed above,
@@ -10907,6 +10893,20 @@ pub async fn run_server(
     let worker_handle = state.worker_handle.lock().ok().and_then(|mut g| g.take());
     if let Some(handle) = worker_handle {
         tracing::info!("draining worker pool before exit");
+        let _ = handle.await;
+    }
+
+    // Await the reconcile loop for the same reason as the worker pool above:
+    // its `spawn_blocking` store write cannot be aborted, and everything below
+    // this point unlinks the socket and pidfile. Exiting while that write is in
+    // flight is precisely the crash the shutdown design exists to avoid.
+    let reconciler_handle = state
+        .trigram_reconciler_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = reconciler_handle {
+        tracing::info!("draining trigram reconcile loop before exit");
         let _ = handle.await;
     }
 
