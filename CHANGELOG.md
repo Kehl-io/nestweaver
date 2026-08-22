@@ -12,77 +12,13 @@
 
 * **cli,setup,tests:** daemon gc needs no database; codex shares the MCP argv builder ([2714965](https://github.com/Kehl-io/nestweaver/commit/2714965fcaf66456af79d2435a1297aa467ab5c3))
 * **daemon,setup,tests:** count the reconcile write, reconcile existing registrations, isolate the gc test ([8e68eea](https://github.com/Kehl-io/nestweaver/commit/8e68eea39c4d301363b64c67a0d8c25c44112382))
-* **daemon,setup:** close PR 275 review gaps ([2cf2209](https://github.com/Kehl-io/nestweaver/commit/2cf22091201861485c2f500ef6482b1ea0e3ff4d))
 * **daemon,setup:** close PR 275 review gaps ([0ea8c4a](https://github.com/Kehl-io/nestweaver/commit/0ea8c4ae1f2191edeed6c0817740cbd4e9197827))
 * **index,tests:** refresh the cached stat on a content match, and de-flake the investigate parity test ([9edcd46](https://github.com/Kehl-io/nestweaver/commit/9edcd461dab9c77ea8fcb09207f523fec48ced68))
 * **index:** compare size as well as mtime, so same-second edits are not lost ([3697824](https://github.com/Kehl-io/nestweaver/commit/3697824a74449dab08bd6234331bda2457c117d2))
 * **index:** floor the --since threshold, rename file_meta_nanos, correct the platform claim ([bdb8e31](https://github.com/Kehl-io/nestweaver/commit/bdb8e311ecb1b7906edf1d578b7a16cf2356c269))
 * **index:** keep nanosecond mtimes so same-second edits are never lost ([72b1f9a](https://github.com/Kehl-io/nestweaver/commit/72b1f9a73216252d4c2da79796e8b8964b954dba))
 * **regex:** give the trigram reconciler an owner, and move interaction tracking into config ([0f10e28](https://github.com/Kehl-io/nestweaver/commit/0f10e28ee44d3e242f6f94a820c23d4a9615ebf2))
-* **regex:** give the trigram reconciler an owner; move interaction tracking into config ([8d46cff](https://github.com/Kehl-io/nestweaver/commit/8d46cffe6af33c92a00c2e95fa927d9f62680d04))
 * **setup:** distinguish explicit and bare config candidates ([3125048](https://github.com/Kehl-io/nestweaver/commit/3125048fe7d9d0e4b31c2298865a2ad75bc350c8))
-
-## Detail for 6.3.0 – 6.4.0
-
-> These entries were written by hand and were never picked up by release-please,
-> so they sat under an "Unreleased" heading above the released sections and read
-> as pending work. Everything here has SHIPPED: the publication/Tantivy-shard
-> work in 6.3.0 (`c1f891d`), the daemon `--config` identity enforcement as far
-> back as 4.1.0 (`15077f8`), and the remainder across 6.4.0. Kept because the
-> generated entries for those releases are one-liners and this is the only
-> detailed description of the behaviour.
-
-### ⚠ BREAKING CHANGES
-
-* **storage/publication:** regex acceleration moves from graph-resident posting nodes to disposable per-repository/per-vault Tantivy shards, and semantic vectors move to embedding pipeline v2. Existing brains require one full staged graph reindex and re-embed with `nestweaver publication rebuild --config <instance.toml>`. The incumbent stays selected until validation and is retained for one-step rollback; there is no destructive in-place posting/vector migration.
-* **daemon/config:** commands that explicitly pass `--config` now fail when a current-version, already-running daemon cannot prove the same canonical configured path (including compiled-default daemons and daemons using a different config). Previously these commands could exit successfully while silently ignoring the requested configuration. Use `nestweaver daemon --db <db> restart --config <path>` to apply a different configuration. A verified version-upgrade restart still applies the explicit config to its verified successor. Relative paths and symlinks remain accepted when they canonicalize to the daemon's configured path. Editing that file in place does not trigger a path mismatch, but the daemon must still be restarted to load the changed contents.
-
-### Features
-
-* **publication:** add resumable staged rebuild, cooperative cancellation, source/config revalidation, typed preserved-state receipts, atomic `CURRENT` cutover, startup artifact smoke checks, and bounded pointer rollback
-* **regex:** replace quadratic LadybugDB trigram postings with incrementally maintained per-scope Tantivy shards, bounded reader reuse, safe tombstone retirement/generation garbage collection, scoped fail-open scans, and cross-surface execution diagnostics
-* **embedding:** add identity-bound pipeline fingerprints, Sentence Transformers module semantics, mmap base plus durable delta journal, streamed compaction, and bounded exact top-k search
-* **cli:** add first-class `detect-changes`, `cross-repo-contracts`, and `backlinks` commands with config-aware direct/daemon routing and MCP-equivalent JSON contracts
-
-### Bug Fixes
-
-* **publication:** stream large artifact validation, checkpoint graph rebuilds per source, avoid a second full content walk for unchanged non-Git trees, acquire failed-smoke rollback from the retained incumbent, report rollback failures honestly, and refuse rollback toggling
-* **regex:** treat candidate-cap saturation as a scoped graph-scan fallback and retire selectors without deleting immutable generations from active readers
-* **embedding:** keep compatible bases across patch-version upgrades and replace rejected legacy/incompatible bases on the next successful flush instead of persisting vectors only in an unusable journal
-* **search:** `regex-search`/`count-patterns` — fix trigram pre-filter correctness for alternation patterns; detect a stale trigram index and fall back to a full scan (`stale_index: true` in JSON, note in text output; remedy: re-run `index --with-trigrams`); bound `--limit` to 1–10000 and `--max-millis` to 1–600000
-* **impact/trust:** `impact`/`brain_impact` fail closed on unknown or foreign UIDs (CLI exit 2, MCP `not_found`) instead of returning an empty result; `--depth` bounded to 1–15 on CLI and MCP (`pr-impact --depth` same)
-* **impact/trust:** `affected-tests` — changed files with unrecognized extensions (Makefile, CI YAML, `.sql`, `.proto`, …) now report `status: partial` with `recommendation: run-full-suite` instead of a silent `complete`; markdown-only changes stay `complete`
-* **impact/trust:** `dead-code`/`dead_code` JSON gains `matching_count` (post-`--min-confidence`); `unreachable_count` is again the unfiltered total, consistent with `total_symbols`/`reachable_symbols`/`dead_percentage`; `--limit` bounded to 1–1000
-* **MCP validation:** enforce `--tools`/`--lite` allowlists on all transports (local stdio, daemon proxy, hybrid, MCP-over-HTTP); add numeric bounds to tool schemas (`token_budget` 1–16000, `depth`/`max_depth` 1–15, `limit` 1–1000, `include_neighbors` 0–255); hardened tools reject unknown argument names instead of silently ignoring them; `regex_search` rejects conflicting `pattern`+`query` and invalid `kinds`; stdio tool errors no longer carry a misleading `gRPC error:` prefix; `brain_guide` via daemon errors if `config` is passed (use CLI `generate-guide --config`)
-* **investigate:** the query's own seed/direct-hit nodes appear first in the map with `is_seed: true`; `--scope` is validated strictly (`project:<name>`, `repo:<name>`, `vault`, `all`; unknown scopes error); `project:` scope filters symbols to project members; bundle storage is concurrency-safe and salvages corrupt sidecars; hydrate skips over-budget bodies instead of aborting
-* **daemon/watch:** `watch` works without an instance config (daemon-side watcher with a safe-root denylist); `--force` replaces an existing watcher; direct fallback only when no daemon is running; lock errors hint at `daemon stop`
-* **daemon/watch:** `daemon stop`/`status` verify the pidfile PID belongs to this DB's daemon (cmdline + socket peer-PID cross-check) and refuse to signal foreign processes; `daemon start` waits for real health (up to 60s) with a "still booting" message instead of a false failure, and refuses to install over a not-yet-exited old daemon; `ui` releases its port on Ctrl-C and errors clearly on an already-bound port
-* **CLI correctness:** `stale-check` exits 1 when any repo is stale (CI freshness gate), flags deleted working trees as `[missing]`, and reports an accurate `stale_repos`
-* **CLI correctness:** `clusters`/`cluster` docs and output correctly describe the algorithm as Louvain-style local moving (single-level, not full Leiden) with true Newman–Girvan modularity; non-finite/non-positive `--resolution` clamps to 1.0; `cluster <id|name>` reads the cached sidecar
-* **CLI correctness:** `export` — cypher/graphml/mermaid carry real PageRank scores and mermaid `--top N` ranks by actual PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout
-* **CLI correctness:** `contracts diff` content-sniffs explicit spec paths (any filename works for OpenAPI JSON/YAML); `generate-guide --format` is validated; `materialize-projects` rejects duplicate project names in the instance config (exit 1); `index --repo` rejects non-directory paths (exit 1, naming the path); `embed` reports a clear "stop the daemon first" error when a daemon holds the DB lock and requires `--batch-size` ≥ 1; `server init-tls --validity-days` bounded to 1–36500 and re-running over an existing CA warns about invalidating signed certs
-* **CLI correctness:** read/lookup commands (`list-repos`, `stale-check`, `prune-stale`, `remove-repo`, `export`, brain/memory reads, `hubs`, `instance merge`/`remove --purge-graph`) fail with `db_not_found` (exit 1) against a missing database instead of creating an empty DB and reporting success
-* **CLI correctness:** `pull --ephemeral` uses a unique temp workspace (never deletes a persistent checkout) and failed pulls clean up after themselves (only destinations the pull created); `instance abort-migration --force` can discard an unreadable/corrupt migration journal (phase unknown — reconcile manually); `rts-eval record-truth` re-recording the same (repo, sha) upserts (correction wins) instead of first-record-wins
-* **docs:** README, CI guide, instance-config and instance-migration guides, server-mode doc, and integration READMEs updated to match the above
-* **daemon/watch (critical):** `watch` reindex no longer drops edges — a watcher-processed file previously lost every incoming/outgoing CALLS/IMPORTS edge (single-file resolution only) until a full `--force` reindex; the watcher now shares the incremental indexer's reverse-dependent re-resolution. A transient unreadable file no longer kills the watcher thread and deletes the file's symbols; per-file failures are skipped, never fatal
-* **daemon/watch:** watcher embedding is debounced (30s) with a circuit breaker after repeated all-fail passes — fixes a 300%+ CPU hot loop and multi-minute reindex bursts on save-heavy workflows
-* **resolver:** Rust cross-crate CALLS/imports now resolve across workspace crates (`crate::`/`super::`, named workspace crates, `tests/` against the crate-under-test, `use` lists/wildcards/aliases) — blast radius for library-crate symbols was massively understated; Python module-level code (`if __name__ == "__main__":`) is no longer attributed to the preceding `def`, eliminating phantom call edges
-* **impact/trust:** `impact` reports when traversal was pruned by the impact-score threshold or max depth (text note + honest JSON object on the CLI, `truncated_by_threshold`/`truncated_by_depth` on MCP `brain_impact`) and gains `--min-score` to opt out — reported impact is disclosed as a floor instead of silently incomplete
-* **impact/trust:** `dead-code` no longer flags Rust `pub mod` Module symbols (the crate's public API) as unreachable; the visibility-not-persisted limitation (all confidence scores are inferred/Medium) is documented
-* **perf:** `brain_context` skips the BERT semantic leg entirely when the database has no embedding vectors, and identical concurrent calls coalesce single-flight — eliminates 30s stampede timeouts under concurrency; trigram index builds are transactional (20+ min → ~30s on a 15k-symbol repo)
-* **server:** admin tokens bypass the `/mcp` per-session rate limiter (parity with the gRPC interceptor); `init-tls` certificates carry AKI/BasicConstraints/KeyUsage so strict verifiers (Python 3.13+) accept them; `ui` reports the actual running port (no dead URL on a second request) and exits non-zero on a busy port
-* **misc:** `summary --target` matches symbol name/path/exact-UID instead of UID hex substrings; `/api/v1/llm/query` strips punctuation from keyword seeds; `context`/`brain context`/`brain search` CLI bounds match the MCP schemas; rts-eval joins truths 1:1 to the temporally-correct selection, locks its sidecars against concurrent recorders, rotates history atomically, and marks recall estimates uncertain (not an upper bound) when failures are unconfirmed
-* **rts-eval:** the report cache (which feeds the in-band `measured` disclosure) refreshes from any report covering all joined data — the default `--window 50` no longer freezes once history exceeds 50, and a genuine slice still never clobbers the canonical report; the temporal join picks the greatest eligible timestamp (parallel recorders can append out of order) and never pairs a truth with a future-dated selection; the sidecar lock writes an ownership token so a stale-lock takeover can't void the successor's mutual exclusion
-* **perf:** `brain_context`'s no-embeddings probe is time-bounded (30s) — embeddings added through the daemon without a graph mutation are picked up instead of being hidden behind a cached negative
-* **daemon/watch:** a mid-mutation reindex failure (delete landed, re-add failed) is reported as failed after publication finalizes instead of being misreported as "previous data preserved"; the watcher embed pass budgets by attempts, not successes, so a failing endpoint can't fire 3x the intended requests per pass
-* **resolver:** Rust `use ... as` aliases become local bindings (calls through aliased imports resolve; same-file shadowing wins); the root-crate fallback is restricted to dev targets (tests/benches/examples) and runs after unique-crate resolution, so external crates like `serde::de` no longer bind to local modules; builtin crates (`std`/`core`/`alloc`) never resolve to local modules; regex-parsed languages (Astro/Svelte/Vue/Cobol) keep intra-function call edges via a degenerate-span (start == end) fallback in enclosing-symbol attribution
-* **store:** `purge_instance`/`merge_instance_ids` legacy wrappers route through `legacy_mutation_result` (partial/ambiguous outcomes are no longer reported as success); the merge final probe excludes intentional collision discards, so a clean target-wins merge verifies Applied
-* **server:** mTLS client certificates carry AKI/BasicConstraints/KeyUsage like the CA/server certs
-* **investigate:** the bundle storage lock gains the ownership token + post-create verify (a stale-lock takeover can't void a successor's lock)
-* **daemon/ui:** an already-running `ui` now starts a requested `--watch` session instead of silently dropping it
-* **daemon:** `daemon stop` against a dead pidfile PID retargets the live socket-peer daemon instead of declaring not-running and deleting its socket; `wait_healthy` caps each health-check attempt at the remaining budget so the poll loop never overshoots its timeout
-* **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
-* **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
 ## [6.4.0](https://github.com/Kehl-io/nestweaver/compare/v6.3.0...v6.4.0) (2026-08-21)
 
@@ -109,7 +45,6 @@
 * **dead-code:** stop reporting exported symbols as high-confidence dead code ([90dfa3e](https://github.com/Kehl-io/nestweaver/commit/90dfa3eb2573b28722994c02e43df01230706e64))
 * **embed:** treat config_sentence_transformers.json as the optional artifact it is ([8f85604](https://github.com/Kehl-io/nestweaver/commit/8f85604b147477ed4e5c8841d1f66755ae3dbf58))
 * **eval:** score seeds, and reject mistyped judgment keys ([4c4672f](https://github.com/Kehl-io/nestweaver/commit/4c4672f0adf04eef68ce0ac84002a025d60a41b1))
-* harden publication and query lifecycle regressions ([d0de9fe](https://github.com/Kehl-io/nestweaver/commit/d0de9fe743a6afa0d7dc3270df3b3ea5fa230f9c))
 * harden publication and query lifecycle regressions ([c7d513d](https://github.com/Kehl-io/nestweaver/commit/c7d513d784174621fc4237fecd2ad0f13eba8750))
 * **impact:** apply --repo to uniquely-resolving names, not just ambiguous ones ([a0e1662](https://github.com/Kehl-io/nestweaver/commit/a0e1662aa64b8a641a3d1533cdfcbea9d683f245))
 * **indexing:** survive non-UTF-8 sources; explain OpenAPI 3.1 failures ([c0d6475](https://github.com/Kehl-io/nestweaver/commit/c0d6475afa317436a052b25c9f2bed55cb47f6ae))
@@ -181,30 +116,22 @@
 * **cli:** align the still-draining message and drain docs with live-index semantics ([631a7ae](https://github.com/Kehl-io/nestweaver/commit/631a7aee9261361a556d5bf232f691d7011954d2))
 * **cli:** cover the owner-release gate in restart restore, honest restore remedies ([892620e](https://github.com/Kehl-io/nestweaver/commit/892620eb87faf9509ca2e7499da13b1b8cbca834))
 * **cli:** do not claim the incumbent was stopped when its flock is still held ([f27eeb0](https://github.com/Kehl-io/nestweaver/commit/f27eeb0e0fab4555bf08c194457ce965d090f656))
-* **client:** adopt a pidfile-less daemon on socket peer credentials ([78acdde](https://github.com/Kehl-io/nestweaver/commit/78acddeb27896d6a8570fda76f1df9588cc54186))
 * **client:** adopt a pidfile-less daemon on socket peer credentials ([eb98284](https://github.com/Kehl-io/nestweaver/commit/eb982843859f9a4a59d143cf73fe60d731e95b29))
-* **cli:** forward every brain status warning to text output ([99d92b6](https://github.com/Kehl-io/nestweaver/commit/99d92b6dc2556a1c48a439c18f7890f4179ba6a9))
 * **cli:** forward every brain status warning to text output ([352fc56](https://github.com/Kehl-io/nestweaver/commit/352fc564add453c863abbfa72c97319c6ddecce4))
-* **cli:** keep the UI port answering across a daemon outage ([4acee26](https://github.com/Kehl-io/nestweaver/commit/4acee262bb8f9c89baa09c00bead48ab5df7ef00))
 * **cli:** keep the UI port answering across a daemon outage ([9ad09e3](https://github.com/Kehl-io/nestweaver/commit/9ad09e308995132405bfdc2cedb1490c2cec91a3))
 * **cli:** no dangling "see warning" pointer for an in-flight publication ([b1d0872](https://github.com/Kehl-io/nestweaver/commit/b1d0872c7e4c1c3b59218cff982d7e3c47f36b73))
 * **cli:** say only what the pidfile-flock probe establishes after a failed restart ([01c11fe](https://github.com/Kehl-io/nestweaver/commit/01c11fe772d420ed6d702053d021451223f74f09))
 * **cli:** scope the bypass warning's in-band marker claim to brain status ([5fd954e](https://github.com/Kehl-io/nestweaver/commit/5fd954ee1f88d0c9caf924d5b725da644c7c0b3d))
 * **cli:** serve the daemon brain status schema on the direct path ([49cbecb](https://github.com/Kehl-io/nestweaver/commit/49cbecb33d7b6c58ae1e15ccb396803a506bd080))
-* **cli:** un-wedge restart/start --config behind a dead launchd incumbent ([981ed16](https://github.com/Kehl-io/nestweaver/commit/981ed163bb64499f54f5e7f216de50a885ffc9b5))
 * **cli:** un-wedge restart/start --config behind a dead launchd incumbent ([f5df1c4](https://github.com/Kehl-io/nestweaver/commit/f5df1c492a5dba14f4b3ff8215204012c3da629d))
 * **cli:** verify the daemon's UI port before claiming recovery ([2757e00](https://github.com/Kehl-io/nestweaver/commit/2757e00103ffd040f2cdd8338780381a0cb5a727))
 * **daemon:** correct gc help text and race docs, dedupe sweep roots ([c826d62](https://github.com/Kehl-io/nestweaver/commit/c826d6240a645b7819d37e770b8d3ef930138ad7))
-* **daemon:** distinguish a live index job from a stuck flag in the drain ([8b22ecc](https://github.com/Kehl-io/nestweaver/commit/8b22eccd3c7ab6f857287898d0e38d8b1290bb58))
 * **daemon:** distinguish a live index job from a stuck flag in the drain ([471f61b](https://github.com/Kehl-io/nestweaver/commit/471f61b1880f9afc48159e1703d806e0d16d864f))
-* **daemon:** gate daemon restart on the database write lock, not the pidfile lock ([0236c6e](https://github.com/Kehl-io/nestweaver/commit/0236c6eed5d3d8b75ba5d00ba83688e53eaa45b0))
 * **daemon:** gate daemon restart on the database write lock, not the pidfile lock ([54ff6e1](https://github.com/Kehl-io/nestweaver/commit/54ff6e197aaf8d7441b8b77b96f70110bb9d6d6c))
-* **daemon:** reclaim orphaned runtime and socket-fallback dirs ([0c77622](https://github.com/Kehl-io/nestweaver/commit/0c776220241237a8a15a4d7b52f774c7ed8f85bd))
 * **daemon:** reclaim orphaned runtime and socket-fallback dirs ([97015f8](https://github.com/Kehl-io/nestweaver/commit/97015f80ca48c4534507a9b3f093cadca4ee583d))
 * **engine:** fail closed when the owner PageRank cache is wiped before sidecar save ([56dfa59](https://github.com/Kehl-io/nestweaver/commit/56dfa5928d2983f5528eb1a2e5019d00ace9632a))
 * **engine:** fold the is_wedged gate into needs_forced_repair ([1e099aa](https://github.com/Kehl-io/nestweaver/commit/1e099aa9617c8878d6074d9036b485e20b382030))
 * **engine:** fold the is_wedged gate into needs_forced_repair + pin the read-only boot gate ([242a65e](https://github.com/Kehl-io/nestweaver/commit/242a65ed00f69650c14c093102ae374fc8c89d33))
-* **engine:** publish the fresh PageRank sidecar before retiring the dirty marker ([29a6129](https://github.com/Kehl-io/nestweaver/commit/29a6129e0266379f43ce55ef03926613e3540353))
 * **engine:** publish the fresh PageRank sidecar before retiring the dirty marker ([fd7e918](https://github.com/Kehl-io/nestweaver/commit/fd7e91844dabba393bc10fd6c3ef480f9e2dd980))
 * **mcp:** derive brain_status warnings and publication from one path, one read ([f2c0976](https://github.com/Kehl-io/nestweaver/commit/f2c0976a877cc4d7d839bd4e8a954cf61a11fccd))
 * **mcp:** give the wedged-publication warning a kind and share the builder ([66f698e](https://github.com/Kehl-io/nestweaver/commit/66f698e30d78ebccc75d524f9ed17880e6c079d1))
@@ -373,7 +300,6 @@
 
 ### Performance Improvements
 
-* **store:** add remove-repo hub-degree regression benchmark ([27afb9f](https://github.com/Kehl-io/nestweaver/commit/27afb9f7b7d36b21e75b0463f6e6cdff05316379))
 * **store:** add remove-repo hub-degree regression benchmark ([42a46d6](https://github.com/Kehl-io/nestweaver/commit/42a46d6ff8e9ec09b2d726752996bd1c0a59f2a5))
 
 ## [4.0.0](https://github.com/Kehl-io/nestweaver/compare/v3.0.0...v4.0.0) (2026-08-06)
@@ -528,7 +454,6 @@
 
 ### Bug Fixes
 
-* **ci:** gate releases on lockfile synchronization ([b3b863c](https://github.com/Kehl-io/nestweaver/commit/b3b863c0bce34cf689138b47d6a1bb4748965949))
 * **ci:** gate releases on lockfile synchronization ([6b5cda6](https://github.com/Kehl-io/nestweaver/commit/6b5cda6f24546c1c1ba755545445aa656a283a06))
 * **ci:** keep test artifacts within runner disk ([1f75f5c](https://github.com/Kehl-io/nestweaver/commit/1f75f5c6569c9cc80ad8bf109dd5d5566c3bc240))
 
@@ -548,7 +473,6 @@
 * **daemon:** bake NESTWEAVER_INDEX_CPU_PERCENT into the launchd plist ([906b1ae](https://github.com/Kehl-io/nestweaver/commit/906b1ae186fe9923bec699be71a997e1337d203c))
 * **daemon:** reload launchd plist on install; add LowPriorityIO and ThrottleInterval ([c711a05](https://github.com/Kehl-io/nestweaver/commit/c711a050a4056b076cab35ad32903780c10de55d))
 * **engine:** self-heal incomplete index on the server worker path ([8eb8854](https://github.com/Kehl-io/nestweaver/commit/8eb8854a95b9c68451720e90bd8f297a5580a9ab))
-* **engine:** survive and self-heal mid-index process kills ([764f587](https://github.com/Kehl-io/nestweaver/commit/764f58759c7b135cf7160973f6d7c2d96d439b59))
 * **engine:** survive and self-heal mid-index process kills ([5ae091a](https://github.com/Kehl-io/nestweaver/commit/5ae091a1ea68d8c2bfec01bf0303b3f7a4172683))
 * **mcp:** drop anyOf from tool schemas so strict providers accept them ([9205501](https://github.com/Kehl-io/nestweaver/commit/9205501ac91aebce809d602626575f9ee7ac7abc))
 * **mcp:** drop anyOf from tool schemas, keep root "type": "object" ([c2e7810](https://github.com/Kehl-io/nestweaver/commit/c2e7810c6d8bc5631972ba20402427eba092feb0))
@@ -646,7 +570,6 @@
 
 ### Bug Fixes
 
-* **release:** require macOS 13.3 ([325ccf1](https://github.com/Kehl-io/nestweaver/commit/325ccf11e378bf0115ddf3b1ccaf17f9e4672652))
 * **release:** require macOS 13.3 ([790857a](https://github.com/Kehl-io/nestweaver/commit/790857a2213ea797b731487fd5e8fd41972056c4))
 
 ## [2.5.9](https://github.com/Kehl-io/nestweaver/compare/v2.5.8...v2.5.9) (2026-07-20)
@@ -654,7 +577,6 @@
 
 ### Bug Fixes
 
-* **release:** use portable lipo syntax ([2256a9b](https://github.com/Kehl-io/nestweaver/commit/2256a9b9af41799a603e83012945a5c34095a83f))
 * **release:** use portable lipo syntax ([33c4620](https://github.com/Kehl-io/nestweaver/commit/33c462095c594eb230970bba89c8daf261c657a2))
 
 ## [2.5.8](https://github.com/Kehl-io/nestweaver/compare/v2.5.7...v2.5.8) (2026-07-20)
@@ -662,7 +584,6 @@
 
 ### Bug Fixes
 
-* **release:** link Intel macOS compiler runtime ([ba06971](https://github.com/Kehl-io/nestweaver/commit/ba069717dde867a7b79688d115a56db9920832dd))
 * **release:** link Intel macOS compiler runtime ([d6e2bb2](https://github.com/Kehl-io/nestweaver/commit/d6e2bb24b6fe17798aee4176a6673730b9607917))
 
 ## [2.5.7](https://github.com/Kehl-io/nestweaver/compare/v2.5.6...v2.5.7) (2026-07-20)
@@ -705,7 +626,6 @@
 
 ### Bug Fixes
 
-* **release:** guard missing release PR output ([93646d5](https://github.com/Kehl-io/nestweaver/commit/93646d5361b3cd49f868a38c052999fca75a9d30))
 * **release:** guard missing release PR output ([acfba65](https://github.com/Kehl-io/nestweaver/commit/acfba65201da0fb4fe19cb9e0a6107726a769b9c))
 
 ## [2.5.1](https://github.com/Kehl-io/nestweaver/compare/v2.5.0...v2.5.1) (2026-07-19)
@@ -713,7 +633,6 @@
 
 ### Bug Fixes
 
-* **release:** synchronize Cargo lockfile in release PRs ([17619a0](https://github.com/Kehl-io/nestweaver/commit/17619a0b09708bec4d30631e08b999ed3fbb2458))
 * **release:** synchronize Cargo lockfile in release PRs ([ed5c404](https://github.com/Kehl-io/nestweaver/commit/ed5c404ad295c9b1bce1b20d13722fd5ec0100e3))
 
 ## [2.5.0](https://github.com/Kehl-io/nestweaver/compare/v2.4.0...v2.5.0) (2026-07-19)
@@ -837,10 +756,8 @@
 
 ### Bug Fixes
 
-* **dist:** repair npm install path and stamp app bundle version ([f732e8a](https://github.com/Kehl-io/nestweaver/commit/f732e8a1a4122b68bafb3242bb274b851d5c4ae7))
 * **dist:** repair npm install path and stamp app bundle version ([40dadf9](https://github.com/Kehl-io/nestweaver/commit/40dadf9a0cb714ffdf17698be212a2865356a0cf))
 * **dist:** sync Cargo.lock workspace versions to 2.3.0 ([7a37392](https://github.com/Kehl-io/nestweaver/commit/7a3739203c58f70e539afbefb1c6359778f066b6))
-* **guide:** generate-guide uses the live tool registry, emits raw markdown ([fdbedbd](https://github.com/Kehl-io/nestweaver/commit/fdbedbda7f9094db6da2c550327ea800bf711701))
 * **guide:** generate-guide uses the live tool registry, emits raw markdown ([ada5f9e](https://github.com/Kehl-io/nestweaver/commit/ada5f9e7910b572047ce9061ae613cd6545a6260))
 
 ## [2.3.0](https://github.com/Kehl-io/nestweaver/compare/v2.2.1...v2.3.0) (2026-07-08)
@@ -1264,7 +1181,6 @@
 * **daemon:** serialize write RPCs with tokio Mutex ([4320814](https://github.com/Kehl-io/nestweaver/commit/4320814b1fdc840641c867a905319ad2802dd395))
 * **engine:** move SHA update to after bulk_index_write in full-index path ([7fe88e4](https://github.com/Kehl-io/nestweaver/commit/7fe88e4acfec26ca5bd27828ba95cacb5664fd0e))
 * ensure frontend assets are embedded in release binaries ([2b5e371](https://github.com/Kehl-io/nestweaver/commit/2b5e371f4bbb342e929d703a397c7dfcc91cc81f))
-* ensure frontend assets are embedded in release binaries ([2e46a09](https://github.com/Kehl-io/nestweaver/commit/2e46a091858888446acf07faa85f557ac48a96ad))
 * repo SHA stale reads — single store, write serialization, atomic SHA update ([1a110af](https://github.com/Kehl-io/nestweaver/commit/1a110af466f48cfde45026a22530137ba0e75e0d))
 * **store:** wrap update_repo_sha DELETE+CREATE in explicit transaction ([735cc98](https://github.com/Kehl-io/nestweaver/commit/735cc9857bf00a993298536426b7bcdb4e97e637))
 
@@ -1415,7 +1331,6 @@
 ### Bug Fixes
 
 * **mcp:** use stable state_dir for daemon socket path, not $TMPDIR ([6813314](https://github.com/Kehl-io/nestweaver/commit/6813314fa8f7eef6f722754eba8a5ae1f72b5032))
-* **mcp:** use stable state_dir for daemon socket path, not $TMPDIR ([3a1edf6](https://github.com/Kehl-io/nestweaver/commit/3a1edf6476b23813559f5e288d116adf866ede90))
 
 ## [0.26.2](https://github.com/Kehl-io/nestweaver/compare/v0.26.1...v0.26.2) (2026-06-17)
 
@@ -1430,7 +1345,6 @@
 ### Bug Fixes
 
 * **cli:** add --limit to broken-links, orphans, topic-clusters, tag-graph; surface staleness_commits_behind ([6971396](https://github.com/Kehl-io/nestweaver/commit/6971396a31fac3e8e81df16e9f5821173ee5c338))
-* **cli:** add --limit to broken-links, orphans, topic-clusters, tag-graph; surface staleness_commits_behind ([39b5ba5](https://github.com/Kehl-io/nestweaver/commit/39b5ba5892784b14df025231e259e1731b11334e))
 
 ## [0.26.0](https://github.com/Kehl-io/nestweaver/compare/v0.25.1...v0.26.0) (2026-06-16)
 
