@@ -92,13 +92,6 @@ pub struct WorkerPool {
     /// Tracks successful incremental code updates so server mode can
     /// periodically force a full refresh and bound graph drift.
     reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
-    /// Keep the regex trigram pre-filter fresh after each indexed job.
-    ///
-    /// Populated from `[indexing] with_trigrams` by the daemon. Nothing in the
-    /// background reindex path used to touch trigrams at all, so postings
-    /// only stayed current if a human reran `index --with-trigrams`; between
-    /// those runs `regex-search` silently fell back to a full scan.
-    refresh_trigrams: bool,
 }
 
 impl WorkerPool {
@@ -109,17 +102,7 @@ impl WorkerPool {
             repo_types: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
-            refresh_trigrams: false,
         }
-    }
-
-    /// Keep the trigram pre-filter fresh after each indexed job.
-    ///
-    /// Set from `[indexing] with_trigrams`. Off by default, preserving the
-    /// existing opt-in behaviour and its storage cost.
-    pub fn with_trigram_refresh(mut self, refresh_trigrams: bool) -> Self {
-        self.refresh_trigrams = refresh_trigrams;
-        self
     }
 
     /// Attach per-repo index strategies resolved from the instance config.
@@ -197,7 +180,6 @@ impl WorkerPool {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
         let index_limits = self.index_limits;
-        let refresh_trigrams = self.refresh_trigrams;
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -404,29 +386,14 @@ impl WorkerPool {
                                 );
                             }
 
-                            // Keep the regex pre-filter in step with the graph
-                            // this job just changed. Best-effort: a trigram
-                            // refresh failure must never fail an otherwise
-                            // successful index, because a stale posting table
-                            // is detected and bypassed at query time — the
-                            // cost is a slower regex-search, not a wrong one.
-                            if refresh_trigrams {
-                                match store.refresh_trigram_index(false) {
-                                    Ok(stats) => tracing::info!(
-                                        repo = %prepared.repo_id,
-                                        scopes_refreshed = stats.scopes_refreshed,
-                                        scopes_unchanged = stats.scopes_unchanged,
-                                        "trigram index refreshed after indexing"
-                                    ),
-                                    Err(error) => tracing::warn!(
-                                        repo = %prepared.repo_id,
-                                        %error,
-                                        "trigram refresh failed after indexing; \
-                                         regex-search falls back to a full scan \
-                                         until the next successful refresh"
-                                    ),
-                                }
-                            }
+                            // nw-198: this job's mutations have already
+                            // enqueued their scopes in the transactional
+                            // outbox. Draining that queue is the daemon's
+                            // trigram reconcile loop's job, not this worker's.
+                            // Refreshing here made every writer responsible for
+                            // remembering to reconcile, which is precisely how
+                            // the vault path and both file watchers ended up
+                            // enqueueing work nobody ever drained.
 
                             Ok(())
                         } else {
