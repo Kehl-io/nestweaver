@@ -226,21 +226,43 @@ fn bound_config_path(db_path: &Path, base: &Path) -> Result<Option<String>, anyh
     // so relying on it alone silently emitted a config-less registration in the
     // exact case that matters most. Look where an instance config actually
     // lives relative to the tree being set up.
-    for candidate in [
-        base.join(".nestweaver/instance.toml"),
-        base.join("instance.toml"),
-    ] {
-        if candidate.is_file() {
-            nestweaver_engine::InstanceConfig::from_file(&candidate).with_context(|| {
-                format!(
-                    "{} looks like the NestWeaver instance config for this setup, but it is invalid",
-                    candidate.display()
-                )
-            })?;
-            return candidate
-                .canonicalize()
-                .with_context(|| format!("canonicalize config path {}", candidate.display()))
-                .map(|path| Some(path.display().to_string()));
+    // `.nestweaver/` is our namespace. A file there is explicit operator
+    // intent, so accepting defaults after it fails to parse would silently
+    // discard configuration the user expected us to honor.
+    let explicit_candidate = base.join(".nestweaver/instance.toml");
+    if explicit_candidate.is_file() {
+        nestweaver_engine::InstanceConfig::from_file(&explicit_candidate).with_context(|| {
+            format!(
+                "{} is the NestWeaver instance config for this setup, but it is invalid",
+                explicit_candidate.display()
+            )
+        })?;
+        return explicit_candidate
+            .canonicalize()
+            .with_context(|| format!("canonicalize config path {}", explicit_candidate.display()))
+            .map(|path| Some(path.display().to_string()));
+    }
+
+    // A bare `instance.toml` is only a compatibility heuristic and may belong
+    // to another tool. Use it when it parses as a complete NestWeaver config;
+    // otherwise disclose the skipped candidate and continue without binding
+    // it instead of making an unrelated file break setup.
+    let bare_candidate = base.join("instance.toml");
+    if bare_candidate.is_file() {
+        match nestweaver_engine::InstanceConfig::from_file(&bare_candidate) {
+            Ok(_) => {
+                return bare_candidate
+                    .canonicalize()
+                    .with_context(|| {
+                        format!("canonicalize config path {}", bare_candidate.display())
+                    })
+                    .map(|path| Some(path.display().to_string()));
+            }
+            Err(error) => eprintln!(
+                "warning: ignoring bare config candidate {} because it is not a valid \
+                 NestWeaver instance config: {error:#}",
+                bare_candidate.display()
+            ),
         }
     }
     Ok(None)
@@ -1500,11 +1522,11 @@ mod mcp_arg_source_of_truth_tests {
         );
     }
 
-    /// A nearby TOML file is not necessarily a NestWeaver instance config.
-    /// Setup must fail visibly instead of wiring every generated MCP server to
-    /// an unrelated or malformed file that only happens to have the right name.
+    /// A config inside NestWeaver's own namespace is explicit operator intent.
+    /// Setup must fail visibly instead of silently discarding an invalid file
+    /// the user expected it to honor.
     #[test]
-    fn fresh_setup_rejects_an_invalid_discovered_config() {
+    fn fresh_setup_rejects_an_invalid_explicit_config() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         std::fs::create_dir_all(base.join(".nestweaver")).unwrap();
@@ -1515,6 +1537,38 @@ mod mcp_arg_source_of_truth_tests {
         let message = format!("{error:#}");
         assert!(message.contains(&config.display().to_string()));
         assert!(message.contains("invalid"));
+    }
+
+    /// The root-level filename is ambiguous and may belong to another tool.
+    /// An invalid candidate there is disclosed but must not break setup.
+    #[test]
+    fn fresh_setup_skips_an_invalid_bare_config_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("instance.toml"),
+            "title = \"another tool owns this\"\n",
+        )
+        .unwrap();
+
+        let found = bound_config_path(&base.join("fresh.lbug"), base)
+            .expect("an unrelated bare config must not break setup");
+        assert_eq!(found, None);
+    }
+
+    /// The compatibility filename remains supported when it proves itself by
+    /// parsing as a complete NestWeaver instance config.
+    #[test]
+    fn fresh_setup_accepts_a_valid_bare_config_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let config = base.join("instance.toml");
+        std::fs::write(&config, include_str!("../examples/minimal-instance.toml")).unwrap();
+
+        let found = bound_config_path(&base.join("fresh.lbug"), base)
+            .expect("config discovery must succeed")
+            .expect("a valid bare config must remain discoverable");
+        assert_eq!(found, config.canonicalize().unwrap().display().to_string());
     }
 
     /// Upgrade path: an EXISTING registration must gain `--config`.
