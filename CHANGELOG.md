@@ -54,6 +54,28 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [7.0.0](https://github.com/Kehl-io/nestweaver/compare/v6.4.0...v7.0.0) (2026-08-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **index:** floor the --since threshold, rename file_meta_nanos, correct the platform claim
+* **index:** the `<db>.filemeta.json` change-detection sidecar moves to v3 (nanosecond mtimes), and `resolution_cache::CACHE_VERSION` is bumped in lockstep as its pairing test requires. A v2 sidecar stores SECONDS in the field v3 reads as NANOSECONDS, so it is DISCARDED rather than reinterpreted — reusing it would be indistinguishable from a real edit. The first index after upgrading is therefore a FULL RE-INDEX for every existing database. This is the documented fail-open: it costs one re-index and can never mis-classify a file. Embeddings are keyed separately and are not invalidated.
+
+### Bug Fixes
+
+* **cli,setup,tests:** daemon gc needs no database; codex shares the MCP argv builder ([2714965](https://github.com/Kehl-io/nestweaver/commit/2714965fcaf66456af79d2435a1297aa467ab5c3))
+* **daemon,setup,tests:** count the reconcile write, reconcile existing registrations, isolate the gc test ([8e68eea](https://github.com/Kehl-io/nestweaver/commit/8e68eea39c4d301363b64c67a0d8c25c44112382))
+* **daemon,setup:** close PR 275 review gaps ([2cf2209](https://github.com/Kehl-io/nestweaver/commit/2cf22091201861485c2f500ef6482b1ea0e3ff4d))
+* **daemon,setup:** close PR 275 review gaps ([0ea8c4a](https://github.com/Kehl-io/nestweaver/commit/0ea8c4ae1f2191edeed6c0817740cbd4e9197827))
+* **index,tests:** refresh the cached stat on a content match, and de-flake the investigate parity test ([9edcd46](https://github.com/Kehl-io/nestweaver/commit/9edcd461dab9c77ea8fcb09207f523fec48ced68))
+* **index:** compare size as well as mtime, so same-second edits are not lost ([3697824](https://github.com/Kehl-io/nestweaver/commit/3697824a74449dab08bd6234331bda2457c117d2))
+* **index:** floor the --since threshold, rename file_meta_nanos, correct the platform claim ([bdb8e31](https://github.com/Kehl-io/nestweaver/commit/bdb8e311ecb1b7906edf1d578b7a16cf2356c269))
+* **index:** keep nanosecond mtimes so same-second edits are never lost ([72b1f9a](https://github.com/Kehl-io/nestweaver/commit/72b1f9a73216252d4c2da79796e8b8964b954dba))
+* **regex:** give the trigram reconciler an owner, and move interaction tracking into config ([0f10e28](https://github.com/Kehl-io/nestweaver/commit/0f10e28ee44d3e242f6f94a820c23d4a9615ebf2))
+* **regex:** give the trigram reconciler an owner; move interaction tracking into config ([8d46cff](https://github.com/Kehl-io/nestweaver/commit/8d46cffe6af33c92a00c2e95fa927d9f62680d04))
+* **setup:** distinguish explicit and bare config candidates ([3125048](https://github.com/Kehl-io/nestweaver/commit/3125048fe7d9d0e4b31c2298865a2ad75bc350c8))
+
 ## [6.4.0](https://github.com/Kehl-io/nestweaver/compare/v6.3.0...v6.4.0) (2026-08-21)
 
 
