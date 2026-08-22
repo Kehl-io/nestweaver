@@ -233,7 +233,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Trigram refresh follows `[indexing] with_trigrams`; with no `--config` the daemon's own setting is inherited. `--with-trigrams` forces it on for one run, `--no-trigrams` off (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Indexing does NOT refresh trigrams implicitly — the daemon's reconcile loop owns that (see `[indexing] trigram_reconcile_interval`). `--with-trigrams` forces an inline refresh for one run (CI, scripted reindex), `--no-trigrams` suppresses it (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. The direct `--local` path still refreshes inline, since no daemon exists there to drain for it. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
@@ -243,7 +243,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `detect-changes` | Run the MCP-compatible changed-file impact contract directly from the CLI, including risk, gate state, status, and blind spots |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
 | `read-symbols` | Read a symbol's source span |
-| `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh with `index --with-trigrams`, or set `[indexing] with_trigrams = true` so indexing keeps the pre-filter fresh automatically) |
+| `regex-search` | Regex search over indexed text (scope-aware trigram pre-filter; safely scans only missing or stale scopes with `stale_index: true` — refresh now with `index --with-trigrams`, or set `[indexing] with_trigrams = true` so the daemon's reconcile loop keeps the pre-filter fresh on `trigram_reconcile_interval`) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
 | `investigate-expand` | Drill into investigate bundle entries — full body plus immediate neighbours |

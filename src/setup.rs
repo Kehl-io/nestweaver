@@ -1165,7 +1165,8 @@ fn generate_copilot_instructions() -> String {
     - Don't grep indexed repos — use `brain_search`\n\
     - Don't read entire files — use `read_symbols`\n\n\
     ## Interaction Memory\n\n\
-    When the MCP server is started with `--track-interactions`, NestWeaver learns from agent \
+    Set `[ranking] track_interactions = true` in your instance config (or start the MCP \
+    server with `--track-interactions`) and NestWeaver learns from agent \
     query patterns to improve retrieval ranking over time. Opt-in, local-only, records UIDs \
     and timestamps only — no content is captured. Use `interactions status` to view memory stats \
     and `interactions clear` to wipe interaction data.\n",
