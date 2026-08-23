@@ -7524,8 +7524,34 @@ fn watch_path_allowed(
         .filter_map(|r| config_repo_canonical_path(&r.url))
         .collect();
     if !allowed.iter().any(|a| path.starts_with(a)) {
+        // nw-203: name the REGISTRY and the REMEDY.
+        //
+        // The old message — "is not in the instance's registered sources" —
+        // stated a fact and stopped, and its central word was doing double
+        // duty. A vault indexed with `brain add --config` IS registered: it is
+        // in the DB and `brain status` lists it. But the watcher consults the
+        // instance CONFIG allow-list, a different registry, so an operator who
+        // had demonstrably registered the vault was told it was not
+        // registered. Saying WHICH registry was consulted is what removes the
+        // contradiction.
+        //
+        // The allow-list itself is correct and deliberate — without `--config`
+        // the daemon falls back to a system-root denylist, and this list is
+        // what stops someone watching a home directory. So this is a message
+        // fix, not a policy change, and the remedy has to be the exact stanza
+        // rather than "register it", which is what the operator believes they
+        // already did.
+        let type_hint = if vault_only {
+            "\n  type = \"vault\""
+        } else {
+            ""
+        };
         return Err(Status::invalid_argument(format!(
-            "{kind} path {} is not in the instance's registered sources",
+            "{kind} path {} is not in the instance config's [[repos]] allow-list. \
+             Indexing it with `brain add` is NOT enough: the watcher checks the \
+             config, not the database.\n\
+             Add this to your instance.toml and restart the daemon:\n\n               [[repos]]{type_hint}\n  url = \"file://{}\"",
+            path.display(),
             path.display()
         )));
     }
@@ -19094,6 +19120,63 @@ mod watch_path_allowed_tests {
         std::fs::create_dir(&sub).unwrap();
         let sub = std::fs::canonicalize(&sub).unwrap();
         assert!(watch_path_allowed(Some(&repos), &sub, "repo", false).is_ok());
+    }
+
+    /// nw-203. The rejection must name the REGISTRY it consulted and the exact
+    /// remedy.
+    ///
+    /// The old message was "is not in the instance's registered sources", which
+    /// stated a fact and stopped — and its central word was doing double duty.
+    /// A vault indexed with `brain add --config` IS registered: it is in the DB
+    /// and `brain status` lists it. The watcher checks the instance CONFIG,
+    /// a different registry, so an operator who had demonstrably registered the
+    /// vault was told it was not registered.
+    ///
+    /// Asserts what an operator can ACT on, not the phrasing: which registry,
+    /// that indexing is not sufficient, and a stanza they can paste.
+    #[test]
+    fn rejection_names_the_config_registry_and_a_pastable_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registered = tmp.path().join("registered");
+        let outsider = tmp.path().join("outsider");
+        std::fs::create_dir(&registered).unwrap();
+        std::fs::create_dir(&outsider).unwrap();
+        let outsider = std::fs::canonicalize(&outsider).unwrap();
+        let repos = vec![repo_cfg(
+            &format!("file://{}", registered.display()),
+            Some(RepoType::Vault),
+        )];
+
+        let error = watch_path_allowed(Some(&repos), &outsider, "vault", true)
+            .expect_err("an unregistered path must still be refused");
+        let message = error.message();
+
+        assert!(
+            message.contains("[[repos]]"),
+            "must name the config allow-list it actually consulted: {message}"
+        );
+        assert!(
+            !message.contains("registered sources"),
+            "the ambiguous wording is the defect, not the phrasing: {message}"
+        );
+        assert!(
+            message.contains("brain add") && message.contains("NOT enough"),
+            "must resolve the contradiction for someone who already indexed it: {message}"
+        );
+        assert!(
+            message.contains(&format!("url = \"file://{}\"", outsider.display())),
+            "the remedy must be pastable, naming the path the operator asked for: {message}"
+        );
+        assert!(
+            message.contains("type = \"vault\""),
+            "a vault watch needs the type line, which is the part nothing documented: {message}"
+        );
+
+        // A code watch gets the same stanza WITHOUT the vault type line, which
+        // would otherwise be wrong advice.
+        let code_error = watch_path_allowed(Some(&repos), &outsider, "repo", false)
+            .expect_err("an unregistered path must still be refused");
+        assert!(!code_error.message().contains("type = \"vault\""));
     }
 
     /// Paths outside the config's registered sources are still rejected, and

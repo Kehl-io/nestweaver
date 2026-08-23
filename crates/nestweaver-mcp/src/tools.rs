@@ -7225,6 +7225,13 @@ fn tool_schema_detect_changes() -> Value {
                     "items": { "type": "string" },
                     "minItems": 1,
                     "description": "Backward-compatible alias for changed_files."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Max affected symbols AND max affected processes to inline (default 50). The totals are always reported as affected_symbol_count / affected_process_count, and truncated says whether anything was omitted.",
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -7245,11 +7252,25 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         return Err(anyhow!("'files' must contain at least one path"));
     }
 
+    // nw-174: this tool inlined EVERY affected symbol and process. On a
+    // high-fanout file that was 156 KB (~39K tokens) with 416 processes in one
+    // call — a fifth of a context window — while every neighbouring tool
+    // (brain_broken_links, brain_orphan_documents, blast_radius) already
+    // capped and reported total vs returned. The counts below were already
+    // honest; what was missing was the bound.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_RESULT_LIMIT)
+        .clamp(1, 1000);
+
     let impact = detect_changes_impact(store, &files, 10).context("detect_changes_impact")?;
 
     let affected_symbols: Vec<Value> = impact
         .affected_symbols
         .iter()
+        .take(limit)
         .map(|s| {
             json!({
                 "uid": s.uid,
@@ -7262,6 +7283,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     let affected_processes: Vec<Value> = impact
         .affected_processes
         .iter()
+        .take(limit)
         .map(|p| {
             json!({
                 "name": p.name,
@@ -7278,6 +7300,15 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         nestweaver_engine::RiskLevel::High => "high",
     };
 
+    let symbols_omitted = impact
+        .affected_symbols
+        .len()
+        .saturating_sub(affected_symbols.len());
+    let processes_omitted = impact
+        .affected_processes
+        .len()
+        .saturating_sub(affected_processes.len());
+
     Ok(json!({
         "files": files,
         "risk": risk_str,
@@ -7286,9 +7317,16 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         "notifications": serde_json::to_value(&impact.notifications)?,
         "blast_radius": impact.blast_radius,
         "affected_symbols": affected_symbols,
+        // The TOTAL, not the returned length — so `affected_symbol_count`
+        // against the array length is how a caller sees what was dropped, and
+        // `truncated` says it outright rather than requiring the comparison.
         "affected_symbol_count": impact.affected_symbols.len(),
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
+        "limit": limit,
+        "truncated": symbols_omitted > 0 || processes_omitted > 0,
+        "symbols_omitted": symbols_omitted,
+        "processes_omitted": processes_omitted,
     }))
 }
 
@@ -8541,6 +8579,14 @@ fn tool_project_context(
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
     let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget, concise);
     let used_tokens = seed_tokens + connected_tokens;
+    // nw-188: a caller could not distinguish "this project is empty" from
+    // "your budget was too small", because `connected: []` was reported
+    // identically in both cases with no flag. Seeds are charged against the
+    // budget FIRST, so a budget smaller than the seed overhead leaves zero for
+    // connected and drops every one of them silently — reproduced as
+    // token_budget 200 / tokens_used 257 / connected [] / seeds_expanded 114.
+    let connected_dropped = result.connected.len().saturating_sub(cut);
+    let budget_exceeded = used_tokens > token_budget;
 
     // 7. Load external_refs from extension sidecar.
     let ext_store = load_extensions(&db_path);
@@ -8595,6 +8641,9 @@ fn tool_project_context(
             "connected": connected_json,
             "tokens_used": used_tokens,
             "token_budget": token_budget,
+            "more_available": connected_dropped,
+            "truncated": connected_dropped > 0,
+            "budget_exceeded": budget_exceeded,
             "semantic_applied": result.semantic_applied,
             "degraded_components": &result.degraded_components,
         });
@@ -8621,6 +8670,11 @@ fn tool_project_context(
         }
     }
 
+    // nw-188: `more_available` and `truncated` name what was dropped;
+    // `budget_exceeded` says plainly that `tokens_used` is over `token_budget`
+    // rather than leaving a caller to notice the arithmetic. Reporting the
+    // real `tokens_used` and flagging it is the honest pair — silently
+    // clamping the number would trade one lie for another.
     let mut resp = json!({
         "project": project.name,
         "project_uid": project.uid,
@@ -8628,6 +8682,9 @@ fn tool_project_context(
         "connected": connected_json,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
+        "more_available": connected_dropped,
+        "truncated": connected_dropped > 0,
+        "budget_exceeded": budget_exceeded,
         "semantic_applied": result.semantic_applied,
         "degraded_components": &result.degraded_components,
     });
@@ -10446,7 +10503,7 @@ fn tool_schema_investigate() -> Value {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
-                "scope": { "type": "string", "description": "Optional scope: \"project:<slug>\", \"repo:<name>\", or \"vault\"/\"all\" (default = no restriction)." },
+                "scope": { "type": "string", "description": "Optional scope. \"project:<slug>\" and \"repo:<name>\" genuinely restrict results; \"vault\" and \"all\" are PASS-THROUGHS that restrict nothing (default: \"all\"). Read `scope_filtered` in the response to know whether a filter was actually applied — `scope` only echoes what you asked for." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
                 "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
             },
@@ -10466,10 +10523,13 @@ fn tool_investigate(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'query' must be a string"))?;
-    let scope = args
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("vault");
+    // nw-189: "all", not "vault". The result echoes this string back, and
+    // defaulting to "vault" told an agent that supplied NO scope that its
+    // results were vault-scoped while code symbols from every repo came back.
+    // Both are documented pass-throughs; "all" is the honest name for the
+    // default. `scope_filtered` in the response reports whether a filter was
+    // actually applied.
+    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())

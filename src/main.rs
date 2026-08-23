@@ -1989,7 +1989,8 @@ enum Commands {
         after_help = "Accepts a repo name, filesystem path, file:// URL, or UID.\n\nExamples:\n  nestweaver remove-repo acme-server\n  nestweaver remove-repo /home/user/dev/workspaces/acme/acme-server\n  nestweaver remove-repo repo:051a9ff9:abc123"
     )]
     RemoveRepo {
-        /// Repo name, filesystem path, file:// URL, or UID
+        /// Repo name, remote URL, filesystem path, file:// URL, or UID —
+        /// including the exact `URL:` and UID lines `list-repos` prints
         target: String,
         #[arg(
             long,
@@ -4130,6 +4131,14 @@ enum BrainCommands {
     /// Runs in the foreground; Ctrl-C stops it cleanly. On each .md save
     /// the changed file is re-parsed and its nodes are replaced via
     /// cascade-delete + re-insert.
+    ///
+    /// When the daemon runs with `--config`, the vault must have a `[[repos]]`
+    /// entry with `type = "vault"` in instance.toml. Having indexed it with
+    /// `brain add` is NOT sufficient — that registers it in the database,
+    /// while the watcher checks the config allow-list.
+    #[command(
+        after_help = "Examples:\n  nestweaver brain watch ~/brain\n  nestweaver brain watch ~/brain --name my-vault\n\nWith a --config daemon, instance.toml needs:\n\n  [[repos]]\n  type = \"vault\"\n  url = \"file:///Users/me/brain\"\n\nIndexing with `brain add` registers the vault in the DATABASE; the watcher\nchecks the instance CONFIG. Both are required."
+    )]
     Watch {
         /// Vault directory to watch.
         path: PathBuf,
@@ -7768,6 +7777,67 @@ async fn restart_live_daemon_preserving_config(
 /// `db_not_found` when the file is absent — never autostart a daemon that
 /// CREATES an empty DB (a typo'd `--db` must not false-green). The message is
 /// phrased so `into_diagnostic` maps it to `CliDiagnostic::DatabaseNotFound`.
+/// Whether `repo` is identified by `target` for `remove-repo`.
+///
+/// Extracted from the command body so the rules are testable without a daemon
+/// or a database — the previous inline closure could only be exercised
+/// end-to-end, which is why nw-202 (a remote URL matching nothing) went
+/// unnoticed despite `list-repos` advertising exactly that identity.
+///
+/// Accepts, in rough order of directness: the repo UID, its remote URL
+/// verbatim, its name, an absolute path or `file://` URL, the git origin
+/// remote of a local checkout, the stored root path, and a trailing path
+/// segment of the URL.
+fn repo_matches_target(repo: &nestweaver_schema::Repo, target: &str) -> bool {
+    let target_trimmed = target.trim_end_matches('/');
+    let r_url = repo.url.trim_end_matches('/');
+
+    // nw-202: the REMOTE URL, matched verbatim, as a primary key.
+    // `list-repos` leads every entry with `URL: git@github.com:Org/repo.git`,
+    // and passing that exact string back used to match nothing: the resolver
+    // was path- and `file://`-centric, so `url_target` below stays empty for an
+    // ssh or https remote. The tool advertised an identity it would not accept,
+    // and the error then told the operator to re-run the command that printed
+    // it.
+    if r_url == target_trimmed
+        || repo.uid == target_trimmed
+        || repo.name.as_deref() == Some(target_trimmed)
+    {
+        return true;
+    }
+
+    let canonical_target = std::fs::canonicalize(target_trimmed)
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap_or_default();
+    let url_target = if target_trimmed.starts_with("file://") {
+        target_trimmed.to_string()
+    } else if std::path::Path::new(target_trimmed).is_absolute() {
+        format!("file://{target_trimmed}")
+    } else {
+        String::new()
+    };
+    // A path target may refer to a repo identified by its git origin remote
+    // rather than a file:// URL — try that identity and the stored root_path
+    // too (the origin URL is read from git config, never fetched).
+    let origin_target = std::fs::canonicalize(target_trimmed)
+        .ok()
+        .filter(|p| p.join(".git").exists())
+        .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
+        .unwrap_or_default();
+    let canonical_path = canonical_target
+        .strip_prefix("file://")
+        .unwrap_or_default()
+        .to_string();
+
+    (!url_target.is_empty() && r_url == url_target)
+        || (!canonical_target.is_empty() && r_url == canonical_target)
+        || (!origin_target.is_empty() && r_url == origin_target.trim_end_matches('/'))
+        || (!canonical_path.is_empty()
+            && repo.local_root().map(|p| p.trim_end_matches('/'))
+                == Some(canonical_path.trim_end_matches('/')))
+        || r_url.ends_with(&format!("/{target_trimmed}"))
+}
+
 fn require_existing_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     if !db_path.exists() {
         anyhow::bail!("database not found at {}", db_path.display());
@@ -8731,55 +8801,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .context("failed to parse repo list")?
             };
 
-            // Resolve target → repo UID.  Accept: UID, name, path, or URL.
-            let target_trimmed = target.trim_end_matches('/');
-            let canonical_target = std::fs::canonicalize(target_trimmed)
-                .map(|p| format!("file://{}", p.display()))
-                .unwrap_or_default();
-
-            let url_target = if target_trimmed.starts_with("file://") {
-                target_trimmed.trim_end_matches('/').to_string()
-            } else if std::path::Path::new(target_trimmed).is_absolute() {
-                format!("file://{target_trimmed}")
-            } else {
-                String::new()
-            };
-
-            // A path target may refer to a repo identified by its git origin
-            // remote rather than a file:// URL — try that identity and the
-            // stored root_path too (the origin URL is read from git config,
-            // never fetched).
-            let origin_target = std::fs::canonicalize(target_trimmed)
-                .ok()
-                .filter(|p| p.join(".git").exists())
-                .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
-                .unwrap_or_default();
-            let canonical_path = canonical_target
-                .strip_prefix("file://")
-                .unwrap_or_default()
-                .to_string();
-
+            // Resolve target → repo UID. Accepts UID, remote URL, name, path,
+            // or file:// URL. See `repo_matches_target`, which is where the
+            // rules live so they can be tested without a daemon.
             let matched: Vec<&nestweaver_schema::Repo> = repos
                 .iter()
-                .filter(|r| {
-                    let r_url = r.url.trim_end_matches('/');
-                    r.uid == target
-                        || r.name.as_deref() == Some(target_trimmed)
-                        || r_url == url_target
-                        || r_url == canonical_target
-                        || (!origin_target.is_empty()
-                            && r_url == origin_target.trim_end_matches('/'))
-                        || (!canonical_path.is_empty()
-                            && r.local_root().map(|p| p.trim_end_matches('/'))
-                                == Some(canonical_path.trim_end_matches('/')))
-                        || r_url.ends_with(&format!("/{target_trimmed}"))
-                })
+                .filter(|r| repo_matches_target(r, &target))
                 .collect();
 
             if matched.is_empty() {
+                // nw-202: name what IS accepted. The previous remedy was "Run
+                // `nestweaver list-repos`" — the command that printed the
+                // rejected string — which is a closed loop for a genuine typo
+                // as well as for the URL case fixed above.
                 eprintln!(
                     "Error: no repo matching '{target}' found.\n  \
-                     Run `nestweaver list-repos` to see indexed repos."
+                     Accepted: the repo UID, its remote URL, its name, a filesystem \
+                     path, or a file:// URL.\n  \
+                     `nestweaver list-repos` prints the UID and the URL for every \
+                     indexed repo; either one works here."
                 );
                 return Ok((EXIT_NOT_FOUND, None));
             }
@@ -13983,7 +14023,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
             let root = root.unwrap_or_else(detect_repo_root);
-            let scope = scope.unwrap_or_else(|| "vault".to_string());
+            // nw-189: "all", not "vault". Both are pass-throughs, but the
+            // result echoes this string back, and defaulting to "vault" told a
+            // caller who supplied NO scope that their results were
+            // vault-scoped — while code symbols from every repo came back.
+            // "all" is the honest name for the no-restriction default and is
+            // already an advertised option.
+            let scope = scope.unwrap_or_else(|| "all".to_string());
             let result = nestweaver_engine::investigate(
                 &store,
                 tantivy.as_ref(),
@@ -26205,6 +26251,61 @@ credential_method = "gh"
 
     /// nw-087: a nonexistent --db must fail with the db_not_found
     /// diagnostic (exit 1), not silently create/spawn anything.
+    /// nw-202. `list-repos` leads every entry with `URL: git@github.com:Org/repo.git`,
+    /// and passing that exact string to `remove-repo` used to match NOTHING —
+    /// the resolver was path- and `file://`-centric. The error then said "Run
+    /// `nestweaver list-repos`", i.e. re-run the command that printed the
+    /// rejected string. A closed loop.
+    ///
+    /// Asserts the identities `list-repos` actually PRINTS are accepted, which
+    /// is the user-visible contract, rather than asserting on the internals of
+    /// the match.
+    #[test]
+    fn remove_repo_accepts_the_identities_list_repos_prints() {
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:kory-brain:29b71f654c79".to_string(),
+            url: "git@github.com:Ballistic-X/web-app.git".to_string(),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "kory-brain".to_string(),
+            name: Some("web-app".to_string()),
+            root_path: None,
+        };
+
+        // The two lines `list-repos` prints for every repo.
+        assert!(
+            repo_matches_target(&repo, "git@github.com:Ballistic-X/web-app.git"),
+            "the ssh remote URL is the identity the tool advertises"
+        );
+        assert!(repo_matches_target(&repo, "repo:kory-brain:29b71f654c79"));
+
+        // Reproduced originally on an https URL too, so both forms are pinned.
+        let https = nestweaver_schema::Repo {
+            url: "https://github.com/Ballistic-X/web-app.git".to_string(),
+            ..repo.clone()
+        };
+        assert!(repo_matches_target(
+            &https,
+            "https://github.com/Ballistic-X/web-app.git"
+        ));
+
+        // A trailing slash must not defeat either form.
+        assert!(repo_matches_target(
+            &https,
+            "https://github.com/Ballistic-X/web-app.git/"
+        ));
+        assert!(repo_matches_target(&repo, "repo:kory-brain:29b71f654c79/"));
+
+        // Name still works, and an unrelated string still does not — otherwise
+        // this test would pass against a matcher that returns true for anything.
+        assert!(repo_matches_target(&repo, "web-app"));
+        assert!(!repo_matches_target(
+            &repo,
+            "git@github.com:Other/thing.git"
+        ));
+        assert!(!repo_matches_target(&repo, "repo:kory-brain:deadbeef"));
+    }
+
     #[test]
     fn require_existing_db_fails_db_not_found_on_missing_db() {
         let dir = tempfile::tempdir().unwrap();

@@ -138,7 +138,20 @@ pub struct Domain {
 pub struct InvestigateResult {
     pub bundle_id: String,
     pub query: String,
+    /// The scope STRING the caller supplied, echoed back verbatim.
+    ///
+    /// nw-189: this alone reads as a restriction that was applied, which for
+    /// `vault`/`all`/empty is false — they are documented pass-throughs, and
+    /// the CLI additionally defaulted an unsupplied scope to the literal
+    /// "vault", so a caller who asked for nothing was told their results were
+    /// vault-scoped while code symbols from every repo came back. Pair it with
+    /// `scope_filtered` before drawing any conclusion from it.
     pub scope: String,
+    /// Whether a real filter was constructed and applied for `scope`.
+    ///
+    /// False for the pass-through scopes. A caller that wants to know whether
+    /// results were actually restricted must read THIS, not `scope`.
+    pub scope_filtered: bool,
     pub domains: Vec<Domain>,
     pub entries: Vec<BundleEntry>,
     /// Number of additional connected nodes dropped due to the token budget.
@@ -593,6 +606,7 @@ pub fn investigate(
         bundle_id,
         query: query.to_string(),
         scope: scope.to_string(),
+        scope_filtered: scope_filter.is_some(),
         domains,
         entries,
         more_available,
@@ -1377,6 +1391,44 @@ mod tests {
         assert_eq!(a, b, "same inputs → same asset id");
         assert_ne!(a, c, "different uid → different asset id");
         assert!(a.starts_with('a') && a.len() == 13);
+    }
+
+    /// nw-189. `vault` and `all` are documented PASS-THROUGHS — they construct
+    /// no filter — so a response that echoes `scope: "vault"` and nothing else
+    /// reads as a restriction that never happened. The CLI and MCP made it
+    /// worse by defaulting an unsupplied scope to the literal "vault", so a
+    /// caller who asked for nothing was told their results were vault-scoped
+    /// while code symbols from every repo came back.
+    ///
+    /// Pins the property that matters: whether a filter was BUILT, which is
+    /// what `scope_filtered` reports. Asserting on `resolve_scope` directly
+    /// keeps this independent of a populated graph.
+    #[test]
+    fn pass_through_scopes_build_no_filter_and_real_scopes_do() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // Every documented pass-through, including the empty string and the
+        // case variants the resolver accepts.
+        for pass_through in ["", "vault", "all", "VAULT", "All", "  vault  "] {
+            let (_, filter) = resolve_scope(&store, "anything", pass_through).unwrap();
+            assert!(
+                filter.is_none(),
+                "{pass_through:?} is documented as no restriction, so it must build no filter"
+            );
+        }
+
+        // A repo scope for a repo that does not exist is an ERROR, not a
+        // silent pass-through — 6.4.0's fix, pinned here so a future change
+        // cannot quietly turn an unknown scope back into "no restriction",
+        // which would be indistinguishable from the bug above.
+        assert!(
+            resolve_scope(&store, "anything", "repo:does-not-exist").is_err(),
+            "an unresolvable repo scope must error rather than silently match everything"
+        );
+        assert!(
+            resolve_scope(&store, "anything", "project:does-not-exist").is_err(),
+            "an unresolvable project scope must error rather than silently match everything"
+        );
     }
 
     #[test]

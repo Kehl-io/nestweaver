@@ -318,6 +318,28 @@ sparse = false        # optional: disable sparse checkout (default: true)
 pin_sha = "abc123"    # optional: pin to a specific commit
 ```
 
+> **A path must appear here to be WATCHABLE, not just to be indexed.**
+>
+> `[[repos]]` is the allow-list the file watchers check. Indexing a path with
+> `brain add` registers it in the *database*, which is a different registry —
+> `brain status` will list the vault while `brain watch` still refuses it:
+>
+> ```
+> vault path /Users/me/brain is not in the instance config's [[repos]] allow-list
+> ```
+>
+> For a local vault, that means a `file://` entry with `type = "vault"`:
+>
+> ```toml
+> [[repos]]
+> type = "vault"
+> url = "file:///Users/me/brain"
+> ```
+>
+> Restart the daemon after adding it. The allow-list is deliberate: without
+> `--config` the daemon falls back to a system-root denylist, and this list is
+> what prevents watching an entire home directory.
+
 ### Optional sections
 
 #### `[daemon]` — Daemon lifecycle policy
