@@ -1440,6 +1440,22 @@ fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String
         format!("  Metal compiled:   {}", status.metal_compiled),
         format!("  Fallback used:    {}", status.fallback_used),
     ]);
+    // nw-204. Only shown when the daemon actually reported it (an older daemon
+    // sends proto3 zeros, and "0 stored" is indistinguishable from "not
+    // reported" — printing "0 vectors" for a healthy brain would be a lie).
+    if status.index_stored > 0 {
+        lines.push(format!(
+            "  Vectors:          {} live / {} stored",
+            status.index_live, status.index_stored
+        ));
+        if status.index_tombstoned > 0 {
+            let pct = status.index_tombstoned as f64 / status.index_stored as f64 * 100.0;
+            lines.push(format!(
+                "  Reclaimable:      {} tombstoned ({pct:.0}%) — run `nestweaver compact-embeddings`",
+                status.index_tombstoned
+            ));
+        }
+    }
     if !status.error.is_empty() {
         lines.push(format!("  Error:            {}", status.error));
     }
@@ -1463,6 +1479,9 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
         pass_total: value["pass_total"].as_u64().unwrap_or(0),
         pass_started_at: value["pass_started_at"].as_i64().unwrap_or(0),
         pass_scope: value["pass_scope"].as_str().unwrap_or("").to_string(),
+        index_live: value["index_live"].as_u64().unwrap_or(0),
+        index_tombstoned: value["index_tombstoned"].as_u64().unwrap_or(0),
+        index_stored: value["index_stored"].as_u64().unwrap_or(0),
     }
 }
 
@@ -1990,6 +2009,38 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Reclaim embedding vectors left behind by deleted graph nodes.
+    ///
+    /// Reconciles the embedding sidecar against the live graph and rewrites it
+    /// without the dead rows. Does NOT load the embedding model and does NOT
+    /// re-embed anything, so it is cheap and safe to run on a large brain.
+    ///
+    /// Two reasons to run it. Disk is the obvious one. The other is result
+    /// quality: the vector scan skips rows that are tombstoned, so a dead
+    /// vector that was never tombstoned is still SCORED, and one outranking a
+    /// live result silently consumes a top-k slot in semantic search.
+    ///
+    /// Ongoing tombstoning is automatic (nw-204); this exists for brains that
+    /// already accumulated orphans, and as an explicit way to force the
+    /// reclaim rather than waiting for the ratio threshold.
+    ///
+    /// Runs through the daemon, which holds the same write gate for this that
+    /// it holds for indexing — so it cannot race an in-flight index or watcher
+    /// batch while rewriting the artifact.
+    #[command(
+        after_help = "Examples:\n  nestweaver compact-embeddings\n  nestweaver compact-embeddings --db ~/brain/.nestweaver/brain.lbug\n  nestweaver compact-embeddings --dry-run   # report occupancy, change nothing"
+    )]
+    CompactEmbeddings {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Report what would be reclaimed without writing anything")]
+        dry_run: bool,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
     },
     /// Remove repos and vaults whose paths no longer exist on disk.
     #[command(
@@ -8826,6 +8877,76 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             require_existing_db(&db_path)?;
             let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
+        }
+
+        Commands::CompactEmbeddings { db, dry_run, json } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
+            // Through the daemon, like every other write. Compaction rewrites
+            // the embedding base; doing that from a second process while the
+            // daemon indexes or a watcher batch flushes would race a store that
+            // is not crash-safe. The daemon holds the same write gate for this
+            // that it holds for indexing.
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            let resp = match rt.block_on(client.compact_embeddings(dry_run)) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("Error: compact-embeddings failed: {e}");
+                    return Ok((EXIT_ERROR, None));
+                }
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": resp.dry_run,
+                        "live": resp.live_after,
+                        "stored_before": resp.stored_before,
+                        "stored_after": resp.stored_after,
+                        "tombstoned_before": resp.tombstoned_before,
+                        // stored_after - live_after: lets a scripted caller
+                        // verify the tombstones were actually cleared rather
+                        // than inferring it from the reclaim count.
+                        "tombstoned_after": resp.stored_after - resp.live_after,
+                        "reclaimed_vectors": resp.reclaimed,
+                        "bytes_before": resp.bytes_before,
+                        "bytes_after": resp.bytes_after,
+                    }))?
+                );
+            } else if resp.dry_run {
+                println!("Embedding index (dry run — nothing written):");
+                println!("  live vectors:      {}", resp.live_after);
+                println!("  tombstoned:        {}", resp.tombstoned_before);
+                println!("  stored on disk:    {}", resp.stored_before);
+                println!("  sidecar bytes:     {}", resp.bytes_before);
+                println!(
+                    "\nA dry run reports only what is ALREADY tombstoned. Orphans that were\n\
+                     never tombstoned are invisible here and are found by the reconcile\n\
+                     that a real run performs — run without --dry-run to see the true total."
+                );
+            } else if resp.reclaimed == 0 && resp.tombstoned_before == 0 {
+                println!(
+                    "Nothing to reclaim: all {} stored vectors are live.",
+                    resp.stored_after
+                );
+            } else {
+                println!("Reclaimed {} dead vector(s).", resp.reclaimed);
+                println!("  stored before:  {}", resp.stored_before);
+                println!("  stored after:   {}", resp.stored_after);
+                println!("  live:           {}", resp.live_after);
+                if resp.bytes_before > 0 && resp.bytes_after > 0 {
+                    println!(
+                        "  sidecar bytes:  {} -> {}",
+                        resp.bytes_before, resp.bytes_after
+                    );
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::PruneStale { db } => {

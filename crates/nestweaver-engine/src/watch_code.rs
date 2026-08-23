@@ -601,29 +601,38 @@ impl CodeWatcher {
         }
 
         let mut files_processed = 0usize;
+        // nw-204: every symbol UID this batch removes, so the epilogue can
+        // tombstone the ones that do not come back. Both arms delete — a
+        // Replace deletes the file's symbols before re-inserting them.
+        let mut deleted_symbol_uids: Vec<String> = Vec::new();
+        let mut deleted_symbol_files: Vec<String> = Vec::new();
         for prepared_path in &prepared_paths {
             match prepared_path {
                 PreparedPath::Replace(prepared) => {
-                    let symbols = apply_prepared_code_file(&txn, r_uid, prepared)
+                    let (symbols, removed) = apply_prepared_code_file(&txn, r_uid, prepared)
                         .with_context(|| format!("apply watched file {}", prepared.rel_path))?;
+                    deleted_symbol_uids.extend(removed);
+                    deleted_symbol_files.push(prepared.rel_path.clone());
                     tracing::debug!(path = %prepared.rel_path, symbols, "re-indexed file");
                     files_processed += 1;
                 }
                 PreparedPath::Delete { rel_path } => {
-                    let removed_count = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                         &txn, r_uid, rel_path,
                     )
                     .with_context(|| format!("delete symbols for removed file {rel_path}"))?;
                     let f_uid = nestweaver_schema::file_uid(r_uid, rel_path);
                     nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
                         .with_context(|| format!("delete removed File node {rel_path}"))?;
-                    if removed_count > 0 {
+                    if !removed.is_empty() {
                         tracing::debug!(
                             path = %rel_path,
-                            removed = removed_count,
+                            removed = removed.len(),
                             "deleted symbols for removed file"
                         );
                     }
+                    deleted_symbol_uids.extend(removed);
+                    deleted_symbol_files.push(rel_path.clone());
                     files_processed += 1;
                 }
             }
@@ -665,6 +674,15 @@ impl CodeWatcher {
         if let Err(error) = store.clear_contract_derivation_failed(r_uid) {
             tracing::warn!("clearing watcher contract derivation marker failed: {error}");
         }
+        // After the commit: a Replace deletes and re-inserts the same UIDs, so
+        // the pre-commit graph would report a whole saved file as dead.
+        crate::index::tombstone_deleted_symbol_embeddings_after_commit(
+            store,
+            r_uid,
+            &deleted_symbol_files,
+            &deleted_symbol_uids,
+            "code watcher batch",
+        );
         self.finalize_graph_publication_with_io(publication, epilogue_io)
             .map_err(anyhow::Error::from)?;
         Ok(WatchBatchOutcome::Published { files_processed })
@@ -915,12 +933,22 @@ fn prepare_code_file(
     })
 }
 
+/// Apply one prepared file, returning `(symbols_inserted, deleted_symbol_uids)`.
+///
+/// nw-204: the delete list matters as much as the insert count here. This is
+/// the watcher's per-save path, so it is the single most frequent producer of
+/// orphaned embedding vectors in a long-lived brain — every save that removes
+/// or renames a symbol leaves one behind. The list is RAW (a re-index rewrites
+/// most symbols under their original UIDs); the post-commit liveness filter in
+/// `GraphStore::tombstone_deleted_symbol_embeddings` decides what is actually
+/// dead.
 fn apply_prepared_code_file(
     txn: &nestweaver_store::DbConnection<'_>,
     r_uid: &str,
     prepared: &PreparedCodeFile,
-) -> Result<usize, anyhow::Error> {
-    nestweaver_store::GraphStore::delete_symbols_in_file_on(txn, r_uid, &prepared.rel_path)?;
+) -> Result<(usize, Vec<String>), anyhow::Error> {
+    let deleted_symbol_uids =
+        nestweaver_store::GraphStore::delete_symbols_in_file_on(txn, r_uid, &prepared.rel_path)?;
     let old_file_uid = nestweaver_schema::file_uid(r_uid, &prepared.rel_path);
     nestweaver_store::GraphStore::delete_file_node_on(txn, &old_file_uid)?;
     nestweaver_store::GraphStore::insert_file_on(txn, &prepared.file)?;
@@ -935,7 +963,7 @@ fn apply_prepared_code_file(
     if !prepared.resolved_edges.is_empty() {
         nestweaver_store::GraphStore::batch_insert_edges_on(txn, &prepared.resolved_edges)?;
     }
-    Ok(prepared.symbols.len())
+    Ok((prepared.symbols.len(), deleted_symbol_uids))
 }
 
 fn reject_recovered_publication(

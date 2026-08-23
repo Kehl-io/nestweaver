@@ -42,6 +42,9 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "brain_memory_consolidate",
     "set_extension",
     "prune_stale",
+    // Rewrites the embedding artifact through the daemon's write gate. A
+    // read-only endpoint must neither advertise nor dispatch it.
+    "compact_embeddings",
 ];
 
 const SERVER_NAME: &str = "nestweaver-brain";
@@ -1222,6 +1225,7 @@ mod tests {
                 "brain_memory_consolidate",
                 "set_extension",
                 "prune_stale",
+                "compact_embeddings",
             ]
         );
         let unique: std::collections::HashSet<_> = MUTATING_TOOLS.iter().collect();
@@ -1269,6 +1273,7 @@ mod tests {
                 "value": true,
             }),
             "prune_stale" => json!({}),
+            "compact_embeddings" => json!({ "dry_run": true }),
             other => panic!("missing schema-valid mutating fixture for {other}"),
         }
     }

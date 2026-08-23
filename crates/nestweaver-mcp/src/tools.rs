@@ -159,6 +159,7 @@ fn all_tool_schemas() -> Vec<Value> {
         tool_schema_brain_add_source(),
         tool_schema_brain_remove_source(),
         tool_schema_prune_stale(),
+        tool_schema_compact_embeddings(),
         tool_schema_cross_repo_contracts(),
         tool_schema_brain_impact(),
         tool_schema_brain_guide(),
@@ -489,7 +490,7 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
-    fn registry_contains_exactly_the_40_advertised_unique_names() {
+    fn registry_contains_exactly_the_41_advertised_unique_names() {
         let expected: BTreeSet<&str> = [
             "affected_tests",
             "backlinks",
@@ -512,6 +513,7 @@ mod tool_schema_validation_tests {
             "brain_topic_clusters",
             "bridge_nodes",
             "clusters",
+            "compact_embeddings",
             "contract_drift",
             "count_patterns",
             "cross_repo_contracts",
@@ -538,8 +540,8 @@ mod tool_schema_validation_tests {
         let schemas = all_tool_schemas();
         assert_eq!(
             schemas.len(),
-            40,
-            "registry must contain exactly 40 schemas"
+            41,
+            "registry must contain exactly 41 schemas"
         );
         let names: BTreeSet<&str> = schemas
             .iter()
@@ -1261,6 +1263,7 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         ("brain_add_source", "Status & maintenance"),
         ("brain_remove_source", "Status & maintenance"),
         ("prune_stale", "Status & maintenance"),
+        ("compact_embeddings", "Status & maintenance"),
         ("get_summary", "Status & maintenance"),
         ("read_symbols", "Code search"),
         ("regex_search", "Code search"),
@@ -1526,6 +1529,7 @@ fn dispatch_uncached(
         "brain_add_source" => tool_brain_add_source(store, args),
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
+        "compact_embeddings" => tool_compact_embeddings(store, args),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
         "brain_impact" => tool_brain_impact(store, args, cancel, visible),
         "brain_guide" => tool_brain_guide(store, args),
@@ -6390,6 +6394,65 @@ fn tool_prune_stale(store: &GraphStore) -> Result<Value, anyhow::Error> {
     {
         let _ = store;
         Err(anyhow!("prune_stale requires daemon mode"))
+    }
+}
+
+// ── 6d. compact_embeddings ──────────────────────────────────────────────────
+
+fn tool_schema_compact_embeddings() -> Value {
+    json!({
+        "name": "compact_embeddings",
+        "description": "Reclaim embedding vectors left behind by deleted graph nodes, then rewrite the sidecar without them. Does NOT load the embedding model and does NOT re-embed anything.\n\nGuidelines:\n- Two reasons to run it. Disk is the obvious one. The other is result quality: the vector scan skips tombstoned rows, so a dead vector that was never tombstoned is still SCORED, and one outranking a live result silently consumes a top-k slot in semantic search.\n- Ongoing tombstoning is automatic. Use this on a brain that accumulated orphans before that existed, or to force the reclaim rather than waiting for the ratio threshold.\n- Check `brain_status` first: its `index_tombstoned` / `index_stored` fields show whether there is anything to reclaim.\n\nReading the response:\n- `reclaimed` is the number of dead vectors removed; `stored_before` / `stored_after` and `bytes_before` / `bytes_after` bracket the change.\n- `dry_run: true` reports only what is ALREADY tombstoned. Orphans that were never tombstoned are invisible to a dry run and are found by the reconcile a real run performs, so a dry run is a FLOOR, not a total.\n\nLimitations:\n- Requires daemon mode: it is a write, and rewriting the artifact outside the daemon's write gate can race an index or watcher batch.\n- Reclaims nothing on a brain with no deletions, which is the correct outcome, not a failure.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Report occupancy without writing anything. Defaults to false.",
+                    "default": false
+                }
+            },
+            "required": [],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn tool_compact_embeddings(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    #[cfg(feature = "daemon")]
+    {
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let db_path = current_db_path(store)?;
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        let resp = rt
+            .block_on(
+                client.compact_embeddings(nestweaver_proto::CompactEmbeddingsRequest { dry_run }),
+            )
+            .map_err(|e| anyhow!("compact_embeddings RPC failed: {e}"))?;
+        let inner = resp.into_inner();
+        Ok(json!({
+            "dry_run": inner.dry_run,
+            "reclaimed": inner.reclaimed,
+            "live": inner.live_after,
+            "stored_before": inner.stored_before,
+            "stored_after": inner.stored_after,
+            "tombstoned_before": inner.tombstoned_before,
+            "bytes_before": inner.bytes_before,
+            "bytes_after": inner.bytes_after
+        }))
+    }
+    #[cfg(not(feature = "daemon"))]
+    {
+        let _ = (store, args);
+        Err(anyhow!("compact_embeddings requires daemon mode"))
     }
 }
 

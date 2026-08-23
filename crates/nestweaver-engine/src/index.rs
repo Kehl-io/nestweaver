@@ -3315,11 +3315,20 @@ where
         //     from seeing zero symbols while the CPU-heavy service-grouping work
         //     runs between delete and insert.
         let force_reindex = existing_repo.is_some() && files_unchanged == 0;
+        // nw-204: this whole-store re-index path deletes symbols too, and used
+        // to discard the fact entirely. Accumulate what it removed so the
+        // epilogue can tombstone the embeddings of symbols that do not come
+        // back — the same treatment the incremental and watcher paths get.
+        let mut reindex_deleted_uids: Vec<String> = Vec::new();
+        let mut reindex_deleted_files: Vec<String> = Vec::new();
         if !force_reindex && existing_repo.is_some() {
             // Incremental: only delete the specific files we're about to re-insert.
             for file in &all_files {
                 // Remove old symbols belonging to this file.
-                let _ = store.delete_symbols_in_file(&r_uid, &file.path);
+                if let Ok(removed) = store.delete_symbols_in_file(&r_uid, &file.path) {
+                    reindex_deleted_uids.extend(removed);
+                    reindex_deleted_files.push(file.path.clone());
+                }
                 // Remove old File node.
                 let _ = store.delete_file_node(&file.uid);
             }
@@ -3332,7 +3341,10 @@ where
             if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
                 for (f_uid, path) in &stored_files {
                     if !present_files.contains(path) {
-                        let _ = store.delete_symbols_in_file(&r_uid, path);
+                        if let Ok(removed) = store.delete_symbols_in_file(&r_uid, path) {
+                            reindex_deleted_uids.extend(removed);
+                            reindex_deleted_files.push(path.clone());
+                        }
                         let _ = store.delete_file_node(f_uid);
                         // nw-055 (P1b): a vanished file is a genuine deletion. Count
                         // it so the index-time PageRank guard fires on a delete-only
@@ -3427,6 +3439,19 @@ where
             symbols_written = all_symbols.len(),
             services_written = all_services.len(),
             "phase write complete"
+        );
+
+        // nw-204: the symbols are back in the graph now, so the liveness
+        // difference is meaningful — nearly every UID deleted above has just
+        // been re-inserted unchanged, and only the genuine disappearances
+        // should lose their vectors. Running this before the write would
+        // tombstone the entire repo.
+        tombstone_deleted_symbol_embeddings_after_commit(
+            store,
+            &r_uid,
+            &reindex_deleted_files,
+            &reindex_deleted_uids,
+            "full index over existing store",
         );
         drop(_phase_write_span);
 
@@ -4854,6 +4879,46 @@ pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
     })
 }
 
+/// nw-204: tombstone the embeddings of symbols an index run actually removed.
+///
+/// Every whole-graph delete path already reconciles the embedding index, but
+/// the ordinary index epilogue did not — and that is where most node deletions
+/// happen. An untombstoned vector is not merely wasted disk: the vector scan
+/// filters on the tombstone set, so a missing tombstone means the dead vector
+/// is SCORED and can consume a top-k slot a live result would have held.
+///
+/// Deliberately BEST-EFFORT. The graph mutation is already committed and
+/// durable at this point; failing the whole index over sidecar hygiene would
+/// turn a recoverable degradation into a hard failure. The periodic reconcile
+/// on the daemon is the designed backstop, and `brain_status` reports the
+/// resulting occupancy gap, so a failure here is visible rather than silent.
+pub(crate) fn tombstone_deleted_symbol_embeddings_after_commit(
+    store: &nestweaver_store::GraphStore,
+    repo_uid: &str,
+    touched_files: &[String],
+    deleted_symbol_uids: &[String],
+    operation: &str,
+) {
+    if deleted_symbol_uids.is_empty() {
+        return;
+    }
+    match store.tombstone_deleted_symbol_embeddings(repo_uid, touched_files, deleted_symbol_uids) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            removed,
+            candidates = deleted_symbol_uids.len(),
+            operation,
+            "tombstoned embeddings for deleted symbols"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            operation,
+            "embedding tombstoning failed; dead vectors stay searchable until the \
+             periodic reconcile repairs it (see `brain status` occupancy)"
+        ),
+    }
+}
+
 /// Result returned by `incremental_index`.
 #[derive(Debug, Default)]
 pub struct IncrementalResult {
@@ -4865,6 +4930,18 @@ pub struct IncrementalResult {
     pub skipped_files: Vec<SkippedFile>,
     pub symbols_added: usize,
     pub symbols_removed: usize,
+    /// UIDs of every Symbol deleted during the run — the RAW delete set, which
+    /// routinely contains UIDs the same run re-inserted unchanged (a modified
+    /// file has its symbols deleted and rewritten). nw-204: the epilogue
+    /// differences this against the post-commit graph to tombstone the
+    /// embeddings of symbols that really did disappear. Never tombstone from
+    /// this list directly.
+    pub deleted_symbol_uids: Vec<String>,
+    /// Every file path `deleted_symbol_uids` came from. Paired with that list
+    /// so the post-commit liveness check can be scoped to exactly what this run
+    /// touched instead of scanning the whole repo — the watcher runs this on
+    /// every save.
+    pub deleted_symbol_files: Vec<String>,
     pub fell_back_to_full: bool,
 }
 
@@ -5171,7 +5248,9 @@ fn incremental_index_with_name_and_io(
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(rel_str.to_string());
                 match prepared {
                     PreparedIncrementalOutcome::Ready(prepared) => {
                         let outcome = write_prepared_incremental_file_txn(
@@ -5197,7 +5276,9 @@ fn incremental_index_with_name_and_io(
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(rel_str.to_string());
 
                 let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
@@ -5208,8 +5289,8 @@ fn incremental_index_with_name_and_io(
                 let from_str = from.to_string_lossy();
                 let to_str = to.to_string_lossy();
 
-                // The old path's symbols are dead in BOTH cases, so delete them
-                // unconditionally rather than branching.
+                // nw-206: the old path's symbols are dead in BOTH cases, so
+                // delete them unconditionally rather than branching.
                 //
                 // `symbol_uid` hashes the file path, so a rename re-keys every
                 // symbol in the file — nothing at `from` can survive, whether
@@ -5217,8 +5298,8 @@ fn incremental_index_with_name_and_io(
                 // used to call `update_symbol_file_paths_on` instead, which
                 // carried the rows across by rewriting `file_path` while
                 // KEEPING the old-path-derived UID. Those rows were then
-                // deleted two statements below and re-created from the parse,
-                // so the re-key preserved nothing.
+                // deleted two statements later and re-created from the parse,
+                // so the re-key accomplished nothing.
                 //
                 // It was also actively harmful: its per-row CREATE
                 // (`insert_symbol_with_conn_static`) preceded the bulk
@@ -5232,13 +5313,15 @@ fn incremental_index_with_name_and_io(
                 // which failed the WHOLE incremental index for any repo where
                 // git reported a rename between parseable paths. DELETE-then-
                 // COPY is fine — the Modified arm has always done exactly that
-                // — so the per-row CREATE is the ingredient that breaks it. Do
-                // not reintroduce one on a table this transaction COPYs into.
+                // — so the per-row CREATE is the ingredient that breaks it.
+                // Do not reintroduce one on a table this transaction COPYs into.
                 let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                     &txn, &r_uid, &from_str,
                 )
                 .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(from_str.to_string());
 
                 // Re-key the File node: delete old, insert new.
                 let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
@@ -5251,7 +5334,9 @@ fn incremental_index_with_name_and_io(
                         &txn, &r_uid, &to_str,
                     )
                     .with_context(|| "delete_symbols_in_file (rename to)")?;
-                    result.symbols_removed += removed2;
+                    result.symbols_removed += removed2.len();
+                    result.deleted_symbol_uids.extend(removed2);
+                    result.deleted_symbol_files.push(to_str.to_string());
 
                     match prepared_files
                         .get(to_str.as_ref())
@@ -5311,6 +5396,17 @@ fn incremental_index_with_name_and_io(
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
     }
+
+    // AFTER the commit, never before: a modified file has its symbols deleted
+    // and re-inserted under the same UIDs, so the pre-commit graph would report
+    // the whole file as dead and tombstone live vectors.
+    tombstone_deleted_symbol_embeddings_after_commit(
+        &store,
+        &r_uid,
+        &result.deleted_symbol_files,
+        &result.deleted_symbol_uids,
+        "incremental index",
+    );
 
     finalize_committed_index_with_io(
         publication,
@@ -5443,7 +5539,9 @@ where
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(rel_str.to_string());
 
                 match prepared {
                     PreparedIncrementalOutcome::Ready(prepared) => {
@@ -5470,7 +5568,9 @@ where
                 let removed =
                     nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                         .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(rel_str.to_string());
 
                 let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
@@ -5481,8 +5581,8 @@ where
                 let from_str = from.to_string_lossy();
                 let to_str = to.to_string_lossy();
 
-                // The old path's symbols are dead in BOTH cases, so delete them
-                // unconditionally rather than branching.
+                // nw-206: the old path's symbols are dead in BOTH cases, so
+                // delete them unconditionally rather than branching.
                 //
                 // `symbol_uid` hashes the file path, so a rename re-keys every
                 // symbol in the file — nothing at `from` can survive, whether
@@ -5490,8 +5590,8 @@ where
                 // used to call `update_symbol_file_paths_on` instead, which
                 // carried the rows across by rewriting `file_path` while
                 // KEEPING the old-path-derived UID. Those rows were then
-                // deleted two statements below and re-created from the parse,
-                // so the re-key preserved nothing.
+                // deleted two statements later and re-created from the parse,
+                // so the re-key accomplished nothing.
                 //
                 // It was also actively harmful: its per-row CREATE
                 // (`insert_symbol_with_conn_static`) preceded the bulk
@@ -5505,13 +5605,15 @@ where
                 // which failed the WHOLE incremental index for any repo where
                 // git reported a rename between parseable paths. DELETE-then-
                 // COPY is fine — the Modified arm has always done exactly that
-                // — so the per-row CREATE is the ingredient that breaks it. Do
-                // not reintroduce one on a table this transaction COPYs into.
+                // — so the per-row CREATE is the ingredient that breaks it.
+                // Do not reintroduce one on a table this transaction COPYs into.
                 let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                     &txn, &r_uid, &from_str,
                 )
                 .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
-                result.symbols_removed += removed;
+                result.symbols_removed += removed.len();
+                result.deleted_symbol_uids.extend(removed);
+                result.deleted_symbol_files.push(from_str.to_string());
 
                 let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
@@ -5522,7 +5624,9 @@ where
                         &txn, &r_uid, &to_str,
                     )
                     .with_context(|| "delete_symbols_in_file (rename to)")?;
-                    result.symbols_removed += removed2;
+                    result.symbols_removed += removed2.len();
+                    result.deleted_symbol_uids.extend(removed2);
+                    result.deleted_symbol_files.push(to_str.to_string());
 
                     match prepared_files
                         .get(to_str.as_ref())
@@ -5580,6 +5684,15 @@ where
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
     }
+
+    // See the note at the sibling call site: this must follow the commit.
+    tombstone_deleted_symbol_embeddings_after_commit(
+        store,
+        &r_uid,
+        &result.deleted_symbol_files,
+        &result.deleted_symbol_uids,
+        "server incremental index",
+    );
 
     finalize_committed_index_with_io(
         publication,
@@ -9661,18 +9774,129 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
-    /// nw-206. A rename between two parseable paths must not fail the
-    /// incremental index. It used to fail ALL of it, on an ordinary `git mv`:
+    /// nw-204. The acceptance criterion that matters, and the one the original
+    /// backlog item did NOT have: assert on SEARCH RESULTS, not on the vector
+    /// count or the file size. Compaction alone satisfies "the count drops and
+    /// the file shrinks" while leaving the recall bug completely intact —
+    /// dead vectors stay scored, and one outranking a live result silently eats
+    /// a top-k slot.
     ///
-    ///   batch_insert_file_symbol_edges after.js: query error:
-    ///   COPY FILE_HAS_SYMBOL: Unable to find primary key value sym:…
+    /// Drives the INCREMENTAL INDEX path specifically. Repo removal already
+    /// reconciled correctly before this fix; the epilogue for an ordinary
+    /// re-index did not, which is where ~52% of a real brain's index went dead.
+    #[test]
+    fn incremental_index_stops_deleted_symbols_from_being_returned_by_vector_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("doomed.js"),
+            "function doomed() { return 'doomed'; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("survivor.js"),
+            "function survivor() { return 'survivor'; }",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo_url = "https://example.com/nw-204-incremental";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let doomed_uid = store
+            .symbols_in_file("doomed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        let survivor_uid = store
+            .symbols_in_file("survivor.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        // The doomed vector is the NEAREST neighbour of the probe, so if it is
+        // still scored after deletion it necessarily displaces the survivor.
+        assert!(store.add_embedding(&doomed_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&survivor_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            doomed_uid,
+            "precondition: the doomed vector must outrank the survivor"
+        );
+        drop(store);
+
+        fs::remove_file(repo.join("doomed.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete doomed.js"]);
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "this must exercise the incremental path, not a full re-index"
+        );
+        assert!(
+            result.symbols_removed > 0,
+            "precondition: the run must have deleted symbols"
+        );
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        // THE assertion. Not "the count dropped" — what a caller actually sees.
+        let hits = store.try_vector_search(&[1.0, 0.0], 2).unwrap();
+        assert!(
+            !hits.iter().any(|(uid, _)| uid == &doomed_uid),
+            "a deleted symbol must not be returned by vector search; got {hits:?}"
+        );
+        assert_eq!(
+            hits.first().map(|(uid, _)| uid.as_str()),
+            Some(survivor_uid.as_str()),
+            "the live symbol must take the top-k slot the dead vector held"
+        );
+        assert!(!store.has_embedding(&doomed_uid));
+        assert!(
+            store.has_embedding(&survivor_uid),
+            "an untouched file's embedding must survive the re-index"
+        );
+    }
+
+    /// nw-206. A parseable-to-parseable rename must not fail the incremental
+    /// index — it used to fail ALL of it, on an ordinary `git mv`.
     ///
-    /// The rename arms had no test at all, which is how two independent bugs
-    /// shipped behind each other on this path.
-    ///
-    /// Asserts on the resulting GRAPH STATE, not merely that the call returned
-    /// Ok: the first attempt at this fix stopped the error while leaving stale
-    /// symbols at the old path, turning a loud failure into silent bad data.
+    /// Also the nw-204 coverage for the rename arm that pushes `to_str` into
+    /// the touched-file set: the destination's re-inserted symbol must KEEP its
+    /// place in the graph while the old path's UID disappears. That arm was
+    /// untestable until the failure below was fixed.
     #[test]
     fn incremental_index_survives_a_rename_between_parseable_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -9722,12 +9946,20 @@ function hello(name) { return "Hello " + name; }
             .next()
             .unwrap()
             .uid;
+        // nw-204: give the pre-rename symbol a vector, so this also proves the
+        // dead UID stops being scored rather than merely leaving the graph.
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding(&old_uid, vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
         drop(store);
 
         fs::rename(repo.join("before.js"), repo.join("after.js")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "rename before.js -> after.js"]);
 
+        // THE assertion: this used to return
+        // `batch_insert_file_symbol_edges after.js: … Unable to find primary
+        // key value sym:…`, taking the entire incremental run with it.
         incremental_index(&repo, &db_path, "test", repo_url)
             .expect("a rename between parseable paths must not fail the incremental index");
 
@@ -9740,11 +9972,202 @@ function hello(name) { return "Hello " + name; }
         );
         assert_ne!(
             moved[0].uid, old_uid,
-            "a rename re-keys the symbol, so the new UID must differ from the old"
+            "a rename re-keys the symbol, so the new UID must differ"
         );
         assert!(
             store.symbols_in_file("before.js").unwrap().is_empty(),
             "no symbol may remain at the old path"
+        );
+        assert!(
+            !store.has_embedding(&old_uid),
+            "the pre-rename UID is dead and its vector must not survive"
+        );
+    }
+
+    /// nw-204. Covers the rename arm that deletes without re-inserting: when a
+    /// file is renamed to a NON-parseable path, its symbols are dropped for
+    /// good, so their vectors must stop being scored. This is the arm that
+    /// pushes `from_str` into the touched-file set.
+    ///
+    /// The sibling arm — a parseable-to-parseable rename, which pushes `to_str`
+    /// — is covered by `incremental_index_survives_a_rename_between_parseable_paths`
+    /// above, which was only possible once nw-206 was fixed.
+    #[test]
+    fn incremental_index_tombstones_symbols_a_rename_drops_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("doomed.js"),
+            "function doomed() { return 'doomed'; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("anchor.js"),
+            "function anchor() { return 'anchor'; }",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo_url = "https://example.com/nw-204-rename-drop";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let doomed_uid = store
+            .symbols_in_file("doomed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        let anchor_uid = store
+            .symbols_in_file("anchor.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        // The doomed vector is the probe's nearest neighbour, so a regression
+        // necessarily displaces the survivor rather than merely lingering.
+        assert!(store.add_embedding(&doomed_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&anchor_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            doomed_uid,
+            "precondition: the doomed vector must outrank the survivor"
+        );
+        drop(store);
+
+        // Rename to a non-parseable extension: the symbols are gone for good.
+        fs::rename(repo.join("doomed.js"), repo.join("doomed.txt")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "rename doomed.js -> doomed.txt"]);
+        incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let hits = store.try_vector_search(&[1.0, 0.0], 2).unwrap();
+        assert!(
+            !hits.iter().any(|(uid, _)| uid == &doomed_uid),
+            "a symbol dropped by a rename must not be returned by vector search; got {hits:?}"
+        );
+        assert_eq!(
+            hits.first().map(|(uid, _)| uid.as_str()),
+            Some(anchor_uid.as_str()),
+            "the live symbol must take the top-k slot the dead vector held"
+        );
+        assert!(
+            store.has_embedding(&anchor_uid),
+            "a rename elsewhere must not disturb an untouched file's embedding"
+        );
+    }
+
+    /// nw-204 regression guard. A modified file has ALL its symbols deleted and
+    /// then re-inserted under the same UIDs, so tombstoning the raw delete list
+    /// would drop live vectors — a far worse bug than the orphans being fixed.
+    /// This is the test that fails if the liveness difference is ever removed.
+    #[test]
+    fn incremental_index_keeps_embeddings_for_symbols_a_modified_file_reinserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("stable.js"),
+            "function kept() { return 1; }\nfunction doomed() { return 2; }\n",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo_url = "https://example.com/nw-204-reinsert";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let symbols = store.symbols_in_file("stable.js").unwrap();
+        let kept_uid = symbols
+            .iter()
+            .find(|s| s.name == "kept")
+            .expect("kept symbol")
+            .uid
+            .clone();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        assert!(store.add_embedding(&kept_uid, vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+        drop(store);
+
+        // Remove only `doomed`, leaving `kept` byte-identical. The re-index
+        // deletes both symbols and re-inserts `kept` under its original UID.
+        fs::write(repo.join("stable.js"), "function kept() { return 1; }\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "drop doomed"]);
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            result.deleted_symbol_uids.contains(&kept_uid),
+            "precondition: the raw delete list must include the re-inserted symbol, \
+             otherwise this test is not exercising the liveness filter"
+        );
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store.has_embedding(&kept_uid),
+            "a symbol the same run re-inserted must keep its embedding"
+        );
+        assert_eq!(
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            kept_uid,
+            "the surviving symbol must still be reachable by vector search"
         );
     }
 

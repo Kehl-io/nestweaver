@@ -16,8 +16,8 @@ pub mod write;
 pub mod zstd;
 
 pub use db::{
-    EmbeddingIndexReconciliation, EmbeddingSnapshotLease, EmbeddingSnapshotState, GraphStore,
-    IndexPublicationLease, PublicationIdentity,
+    EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
+    EmbeddingSnapshotState, GraphStore, IndexPublicationLease, PublicationIdentity,
 };
 pub use error::{CancelReason, StoreError};
 
@@ -1343,7 +1343,10 @@ mod tests {
         let deleted = store
             .delete_symbols_in_file("repo-del-1", "src/a.rs")
             .unwrap();
-        assert_eq!(deleted, 1);
+        // nw-204: the UIDs themselves are the contract now — the epilogue
+        // tombstones embeddings by them, so returning the right count with the
+        // wrong identities would be silently useless.
+        assert_eq!(deleted, vec!["sym-del-a".to_string()]);
 
         // sym-a should be gone; sym-b should remain.
         let err = store.lookup_symbol("sym-del-a").unwrap_err();

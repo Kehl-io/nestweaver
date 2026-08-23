@@ -1468,6 +1468,100 @@ impl EmbeddingIndex {
         entries
     }
 
+    /// Tombstone embeddings for a known-dead set of UIDs.
+    ///
+    /// The targeted counterpart to [`retain_uids`]: that function derives the
+    /// dead set by differencing against every live node, which costs a full
+    /// graph scan. Incremental indexing already KNOWS which UIDs it deleted, so
+    /// it pays only for what it removed. Both converge on the same tombstones;
+    /// this one is cheap enough to run on the watcher's per-save path.
+    ///
+    /// CALLERS MUST HAVE ALREADY EXCLUDED LIVE UIDS. An incremental re-index
+    /// deletes a file's symbols and re-inserts most of them under the SAME
+    /// UIDs, so passing the raw delete list would tombstone vectors for symbols
+    /// that still exist — silently deleting live embeddings, which is worse
+    /// than the orphans this exists to remove. See
+    /// `GraphStore::tombstone_deleted_symbol_embeddings`, which applies that
+    /// filter against the post-commit graph before calling here.
+    ///
+    /// Returns the number of vectors actually removed.
+    ///
+    /// [`retain_uids`]: EmbeddingIndex::retain_uids
+    pub(crate) fn tombstone_uids(&mut self, dead_uids: &[String]) -> usize {
+        let before = self.len();
+        for uid in dead_uids {
+            let in_overlay = self.embeddings.remove(uid).is_some();
+            // `base.contains` stays true for a UID ALREADY tombstoned — the row
+            // is still physically present, just hidden. Without the second
+            // clause a repeat tombstone (a file deleted, recreated, deleted
+            // again before any embed pass reaches it) re-journals a Delete that
+            // removes nothing, inflating the very journal length that triggers
+            // a full base rewrite.
+            let in_base = self
+                .base
+                .as_ref()
+                .is_some_and(|base| base.contains(uid) && !self.deleted_base_uids.contains(uid));
+            if in_base {
+                self.deleted_base_uids.insert(uid.clone());
+            }
+            // Only journal a delta for a UID the index actually held. A caller
+            // passing UIDs that were never embedded (a symbol deleted before an
+            // embed pass ever reached it) must not inflate the journal, which
+            // is what drives compaction.
+            if in_overlay || in_base {
+                self.pending_deltas
+                    .push(EmbeddingDelta::Delete { uid: uid.clone() });
+            }
+        }
+        before - self.len()
+    }
+
+    /// Pending journal deltas not yet flushed. Test-visible so the journaling
+    /// contract of `tombstone_uids` can be asserted directly rather than
+    /// inferred from file sizes.
+    #[cfg(test)]
+    pub(crate) fn pending_delta_count(&self) -> usize {
+        self.pending_deltas.len()
+    }
+
+    /// Number of base rows currently hidden by tombstones. Drives
+    /// ratio-triggered compaction and status reporting: unlike the journal
+    /// length, it survives compaction and reflects real reclaimable bytes.
+    pub fn tombstoned_len(&self) -> usize {
+        self.deleted_base_uids.len()
+    }
+
+    /// `(live, tombstoned, stored)` without an O(base) scan.
+    ///
+    /// [`len`] iterates every base row to exclude tombstoned and
+    /// overlay-shadowed UIDs, which is fine for the occasional call it was
+    /// written for but NOT for `brain status`, which is polled and would
+    /// otherwise hold this mutex — the one `vector_search_cancellable` needs —
+    /// across a 389k-row scan on a real brain.
+    ///
+    /// The arithmetic instead: the base contributes `rows.len()` physical rows,
+    /// of which `deleted_base_uids` are hidden. The overlay contributes only
+    /// its UIDs that are NOT already base rows, since a shadowing upsert
+    /// replaces a row rather than adding one — and that count is O(overlay),
+    /// which is bounded by what a single embed pass has written since the last
+    /// compaction, not by corpus size.
+    ///
+    /// [`len`]: EmbeddingIndex::len
+    pub(crate) fn occupancy(&self) -> (usize, usize, usize) {
+        let base_rows = self.base.as_ref().map_or(0, |base| base.rows.len());
+        let tombstoned = self.deleted_base_uids.len();
+        let overlay_only = match &self.base {
+            Some(base) => self
+                .embeddings
+                .keys()
+                .filter(|uid| !base.contains(uid))
+                .count(),
+            None => self.embeddings.len(),
+        };
+        let stored = base_rows + overlay_only;
+        (stored - tombstoned, tombstoned, stored)
+    }
+
     /// Retain only embeddings whose graph nodes still exist.
     ///
     /// Returns the number of removed vectors so callers can report and test
@@ -2473,6 +2567,46 @@ mod tests {
         assert!(
             error.to_string().contains("checksum mismatch"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// nw-204. `tombstone_uids` must hide base rows, drop overlay rows, and
+    /// journal a delta ONLY for UIDs the index actually held — a symbol deleted
+    /// before any embed pass reached it must not inflate the journal, because
+    /// journal length is what drives compaction.
+    #[test]
+    fn tombstone_uids_hides_base_rows_without_journaling_unknown_uids() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.bin");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 2);
+        let mut original = EmbeddingIndex::new();
+        for (uid, vector) in [("a", vec![1.0, 0.0]), ("b", vec![0.0, 1.0])] {
+            assert!(original.add_with_pipeline(uid, vector, &pipeline, false));
+        }
+        original
+            .save_binary_v2(&base_path, &identity, 1, &pipeline)
+            .unwrap();
+
+        let mut index = EmbeddingIndex::load_binary_v2(&base_path).unwrap();
+        assert!(index.add_with_pipeline("c", vec![0.5, 0.5], &pipeline, false));
+        let deltas_before = index.pending_delta_count();
+
+        // "a" is in the mapped base, "c" is overlay-only, "ghost" was never
+        // embedded at all.
+        let removed =
+            index.tombstone_uids(&["a".to_string(), "c".to_string(), "ghost".to_string()]);
+
+        assert_eq!(removed, 2, "only the two held vectors count as removed");
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.tombstoned_len(), 1, "only 'a' came from the base");
+        assert!(index.get("a").is_none());
+        assert!(index.get("c").is_none());
+        assert_eq!(index.get("b"), Some(vec![0.0, 1.0]));
+        assert_eq!(
+            index.pending_delta_count() - deltas_before,
+            2,
+            "the never-embedded UID must not produce a journal delta"
         );
     }
 

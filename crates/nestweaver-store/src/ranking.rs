@@ -1970,7 +1970,8 @@ mod tests {
         assert_eq!(
             store
                 .delete_symbols_in_file("repo-1", "src/lib.rs")
-                .unwrap(),
+                .unwrap()
+                .len(),
             1
         );
         store
