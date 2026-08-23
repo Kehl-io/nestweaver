@@ -778,6 +778,7 @@ pub struct RepoConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaExtensions {
     pub extra_node_properties: Option<HashMap<String, HashMap<String, String>>>,
 }
@@ -1404,6 +1405,7 @@ fn validate_and_normalize_seed_resolution(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// A typo in a config key used to be SILENTLY ACCEPTED. `with_trigams`
     /// instead of `with_trigrams` left trigram refresh off while
@@ -1429,7 +1431,6 @@ mod tests {
             toml::from_str("with_trigrams = true\n").expect("the correct spelling must parse");
         assert!(parsed.with_trigrams);
     }
-    use super::*;
 
     const MINIMAL_TOML: &str = r#"
 instance_id = "test-instance"

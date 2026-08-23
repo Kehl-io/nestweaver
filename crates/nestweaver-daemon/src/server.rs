@@ -1057,9 +1057,6 @@ fn build_daemon_permission_source(
 
 /// Resolve the empty RPC sentinel to the daemon's configured graph-data
 /// identity, then validate the effective ID at the trust boundary.
-/// Resolve the instance a write lands in: an explicit `requested` wins, and an
-/// empty one defers to the daemon's `configured` identity.
-///
 /// KNOWN GAP (validated 2026-08-23, filed as nw-207): "explicit" cannot be
 /// distinguished from "a client's fallback". The MCP `brain_add_source` path
 /// resolves its OWN config and sends the literal `"default"` when it has none —
@@ -15027,11 +15024,6 @@ mod startup_helper_tests {
         assert!(!extensions.contains_key(&file_uid));
     }
 
-    /// The gRPC mutating-tool gate MUST reference the single shared
-    /// `MUTATING_TOOLS` list defined in `nestweaver-mcp`, not a private copy
-    /// that can drift from the HTTP/MCP gate. This asserts the daemon reads the
-    /// shared const (it won't compile if the daemon reintroduces a private one)
-    /// and pins the known set so adding a mutating tool is a deliberate edit.
     /// nw-207 reproduction. A client-supplied instance id OVERRIDES the
     /// daemon's configured one, and the MCP add-source path supplies the
     /// literal "default" whenever the MCP process itself has no config.
@@ -15052,13 +15044,18 @@ mod startup_helper_tests {
 
         // Empty correctly defers — which is why "send empty" looks like the
         // fix until you notice a config-less daemon's id is a db-path hash,
-        // not \"default\".
+        // not "default".
         assert_eq!(
             resolve_effective_instance_id("", "kory-brain").unwrap(),
             "kory-brain"
         );
     }
 
+    /// The gRPC mutating-tool gate MUST reference the single shared
+    /// `MUTATING_TOOLS` list defined in `nestweaver-mcp`, not a private copy
+    /// that can drift from the HTTP/MCP gate. This asserts the daemon reads the
+    /// shared const (it won't compile if the daemon reintroduces a private one)
+    /// and pins the known set so adding a mutating tool is a deliberate edit.
     #[test]
     fn mutating_tools_gate_uses_shared_const() {
         assert_eq!(

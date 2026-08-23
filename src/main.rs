@@ -26211,6 +26211,73 @@ credential_method = "gh"
 
     /// nw-087: a nonexistent --db must fail with the db_not_found
     /// diagnostic (exit 1), not silently create/spawn anything.
+    /// Supplying a config for an UNRELATED reason must not move a command's
+    /// documented default.
+    ///
+    /// `[limits] default_result_limit` used to be a `usize` with a serde
+    /// default, so ANY parsed config yielded `Some(50)` and
+    /// `nestweaver search --config <anything>` silently returned 50 results
+    /// where the help text promises 10. The operator never opted in; the serde
+    /// default did it for them.
+    ///
+    /// This is the regression the `Option` change prevents, and it had no test
+    /// on the CLI side at all.
+    #[test]
+    fn an_unrelated_config_does_not_move_the_documented_search_default() {
+        // A real config that says NOTHING about limits — the state someone is
+        // in when they pass `--config` for an unrelated reason.
+        const NO_LIMITS_TOML: &str = r#"
+instance_id = "limit-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+        let unrelated = nestweaver_engine::InstanceConfig::from_toml_str(NO_LIMITS_TOML)
+            .expect("a config without a [limits] section must parse");
+        assert_eq!(
+            unrelated.limits.default_result_limit, None,
+            "precondition: an absent [limits] must stay None, not become Some(50) — \
+             if this fails the Option change has regressed and the rest is meaningless"
+        );
+        assert_eq!(
+            resolve_limit(None, Some(&unrelated), 10),
+            10,
+            "a config that does not set a limit must leave the builtin default alone"
+        );
+
+        // An operator who DOES set it is honoured.
+        let configured = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            "{NO_LIMITS_TOML}\n[limits]\ndefault_result_limit = 75\n"
+        ))
+        .expect("an explicit limit must parse");
+        assert_eq!(configured.limits.default_result_limit, Some(75));
+        assert_eq!(resolve_limit(None, Some(&configured), 10), 75);
+
+        // An explicit flag beats both.
+        assert_eq!(resolve_limit(Some(3), Some(&configured), 10), 3);
+        assert_eq!(resolve_limit(Some(3), None, 10), 3);
+
+        // No config at all still yields the builtin.
+        assert_eq!(resolve_limit(None, None, 10), 10);
+
+        // The same call with a DIFFERENT builtin proves the builtin is what
+        // flows through, not a shared constant.
+        assert_eq!(resolve_limit(None, Some(&unrelated), 20), 20);
+    }
+
     #[test]
     fn require_existing_db_fails_db_not_found_on_missing_db() {
         let dir = tempfile::tempdir().unwrap();

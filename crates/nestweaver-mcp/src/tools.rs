@@ -3724,8 +3724,7 @@ fn tool_schema_brain_search() -> Value {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results PER KIND, not in total. Default 20. Notes and code symbols are capped separately, so a query matching both can return up to 2x this value — budget accordingly and read returned_matches for the true count. Set lower for focused lookups, higher for broad discovery.",
-                    "default": 20,
+                    "description": "Maximum results PER KIND, not in total. Defaults to the configured `[limits] default_result_limit`, or 20 when none is set. Notes and code symbols are capped separately, so a query matching both can return up to 2x this value — budget accordingly and read returned_matches for the true count. Set lower for focused lookups, higher for broad discovery.",
                     "minimum": 1,
                     "maximum": 1000
                 },
@@ -7022,7 +7021,12 @@ fn tool_schema_flow_trace() -> Value {
                     "description": "\"concise\" returns function name chain only; \"detailed\" (default) adds file paths, UIDs, and depth at each node."
                 }
             },
-            "required": ["symbol"]
+            "required": ["symbol"],
+            // A mistyped argument name must fail loudly rather than be dropped.
+            // Without this, `max_dpeth: 100` validated, the handler silently
+            // used 10, and the caller believed they had set 100 — the same
+            // silent-typo failure the config half of this change removes.
+            "additionalProperties": false
         }
     })
 }

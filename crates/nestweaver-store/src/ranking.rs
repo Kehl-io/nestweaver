@@ -111,6 +111,12 @@ pub const SEED_PATH_FACTOR_MAX: f64 = 10.0;
 /// `*.test.ts`, etc.). Tune per-project by adding to
 /// `[seed_resolution].path_deboost` in `nestweaver-instance.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Deserialized from `[seed_resolution]` in instance.toml. Denies unknown keys
+// for the same reason every struct in `config.rs` does — a typo'd key is
+// otherwise dropped and the operator's tuning silently never applies. This one
+// lives in `nestweaver-store` rather than `config.rs`, which is exactly why a
+// sweep of that file missed it.
+#[serde(deny_unknown_fields)]
 pub struct SeedResolutionConfig {
     /// Multiplicative factor applied to a seed candidate's match score
     /// when its file_path matches the given prefix or suffix. Factor < 1.0
@@ -128,6 +134,7 @@ pub struct SeedResolutionConfig {
 /// Exactly one of `prefix` / `suffix` must be set. Validation in the engine
 /// layer rejects rules that violate this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathDeboostRule {
     /// Match if the (`/`-prepended, lowercased) file_path contains this
     /// substring. Mutually exclusive with `suffix`.
