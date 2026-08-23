@@ -457,6 +457,26 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
         return canonical_parent.join(file_name);
     }
 
+    // A BARE relative path — `nestweaver.lbug`, no directory component — lands
+    // here and used to be returned unchanged, hashing to a DIFFERENT instance
+    // id than the same database gets once the file exists:
+    //
+    //   before creation: canonicalize fails; `parent()` is Some(""), which
+    //                    also fails to canonicalize -> id = hash("nestweaver.lbug")
+    //   after creation:  canonicalize succeeds     -> id = hash("/cwd/nestweaver.lbug")
+    //
+    // So the first `daemon start` in a fresh directory bound one identity, and
+    // every command after the database existed looked for another — leaving a
+    // daemon holding the write lock that the CLI could no longer address by
+    // name. Joining the cwd makes the pre-creation answer agree with the
+    // post-creation one, which is what `database_path_fingerprint` already did
+    // for the same reason; this function simply never got the same treatment.
+    if db_path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(db_path);
+    }
+
     db_path.to_path_buf()
 }
 
@@ -2648,6 +2668,35 @@ mod tests {
             Some(expected.as_str())
         );
         assert!(!selected.exists(), "the probe must not require the graph");
+    }
+
+    /// A bare relative db path must resolve to ONE instance id, before and
+    /// after the database file exists.
+    ///
+    /// It did not. `canonicalize` fails on a path that does not exist yet, and
+    /// for a BARE filename `parent()` is `Some("")`, which also fails — so the
+    /// path was returned relative and hashed to a different id than the same
+    /// database gets once created. The first `daemon start` in a fresh
+    /// directory therefore bound one identity while every later command looked
+    /// for another, leaving a daemon holding the write lock that the CLI could
+    /// no longer address.
+    #[test]
+    fn bare_relative_db_path_identity_is_stable_across_creation() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let bare = Path::new("nestweaver.lbug");
+        let before = instance_id_from_db_path(bare);
+        std::fs::write(bare, b"x").unwrap();
+        let after = instance_id_from_db_path(bare);
+
+        std::env::set_current_dir(&original).unwrap();
+        assert_eq!(
+            before, after,
+            "a bare relative db path must resolve to ONE instance id before and \
+             after the file is created; got {before} then {after}"
+        );
     }
 
     #[test]

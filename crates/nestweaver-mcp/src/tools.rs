@@ -730,6 +730,10 @@ mod tool_schema_validation_tests {
             ("brain_impact", json!({ "symbol": "s", "depth": 0 })),
             ("brain_impact", json!({ "symbol": "s", "depth": 16 })),
             ("brain_impact", json!({ "symbol": "s", "limit": -2 })),
+            // flow_trace declared NO bounds while the CLI enforced 1..=15, so
+            // the MCP accepted depth 0 and depth 1000.
+            ("flow_trace", json!({ "symbol": "s", "max_depth": 0 })),
+            ("flow_trace", json!({ "symbol": "s", "max_depth": 16 })),
             (
                 "blast_radius",
                 json!({ "changed_files": ["a.rs"], "max_depth": 0 }),
@@ -786,6 +790,37 @@ mod tool_schema_validation_tests {
         ];
         for (name, args) in valid {
             assert_valid(name, args);
+        }
+    }
+
+    /// Structurally invalid scalars must be rejected at DISPATCH, not silently
+    /// defaulted in a handler.
+    ///
+    /// Written to check a report that "MCP core methods accept structurally
+    /// invalid scalar parameters" — they do not. Every handler reads scalars
+    /// with `as_u64()`/`as_str()`, which return `None` for a wrong-typed value
+    /// and fall back to a default, so the guarantee rests ENTIRELY on schema
+    /// validation running first. Nothing pinned that, which is what made the
+    /// report plausible. This pins it: if validation is ever bypassed or
+    /// loosened, those 34 silent fallbacks become real.
+    #[test]
+    fn structurally_invalid_scalars_are_rejected_at_dispatch() {
+        for (name, args) in [
+            // A quoted number where an integer is declared.
+            ("brain_search", json!({ "query": "x", "limit": "50" })),
+            ("flow_trace", json!({ "symbol": "s", "max_depth": "3" })),
+            // A bool where an integer is declared.
+            ("brain_impact", json!({ "symbol": "s", "depth": true })),
+            // A number where a string is declared.
+            ("brain_search", json!({ "query": 42 })),
+            // A fractional value for an integer field.
+            ("brain_search", json!({ "query": "x", "limit": 2.5 })),
+        ] {
+            let result = validate_tool_arguments(name, &args);
+            assert!(
+                result.is_err(),
+                "{name} accepted a structurally invalid scalar: {args}"
+            );
         }
     }
 
@@ -3761,7 +3796,12 @@ fn tool_brain_search(
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(20)
+        // Honour `[limits] default_result_limit` when the operator set one.
+        // This hardcoded 20 while every paginated sibling consulted the config,
+        // so a configured limit was silently ignored by the one tool most
+        // likely to be tuned. 20 stays the DOCUMENTED default when nothing is
+        // configured, matching this tool's own schema.
+        .unwrap_or_else(|| configured_result_limit_or(20))
         // Schema validation rejects out-of-range MCP calls; keep a defensive
         // clamp for direct unit/internal calls that bypass dispatch validation.
         .clamp(1, BRAIN_SEARCH_MAX_PER_KIND);
@@ -6970,7 +7010,9 @@ fn tool_schema_flow_trace() -> Value {
                 "symbol": { "type": "string", "description": "Symbol name (e.g. \"handleRequest\") or full UID (e.g. \"sym:repo:...:hash:42\") to trace from." },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Maximum traversal depth. Default 10. Higher values trace deeper call chains but produce larger results.",
+                    "minimum": 1,
+                    "maximum": 15,
+                    "description": "Maximum traversal depth (1-15). Default 10. Matches the CLI's --max-depth range; values outside it are rejected rather than silently accepted.",
                     "default": 10
                 },
                 "response_format": {
@@ -6998,7 +7040,13 @@ fn tool_flow_trace(
         .get("max_depth")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(10);
+        .unwrap_or(10)
+        // The schema now declares 1..=15 (the CLI's `--max-depth` range, which
+        // this tool accepted no equivalent of). Schema validation rejects
+        // out-of-range MCP calls; this defensive clamp covers direct
+        // unit/internal calls that bypass dispatch validation, matching
+        // brain_search.
+        .clamp(1, 15);
     let concise = is_concise(&args);
 
     let resolved_uid = resolve_symbol_uid(store, symbol)?;
@@ -9436,9 +9484,18 @@ pub(crate) fn current_instance_config() -> Option<std::sync::Arc<nestweaver_engi
 /// `[limits]` section, falling back to the compile-time constant if no
 /// instance config is installed for this dispatch context.
 fn configured_result_limit() -> usize {
+    configured_result_limit_or(DEFAULT_RESULT_LIMIT)
+}
+
+/// The operator's configured result limit, or `builtin` when they set none.
+///
+/// Tools document different defaults on purpose — `brain_search` says 20 while
+/// the paginated tools say 50 — so each passes its own rather than inheriting a
+/// shared constant it never advertised.
+fn configured_result_limit_or(builtin: usize) -> usize {
     current_instance_config()
-        .map(|cfg| cfg.limits.default_result_limit)
-        .unwrap_or(DEFAULT_RESULT_LIMIT)
+        .and_then(|cfg| cfg.limits.default_result_limit)
+        .unwrap_or(builtin)
 }
 
 fn configured_index_limits() -> nestweaver_engine::index_limits::IndexLimits {
@@ -12336,7 +12393,7 @@ mod configured_limit_tests {
     #[test]
     fn configured_result_limit_reads_from_instance_config() {
         let cfg = test_config(7);
-        assert_eq!(cfg.limits.default_result_limit, 7);
+        assert_eq!(cfg.limits.default_result_limit, Some(7));
         set_current_instance_config(Some(std::sync::Arc::new(cfg)));
         assert_eq!(configured_result_limit(), 7);
         set_current_instance_config(None);

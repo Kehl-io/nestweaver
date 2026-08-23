@@ -5394,8 +5394,14 @@ fn resolve_limit(
     config: Option<&nestweaver_engine::InstanceConfig>,
     builtin_default: usize,
 ) -> usize {
+    // `and_then`, not `map`: a parsed config no longer implies a configured
+    // limit. `default_result_limit` used to be a `usize` with a serde default,
+    // so ANY config produced `Some(50)` and merely passing `--config` for an
+    // unrelated reason silently changed this command's documented default of
+    // 10 to 50. It is now `Option`, so an unset value falls through to the
+    // builtin the help text advertises.
     explicit
-        .or_else(|| config.map(|c| c.limits.default_result_limit))
+        .or_else(|| config.and_then(|c| c.limits.default_result_limit))
         .unwrap_or(builtin_default)
 }
 
