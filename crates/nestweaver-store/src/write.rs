@@ -3800,53 +3800,67 @@ impl GraphStore {
     /// `repo_uid` AND `file_path`). Uses `DETACH DELETE` so all incident edges
     /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, USES, ACCESSES, MEMBER_OF,
     /// FILE_HAS_SYMBOL, CROSS_REPO_LINK, REFERENCES_CODE_*) are automatically
-    /// removed. Returns the count of deleted symbols.
+    /// removed. Returns the UIDs of the deleted symbols.
     pub fn delete_symbols_in_file(
         &self,
         repo_uid: &str,
         file_path: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<Vec<String>, StoreError> {
         let conn = self.conn()?;
         Self::delete_symbols_in_file_on(&conn, repo_uid, file_path)
     }
 
-    /// Delete symbols in a file using an externally-provided connection (for transaction batching).
+    /// Delete symbols in a file using an externally-provided connection (for
+    /// transaction batching), returning the UIDs that were removed.
+    ///
+    /// nw-204: this used to return only a count, which is why the index
+    /// epilogue could not tombstone the embeddings of symbols it deleted —
+    /// there was nothing to tombstone them BY. The UIDs are read in the same
+    /// pass that previously counted them, so this costs no extra query; the
+    /// result is bounded by the number of symbols in one file.
+    ///
+    /// The returned list is the RAW delete set and routinely contains UIDs that
+    /// a re-index immediately re-inserts unchanged. It is not a dead set. See
+    /// `GraphStore::tombstone_deleted_symbol_embeddings`, which differences it
+    /// against the post-commit graph before anything is tombstoned.
     pub fn delete_symbols_in_file_on(
         conn: &lbug::Connection<'_>,
         repo_uid: &str,
         file_path: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<Vec<String>, StoreError> {
         // LadybugDB does not support parameterized compound WHERE clauses.
         // Sanitize user-derived values by escaping single quotes.
         let safe_repo_uid = repo_uid.replace('\'', "\\'");
         let safe_file_path = file_path.replace('\'', "\\'");
 
-        // Count first so we can report how many were deleted.
-        let count: usize = {
+        // Read the UIDs first, in the query that used to only count them.
+        let uids: Vec<String> = {
             let rows = conn
                 .query(&format!(
-                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN count(s)"
+                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN s.uid"
                 ))
-                .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
+                .map_err(|e| StoreError::Query(format!("list symbols in file: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
+                    lbug::Value::String(uid) => Some(uid.clone()),
                     _ => None,
                 })
             })
-            .next()
-            .unwrap_or(0)
+            .collect()
         };
 
-        if count > 0 {
-            // Single bulk DETACH DELETE instead of per-UID queries.
-            conn.query(&format!(
-                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' DETACH DELETE s"
-            ))
-            .map_err(|e| StoreError::Query(format!("delete symbols in file: {e}")))?;
-        }
+        // UNCONDITIONAL, deliberately. This used to run under `count > 0` from a
+        // `RETURN count(s)`; it now runs regardless of how many UIDs parsed out
+        // of the row set above. Gating the delete on the parsed list would make
+        // deletion depend on every row decoding as a String — a row that did
+        // not would silently leave symbols behind, turning a decode quirk into
+        // a data bug. The statement is a no-op when nothing matches.
+        conn.query(&format!(
+            "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' DETACH DELETE s"
+        ))
+        .map_err(|e| StoreError::Query(format!("delete symbols in file: {e}")))?;
 
-        Ok(count)
+        Ok(uids)
     }
 
     /// Delete all resolved (semantic) edges originating from symbols in a
@@ -3963,22 +3977,16 @@ impl GraphStore {
         )
     }
 
-    // `update_symbol_file_paths` / `_on` were REMOVED here, not merely orphaned.
-    // They rewrote a Symbol's `file_path` while KEEPING its UID — but
-    // `symbol_uid` hashes the file path, so every row they produced had a UID
-    // that disagreed with its own `file_path`, an inconsistency nothing
-    // downstream expected. Their only callers were the incremental index's two
-    // rename arms, where the rows were deleted two statements later and
+    // nw-206: `update_symbol_file_paths` / `_on` were REMOVED here, not merely
+    // orphaned. They rewrote a Symbol's `file_path` while KEEPING its UID —
+    // but `symbol_uid` hashes the file path, so every row they produced had a
+    // UID that disagreed with its own `file_path`, an inconsistency nothing
+    // downstream expected. Their only caller was the incremental index's
+    // rename arm, where the rows were deleted two statements later and
     // re-created from the parse, so they preserved nothing; and their per-row
     // CREATE poisoned the bulk `COPY Symbol` that followed in the same
-    // transaction, failing the whole incremental index on any parseable rename.
-    // A rename re-keys symbols: delete and re-insert them.
-    //
-    // They also carried a second, independent bug that this removal moots: the
-    // RETURN list omitted `s.end_line` while `row_to_symbol` reads by POSITION,
-    // shifting every column from index 6 on, so the parse hit `signature` where
-    // it expected an Int64 and the function errored for any symbol that had
-    // one. That error is what shielded the COPY failure above from view.
+    // transaction, failing the whole incremental index on any parseable
+    // rename. A rename re-keys symbols; delete and re-insert them.
 
     /// Update the `indexed_sha` field of a Repo node.
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {

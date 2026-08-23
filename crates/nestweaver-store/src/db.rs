@@ -7,6 +7,39 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
 
+/// Dead fraction at which the embedding base is worth rewriting. 20% matches
+/// the threshold shape used by segment-merge reclaim in Lucene and by Milvus's
+/// automatic compaction.
+const EMBEDDING_COMPACT_TOMBSTONE_RATIO: f64 = 0.20;
+
+/// Absolute floor for ratio-triggered compaction. Below this the ratio is noisy
+/// and the reclaim is not worth a rewrite.
+const EMBEDDING_COMPACT_MIN_TOMBSTONES: usize = 1_000;
+
+/// Occupancy of the embedding sidecar: what a query can match, what is
+/// tombstoned but still on disk, and what the base physically stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingIndexOccupancy {
+    /// Vectors a query can actually match.
+    pub live: usize,
+    /// Base rows hidden by tombstones — reclaimable by compaction.
+    pub tombstoned: usize,
+    /// `live + tombstoned`: what the artifact physically holds.
+    pub stored: usize,
+}
+
+impl EmbeddingIndexOccupancy {
+    /// Fraction of stored vectors that are dead, in `0.0..=1.0`. Zero for an
+    /// empty index — an index with nothing in it is not "100% dead", and
+    /// reporting it that way would trip every ratio threshold on a fresh brain.
+    pub fn tombstone_ratio(&self) -> f64 {
+        if self.stored == 0 {
+            return 0.0;
+        }
+        self.tombstoned as f64 / self.stored as f64
+    }
+}
+
 /// Typed results for the two durable embedding reconciliation sub-stages.
 /// Legacy retirement is not attempted until canonical persistence succeeds.
 #[derive(Debug)]
@@ -1836,7 +1869,13 @@ impl GraphStore {
             .embedding_index
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if index.is_empty() {
+        // NOT `is_empty()`, which is `len() == 0` and counts only LIVE vectors.
+        // An index whose rows are ALL tombstoned reports itself empty, so the
+        // old guard returned early on the MAXIMUM-reclaim case and left every
+        // dead row on disk permanently — a brain that removed all its repos
+        // could never reclaim its sidecar. Compaction has work whenever there
+        // is anything to write or anything to drop.
+        if index.is_empty() && index.tombstoned_len() == 0 {
             return Ok(());
         }
         let Some(path) = self.embedding_sidecar_path() else {
@@ -1950,6 +1989,126 @@ impl GraphStore {
             _guard: idx,
         })
     }
+    /// Tombstone embeddings for symbols an index run deleted from one repo,
+    /// and persist the result.
+    ///
+    /// This is the targeted counterpart to [`reconcile_embedding_index`], and
+    /// the fix for nw-204: every whole-graph delete path (repo removal, prune,
+    /// purge, merge, vault removal) already reconciles, but the ordinary
+    /// index-publication epilogue did not — and that is where the vast
+    /// majority of node deletions actually happen (a file deleted, a file
+    /// re-parsed into fewer symbols, a scope or size-cap change). Untombstoned
+    /// vectors are not merely wasted disk: `vector_search_cancellable` filters
+    /// on `deleted_base_uids`, so a UID missing from that set is SCORED, and a
+    /// dead vector outranking a live one silently consumes a top-k slot.
+    ///
+    /// `deleted_uids` is the raw delete list, which is deliberately allowed to
+    /// contain UIDs that are still live: an incremental re-index deletes a
+    /// file's symbols and re-inserts most of them under the same UIDs. This
+    /// function re-reads the live symbols of `touched_files` from the
+    /// POST-COMMIT graph and tombstones only the difference, so callers cannot
+    /// cause live vectors to be dropped by passing the delete list verbatim.
+    /// Call it AFTER the index transaction commits; calling it mid-transaction
+    /// would see the deletions but not the re-inserts and would tombstone the
+    /// whole file.
+    ///
+    /// `touched_files` MUST cover every file `deleted_uids` came from, or a
+    /// still-live symbol in an unlisted file would be read as dead. Scoping to
+    /// those files rather than the whole repo is what keeps this affordable on
+    /// the watcher's per-save path; see `symbol_uids_for_files`.
+    ///
+    /// Returns the number of vectors removed.
+    ///
+    /// [`reconcile_embedding_index`]: Self::reconcile_embedding_index
+    pub fn tombstone_deleted_symbol_embeddings(
+        &self,
+        repo_uid: &str,
+        touched_files: &[String],
+        deleted_uids: &[String],
+    ) -> Result<usize, StoreError> {
+        if deleted_uids.is_empty() {
+            return Ok(0);
+        }
+        let live = self.symbol_uids_for_files(repo_uid, touched_files)?;
+        let dead: Vec<String> = deleted_uids
+            .iter()
+            .filter(|uid| !live.contains(uid.as_str()))
+            .cloned()
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let removed = {
+            let mut idx = self
+                .embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            idx.tombstone_uids(&dead)
+        };
+        // Nothing was actually held for those UIDs (deleted before an embed
+        // pass ever reached them, or already tombstoned). Flushing would
+        // rewrite the sidecar for no change, so leave the artifact and its
+        // journal untouched. This is also what keeps the common watcher save —
+        // a file whose symbols were never embedded — off the disk entirely.
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.flush_embedding_index()?;
+        Ok(removed)
+    }
+
+    /// Whether the embedding sidecar carries enough dead weight to be worth
+    /// rewriting.
+    ///
+    /// Ratio-triggered, matching the Lucene/Elasticsearch and Milvus shape:
+    /// reclaim on deleted-fraction rather than on ceremony or a manual command,
+    /// because the cost of carrying tombstones grows monotonically and nobody
+    /// runs hygiene commands on a schedule.
+    ///
+    /// DELIBERATELY NOT CONSULTED BY `flush_embedding_index`. The per-save
+    /// watcher path flushes, and compaction rewrites the entire base — on a
+    /// real brain that is over a gigabyte. Firing THIS trigger from a flush
+    /// would put a multi-hundred-millisecond rewrite inside a file save. The
+    /// daemon's reconcile loop is the intended caller: writers enqueue, the
+    /// relay drains.
+    ///
+    /// PRECISION, because the weaker claim is the true one: this removes the
+    /// RATIO trigger from the save path, not every rewrite. `flush_embedding_index`
+    /// still compacts when the JOURNAL crosses its size/record threshold, and
+    /// that can now be reached by tombstone deltas as well as upserts. That
+    /// trigger is what bounds journal growth, so removing it would trade a
+    /// bounded latency spike for an unbounded file — a worse deal. The
+    /// worst case on a save is therefore one base rewrite per ~10k journal
+    /// records, not one per threshold-crossing delete.
+    ///
+    /// The absolute floor keeps a nearly-empty index from rewriting itself
+    /// over a handful of vectors, where the ratio is noisy and the reclaim is
+    /// worth nothing.
+    pub fn should_compact_embeddings(&self) -> bool {
+        let occupancy = self.embedding_index_occupancy();
+        occupancy.tombstoned >= EMBEDDING_COMPACT_MIN_TOMBSTONES
+            && occupancy.tombstone_ratio() >= EMBEDDING_COMPACT_TOMBSTONE_RATIO
+    }
+
+    /// Live, tombstoned, and stored vector counts for the embedding sidecar.
+    ///
+    /// `stored` is what the base file physically holds, `live` is what a query
+    /// can actually match, and `tombstoned` is the reclaimable difference.
+    /// Surfacing all three is deliberate: a 52%-dead index reported itself as
+    /// "ready" for weeks because status had no way to express the gap.
+    pub fn embedding_index_occupancy(&self) -> EmbeddingIndexOccupancy {
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (live, tombstoned, stored) = idx.occupancy();
+        EmbeddingIndexOccupancy {
+            live,
+            tombstoned,
+            stored,
+        }
+    }
+
     /// Remove embeddings for graph nodes that no longer exist, update the
     /// live index, and persist the repaired binary sidecar.
     ///
@@ -3508,6 +3667,55 @@ mod tests {
         );
     }
 
+    /// nw-204. The ordering invariant `compact-embeddings` depends on:
+    /// compaction alone reclaims NOTHING when the orphans were never
+    /// tombstoned, which is the state of every brain that predates the fix —
+    /// exactly the brains the command exists for. Reconcile must run first.
+    ///
+    /// Without this, dropping or reordering the reconcile would leave a
+    /// command that exits 0, prints a reclaim summary, and does nothing.
+    #[test]
+    fn compaction_reclaims_nothing_until_orphans_are_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        // No graph nodes are inserted, so both vectors are orphans — but
+        // nothing has tombstoned them yet.
+        assert!(store.add_embedding("symbol:orphan-a", vec![1.0, 0.0]));
+        assert!(store.add_embedding("symbol:orphan-b", vec![0.0, 1.0]));
+        store.flush_embedding_index().unwrap();
+
+        let before = store.embedding_index_occupancy();
+        assert_eq!(before.stored, 2);
+        assert_eq!(
+            before.tombstoned, 0,
+            "precondition: the orphans must be untombstoned, as on a pre-fix brain"
+        );
+
+        // Compaction on its own.
+        store.compact_embedding_index().unwrap();
+        let after_compact_only = store.embedding_index_occupancy();
+        assert_eq!(
+            after_compact_only.stored, 2,
+            "compaction alone must not reclaim untombstoned orphans"
+        );
+
+        // Reconcile first, then compact — the order the command uses.
+        assert_eq!(store.reconcile_embedding_index().unwrap(), 2);
+        store.compact_embedding_index().unwrap();
+        let after = store.embedding_index_occupancy();
+        // Also pins the all-dead case, which this test originally caught:
+        // `compact_embedding_index` guarded on `is_empty()`, i.e. `len() == 0`,
+        // which counts only LIVE vectors — so an index whose rows were ALL
+        // tombstoned reported itself empty and returned early on the maximum-
+        // reclaim case, stranding every dead row on disk.
+        assert_eq!(after.stored, 0);
+        assert_eq!(after.tombstoned, 0, "compaction must clear the tombstones");
+        assert!(!store.has_embedding("symbol:orphan-a"));
+        assert!(!store.has_embedding("symbol:orphan-b"));
+    }
+
     #[test]
     fn embedding_reconciliation_persists_deletion_of_the_last_vector() {
         let dir = tempfile::tempdir().unwrap();
@@ -3523,6 +3731,33 @@ mod tests {
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert!(!reopened.has_embedding("symbol:stale"));
+    }
+
+    /// nw-204. An empty index must report a 0.0 tombstone ratio, not 100% dead.
+    /// Reporting `0/0` as fully dead would trip the compaction threshold on
+    /// every fresh brain and make status alarm about nothing.
+    #[test]
+    fn tombstone_ratio_is_zero_for_an_empty_index() {
+        let empty = EmbeddingIndexOccupancy {
+            live: 0,
+            tombstoned: 0,
+            stored: 0,
+        };
+        assert_eq!(empty.tombstone_ratio(), 0.0);
+
+        let healthy = EmbeddingIndexOccupancy {
+            live: 100,
+            tombstoned: 0,
+            stored: 100,
+        };
+        assert_eq!(healthy.tombstone_ratio(), 0.0);
+
+        let half_dead = EmbeddingIndexOccupancy {
+            live: 50,
+            tombstoned: 50,
+            stored: 100,
+        };
+        assert_eq!(half_dead.tombstone_ratio(), 0.5);
     }
 
     #[test]

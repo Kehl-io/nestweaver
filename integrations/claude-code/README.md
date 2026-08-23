@@ -44,7 +44,7 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
 ## MCP Tools
 
-When configured as an MCP server, NestWeaver exposes 40 tools across these categories:
+When configured as an MCP server, NestWeaver exposes 41 tools across these categories:
 
 **Context & Search:**
 - **brain_context** — Task-focused subgraph via Personalized PageRank with type-aware resolution

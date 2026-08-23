@@ -277,7 +277,7 @@ nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tra
 nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
 nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
 
-# MCP server (40 tools, or 6 in lite mode for Cursor)
+# MCP server (41 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools

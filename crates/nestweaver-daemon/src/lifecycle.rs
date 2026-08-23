@@ -2674,6 +2674,17 @@ mod tests {
             "a cutover to a new slot must not rename the daemon"
         );
 
+        // nw-205: the two `socket_path` calls below each resolve the XDG roots
+        // independently, so a sibling test swapping XDG_STATE_HOME /
+        // XDG_RUNTIME_DIR between them makes the SAME instance id render under
+        // two different roots and this assertion fail — the observed symptom
+        // being `~/.local/state/...` on one side and a test tempdir on the
+        // other. `instance_id_from_db_path` is a pure hash of the path and
+        // needs no lock; only the path rendering reads the environment. Same
+        // defect and same fix as `log_hint_names_the_dated_tracing_file_not_just_stderr`
+        // below: the writers already take ENV_LOCK, this reader did not.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
         // The same anchoring applies to every derived local-state path.
         assert_eq!(
             socket_path(&instance_id_from_db_path(&after)),

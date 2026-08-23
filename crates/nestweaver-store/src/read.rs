@@ -1441,6 +1441,51 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Return the UIDs of every Symbol currently attached to the given files.
+    ///
+    /// Liveness scoped to exactly the files a run touched, for targeted
+    /// embedding reconciliation. Deliberately NOT repo-scoped: the code
+    /// watcher runs this on every save, and a repo-wide symbol scan on a large
+    /// repo would put a six-figure row count in the path of every keystroke-
+    /// triggered re-index. One query per touched file mirrors what
+    /// `delete_symbols_in_file_on` already pays, so the added cost is a
+    /// constant factor on work the run does anyway.
+    ///
+    /// Sound because the file set is exactly the set the caller deleted from:
+    /// a UID can only reappear in a file the run wrote, and the rename path
+    /// touches both the source and destination paths.
+    pub fn symbol_uids_for_files(
+        &self,
+        repo_uid: &str,
+        file_paths: &[String],
+    ) -> Result<HashSet<String>, StoreError> {
+        let mut uids = HashSet::new();
+        if file_paths.is_empty() {
+            return Ok(uids);
+        }
+        let conn = self.conn()?;
+        // LadybugDB does not support parameterized compound WHERE clauses.
+        // Escaping deliberately mirrors `delete_symbols_in_file_on` (`\'`), NOT
+        // the SQL-style `''` doubling used elsewhere in this file: these two
+        // queries must select the SAME rows for the liveness difference to be
+        // sound, so they have to agree with each other rather than with the
+        // file. That the codebase carries two escaping conventions is a real
+        // inconsistency and its own cleanup.
+        let safe_repo_uid = repo_uid.replace('\'', "\\'");
+        for file_path in file_paths {
+            let safe_file_path = file_path.replace('\'', "\\'");
+            let result = conn
+                .query(&format!(
+                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN s.uid"
+                ))
+                .map_err(|e| StoreError::Query(format!("list symbol uids in file: {e}")))?;
+            for row in result {
+                uids.insert(extract_string(&row, 0)?);
+            }
+        }
+        Ok(uids)
+    }
+
     /// Return the authoritative set of graph-node UIDs supported by the
     /// sidecar embedding index. The embedding producers currently cover
     /// Symbols, Notes, and Headings; querying all three protects vault data

@@ -223,6 +223,32 @@ message PruneStaleResponse {
   repeated ReconciliationFailure reconciliation_failures = 4;
 }
 
+// nw-204. Reclaim embedding vectors left behind by deleted graph nodes.
+message CompactEmbeddingsRequest {
+  // Report occupancy without writing anything. Note that a dry run can only
+  // report what is ALREADY tombstoned — orphans that were never tombstoned are
+  // found by the reconcile a real run performs, so a dry run's `tombstoned` is
+  // a floor, not a total.
+  bool dry_run = 1;
+}
+
+message CompactEmbeddingsResponse {
+  // Occupancy before the run.
+  uint64 stored_before = 1;
+  uint64 tombstoned_before = 2;
+  // Occupancy after. Equal to the `before` values on a dry run.
+  uint64 stored_after = 3;
+  uint64 live_after = 4;
+  // Vectors the reconcile found to be dead. 0 on a dry run.
+  uint64 reclaimed = 5;
+  // Sidecar file size in bytes, before and after. 0 when the artifact is
+  // absent or unreadable, which is not an error — an un-embedded brain has no
+  // sidecar and nothing to reclaim.
+  uint64 bytes_before = 6;
+  uint64 bytes_after = 7;
+  bool dry_run = 8;
+}
+
 message MergeInstanceRequest {
   string from_id = 1;
   string to_id = 2;
@@ -356,6 +382,21 @@ message EmbeddingStatus {
   int64 pass_started_at = 12;
   // Scope string of the running pass (all | symbols | notes | headings).
   string pass_scope = 13;
+
+  // ── Sidecar occupancy (added 7.1, nw-204) ────────────────────────
+  // Vectors a query can actually match, versus what the artifact physically
+  // stores. `index_stored - index_live` is dead weight that is both wasted
+  // disk AND, before it is tombstoned, scored: an untombstoned dead vector
+  // outranking a live one silently consumes a top-k slot.
+  //
+  // Reported so that a brain carrying a majority-dead index cannot keep
+  // describing itself as simply "ready", which is how this went unnoticed
+  // until over half of a real index was dead. Proto3 scalars, so an older
+  // daemon decodes as 0/0 rather than as an error; a client should treat
+  // index_stored == 0 as "not reported" rather than "empty index".
+  uint64 index_live = 14;
+  uint64 index_tombstoned = 15;
+  uint64 index_stored = 16;
 }
 message EffectiveConfig {
   // The daemon's effective configuration source. Absence of EffectiveConfig
@@ -709,6 +750,7 @@ service NestWeaverDaemon {
   rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoResponse);
   rpc RemoveProject(RemoveProjectRequest) returns (RemoveProjectResponse);
   rpc PruneStale(PruneStaleRequest) returns (PruneStaleResponse);
+  rpc CompactEmbeddings(CompactEmbeddingsRequest) returns (CompactEmbeddingsResponse);
   rpc MergeInstance(MergeInstanceRequest) returns (MergeInstanceResponse);
   rpc PurgeInstance(PurgeInstanceRequest) returns (stream IndexProgress);
 

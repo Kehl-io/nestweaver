@@ -104,8 +104,13 @@ jobs:
       # Scoped to the WORKSPACE, not just the daemon: the class recurred in a
       # second crate precisely because the gate was per-crate. --lib keeps this
       # to unit tests; the ubuntu job still carries integration coverage.
+      # nw-205: --no-fail-fast. Without it a failure in one crate ABORTS the
+      # remaining crates, and the job reports a single non-zero exit that reads
+      # like a verdict on the whole workspace while later crates were never run
+      # at all. That is how a daemon-crate flake hid the store and engine
+      # suites entirely. Every other test job here already passes it.
       - name: Workspace unit tests (macOS portability gate)
-        run: cargo test --locked --release --workspace --lib
+        run: cargo test --locked --release --workspace --lib --no-fail-fast
       # The --lib gate above did not cover INTEGRATION tests, and two of them
       # were failing on macOS the whole time: one #[cfg(target_os = "macos")]
       # test Linux CI can never run, and one gc test that passes on Linux but

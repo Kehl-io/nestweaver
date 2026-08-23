@@ -1279,6 +1279,24 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Reclaim embedding vectors left behind by deleted graph nodes (nw-204).
+    ///
+    /// `dry_run` reports occupancy without writing. Note that a dry run can
+    /// only see what is ALREADY tombstoned; orphans that were never tombstoned
+    /// are discovered by the reconcile a real run performs, so a dry run's
+    /// count is a floor rather than a total.
+    pub async fn compact_embeddings(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<nestweaver_proto::CompactEmbeddingsResponse> {
+        let resp = self
+            .inner
+            .compact_embeddings(nestweaver_proto::CompactEmbeddingsRequest { dry_run })
+            .await
+            .context("compact_embeddings RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Merge one instance's data into another.
     pub async fn merge_instance(
         &mut self,

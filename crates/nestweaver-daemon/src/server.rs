@@ -714,6 +714,7 @@ fn effective_embedding_state(
 fn embedding_status_proto(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
+    occupancy: nestweaver_store::EmbeddingIndexOccupancy,
 ) -> nestweaver_proto::EmbeddingStatus {
     nestweaver_proto::EmbeddingStatus {
         state: effective_embedding_state(status, progress),
@@ -729,12 +730,16 @@ fn embedding_status_proto(
         pass_total: progress.total,
         pass_started_at: progress.started_at,
         pass_scope: progress.scope.clone(),
+        index_live: occupancy.live as u64,
+        index_tombstoned: occupancy.tombstoned as u64,
+        index_stored: occupancy.stored as u64,
     }
 }
 
 fn embedding_status_json(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
+    occupancy: nestweaver_store::EmbeddingIndexOccupancy,
 ) -> serde_json::Value {
     serde_json::json!({
         "state": effective_embedding_state(status, progress),
@@ -750,6 +755,9 @@ fn embedding_status_json(
         "pass_total": progress.total,
         "pass_started_at": progress.started_at,
         "pass_scope": progress.scope,
+        "index_live": occupancy.live,
+        "index_tombstoned": occupancy.tombstoned,
+        "index_stored": occupancy.stored,
     })
 }
 
@@ -1416,6 +1424,120 @@ async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
         }
     }
     tracing::debug!("trigram reconcile loop stopped");
+}
+
+/// How often the embedding backstop checks for orphaned vectors.
+///
+/// Not configurable and not tied to the trigram interval: this is a safety net,
+/// not a feature. Five minutes is far below any rate at which orphans become a
+/// problem, and each tick is O(1) unless the graph generation actually moved.
+const EMBEDDING_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// nw-204 backstop: reconcile the embedding index against the live graph, and
+/// compact it once enough of it is dead.
+///
+/// The targeted tombstoning on the index and watcher paths is the primary fix
+/// and handles the common case at O(deleted). This exists because that
+/// guarantee is only as good as every delete path remembering to report what it
+/// removed — which is exactly the assumption that failed and produced the
+/// original bug. Level-triggered: it reads current state rather than reacting
+/// to events, so a delete path added later cannot reintroduce the leak, because
+/// there is nothing for it to remember to call. It is also the ONLY thing that
+/// covers Note and Heading vectors, which the targeted path does not.
+///
+/// OWNS ITS OWN LOOP, deliberately. The first cut rode the trigram reconciler
+/// to save a task — but that loop only spawns when `[indexing] with_trigrams`
+/// is on, and that defaults to OFF. The backstop would therefore have been
+/// absent on almost every real daemon while its doc comment claimed a
+/// structural guarantee. A safety net may not depend on an unrelated opt-in.
+async fn run_embedding_reconciler(state: Arc<DaemonState>, period: Duration) {
+    let mut shutdown = state.shutdown_tx.subscribe();
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_generation: Option<u64> = None;
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => break,
+        }
+        if backoff_until.is_some_and(|until| Instant::now() < until) {
+            continue;
+        }
+
+        // Cheap gates first, before the write gate and before anything O(graph).
+        // The generation advances on every mutating publication, so an unchanged
+        // one proves there is nothing new to reconcile.
+        let generation = state.store.graph_generation();
+        if last_generation == Some(generation) {
+            continue;
+        }
+        // A brain with no vectors at all has nothing to reconcile, and the
+        // liveness scan below is three full-table queries. This check is O(1)
+        // in the base because occupancy reads maintained counts.
+        if state.store.embedding_index_occupancy().stored == 0 {
+            last_generation = Some(generation);
+            continue;
+        }
+
+        let Ok(_admission) = ConnectionGuard::write(&state) else {
+            break;
+        };
+        let lease = state.write_gate.lock("embedding_reconcile").await;
+        let reconcile_state = Arc::clone(&state);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let removed = reconcile_state.store.reconcile_embedding_index()?;
+            // Compaction is deliberately here and NOT in `flush_embedding_index`:
+            // the watcher flushes on every save, and compaction rewrites the
+            // whole base.
+            let compacted = if reconcile_state.store.should_compact_embeddings() {
+                reconcile_state.store.compact_embedding_index()?;
+                true
+            } else {
+                false
+            };
+            Ok::<_, nestweaver_store::StoreError>((removed, compacted))
+        })
+        .await;
+        drop(lease);
+
+        match outcome {
+            Ok(Ok((removed, compacted))) => {
+                consecutive_failures = 0;
+                backoff_until = None;
+                // Only advance the watermark on success, so a failed pass is
+                // retried rather than skipped.
+                last_generation = Some(generation);
+                if removed > 0 || compacted {
+                    tracing::info!(
+                        removed,
+                        compacted,
+                        generation,
+                        "embedding reconcile: reclaimed vectors for deleted nodes"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                // Backoff matters more here than for trigrams: a permanent
+                // failure (vectors present but no pipeline-v2 metadata, say)
+                // would otherwise repeat a full graph scan under the write gate
+                // every tick forever, with a warning each time.
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until =
+                    Some(Instant::now() + trigram_reconcile_backoff(period, consecutive_failures));
+                tracing::warn!(%error, consecutive_failures, generation, "embedding reconcile failed");
+            }
+            Err(join_error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_until =
+                    Some(Instant::now() + trigram_reconcile_backoff(period, consecutive_failures));
+                tracing::error!(%join_error, "embedding reconcile task panicked");
+            }
+        }
+    }
+    tracing::debug!("embedding reconcile loop stopped");
 }
 
 /// The SIGTERM handler task: route every SIGTERM into [`begin_shutdown_drain`].
@@ -5140,6 +5262,90 @@ impl NestWeaverDaemon for DaemonService {
         result.map(Response::new)
     }
 
+    /// nw-204. Reclaim embedding vectors for nodes that no longer exist.
+    ///
+    /// Routed through the daemon like every other write: it takes the same
+    /// admission guard and write gate, so it cannot race an index, a watcher
+    /// batch, or the reconcile loop against a store that is not crash-safe.
+    /// An operator running this on a live brain is exactly when a concurrent
+    /// write is most likely, which is why it is an RPC rather than a
+    /// direct-store command.
+    async fn compact_embeddings(
+        &self,
+        request: Request<CompactEmbeddingsRequest>,
+    ) -> Result<Response<CompactEmbeddingsResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        let dry_run = request.into_inner().dry_run;
+        let state = self.state.clone();
+
+        // A dry run writes NOTHING, so it must not take the write gate: doing so
+        // would let a purely informational query block indexing and the watcher,
+        // and be refused outright during a drain. The real run takes the guard
+        // BEFORE the gate, matching every other write RPC — during a drain the
+        // gate is held for as long as the in-flight write runs, so taking it
+        // first would queue this behind a write it is about to be refused after.
+        let _write_scope = if dry_run {
+            None
+        } else {
+            let guard = ConnectionGuard::write(&self.state)?;
+            let lease = self.state.write_gate.lock("compact_embeddings").await;
+            Some((guard, lease))
+        };
+
+        let response = tokio::task::spawn_blocking(move || {
+            let sidecar = nestweaver_engine::sidecar_path(&state.db_path, ".embeddings.bin");
+            let bytes_of = |path: &std::path::Path| {
+                std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+            };
+
+            let before = state.store.embedding_index_occupancy();
+            let bytes_before = bytes_of(&sidecar);
+
+            if dry_run {
+                return Ok::<_, nestweaver_store::StoreError>(CompactEmbeddingsResponse {
+                    stored_before: before.stored as u64,
+                    tombstoned_before: before.tombstoned as u64,
+                    stored_after: before.stored as u64,
+                    live_after: before.live as u64,
+                    reclaimed: 0,
+                    bytes_before,
+                    bytes_after: bytes_before,
+                    dry_run: true,
+                });
+            }
+
+            // Reconcile FIRST, always. Compaction rewrites the base without
+            // tombstoned rows, so running it alone on a brain whose orphans
+            // were never tombstoned reclaims exactly nothing — which is the
+            // state every pre-fix brain is in.
+            let reclaimed = state.store.reconcile_embedding_index()?;
+            if state.store.embedding_index_occupancy().tombstoned > 0 {
+                state.store.compact_embedding_index()?;
+            }
+
+            let after = state.store.embedding_index_occupancy();
+            Ok(CompactEmbeddingsResponse {
+                stored_before: before.stored as u64,
+                tombstoned_before: before.tombstoned as u64,
+                stored_after: after.stored as u64,
+                live_after: after.live as u64,
+                reclaimed: reclaimed as u64,
+                bytes_before,
+                bytes_after: bytes_of(&sidecar),
+                dry_run: false,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| Status::internal(format!("compact embeddings failed: {e}")))?;
+
+        Ok(Response::new(response))
+    }
+
     async fn merge_instance(
         &self,
         request: Request<MergeInstanceRequest>,
@@ -5757,6 +5963,7 @@ impl NestWeaverDaemon for DaemonService {
         let embedding_status = embedding_status_proto(
             &self.state.embedding_runtime.status(),
             &self.state.embed_progress.snapshot(),
+            self.state.store.embedding_index_occupancy(),
         );
         let write_queue_depth = self.state.write_gate.waiting() as i32;
         let (write_holder, write_holder_seconds) = self
@@ -5871,8 +6078,11 @@ impl NestWeaverDaemon for DaemonService {
             value["write_holder"] = serde_json::json!(write_holder);
             value["write_holder_seconds"] = serde_json::json!(write_holder_seconds);
             let embedding_status = self.state.embedding_runtime.status();
-            value["embedding_status"] =
-                embedding_status_json(&embedding_status, &self.state.embed_progress.snapshot());
+            value["embedding_status"] = embedding_status_json(
+                &embedding_status,
+                &self.state.embed_progress.snapshot(),
+                self.state.store.embedding_index_occupancy(),
+            );
             // Daemon-side witness counter in the `cache` block (the
             // `hit_rate_pct` session-counter precedent): an adopted client
             // proves the answer came from THIS daemon because the counter
@@ -9678,6 +9888,21 @@ pub async fn run_server(
                 "trigram reconcile loop disabled ([indexing] with_trigrams off, or interval 0)"
             ),
         }
+    }
+
+    // nw-204: the embedding backstop, spawned in EVERY writable daemon mode.
+    // Unlike the trigram reconciler above it is NOT gated on an instance config
+    // or on an opt-in feature flag — orphaned vectors accumulate on any brain
+    // that deletes nodes, which is all of them.
+    if !read_only {
+        tracing::info!(
+            interval_secs = EMBEDDING_RECONCILE_INTERVAL.as_secs(),
+            "embedding reconcile loop enabled"
+        );
+        tokio::spawn(run_embedding_reconciler(
+            Arc::clone(&state),
+            EMBEDDING_RECONCILE_INTERVAL,
+        ));
     }
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
@@ -14801,6 +15026,7 @@ mod startup_helper_tests {
                 "brain_memory_consolidate",
                 "set_extension",
                 "prune_stale",
+                "compact_embeddings",
             ]
         );
         // The daemon's gate is this exact const, not a copy.
