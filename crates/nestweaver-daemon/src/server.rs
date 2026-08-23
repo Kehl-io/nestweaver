@@ -7541,16 +7541,16 @@ fn watch_path_allowed(
         // fix, not a policy change, and the remedy has to be the exact stanza
         // rather than "register it", which is what the operator believes they
         // already did.
-        let type_hint = if vault_only {
-            "\n  type = \"vault\""
-        } else {
-            ""
-        };
+        // Column 0, matching the docs example. The stanza is the one thing
+        // this message is selling, so it must paste cleanly rather than
+        // inherit whatever indentation the source line happens to have.
+        let type_hint = if vault_only { "\ntype = \"vault\"" } else { "" };
         return Err(Status::invalid_argument(format!(
             "{kind} path {} is not in the instance config's [[repos]] allow-list. \
              Indexing it with `brain add` is NOT enough: the watcher checks the \
              config, not the database.\n\
-             Add this to your instance.toml and restart the daemon:\n\n               [[repos]]{type_hint}\n  url = \"file://{}\"",
+             Add this to your instance.toml and restart the daemon:\n\n\
+             [[repos]]{type_hint}\nurl = \"file://{}\"",
             path.display(),
             path.display()
         )));

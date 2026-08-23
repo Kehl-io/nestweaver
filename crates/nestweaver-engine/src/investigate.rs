@@ -1393,6 +1393,63 @@ mod tests {
         assert!(a.starts_with('a') && a.len() == 13);
     }
 
+    /// nw-189. `scope_filtered` must report whether a filter actually RAN,
+    /// which is the thing `scope` alone cannot express.
+    ///
+    /// The previous test in this module exercises `resolve_scope` only, and so
+    /// passes identically on `main` — it guards pre-existing behaviour rather
+    /// than this change. This one pins the new field against the same binding
+    /// that gates the filter, so the flag cannot drift from reality.
+    #[test]
+    fn scope_filtered_reports_whether_a_filter_actually_ran() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // Every documented pass-through must report FALSE — including the
+        // literal "vault" a caller may still pass explicitly.
+        for pass_through in ["", "vault", "all"] {
+            let (_, filter) = resolve_scope(&store, "anything", pass_through).unwrap();
+            assert!(
+                filter.is_none(),
+                "{pass_through:?} builds no filter, so scope_filtered must be false"
+            );
+        }
+
+        // The RESPONSE is where the defect showed, so assert on the serialized
+        // shape a caller actually reads. `scope` echoing "vault" is not itself
+        // wrong — what was wrong is that nothing alongside it said whether a
+        // restriction happened.
+        let unrestricted = InvestigateResult {
+            bundle_id: "b".to_string(),
+            query: "q".to_string(),
+            scope: "vault".to_string(),
+            scope_filtered: false,
+            domains: vec![],
+            entries: vec![],
+            more_available: 0,
+            semantic_applied: false,
+            degraded_components: vec![],
+        };
+        let json = serde_json::to_value(&unrestricted).unwrap();
+        assert_eq!(
+            json["scope"], "vault",
+            "the caller's scope string is still echoed verbatim"
+        );
+        assert_eq!(
+            json["scope_filtered"], false,
+            "…and `scope_filtered` is what tells them nothing was restricted"
+        );
+
+        let restricted = InvestigateResult {
+            scope: "repo:acme".to_string(),
+            scope_filtered: true,
+            ..unrestricted
+        };
+        assert_eq!(
+            serde_json::to_value(&restricted).unwrap()["scope_filtered"],
+            true
+        );
+    }
+
     /// nw-189. `vault` and `all` are documented PASS-THROUGHS — they construct
     /// no filter — so a response that echoes `scope: "vault"` and nothing else
     /// reads as a restriction that never happened. The CLI and MCP made it

@@ -7230,7 +7230,7 @@ fn tool_schema_detect_changes() -> Value {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000,
-                    "description": "Max affected symbols AND max affected processes to inline (default 50). The totals are always reported as affected_symbol_count / affected_process_count, and truncated says whether anything was omitted.",
+                    "description": "Max affected symbols AND max affected processes to inline (default 50). The totals are always reported as affected_symbol_count / affected_process_count, and truncated says whether anything was omitted. NOTE: the cut is positional, not by importance — symbols are ordered by (file_path, name) and processes by name, because neither carries an impact score. Raise limit rather than assuming the first N are the most impactful; for ranked results use blast_radius.",
                     "default": DEFAULT_RESULT_LIMIT
                 }
             }
@@ -7267,8 +7267,21 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 
     let impact = detect_changes_impact(store, &files, 10).context("detect_changes_impact")?;
 
-    let affected_symbols: Vec<Value> = impact
-        .affected_symbols
+    // Sorted before truncating. `affected_symbols` is built in
+    // changed_files x symbols_in_file discovery order with no scoring, so a
+    // bare `take(limit)` keeps an ARBITRARY subset — on a large change the
+    // highest-fanout symbol could be dropped while trivial helpers from the
+    // first file are kept, and which ones you got would shift with the order
+    // the caller happened to list their files in.
+    //
+    // `AffectedSymbol` carries no impact score, so this CANNOT rank by
+    // importance the way blast_radius does. Sorting by (file_path, name) buys
+    // determinism and nothing more — which is why the schema says the cut is
+    // positional rather than implying the first N matter most.
+    let mut ranked_symbols: Vec<_> = impact.affected_symbols.iter().collect();
+    ranked_symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+
+    let affected_symbols: Vec<Value> = ranked_symbols
         .iter()
         .take(limit)
         .map(|s| {
@@ -8585,8 +8598,12 @@ fn tool_project_context(
     // budget FIRST, so a budget smaller than the seed overhead leaves zero for
     // connected and drops every one of them silently — reproduced as
     // token_budget 200 / tokens_used 257 / connected [] / seeds_expanded 114.
-    let connected_dropped = result.connected.len().saturating_sub(cut);
-    let budget_exceeded = used_tokens > token_budget;
+    // Provisional: `budgeted_cut` decided this, but the probe loop below can
+    // drop more. The authoritative count is recomputed after it.
+    let provisional_dropped = result.connected.len().saturating_sub(cut);
+    // Overwritten by the probe block with the ACTUAL serialized size.
+    #[allow(unused_assignments)]
+    let mut final_payload_tokens = used_tokens;
 
     // 7. Load external_refs from extension sidecar.
     let ext_store = load_extensions(&db_path);
@@ -8641,9 +8658,9 @@ fn tool_project_context(
             "connected": connected_json,
             "tokens_used": used_tokens,
             "token_budget": token_budget,
-            "more_available": connected_dropped,
-            "truncated": connected_dropped > 0,
-            "budget_exceeded": budget_exceeded,
+            "more_available": provisional_dropped,
+            "truncated": provisional_dropped > 0,
+            "budget_exceeded": used_tokens > token_budget,
             "semantic_applied": result.semantic_applied,
             "degraded_components": &result.degraded_components,
         });
@@ -8657,18 +8674,28 @@ fn tool_project_context(
             probe["external_refs"] = external_refs.clone();
         }
         let serialized = serde_json::to_string(&probe)?;
-        let actual_tokens = serialized.len().div_ceil(4);
+        let mut actual_tokens = serialized.len().div_ceil(4);
         if actual_tokens > token_budget {
             while connected_json.len() > 1 {
                 connected_json.pop();
                 probe["connected"] = json!(connected_json);
                 let check = serde_json::to_string(&probe)?;
-                if check.len().div_ceil(4) <= token_budget {
+                actual_tokens = check.len().div_ceil(4);
+                if actual_tokens <= token_budget {
                     break;
                 }
             }
         }
+        final_payload_tokens = actual_tokens;
     }
+
+    // RECOMPUTED after the probe loop, not before it. The loop above pops
+    // further entries off `connected_json` to fit the SERIALIZED payload under
+    // the budget, so a count taken from `budgeted_cut` alone understates what
+    // the caller actually lost — the response would have reported a smaller
+    // `more_available` than the number of items genuinely missing, which is the
+    // same class of dishonesty this item exists to remove.
+    let connected_dropped = result.connected.len().saturating_sub(connected_json.len());
 
     // nw-188: `more_available` and `truncated` name what was dropped;
     // `budget_exceeded` says plainly that `tokens_used` is over `token_budget`
@@ -8680,11 +8707,20 @@ fn tool_project_context(
         "project_uid": project.uid,
         "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
-        "tokens_used": used_tokens,
         "token_budget": token_budget,
         "more_available": connected_dropped,
         "truncated": connected_dropped > 0,
-        "budget_exceeded": budget_exceeded,
+        // The ACTUAL serialized size, not the pre-serialization estimate.
+        //
+        // The estimate charges `seed_tokens` against the budget even when
+        // `include_seeds` is false and the seeds are therefore NOT in the
+        // payload — which is how the reported case produced `tokens_used: 257`
+        // for a response that serialized to a fraction of that. Reporting the
+        // estimate as "used" was itself the dishonesty; `seed_tokens_charged`
+        // below explains where the budget actually went.
+        "tokens_used": final_payload_tokens,
+        "seed_tokens_charged": seed_tokens,
+        "budget_exceeded": final_payload_tokens > token_budget,
         "semantic_applied": result.semantic_applied,
         "degraded_components": &result.degraded_components,
     });
