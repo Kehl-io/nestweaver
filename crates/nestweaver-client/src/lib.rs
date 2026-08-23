@@ -701,6 +701,33 @@ fn verify_requested_config_evidence(
         health.instance_id,
         restart_with_requested_config_remedy(db_path, requested)
     );
+    // nw-201: VERSION, not just config identity.
+    //
+    // `daemon start --config` used to verify only that the incumbent's
+    // effective config matched, then print "Daemon already running with
+    // requested config." and exit 0 — while the running process was the
+    // PREVIOUS binary. `brain status` looked healthy, so the upgrade appeared
+    // applied and was not. For 7.0.0 specifically that meant an operator ran
+    // neither the trigram reconcile loop nor nanosecond change detection while
+    // being told everything was fine.
+    //
+    // The same assertion already guarded a REPLACEMENT daemon in
+    // `verify_replacement_evidence`; the incumbent simply had no equivalent.
+    // This is an inconsistency between two paths, not a new policy.
+    //
+    // FAILS rather than restarting, deliberately. `start` means "ensure a
+    // daemon is running", and stopping one that is actively serving is a
+    // larger action than that asks for — the same reasoning behind
+    // `RefuseForeignIncumbent` never stopping a foreign daemon implicitly.
+    // The remedy names `restart`, which is the command that owns that action.
+    anyhow::ensure!(
+        health.version == env!("CARGO_PKG_VERSION"),
+        "the running daemon is version {} but this client is {}; the upgrade has NOT been \
+         applied and its new behaviour is not active. {}",
+        health.version,
+        env!("CARGO_PKG_VERSION"),
+        restart_with_requested_config_remedy(db_path, requested)
+    );
     anyhow::ensure!(health.pid != 0, "running daemon HealthCheck returned PID 0");
     anyhow::ensure!(
         binding.pid == health.pid,
@@ -1581,6 +1608,73 @@ credential_method = "gh"
         assert!(relative.as_path().unwrap().is_absolute());
     }
 
+    /// nw-201. `daemon start --config` verified the incumbent's CONFIG but not
+    /// its VERSION, so after `cargo install` of a new build it printed "Daemon
+    /// already running with requested config." and exited 0 while the previous
+    /// binary was still serving. `brain status` looked healthy, so the upgrade
+    /// appeared applied and was not — on 7.0.0 that meant running neither the
+    /// trigram reconcile loop nor nanosecond change detection.
+    ///
+    /// Asserts the failure NAMES both versions and the remedy: an operator who
+    /// is told "restart" without being told why is being asked to guess.
+    #[test]
+    fn explicit_config_evidence_refuses_a_stale_version_incumbent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let requested_path = fs::canonicalize(valid_config(&dir, "requested.toml")).unwrap();
+        let requested = RestartConfig::Configured(requested_path.clone());
+
+        // The config MATCHES — this is the exact state that used to report
+        // success. Only the version differs.
+        let stale = nestweaver_proto::HealthCheckResponse {
+            version: "0.0.1-stale".to_string(),
+            instance_id: nestweaver_daemon::lifecycle::instance_id_from_db_path(&db),
+            pid: 91,
+            ..Default::default()
+        };
+
+        let error = verify_requested_config_evidence(
+            &db,
+            &stale,
+            &requested,
+            binding(
+                91,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                    path: requested_path.to_str().unwrap().to_string(),
+                },
+            ),
+        )
+        .expect_err("a stale-version incumbent must not verify as acceptable");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("0.0.1-stale"), "{message}");
+        assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+        assert!(
+            message.contains("has NOT been applied"),
+            "the message must say the upgrade did not take effect: {message}"
+        );
+        assert!(message.contains("restart --config"), "{message}");
+
+        // Control: the SAME evidence with a current version verifies cleanly,
+        // so the test cannot pass merely because the fixture is malformed.
+        let current = nestweaver_proto::HealthCheckResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ..stale.clone()
+        };
+        verify_requested_config_evidence(
+            &db,
+            &current,
+            &requested,
+            binding(
+                91,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                    path: requested_path.to_str().unwrap().to_string(),
+                },
+            ),
+        )
+        .expect("a current-version incumbent with a matching config must verify");
+    }
+
     #[test]
     fn explicit_config_evidence_names_requested_and_effective_mismatch_states() {
         let dir = tempfile::tempdir().unwrap();
@@ -1589,6 +1683,11 @@ credential_method = "gh"
         let effective_path = fs::canonicalize(valid_config(&dir, "effective.toml")).unwrap();
         let requested = RestartConfig::Configured(requested_path.clone());
         let health = nestweaver_proto::HealthCheckResponse {
+            // nw-201: a CURRENT version, so this test still exercises the
+            // config-mismatch states it is named for. Without it the version
+            // assertion fires first and this test would silently stop covering
+            // config identity at all.
+            version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: nestweaver_daemon::lifecycle::instance_id_from_db_path(&db),
             pid: 91,
             ..Default::default()
