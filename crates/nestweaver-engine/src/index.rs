@@ -5208,22 +5208,37 @@ fn incremental_index_with_name_and_io(
                 let from_str = from.to_string_lossy();
                 let to_str = to.to_string_lossy();
 
-                if is_parseable(to) && !path_in_skip_dir(to) {
-                    // Update symbol file_path references.
-                    nestweaver_store::GraphStore::update_symbol_file_paths_on(
-                        &txn, &r_uid, &from_str, &to_str,
-                    )
-                    .with_context(|| {
-                        format!("update_symbol_file_paths {} -> {}", from_str, to_str)
-                    })?;
-                } else {
-                    // Destination is not parseable — just delete the old symbols.
-                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
-                        &txn, &r_uid, &from_str,
-                    )
-                    .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
-                    result.symbols_removed += removed;
-                }
+                // The old path's symbols are dead in BOTH cases, so delete them
+                // unconditionally rather than branching.
+                //
+                // `symbol_uid` hashes the file path, so a rename re-keys every
+                // symbol in the file — nothing at `from` can survive, whether
+                // or not the destination is parseable. The parseable branch
+                // used to call `update_symbol_file_paths_on` instead, which
+                // carried the rows across by rewriting `file_path` while
+                // KEEPING the old-path-derived UID. Those rows were then
+                // deleted two statements below and re-created from the parse,
+                // so the re-key preserved nothing.
+                //
+                // It was also actively harmful: its per-row CREATE
+                // (`insert_symbol_with_conn_static`) preceded the bulk
+                // `COPY Symbol` of the re-insert in the SAME transaction, and
+                // the copied nodes were then invisible to the following
+                // `COPY FILE_HAS_SYMBOL`:
+                //
+                //   COPY FILE_HAS_SYMBOL: Unable to find primary key value
+                //   sym:<repo>:<hash(after.js)>:<hash(name)>:<line>
+                //
+                // which failed the WHOLE incremental index for any repo where
+                // git reported a rename between parseable paths. DELETE-then-
+                // COPY is fine — the Modified arm has always done exactly that
+                // — so the per-row CREATE is the ingredient that breaks it. Do
+                // not reintroduce one on a table this transaction COPYs into.
+                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                    &txn, &r_uid, &from_str,
+                )
+                .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
+                result.symbols_removed += removed;
 
                 // Re-key the File node: delete old, insert new.
                 let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
@@ -5466,20 +5481,37 @@ where
                 let from_str = from.to_string_lossy();
                 let to_str = to.to_string_lossy();
 
-                if is_parseable(to) && !path_in_skip_dir(to) {
-                    nestweaver_store::GraphStore::update_symbol_file_paths_on(
-                        &txn, &r_uid, &from_str, &to_str,
-                    )
-                    .with_context(|| {
-                        format!("update_symbol_file_paths {} -> {}", from_str, to_str)
-                    })?;
-                } else {
-                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
-                        &txn, &r_uid, &from_str,
-                    )
-                    .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
-                    result.symbols_removed += removed;
-                }
+                // The old path's symbols are dead in BOTH cases, so delete them
+                // unconditionally rather than branching.
+                //
+                // `symbol_uid` hashes the file path, so a rename re-keys every
+                // symbol in the file — nothing at `from` can survive, whether
+                // or not the destination is parseable. The parseable branch
+                // used to call `update_symbol_file_paths_on` instead, which
+                // carried the rows across by rewriting `file_path` while
+                // KEEPING the old-path-derived UID. Those rows were then
+                // deleted two statements below and re-created from the parse,
+                // so the re-key preserved nothing.
+                //
+                // It was also actively harmful: its per-row CREATE
+                // (`insert_symbol_with_conn_static`) preceded the bulk
+                // `COPY Symbol` of the re-insert in the SAME transaction, and
+                // the copied nodes were then invisible to the following
+                // `COPY FILE_HAS_SYMBOL`:
+                //
+                //   COPY FILE_HAS_SYMBOL: Unable to find primary key value
+                //   sym:<repo>:<hash(after.js)>:<hash(name)>:<line>
+                //
+                // which failed the WHOLE incremental index for any repo where
+                // git reported a rename between parseable paths. DELETE-then-
+                // COPY is fine — the Modified arm has always done exactly that
+                // — so the per-row CREATE is the ingredient that breaks it. Do
+                // not reintroduce one on a table this transaction COPYs into.
+                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                    &txn, &r_uid, &from_str,
+                )
+                .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
+                result.symbols_removed += removed;
 
                 let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
@@ -9626,6 +9658,93 @@ function hello(name) { return "Hello " + name; }
         assert!(
             !clusters_path.exists(),
             "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    /// nw-206. A rename between two parseable paths must not fail the
+    /// incremental index. It used to fail ALL of it, on an ordinary `git mv`:
+    ///
+    ///   batch_insert_file_symbol_edges after.js: query error:
+    ///   COPY FILE_HAS_SYMBOL: Unable to find primary key value sym:…
+    ///
+    /// The rename arms had no test at all, which is how two independent bugs
+    /// shipped behind each other on this path.
+    ///
+    /// Asserts on the resulting GRAPH STATE, not merely that the call returned
+    /// Ok: the first attempt at this fix stopped the error while leaving stale
+    /// symbols at the old path, turning a loud failure into silent bad data.
+    #[test]
+    fn incremental_index_survives_a_rename_between_parseable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("before.js"),
+            "function moved() { return 'moved'; }",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo_url = "https://example.com/nw-206-rename";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let old_uid = store
+            .symbols_in_file("before.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        drop(store);
+
+        fs::rename(repo.join("before.js"), repo.join("after.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "rename before.js -> after.js"]);
+
+        incremental_index(&repo, &db_path, "test", repo_url)
+            .expect("a rename between parseable paths must not fail the incremental index");
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let moved = store.symbols_in_file("after.js").unwrap();
+        assert_eq!(
+            moved.len(),
+            1,
+            "the renamed file's symbol must be present at its new path"
+        );
+        assert_ne!(
+            moved[0].uid, old_uid,
+            "a rename re-keys the symbol, so the new UID must differ from the old"
+        );
+        assert!(
+            store.symbols_in_file("before.js").unwrap().is_empty(),
+            "no symbol may remain at the old path"
         );
     }
 

@@ -3963,58 +3963,22 @@ impl GraphStore {
         )
     }
 
-    /// Update `file_path` on every Symbol belonging to `repo_uid` that
-    /// currently has `old_path`.  LadybugDB does not support `SET`, so each
-    /// symbol is deleted and re-created with the new path while preserving all
-    /// other fields.
-    pub fn update_symbol_file_paths(
-        &self,
-        repo_uid: &str,
-        old_path: &str,
-        new_path: &str,
-    ) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        Self::update_symbol_file_paths_on(&conn, repo_uid, old_path, new_path)
-    }
-
-    /// Update symbol file paths using an externally-provided connection (for transaction batching).
-    pub fn update_symbol_file_paths_on(
-        conn: &lbug::Connection<'_>,
-        repo_uid: &str,
-        old_path: &str,
-        new_path: &str,
-    ) -> Result<(), StoreError> {
-        use crate::read::row_to_symbol;
-
-        let rows: Vec<_> = {
-            let r = conn
-                .query(&format!(
-                    "MATCH (s:Symbol) WHERE s.repo_uid = '{}' AND s.file_path = '{}' RETURN \
-                     s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, \
-                     s.signature, s.summary, s.content_hash, s.pagerank_score",
-                    repo_uid.replace('\'', "''"),
-                    old_path.replace('\'', "''"),
-                ))
-                .map_err(|e| StoreError::Query(format!("query symbols: {e}")))?;
-            r.collect()
-        };
-
-        for row in rows {
-            let mut sym = row_to_symbol(&row)?;
-            let old_uid = sym.uid.clone();
-            sym.file_path = new_path.to_string();
-
-            exec_params(
-                conn,
-                "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
-                vec![("uid", lbug::Value::String(old_uid))],
-            )?;
-
-            Self::insert_symbol_with_conn_static(conn, &sym)?;
-        }
-
-        Ok(())
-    }
+    // `update_symbol_file_paths` / `_on` were REMOVED here, not merely orphaned.
+    // They rewrote a Symbol's `file_path` while KEEPING its UID — but
+    // `symbol_uid` hashes the file path, so every row they produced had a UID
+    // that disagreed with its own `file_path`, an inconsistency nothing
+    // downstream expected. Their only callers were the incremental index's two
+    // rename arms, where the rows were deleted two statements later and
+    // re-created from the parse, so they preserved nothing; and their per-row
+    // CREATE poisoned the bulk `COPY Symbol` that followed in the same
+    // transaction, failing the whole incremental index on any parseable rename.
+    // A rename re-keys symbols: delete and re-insert them.
+    //
+    // They also carried a second, independent bug that this removal moots: the
+    // RETURN list omitted `s.end_line` while `row_to_symbol` reads by POSITION,
+    // shifting every column from index 6 on, so the parse hit `signature` where
+    // it expected an Int64 and the function errored for any symbol that had
+    // one. That error is what shielded the COPY failure above from view.
 
     /// Update the `indexed_sha` field of a Repo node.
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {
