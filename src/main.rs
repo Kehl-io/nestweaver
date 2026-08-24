@@ -13590,6 +13590,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             edge_type: &'a str,
                             confidence: f32,
                             depth: u32,
+                            // The daemon path emits this and the tool
+                            // description names it as the sort key ("results
+                            // sorted by impact_score, highest risk first"), so
+                            // a caller told to rank by it got nothing to rank
+                            // by on the direct path.
+                            impact_score: f64,
                         }
                         let json_nodes: Vec<_> = nodes
                             .iter()
@@ -13601,6 +13607,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 edge_type: &n.edge_type,
                                 confidence: n.confidence,
                                 depth: n.depth,
+                                impact_score: n.impact_score,
                             })
                             .collect();
                         let note = truncated.then(|| {
@@ -13615,8 +13622,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
-                                None,
-                                None,
+                                // `total` was hardcoded `None`, so the direct
+                                // path reported `"total": null` for a count it
+                                // knew — while the daemon path reported the
+                                // real number for the same query. When nothing
+                                // was truncated the returned set IS the total.
+                                // When it WAS truncated the pre-truncation
+                                // total is genuinely unknown here, and `None`
+                                // stays the honest answer rather than a guess.
+                                (!truncated).then_some(json_nodes.len() as u64),
+                                Some(json_nodes.len() as u64),
                                 note,
                             ))?
                         );

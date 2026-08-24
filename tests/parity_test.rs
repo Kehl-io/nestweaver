@@ -403,6 +403,52 @@ fn assert_parity(command: &str, mode_label: &str, direct: &Output, daemon: &Outp
 /// Run one command in both output formats, direct mode FIRST (before the
 /// daemon starts, since a running daemon may hold the DB lock), then daemon
 /// mode, and assert byte-identical stdout + equal exit codes for both formats.
+/// Like [`check_parity`], but compares the JSON output SEMANTICALLY.
+///
+/// Byte equality is the default because it is the stronger guarantee and
+/// catches formatting drift as well as content drift. It is the wrong
+/// assertion only where the two paths serialize the same data through
+/// different types: the daemon route round-trips through `serde_json::Value`,
+/// whose object is a BTreeMap and therefore alphabetises keys, while a direct
+/// path serializing a struct keeps declaration order. JSON object key order
+/// carries no meaning, so demanding it would be conforming the product to the
+/// test. Field PRESENCE and VALUES are the contract, and those are compared.
+fn check_parity_json_semantic(db_path: &Path, command: &str, args: &[&str]) {
+    let mut json_args: Vec<&str> = args.to_vec();
+    json_args.push("--json");
+
+    let direct_human = run_direct(db_path, args);
+    let direct_json = run_direct(db_path, &json_args);
+
+    let _guard = DaemonGuard::new(db_path);
+    start_daemon(db_path);
+
+    let daemon_human = run_via_daemon(db_path, args);
+    let daemon_json = run_via_daemon(db_path, &json_args);
+
+    assert_parity(command, "human", &direct_human, &daemon_human);
+
+    let parse = |label: &str, raw: &Output| -> serde_json::Value {
+        let text = String::from_utf8_lossy(&raw.stdout).into_owned();
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("{command} ({label}): stdout is not valid JSON: {error}\n{text}")
+        })
+    };
+    assert_eq!(
+        parse("direct", &direct_json),
+        parse("daemon", &daemon_json),
+        "{command} (json): parsed output diverged between direct and daemon mode\n\
+         --- direct ---\n{}\n--- daemon ---\n{}",
+        String::from_utf8_lossy(&direct_json.stdout),
+        String::from_utf8_lossy(&daemon_json.stdout)
+    );
+    assert_eq!(
+        direct_json.status.code(),
+        daemon_json.status.code(),
+        "{command} (json): exit code diverged"
+    );
+}
+
 fn check_parity(db_path: &Path, command: &str, args: &[&str]) {
     let mut json_args: Vec<&str> = args.to_vec();
     json_args.push("--json");
@@ -856,6 +902,61 @@ fn parity_export_scope_direct_vs_daemon() {
             &["export", "--format", "graphml", "--scope", scope],
         );
     }
+}
+
+/// Coverage sweep. Thirty commands route through the daemon; fourteen had a
+/// parity case. Every transport divergence found in the 7.0.0 review was the
+/// same shape — right on one path, wrong or absent on the other — and CI
+/// caught none of them, because both paths pass their own tests. These are the
+/// remaining routed commands whose fixture requirements are already met.
+///
+/// A command is worth covering here even when it currently agrees: the value
+/// is catching the day it stops.
+#[test]
+fn parity_list_repos_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    // Semantic: the direct path serializes a struct (declaration order), the
+    // daemon path round-trips through `serde_json::Value` (alphabetised). Same
+    // fields, same values, different key order — which is not a contract.
+    check_parity_json_semantic(&fixture.db_path, "list-repos", &["list-repos"]);
+}
+
+#[test]
+fn parity_brain_context_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "brain-context",
+        &["brain-context", "--seeds", "mainA"],
+    );
+}
+
+#[test]
+fn parity_brain_impact_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "impact", &["impact", "mainA"]);
+}
+
+#[test]
+fn parity_search_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "search", &["search", "helper"]);
+}
+
+#[test]
+fn parity_read_symbols_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "read-symbols", &["read-symbols", "mainA"]);
+}
+
+#[test]
+fn parity_detect_changes_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "detect-changes",
+        &["detect-changes", "--files", CHANGED_FILES],
+    );
 }
 
 /// nw-188's honesty fields — `more_available`, `truncated`, `budget_exceeded`,
