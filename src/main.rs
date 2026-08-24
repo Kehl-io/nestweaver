@@ -13622,15 +13622,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
-                                // `total` was hardcoded `None`, so the direct
-                                // path reported `"total": null` for a count it
-                                // knew — while the daemon path reported the
-                                // real number for the same query. When nothing
-                                // was truncated the returned set IS the total.
-                                // When it WAS truncated the pre-truncation
-                                // total is genuinely unknown here, and `None`
-                                // stays the honest answer rather than a guess.
-                                (!truncated).then_some(json_nodes.len() as u64),
+                                // `total` is the RESULT-SET size, matching the
+                                // daemon, which computes `nodes.len()` after
+                                // its visibility retain and regardless of
+                                // truncation. The truncation flags carry the
+                                // "this set is a FLOOR" meaning; `total` does
+                                // not.
+                                //
+                                // An earlier version of this emitted `None`
+                                // when truncated, reasoning that the
+                                // PRE-truncation universe is unknown here. True
+                                // but irrelevant — that is a different
+                                // quantity than the one the daemon reports
+                                // under the same key, so it reintroduced the
+                                // divergence it was meant to close, in the one
+                                // case the happy-path parity fixture cannot
+                                // reach.
+                                Some(json_nodes.len() as u64),
                                 Some(json_nodes.len() as u64),
                                 note,
                             ))?
