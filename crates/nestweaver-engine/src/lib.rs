@@ -347,6 +347,7 @@ pub use eval::{
 };
 pub use export::{
     ExportScope, export_cypher, export_graphml, export_graphml_scoped, export_mermaid,
+    export_text_format,
 };
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{

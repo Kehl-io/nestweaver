@@ -508,6 +508,55 @@ pub fn export_graphml_scoped(
     Ok(())
 }
 
+/// Render one of the text export formats, applying the scope policy.
+///
+/// ONE implementation, called by both the direct CLI path and the daemon's
+/// `export_graph` RPC. They previously diverged completely: the CLI parsed
+/// `--scope` and the daemon neither received nor read it, calling the
+/// unscoped `export_graphml`. Since the daemon route is the DEFAULT
+/// (`--no-daemon` is the fallback), `--scope` did nothing at all for most
+/// users while the engine-level tests passed.
+///
+/// Returns a notice when the chosen format cannot represent everything the
+/// scope asked for, so the caller can say so instead of silently writing less.
+pub fn export_text_format(
+    store: &GraphStore,
+    writer: &mut impl Write,
+    format: &str,
+    scope: ExportScope,
+    top: usize,
+) -> anyhow::Result<Option<String>> {
+    // Cypher and Mermaid are code-only representations. A VAULT scope is a
+    // request they cannot satisfy at all, so they refuse rather than write an
+    // empty file and report success.
+    if scope == ExportScope::Vault && matches!(format, "cypher" | "mermaid") {
+        anyhow::bail!(
+            "{format} export is code-only and cannot represent the vault subgraph; \
+             use --format graphml for --scope vault"
+        );
+    }
+    match format {
+        "cypher" => export_cypher(store, writer)?,
+        "mermaid" => export_mermaid(store, top, writer)?,
+        "graphml" => export_graphml_scoped(store, writer, scope)?,
+        other => anyhow::bail!(
+            "unknown export format '{other}' (expected: cypher, graphml, mermaid, msgpack)"
+        ),
+    }
+    // `all` on a code-only format is not an error — it is the default, and
+    // failing it would break every existing `export --format cypher`. But the
+    // file IS only the code subgraph, and nw-173 exists because that went
+    // unsaid.
+    Ok(
+        (scope == ExportScope::All && matches!(format, "cypher" | "mermaid")).then(|| {
+            format!(
+                "{format} is a code-only format: this export contains the code subgraph, \
+                 not the vault. Use --format graphml for the whole graph."
+            )
+        }),
+    )
+}
+
 // ── Mermaid export ───────────────────────────────────────────────────────────
 
 /// Sanitize a string for use as a Mermaid node ID.
@@ -810,6 +859,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scope policy both transports share.
+    ///
+    /// The engine-level scope tests passed while `--scope` did nothing for
+    /// users, because the CLI never sent it and the daemon never read it.
+    /// Pinning the POLICY in one place is what makes the two routes agree;
+    /// pinning `export_graphml_scoped` alone did not.
+    #[test]
+    fn shared_export_policy_refuses_what_a_format_cannot_represent() {
+        let store = populated_store();
+        let render = |format: &str, scope: ExportScope| {
+            let mut buf = Vec::new();
+            export_text_format(&store, &mut buf, format, scope, 10)
+                .map(|notice| (String::from_utf8(buf).unwrap(), notice))
+        };
+
+        // A vault scope on a code-only format is a request it cannot satisfy.
+        for format in ["cypher", "mermaid"] {
+            let error = render(format, ExportScope::Vault).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("code-only"),
+                "{format} must refuse --scope vault: {error:#}"
+            );
+        }
+
+        // `all` is the DEFAULT, so it must not fail — but the file really is
+        // code-only, and saying nothing is the nw-173 defect.
+        for format in ["cypher", "mermaid"] {
+            let (_, notice) = render(format, ExportScope::All).unwrap();
+            assert!(
+                notice.is_some_and(|n| n.contains("code-only")),
+                "{format} at --scope all must say the output is code-only"
+            );
+        }
+
+        // An explicit code scope asked for exactly what it got: no notice.
+        for format in ["cypher", "mermaid"] {
+            let (_, notice) = render(format, ExportScope::Code).unwrap();
+            assert!(notice.is_none(), "{format} --scope code needs no notice");
+        }
+
+        // graphml represents everything, so it never warns and never refuses.
+        for scope in [ExportScope::All, ExportScope::Code, ExportScope::Vault] {
+            let (output, notice) = render("graphml", scope).unwrap();
+            assert!(notice.is_none(), "graphml needs no notice at {scope:?}");
+            assert!(
+                output.contains("<graphml"),
+                "graphml must render at {scope:?}"
+            );
+        }
+
+        // graphml actually HONOURS the scope through this entry point, not
+        // just through `export_graphml_scoped`.
+        let (code_only, _) = render("graphml", ExportScope::Code).unwrap();
+        assert!(!code_only.contains(r#"<data key="kind">Note</data>"#));
+
+        assert!(render("nonsense", ExportScope::All).is_err());
     }
 
     #[test]

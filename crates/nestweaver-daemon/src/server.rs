@@ -4098,17 +4098,28 @@ impl NestWeaverDaemon for DaemonService {
                 .unwrap_or("cypher");
             let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let output_path = args.get("output").and_then(|v| v.as_str());
+            // The daemon route is the DEFAULT, and it neither received nor
+            // read `scope` — so `--scope code|vault` silently exported
+            // everything while the direct path honoured it.
+            let scope: nestweaver_engine::ExportScope = args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all")
+                .parse()
+                .map_err(|e| Status::invalid_argument(format!("invalid scope: {e}")))?;
 
             match format {
                 "cypher" | "graphml" | "mermaid" => {
                     let mut buf = Vec::new();
-                    match format {
-                        "cypher" => nestweaver_engine::export_cypher(&state.store, &mut buf),
-                        "graphml" => nestweaver_engine::export_graphml(&state.store, &mut buf),
-                        "mermaid" => nestweaver_engine::export_mermaid(&state.store, top, &mut buf),
-                        _ => unreachable!(),
-                    }
-                    .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+                    // Same shared implementation the direct CLI path uses.
+                    let notice = nestweaver_engine::export_text_format(
+                        &state.store,
+                        &mut buf,
+                        format,
+                        scope,
+                        top,
+                    )
+                    .map_err(|e| Status::invalid_argument(format!("export failed: {e:#}")))?;
 
                     let text = String::from_utf8(buf)
                         .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
@@ -4129,6 +4140,7 @@ impl NestWeaverDaemon for DaemonService {
                         "bytes": text.len(),
                         "text": if output_path.is_some() { None } else { Some(&text) },
                         "output": output_path,
+                        "notice": notice,
                     }))
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
@@ -4139,6 +4151,15 @@ impl NestWeaverDaemon for DaemonService {
                         ));
                     }
 
+                    // msgpack carries the code graph only; a vault scope is a
+                    // request it cannot satisfy, so refuse instead of writing
+                    // code and reporting success.
+                    if scope == nestweaver_engine::ExportScope::Vault {
+                        return Err(Status::invalid_argument(
+                            "msgpack export is code-only and cannot represent the vault subgraph; \
+                             use --format graphml for --scope vault",
+                        ));
+                    }
                     let graph = nestweaver_engine::export_in_memory_graph(&state.store)
                         .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
                     let bytes = rmp_serde::to_vec(&graph).map_err(|e| {

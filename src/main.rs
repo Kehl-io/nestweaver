@@ -97,10 +97,10 @@ use nestweaver_engine::{
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
-    embedding::generate_embeddings_batch, export_cypher, export_graphml_scoped,
-    export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
-    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
-    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
+    embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
+    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
+    generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
     index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
     load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
@@ -11150,7 +11150,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(db_path, None))?;
 
-                let mut args = serde_json::json!({ "format": format, "top": top });
+                // `scope` was never sent, so the daemon — the DEFAULT route —
+                // exported the whole graph no matter what `--scope` said.
+                let mut args = serde_json::json!({ "format": format, "top": top, "scope": scope });
                 if let Some(ref p) = output {
                     // The DAEMON writes the file and runs with CWD=/, so a client-relative
                     // --output would land in / (or fail), not the user's directory. Resolve
@@ -11173,6 +11175,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .context("export_graph RPC failed")?;
                 let result: serde_json::Value =
                     serde_json::from_str(&resp.into_inner().result_json)?;
+
+                if let Some(notice) = result.get("notice").and_then(|v| v.as_str()) {
+                    out.status(notice);
+                }
 
                 // For text formats without an output file, print the text to stdout.
                 if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
@@ -11242,33 +11248,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Parsed once, before dispatch, so an invalid scope fails before any
             // output is written rather than half way through a 163 MB file.
             let export_scope: ExportScope = scope.parse()?;
-            match format.as_str() {
-                // nw-173: `export` used to emit only the code subgraph with no
-                // indication. `graphml` now honours the scope; the two formats
-                // that genuinely cannot represent the vault REFUSE a vault
-                // scope rather than writing an empty file and calling it done.
-                "cypher" if export_scope.includes_vault() && export_scope != ExportScope::All => {
-                    anyhow::bail!(
-                        "cypher export is code-only and cannot represent the vault subgraph; \
-                         use --format graphml for --scope vault"
-                    )
-                }
-                "mermaid" if export_scope.includes_vault() && export_scope != ExportScope::All => {
-                    anyhow::bail!(
-                        "mermaid export is code-only and cannot represent the vault subgraph; \
-                         use --format graphml for --scope vault"
-                    )
-                }
-                "cypher" => export_cypher(&store, &mut writer)?,
-                "graphml" => export_graphml_scoped(&store, &mut writer, export_scope)?,
-                "mermaid" => export_mermaid(&store, top, &mut writer)?,
-                other => {
-                    eprintln!(
-                        "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
-                        other
-                    );
-                    return Ok((EXIT_ERROR, None));
-                }
+            // Unknown formats keep their friendly listing and EXIT_ERROR
+            // rather than becoming a generic error chain.
+            if !matches!(format.as_str(), "cypher" | "graphml" | "mermaid") {
+                eprintln!(
+                    "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
+                    format
+                );
+                return Ok((EXIT_ERROR, None));
+            }
+            // One shared implementation with the daemon's `export_graph`, so
+            // the two cannot drift on scope again.
+            if let Some(notice) =
+                export_text_format(&store, &mut writer, format.as_str(), export_scope, top)?
+            {
+                out.status(&notice);
             }
             std::io::Write::flush(&mut writer)?;
 
