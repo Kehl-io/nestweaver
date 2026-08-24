@@ -457,6 +457,84 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
         return canonical_parent.join(file_name);
     }
 
+    // A relative path whose parent does not resolve — most importantly a BARE
+    // `nestweaver.lbug`, where `parent()` is `Some("")` and also fails to
+    // canonicalize — used to be returned unchanged, hashing to a DIFFERENT
+    // instance id than the same database gets once the file exists:
+    //
+    //   before creation: canonicalize fails -> id = hash("nestweaver.lbug")
+    //   after creation:  canonicalize wins  -> id = hash("/cwd/nestweaver.lbug")
+    //
+    // So the first `daemon start` in a fresh directory bound one identity, and
+    // every command after the database existed looked for another — leaving a
+    // daemon holding the write lock that the CLI could no longer address by
+    // name. Joining the cwd makes the pre-creation answer agree with the
+    // post-creation one, which is what `database_path_fingerprint` already did
+    // for the same reason; this function simply never got the same treatment.
+    //
+    // The join is LEXICALLY NORMALIZED. `cwd.join("sub/../nw.lbug")` yields
+    // `/cwd/sub/../nw.lbug`, which hashes differently from the `/cwd/nw.lbug`
+    // that `canonicalize` returns once the file exists — the same fork, one
+    // path shape further out.
+    if db_path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return lexically_normalize(&cwd.join(db_path));
+    }
+
+    db_path.to_path_buf()
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// `Path::join` is purely textual, so a relative `--db` containing `..` would
+/// otherwise produce a path that never equals the canonicalized form.
+/// Deliberately lexical: the point is to agree with `canonicalize` for paths
+/// that do not exist YET, so it cannot resolve symlinks — and on the platforms
+/// this runs on, a `..` crossing a symlinked directory is the only case where
+/// the two disagree, which no `--db` argument in practice exercises.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // Never pop past the root; `/..` is `/`.
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Reproduce the PRE-nw-208 canonicalization exactly.
+///
+/// [`canonical_db_path`] now joins the cwd for an unresolvable relative path,
+/// which is the fix for a forked identity. `legacy_instance_id_from_db_path`
+/// must NOT inherit that: it exists to recompute a hash a previous release
+/// already wrote, and a legacy daemon that registered under the RELATIVE form
+/// stays unreachable if we look for it under the absolute one — leaving it
+/// holding the write lock, which is precisely the orphan the retirement path
+/// exists to clear. This is the same reasoning the module header gives for
+/// keeping `identity_db_path` away from that function.
+fn legacy_canonical_db_path(db_path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        return canonical;
+    }
+
+    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
+        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+    {
+        return canonical_parent.join(file_name);
+    }
+
     db_path.to_path_buf()
 }
 
@@ -2309,7 +2387,10 @@ pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let canonical = canonical_db_path(db_path);
+    // NOT `canonical_db_path`: see `legacy_canonical_db_path`. This must
+    // reproduce what a previous release hashed, including its treatment of an
+    // unresolvable relative path.
+    let canonical = legacy_canonical_db_path(db_path);
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
@@ -2648,6 +2729,103 @@ mod tests {
             Some(expected.as_str())
         );
         assert!(!selected.exists(), "the probe must not require the graph");
+    }
+
+    /// A bare relative db path must resolve to ONE instance id, before and
+    /// after the database file exists.
+    ///
+    /// It did not. `canonicalize` fails on a path that does not exist yet, and
+    /// for a BARE filename `parent()` is `Some("")`, which also fails — so the
+    /// path was returned relative and hashed to a different id than the same
+    /// database gets once created. The first `daemon start` in a fresh
+    /// directory therefore bound one identity while every later command looked
+    /// for another, leaving a daemon holding the write lock that the CLI could
+    /// no longer address.
+    ///
+    /// Takes ENV_LOCK because it mutates process-global cwd: the test harness
+    /// runs this binary's tests on many threads in ONE process, so without it
+    /// every concurrent test briefly observes a different working directory.
+    /// The cwd is restored by a guard rather than a plain statement, so a panic
+    /// between here and the end cannot strand the whole binary in a temp dir
+    /// that is about to be deleted.
+    #[test]
+    fn bare_relative_db_path_identity_is_stable_across_creation() {
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        // NOT `tempdir_in(".")`: under `cargo test` the cwd is the package
+        // root, so that leaves an untracked directory in the source tree when a
+        // run is killed. `.gitignore` has no `.tmp*` pattern, so the repo — and
+        // the indexer — would pick it up.
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let bare = Path::new("nestweaver.lbug");
+        let before = instance_id_from_db_path(bare);
+        std::fs::write(bare, b"x").unwrap();
+        let after = instance_id_from_db_path(bare);
+
+        assert_eq!(
+            before, after,
+            "a bare relative db path must resolve to ONE instance id before and \
+             after the file is created; got {before} then {after}"
+        );
+
+        // A relative path with a `..` component forks the same way one shape
+        // further out, which the bare case alone does not cover.
+        std::fs::create_dir("sub").unwrap();
+        let dotted = Path::new("sub/../nested.lbug");
+        let before_dotted = instance_id_from_db_path(dotted);
+        std::fs::write("nested.lbug", b"x").unwrap();
+        let after_dotted = instance_id_from_db_path(dotted);
+        assert_eq!(
+            before_dotted, after_dotted,
+            "a relative db path containing `..` must also resolve to one id; \
+             got {before_dotted} then {after_dotted}"
+        );
+    }
+
+    /// The LEGACY hash must keep reproducing what a previous release wrote,
+    /// including for a bare relative path — otherwise `stop_legacy_hash_daemon`
+    /// looks for an orphan under an id it never registered under, and the
+    /// orphan keeps the write lock. Pins that the nw-208 fix did NOT leak into
+    /// the historical algorithm.
+    #[test]
+    fn legacy_hash_still_reproduces_the_relative_form_it_must_clean_up() {
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let bare = Path::new("nestweaver.lbug");
+        // No file on disk: canonicalize fails, which is the only state where
+        // the legacy and current algorithms may differ.
+        let legacy = legacy_instance_id_from_db_path(bare);
+        let current = instance_id_from_db_path(bare);
+        assert_ne!(
+            legacy, current,
+            "the legacy hash is a DIFFERENT algorithm (DefaultHasher over the \
+             un-joined relative path); if these ever agree, the legacy function \
+             has stopped reproducing history"
+        );
+        assert_eq!(
+            legacy,
+            legacy_instance_id_from_db_path(bare),
+            "the legacy hash must be stable"
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub const RANKING_MULTIPLIER_MAX: f64 = 5.0;
 /// boosts (e.g. `Projects/*/sync.md → 1.5`). The multiplier is clamped to
 /// `[RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX]` on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobRule {
     pub glob: String,
     pub multiplier: f64,
@@ -33,6 +34,7 @@ pub struct GlobRule {
 /// **last** matching rule wins (last-match-wins), with `dampen` rules ordered
 /// before `boost` rules in the merged list. Empty config → no-op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RankingConfig {
     #[serde(default)]
     pub dampen: Vec<GlobRule>,
@@ -154,6 +156,7 @@ impl RankingConfig {
 
 /// Configuration for cross-domain link discovery (notes ↔ code bridging).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrossDomainConfig {
     /// Additional stoplist words to suppress on top of the built-in list.
     #[serde(default)]
@@ -168,6 +171,7 @@ pub struct CrossDomainConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LinkConfig {
     pub from: String,
     pub to: String,
@@ -185,6 +189,7 @@ pub struct LinkConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureConfig {
     pub name: String,
     pub description: Option<String>,
@@ -193,6 +198,7 @@ pub struct FeatureConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct InstanceConfig {
     pub instance_id: String,
     /// Optional data-identity assertion for this instance. Unlike
@@ -279,6 +285,7 @@ pub struct InstanceConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SourceIndexingConfig {
     #[serde(default = "default_max_source_file_bytes")]
     pub max_source_file_bytes: u64,
@@ -387,6 +394,7 @@ impl SourceIndexingConfig {
 /// isn't blocked by a high score. Opt into `strict_block_on_high_risk` for a
 /// stricter gate. A degraded/incomplete run is never blocked on risk regardless.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PrImpactConfig {
     /// Block a `--strict` run on a contract-verified breaking change
     /// (`BreakTier::Breaking`). Default: true.
@@ -413,6 +421,7 @@ impl Default for PrImpactConfig {
 /// where the model weights are cached, and the BM25/PPR/semantic fusion weights
 /// applied when blending result sets.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// HuggingFace model ID (or local path) for the sentence-transformer.
     /// Default: `"sentence-transformers/all-MiniLM-L6-v2"` (384-dim, fast). A DB's
@@ -557,6 +566,7 @@ impl Default for EmbeddingConfig {
 /// match, so a reindex invalidates everything WITHOUT a background daemon.
 /// `max_size_mb` caps total stored size; LRU eviction trims the rest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Maximum total cache size in MiB before LRU eviction kicks in.
     /// Default 256.
@@ -585,6 +595,7 @@ impl Default for CacheConfig {
 /// redaction is a no-op — the historical single-trust-domain behavior. Add any
 /// rule and the policy is *enabled*: it fails closed for unknown tokens.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzConfig {
     /// token -> repo glob patterns (matched against `Repo.url` and `Repo.uid`).
     #[serde(default)]
@@ -602,6 +613,7 @@ impl AuthzConfig {
 
 /// `[watch]` — vault file-watching configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -634,21 +646,30 @@ pub const DEFAULT_RESULT_LIMIT: usize = 50;
 /// thread-local `InstanceConfig` (set by the daemon or direct MCP server).
 /// When no instance config is loaded, tools fall back to
 /// `DEFAULT_RESULT_LIMIT`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
-    #[serde(default = "default_result_limit")]
-    pub default_result_limit: usize,
+    /// `None` means the operator did NOT set it — NOT "use 50".
+    ///
+    /// This used to be a `usize` with a serde default, which made it
+    /// indistinguishable from a value the operator actually wrote. Every
+    /// caller that asked "is a limit configured?" got `Some(50)` from any
+    /// parsed config, so merely passing `--config` for an unrelated reason
+    /// silently changed `nestweaver search`'s default from 10 to 50. Keeping
+    /// the option lets each caller apply its OWN documented default when
+    /// nothing was configured.
+    #[serde(default)]
+    pub default_result_limit: Option<usize>,
 }
 
-fn default_result_limit() -> usize {
-    DEFAULT_RESULT_LIMIT
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            default_result_limit: DEFAULT_RESULT_LIMIT,
-        }
+impl LimitsConfig {
+    /// The configured limit, or `builtin` when the operator set none.
+    ///
+    /// Callers pass their own documented default rather than a shared
+    /// constant, because they differ on purpose: `search` documents 10 and
+    /// `brain_search` documents 20.
+    pub fn result_limit_or(&self, builtin: usize) -> usize {
+        self.default_result_limit.unwrap_or(builtin)
     }
 }
 
@@ -660,6 +681,7 @@ impl Default for LimitsConfig {
 /// `inline_body_threshold`. Each body is truncated to `inline_max_body_tokens`
 /// (chars/4 estimate).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
     /// Minimum normalized relevance (0.0–1.0) a result must reach before its
     /// body is embedded inline. Default 0.75.
@@ -688,6 +710,7 @@ impl Default for ResponseConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: String,
     pub path: Option<String>,
@@ -697,12 +720,14 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub backend: String,
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct InferenceConfig {
     pub endpoint: String,
     pub embedding_model: String,
@@ -710,6 +735,7 @@ pub struct InferenceConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct GitConfig {
     pub credential_method: String,
 }
@@ -726,6 +752,7 @@ pub enum RepoType {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub url: String,
     /// Index strategy for this repo. Absent → treated as [`RepoType::Code`].
@@ -751,11 +778,13 @@ pub struct RepoConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaExtensions {
     pub extra_node_properties: Option<HashMap<String, HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub name: String,
     #[serde(default)]
@@ -781,6 +810,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WikiSourceConfig {
     pub label: String,
     pub mcp_server: String,
@@ -790,6 +820,7 @@ pub struct WikiSourceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalRefConfig {
     pub label: String,
     pub url: String,
@@ -798,6 +829,7 @@ pub struct ExternalRefConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
@@ -816,6 +848,7 @@ pub struct McpServerConfig {
 /// the engine crate to avoid a circular dependency. The client crate
 /// re-reads these entries via its own discovery layer at connect time.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamEntry {
     #[serde(default)]
     pub name: Option<String>,
@@ -841,6 +874,7 @@ fn default_upstream_timeout() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub indexing: IndexingConfig,
@@ -848,6 +882,7 @@ pub struct ServerConfig {
 
 /// `[daemon]` — daemon lifecycle policy.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Emit `RunAtLoad` into the generated macOS launch agent, so the daemon
     /// is *started* at login and not merely registered.
@@ -861,6 +896,7 @@ pub struct DaemonConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
@@ -1370,6 +1406,31 @@ fn validate_and_normalize_seed_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo in a config key used to be SILENTLY ACCEPTED. `with_trigams`
+    /// instead of `with_trigrams` left trigram refresh off while
+    /// `config validate` reported success — the operator had every reason to
+    /// believe the feature was on.
+    ///
+    /// Asserts the OBSERVABLE outcome: the load fails and the message NAMES the
+    /// offending key, so the typo is findable. A test that only checked "an
+    /// error occurred" would pass against an error that says nothing useful.
+    #[test]
+    fn an_unknown_config_key_is_rejected_and_named() {
+        let error = toml::from_str::<SourceIndexingConfig>("with_trigams = true\n")
+            .expect_err("an unknown key must not be silently accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains("with_trigams"),
+            "the error must name the offending key so the typo is findable: {message}"
+        );
+
+        // The correct spelling still parses — this rejects typos, not the
+        // feature.
+        let parsed: SourceIndexingConfig =
+            toml::from_str("with_trigrams = true\n").expect("the correct spelling must parse");
+        assert!(parsed.with_trigrams);
+    }
 
     const MINIMAL_TOML: &str = r#"
 instance_id = "test-instance"
