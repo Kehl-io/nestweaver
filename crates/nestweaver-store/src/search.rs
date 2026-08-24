@@ -1049,6 +1049,58 @@ impl EmbeddingIndex {
             journal.truncate(valid_bytes as usize);
         }
 
+        // Drop any Upsert that a later Delete supersedes.
+        //
+        // Replaying `Upsert A` then `Delete A` nets to deleted, so writing the
+        // Upsert achieves nothing — but resolving it calls `get(uid)`, and for
+        // an overlay-only UID the tombstone already removed the vector. That
+        // returned an error BEFORE `pending_deltas.clear()` below, so the
+        // poisoned delta was never drained and EVERY later flush failed on it.
+        // Both callers log and continue, so the sidecar silently stopped
+        // persisting for the life of the process.
+        //
+        // Reaching it needs one prior failed flush to retain the Upsert — a
+        // corrupt journal header, a transient IO error — after which an
+        // ordinary file deletion is enough.
+        //
+        // Only Upserts SUPERSEDED by a Delete are dropped. An Upsert with no
+        // vector and no matching Delete is still a real invariant violation
+        // and still errors.
+        let superseded: std::collections::HashSet<&str> = self
+            .pending_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EmbeddingDelta::Delete { uid } => Some(uid.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !superseded.is_empty() {
+            let mut seen_delete: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            // Walk backwards so "a Delete LATER than this Upsert" is exact: an
+            // Upsert that comes after the Delete (re-added in the same batch)
+            // must be kept.
+            let mut keep: Vec<bool> = Vec::with_capacity(self.pending_deltas.len());
+            for delta in self.pending_deltas.iter().rev() {
+                match delta {
+                    EmbeddingDelta::Delete { uid } => {
+                        seen_delete.insert(uid.as_str());
+                        keep.push(true);
+                    }
+                    EmbeddingDelta::Upsert { uid } => {
+                        keep.push(!seen_delete.contains(uid.as_str()));
+                    }
+                    EmbeddingDelta::Clear => keep.push(true),
+                }
+            }
+            keep.reverse();
+            let mut index = 0;
+            self.pending_deltas.retain(|_| {
+                let keep_this = keep[index];
+                index += 1;
+                keep_this
+            });
+        }
+
         let count = self.pending_deltas.len();
         let mut next_sequence = self.journal_sequence;
         for delta in &self.pending_deltas {
@@ -2682,6 +2734,92 @@ mod tests {
             Some(produced.fingerprint().unwrap())
         );
         assert!(!index.add_with_pipeline("bad", vec![1.0, 0.0], &produced, false));
+    }
+
+    /// A pending Upsert whose vector is later tombstoned wedges EVERY future
+    /// flush, permanently and silently.
+    ///
+    /// `append_journal_v2` resolves each pending `Upsert` via `get(uid)` and
+    /// errors when it returns `None`, returning BEFORE `pending_deltas.clear()`
+    /// — so the poisoned delta is never drained and every subsequent flush
+    /// fails on it. Both callers (the embed pass tail flush and the reconciler)
+    /// log and continue, so the sidecar simply stops persisting for the life of
+    /// the process with nothing reported.
+    ///
+    /// Reaching it needs one prior failed flush; a corrupt journal header is
+    /// the deterministic way in, and is a real state — the same one
+    /// `journal_replays_..._torn_tail` exists for, one step worse.
+    #[test]
+    fn a_tombstoned_pending_upsert_does_not_wedge_every_later_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("embeddings-v2.journal");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 2);
+
+        let mut index = EmbeddingIndex::new();
+        // Overlay-only: no base, so removing it from `embeddings` makes
+        // `get` return None.
+        assert!(index.add_with_pipeline("doomed", vec![1.0, 0.0], &pipeline, false));
+        assert!(index.add_with_pipeline("kept", vec![0.0, 1.0], &pipeline, false));
+
+        // A corrupt journal fails the flush and RETAINS the pending deltas.
+        std::fs::write(&journal, b"not-a-nestweaver-journal").unwrap();
+        assert!(
+            index
+                .append_journal_v2(&journal, &identity, &pipeline)
+                .is_err(),
+            "precondition: a corrupt header must fail the flush"
+        );
+
+        // The operator clears the corrupt file, so nothing is wrong on disk.
+        std::fs::remove_file(&journal).unwrap();
+
+        // The file holding `doomed` is deleted and the watcher tombstones it —
+        // routine, and the step that poisons the retained Upsert.
+        assert_eq!(index.tombstone_uids(&["doomed".to_string()]), 1);
+
+        // This flush used to fail forever: "pending embedding upsert doomed has
+        // no vector", never clearing, so the sidecar stopped persisting.
+        index
+            .append_journal_v2(&journal, &identity, &pipeline)
+            .expect("a tombstoned pending upsert must not wedge the flush");
+
+        // And the surviving vector really is on disk: a fresh index replaying
+        // the journal sees `kept` and not `doomed`.
+        let mut replayed = EmbeddingIndex::new();
+        replayed
+            .replay_journal_v2(&journal, &identity, &pipeline)
+            .expect("replay the journal written above");
+        assert!(
+            replayed.get("kept").is_some(),
+            "the live vector must persist"
+        );
+        assert!(
+            replayed.get("doomed").is_none(),
+            "the tombstoned vector must not come back"
+        );
+
+        // The edge the coalescing must NOT break: deleted and then RE-ADDED in
+        // the same batch. Only an Upsert superseded by a LATER Delete is
+        // droppable; this one comes after, so it must survive.
+        let journal2 = dir.path().join("readded.journal");
+        let mut index = EmbeddingIndex::new();
+        assert!(index.add_with_pipeline("revived", vec![1.0, 0.0], &pipeline, false));
+        assert_eq!(index.tombstone_uids(&["revived".to_string()]), 1);
+        assert!(index.add_with_pipeline("revived", vec![0.25, 0.75], &pipeline, false));
+        index
+            .append_journal_v2(&journal2, &identity, &pipeline)
+            .expect("a re-added vector must still flush");
+
+        let mut replayed = EmbeddingIndex::new();
+        replayed
+            .replay_journal_v2(&journal2, &identity, &pipeline)
+            .expect("replay");
+        assert_eq!(
+            replayed.get("revived"),
+            Some(vec![0.25, 0.75]),
+            "a vector re-added after a delete must survive the coalescing"
+        );
     }
 
     #[test]
