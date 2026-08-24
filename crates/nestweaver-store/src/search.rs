@@ -2736,7 +2736,6 @@ mod tests {
         assert!(!index.add_with_pipeline("bad", vec![1.0, 0.0], &produced, false));
     }
 
-    #[test]
     /// A pending Upsert whose vector is later tombstoned wedges EVERY future
     /// flush, permanently and silently.
     ///
@@ -2823,6 +2822,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn journal_replays_upserts_deletes_and_ignores_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("embeddings-v2.bin");
