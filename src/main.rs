@@ -11754,7 +11754,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::WatchStop { db, config } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            // `resolve_db_with_config`, not a bare `--db` fallback: this
+            // command accepts `--config`, so it must resolve the database the
+            // way every other config-aware command does — honouring the
+            // config's `db`, following the publication CURRENT pointer, and
+            // asserting `expected_brain_uuid`. Taking `--config` and then
+            // ignoring it is exactly what the config-DB inventory contract
+            // exists to catch, and it caught this.
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
                 &db_path,
@@ -21385,6 +21392,7 @@ mod cli_help_contract_tests {
             "nestweaver suggest-links",
             "nestweaver ui",
             "nestweaver watch",
+            "nestweaver watch-stop",
         ]
         .map(str::to_string)
         .to_vec();
