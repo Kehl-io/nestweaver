@@ -1075,11 +1075,6 @@ fn parity_detect_changes_direct_vs_daemon() {
     );
 }
 
-/// nw-188's honesty fields — `more_available`, `truncated`, `budget_exceeded`,
-/// `seed_tokens_charged` — were added to the daemon/MCP path only, so the same
-/// command answered with four extra keys and a different `tokens_used`
-/// depending on whether a daemon happened to be running. A tight budget is
-/// used deliberately: it is the case that produced the original report.
 // `parity_project_context_direct_vs_daemon` is deliberately absent until the
 // fixture can carry a project. `setup_fixture` indexes four plain `.js` files
 // and creates no Project node, so `project-context demo` exited NOT_FOUND on
