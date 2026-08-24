@@ -73,6 +73,38 @@ pub(crate) fn pagerank_artifact_contract(
              re-index to produce a self-describing artifact"
         );
     }
+    // The declaration must match what THIS BUILD computes with. Recomputing
+    // the fingerprint from the declaration (below) only proves the artifact
+    // agrees with itself; without this an artifact declaring damping 0.5 and
+    // carrying the correct fingerprint FOR 0.5 passed, because nothing
+    // supplied an independent expectation. Scope is not checked here — it
+    // legitimately varies between a code-only and a unified pass.
+    for (field, expected, actual) in [
+        (
+            "damping",
+            nestweaver_store::ranking::PAGERANK_DAMPING,
+            declared.get("damping").and_then(|value| value.as_f64()),
+        ),
+        (
+            "iterations",
+            f64::from(nestweaver_store::ranking::PAGERANK_ITERATIONS),
+            declared.get("iterations").and_then(|value| value.as_f64()),
+        ),
+    ] {
+        let Some(actual) = actual else {
+            anyhow::bail!(
+                "PageRank sidecar declares no {field}, so its parameters cannot be \
+                 checked against this build's"
+            );
+        };
+        if actual != expected {
+            anyhow::bail!(
+                "PageRank sidecar declares {field} {actual} but this build computes \
+                 with {expected}; the artifact was produced by a different \
+                 configuration and its scores are not comparable"
+            );
+        }
+    }
     let recomputed = nestweaver_store::ranking::pagerank_fingerprint_from_declared(declared)
         .ok_or_else(|| {
             anyhow::anyhow!("PageRank sidecar declares malformed algorithm parameters: {declared}")
@@ -1327,6 +1359,79 @@ mod tests {
             classify_artifact_descriptor(&expected, Err("torn header".to_string())),
             ArtifactState::Corrupt { .. }
         ));
+    }
+
+    /// nw-147, second half. Recomputing the fingerprint from the parameters an
+    /// artifact DECLARES proves only that the artifact agrees with itself.
+    ///
+    /// An artifact computed with foreign damping can declare that damping and
+    /// carry the correct fingerprint FOR it, and every internal check passes —
+    /// because nothing supplied an expectation from outside the artifact. The
+    /// scores are then silently incomparable with the ones this build produces.
+    #[test]
+    fn a_self_consistent_pagerank_artifact_from_a_foreign_configuration_is_refused() {
+        use nestweaver_store::artifact_envelope::{ArtifactEnvelope, ArtifactExpectation};
+        use nestweaver_store::ranking::{
+            PAGERANK_ARTIFACT_KIND, PAGERANK_ARTIFACT_SCHEMA_VERSION, PAGERANK_DAMPING,
+            PAGERANK_ITERATIONS, pagerank_algorithm_fingerprint, pagerank_declared_parameters,
+        };
+
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            publication_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+        };
+        let scope = nestweaver_store::GraphScope::code_only();
+        let scores: std::collections::HashMap<String, f64> =
+            [("sym:a".to_string(), 1.0)].into_iter().collect();
+
+        // Fully self-consistent by construction: the declaration and the
+        // fingerprint are produced from the SAME parameters, so every check
+        // internal to the artifact agrees.
+        let sealed = |damping: f64, iterations: u32| -> Vec<u8> {
+            let envelope = ArtifactEnvelope::new(
+                ArtifactExpectation {
+                    artifact_kind: PAGERANK_ARTIFACT_KIND,
+                    artifact_schema_version: PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                    identity: &identity,
+                    producer_version: env!("CARGO_PKG_VERSION"),
+                    source_graph_generation: 1,
+                    algorithm_fingerprint: &pagerank_algorithm_fingerprint(
+                        damping, iterations, &scope,
+                    ),
+                },
+                &scores,
+            )
+            .expect("seal artifact")
+            .with_algorithm_parameters(pagerank_declared_parameters(damping, iterations, &scope));
+            serde_json::to_vec(&envelope).expect("serialize envelope")
+        };
+
+        // The build's own parameters still load.
+        pagerank_artifact_contract(
+            &sealed(PAGERANK_DAMPING, PAGERANK_ITERATIONS),
+            &identity,
+            env!("CARGO_PKG_VERSION"),
+            1,
+        )
+        .expect("an artifact matching this build's parameters must load");
+
+        // A different damping, and a different iteration count, each refused
+        // by name — despite being internally consistent.
+        for (label, bytes) in [
+            ("damping", sealed(0.5, PAGERANK_ITERATIONS)),
+            (
+                "iterations",
+                sealed(PAGERANK_DAMPING, PAGERANK_ITERATIONS + 1),
+            ),
+        ] {
+            let error = pagerank_artifact_contract(&bytes, &identity, env!("CARGO_PKG_VERSION"), 1)
+                .expect_err("a foreign configuration must be refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(label) && rendered.contains("this build computes with"),
+                "{label} mismatch must be named: {rendered}"
+            );
+        }
     }
 
     /// nw-149. `validate_metadata` accepted three shapes it should not.

@@ -1174,7 +1174,9 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                     && let Err(error) = store.load_pagerank_cache_expecting(
                         &crate::sidecar_path(db_path, ".pagerank.json"),
                         Some(&nestweaver_store::ranking::pagerank_algorithm_fingerprint(
-                            0.85, 20, scope,
+                            nestweaver_store::ranking::PAGERANK_DAMPING,
+                            nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                            scope,
                         )),
                     )
                 {

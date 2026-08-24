@@ -40,6 +40,21 @@ pub const PAGERANK_ARTIFACT_KIND: &str = "ranking";
 pub const PAGERANK_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:";
 
+/// The damping factor and iteration count every production PageRank pass uses.
+///
+/// Named because a READER needs an expectation that does not come from the
+/// artifact. Recomputing a fingerprint from the parameters an artifact declares
+/// proves the artifact is internally consistent — it does NOT prove those are
+/// the parameters this build computes with, so an artifact declaring different
+/// damping, carrying the matching fingerprint for that damping, passed. These
+/// constants are what a reader checks the declaration AGAINST.
+///
+/// Scope is deliberately not pinned here: it legitimately varies (code-only
+/// versus unified), so it stays part of the declaration rather than a
+/// constant.
+pub const PAGERANK_DAMPING: f64 = 0.85;
+pub const PAGERANK_ITERATIONS: u32 = 20;
+
 /// The algorithm/scope fingerprint an artifact computed with these parameters
 /// must carry. Public so a caller that KNOWS the parameters can pass the
 /// expected value to [`GraphStore::load_pagerank_cache_expecting`] instead of
