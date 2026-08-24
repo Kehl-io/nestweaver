@@ -272,6 +272,10 @@ pub struct GraphStore {
     /// confuse code-only, notes-only, unified, or parameter-incompatible
     /// ranks.
     pub(crate) pagerank_artifact_fingerprint: Mutex<Option<String>>,
+    /// The parameters that produced `pagerank_artifact_fingerprint`, declared
+    /// into the artifact so a reader can recompute rather than trust it
+    /// (nw-147).
+    pub(crate) pagerank_declared_parameters: Mutex<Option<serde_json::Value>>,
     /// Monotonic counter that bumps whenever PageRank scores change. Lets
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
@@ -622,6 +626,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_declared_parameters: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -674,6 +679,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_declared_parameters: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -710,6 +716,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_declared_parameters: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -747,6 +754,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_declared_parameters: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
@@ -810,6 +818,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
+            pagerank_declared_parameters: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),

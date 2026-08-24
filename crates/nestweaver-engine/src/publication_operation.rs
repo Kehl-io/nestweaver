@@ -822,6 +822,49 @@ fn validate_target_slot(
             .into());
         }
     }
+
+    // nw-149: and the REVERSE. The loop above only proves every DESCRIBED file
+    // is present and intact; it says nothing about files present but not
+    // described, so anything dropped into a sealed slot was invisible to
+    // validation and travelled with the publication. `validate_backup_publication_inventory`
+    // already required `described == present` for the same artifacts — this
+    // path simply never got the other half.
+    //
+    // Filed as a hardening asymmetry rather than a proven escape: the probe
+    // matrix achieved no exploit. It closes a gap in an invariant; it does not
+    // patch a known attack.
+    let described: std::collections::BTreeSet<&str> = bundle
+        .artifacts
+        .iter()
+        .map(|descriptor| descriptor.path.as_str())
+        .collect();
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&slot)
+        .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?
+    {
+        let entry = entry.map_err(|error| anyhow::anyhow!("read target slot entry: {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The manifest describes the artifacts; it does not describe itself.
+        if name == crate::publication::PUBLICATION_MANIFEST_FILE {
+            continue;
+        }
+        present.insert(name);
+    }
+    let undescribed: Vec<&String> = present
+        .iter()
+        .filter(|name| !described.contains(name.as_str()))
+        .collect();
+    if !undescribed.is_empty() {
+        // Permanent for the same reason as a digest mismatch: a retry sees the
+        // same directory.
+        return Err(PermanentPublicationFailure(format!(
+            "target slot contains {} file(s) the manifest does not describe: {:?};              a sealed slot must contain exactly what it declares",
+            undescribed.len(),
+            undescribed
+        ))
+        .into());
+    }
+
     Ok(crate::hash::blake3_hex_bytes(&bytes))
 }
 
@@ -949,13 +992,35 @@ mod tests {
     fn write_target_bundle(root: &Path, plan: &PublicationOperationPlan) -> String {
         let slot = crate::publication::slot_path(root, &plan.target_publication_uuid).unwrap();
         std::fs::create_dir_all(&slot).unwrap();
+        // The bundle describes a real artifact and the slot holds exactly that
+        // file. An empty `artifacts` list used to be enough here, but a
+        // publication describing nothing is not a publication — and slot
+        // validation is now bidirectional, so an undescribed file in the slot
+        // is rejected too.
+        let graph = b"nw-test-graph".to_vec();
+        std::fs::write(
+            slot.join(crate::publication::PUBLICATION_GRAPH_FILE),
+            &graph,
+        )
+        .unwrap();
         let bundle = crate::publication::PublicationBundleV3 {
             format_version: plan.publication_format_version,
             brain_uuid: plan.brain_uuid.clone(),
             publication_uuid: plan.target_publication_uuid.clone(),
             producer_version: plan.producer_version.clone(),
             source_graph_generation: 0,
-            artifacts: Vec::new(),
+            artifacts: vec![crate::publication::ArtifactDescriptor {
+                path: crate::publication::PUBLICATION_GRAPH_FILE.to_string(),
+                kind: crate::publication::ArtifactKind::Graph,
+                artifact_schema_version: 1,
+                byte_size: graph.len() as u64,
+                blake3: crate::hash::blake3_hex_bytes(&graph),
+                brain_uuid: plan.brain_uuid.clone(),
+                publication_uuid: plan.target_publication_uuid.clone(),
+                producer_version: plan.producer_version.clone(),
+                source_graph_generation: 0,
+                algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+            }],
         };
         let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
         std::fs::write(

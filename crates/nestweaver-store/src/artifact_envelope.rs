@@ -22,6 +22,18 @@ pub struct ArtifactEnvelope {
     pub producer_version: String,
     pub source_graph_generation: u64,
     pub algorithm_fingerprint: String,
+    /// The parameters the producer used, declared in the open.
+    ///
+    /// nw-147: `algorithm_fingerprint` is an opaque hash, so a reader with no
+    /// independent expectation could only compare it to ITSELF — which always
+    /// passes. Recording the inputs lets a reader RECOMPUTE the fingerprint
+    /// and reject an artifact whose declared parameters do not produce the
+    /// fingerprint it carries. An artifact can then no longer vouch for its
+    /// own provenance.
+    ///
+    /// Shape is per artifact kind; `null` for kinds that declare nothing yet.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub algorithm_parameters: Value,
     pub payload_blake3: String,
     pub payload: Value,
 }
@@ -57,9 +69,20 @@ impl ArtifactEnvelope {
             producer_version: expectation.producer_version.to_string(),
             source_graph_generation: expectation.source_graph_generation,
             algorithm_fingerprint: expectation.algorithm_fingerprint.to_string(),
+            algorithm_parameters: Value::Null,
             payload_blake3,
             payload,
         })
+    }
+
+    /// Declare the parameters that produced this artifact's fingerprint.
+    ///
+    /// nw-147: a reader can then recompute the fingerprint from these and
+    /// refuse an artifact whose declaration does not match what it carries.
+    #[must_use]
+    pub fn with_algorithm_parameters(mut self, parameters: Value) -> Self {
+        self.algorithm_parameters = parameters;
+        self
     }
 
     pub fn validate_and_decode<T: DeserializeOwned>(

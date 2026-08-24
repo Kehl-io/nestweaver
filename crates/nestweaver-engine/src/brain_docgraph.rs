@@ -386,7 +386,20 @@ pub struct CoOccurringTag {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagGraph {
     pub tag: String,
+    /// Notes carrying this tag OR any nested descendant of it.
     pub count: usize,
+    /// The descendant tags folded into `count`, e.g. `project/nestweaver` for
+    /// a focus of `project`. Empty for a leaf.
+    ///
+    /// nw-172: emitted so a caller can tell "47 notes, 46 of them from
+    /// children" from "47 notes on this exact tag" — the count alone cannot
+    /// express that, and the previous bare `0` for a parent tag was
+    /// indistinguishable from "no such tag".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descendants: Vec<String>,
+    /// Notes carrying this tag EXACTLY, excluding descendants.
+    #[serde(default)]
+    pub exact_count: usize,
     pub co_occurring: Vec<CoOccurringTag>,
 }
 
@@ -429,20 +442,49 @@ pub fn tag_graph_all(store: &GraphStore) -> Result<Vec<TagGraph>> {
 /// Shared co-occurrence computation for a single normalized focus tag against
 /// pre-fetched note tag sets. `focus` must already be trimmed/lowercased.
 fn tag_graph_from_sets(focus: &str, sets: &[(String, Vec<String>)]) -> TagGraph {
+    // nw-172: a parent tag matches its nested descendants.
+    //
+    // `#project` used to match only the literal tag `project` and returned 0
+    // while `project/nestweaver` returned 46 — a silent zero for a tag that
+    // demonstrably exists in the hierarchy, indistinguishable from "no such
+    // tag". Obsidian's own search matches descendants for a parent, which is
+    // the behaviour a vault user arrives with.
+    //
+    // The separator is required: `project` matches `project/x` but never
+    // `projects`, which a bare prefix test would silently fold in.
+    let prefix = format!("{focus}/");
+    let matches_focus = |t: &str| {
+        let lower = t.to_lowercase();
+        lower == focus || lower.starts_with(&prefix)
+    };
+
     let mut focus_count = 0usize;
+    let mut exact_count = 0usize;
+    let mut descendants: Vec<String> = Vec::new();
+    let mut seen_descendant = std::collections::HashSet::new();
     let mut co: HashMap<String, usize> = HashMap::new();
     for (_note, tags) in sets {
-        if !tags.iter().any(|t| t.to_lowercase() == focus) {
+        if !tags.iter().any(|t| matches_focus(t)) {
             continue;
         }
         focus_count += 1;
+        if tags.iter().any(|t| t.to_lowercase() == focus) {
+            exact_count += 1;
+        }
         for t in tags {
-            if t.to_lowercase() == focus {
+            if matches_focus(t) {
+                // A descendant is part of the focus, not a co-occurrence —
+                // counting `project/nestweaver` as co-occurring with `project`
+                // would report the hierarchy as a relationship.
+                if t.to_lowercase() != focus && seen_descendant.insert(t.to_lowercase()) {
+                    descendants.push(t.clone());
+                }
                 continue;
             }
             *co.entry(t.clone()).or_default() += 1;
         }
     }
+    descendants.sort();
     let mut co_occurring: Vec<CoOccurringTag> = co
         .into_iter()
         .map(|(tag, count)| CoOccurringTag { tag, count })
@@ -452,6 +494,8 @@ fn tag_graph_from_sets(focus: &str, sets: &[(String, Vec<String>)]) -> TagGraph 
     TagGraph {
         tag: focus.to_string(),
         count: focus_count,
+        descendants,
+        exact_count,
         co_occurring,
     }
 }
@@ -847,6 +891,71 @@ mod tests {
             .find(|c| c.tag == "urgent")
             .expect("urgent should co-occur with project");
         assert_eq!(urgent.count, 1);
+    }
+
+    /// nw-172. A PARENT tag must match its nested descendants, and must never
+    /// report a bare 0 for a tag that demonstrably has children.
+    ///
+    /// `#project` used to match only the literal tag and returned 0 while
+    /// `project/nestweaver` returned 46 — indistinguishable from "no such
+    /// tag", which is what made every `tags=["project"]` filter silently empty.
+    #[test]
+    fn a_parent_tag_matches_its_nested_descendants() {
+        let (_dir, root) = make_vault(&[
+            (
+                "Alpha.md",
+                "---\ntags: [project/nestweaver]\n---\n# Alpha\n",
+            ),
+            (
+                "Beta.md",
+                "---\ntags: [project/shot-insights, urgent]\n---\n# Beta\n",
+            ),
+            ("Gamma.md", "---\ntags: [project]\n---\n# Gamma\n"),
+            // A tag that SHARES THE PREFIX but is not a child. A bare
+            // `starts_with` would silently fold this in.
+            ("Delta.md", "---\ntags: [projects]\n---\n# Delta\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let tg = tag_graph(&store, "project").unwrap();
+        assert_eq!(
+            tg.count, 3,
+            "the parent must cover its two children plus its own exact use, and \
+             must NOT include the unrelated `projects`: {tg:?}"
+        );
+        assert_eq!(tg.exact_count, 1, "only Gamma carries the bare tag");
+        assert_eq!(
+            tg.descendants,
+            vec![
+                "project/nestweaver".to_string(),
+                "project/shot-insights".to_string()
+            ],
+            "the folded-in children are disclosed, so a caller can tell a busy \
+             parent from a busy leaf"
+        );
+
+        // A descendant is part of the focus, not a co-occurrence — reporting
+        // `project/nestweaver` as co-occurring with `project` would present the
+        // hierarchy as a relationship.
+        assert!(
+            !tg.co_occurring
+                .iter()
+                .any(|c| c.tag.starts_with("project/")),
+            "descendants must not appear as co-occurring tags: {tg:?}"
+        );
+        // A genuine co-occurrence still shows up.
+        assert!(tg.co_occurring.iter().any(|c| c.tag == "urgent"));
+
+        // The sibling prefix is its own tag and unaffected.
+        let siblings = tag_graph(&store, "projects").unwrap();
+        assert_eq!(siblings.count, 1);
+        assert!(siblings.descendants.is_empty());
+
+        // A leaf still behaves exactly as before.
+        let leaf = tag_graph(&store, "project/nestweaver").unwrap();
+        assert_eq!(leaf.count, 1);
+        assert_eq!(leaf.exact_count, 1);
+        assert!(leaf.descendants.is_empty());
     }
 
     #[test]

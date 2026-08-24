@@ -18680,6 +18680,7 @@ fn run_brain(
                     serde_json::to_string_pretty(&serde_json::json!({
                         "repo_count": repos.len(),
                         "any_stale": any_stale,
+                        "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "repos": results,
                     }))?

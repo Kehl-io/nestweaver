@@ -2096,11 +2096,62 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
-    /// Returns the set of Note UIDs that are tagged with any of the given tag names.
+    /// Expand each requested tag to itself plus every nested descendant.
+    ///
+    /// nw-172: `#project` matched only the literal tag `project`, so a filter
+    /// on a PARENT that exists in the hierarchy returned zero — indistinguishable
+    /// from "no such tag" — while `project/nestweaver` returned 46. A silent
+    /// zero for a tag that demonstrably has children is the defect.
+    ///
+    /// Descendants-by-default matches what Obsidian's own search does for a
+    /// parent tag, which is the behaviour a vault user arrives with. (Obsidian
+    /// is not uniformly consistent here — its Bases `tags.contains()` is
+    /// exact-only, and that inconsistency is an active complaint — so the
+    /// argument is the silent zero, not "Obsidian does it".)
+    ///
+    /// Separator is `/`, matching the nested-tag syntax. `project` expands to
+    /// `project` and `project/*`, but never to `projects` — a prefix match
+    /// without the separator would silently widen the filter to unrelated tags.
+    pub fn expand_tags_with_descendants(
+        &self,
+        tag_names: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        if tag_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all = self.list_tags(None)?;
+        let mut expanded: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for requested in tag_names {
+            let requested = requested.trim_start_matches('#');
+            let prefix = format!("{requested}/");
+            for tag in &all {
+                if (tag.name == requested || tag.name.starts_with(&prefix))
+                    && seen.insert(tag.name.clone())
+                {
+                    expanded.push(tag.name.clone());
+                }
+            }
+            // A requested tag that matches nothing at all is still passed
+            // through, so the caller's own "no such tag" handling still fires
+            // rather than being masked by an empty expansion.
+            if seen.insert(requested.to_string()) {
+                expanded.push(requested.to_string());
+            }
+        }
+        Ok(expanded)
+    }
+
+    /// Returns the set of Note UIDs that are tagged with any of the given tag
+    /// names, INCLUDING their nested descendants (see
+    /// [`expand_tags_with_descendants`]).
+    ///
+    /// [`expand_tags_with_descendants`]: Self::expand_tags_with_descendants
     pub fn list_note_uids_with_tags(
         &self,
         tag_names: &[String],
     ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let tag_names = &self.expand_tags_with_descendants(tag_names)?;
         let conn = self.conn()?;
         let mut uids = std::collections::HashSet::new();
         for tag_name in tag_names {
@@ -2120,11 +2171,13 @@ impl GraphStore {
         Ok(uids)
     }
 
-    /// Returns the set of Section UIDs that are tagged with any of the given tag names.
+    /// Returns the set of Section UIDs that are tagged with any of the given
+    /// tag names, INCLUDING their nested descendants.
     pub fn list_section_uids_with_tags(
         &self,
         tag_names: &[String],
     ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let tag_names = &self.expand_tags_with_descendants(tag_names)?;
         let conn = self.conn()?;
         let mut uids = std::collections::HashSet::new();
         for tag_name in tag_names {
