@@ -18474,17 +18474,26 @@ fn run_brain(
                 // `stale_repos` verdict could contradict the tool's fresh
                 // `any_stale` — is replaced by a top-level `stale_repos`
                 // computed from the actual stale list).
-                let stale_urls: Vec<serde_json::Value> = value
-                    .get("repos")
-                    .and_then(|v| v.as_array())
-                    .map(|repos| {
-                        repos
-                            .iter()
-                            .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
-                            .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let urls_where = |field: &str| -> Vec<serde_json::Value> {
+                    value
+                        .get("repos")
+                        .and_then(|v| v.as_array())
+                        .map(|repos| {
+                            repos
+                                .iter()
+                                .filter(|r| r[field].as_bool().unwrap_or(false))
+                                .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let stale_urls = urls_where("is_stale");
+                // nw-163: `stale_repos` narrowed along with `is_stale`, so it
+                // no longer names an `incomplete` or `missing` repo — yet those
+                // still exit 2, and the CI recipe tells a job to re-index what
+                // this array names. `needs_reindex_repos` is the actionable
+                // set; `stale_repos` stays behind-HEAD only.
+                let needs_reindex_urls = urls_where("needs_reindex");
                 let any_stale = value
                     .get("any_stale")
                     .and_then(|v| v.as_bool())
@@ -18502,6 +18511,7 @@ fn run_brain(
                         "any_stale": any_stale,
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
+                        "needs_reindex_repos": needs_reindex_urls,
                         "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
                     });
                     println!("{}", serde_json::to_string_pretty(&normalized)?);
@@ -18522,8 +18532,12 @@ fn run_brain(
                         println!(
                             "Stale check: {} repo(s), {}",
                             repo_count,
-                            if any_stale {
-                                "INDEX IS STALE"
+                            // Gated on the union, not `any_stale`: an `incomplete`
+                            // repo exits 2, and a banner reading "up to date"
+                            // above that exit code is the exact dishonesty this
+                            // contract exists to remove.
+                            if any_needs_reindex {
+                                "NEEDS REINDEX"
                             } else {
                                 "up to date"
                             }
@@ -18619,13 +18633,14 @@ fn run_brain(
                     }
                     _ => repo.staleness_commits_behind as u64,
                 };
-                let is_stale = if local_missing {
-                    true
-                } else {
-                    match &current_head {
-                        Some(head) => head != &repo.indexed_sha,
-                        None => commits_behind > 0,
-                    }
+                // nw-163: BEHIND HEAD and nothing else — a deleted working
+                // tree is `status: "missing"` and `needs_reindex: true`, not
+                // "stale". The daemon path (`tool_stale_check`) was changed to
+                // this and the direct path was not, so the same repo answered
+                // `is_stale: true` without a daemon and `false` with one.
+                let is_stale = match &current_head {
+                    Some(head) => head != &repo.indexed_sha,
+                    None => commits_behind > 0,
                 };
                 // A repo whose SHA was committed but whose content never
                 // landed (interrupted index) compares equal to HEAD yet
@@ -18670,11 +18685,15 @@ fn run_brain(
             if json {
                 // Include the actual stale list so `any_stale: true`
                 // never sits next to an empty stale set.
-                let stale_urls: Vec<serde_json::Value> = results
-                    .iter()
-                    .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
-                    .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
-                    .collect();
+                let urls_where = |field: &str| -> Vec<serde_json::Value> {
+                    results
+                        .iter()
+                        .filter(|r| r[field].as_bool().unwrap_or(false))
+                        .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                        .collect()
+                };
+                let stale_urls = urls_where("is_stale");
+                let needs_reindex_urls = urls_where("needs_reindex");
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -18682,6 +18701,7 @@ fn run_brain(
                         "any_stale": any_stale,
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
+                        "needs_reindex_repos": needs_reindex_urls,
                         "repos": results,
                     }))?
                 );
@@ -18691,8 +18711,12 @@ fn run_brain(
                 println!(
                     "Stale check: {} repo(s), {}",
                     repos.len(),
-                    if any_stale {
-                        "INDEX IS STALE"
+                    // Gated on the union, not `any_stale`: an `incomplete`
+                    // repo exits 2, and a banner reading "up to date"
+                    // above that exit code is the exact dishonesty this
+                    // contract exists to remove.
+                    if any_needs_reindex {
+                        "NEEDS REINDEX"
                     } else {
                         "up to date"
                     }

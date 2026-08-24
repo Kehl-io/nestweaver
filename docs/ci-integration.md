@@ -434,13 +434,19 @@ Three conditions produce exit `2`, all fixed the same way:
 **Gate on `any_needs_reindex`** (or on exit `2`). `any_stale` and `is_stale`
 mean *behind HEAD* specifically, so a repo that is at HEAD but incompletely
 indexed reports `is_stale: false` with `needs_reindex: true`. The JSON also
-carries a `stale_repos` array so a job can name what to re-index:
+carries two arrays so a job can name what to act on: `needs_reindex_repos` is
+the actionable set matching the exit code, and `stale_repos` is the
+behind-HEAD subset. Gate on `needs_reindex_repos` — `stale_repos` will not
+name an `incomplete` or `missing` repo.
 
 ```yaml
 - name: Fail if the NestWeaver index needs re-indexing
   run: |
-    nestweaver stale-check --db nestweaver.lbug   # 0 ok · 1 check failed · 2 re-index
-    case $? in
+    # `run:` executes under `bash -e`, so a non-zero exit would abort the
+    # step before `case` ever runs. Capture the status instead.
+    rc=0
+    nestweaver stale-check --db nestweaver.lbug || rc=$?   # 0 ok · 1 failed · 2 re-index
+    case $rc in
       0) ;;
       2) echo "::error::NestWeaver index is out of date"; exit 1 ;;
       *) echo "::error::stale-check could not run"; exit 1 ;;

@@ -838,12 +838,38 @@ fn validate_target_slot(
         .iter()
         .map(|descriptor| descriptor.path.as_str())
         .collect();
+    // Walk RECURSIVELY and compare the same shape the manifest uses. Artifact
+    // paths are relative and `/`-joined (`build_backup_publication_bundle` ->
+    // `normalized_relative_path`), and nested ones are routine: the BM25 and
+    // regex sidecars are whole DIRECTORIES, described file by file as
+    // `<db>.tantivy/meta.json` and friends. A non-recursive `read_dir` would
+    // compare the bare directory name `<db>.tantivy` against those paths,
+    // match nothing, and fail every real publication permanently.
     let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(&slot)
-        .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?
-    {
-        let entry = entry.map_err(|error| anyhow::anyhow!("read target slot entry: {error}"))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for entry in walkdir::WalkDir::new(&slot).into_iter() {
+        let entry = entry
+            .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?;
+        // Directories are containers, not artifacts; the manifest describes the
+        // files inside them.
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&slot)
+            .map_err(|error| anyhow::anyhow!("target slot entry outside the slot: {error}"))?;
+        let mut components = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().into_owned())
+                }
+                // A slot is written by us; anything else is not a shape we
+                // describe, so refuse rather than guess at a normal form.
+                _ => anyhow::bail!("unsafe target slot entry path: {}", entry.path().display()),
+            }
+        }
+        let name = components.join("/");
         // The manifest describes the artifacts; it does not describe itself.
         if name == crate::publication::PUBLICATION_MANIFEST_FILE {
             continue;
@@ -858,7 +884,8 @@ fn validate_target_slot(
         // Permanent for the same reason as a digest mismatch: a retry sees the
         // same directory.
         return Err(PermanentPublicationFailure(format!(
-            "target slot contains {} file(s) the manifest does not describe: {:?};              a sealed slot must contain exactly what it declares",
+            "target slot contains {} file(s) the manifest does not describe: {:?}; \
+             a sealed slot must contain exactly what it declares",
             undescribed.len(),
             undescribed
         ))
@@ -1003,24 +1030,53 @@ mod tests {
             &graph,
         )
         .unwrap();
+        // A NESTED artifact, because that is the normal case: the BM25 and
+        // regex sidecars are directories described file by file. A fixture
+        // with only top-level files let slot validation compare bare
+        // directory names against `/`-joined manifest paths and still pass.
+        let nested_dir = slot.join(format!(
+            "{}.tantivy",
+            crate::publication::PUBLICATION_GRAPH_FILE
+        ));
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = b"nw-test-bm25-meta".to_vec();
+        std::fs::write(nested_dir.join("meta.json"), &nested).unwrap();
+        let nested_path = format!(
+            "{}.tantivy/meta.json",
+            crate::publication::PUBLICATION_GRAPH_FILE
+        );
         let bundle = crate::publication::PublicationBundleV3 {
             format_version: plan.publication_format_version,
             brain_uuid: plan.brain_uuid.clone(),
             publication_uuid: plan.target_publication_uuid.clone(),
             producer_version: plan.producer_version.clone(),
             source_graph_generation: 0,
-            artifacts: vec![crate::publication::ArtifactDescriptor {
-                path: crate::publication::PUBLICATION_GRAPH_FILE.to_string(),
-                kind: crate::publication::ArtifactKind::Graph,
-                artifact_schema_version: 1,
-                byte_size: graph.len() as u64,
-                blake3: crate::hash::blake3_hex_bytes(&graph),
-                brain_uuid: plan.brain_uuid.clone(),
-                publication_uuid: plan.target_publication_uuid.clone(),
-                producer_version: plan.producer_version.clone(),
-                source_graph_generation: 0,
-                algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
-            }],
+            artifacts: vec![
+                crate::publication::ArtifactDescriptor {
+                    path: crate::publication::PUBLICATION_GRAPH_FILE.to_string(),
+                    kind: crate::publication::ArtifactKind::Graph,
+                    artifact_schema_version: 1,
+                    byte_size: graph.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&graph),
+                    brain_uuid: plan.brain_uuid.clone(),
+                    publication_uuid: plan.target_publication_uuid.clone(),
+                    producer_version: plan.producer_version.clone(),
+                    source_graph_generation: 0,
+                    algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+                },
+                crate::publication::ArtifactDescriptor {
+                    path: nested_path,
+                    kind: crate::publication::ArtifactKind::Bm25,
+                    artifact_schema_version: 1,
+                    byte_size: nested.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&nested),
+                    brain_uuid: plan.brain_uuid.clone(),
+                    publication_uuid: plan.target_publication_uuid.clone(),
+                    producer_version: plan.producer_version.clone(),
+                    source_graph_generation: 0,
+                    algorithm_fingerprint: "nestweaver-tantivy-bm25-v1".to_string(),
+                },
+            ],
         };
         let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
         std::fs::write(

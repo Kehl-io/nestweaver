@@ -1394,8 +1394,16 @@ impl GraphStore {
                 .pagerank_declared_parameters
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))?
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+                .clone();
+            // Fail at WRITE time rather than emitting an artifact that every
+            // reader refuses. A null-parameter file used to be written happily
+            // and only rejected later, at load, far from the cause.
+            let declared = declared.ok_or_else(|| {
+                StoreError::Query(
+                    "refusing to write a PageRank artifact that declares no algorithm parameters"
+                        .to_string(),
+                )
+            })?;
             let envelope = envelope.with_algorithm_parameters(declared);
             let json = serde_json::to_vec_pretty(&envelope)
                 .map_err(|e| StoreError::Query(format!("serialize PageRank artifact: {e}")))?;
@@ -1499,6 +1507,16 @@ impl GraphStore {
                 .pagerank_artifact_fingerprint
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(fingerprint);
+            // nw-147: restore the DECLARED parameters too, not just the
+            // fingerprint. Without this a load->save round trip re-emitted the
+            // artifact with null parameters, which `pagerank_artifact_contract`
+            // then refuses — the store would produce a file it cannot read.
+            *self
+                .pagerank_declared_parameters
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+                (!envelope.algorithm_parameters.is_null())
+                    .then(|| envelope.algorithm_parameters.clone());
         }
         Ok(())
     }

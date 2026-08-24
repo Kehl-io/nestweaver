@@ -150,6 +150,46 @@ const LITE_TOOLS: &[&str] = &[
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
 /// When `--tools` was specified, only those named tools are included.
 fn all_tool_schemas() -> Vec<Value> {
+    let mut schemas = all_tool_schemas_undecorated();
+    // Every cacheable tool honours `cache: "bypass"` / `no_cache: true` at
+    // dispatch (`cache_bypassed`), so every cacheable tool must DECLARE them.
+    // Derived from `CACHEABLE_TOOLS` rather than written into each schema by
+    // hand: with `additionalProperties: false` an undeclared pair is a hard
+    // rejection, and a hand-maintained list drifts the moment a tool joins
+    // `CACHEABLE_TOOLS`. That drift already happened — 18 of 25 cacheable
+    // tools did not declare them, which made `no_cache` a validation error
+    // and left `get_summary`'s own `cache_bypassed` branch unreachable.
+    for tool in &mut schemas {
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        if !CACHEABLE_TOOLS.contains(&name) {
+            continue;
+        }
+        let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(|properties| properties.as_object_mut())
+        else {
+            continue;
+        };
+        properties.entry("cache").or_insert_with(|| {
+            serde_json::json!({
+                "type": "string",
+                "description": "Set to \"bypass\" to skip the response cache for this call."
+            })
+        });
+        properties.entry("no_cache").or_insert_with(|| {
+            serde_json::json!({
+                "type": "boolean",
+                "description": "When true, skip the response cache for this call."
+            })
+        });
+    }
+    schemas
+}
+
+fn all_tool_schemas_undecorated() -> Vec<Value> {
     vec![
         tool_schema_brain_context(),
         tool_schema_brain_search(),
@@ -1291,6 +1331,114 @@ mod tool_schema_validation_tests {
         // keep validating under additionalProperties: false.
         assert_valid("brain_search", json!({ "query": "x", "cache": "bypass" }));
         assert_valid("brain_search", json!({ "query": "x", "no_cache": true }));
+    }
+
+    /// EVERY cacheable tool, not just the seven that happened to declare them.
+    ///
+    /// `additionalProperties: false` turned an undeclared `no_cache` from
+    /// "ignored" into "rejected", so a tool the dispatch layer treats as
+    /// bypassable while its schema refuses the argument is a contradiction the
+    /// caller cannot work around. Pinning this per-tool by hand is what let 18
+    /// tools drift; this walks `CACHEABLE_TOOLS` so a new entry is covered the
+    /// day it is added.
+    #[test]
+    fn every_cacheable_tool_accepts_the_cache_bypass_arguments() {
+        // Synthesize the smallest argument object each schema accepts, so the
+        // only thing under test is the cache pair.
+        fn minimal_args(schema: &Value) -> serde_json::Map<String, Value> {
+            let mut args = serde_json::Map::new();
+            let properties = schema["properties"].as_object();
+            for required in schema["required"].as_array().into_iter().flatten() {
+                let Some(field) = required.as_str() else {
+                    continue;
+                };
+                let declared = properties.and_then(|properties| properties.get(field));
+                let kind = declared
+                    .and_then(|value| value["type"].as_str())
+                    .unwrap_or("string");
+                let value = match kind {
+                    "array" => json!(["x"]),
+                    "integer" | "number" => json!(1),
+                    "boolean" => json!(true),
+                    "object" => json!({}),
+                    // An enum must be satisfied with one of its own members.
+                    _ => declared
+                        .and_then(|value| value["enum"].as_array())
+                        .and_then(|values| values.first().cloned())
+                        .unwrap_or_else(|| json!("x")),
+                };
+                args.insert(field.to_string(), value);
+            }
+            args
+        }
+
+        // Some tools express "one of these two" as an alias rule enforced
+        // beside the schema (`missing_alias_requirement`), not as `required`.
+        // Satisfy it by adding declared properties until the rule is happy,
+        // so the assertion below is about the cache pair and nothing else.
+        fn satisfy_alias_requirement(
+            name: &str,
+            schema: &Value,
+            args: &mut serde_json::Map<String, Value>,
+        ) {
+            if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
+                return;
+            }
+            let Some(properties) = schema["properties"].as_object() else {
+                return;
+            };
+            for (field, declared) in properties {
+                if args.contains_key(field) {
+                    continue;
+                }
+                let value = match declared["type"].as_str().unwrap_or("string") {
+                    "array" => json!(["x"]),
+                    "integer" | "number" => json!(1),
+                    "boolean" => json!(true),
+                    "object" => json!({}),
+                    _ => json!("x"),
+                };
+                args.insert(field.clone(), value);
+                if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
+                    return;
+                }
+                args.remove(field);
+            }
+        }
+
+        let schemas = all_tool_schemas();
+        for name in CACHEABLE_TOOLS {
+            let tool = schemas
+                .iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is cacheable but not registered"));
+            let schema = &tool["inputSchema"];
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties"));
+            for field in ["cache", "no_cache"] {
+                assert!(
+                    properties.contains_key(field),
+                    "{name} is cacheable but does not declare `{field}`, so \
+                     `additionalProperties: false` rejects a caller that sends it"
+                );
+            }
+
+            // Declaring it is not enough — it has to actually validate.
+            let mut base = minimal_args(schema);
+            satisfy_alias_requirement(name, schema, &mut base);
+            for bypass in [json!({ "cache": "bypass" }), json!({ "no_cache": true })] {
+                let mut args = base.clone();
+                for (key, value) in bypass.as_object().expect("bypass args are an object") {
+                    args.insert(key.clone(), value.clone());
+                }
+                let args = Value::Object(args);
+                assert!(
+                    validate_tool_arguments(name, &args).is_ok(),
+                    "{name} rejected a cache-bypass call: {args}"
+                );
+            }
+        }
     }
 }
 
