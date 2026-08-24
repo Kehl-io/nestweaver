@@ -692,6 +692,16 @@ impl BrainWatcher {
         // path because rename/remove delivery varies by backend.
         let file_exists = path.exists();
 
+        // nw-204, vault half: collect what the cascade is about to remove so
+        // the epilogue can tombstone whatever does not come back. Collected
+        // BEFORE the delete because the UIDs are unreachable afterwards, and
+        // applied AFTER the write because an edited note is deleted and
+        // re-inserted under the SAME uid — tombstoning the raw list here would
+        // drop live vectors.
+        let embedding_candidates = store
+            .note_embedding_candidate_uids(&n_uid)
+            .unwrap_or_default();
+
         // Step 1: always cascade-delete the existing graph data for this
         // note. Safe even when the note doesn't yet exist (no-op).
         store
@@ -704,6 +714,7 @@ impl BrainWatcher {
         }
 
         if !file_exists {
+            tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "note deleted");
             return Ok(UpdateOutcome::Deleted { path });
         }
 
@@ -787,6 +798,11 @@ impl BrainWatcher {
                 tracing::warn!("tantivy.update_note failed: {e}");
             }
         }
+
+        // An edit keeps the note's own vector (same uid, still live) but a
+        // heading that vanished is gone for good; the liveness filter tells
+        // them apart.
+        tombstone_vault_embeddings_after_commit(store, &embedding_candidates, "note updated");
 
         Ok(UpdateOutcome::Updated {
             path,
@@ -1225,6 +1241,33 @@ fn format_system_time(t: std::time::SystemTime) -> Option<String> {
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+/// Tombstone vault embeddings whose nodes did not survive a refresh.
+///
+/// Best-effort and AFTER the commit, exactly like the symbol epilogue: a
+/// tombstoning failure must not fail the refresh that already succeeded, and
+/// the periodic reconciler remains the backstop.
+fn tombstone_vault_embeddings_after_commit(
+    store: &GraphStore,
+    candidates: &[String],
+    operation: &str,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    match store.tombstone_deleted_vault_embeddings(candidates) {
+        Ok(0) => {}
+        Ok(removed) => {
+            tracing::debug!("{operation}: tombstoned {removed} dead vault vector(s)");
+        }
+        Err(error) => {
+            tracing::warn!(
+                "{operation}: could not tombstone dead vault vectors: {error}; \
+                 the periodic reconciler will reclaim them"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

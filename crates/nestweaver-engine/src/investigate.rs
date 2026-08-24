@@ -1414,39 +1414,74 @@ mod tests {
             );
         }
 
-        // The RESPONSE is where the defect showed, so assert on the serialized
-        // shape a caller actually reads. `scope` echoing "vault" is not itself
-        // wrong — what was wrong is that nothing alongside it said whether a
-        // restriction happened.
-        let unrestricted = InvestigateResult {
-            bundle_id: "b".to_string(),
-            query: "q".to_string(),
-            scope: "vault".to_string(),
-            scope_filtered: false,
-            domains: vec![],
-            entries: vec![],
-            more_available: 0,
-            semantic_applied: false,
-            degraded_components: vec![],
-        };
-        let json = serde_json::to_value(&unrestricted).unwrap();
-        assert_eq!(
-            json["scope"], "vault",
-            "the caller's scope string is still echoed verbatim"
-        );
-        assert_eq!(
-            json["scope_filtered"], false,
-            "…and `scope_filtered` is what tells them nothing was restricted"
-        );
+        // Assert on what `investigate` ACTUALLY SETS, not on a struct built by
+        // hand here. The previous version of this constructed an
+        // `InvestigateResult` with `scope_filtered: false` and then asserted
+        // the serialized JSON said `false` — which tests serde, not the
+        // wiring. `scope_filtered: scope_filter.is_some()` was unexercised, so
+        // pinning it to a constant left this test green.
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
 
-        let restricted = InvestigateResult {
-            scope: "repo:acme".to_string(),
-            scope_filtered: true,
-            ..unrestricted
+        // A real project, so the restrictive case actually BUILDS a filter
+        // rather than erroring on an unknown scope.
+        let hello_uid = store
+            .lookup_symbols_by_name("hello")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "hello")
+            .expect("hello symbol exists")
+            .uid;
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:onlyhello".to_string(),
+            name: "onlyhello".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
         };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&hello_uid), 1.0)
+            .unwrap();
+
+        let investigate_with = |scope: &str| {
+            investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                Some(4000),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("investigate({scope:?}) failed: {error:#}"))
+        };
+
+        // Every documented pass-through reports FALSE, including the literal
+        // "vault" a caller may still send explicitly.
+        for pass_through in ["", "vault", "all"] {
+            let result = investigate_with(pass_through);
+            assert!(
+                !result.scope_filtered,
+                "{pass_through:?} builds no filter, so scope_filtered must be false"
+            );
+            assert_eq!(
+                serde_json::to_value(&result).unwrap()["scope_filtered"],
+                false,
+                "{pass_through:?} must serialize the same verdict it computed"
+            );
+        }
+
+        // A real restriction reports TRUE — and the scope string alone could
+        // never have expressed that, which is why the flag exists.
+        let restricted = investigate_with("project:onlyhello");
+        assert!(
+            restricted.scope_filtered,
+            "a project scope builds a filter, so scope_filtered must be true"
+        );
         assert_eq!(
-            serde_json::to_value(&restricted).unwrap()["scope_filtered"],
-            true
+            restricted.scope, "project:onlyhello",
+            "the caller's scope string is still echoed verbatim"
         );
     }
 

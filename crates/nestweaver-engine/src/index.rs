@@ -3411,7 +3411,7 @@ where
             // Atomic delete+insert: old data is only removed within the same
             // transaction that inserts the replacement, so concurrent readers
             // never see an empty repo.
-            let (deleted_files, deleted_symbols) = store
+            let (deleted_files, deleted_symbols, removed_symbol_uids) = store
                 .bulk_reindex_write(
                     &r_uid,
                     &all_files,
@@ -3424,6 +3424,17 @@ where
                 .context("bulk_reindex_write")?;
             files_deleted += deleted_files;
             symbols_deleted += deleted_symbols;
+            // nw-204: this arm removed every symbol in the repo and reported
+            // only a COUNT, so the epilogue below received an empty UID list,
+            // hit its `is_empty()` guard, and tombstoned nothing. The vectors
+            // of symbols that did not come back stayed live and kept being
+            // scored — the exact leak nw-204 closed for the incremental path,
+            // still open on the path its own operation label names ("full
+            // index over existing store"). `force_reindex` fires whenever
+            // `files_unchanged == 0`, which includes a missing or corrupt
+            // resolution-deps sidecar, so this is not a rare path.
+            reindex_deleted_uids.extend(removed_symbol_uids);
+            reindex_deleted_files.extend(all_files.iter().map(|file| file.path.clone()));
         } else {
             store
                 .bulk_index_write(
@@ -10088,6 +10099,99 @@ function hello(name) { return "Hello " + name; }
         assert!(
             store.has_embedding(&anchor_uid),
             "a rename elsewhere must not disturb an untouched file's embedding"
+        );
+    }
+
+    /// nw-204, the path the original fix missed. `index_directory`'s
+    /// `force_reindex` arm removes every symbol in the repo via
+    /// `bulk_reindex_write`, which reported only a COUNT — so the epilogue got
+    /// an empty UID list, hit its `is_empty()` guard, and tombstoned nothing.
+    ///
+    /// This is not a rare path: `force_reindex` fires whenever
+    /// `files_unchanged == 0`, which includes a missing or corrupt
+    /// resolution-deps sidecar. Only a running daemon's periodic reconciler
+    /// repaired it; a CLI-only `nestweaver index` never did.
+    #[test]
+    fn a_full_reindex_tombstones_symbols_that_do_not_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("doomed.js"),
+            "function doomed() { return 'doomed'; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("anchor.js"),
+            "function anchor() { return 'anchor'; }",
+        )
+        .unwrap();
+
+        let repo_url = "https://example.com/nw-204-force-reindex";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-one").unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let uid_in = |file: &str| {
+            store
+                .symbols_in_file(file)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .uid
+        };
+        let doomed_uid = uid_in("doomed.js");
+        let anchor_uid = uid_in("anchor.js");
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        // The doomed vector is the probe's nearest neighbour, so a regression
+        // displaces the survivor rather than merely lingering unnoticed.
+        assert!(store.add_embedding(&doomed_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&anchor_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            doomed_uid,
+            "precondition: the doomed vector must outrank the survivor"
+        );
+        drop(store);
+
+        // Delete the file AND the change-detection sidecar. Without the
+        // sidecar every remaining file classifies as changed, so
+        // `files_unchanged == 0` and `force_reindex` fires — the same state a
+        // missing or corrupt sidecar produces in the field, and the arm this
+        // test exists for. Deleting the file alone leaves `anchor.js`
+        // unchanged, which takes the INCREMENTAL arm instead and proves
+        // nothing about this one.
+        fs::remove_file(repo.join("doomed.js")).unwrap();
+        let filemeta = db_path.with_extension("lbug.filemeta.json");
+        assert!(
+            filemeta.exists(),
+            "precondition: the first index must have written {}",
+            filemeta.display()
+        );
+        fs::remove_file(&filemeta).unwrap();
+        index_directory(&repo, &db_path, "test", repo_url, "sha-two").unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store.symbols_in_file("doomed.js").unwrap().is_empty(),
+            "precondition: the full re-index must have removed the symbol"
+        );
+        let hits = store.try_vector_search(&[1.0, 0.0], 2).unwrap();
+        assert!(
+            !hits.iter().any(|(uid, _)| uid == &doomed_uid),
+            "a symbol a full re-index dropped must not still be scored; got {hits:?}"
+        );
+        assert_eq!(
+            hits.first().map(|(uid, _)| uid.as_str()),
+            Some(anchor_uid.as_str()),
+            "the live symbol must take the top-k slot the dead vector held"
+        );
+        assert!(
+            store.has_embedding(&anchor_uid),
+            "a symbol the re-index re-inserted must KEEP its vector; tombstoning \
+             the raw delete list would drop every live vector in the repo"
         );
     }
 

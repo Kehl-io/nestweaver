@@ -2777,10 +2777,16 @@ mod tests {
              after the file is created; got {before} then {after}"
         );
 
-        // A relative path with a `..` component forks the same way one shape
-        // further out, which the bare case alone does not cover.
-        std::fs::create_dir("sub").unwrap();
-        let dotted = Path::new("sub/../nested.lbug");
+        // A relative path with a `..` component, where the parent chain does
+        // NOT resolve — `missing/` is never created. This is what reaches
+        // `lexically_normalize`.
+        //
+        // Creating `sub/` first (as this test used to) means
+        // `canonicalize("sub/..")` SUCCEEDS, so the pre-existing parent branch
+        // handles the path and the new relative branch is never entered. That
+        // version passed with `lexically_normalize` replaced by a plain
+        // `cwd.join`, i.e. with the bug it was written to catch still present.
+        let dotted = Path::new("missing/../nested.lbug");
         let before_dotted = instance_id_from_db_path(dotted);
         std::fs::write("nested.lbug", b"x").unwrap();
         let after_dotted = instance_id_from_db_path(dotted);
@@ -2788,6 +2794,14 @@ mod tests {
             before_dotted, after_dotted,
             "a relative db path containing `..` must also resolve to one id; \
              got {before_dotted} then {after_dotted}"
+        );
+        // …and to the SAME id as the path it normalizes to, so the `..` form
+        // and the plain form are one instance rather than two.
+        assert_eq!(
+            before_dotted,
+            instance_id_from_db_path(Path::new("nested.lbug")),
+            "`missing/../nested.lbug` and `nested.lbug` name the same database, \
+             so they must not fork the daemon into two instances"
         );
     }
 
@@ -2812,17 +2826,31 @@ mod tests {
 
         let bare = Path::new("nestweaver.lbug");
         // No file on disk: canonicalize fails, which is the only state where
-        // the legacy and current algorithms may differ.
-        let legacy = legacy_instance_id_from_db_path(bare);
-        let current = instance_id_from_db_path(bare);
+        // the legacy and current canonicalizations differ.
+        //
+        // The assertion that MATTERS is that the legacy hash still folds the
+        // UN-JOINED relative path. Comparing it against
+        // `instance_id_from_db_path` proves nothing — legacy is DefaultHasher
+        // (SipHash) masked to 32 bits and current is the first four bytes of
+        // SHA-256, so the two can never agree no matter which canonicalization
+        // legacy uses. That test passed with `legacy_canonical_db_path`
+        // swapped for `canonical_db_path`, i.e. with the regression it was
+        // written to prevent fully reintroduced.
+        //
+        // Joining against the cwd is exactly what `canonical_db_path` does to
+        // a relative path, so the legacy id must NOT match the id of the
+        // joined form.
+        let joined = std::env::current_dir().unwrap().join(bare);
         assert_ne!(
-            legacy, current,
-            "the legacy hash is a DIFFERENT algorithm (DefaultHasher over the \
-             un-joined relative path); if these ever agree, the legacy function \
-             has stopped reproducing history"
+            legacy_instance_id_from_db_path(bare),
+            legacy_instance_id_from_db_path(&joined),
+            "the legacy hash must fold the UN-JOINED relative path; if these \
+             agree it has started resolving against the cwd, and
+             `stop_legacy_hash_daemon` will look for an orphan under an id it \
+             never registered under"
         );
         assert_eq!(
-            legacy,
+            legacy_instance_id_from_db_path(bare),
             legacy_instance_id_from_db_path(bare),
             "the legacy hash must be stable"
         );

@@ -972,6 +972,16 @@ fn index_markdown_since_with_reader(
         }
     }
     let project_note_refs = string_edge_refs(&project_note_edges);
+    // nw-204, vault half: collect the Note and Heading UIDs the refresh is
+    // about to remove, BEFORE it removes them. Applied after the commit with a
+    // liveness filter, because an edited note is deleted and re-inserted under
+    // the same uid.
+    let embedding_candidates: Vec<String> = delete_note_uids
+        .iter()
+        .filter_map(|uid| store.note_embedding_candidate_uids(uid).ok())
+        .flatten()
+        .collect();
+
     store
         .incremental_vault_refresh_atomically(
             &Vault {
@@ -1007,6 +1017,25 @@ fn index_markdown_since_with_reader(
     // that stales the trigram posting table (mirrors `index.rs` and the full
     // vault index above).
     store.bump_and_persist_generation();
+
+    // Best-effort and AFTER the commit, like the symbol epilogue: a
+    // tombstoning failure must not fail a refresh that already succeeded.
+    // Without this a CLI `brain refresh` that dropped 200 notes left every
+    // note and heading vector live and scored, with only a WRITABLE daemon's
+    // periodic reconciler as backstop — so a CLI-only run, or one against a
+    // read-only daemon, leaked indefinitely.
+    if !embedding_candidates.is_empty() {
+        match store.tombstone_deleted_vault_embeddings(&embedding_candidates) {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::debug!("vault refresh: tombstoned {removed} dead vault vector(s)")
+            }
+            Err(error) => tracing::warn!(
+                "vault refresh: could not tombstone dead vault vectors: {error}; \
+                 the periodic reconciler will reclaim them"
+            ),
+        }
+    }
 
     Ok(MarkdownSinceResult {
         vault_name: vault_name.to_string(),
@@ -4137,6 +4166,73 @@ sub b body
         .unwrap();
         assert_eq!(store.lookup_vault(&uid).unwrap().name, "empty");
         assert_eq!(store.graph_generation(), generation);
+    }
+
+    /// nw-204, vault half. The vault side had NO synchronous tombstoning: a
+    /// refresh that dropped notes left their vectors live and scored, and only
+    /// a WRITABLE daemon's periodic reconciler repaired it — so a CLI-only
+    /// `brain refresh`, or one against a read-only daemon, leaked forever.
+    #[test]
+    fn a_vault_refresh_tombstones_vectors_of_notes_it_drops() {
+        let (_dir, root) = make_vault(&[("kept.md", "# Kept\n"), ("doomed.md", "# Doomed\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+
+        let uid_of = |title: &str| {
+            store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .find(|note| note.title == title)
+                .unwrap_or_else(|| panic!("{title} indexed"))
+                .uid
+        };
+        let doomed_uid = uid_of("Doomed");
+        let kept_uid = uid_of("Kept");
+
+        store.set_embedding_metadata("test-model", 2).unwrap();
+        // The doomed vector is the probe's nearest neighbour, so a regression
+        // displaces the survivor rather than merely lingering unnoticed.
+        assert!(store.add_embedding(&doomed_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&kept_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.try_vector_search(&[1.0, 0.0], 1).unwrap()[0].0,
+            doomed_uid,
+            "precondition: the doomed vector must outrank the survivor"
+        );
+
+        // Drop the note by ignoring it — the same delete path a removed file
+        // takes, without racing the filesystem clock.
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            &["doomed.md".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            result.notes_deleted, 1,
+            "precondition: the note was dropped"
+        );
+
+        let hits = store.try_vector_search(&[1.0, 0.0], 2).unwrap();
+        assert!(
+            !hits.iter().any(|(uid, _)| uid == &doomed_uid),
+            "a dropped note's vector must not still be scored; got {hits:?}"
+        );
+        assert_eq!(
+            hits.first().map(|(uid, _)| uid.as_str()),
+            Some(kept_uid.as_str()),
+            "the live note must take the top-k slot the dead vector held"
+        );
+        assert!(
+            store.has_embedding(&kept_uid),
+            "a surviving note must KEEP its vector"
+        );
     }
 
     #[test]

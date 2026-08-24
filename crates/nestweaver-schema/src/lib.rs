@@ -26,4 +26,4 @@ pub use uid::{
     normalize_http_path, note_uid, project_uid, repo_uid, scope_hash, scoped_contract_uid,
     section_uid, service_uid, symbol_uid, tag_uid, truncated_hash, vault_uid,
 };
-pub use version::{core_schema_hash, effective_schema_hash};
+pub use version::{core_schema_hash, describe_version_skew, effective_schema_hash};

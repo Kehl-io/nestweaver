@@ -168,3 +168,115 @@ mod tests {
         );
     }
 }
+
+/// Describe a version mismatch between a running daemon and a client, or
+/// `None` when they agree.
+///
+/// Direction matters and the original check ignored it. It was a bare equality
+/// test whose message was hardcoded to the older-daemon case, so running an
+/// older client against a NEWER installed daemon reported "the upgrade has NOT
+/// been applied" — false — and then named `restart` as the remedy, which would
+/// replace the live newer daemon with the older build. An operator was told to
+/// perform a downgrade in the language of an upgrade.
+///
+/// Both versions are passed in rather than read from `CARGO_PKG_VERSION`
+/// here: this lives in the schema crate so the CLI, the client and the MCP
+/// server can all share one rule (the MCP crate cannot depend on the client —
+/// `mcp -> client -> daemon -> mcp` is a cycle), and each caller must report
+/// ITS OWN version, not this crate's.
+///
+/// An unparseable version on either side is reported as a plain mismatch
+/// rather than guessed at: unknown ordering must not become a confident claim.
+pub fn describe_version_skew(daemon_version: &str, client_version: &str) -> Option<String> {
+    if daemon_version == client_version {
+        return None;
+    }
+    let parse = |version: &str| -> Option<(u64, u64, u64)> {
+        // Ignore any pre-release/build suffix; the numeric triple is what
+        // orders two NestWeaver builds.
+        let core = version.split(['-', '+']).next().unwrap_or(version);
+        let mut parts = core.split('.');
+        let mut next = || parts.next()?.parse::<u64>().ok();
+        let (major, minor, patch) = (next()?, next()?, next()?);
+        parts.next().is_none().then_some((major, minor, patch))
+    };
+    let ordering = match (parse(daemon_version), parse(client_version)) {
+        (Some(daemon), Some(client)) => Some(daemon.cmp(&client)),
+        _ => None,
+    };
+    Some(match ordering {
+        Some(std::cmp::Ordering::Less) => format!(
+            "the running daemon is version {daemon_version} but this client is \
+             {client_version}; the upgrade has NOT been applied and its new behaviour \
+             is not active."
+        ),
+        Some(std::cmp::Ordering::Greater) => format!(
+            "the running daemon is version {daemon_version}, NEWER than this client \
+             ({client_version}); restarting it would DOWNGRADE the running daemon. \
+             Use the {daemon_version} binary, or stop the daemon deliberately if you \
+             intend to downgrade."
+        ),
+        // Equal is impossible here (the strings differ), so this is the
+        // unparseable case.
+        _ => format!(
+            "the running daemon reports version {daemon_version} and this client is \
+             {client_version}; the two do not match and their order cannot be \
+             determined."
+        ),
+    })
+}
+
+#[cfg(test)]
+mod version_skew_tests {
+    use super::describe_version_skew;
+
+    /// The original check was a bare equality test whose message was hardcoded
+    /// to the older-daemon direction, so a NEWER incumbent was described as
+    /// "the upgrade has NOT been applied" — false — and the remedy it named
+    /// (`restart`) would have replaced the live newer daemon with the older
+    /// client's build. A downgrade, described as an upgrade.
+    #[test]
+    fn skew_is_reported_by_direction_and_never_guesses() {
+        assert!(describe_version_skew("7.0.0", "7.0.0").is_none());
+
+        let older = describe_version_skew("6.4.0", "7.0.0").expect("older daemon is skew");
+        assert!(older.contains("has NOT been applied"), "{older}");
+
+        let newer = describe_version_skew("7.1.0", "7.0.0").expect("newer daemon is skew");
+        assert!(newer.contains("DOWNGRADE"), "{newer}");
+        assert!(
+            !newer.contains("has NOT been applied"),
+            "a newer daemon is not a missing upgrade: {newer}"
+        );
+
+        // Ordering across each component, not just the patch.
+        assert!(
+            describe_version_skew("8.0.0", "7.9.9")
+                .unwrap()
+                .contains("DOWNGRADE")
+        );
+        assert!(
+            describe_version_skew("7.9.9", "8.0.0")
+                .unwrap()
+                .contains("has NOT been applied")
+        );
+
+        // Unparseable: report a mismatch, but do NOT claim a direction.
+        for daemon in ["", "7.0", "seven", "7.0.0.1", "7.0.x"] {
+            let unknown = describe_version_skew(daemon, "7.0.0")
+                .unwrap_or_else(|| panic!("{daemon:?} differs from 7.0.0"));
+            assert!(
+                unknown.contains("cannot be determined"),
+                "{daemon:?} must not be given a direction: {unknown}"
+            );
+        }
+
+        // A pre-release suffix orders by its numeric core rather than falling
+        // into the unparseable branch.
+        assert!(
+            describe_version_skew("7.1.0-rc.1", "7.0.0")
+                .unwrap()
+                .contains("DOWNGRADE")
+        );
+    }
+}
