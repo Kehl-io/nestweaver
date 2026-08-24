@@ -264,9 +264,24 @@ pub fn export_graphml_scoped(
 
     writeln!(writer, r#"  <graph id="G" edgedefault="directed">"#)?;
 
+    // Every id written as a <node>. Edges are filtered against this at the
+    // end: a GraphML file referencing an undeclared node is not a valid
+    // subgraph — Gephi reports missing-node errors and networkx silently
+    // invents thousands of unlabeled phantom nodes. Tracking emission is the
+    // only way a scope filter can be honest, because an edge does not know
+    // which half of the graph its endpoints came from.
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // ── Repo nodes ───────────────────────────────────────────────────────
-    let repos = store.list_repos(None).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Gated on scope: `--scope vault` emitted every Repo and File regardless,
+    // so the "vault" export was not the vault subgraph.
+    let repos = if scope.includes_code() {
+        store.list_repos(None).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        Vec::new()
+    };
     for repo in &repos {
+        emitted.insert(repo.uid.clone());
         writeln!(
             writer,
             r#"    <node id="{}">
@@ -284,6 +299,7 @@ pub fn export_graphml_scoped(
             .list_files_by_repo(&repo.uid)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for (file_uid, file_path) in &files {
+            emitted.insert(file_uid.clone());
             writeln!(
                 writer,
                 r#"    <node id="{}">
@@ -331,6 +347,7 @@ pub fn export_graphml_scoped(
             xml_escape(&sym.file_path),
             pr,
         )?;
+        emitted.insert(sym.uid.clone());
     }
 
     // ── Vault nodes ──────────────────────────────────────────────────────
@@ -357,6 +374,7 @@ pub fn export_graphml_scoped(
                 xml_escape(&vault.name),
                 xml_escape(&vault.root_path),
             )?;
+            emitted.insert(vault.uid.clone());
         }
 
         let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -375,6 +393,7 @@ pub fn export_graphml_scoped(
                 xml_escape(&note.file_path),
                 pr,
             )?;
+            emitted.insert(note.uid.clone());
         }
 
         for vault in &vaults {
@@ -396,6 +415,46 @@ pub fn export_graphml_scoped(
                     xml_escape(&heading.note_uid),
                     pr,
                 )?;
+                emitted.insert(heading.uid.clone());
+            }
+        }
+
+        // nw-173: Section nodes are named by this function's own doc comment
+        // and by `ExportScope::Vault`, but were never emitted — so HAS_TAG and
+        // wikilink edges pointed at `sec:` ids that appeared in no <node>.
+        // NOT `list_sections_by_vault`: that traverses NOTE_HAS_SECTION, and
+        // the edge is NOT guaranteed — `write.rs` deletes sections by the
+        // `note_uid` PROPERTY precisely to catch "fragments whose
+        // NOTE_HAS_SECTION edge is missing", and `regex.rs` avoids the
+        // traversal for the same reason. Ownership lives on the property, so
+        // scan once and keep the sections belonging to notes we emitted.
+        {
+            let owning_notes: std::collections::HashSet<&str> =
+                notes.iter().map(|note| note.uid.as_str()).collect();
+            let sections = store
+                .list_all_sections()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for section in sections
+                .iter()
+                .filter(|section| owning_notes.contains(section.note_uid.as_str()))
+            {
+                let pr = pagerank.get(&section.uid).copied().unwrap_or(0.0);
+                writeln!(
+                    writer,
+                    r#"    <node id="{}">
+      <data key="label">{}</data>
+      <data key="kind">Section</data>
+      <data key="file_path">{}</data>
+      <data key="pagerank">{:.6}</data>
+    </node>"#,
+                    xml_escape(&section.uid),
+                    // Sections have no title of their own; the line span is
+                    // the only human-readable label available.
+                    xml_escape(&format!("L{}-{}", section.start_line, section.end_line)),
+                    xml_escape(&section.note_uid),
+                    pr,
+                )?;
+                emitted.insert(section.uid.clone());
             }
         }
 
@@ -412,6 +471,7 @@ pub fn export_graphml_scoped(
                 xml_escape(&tag.uid),
                 xml_escape(&tag.name),
             )?;
+            emitted.insert(tag.uid.clone());
         }
     }
 
@@ -419,7 +479,15 @@ pub fn export_graphml_scoped(
     let typed_edges = store
         .load_typed_edges()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for (idx, (src, dst, edge_type, confidence, _evidence)) in typed_edges.iter().enumerate() {
+    // Only edges whose BOTH endpoints were declared above. Previously every
+    // edge was written unconditionally, so `--scope vault` emitted every
+    // CALLS/IMPORTS edge between `sym:` ids that the file never declared.
+    // Re-indexed so ids stay contiguous rather than gapped.
+    for (idx, (src, dst, edge_type, confidence, _evidence)) in typed_edges
+        .iter()
+        .filter(|(src, dst, _, _, _)| emitted.contains(src) && emitted.contains(dst))
+        .enumerate()
+    {
         writeln!(
             writer,
             r#"    <edge id="e{}" source="{}" target="{}">
@@ -656,11 +724,30 @@ mod tests {
                 embedding: None,
             })
             .unwrap();
+        // A Section, because the export claims to emit them and edges point at
+        // them. Without one in the fixture the claim was never tested.
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: "sec:test:one:0".to_string(),
+                note_uid: "note:test:one".to_string(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 3,
+                text_hash: "hash".to_string(),
+                text_content: "body".to_string(),
+                word_count: 1,
+                pagerank_score: None,
+            })
+            .unwrap();
 
         let mut buf = Vec::new();
         export_graphml_scoped(&store, &mut buf, ExportScope::All).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
+        assert!(
+            output.contains(r#"<data key="kind">Section</data>"#),
+            "a full export must contain Section nodes"
+        );
         assert!(
             output.contains(r#"<data key="kind">Vault</data>"#),
             "a full export must contain Vault nodes"
@@ -687,6 +774,42 @@ mod tests {
         let vault_only = String::from_utf8(vault_only).unwrap();
         assert!(vault_only.contains(r#"<data key="kind">Note</data>"#));
         assert!(!vault_only.contains(r#"<data key="kind">Function</data>"#));
+
+        // Absence of Symbol nodes was the ONLY thing asserted here, which is
+        // why the scope filter shipped emitting every Repo and File anyway.
+        assert!(
+            !vault_only.contains(r#"<data key="kind">Repo</data>"#),
+            "a vault export must not carry Repo nodes"
+        );
+        assert!(
+            !vault_only.contains(r#"<data key="kind">File</data>"#),
+            "a vault export must not carry File nodes"
+        );
+
+        // The real invariant: no edge may reference a node the file does not
+        // declare. This is what makes a scoped export loadable at all — Gephi
+        // errors on a dangling endpoint and networkx invents a phantom node.
+        for graph in [&output, &code_only, &vault_only] {
+            let declared: std::collections::HashSet<&str> = graph
+                .match_indices(r#"<node id=""#)
+                .filter_map(|(at, marker)| {
+                    let rest = &graph[at + marker.len()..];
+                    rest.find('"').map(|end| &rest[..end])
+                })
+                .collect();
+            for (at, marker) in graph.match_indices(r#"<edge id=""#) {
+                let rest = &graph[at + marker.len()..];
+                for attribute in [r#"source=""#, r#"target=""#] {
+                    let from = rest.find(attribute).expect("edge declares both endpoints")
+                        + attribute.len();
+                    let value = &rest[from..from + rest[from..].find('"').unwrap()];
+                    assert!(
+                        declared.contains(value),
+                        "edge endpoint {value} appears in no <node> element"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

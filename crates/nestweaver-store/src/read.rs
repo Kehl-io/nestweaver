@@ -2123,7 +2123,14 @@ impl GraphStore {
         let mut expanded: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for requested in tag_names {
-            let requested = requested.trim_start_matches('#');
+            // Tag names are stored LOWERCASED (`index_md.rs` canonicalizes at
+            // both construction sites), so a raw comparison silently misses
+            // every mixed-case request: a note tagged `#Project/NestWeaver` is
+            // stored as `project/nestweaver`, and `tags=["Project"]` matched
+            // nothing while `brain_tag_graph {"tag":"Project"}` — which
+            // lowercases — reported it. Same rule, opposite answers.
+            let requested = requested.trim_start_matches('#').to_lowercase();
+            let requested = requested.as_str();
             let prefix = format!("{requested}/");
             for tag in &all {
                 if (tag.name == requested || tag.name.starts_with(&prefix))

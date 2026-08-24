@@ -1078,6 +1078,71 @@ mod tests {
         store.insert_vault_note_edge("vlt:x", "note:x:1").unwrap();
     }
 
+    /// nw-172 shipped `expand_tags_with_descendants` with no test at all.
+    ///
+    /// Two rules, and the second was broken: descendants match through a
+    /// REQUIRED `/` separator, and matching is case-insensitive because tag
+    /// names are canonicalized to lowercase when indexed. Comparing a raw
+    /// request against stored names meant `tags=["Project"]` found nothing
+    /// while `brain_tag_graph {"tag":"Project"}` — which lowercases — found
+    /// the same note. One rule, two answers.
+    #[test]
+    fn tag_expansion_matches_descendants_case_insensitively() {
+        use nestweaver_schema::{Tag, Vault};
+        let store = test_store();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".to_string(),
+                name: "t".to_string(),
+                root_path: "/t".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        // Stored lowercased, exactly as the markdown indexer canonicalizes.
+        for (uid, name) in [
+            ("tag:t:project", "project"),
+            ("tag:t:project-nw", "project/nestweaver"),
+            ("tag:t:projectile", "projectile"),
+        ] {
+            store
+                .insert_tag(&Tag {
+                    uid: uid.to_string(),
+                    vault_uid: "vlt:t".to_string(),
+                    name: name.to_string(),
+                })
+                .unwrap();
+        }
+
+        let expanded = |request: &str| -> Vec<String> {
+            let mut out = store
+                .expand_tags_with_descendants(&[request.to_string()])
+                .unwrap();
+            out.sort();
+            out
+        };
+
+        // The parent carries its subtree, and `projectile` is NOT in it — a
+        // prefix match without the separator would silently widen the filter.
+        assert_eq!(
+            expanded("project"),
+            vec!["project".to_string(), "project/nestweaver".to_string()]
+        );
+
+        // The case the mismatch broke. `#` stripping and case folding must
+        // both apply, and the result must equal the canonical request's.
+        for request in ["Project", "PROJECT", "#Project"] {
+            assert_eq!(
+                expanded(request),
+                expanded("project"),
+                "{request:?} must resolve exactly like its canonical form"
+            );
+        }
+
+        // A request that matches nothing still passes through, so the caller's
+        // own "no such tag" handling fires instead of an empty expansion.
+        assert_eq!(expanded("nope"), vec!["nope".to_string()]);
+    }
+
     #[test]
     fn delete_note_cascade_removes_descendants() {
         use nestweaver_schema::{Heading, Note, NoteKind, Section, Vault};

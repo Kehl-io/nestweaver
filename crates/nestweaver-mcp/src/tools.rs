@@ -3236,12 +3236,12 @@ fn tool_schema_brain_context() -> Value {
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept)."
+                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes)."
+                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
                 },
                 "weight_ppr": {
                     "type": "number",
@@ -8398,12 +8398,12 @@ fn tool_schema_project_context() -> Value {
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept."
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Drop note/section nodes tagged with any of these tags."
+                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
