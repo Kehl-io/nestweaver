@@ -139,6 +139,19 @@ pub struct ResponseCache {
     shape_version: u64,
 }
 
+/// Create the staging file `flush` writes through, in the target's own
+/// directory (a cross-filesystem `rename` would fail with `EXDEV`).
+///
+/// Extracted so the property that actually matters is directly observable: the
+/// staging path must be UNIQUE PER CALL. The defect this replaced was a
+/// constant — `<db>.cache.tmp` — and a constant is what makes two writers
+/// collide. Testing the collision itself is timing-dependent and unreliable;
+/// testing that the generator does not return the same path twice is neither.
+fn stage_temp_file(target: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let parent = target.parent().unwrap_or(Path::new("."));
+    tempfile::NamedTempFile::new_in(parent)
+}
+
 impl ResponseCache {
     /// Path to the `<db>.cache` sidecar for a database path.
     pub fn sidecar_path(db_path: &Path) -> PathBuf {
@@ -293,19 +306,39 @@ impl ResponseCache {
     }
 
     /// Persist the cache to its sidecar using binary format (MessagePack + ZSTD).
-    /// Uses atomic write: serializes to a `.tmp` file then renames to the final
-    /// path to prevent corruption on crash. Best-effort; logs on failure.
+    /// Replaces the sidecar through a UNIQUE temp file, then renames.
+    ///
+    /// It previously staged through a FIXED shared name, `<db>.cache.tmp`. The
+    /// rename is atomic; writing into a path every other writer also uses is
+    /// not — two flushers interleave in that one file and whichever renames
+    /// last publishes the blend. This is not a cross-process-only hazard:
+    /// `RESPONSE_CACHE` in the MCP crate is a `thread_local`, so every daemon
+    /// worker thread holds its own full copy of the map and flushes the WHOLE
+    /// file. The race is inside a single daemon.
+    ///
+    /// Deliberately NOT `durable_sidecar::atomic_replace_file`, which every
+    /// other sidecar uses: that fsyncs the temp file and the parent directory,
+    /// and this is a CACHE. `open` already treats an unreadable file as empty,
+    /// so a flush lost to power failure costs a recomputation and nothing
+    /// else. What this needs is isolation from concurrent writers, not
+    /// durability — and measured on this path the fsyncs cost ~40x the write
+    /// itself, on a flush that runs every 50 cache misses.
     pub fn flush(&self) {
         match self.encode_binary() {
             Ok(bytes) => {
-                let tmp = self.path.with_extension("cache.tmp");
-                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                let mut tmp = match stage_temp_file(&self.path) {
+                    Ok(tmp) => tmp,
+                    Err(e) => {
+                        tracing::warn!("response cache: failed to create tmp sidecar: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = std::io::Write::write_all(&mut tmp, &bytes) {
                     tracing::warn!("response cache: failed to write tmp sidecar: {e}");
                     return;
                 }
-                if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                if let Err(e) = tmp.persist(&self.path) {
                     tracing::warn!("response cache: failed to rename sidecar: {e}");
-                    let _ = std::fs::remove_file(&tmp);
                 }
             }
             Err(e) => tracing::warn!("response cache: binary encode failed: {e}"),
@@ -435,6 +468,89 @@ mod tests {
 
     /// A stable, non-zero stand-in for a real binary's response-shape version.
     const TEST_SHAPE: u64 = 0xA11CE;
+
+    /// The staging path must be UNIQUE PER CALL.
+    ///
+    /// `flush` used to stage through the constant `<db>.cache.tmp`, and a
+    /// constant is precisely what lets two writers collide — they open the same
+    /// file, interleave, and whichever renames last publishes the blend.
+    /// `RESPONSE_CACHE` in the MCP crate is a `thread_local`, so every daemon
+    /// worker thread flushes its own full copy of the map: the collision lives
+    /// inside one daemon, not only across processes.
+    ///
+    /// Three earlier attempts tested the CONSEQUENCE — race many threads, assert
+    /// the file is not torn — and every one passed against the buggy code,
+    /// because whether two writes actually interleave is timing. The defect is
+    /// not the corruption; the defect is the constant. That is deterministic,
+    /// single-threaded, and observable here.
+    #[test]
+    fn the_staging_path_is_unique_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = ResponseCache::sidecar_path(&dir.path().join("brain.lbug"));
+
+        let first = stage_temp_file(&target).unwrap();
+        let second = stage_temp_file(&target).unwrap();
+        assert_ne!(
+            first.path(),
+            second.path(),
+            "two writers would stage through the same file and interleave"
+        );
+
+        // Same directory as the target: a cross-filesystem rename fails EXDEV,
+        // so a temp in the system temp dir would break `persist` on any setup
+        // where the database lives on another mount.
+        for staged in [&first, &second] {
+            assert_eq!(
+                staged.path().parent(),
+                target.parent(),
+                "staging must happen beside the target so the rename stays on one filesystem"
+            );
+        }
+    }
+
+    /// The reader's corruption tolerance is LOAD-BEARING.
+    ///
+    /// `flush` deliberately does not fsync: this is a cache, and the worst a
+    /// lost write can cost is a recomputation. That trade is only sound because
+    /// a torn or zero-filled file reads back as empty rather than as data. If
+    /// that ever stops being true, the no-fsync decision silently becomes a
+    /// correctness bug — so it is pinned here rather than left as a comment.
+    #[test]
+    fn a_damaged_sidecar_reads_back_as_empty_rather_than_as_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        // `open` DERIVES the sidecar from the db path; it does not use the path
+        // it is handed as the file. Reading the wrong file is what made three
+        // earlier attempts at this test pass against the buggy implementation.
+        let sidecar = ResponseCache::sidecar_path(&db_path);
+
+        let mut cache = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB, TEST_SHAPE);
+        let blob = serde_json::to_vec(&json!({ "blob": "payload" })).unwrap();
+        for i in 0..8 {
+            cache.insert(i, "tool", &blob, 1, 0);
+        }
+        cache.flush();
+        let healthy = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB, TEST_SHAPE).len();
+        assert!(healthy > 0, "precondition: a healthy sidecar round-trips");
+
+        let good = std::fs::read(&sidecar).unwrap();
+        // The two shapes a crash after a non-fsynced rename actually produces:
+        // a truncated file, and a correctly-sized file of zeros (ext4 delayed
+        // allocation lands the metadata before the data blocks).
+        for (label, damaged) in [
+            ("truncated", good[..good.len() / 2].to_vec()),
+            ("zero-filled", vec![0u8; good.len()]),
+            ("empty", Vec::new()),
+        ] {
+            std::fs::write(&sidecar, &damaged).unwrap();
+            let reopened = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB, TEST_SHAPE);
+            assert_eq!(
+                reopened.len(),
+                0,
+                "a {label} sidecar must read back as empty, never as data"
+            );
+        }
+    }
 
     #[test]
     fn key_drops_non_semantic_flags_and_sorts() {
