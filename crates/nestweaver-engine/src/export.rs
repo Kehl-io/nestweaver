@@ -9,6 +9,57 @@ use nestweaver_store::GraphStore;
 
 /// Escape a string value for Cypher string literals.
 /// Wraps in single quotes, escaping internal single quotes and backslashes.
+/// Which subgraph an export should contain.
+///
+/// nw-173: `export` used to emit ONLY the code subgraph, silently. On a graph
+/// holding 1,088 notes and 12,439 headings a full graphml came back with not
+/// one Note, Vault, Heading, Section or Tag node — and nothing in the command
+/// name, `--help`, or the output said so. Someone loading that file into Gephi
+/// or networkx would conclude their vault was not in the graph at all.
+///
+/// The product's core claim is a UNIFIED graph over code and notes, so `All` is
+/// the default: a command named `export` should emit the graph it advertises.
+/// The narrower scopes stay available, but now as an explicit choice rather
+/// than an unannounced one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportScope {
+    /// Code and vault — everything in the graph.
+    #[default]
+    All,
+    /// Repos, files, symbols and their edges.
+    Code,
+    /// Vaults, notes, headings, sections, tags and their edges.
+    Vault,
+}
+
+impl ExportScope {
+    pub fn includes_code(self) -> bool {
+        matches!(self, Self::All | Self::Code)
+    }
+    pub fn includes_vault(self) -> bool {
+        matches!(self, Self::All | Self::Vault)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Code => "code",
+            Self::Vault => "vault",
+        }
+    }
+}
+
+impl std::str::FromStr for ExportScope {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "code" => Ok(Self::Code),
+            "vault" => Ok(Self::Vault),
+            other => anyhow::bail!("unknown export scope '{other}' (expected: all, code, vault)"),
+        }
+    }
+}
+
 fn cypher_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -165,6 +216,15 @@ fn xml_escape(s: &str) -> String {
 /// Emits Repo, File, and Symbol nodes with their properties, and all
 /// code-level edges (CALLS, IMPORTS, EXTENDS, IMPLEMENTS, MEMBER_OF, INCLUDES).
 pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Result<()> {
+    export_graphml_scoped(store, writer, ExportScope::default())
+}
+
+/// GraphML export for `scope`.
+pub fn export_graphml_scoped(
+    store: &GraphStore,
+    writer: &mut dyn Write,
+    scope: ExportScope,
+) -> anyhow::Result<()> {
     // XML header
     writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
@@ -239,9 +299,13 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
     }
 
     // ── Symbol nodes ─────────────────────────────────────────────────────
-    let symbols = store
-        .list_all_symbols()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let symbols = if scope.includes_code() {
+        store
+            .list_all_symbols()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        Vec::new()
+    };
     // The `pagerank_score` column is never populated; the real scores
     // live in the store's PageRank cache (same source `hubs` reads).
     let pagerank = store
@@ -267,6 +331,88 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
             xml_escape(&sym.file_path),
             pr,
         )?;
+    }
+
+    // ── Vault nodes ──────────────────────────────────────────────────────
+    // nw-173: previously absent ENTIRELY. A full export of a graph holding
+    // 1,088 notes and 12,439 headings emitted not one Note, Vault, Heading or
+    // Tag, and nothing said so — a consumer loading it into Gephi or networkx
+    // would conclude the vault was never indexed. `pagerank` is emitted here
+    // for the same reason it is for symbols: a consumer ranking the graph must
+    // be able to rank ALL of it.
+    if scope.includes_vault() {
+        let vaults = store
+            .list_vaults(None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for vault in &vaults {
+            writeln!(
+                writer,
+                r#"    <node id="{}">
+      <data key="label">{}</data>
+      <data key="kind">Vault</data>
+      <data key="file_path">{}</data>
+      <data key="pagerank">0.000000</data>
+    </node>"#,
+                xml_escape(&vault.uid),
+                xml_escape(&vault.name),
+                xml_escape(&vault.root_path),
+            )?;
+        }
+
+        let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for note in &notes {
+            let pr = pagerank.get(&note.uid).copied().unwrap_or(0.0);
+            writeln!(
+                writer,
+                r#"    <node id="{}">
+      <data key="label">{}</data>
+      <data key="kind">Note</data>
+      <data key="file_path">{}</data>
+      <data key="pagerank">{:.6}</data>
+    </node>"#,
+                xml_escape(&note.uid),
+                xml_escape(&note.title),
+                xml_escape(&note.file_path),
+                pr,
+            )?;
+        }
+
+        for vault in &vaults {
+            let headings = store
+                .list_headings_by_vault(&vault.uid)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for heading in &headings {
+                let pr = pagerank.get(&heading.uid).copied().unwrap_or(0.0);
+                writeln!(
+                    writer,
+                    r#"    <node id="{}">
+      <data key="label">{}</data>
+      <data key="kind">Heading</data>
+      <data key="file_path">{}</data>
+      <data key="pagerank">{:.6}</data>
+    </node>"#,
+                    xml_escape(&heading.uid),
+                    xml_escape(&heading.text),
+                    xml_escape(&heading.note_uid),
+                    pr,
+                )?;
+            }
+        }
+
+        let tags = store.list_tags(None).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for tag in &tags {
+            writeln!(
+                writer,
+                r#"    <node id="{}">
+      <data key="label">{}</data>
+      <data key="kind">Tag</data>
+      <data key="file_path"></data>
+      <data key="pagerank">0.000000</data>
+    </node>"#,
+                xml_escape(&tag.uid),
+                xml_escape(&tag.name),
+            )?;
+        }
     }
 
     // ── Edges ────────────────────────────────────────────────────────────
@@ -469,6 +615,78 @@ mod tests {
             .unwrap();
 
         store
+    }
+
+    /// nw-173. A full export must contain the VAULT subgraph, not just code.
+    ///
+    /// It contained none: a real graph with 1,088 notes and 12,439 headings
+    /// exported to graphml with not one Note, Vault, Heading or Tag node, and
+    /// nothing in the command name, `--help`, or the output said so. Someone
+    /// loading that into Gephi or networkx would conclude their vault had never
+    /// been indexed.
+    ///
+    /// Asserts on the OUTPUT — the nodes a consumer would actually read — not
+    /// on whether a vault query was issued.
+    #[test]
+    fn graphml_export_includes_the_vault_subgraph() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let store = populated_store();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:test".to_string(),
+                name: "Test Vault".to_string(),
+                root_path: "/tmp/vault".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:test:one".to_string(),
+                vault_uid: "vlt:test".to_string(),
+                file_path: "one.md".to_string(),
+                title: "Note One".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: "hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let mut buf = Vec::new();
+        export_graphml_scoped(&store, &mut buf, ExportScope::All).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(
+            output.contains(r#"<data key="kind">Vault</data>"#),
+            "a full export must contain Vault nodes"
+        );
+        assert!(
+            output.contains(r#"<data key="kind">Note</data>"#),
+            "a full export must contain Note nodes"
+        );
+        assert!(output.contains("Note One"), "and their labels");
+        // Code is still there — this widened the export, it did not swap it.
+        assert!(output.contains(r#"<data key="kind">Function</data>"#));
+
+        // `--scope code` reproduces the OLD behaviour, now as an explicit
+        // choice rather than an unannounced one.
+        let mut code_only = Vec::new();
+        export_graphml_scoped(&store, &mut code_only, ExportScope::Code).unwrap();
+        let code_only = String::from_utf8(code_only).unwrap();
+        assert!(!code_only.contains(r#"<data key="kind">Note</data>"#));
+        assert!(code_only.contains(r#"<data key="kind">Function</data>"#));
+
+        // …and `--scope vault` is the mirror image.
+        let mut vault_only = Vec::new();
+        export_graphml_scoped(&store, &mut vault_only, ExportScope::Vault).unwrap();
+        let vault_only = String::from_utf8(vault_only).unwrap();
+        assert!(vault_only.contains(r#"<data key="kind">Note</data>"#));
+        assert!(!vault_only.contains(r#"<data key="kind">Function</data>"#));
     }
 
     #[test]

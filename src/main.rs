@@ -92,13 +92,13 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BlastRadiusResult, BrainContextResult, BrainWatcher, BreakTier, BreakingChange, CodeWatcher,
-    ContextResult, DeadCodeConfidence, FeatureContextResult, GateState, HubNode,
+    ContextResult, DeadCodeConfidence, ExportScope, FeatureContextResult, GateState, HubNode,
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
-    embedding::generate_embeddings_batch, export_cypher, export_graphml, export_in_memory_graph,
-    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
+    embedding::generate_embeddings_batch, export_cypher, export_graphml_scoped,
+    export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
     generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
     generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
@@ -114,6 +114,15 @@ use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
+/// `stale-check` found at least one repo needing a re-index.
+///
+/// DISTINCT from `EXIT_ERROR`, following the convention `terraform plan
+/// -detailed-exitcode` and `git diff --exit-code` established: 0 = nothing to
+/// do, 1 = THE CHECK ITSELF FAILED, 2 = the check ran and found drift.
+/// Collapsing the last two into 1 is what made a CI gate unable to tell "your
+/// graph is stale" from "the freshness check crashed" — the two demand
+/// opposite responses.
+const EXIT_NEEDS_REINDEX: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
@@ -3394,6 +3403,12 @@ enum Commands {
         format: String,
         #[arg(long, help = "Write to file instead of stdout")]
         output: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "all",
+            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file"
+        )]
+        scope: String,
         #[arg(
             long,
             default_value = "50",
@@ -11120,6 +11135,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Export {
             format,
+            scope,
             output,
             top,
             db,
@@ -11223,9 +11239,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
+            // Parsed once, before dispatch, so an invalid scope fails before any
+            // output is written rather than half way through a 163 MB file.
+            let export_scope: ExportScope = scope.parse()?;
             match format.as_str() {
+                // nw-173: `export` used to emit only the code subgraph with no
+                // indication. `graphml` now honours the scope; the two formats
+                // that genuinely cannot represent the vault REFUSE a vault
+                // scope rather than writing an empty file and calling it done.
+                "cypher" if export_scope.includes_vault() && export_scope != ExportScope::All => {
+                    anyhow::bail!(
+                        "cypher export is code-only and cannot represent the vault subgraph; \
+                         use --format graphml for --scope vault"
+                    )
+                }
+                "mermaid" if export_scope.includes_vault() && export_scope != ExportScope::All => {
+                    anyhow::bail!(
+                        "mermaid export is code-only and cannot represent the vault subgraph; \
+                         use --format graphml for --scope vault"
+                    )
+                }
                 "cypher" => export_cypher(&store, &mut writer)?,
-                "graphml" => export_graphml(&store, &mut writer)?,
+                "graphml" => export_graphml_scoped(&store, &mut writer, export_scope)?,
                 "mermaid" => export_mermaid(&store, top, &mut writer)?,
                 other => {
                     eprintln!(
@@ -18454,11 +18489,18 @@ fn run_brain(
                     .get("any_stale")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // Falls back to `any_stale` only for an older daemon that does
+                // not send the field — never silently reports "nothing to do".
+                let any_needs_reindex = value
+                    .get("any_needs_reindex")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(any_stale);
 
                 if json {
                     let normalized = serde_json::json!({
                         "repo_count": value.get("repo_count").cloned().unwrap_or(serde_json::json!(0)),
                         "any_stale": any_stale,
+                        "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
                     });
@@ -18513,13 +18555,21 @@ fn run_brain(
                     }
                 }
                 // Stale-check is a freshness gate — exit non-zero when stale.
-                return Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None));
+                return Ok((
+                    if any_needs_reindex {
+                        EXIT_NEEDS_REINDEX
+                    } else {
+                        EXIT_SUCCESS
+                    },
+                    None,
+                ));
             }
 
             let store = open_store(Some(&db_path))?;
             let repos = store.list_repos(None).unwrap_or_default();
 
             let mut any_stale = false;
+            let mut any_needs_reindex = false;
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
@@ -18585,9 +18635,25 @@ fn run_brain(
                 let content_missing = store
                     .repo_index_incomplete(repo)
                     .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?;
-                let is_stale = is_stale || content_missing;
+
+                // nw-163: `is_stale` means BEHIND HEAD and nothing else; the
+                // actionable union lives in `needs_reindex`. Mirrors
+                // `tool_stale_check` exactly — the two paths must not drift.
+                let status = if local_missing {
+                    "missing"
+                } else if content_missing {
+                    "incomplete"
+                } else if is_stale {
+                    "stale"
+                } else {
+                    "ok"
+                };
+                let needs_reindex = status != "ok";
                 if is_stale {
                     any_stale = true;
+                }
+                if needs_reindex {
+                    any_needs_reindex = true;
                 }
 
                 results.push(serde_json::json!({
@@ -18595,8 +18661,9 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
+                    "needs_reindex": needs_reindex,
                     "staleness_commits_behind": commits_behind,
-                    "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
+                    "status": status,
                 }));
             }
 
@@ -18655,7 +18722,14 @@ fn run_brain(
                 }
             }
             // Stale-check is a freshness gate — exit non-zero when stale.
-            Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None))
+            Ok((
+                if any_needs_reindex {
+                    EXIT_NEEDS_REINDEX
+                } else {
+                    EXIT_SUCCESS
+                },
+                None,
+            ))
         }
 
         BrainCommands::Watch {

@@ -267,7 +267,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
-| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD (also available top-level as `stale-check`). Exits 1 when any repo is stale or its working tree is missing (`[missing]`) — usable as a CI freshness gate |
+| `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. `any_stale` / `is_stale` mean *behind HEAD* specifically |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
 | `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
 | `brain orphans` | List notes with zero inbound and zero outbound wikilinks |

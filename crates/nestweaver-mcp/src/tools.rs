@@ -7656,6 +7656,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
 
     let mut results = Vec::new();
     let mut any_stale = false;
+    let mut any_needs_reindex = false;
 
     for repo in &repos {
         // A local working tree that no longer exists on disk is
@@ -7685,25 +7686,44 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             _ => repo.staleness_commits_behind as u64,
         };
 
-        let is_stale = if local_missing {
-            true
-        } else {
-            match &current_head {
-                Some(head) => head != &repo.indexed_sha,
-                None => commits_behind > 0,
-            }
+        // nw-163: `is_stale` means BEHIND HEAD, and nothing else.
+        //
+        // It used to be the union of three unrelated conditions — behind HEAD,
+        // working tree missing, and index incomplete — so a repo sitting
+        // exactly at HEAD with zero commits behind reported `is_stale: true`,
+        // which reads as a contradiction. `status` already classified the
+        // three correctly; only this flag conflated them.
+        let is_stale = match &current_head {
+            Some(head) => head != &repo.indexed_sha,
+            None => commits_behind > 0,
         };
 
         // A repo whose SHA was committed but whose content never landed
-        // (interrupted index) compares equal to HEAD yet serves an empty
-        // graph — flag it stale so the CI gate catches it.
+        // (interrupted index) compares equal to HEAD yet serves an empty graph.
+        // That is NOT staleness — it is incompleteness — but it needs the same
+        // remedy, which is what `needs_reindex` expresses.
         let content_missing = store
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
-        let is_stale = is_stale || content_missing;
+
+        let status = if local_missing {
+            "missing"
+        } else if content_missing {
+            "incomplete"
+        } else if is_stale {
+            "stale"
+        } else {
+            "ok"
+        };
+        // The ACTIONABLE union, and the only thing a CI gate should key on:
+        // every non-`ok` status is fixed by re-indexing.
+        let needs_reindex = status != "ok";
 
         if is_stale {
             any_stale = true;
+        }
+        if needs_reindex {
+            any_needs_reindex = true;
         }
 
         results.push(json!({
@@ -7711,14 +7731,18 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
+            "needs_reindex": needs_reindex,
             "staleness_commits_behind": commits_behind,
-            "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
+            "status": status,
         }));
     }
 
     Ok(json!({
         "repo_count": repos.len(),
+        // Behind HEAD only. Kept because it is what the word means; a CI gate
+        // wanting "is my graph usable" should read `any_needs_reindex`.
         "any_stale": any_stale,
+        "any_needs_reindex": any_needs_reindex,
         "repos": results,
     }))
 }

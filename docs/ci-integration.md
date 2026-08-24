@@ -409,15 +409,42 @@ full-suite run as the safety net, and use `rts-eval report` to learn what your
 ## Index freshness gate
 
 `affected_tests` and blast-radius results are only as current as the index.
-`stale-check` doubles as a CI freshness gate: it exits **1** when any repo's
-indexed SHA is behind git HEAD **or** its working tree has been deleted
-(flagged `[missing]` in text output, `status: "missing"` in JSON). The JSON
-carries an accurate `stale_repos` array, so a job can fail fast and name the
-repos to re-index:
+`stale-check` doubles as a CI freshness gate, with three distinct exit codes:
+
+| Exit | Meaning | CI response |
+|------|---------|-------------|
+| `0` | Every repo is current and completely indexed | proceed |
+| `1` | **The check itself failed** (bad `--db`, unreachable daemon, git error) | investigate — this is not a staleness signal |
+| `2` | At least one repo needs re-indexing | re-index, then re-run |
+
+Exit `1` is reserved for a check that could not answer, following the same
+convention as `terraform plan -detailed-exitcode` and `git diff --exit-code`.
+Collapsing "found drift" into the error code is how a gate ends up unable to
+distinguish a stale graph from a crashed check — the two need opposite
+responses.
+
+Three conditions produce exit `2`, all fixed the same way:
+
+| `status` | Meaning |
+|----------|---------|
+| `stale` | indexed SHA is behind git HEAD |
+| `incomplete` | the SHA was recorded but the content never landed (interrupted index) — the repo compares equal to HEAD while serving an empty graph |
+| `missing` | the working tree has been deleted |
+
+**Gate on `any_needs_reindex`** (or on exit `2`). `any_stale` and `is_stale`
+mean *behind HEAD* specifically, so a repo that is at HEAD but incompletely
+indexed reports `is_stale: false` with `needs_reindex: true`. The JSON also
+carries a `stale_repos` array so a job can name what to re-index:
 
 ```yaml
-- name: Fail if the NestWeaver index is stale
-  run: nestweaver stale-check --db nestweaver.lbug   # exit 1 = re-index needed
+- name: Fail if the NestWeaver index needs re-indexing
+  run: |
+    nestweaver stale-check --db nestweaver.lbug   # 0 ok · 1 check failed · 2 re-index
+    case $? in
+      0) ;;
+      2) echo "::error::NestWeaver index is out of date"; exit 1 ;;
+      *) echo "::error::stale-check could not run"; exit 1 ;;
+    esac
 ```
 
 Read/lookup commands against a non-existent database also fail (exit 1,
