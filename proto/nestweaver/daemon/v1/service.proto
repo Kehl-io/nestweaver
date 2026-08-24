@@ -90,6 +90,12 @@ message WatchVaultRequest {
   string vault_name = 2;
   string instance_id = 3;
   repeated string extra_ignore_patterns = 4;
+  // Adopt an existing watcher registration instead of being refused by it.
+  // `WatchCodeRequest` has carried this since watchers could be orphaned; the
+  // vault side did not, so a `brain watch` whose CLI was killed without
+  // sending StopWatch (SIGKILL, or a closed terminal — SIGHUP is not handled)
+  // blocked every later vault watch for the daemon's lifetime.
+  bool force = 5;
 }
 
 message WatchVaultResponse {

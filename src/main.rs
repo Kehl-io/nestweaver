@@ -3521,6 +3521,28 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
+    /// Stop the daemon's active file watcher, if any.
+    ///
+    /// The watcher slot is global and the daemon keeps no liveness check on the
+    /// CLI that registered it, so a `watch` or `brain watch` killed without a
+    /// clean shutdown (SIGKILL, or a closed terminal — SIGHUP is not handled)
+    /// leaves the slot occupied and every later watch refused. The refusal
+    /// message named `StopWatch`, an RPC no subcommand exposed; this is that
+    /// subcommand.
+    #[command(
+        name = "watch-stop",
+        after_help = "Examples:\n  nestweaver watch-stop\n  nestweaver watch-stop --db ./custom.lbug"
+    )]
+    WatchStop {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+
     /// Watch a repository for source file changes and re-index incrementally
     ///
     /// Monitors the repo directory for creates, modifies, and deletes of
@@ -4181,6 +4203,12 @@ enum BrainCommands {
             help = "Path to instance config (TOML) — required for --refresh-wiki-hours"
         )]
         config: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Adopt an existing watcher instead of being refused by it (use after a \
+                    previous `brain watch` was killed without stopping cleanly)"
+        )]
+        force: bool,
     },
     /// Force a full re-index of a vault. Drops the vault's existing notes
     /// from the graph (via cascade-delete) then re-runs the indexer from
@@ -11725,6 +11753,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
+        Commands::WatchStop { db, config } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                &db_path,
+                config.as_deref(),
+            ))?;
+            let resp = rt
+                .block_on(async {
+                    client
+                        .inner_mut()
+                        .stop_watch(nestweaver_proto::StopWatchRequest {})
+                        .await
+                })
+                .map_err(daemon_status_error)?
+                .into_inner();
+            // Stopping a watcher that is not running is the SUCCESS case for
+            // this command: the caller wanted an empty slot and now has one.
+            if resp.ok {
+                out.status("Stopped the daemon's active watcher.");
+            } else {
+                out.status("No watcher was running.");
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
         Commands::Watch {
             repo,
             db,
@@ -18923,6 +18977,7 @@ fn run_brain(
             ignore,
             refresh_wiki_hours,
             config,
+            force,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
                 eprintln!("Error: --refresh-wiki-hours requires --config");
@@ -18971,6 +19026,7 @@ fn run_brain(
                 // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
                 let vault_abs = abs_for_daemon(&path);
                 let req = nestweaver_proto::WatchVaultRequest {
+                    force,
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     instance_id: instance_id.clone(),
