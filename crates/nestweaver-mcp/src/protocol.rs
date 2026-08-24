@@ -70,13 +70,27 @@ pub fn validate_request(value: Value) -> Result<Request, InvalidRequest> {
             });
         }
     };
-    // Preserve the existing MCP compatibility policy: params remains an
-    // optional arbitrary JSON value here. Method/tool-specific validation
-    // returns -32602 or an in-band tool error; this envelope hardening does not
-    // newly reject clients that send null params.
+    // JSON-RPC 2.0: `params`, when present, MUST be structured — an array or
+    // an object. A scalar is a malformed envelope, and the core methods
+    // (`initialize`, `tools/list`, `ping`) never look at `params` at all, so
+    // nothing downstream would ever reject one: `{"method":"ping","params":7}`
+    // was answered with success.
+    //
+    // `null` keeps its carve-out deliberately. Real MCP clients send
+    // `"params": null` for argument-less calls, and the strictness worth
+    // having here is about malformed shapes, not about newly breaking those
+    // clients — which is the compatibility policy this hardening already
+    // chose. Method- and tool-specific validation still returns -32602 for
+    // structurally valid params with wrong contents.
     let params = match object.remove("params") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(value),
+        Some(value @ (Value::Array(_) | Value::Object(_))) => Some(value),
+        Some(_) => {
+            return Err(InvalidRequest {
+                response_id: id.unwrap_or(Value::Null),
+                message: "JSON-RPC params must be an array or an object".to_string(),
+            });
+        }
     };
     Ok(Request {
         jsonrpc,
@@ -198,6 +212,39 @@ mod request_validation_tests {
         }))
         .unwrap_err();
         assert_eq!(error.response_id, Value::Null);
+    }
+
+    /// JSON-RPC 2.0 requires structured `params`. The core methods never read
+    /// `params`, so a scalar reached no validator anywhere and was answered
+    /// with success — `{"method":"ping","params":7}` returned a result.
+    #[test]
+    fn scalar_params_are_rejected_but_null_keeps_its_carve_out() {
+        for scalar in [json!(false), json!(7), json!("x"), json!(1.5)] {
+            let error = validate_request(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "ping", "params": scalar
+            }))
+            .expect_err("a scalar params must be refused");
+            assert!(
+                error.message.contains("array or an object"),
+                "{}",
+                error.message
+            );
+            // A legal ID still correlates the failure.
+            assert_eq!(error.response_id, json!(1));
+        }
+
+        // Structured params still pass for every core method, including the
+        // empty object real clients send.
+        for method in ["initialize", "tools/list", "ping"] {
+            for params in [json!({}), json!({"a": 1}), json!([])] {
+                validate_request(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                }))
+                .unwrap_or_else(|error| {
+                    panic!("{method} must accept structured params: {}", error.message)
+                });
+            }
+        }
     }
 
     #[test]

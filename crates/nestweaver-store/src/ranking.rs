@@ -40,10 +40,90 @@ pub const PAGERANK_ARTIFACT_KIND: &str = "ranking";
 pub const PAGERANK_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const PAGERANK_ALGORITHM_FINGERPRINT_PREFIX: &str = "nestweaver-pagerank-v2:";
 
+/// The damping factor and iteration count every production PageRank pass uses.
+///
+/// Named because a READER needs an expectation that does not come from the
+/// artifact. Recomputing a fingerprint from the parameters an artifact declares
+/// proves the artifact is internally consistent — it does NOT prove those are
+/// the parameters this build computes with, so an artifact declaring different
+/// damping, carrying the matching fingerprint for that damping, passed. These
+/// constants are what a reader checks the declaration AGAINST.
+///
+/// Scope is deliberately not pinned here: it legitimately varies (code-only
+/// versus unified), so it stays part of the declaration rather than a
+/// constant.
+pub const PAGERANK_DAMPING: f64 = 0.85;
+pub const PAGERANK_ITERATIONS: u32 = 20;
+
 /// The algorithm/scope fingerprint an artifact computed with these parameters
 /// must carry. Public so a caller that KNOWS the parameters can pass the
 /// expected value to [`GraphStore::load_pagerank_cache_expecting`] instead of
 /// letting the artifact vouch for itself (nw-147).
+/// The parameters that produce [`pagerank_algorithm_fingerprint`], declared in
+/// the open so a reader can RECOMPUTE the fingerprint rather than trust it.
+///
+/// nw-147: the fingerprint is an opaque hash, so a reader with no independent
+/// expectation could only compare it to itself — which always passes, and made
+/// a same-brain, same-generation artifact computed with different
+/// damping/iterations/scope indistinguishable from a correct one. Recording
+/// the inputs turns that self-comparison into a real check.
+pub fn pagerank_declared_parameters(
+    damping: f64,
+    iterations: u32,
+    scope: &GraphScope,
+) -> serde_json::Value {
+    serde_json::json!({
+        "damping": damping,
+        "iterations": iterations,
+        "node_queries": scope.node_queries,
+        "edge_queries": scope
+            .edge_queries
+            .iter()
+            .map(|edge| serde_json::json!({
+                "query": edge.query,
+                "edge_type": edge
+                    .edge_type
+                    .map(|kind| kind.rel_table_name().to_string()),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Recompute the fingerprint from parameters an artifact DECLARES.
+///
+/// Returns `None` when the declaration is absent or malformed — the caller
+/// decides whether that is fatal, because an artifact predating the declaration
+/// is a different situation from one that declares something incoherent.
+pub fn pagerank_fingerprint_from_declared(parameters: &serde_json::Value) -> Option<String> {
+    let damping = parameters.get("damping")?.as_f64()?;
+    let iterations = u32::try_from(parameters.get("iterations")?.as_u64()?).ok()?;
+    let node_queries: Vec<String> = parameters
+        .get("node_queries")?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let mut edge_queries = Vec::new();
+    for edge in parameters.get("edge_queries")?.as_array()? {
+        let query = edge.get("query")?.as_str()?.to_string();
+        let edge_type = match edge.get("edge_type") {
+            Some(serde_json::Value::Null) | None => None,
+            Some(value) => Some(nestweaver_schema::EdgeType::from_rel_table_name(
+                value.as_str()?,
+            )?),
+        };
+        edge_queries.push(crate::ranking::ScopedEdgeQuery { query, edge_type });
+    }
+    Some(pagerank_algorithm_fingerprint(
+        damping,
+        iterations,
+        &GraphScope {
+            node_queries,
+            edge_queries,
+        },
+    ))
+}
+
 pub fn pagerank_algorithm_fingerprint(damping: f64, iterations: u32, scope: &GraphScope) -> String {
     let mut digest = blake3::Hasher::new();
     digest.update(b"nestweaver-pagerank-scope-v2\0");
@@ -692,6 +772,11 @@ impl GraphStore {
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
                 Some(pagerank_algorithm_fingerprint(damping, iterations, scope));
+            *self
+                .pagerank_declared_parameters
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+                Some(pagerank_declared_parameters(damping, iterations, scope));
             self.bump_pagerank_generation();
             return Ok(());
         }
@@ -782,6 +867,11 @@ impl GraphStore {
             .lock()
             .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
             Some(pagerank_algorithm_fingerprint(damping, iterations, scope));
+        *self
+            .pagerank_declared_parameters
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+            Some(pagerank_declared_parameters(damping, iterations, scope));
 
         // Bump the generation so cache-holders know to refresh.
         self.bump_pagerank_generation();
@@ -1313,6 +1403,23 @@ impl GraphStore {
                 },
                 scores,
             )?;
+            // nw-147: declare the parameters INTO the artifact so a reader can
+            // recompute the fingerprint instead of taking the artifact's word.
+            let declared = self
+                .pagerank_declared_parameters
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+                .clone();
+            // Fail at WRITE time rather than emitting an artifact that every
+            // reader refuses. A null-parameter file used to be written happily
+            // and only rejected later, at load, far from the cause.
+            let declared = declared.ok_or_else(|| {
+                StoreError::Query(
+                    "refusing to write a PageRank artifact that declares no algorithm parameters"
+                        .to_string(),
+                )
+            })?;
+            let envelope = envelope.with_algorithm_parameters(declared);
             let json = serde_json::to_vec_pretty(&envelope)
                 .map_err(|e| StoreError::Query(format!("serialize PageRank artifact: {e}")))?;
             crate::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
@@ -1415,6 +1522,16 @@ impl GraphStore {
                 .pagerank_artifact_fingerprint
                 .lock()
                 .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(fingerprint);
+            // nw-147: restore the DECLARED parameters too, not just the
+            // fingerprint. Without this a load->save round trip re-emitted the
+            // artifact with null parameters, which `pagerank_artifact_contract`
+            // then refuses — the store would produce a file it cannot read.
+            *self
+                .pagerank_declared_parameters
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? =
+                (!envelope.algorithm_parameters.is_null())
+                    .then(|| envelope.algorithm_parameters.clone());
         }
         Ok(())
     }

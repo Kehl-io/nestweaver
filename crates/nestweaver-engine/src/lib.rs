@@ -345,7 +345,10 @@ pub use eval::{
     EvalComparison, EvalReport, JudgedQuery, PerQueryRow, compare_reports, load_judged_queries,
     mrr, ndcg_at_k, precision_at_k, run_eval,
 };
-pub use export::{export_cypher, export_graphml, export_mermaid};
+pub use export::{
+    ExportScope, export_cypher, export_graphml, export_graphml_scoped, export_mermaid,
+    export_text_format,
+};
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{
     AbortMigrationOutcome, ExtensionStore, InstanceExtensionMigration,

@@ -841,6 +841,23 @@ fn parity_flow_trace_direct_vs_daemon() {
     );
 }
 
+/// `export --scope` was honoured by the direct path and silently DROPPED by
+/// the daemon path: the CLI never sent `scope` and the daemon never read it.
+/// Because the daemon route is the default, the flag did nothing for most
+/// users while the engine-level scope tests passed. Parity is the only place
+/// that catches a flag lost on the wire.
+#[test]
+fn parity_export_scope_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    for scope in ["all", "code", "vault"] {
+        check_parity(
+            &fixture.db_path,
+            &format!("export --scope {scope}"),
+            &["export", "--format", "graphml", "--scope", scope],
+        );
+    }
+}
+
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never

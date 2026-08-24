@@ -1057,19 +1057,19 @@ fn build_daemon_permission_source(
 
 /// Resolve the empty RPC sentinel to the daemon's configured graph-data
 /// identity, then validate the effective ID at the trust boundary.
-/// KNOWN GAP (validated 2026-08-23, filed as nw-207): "explicit" cannot be
-/// distinguished from "a client's fallback". The MCP `brain_add_source` path
-/// resolves its OWN config and sends the literal `"default"` when it has none —
-/// so an MCP server started without `--config`, proxying to a daemon that runs
-/// WITH `--config instance_id = "kory-brain"`, sends `"default"` and this
-/// function honours it. The vault is created under `default` while every other
-/// command on that brain uses `kory-brain`, splitting the graph.
+/// nw-207: THE DAEMON OWNS THE IDENTITY OF THE DATA IT STORES. An empty
+/// `requested` is the protocol's "you decide" sentinel and defers to
+/// `configured`; a non-empty one is an explicit instruction from a caller who
+/// NAMED an instance.
 ///
-/// Not fixed here because the obvious repair — have the MCP send empty and
-/// defer — reintroduces the nw-019 duplication it was written to stop: a
-/// config-less daemon's `data_instance_id` is its db-path HASH, while the CLI's
-/// config-less `resolve_instance_id` is `"default"`. Reconciling those two is a
-/// data-identity change that needs a migration decision, not a one-line patch.
+/// That distinction only became meaningful once clients stopped sending a
+/// fallback as though it were a choice. The MCP `brain_add_source` path used
+/// to resolve its OWN config and send the literal "default" when it had none,
+/// so an MCP server started without `--config`, proxying to a daemon running
+/// WITH `--config instance_id = "kory-brain"`, silently created the vault under
+/// `default` and split the graph. It sends empty now, and a config-less
+/// daemon's `data_instance_id` is "default" rather than a db-path hash, so the
+/// two paths agree without either compensating for the other.
 fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<String, Status> {
     let effective = if requested.is_empty() {
         configured
@@ -4098,17 +4098,28 @@ impl NestWeaverDaemon for DaemonService {
                 .unwrap_or("cypher");
             let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let output_path = args.get("output").and_then(|v| v.as_str());
+            // The daemon route is the DEFAULT, and it neither received nor
+            // read `scope` — so `--scope code|vault` silently exported
+            // everything while the direct path honoured it.
+            let scope: nestweaver_engine::ExportScope = args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all")
+                .parse()
+                .map_err(|e| Status::invalid_argument(format!("invalid scope: {e}")))?;
 
             match format {
                 "cypher" | "graphml" | "mermaid" => {
                     let mut buf = Vec::new();
-                    match format {
-                        "cypher" => nestweaver_engine::export_cypher(&state.store, &mut buf),
-                        "graphml" => nestweaver_engine::export_graphml(&state.store, &mut buf),
-                        "mermaid" => nestweaver_engine::export_mermaid(&state.store, top, &mut buf),
-                        _ => unreachable!(),
-                    }
-                    .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+                    // Same shared implementation the direct CLI path uses.
+                    let notice = nestweaver_engine::export_text_format(
+                        &state.store,
+                        &mut buf,
+                        format,
+                        scope,
+                        top,
+                    )
+                    .map_err(|e| Status::invalid_argument(format!("export failed: {e:#}")))?;
 
                     let text = String::from_utf8(buf)
                         .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
@@ -4129,6 +4140,7 @@ impl NestWeaverDaemon for DaemonService {
                         "bytes": text.len(),
                         "text": if output_path.is_some() { None } else { Some(&text) },
                         "output": output_path,
+                        "notice": notice,
                     }))
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
@@ -4139,6 +4151,15 @@ impl NestWeaverDaemon for DaemonService {
                         ));
                     }
 
+                    // msgpack carries the code graph only; a vault scope is a
+                    // request it cannot satisfy, so refuse instead of writing
+                    // code and reporting success.
+                    if scope == nestweaver_engine::ExportScope::Vault {
+                        return Err(Status::invalid_argument(
+                            "msgpack export is code-only and cannot represent the vault subgraph; \
+                             use --format graphml for --scope vault",
+                        ));
+                    }
                     let graph = nestweaver_engine::export_in_memory_graph(&state.store)
                         .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
                     let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
@@ -9614,13 +9635,26 @@ pub async fn run_server(
         instance_id: instance_id.clone(),
     };
 
-    // nw-019: graph-data identity — the config's logical `instance_id` when we
-    // have a parsed config, else fall back to the runtime hash so a config-less
-    // daemon still has `data_instance_id == instance_id`.
+    // Graph-data identity: the config's logical `instance_id` when we have a
+    // parsed config, else "default".
+    //
+    // nw-207: this used to fall back to the RUNTIME HASH so that
+    // `data_instance_id == instance_id` for a config-less daemon. That looked
+    // tidy and was the root of a graph-splitting bug. The CLI's config-less
+    // resolution (`resolve_instance_id`) is "default", so the same brain
+    // reached two ways got two different data identities — which forced the
+    // MCP add-source path to send a literal "default" to compensate, which in
+    // turn overrode a daemon that DID have a configured instance. One
+    // compensation stacked on another.
+    //
+    // There is now ONE rule: absent an explicit instance, data lives under
+    // "default". The runtime hash keeps doing its own job — naming sockets and
+    // local state per database path — which is unrelated to which logical
+    // instance the graph belongs to. Conflating the two is what broke.
     let data_instance_id = instance_cfg
         .as_ref()
         .map(|c| c.instance_id.clone())
-        .unwrap_or_else(|| instance_id.clone());
+        .unwrap_or_else(|| "default".to_string());
 
     let is_server_mode = server_opts.is_some();
 
@@ -15050,31 +15084,46 @@ mod startup_helper_tests {
         assert!(!extensions.contains_key(&file_uid));
     }
 
-    /// nw-207 reproduction. A client-supplied instance id OVERRIDES the
-    /// daemon's configured one, and the MCP add-source path supplies the
-    /// literal "default" whenever the MCP process itself has no config.
+    /// nw-207. The daemon owns the identity of the data it stores.
     ///
-    /// Documents the CURRENT behaviour rather than the desired one, so the
-    /// severity is visible in the test suite while the fix is decided. Flip
-    /// these assertions when nw-207 lands.
+    /// A client may NAME an instance and be obeyed; it may not redirect writes
+    /// into a different logical namespace by defaulting. The MCP add-source
+    /// path used to send the literal "default" whenever it had no config of its
+    /// own, which this function honoured — so an MCP server started without
+    /// `--config`, proxying to a daemon configured as `kory-brain`, created the
+    /// vault under `default` and split the graph.
+    ///
+    /// This asserts the CORRECTED contract. It replaces a test that pinned the
+    /// buggy behaviour while the fix waited on a migration decision.
     #[test]
-    fn nw207_client_instance_id_overrides_the_daemons_configured_one() {
-        // The reported case: MCP without config sends "default" to a daemon
-        // configured as "kory-brain".
-        let effective = resolve_effective_instance_id("default", "kory-brain").unwrap();
-        assert_eq!(
-            effective, "default",
-            "CURRENT behaviour: the client's fallback wins over the daemon's \
-             configured identity, so the write lands in the wrong instance"
-        );
-
-        // Empty correctly defers — which is why "send empty" looks like the
-        // fix until you notice a config-less daemon's id is a db-path hash,
-        // not "default".
+    fn the_daemon_owns_data_identity_unless_a_caller_names_an_instance() {
+        // The reported case: a client with no config of its own now sends
+        // EMPTY, and the daemon's configured identity wins.
         assert_eq!(
             resolve_effective_instance_id("", "kory-brain").unwrap(),
-            "kory-brain"
+            "kory-brain",
+            "an unspecified instance must defer to the daemon, not override it"
         );
+
+        // A caller that NAMES an instance is still obeyed — multi-instance
+        // targeting is a real feature and this must not break it.
+        assert_eq!(
+            resolve_effective_instance_id("other-brain", "kory-brain").unwrap(),
+            "other-brain"
+        );
+
+        // A config-less daemon resolves to "default", matching the CLI's
+        // `resolve_instance_id`. Before nw-207 it was a db-path HASH, and that
+        // mismatch is what forced clients to send "default" explicitly — the
+        // compensation that caused the override.
+        assert_eq!(
+            resolve_effective_instance_id("", "default").unwrap(),
+            "default"
+        );
+
+        // An invalid instance is still rejected at this trust boundary rather
+        // than silently producing an ambiguous uid.
+        assert!(resolve_effective_instance_id("a:b", "default").is_err());
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared

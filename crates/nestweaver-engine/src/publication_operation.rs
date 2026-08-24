@@ -810,6 +810,32 @@ fn validate_target_slot(
     }
     for descriptor in &bundle.artifacts {
         let artifact = slot.join(&descriptor.path);
+        // Hashing OPENS the path, and opening follows symlinks — so a described
+        // artifact that is a symlink would validate against bytes living
+        // outside the slot entirely, while the reverse inventory below (which
+        // does not follow links) could not see it. A sealed slot contains
+        // exactly what it declares; a link is not a shape we ever write.
+        let metadata = std::fs::symlink_metadata(&artifact).map_err(|error| {
+            anyhow::anyhow!("stat target artifact {}: {error}", artifact.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} is a symbolic link; a sealed slot must contain \
+                 real files only",
+                descriptor.path
+            ))
+            .into());
+        }
+        // Belt and braces on containment: `validate_metadata` rejects absolute
+        // and `..` paths, but the bytes about to be trusted are worth proving
+        // are inside the slot rather than inferring it.
+        if !artifact.starts_with(&slot) {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} resolves outside the publication slot",
+                descriptor.path
+            ))
+            .into());
+        }
         let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
             anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
         })?;
@@ -822,6 +848,88 @@ fn validate_target_slot(
             .into());
         }
     }
+
+    // nw-149: and the REVERSE. The loop above only proves every DESCRIBED file
+    // is present and intact; it says nothing about files present but not
+    // described, so anything dropped into a sealed slot was invisible to
+    // validation and travelled with the publication. `validate_backup_publication_inventory`
+    // already required `described == present` for the same artifacts — this
+    // path simply never got the other half.
+    //
+    // Filed as a hardening asymmetry rather than a proven escape: the probe
+    // matrix achieved no exploit. It closes a gap in an invariant; it does not
+    // patch a known attack.
+    let described: std::collections::BTreeSet<&str> = bundle
+        .artifacts
+        .iter()
+        .map(|descriptor| descriptor.path.as_str())
+        .collect();
+    // Walk RECURSIVELY and compare the same shape the manifest uses. Artifact
+    // paths are relative and `/`-joined (`build_backup_publication_bundle` ->
+    // `normalized_relative_path`), and nested ones are routine: the BM25 and
+    // regex sidecars are whole DIRECTORIES, described file by file as
+    // `<db>.tantivy/meta.json` and friends. A non-recursive `read_dir` would
+    // compare the bare directory name `<db>.tantivy` against those paths,
+    // match nothing, and fail every real publication permanently.
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in walkdir::WalkDir::new(&slot).into_iter() {
+        let entry = entry
+            .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?;
+        // `WalkDir` does not follow symlinks, so a link reports neither file
+        // nor dir — it would fall through this filter and be INVISIBLE to the
+        // undescribed-file check while still being openable by the digest
+        // check above. Refuse it explicitly instead.
+        if entry.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target slot contains a symbolic link ({}); a sealed slot must contain \
+                 real files only",
+                entry.path().display()
+            ))
+            .into());
+        }
+        // Directories are containers, not artifacts; the manifest describes the
+        // files inside them.
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&slot)
+            .map_err(|error| anyhow::anyhow!("target slot entry outside the slot: {error}"))?;
+        let mut components = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().into_owned())
+                }
+                // A slot is written by us; anything else is not a shape we
+                // describe, so refuse rather than guess at a normal form.
+                _ => anyhow::bail!("unsafe target slot entry path: {}", entry.path().display()),
+            }
+        }
+        let name = components.join("/");
+        // The manifest describes the artifacts; it does not describe itself.
+        if name == crate::publication::PUBLICATION_MANIFEST_FILE {
+            continue;
+        }
+        present.insert(name);
+    }
+    let undescribed: Vec<&String> = present
+        .iter()
+        .filter(|name| !described.contains(name.as_str()))
+        .collect();
+    if !undescribed.is_empty() {
+        // Permanent for the same reason as a digest mismatch: a retry sees the
+        // same directory.
+        return Err(PermanentPublicationFailure(format!(
+            "target slot contains {} file(s) the manifest does not describe: {:?}; \
+             a sealed slot must contain exactly what it declares",
+            undescribed.len(),
+            undescribed
+        ))
+        .into());
+    }
+
     Ok(crate::hash::blake3_hex_bytes(&bytes))
 }
 
@@ -949,13 +1057,64 @@ mod tests {
     fn write_target_bundle(root: &Path, plan: &PublicationOperationPlan) -> String {
         let slot = crate::publication::slot_path(root, &plan.target_publication_uuid).unwrap();
         std::fs::create_dir_all(&slot).unwrap();
+        // The bundle describes a real artifact and the slot holds exactly that
+        // file. An empty `artifacts` list used to be enough here, but a
+        // publication describing nothing is not a publication — and slot
+        // validation is now bidirectional, so an undescribed file in the slot
+        // is rejected too.
+        let graph = b"nw-test-graph".to_vec();
+        std::fs::write(
+            slot.join(crate::publication::PUBLICATION_GRAPH_FILE),
+            &graph,
+        )
+        .unwrap();
+        // A NESTED artifact, because that is the normal case: the BM25 and
+        // regex sidecars are directories described file by file. A fixture
+        // with only top-level files let slot validation compare bare
+        // directory names against `/`-joined manifest paths and still pass.
+        let nested_dir = slot.join(format!(
+            "{}.tantivy",
+            crate::publication::PUBLICATION_GRAPH_FILE
+        ));
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = b"nw-test-bm25-meta".to_vec();
+        std::fs::write(nested_dir.join("meta.json"), &nested).unwrap();
+        let nested_path = format!(
+            "{}.tantivy/meta.json",
+            crate::publication::PUBLICATION_GRAPH_FILE
+        );
         let bundle = crate::publication::PublicationBundleV3 {
             format_version: plan.publication_format_version,
             brain_uuid: plan.brain_uuid.clone(),
             publication_uuid: plan.target_publication_uuid.clone(),
             producer_version: plan.producer_version.clone(),
             source_graph_generation: 0,
-            artifacts: Vec::new(),
+            artifacts: vec![
+                crate::publication::ArtifactDescriptor {
+                    path: crate::publication::PUBLICATION_GRAPH_FILE.to_string(),
+                    kind: crate::publication::ArtifactKind::Graph,
+                    artifact_schema_version: 1,
+                    byte_size: graph.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&graph),
+                    brain_uuid: plan.brain_uuid.clone(),
+                    publication_uuid: plan.target_publication_uuid.clone(),
+                    producer_version: plan.producer_version.clone(),
+                    source_graph_generation: 0,
+                    algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+                },
+                crate::publication::ArtifactDescriptor {
+                    path: nested_path,
+                    kind: crate::publication::ArtifactKind::Bm25,
+                    artifact_schema_version: 1,
+                    byte_size: nested.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&nested),
+                    brain_uuid: plan.brain_uuid.clone(),
+                    publication_uuid: plan.target_publication_uuid.clone(),
+                    producer_version: plan.producer_version.clone(),
+                    source_graph_generation: 0,
+                    algorithm_fingerprint: "nestweaver-tantivy-bm25-v1".to_string(),
+                },
+            ],
         };
         let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
         std::fs::write(
@@ -1108,6 +1267,39 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("checksum mismatch")
+        );
+    }
+
+    /// A symlink defeated "a sealed slot contains exactly what it declares"
+    /// from BOTH directions: hashing opens the path and so follows the link to
+    /// bytes outside the slot, while the reverse inventory walks without
+    /// following and so reports a link as neither file nor directory — making
+    /// an undescribed one invisible.
+    #[test]
+    fn a_symlink_in_the_target_slot_is_refused_from_either_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let state = create_operation(dir.path(), plan.clone()).unwrap();
+        let validating = advance_to_validating(dir.path(), &plan, state);
+        write_target_bundle(dir.path(), &plan);
+        let slot =
+            crate::publication::slot_path(dir.path(), &plan.target_publication_uuid).unwrap();
+
+        // Bytes deliberately OUTSIDE the slot, which is the whole point.
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, b"not part of this publication").unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join("smuggled.bin")).unwrap();
+
+        let error = mark_ready(dir.path(), &plan.operation_uuid, validating.revision)
+            .expect_err("a symlink in a sealed slot must be refused");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("symbolic link"), "{rendered}");
+        // Permanent, like a digest mismatch: a retry sees the same directory.
+        assert!(
+            error
+                .downcast_ref::<PermanentPublicationFailure>()
+                .is_some(),
+            "refusal must be permanent, not retried forever: {rendered}"
         );
     }
 

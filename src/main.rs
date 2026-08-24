@@ -92,15 +92,15 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BlastRadiusResult, BrainContextResult, BrainWatcher, BreakTier, BreakingChange, CodeWatcher,
-    ContextResult, DeadCodeConfidence, FeatureContextResult, GateState, HubNode,
+    ContextResult, DeadCodeConfidence, ExportScope, FeatureContextResult, GateState, HubNode,
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
-    embedding::generate_embeddings_batch, export_cypher, export_graphml, export_in_memory_graph,
-    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
-    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
-    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
+    embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
+    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
+    generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
     index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
     load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
@@ -114,6 +114,15 @@ use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
+/// `stale-check` found at least one repo needing a re-index.
+///
+/// DISTINCT from `EXIT_ERROR`, following the convention `terraform plan
+/// -detailed-exitcode` and `git diff --exit-code` established: 0 = nothing to
+/// do, 1 = THE CHECK ITSELF FAILED, 2 = the check ran and found drift.
+/// Collapsing the last two into 1 is what made a CI gate unable to tell "your
+/// graph is stale" from "the freshness check crashed" — the two demand
+/// opposite responses.
+const EXIT_NEEDS_REINDEX: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
@@ -3401,6 +3410,12 @@ enum Commands {
         format: String,
         #[arg(long, help = "Write to file instead of stdout")]
         output: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "all",
+            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file"
+        )]
+        scope: String,
         #[arg(
             long,
             default_value = "50",
@@ -11206,6 +11221,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Export {
             format,
+            scope,
             output,
             top,
             db,
@@ -11220,7 +11236,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(db_path, None))?;
 
-                let mut args = serde_json::json!({ "format": format, "top": top });
+                // `scope` was never sent, so the daemon — the DEFAULT route —
+                // exported the whole graph no matter what `--scope` said.
+                let mut args = serde_json::json!({ "format": format, "top": top, "scope": scope });
                 if let Some(ref p) = output {
                     // The DAEMON writes the file and runs with CWD=/, so a client-relative
                     // --output would land in / (or fail), not the user's directory. Resolve
@@ -11243,6 +11261,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .context("export_graph RPC failed")?;
                 let result: serde_json::Value =
                     serde_json::from_str(&resp.into_inner().result_json)?;
+
+                if let Some(notice) = result.get("notice").and_then(|v| v.as_str()) {
+                    out.status(notice);
+                }
 
                 // For text formats without an output file, print the text to stdout.
                 if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
@@ -11309,17 +11331,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
-            match format.as_str() {
-                "cypher" => export_cypher(&store, &mut writer)?,
-                "graphml" => export_graphml(&store, &mut writer)?,
-                "mermaid" => export_mermaid(&store, top, &mut writer)?,
-                other => {
-                    eprintln!(
-                        "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
-                        other
-                    );
-                    return Ok((EXIT_ERROR, None));
-                }
+            // Parsed once, before dispatch, so an invalid scope fails before any
+            // output is written rather than half way through a 163 MB file.
+            let export_scope: ExportScope = scope.parse()?;
+            // Unknown formats keep their friendly listing and EXIT_ERROR
+            // rather than becoming a generic error chain.
+            if !matches!(format.as_str(), "cypher" | "graphml" | "mermaid") {
+                eprintln!(
+                    "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
+                    format
+                );
+                return Ok((EXIT_ERROR, None));
+            }
+            // One shared implementation with the daemon's `export_graph`, so
+            // the two cannot drift on scope again.
+            if let Some(notice) =
+                export_text_format(&store, &mut writer, format.as_str(), export_scope, top)?
+            {
+                out.status(&notice);
             }
             std::io::Write::flush(&mut writer)?;
 
@@ -18531,27 +18560,44 @@ fn run_brain(
                 // `stale_repos` verdict could contradict the tool's fresh
                 // `any_stale` — is replaced by a top-level `stale_repos`
                 // computed from the actual stale list).
-                let stale_urls: Vec<serde_json::Value> = value
-                    .get("repos")
-                    .and_then(|v| v.as_array())
-                    .map(|repos| {
-                        repos
-                            .iter()
-                            .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
-                            .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let urls_where = |field: &str| -> Vec<serde_json::Value> {
+                    value
+                        .get("repos")
+                        .and_then(|v| v.as_array())
+                        .map(|repos| {
+                            repos
+                                .iter()
+                                .filter(|r| r[field].as_bool().unwrap_or(false))
+                                .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let stale_urls = urls_where("is_stale");
+                // nw-163: `stale_repos` narrowed along with `is_stale`, so it
+                // no longer names an `incomplete` or `missing` repo — yet those
+                // still exit 2, and the CI recipe tells a job to re-index what
+                // this array names. `needs_reindex_repos` is the actionable
+                // set; `stale_repos` stays behind-HEAD only.
+                let needs_reindex_urls = urls_where("needs_reindex");
                 let any_stale = value
                     .get("any_stale")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // Falls back to `any_stale` only for an older daemon that does
+                // not send the field — never silently reports "nothing to do".
+                let any_needs_reindex = value
+                    .get("any_needs_reindex")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(any_stale);
 
                 if json {
                     let normalized = serde_json::json!({
                         "repo_count": value.get("repo_count").cloned().unwrap_or(serde_json::json!(0)),
                         "any_stale": any_stale,
+                        "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
+                        "needs_reindex_repos": needs_reindex_urls,
                         "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
                     });
                     println!("{}", serde_json::to_string_pretty(&normalized)?);
@@ -18572,8 +18618,12 @@ fn run_brain(
                         println!(
                             "Stale check: {} repo(s), {}",
                             repo_count,
-                            if any_stale {
-                                "INDEX IS STALE"
+                            // Gated on the union, not `any_stale`: an `incomplete`
+                            // repo exits 2, and a banner reading "up to date"
+                            // above that exit code is the exact dishonesty this
+                            // contract exists to remove.
+                            if any_needs_reindex {
+                                "NEEDS REINDEX"
                             } else {
                                 "up to date"
                             }
@@ -18605,13 +18655,26 @@ fn run_brain(
                     }
                 }
                 // Stale-check is a freshness gate — exit non-zero when stale.
-                return Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None));
+                return Ok((
+                    if any_needs_reindex {
+                        EXIT_NEEDS_REINDEX
+                    } else {
+                        EXIT_SUCCESS
+                    },
+                    None,
+                ));
             }
 
             let store = open_store(Some(&db_path))?;
-            let repos = store.list_repos(None).unwrap_or_default();
+            // A freshness GATE that cannot read the database must fail, not
+            // report "No repos indexed." and exit 0. The daemon path already
+            // propagates this; only the direct path swallowed it.
+            let repos = store
+                .list_repos(None)
+                .map_err(|error| anyhow::anyhow!("list repos: {error}"))?;
 
             let mut any_stale = false;
+            let mut any_needs_reindex = false;
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
@@ -18661,13 +18724,21 @@ fn run_brain(
                     }
                     _ => repo.staleness_commits_behind as u64,
                 };
-                let is_stale = if local_missing {
-                    true
-                } else {
-                    match &current_head {
-                        Some(head) => head != &repo.indexed_sha,
-                        None => commits_behind > 0,
-                    }
+                // nw-163: BEHIND HEAD and nothing else — a deleted working
+                // tree is `status: "missing"` and `needs_reindex: true`, not
+                // "stale". The daemon path (`tool_stale_check`) was changed to
+                // this and the direct path was not, so the same repo answered
+                // `is_stale: true` without a daemon and `false` with one.
+                let is_stale = match &current_head {
+                    Some(head) => head != &repo.indexed_sha,
+                    // The working tree is GONE, so HEAD is unknowable and
+                    // "behind HEAD" cannot be asserted. The stored counter is
+                    // a leftover from the last successful check; reporting it
+                    // as staleness presents a stale guess as a fact. `status`
+                    // says "missing" and `needs_reindex` is true, which is the
+                    // actionable truth.
+                    None if local_missing => false,
+                    None => commits_behind > 0,
                 };
                 // A repo whose SHA was committed but whose content never
                 // landed (interrupted index) compares equal to HEAD yet
@@ -18677,9 +18748,25 @@ fn run_brain(
                 let content_missing = store
                     .repo_index_incomplete(repo)
                     .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?;
-                let is_stale = is_stale || content_missing;
+
+                // nw-163: `is_stale` means BEHIND HEAD and nothing else; the
+                // actionable union lives in `needs_reindex`. Mirrors
+                // `tool_stale_check` exactly — the two paths must not drift.
+                let status = if local_missing {
+                    "missing"
+                } else if content_missing {
+                    "incomplete"
+                } else if is_stale {
+                    "stale"
+                } else {
+                    "ok"
+                };
+                let needs_reindex = status != "ok";
                 if is_stale {
                     any_stale = true;
+                }
+                if needs_reindex {
+                    any_needs_reindex = true;
                 }
 
                 results.push(serde_json::json!({
@@ -18687,25 +18774,32 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
+                    "needs_reindex": needs_reindex,
                     "staleness_commits_behind": commits_behind,
-                    "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
+                    "status": status,
                 }));
             }
 
             if json {
                 // Include the actual stale list so `any_stale: true`
                 // never sits next to an empty stale set.
-                let stale_urls: Vec<serde_json::Value> = results
-                    .iter()
-                    .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
-                    .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
-                    .collect();
+                let urls_where = |field: &str| -> Vec<serde_json::Value> {
+                    results
+                        .iter()
+                        .filter(|r| r[field].as_bool().unwrap_or(false))
+                        .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                        .collect()
+                };
+                let stale_urls = urls_where("is_stale");
+                let needs_reindex_urls = urls_where("needs_reindex");
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "repo_count": repos.len(),
                         "any_stale": any_stale,
+                        "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
+                        "needs_reindex_repos": needs_reindex_urls,
                         "repos": results,
                     }))?
                 );
@@ -18715,8 +18809,12 @@ fn run_brain(
                 println!(
                     "Stale check: {} repo(s), {}",
                     repos.len(),
-                    if any_stale {
-                        "INDEX IS STALE"
+                    // Gated on the union, not `any_stale`: an `incomplete`
+                    // repo exits 2, and a banner reading "up to date"
+                    // above that exit code is the exact dishonesty this
+                    // contract exists to remove.
+                    if any_needs_reindex {
+                        "NEEDS REINDEX"
                     } else {
                         "up to date"
                     }
@@ -18747,7 +18845,14 @@ fn run_brain(
                 }
             }
             // Stale-check is a freshness gate — exit non-zero when stale.
-            Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None))
+            Ok((
+                if any_needs_reindex {
+                    EXIT_NEEDS_REINDEX
+                } else {
+                    EXIT_SUCCESS
+                },
+                None,
+            ))
         }
 
         BrainCommands::Watch {

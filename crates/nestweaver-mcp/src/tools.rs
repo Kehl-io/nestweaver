@@ -150,6 +150,46 @@ const LITE_TOOLS: &[&str] = &[
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
 /// When `--tools` was specified, only those named tools are included.
 fn all_tool_schemas() -> Vec<Value> {
+    let mut schemas = all_tool_schemas_undecorated();
+    // Every cacheable tool honours `cache: "bypass"` / `no_cache: true` at
+    // dispatch (`cache_bypassed`), so every cacheable tool must DECLARE them.
+    // Derived from `CACHEABLE_TOOLS` rather than written into each schema by
+    // hand: with `additionalProperties: false` an undeclared pair is a hard
+    // rejection, and a hand-maintained list drifts the moment a tool joins
+    // `CACHEABLE_TOOLS`. That drift already happened — 18 of 25 cacheable
+    // tools did not declare them, which made `no_cache` a validation error
+    // and left `get_summary`'s own `cache_bypassed` branch unreachable.
+    for tool in &mut schemas {
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        if !CACHEABLE_TOOLS.contains(&name) {
+            continue;
+        }
+        let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(|properties| properties.as_object_mut())
+        else {
+            continue;
+        };
+        properties.entry("cache").or_insert_with(|| {
+            serde_json::json!({
+                "type": "string",
+                "description": "Set to \"bypass\" to skip the response cache for this call."
+            })
+        });
+        properties.entry("no_cache").or_insert_with(|| {
+            serde_json::json!({
+                "type": "boolean",
+                "description": "When true, skip the response cache for this call."
+            })
+        });
+    }
+    schemas
+}
+
+fn all_tool_schemas_undecorated() -> Vec<Value> {
     vec![
         tool_schema_brain_context(),
         tool_schema_brain_search(),
@@ -824,6 +864,36 @@ mod tool_schema_validation_tests {
         }
     }
 
+    /// nw-175. EVERY registered tool must reject unknown argument names.
+    ///
+    /// Only 11 of 41 did. The consequence is not cosmetic: a mistyped argument
+    /// was silently dropped and the handler used its default, so the caller got
+    /// a plausible answer to a question they did not ask. That exact failure
+    /// was hit twice in one review round — `flow_trace` accepting `max_dpeth`
+    /// and silently tracing depth 10, and the config layer accepting
+    /// `with_trigams` and silently leaving trigrams off.
+    ///
+    /// Asserted over the REGISTRY rather than a hand-listed set, so tool 42
+    /// cannot be added without it.
+    #[test]
+    fn every_registered_schema_rejects_unknown_arguments() {
+        let mut permissive = Vec::new();
+        for schema in all_tool_schemas() {
+            let name = schema["name"].as_str().unwrap_or("<unnamed>").to_string();
+            let input = &schema["inputSchema"];
+            // A schema with no properties at all takes no arguments; it still
+            // must not silently swallow one.
+            if input["additionalProperties"] != serde_json::json!(false) {
+                permissive.push(name);
+            }
+        }
+        assert!(
+            permissive.is_empty(),
+            "these tools silently accept undeclared arguments, so a typo becomes a \
+             wrong answer instead of an error: {permissive:?}"
+        );
+    }
+
     #[test]
     fn bounded_tools_reject_unknown_arguments() {
         // Mistyped arg names must fail loudly instead of being
@@ -1261,6 +1331,114 @@ mod tool_schema_validation_tests {
         // keep validating under additionalProperties: false.
         assert_valid("brain_search", json!({ "query": "x", "cache": "bypass" }));
         assert_valid("brain_search", json!({ "query": "x", "no_cache": true }));
+    }
+
+    /// EVERY cacheable tool, not just the seven that happened to declare them.
+    ///
+    /// `additionalProperties: false` turned an undeclared `no_cache` from
+    /// "ignored" into "rejected", so a tool the dispatch layer treats as
+    /// bypassable while its schema refuses the argument is a contradiction the
+    /// caller cannot work around. Pinning this per-tool by hand is what let 18
+    /// tools drift; this walks `CACHEABLE_TOOLS` so a new entry is covered the
+    /// day it is added.
+    #[test]
+    fn every_cacheable_tool_accepts_the_cache_bypass_arguments() {
+        // Synthesize the smallest argument object each schema accepts, so the
+        // only thing under test is the cache pair.
+        fn minimal_args(schema: &Value) -> serde_json::Map<String, Value> {
+            let mut args = serde_json::Map::new();
+            let properties = schema["properties"].as_object();
+            for required in schema["required"].as_array().into_iter().flatten() {
+                let Some(field) = required.as_str() else {
+                    continue;
+                };
+                let declared = properties.and_then(|properties| properties.get(field));
+                let kind = declared
+                    .and_then(|value| value["type"].as_str())
+                    .unwrap_or("string");
+                let value = match kind {
+                    "array" => json!(["x"]),
+                    "integer" | "number" => json!(1),
+                    "boolean" => json!(true),
+                    "object" => json!({}),
+                    // An enum must be satisfied with one of its own members.
+                    _ => declared
+                        .and_then(|value| value["enum"].as_array())
+                        .and_then(|values| values.first().cloned())
+                        .unwrap_or_else(|| json!("x")),
+                };
+                args.insert(field.to_string(), value);
+            }
+            args
+        }
+
+        // Some tools express "one of these two" as an alias rule enforced
+        // beside the schema (`missing_alias_requirement`), not as `required`.
+        // Satisfy it by adding declared properties until the rule is happy,
+        // so the assertion below is about the cache pair and nothing else.
+        fn satisfy_alias_requirement(
+            name: &str,
+            schema: &Value,
+            args: &mut serde_json::Map<String, Value>,
+        ) {
+            if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
+                return;
+            }
+            let Some(properties) = schema["properties"].as_object() else {
+                return;
+            };
+            for (field, declared) in properties {
+                if args.contains_key(field) {
+                    continue;
+                }
+                let value = match declared["type"].as_str().unwrap_or("string") {
+                    "array" => json!(["x"]),
+                    "integer" | "number" => json!(1),
+                    "boolean" => json!(true),
+                    "object" => json!({}),
+                    _ => json!("x"),
+                };
+                args.insert(field.clone(), value);
+                if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
+                    return;
+                }
+                args.remove(field);
+            }
+        }
+
+        let schemas = all_tool_schemas();
+        for name in CACHEABLE_TOOLS {
+            let tool = schemas
+                .iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is cacheable but not registered"));
+            let schema = &tool["inputSchema"];
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties"));
+            for field in ["cache", "no_cache"] {
+                assert!(
+                    properties.contains_key(field),
+                    "{name} is cacheable but does not declare `{field}`, so \
+                     `additionalProperties: false` rejects a caller that sends it"
+                );
+            }
+
+            // Declaring it is not enough — it has to actually validate.
+            let mut base = minimal_args(schema);
+            satisfy_alias_requirement(name, schema, &mut base);
+            for bypass in [json!({ "cache": "bypass" }), json!({ "no_cache": true })] {
+                let mut args = base.clone();
+                for (key, value) in bypass.as_object().expect("bypass args are an object") {
+                    args.insert(key.clone(), value.clone());
+                }
+                let args = Value::Object(args);
+                assert!(
+                    validate_tool_arguments(name, &args).is_ok(),
+                    "{name} rejected a cache-bypass call: {args}"
+                );
+            }
+        }
     }
 }
 
@@ -2587,6 +2765,7 @@ fn tool_schema_count_patterns() -> Value {
         "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts one match per node, not per occurrence within a node\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "patterns": {
                     "type": "array",
@@ -2632,6 +2811,7 @@ fn tool_schema_brain_broken_links() -> Value {
         "description": "Find wikilinks in the vault that did not resolve cleanly — ambiguous or low-confidence targets (confidence < 1.0).\n\nGuidelines:\n- Use when auditing vault health or before bulk link repairs\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "max_suggestions": {
                     "type": "integer",
@@ -2671,6 +2851,7 @@ fn tool_schema_brain_orphan_documents() -> Value {
         "description": "Find notes with zero inbound and zero outbound wikilinks — disconnected from the knowledge graph.\n\nGuidelines:\n- Candidates to link up or archive; index/MOC notes are excluded via a configurable allowlist\n- Use vault and path_prefix filters to scope the search\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilinks, not tag co-occurrence or other relationships\n- Default allowlist excludes Projects.md, index.md, README.md, and MOC-containing paths",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "vault": { "type": "string", "description": "Restrict to this vault UID." },
                 "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
@@ -2713,6 +2894,7 @@ fn tool_schema_brain_topic_clusters() -> Value {
         "description": "Discover thematic structure of a vault by running Louvain-style local moving community detection over the note-to-note wikilink graph.\n\nGuidelines:\n- Each cluster is labelled by its most central member (highest PageRank)\n- Adjust resolution parameter: higher yields more, smaller clusters\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilink edges between notes, not tags or code references\n- Label quality depends on the most-central note having a descriptive title",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "resolution": {
                     "type": "number",
@@ -2760,6 +2942,7 @@ fn tool_schema_brain_tag_graph() -> Value {
         "description": "Explore tag relationships in a vault via co-occurrence analysis. Two modes: (1) with tag — returns co-occurring tags for a focus tag; (2) without tag — returns the full tag co-occurrence graph.\n\nGuidelines:\n- Use without tag for taxonomy-drift detection across the vault\n- The tag argument may include or omit a leading #\n- Results sorted by shared-note count (with tag) or note count descending (without)\n\nLimitations:\n- Co-occurrence is based on shared notes, not semantic similarity\n- Returns count 0 / empty when the tag or vault is absent",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." },
                 "limit": {
@@ -2788,6 +2971,7 @@ fn tool_schema_brain_doc_stats() -> Value {
         "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All seven keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags, notes_by_year}\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "top_tags_limit": {
                     "type": "integer",
@@ -2841,6 +3025,7 @@ fn tool_schema_brain_memory_lint() -> Value {
         "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "limit": {
                     "type": "integer",
@@ -2882,6 +3067,7 @@ fn tool_schema_brain_memory_consolidate() -> Value {
         "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "apply": {
                     "type": "boolean",
@@ -2918,6 +3104,7 @@ fn tool_schema_brain_memory_related() -> Value {
         "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to configurable depth (default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Seed note UID to traverse from." },
                 "edge_types": {
@@ -3007,6 +3194,7 @@ fn tool_schema_brain_context() -> Value {
         "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; run the `nestweaver repair` command named in the error, or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "seeds": {
                     "type": "array",
@@ -3048,12 +3236,12 @@ fn tool_schema_brain_context() -> Value {
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept)."
+                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes)."
+                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
                 },
                 "weight_ppr": {
                     "type": "number",
@@ -5277,6 +5465,7 @@ fn tool_schema_note_get() -> Value {
         "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid for unambiguous lookup, or title for case-insensitive first-match\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred over title for unambiguous lookup." },
                 "title": { "type": "string", "description": "Note title (case-insensitive). Returns the first match if multiple notes share the same title." },
@@ -5432,6 +5621,7 @@ fn tool_schema_backlinks() -> Value {
         "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred for unambiguous lookup." },
                 "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." }
@@ -5544,6 +5734,7 @@ fn tool_schema_brain_status() -> Value {
         "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {}
         }
     })
@@ -6024,6 +6215,7 @@ fn tool_schema_brain_add_source() -> Value {
         "description": "Index a new vault, code repo, or markdown folder into the brain graph. Auto-detects source type from directory contents.\n\nGuidelines:\n- Check brain_status first to avoid re-indexing already-indexed sources\n- Path must be absolute or start with ~/ (tilde expanded to $HOME)\n- Optional name sets a friendly display name for vaults (ignored for repos)\n\nLimitations:\n- Cannot index remote URLs directly — only local filesystem paths\n- Re-indexing an existing source overwrites the previous index",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "path": { "type": "string", "description": "Absolute or ~/-relative directory path to the vault, repo, or markdown folder to index." },
                 "name": {
@@ -6214,6 +6406,7 @@ fn tool_schema_brain_remove_source() -> Value {
         "description": "Remove an indexed code repository or markdown vault from the brain graph permanently.\n\nGuidelines:\n- Accepts repo name, vault name, filesystem path, file:// URL, or UID\n- Auto-detects whether the target is a repo or vault\n- To re-index (not remove), use brain_add_source instead\n\nReading the response:\n- `committed: true` means the removal HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the removal still succeeded. Do NOT retry as though nothing happened, and do not take corrective action against the removed data; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was removed.\n\nLimitations:\n- Removal is permanent — the source must be re-indexed with brain_add_source to restore\n- Ambiguous targets (matching multiple sources) require a UID to disambiguate",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "target": {
                     "type": "string",
@@ -6404,6 +6597,7 @@ fn tool_schema_prune_stale() -> Value {
         "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nReading the response:\n- `committed: true` means the prune HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the prune still succeeded. Do NOT retry as though nothing happened; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was pruned.\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {},
             "required": []
         }
@@ -6622,6 +6816,7 @@ fn tool_schema_cross_repo_contracts() -> Value {
         "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
@@ -6722,6 +6917,7 @@ fn tool_schema_contract_drift() -> Value {
         "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nTrust contract (read before trusting a clean result):\n- contracts_status (complete/degraded) + degraded_repos: contract derivation is best-effort at index time and never fails the index. Failure is atomic, so a degraded repo's contracts and drift findings reflect its PREVIOUS successful derivation — stale, not wiped. `clean` is true only when the analysis ALSO ran to completion — a degraded repo reports clean: false with contracts_status \"degraded\"\n- Empty buckets on a complete run mean 'no drift'; empty buckets on a degraded run mean 'unknown', not 'safe'\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." },
                 "limit": {
@@ -6937,6 +7133,7 @@ fn tool_schema_brain_guide() -> Value {
         "description": "Generate a comprehensive orientation guide covering all indexed repos, vaults, cross-repo relationships, and available tools.\n\nGuidelines:\n- Call at session start for a read-once overview before issuing specific queries\n- Regenerated from current graph state on each call\n- The tools section is generated from the live MCP registry, so it never drifts from the actual tool set\n- Not a query tool — use brain_context or brain_search for specific lookups\n\nLimitations:\n- Can be expensive on large graphs; prefer brain_status for lightweight session initialization\n- Output size scales with number of indexed sources",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "format": {
                     "type": "string",
@@ -7265,6 +7462,7 @@ fn tool_schema_detect_changes() -> Value {
         "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "changed_files": {
                     "type": "array",
@@ -7403,6 +7601,7 @@ fn tool_schema_affected_tests() -> Value {
         "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "changed_files": {
                     "type": "array",
@@ -7596,6 +7795,7 @@ fn tool_schema_clusters() -> Value {
         "description": "View the codebase's high-level architecture via Louvain-style local moving community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and a 20-member preview per cluster (full `size` reported)\n- Pass cluster_id to get ONE cluster's full member list (paging deep clusters); `members_truncated` flags when even that is capped\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is recomputed on each call (the result is persisted to a sidecar cache that the CLI `cluster` command reads)\n- Quality depends on the density and accuracy of indexed call/import edges",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "resolution": {
                     "type": "number",
@@ -7695,6 +7895,7 @@ fn tool_schema_stale_check() -> Value {
         "description": "Check whether the graph index is current by comparing each repo's indexed git SHA against HEAD. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- If stale, re-index with brain_add_source or CLI nestweaver index\n\nLimitations:\n- Only checks git repos, not vault/note freshness\n- For viewing what actually changed, use brain_diff",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {}
         }
     })
@@ -7707,6 +7908,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
 
     let mut results = Vec::new();
     let mut any_stale = false;
+    let mut any_needs_reindex = false;
 
     for repo in &repos {
         // A local working tree that no longer exists on disk is
@@ -7736,25 +7938,49 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             _ => repo.staleness_commits_behind as u64,
         };
 
-        let is_stale = if local_missing {
-            true
-        } else {
-            match &current_head {
-                Some(head) => head != &repo.indexed_sha,
-                None => commits_behind > 0,
-            }
+        // nw-163: `is_stale` means BEHIND HEAD, and nothing else.
+        //
+        // It used to be the union of three unrelated conditions — behind HEAD,
+        // working tree missing, and index incomplete — so a repo sitting
+        // exactly at HEAD with zero commits behind reported `is_stale: true`,
+        // which reads as a contradiction. `status` already classified the
+        // three correctly; only this flag conflated them.
+        let is_stale = match &current_head {
+            Some(head) => head != &repo.indexed_sha,
+            // Working tree gone: HEAD is unknowable, so "behind HEAD" cannot
+            // be asserted. The stored counter is a leftover from the last
+            // successful check. `status: "missing"` + `needs_reindex` carry
+            // the actionable truth without guessing.
+            None if local_missing => false,
+            None => commits_behind > 0,
         };
 
         // A repo whose SHA was committed but whose content never landed
-        // (interrupted index) compares equal to HEAD yet serves an empty
-        // graph — flag it stale so the CI gate catches it.
+        // (interrupted index) compares equal to HEAD yet serves an empty graph.
+        // That is NOT staleness — it is incompleteness — but it needs the same
+        // remedy, which is what `needs_reindex` expresses.
         let content_missing = store
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
-        let is_stale = is_stale || content_missing;
+
+        let status = if local_missing {
+            "missing"
+        } else if content_missing {
+            "incomplete"
+        } else if is_stale {
+            "stale"
+        } else {
+            "ok"
+        };
+        // The ACTIONABLE union, and the only thing a CI gate should key on:
+        // every non-`ok` status is fixed by re-indexing.
+        let needs_reindex = status != "ok";
 
         if is_stale {
             any_stale = true;
+        }
+        if needs_reindex {
+            any_needs_reindex = true;
         }
 
         results.push(json!({
@@ -7762,14 +7988,18 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
+            "needs_reindex": needs_reindex,
             "staleness_commits_behind": commits_behind,
-            "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
+            "status": status,
         }));
     }
 
     Ok(json!({
         "repo_count": repos.len(),
+        // Behind HEAD only. Kept because it is what the word means; a CI gate
+        // wanting "is my graph usable" should read `any_needs_reindex`.
         "any_stale": any_stale,
+        "any_needs_reindex": any_needs_reindex,
         "repos": results,
     }))
 }
@@ -7837,6 +8067,7 @@ fn tool_schema_set_extension() -> Value {
         "description": "Attach custom key-value metadata to any node (symbol, note, section, tag) in a JSON sidecar alongside the database.\n\nGuidelines:\n- Use for information not in core schema: team ownership, deprecation status, review flags\n- Value accepts any JSON type (string, number, boolean, array, object); overwrites existing\n- Properties persist across sessions and are queryable via query_extensions\n\nLimitations:\n- Stored in a sidecar file, not the main graph — not included in graph traversals\n- To query existing properties use query_extensions, not this tool",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "uid": {
                     "type": "string",
@@ -7935,6 +8166,7 @@ fn tool_schema_query_extensions() -> Value {
         "description": "Query custom metadata set via set_extension. Two modes: by uid (all properties for a node) or by key+value (find all nodes matching a property).\n\nRequires either 'uid' or both 'key' and 'value' (at least one mode must be specified).\n\nGuidelines:\n- Pass uid alone to inspect a node's custom properties\n- Pass key + value to find all nodes matching that property (exact match only)\n- For core graph queries use brain_search or brain_context, not this tool\n\nLimitations:\n- Exact match only — no partial matching, ranges, or regex on values\n- Only queries the extension sidecar, not core graph properties",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "key": {
                     "type": "string",
@@ -8007,6 +8239,7 @@ fn tool_schema_brain_diff() -> Value {
         "description": "Show what changed since the graph was last indexed: files added/modified/deleted plus affected symbols. For locally-indexed repos only.\n\nGuidelines:\n- Use before code review or after pulling changes to understand the delta\n- Pass repo name or URL substring; optional since_sha overrides the base\n- For impact analysis of hypothetical changes use detect_changes; for staleness check use stale_check\n\nLimitations:\n- Only works with local repos (file:// URLs), not remote\n- Shows file-level diff, not line-level — use git diff for detailed patches",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "repo": {
                     "type": "string",
@@ -8221,12 +8454,12 @@ fn tool_schema_project_context() -> Value {
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept."
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Drop note/section nodes tagged with any of these tags."
+                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
@@ -8999,11 +9232,18 @@ fn tool_schema_bridge_nodes() -> Value {
         "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "limit": {
                     "type": "integer",
                     "description": "Number of top bridges to return. Default 10.",
                     "default": 10
+                },
+                "top_n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Alias for `limit`, accepted for backward compatibility."
                 },
                 "response_format": {
                     "type": "string",
@@ -9305,12 +9545,17 @@ fn tool_schema_get_summary() -> Value {
         "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees, 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "level": {
                     "type": "string",
                     "enum": ["symbol", "file", "cluster", "hub"],
                     "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture, 'hub' = top hub nodes with call-graph shape + role (architectural orientation).",
                     "default": "file"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Alias for `target`, accepted for backward compatibility."
                 },
                 "target": {
                     "type": "string",
@@ -10283,10 +10528,20 @@ fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
 /// whose config-less fallback is the db-path hash — a different identity than
 /// the CLI's `"default"`, duplicating any vault added via both paths.
 #[cfg(feature = "daemon")]
+/// The instance this MCP process should ask the daemon to write under.
+///
+/// nw-207: returns EMPTY when this process has no config of its own, which is
+/// the protocol's "you decide" sentinel — the daemon then uses its own
+/// configured identity. It used to return the literal "default", which is a
+/// FALLBACK masquerading as a choice: an MCP server started without `--config`
+/// would override a daemon configured as `kory-brain` and create the vault
+/// under `default`, splitting the graph.
+///
+/// Only a config this process actually has is an instruction worth sending.
 fn resolve_add_source_instance_id() -> String {
     current_instance_config()
         .map(|c| c.instance_id.clone())
-        .unwrap_or_else(|| "default".to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "daemon")]
@@ -10444,13 +10699,26 @@ mod daemon_index_progress_tests {
     }
 
     #[test]
-    fn add_source_instance_id_matches_cli_precedence() {
-        // The MCP daemon path must stamp vaults under the SAME instance id the
-        // CLI resolves (`--instance` > config > "default"): an empty id defers
-        // to a config-less daemon's db-path hash, duplicating any vault added
-        // via both paths under two vault UIDs.
+    fn add_source_sends_its_own_config_or_defers_to_the_daemon() {
+        // The MCP daemon path must land vaults under the SAME instance the CLI
+        // would resolve. nw-019 achieved that by sending the literal "default"
+        // when this process had no config, because a config-less daemon's data
+        // identity was its DB-PATH HASH and an empty id would have duplicated
+        // the vault under two UIDs.
+        //
+        // nw-207 removed that hash: a config-less daemon's data identity is now
+        // "default" too. So the compensation is not merely unnecessary, it was
+        // actively harmful — a literal "default" OVERRODE a daemon that had a
+        // configured instance, creating the vault under `default` and splitting
+        // the graph. Sending EMPTY defers to the daemon, which is the only
+        // party that knows its own data identity.
         set_current_instance_config(None);
-        assert_eq!(resolve_add_source_instance_id(), "default");
+        assert_eq!(
+            resolve_add_source_instance_id(),
+            "",
+            "with no config of its own, this process must defer rather than \
+             assert a default it merely fell back to"
+        );
 
         let cfg: nestweaver_engine::InstanceConfig = serde_json::from_value(serde_json::json!({
             "instance_id": "cfg-instance",
@@ -10461,6 +10729,8 @@ mod daemon_index_progress_tests {
             "git": { "credential_method": "ssh" }
         }))
         .expect("valid test config");
+        // A config this process ACTUALLY HAS is an instruction worth sending,
+        // and still is.
         set_current_instance_config(Some(std::sync::Arc::new(cfg)));
         assert_eq!(resolve_add_source_instance_id(), "cfg-instance");
         set_current_instance_config(None);
@@ -10652,6 +10922,7 @@ fn tool_schema_investigate_expand() -> Value {
         "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- Expanded entries always have body_complete: true (full untruncated body)\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
@@ -10691,6 +10962,7 @@ fn tool_schema_investigate_hydrate() -> Value {
         "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete: true means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
@@ -13650,7 +13922,12 @@ mod stale_check_tool_tests {
     use super::*;
 
     /// A repo whose local working tree was deleted must be flagged
-    /// `status: "missing"` and counted as stale — never silently `[ok]`.
+    /// `status: "missing"` and counted as NEEDING RE-INDEX — never silently
+    /// `[ok]`.
+    ///
+    /// nw-163: it used to be reported as `is_stale: true` as well, which is
+    /// false — the repo is not behind HEAD, it has no working tree to compare
+    /// against. `needs_reindex` is the flag that means "act on this".
     #[test]
     fn stale_check_flags_deleted_working_tree_as_missing() {
         let store = GraphStore::in_memory().expect("in_memory store");
@@ -13671,15 +13948,67 @@ mod stale_check_tool_tests {
         std::fs::remove_dir_all(gone.path()).unwrap();
 
         let result = tool_stale_check(&store).expect("stale check");
-        assert_eq!(result["any_stale"], true, "{result}");
+        assert_eq!(result["any_needs_reindex"], true, "{result}");
         let repo = &result["repos"][0];
         assert_eq!(repo["status"], "missing", "{result}");
-        assert_eq!(repo["is_stale"], true, "{result}");
+        assert_eq!(repo["needs_reindex"], true, "{result}");
+        assert_eq!(
+            repo["is_stale"], false,
+            "a missing working tree is not 'behind HEAD'; conflating them is \
+             what made this command contradict itself: {result}"
+        );
+        assert_eq!(result["any_stale"], false, "{result}");
+    }
+
+    /// The same repo, but with a NONZERO stored staleness counter — the case
+    /// the test above missed by pinning only `staleness_commits_behind: 0`.
+    ///
+    /// With the tree deleted there is no HEAD to compare against, so the stored
+    /// counter is a leftover from the last successful check. Falling back to it
+    /// reported `is_stale: true` — a stale guess presented as a fact — for a
+    /// repo whose staleness is simply unknowable.
+    #[test]
+    fn a_deleted_working_tree_does_not_inherit_its_last_known_staleness() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:gone".to_string(),
+                url: format!("file://{gone_path}"),
+                indexed_sha: "abc".to_string(),
+                // The only difference from the test above.
+                staleness_commits_behind: 7,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(gone_path.clone()),
+            })
+            .expect("insert repo");
+        std::fs::remove_dir_all(gone.path()).unwrap();
+
+        let result = tool_stale_check(&store).expect("stale check");
+        let repo = &result["repos"][0];
+        assert_eq!(repo["status"], "missing", "{result}");
+        assert_eq!(repo["needs_reindex"], true, "{result}");
+        assert_eq!(
+            repo["is_stale"], false,
+            "HEAD is unknowable with the tree deleted, so a stored counter must \
+             not be reported as staleness: {result}"
+        );
+        assert_eq!(result["any_stale"], false, "{result}");
+        // The count itself is still reported — it is the last thing known,
+        // and hiding it would lose information. Only the VERDICT was wrong.
+        assert_eq!(repo["staleness_commits_behind"], 7, "{result}");
     }
 
     /// A repo whose SHA was committed but whose content never landed
-    /// (interrupted index) compares equal to HEAD — it must still be flagged
-    /// stale (`status: "incomplete"`) so the CI gate catches the empty graph.
+    /// (interrupted index) compares equal to HEAD — it must still be caught by
+    /// the CI gate (`status: "incomplete"`, `needs_reindex: true`).
+    ///
+    /// nw-163: it is NOT stale. It sits exactly at HEAD with zero commits
+    /// behind, which is why reporting `is_stale: true` here read as a
+    /// contradiction and made a gate keyed on `any_stale` disagree with one
+    /// keyed on the exit code.
     #[test]
     fn stale_check_flags_sha_set_but_empty_repo_as_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");
@@ -13700,10 +14029,15 @@ mod stale_check_tool_tests {
             .expect("insert repo");
 
         let result = tool_stale_check(&store).expect("stale check");
-        assert_eq!(result["any_stale"], true, "{result}");
+        assert_eq!(result["any_needs_reindex"], true, "{result}");
+        assert_eq!(
+            result["any_stale"], false,
+            "an incomplete index at HEAD is not staleness: {result}"
+        );
         let repo = &result["repos"][0];
         assert_eq!(repo["status"], "incomplete", "{result}");
-        assert_eq!(repo["is_stale"], true, "{result}");
+        assert_eq!(repo["needs_reindex"], true, "{result}");
+        assert_eq!(repo["is_stale"], false, "{result}");
 
         // Once content lands, the same repo must read healthy again. A File
         // node is the content marker: the code index writes one for every
@@ -13718,6 +14052,7 @@ mod stale_check_tool_tests {
             .expect("insert file");
         let healed = tool_stale_check(&store).expect("stale check");
         assert_eq!(healed["any_stale"], false, "{healed}");
+        assert_eq!(healed["any_needs_reindex"], false, "{healed}");
         assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
     }
 

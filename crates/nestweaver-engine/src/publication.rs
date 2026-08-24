@@ -27,14 +27,20 @@ pub const PRESERVED_STATE_ALGORITHM_FINGERPRINT: &str = "nestweaver-publication-
 /// Identity, producer version and source generation ARE checked against the
 /// caller's expectations, so a foreign, stale or corrupt sidecar is rejected.
 ///
-/// The algorithm fingerprint is NOT: this function's whole job is to discover
-/// which parameters the payload declares, so it has no independent expectation
-/// to compare against, and the prefix check below is the only enforcement.
-/// nw-147: the previous doc claimed this also caught a "generically-labelled"
-/// sidecar, which the self-comparison never did. A same-brain, same-generation
-/// artifact computed with different damping/iterations/scope still passes here;
-/// closing that needs the envelope to record the parameters themselves so the
-/// fingerprint can be recomputed from them rather than trusted.
+/// The algorithm fingerprint is now VERIFIED rather than trusted. This function
+/// still has no independent expectation — its job is to discover what the
+/// payload declares — but nw-147 made the artifact declare the parameters that
+/// produced its fingerprint, so the fingerprint can be RECOMPUTED from them.
+/// A same-brain, same-generation artifact computed with different
+/// damping/iterations/scope is now rejected: either its declaration disagrees
+/// with its fingerprint, or its declaration is honest and the recomputation
+/// exposes the mismatch. An artifact can no longer vouch for its own
+/// provenance.
+///
+/// An artifact that declares NOTHING is refused outright. Accepting it would
+/// restore exactly the self-comparison this closes, and — migration being
+/// explicitly on the table for 8.0.0 — a re-index is the honest remedy rather
+/// than a permanent hole kept open for old sidecars.
 pub(crate) fn pagerank_artifact_contract(
     bytes: &[u8],
     identity: &nestweaver_store::PublicationIdentity,
@@ -56,8 +62,61 @@ pub(crate) fn pagerank_artifact_contract(
             envelope.algorithm_fingerprint
         );
     }
-    // Self-comparison, deliberately and now documented: see the note above on
-    // why this function has no independent expectation (nw-147).
+    // nw-147: recompute from the DECLARED parameters and require agreement.
+    // This is what makes the comparison below meaningful — without it, the
+    // fingerprint was only ever compared to itself.
+    let declared = &envelope.algorithm_parameters;
+    if declared.is_null() {
+        anyhow::bail!(
+            "PageRank sidecar declares no algorithm parameters, so its fingerprint \
+             cannot be verified and would only be compared against itself; \
+             re-index to produce a self-describing artifact"
+        );
+    }
+    // The declaration must match what THIS BUILD computes with. Recomputing
+    // the fingerprint from the declaration (below) only proves the artifact
+    // agrees with itself; without this an artifact declaring damping 0.5 and
+    // carrying the correct fingerprint FOR 0.5 passed, because nothing
+    // supplied an independent expectation. Scope is not checked here — it
+    // legitimately varies between a code-only and a unified pass.
+    for (field, expected, actual) in [
+        (
+            "damping",
+            nestweaver_store::ranking::PAGERANK_DAMPING,
+            declared.get("damping").and_then(|value| value.as_f64()),
+        ),
+        (
+            "iterations",
+            f64::from(nestweaver_store::ranking::PAGERANK_ITERATIONS),
+            declared.get("iterations").and_then(|value| value.as_f64()),
+        ),
+    ] {
+        let Some(actual) = actual else {
+            anyhow::bail!(
+                "PageRank sidecar declares no {field}, so its parameters cannot be \
+                 checked against this build's"
+            );
+        };
+        if actual != expected {
+            anyhow::bail!(
+                "PageRank sidecar declares {field} {actual} but this build computes \
+                 with {expected}; the artifact was produced by a different \
+                 configuration and its scores are not comparable"
+            );
+        }
+    }
+    let recomputed = nestweaver_store::ranking::pagerank_fingerprint_from_declared(declared)
+        .ok_or_else(|| {
+            anyhow::anyhow!("PageRank sidecar declares malformed algorithm parameters: {declared}")
+        })?;
+    if recomputed != envelope.algorithm_fingerprint {
+        anyhow::bail!(
+            "PageRank sidecar's fingerprint does not match the parameters it declares \
+             (declared parameters produce '{recomputed}', artifact carries '{}'); \
+             the artifact is mislabelled",
+            envelope.algorithm_fingerprint
+        );
+    }
     let fingerprint = envelope.algorithm_fingerprint.clone();
     let _: std::collections::HashMap<String, f64> =
         envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
@@ -229,9 +288,25 @@ impl PublicationBundleV3 {
         }
         let expected_brain = parse_uuid("bundle brain_uuid", &self.brain_uuid)?;
         let expected_publication = parse_uuid("bundle publication_uuid", &self.publication_uuid)?;
+        // nw-149: a manifest describing NOTHING was accepted here and only
+        // caught later by `resolve_selected_database` — i.e. after the pointer
+        // had already moved. A publication with no artifacts cannot be valid,
+        // and the cheapest place to say so is before anything is trusted.
+        if self.artifacts.is_empty() {
+            anyhow::bail!("publication bundle describes no artifacts");
+        }
         let mut paths = std::collections::BTreeSet::new();
+        let mut case_folded = std::collections::BTreeSet::new();
         for descriptor in &self.artifacts {
             let path = Path::new(&descriptor.path);
+            // nw-149: the EMPTY path was accepted here while
+            // `validate_relative_path` in publication_operation.rs rejects it —
+            // two validators in one subsystem disagreeing about the same
+            // string. `Path::new("")` is not absolute and yields no components,
+            // so both guards below pass it by construction.
+            if descriptor.path.is_empty() {
+                anyhow::bail!("publication bundle contains an empty artifact path");
+            }
             if path.is_absolute()
                 || path
                     .components()
@@ -242,9 +317,26 @@ impl PublicationBundleV3 {
                     descriptor.path
                 );
             }
-            if !paths.insert(descriptor.path.clone()) {
+            // nw-149: dedupe on the NORMALIZED path, not the raw string.
+            // `a/b`, `a//b` and `a/b/` are distinct strings that name one file,
+            // so a raw-string check let a manifest describe the same artifact
+            // more than once with different metadata for each.
+            let normalized: PathBuf = path.components().collect();
+            let normalized = normalized.to_string_lossy().into_owned();
+            if !paths.insert(normalized.clone()) {
                 anyhow::bail!(
                     "publication bundle contains duplicate artifact: {}",
+                    descriptor.path
+                );
+            }
+            // And on a case-insensitive filesystem `graph.lbug` and
+            // `GRAPH.LBUG` are ALSO one file. A manifest must not depend on
+            // case to tell two artifacts apart, because whether that works is a
+            // property of the reader's filesystem, not of the publication.
+            if !case_folded.insert(normalized.to_lowercase()) {
+                anyhow::bail!(
+                    "publication bundle contains artifact paths differing only by case: {}; \
+                     these name one file on a case-insensitive filesystem",
                     descriptor.path
                 );
             }
@@ -1267,6 +1359,168 @@ mod tests {
             classify_artifact_descriptor(&expected, Err("torn header".to_string())),
             ArtifactState::Corrupt { .. }
         ));
+    }
+
+    /// nw-147, second half. Recomputing the fingerprint from the parameters an
+    /// artifact DECLARES proves only that the artifact agrees with itself.
+    ///
+    /// An artifact computed with foreign damping can declare that damping and
+    /// carry the correct fingerprint FOR it, and every internal check passes —
+    /// because nothing supplied an expectation from outside the artifact. The
+    /// scores are then silently incomparable with the ones this build produces.
+    #[test]
+    fn a_self_consistent_pagerank_artifact_from_a_foreign_configuration_is_refused() {
+        use nestweaver_store::artifact_envelope::{ArtifactEnvelope, ArtifactExpectation};
+        use nestweaver_store::ranking::{
+            PAGERANK_ARTIFACT_KIND, PAGERANK_ARTIFACT_SCHEMA_VERSION, PAGERANK_DAMPING,
+            PAGERANK_ITERATIONS, pagerank_algorithm_fingerprint, pagerank_declared_parameters,
+        };
+
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            publication_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+        };
+        let scope = nestweaver_store::GraphScope::code_only();
+        let scores: std::collections::HashMap<String, f64> =
+            [("sym:a".to_string(), 1.0)].into_iter().collect();
+
+        // Fully self-consistent by construction: the declaration and the
+        // fingerprint are produced from the SAME parameters, so every check
+        // internal to the artifact agrees.
+        let sealed = |damping: f64, iterations: u32| -> Vec<u8> {
+            let envelope = ArtifactEnvelope::new(
+                ArtifactExpectation {
+                    artifact_kind: PAGERANK_ARTIFACT_KIND,
+                    artifact_schema_version: PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                    identity: &identity,
+                    producer_version: env!("CARGO_PKG_VERSION"),
+                    source_graph_generation: 1,
+                    algorithm_fingerprint: &pagerank_algorithm_fingerprint(
+                        damping, iterations, &scope,
+                    ),
+                },
+                &scores,
+            )
+            .expect("seal artifact")
+            .with_algorithm_parameters(pagerank_declared_parameters(damping, iterations, &scope));
+            serde_json::to_vec(&envelope).expect("serialize envelope")
+        };
+
+        // The build's own parameters still load.
+        pagerank_artifact_contract(
+            &sealed(PAGERANK_DAMPING, PAGERANK_ITERATIONS),
+            &identity,
+            env!("CARGO_PKG_VERSION"),
+            1,
+        )
+        .expect("an artifact matching this build's parameters must load");
+
+        // A different damping, and a different iteration count, each refused
+        // by name — despite being internally consistent.
+        for (label, bytes) in [
+            ("damping", sealed(0.5, PAGERANK_ITERATIONS)),
+            (
+                "iterations",
+                sealed(PAGERANK_DAMPING, PAGERANK_ITERATIONS + 1),
+            ),
+        ] {
+            let error = pagerank_artifact_contract(&bytes, &identity, env!("CARGO_PKG_VERSION"), 1)
+                .expect_err("a foreign configuration must be refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(label) && rendered.contains("this build computes with"),
+                "{label} mismatch must be named: {rendered}"
+            );
+        }
+    }
+
+    /// nw-149. `validate_metadata` accepted three shapes it should not.
+    ///
+    /// Reported as a hardening asymmetry, NOT a proven escape — the probe
+    /// matrix achieved no exploit. This closes gaps in an invariant; it does
+    /// not patch a known attack, and the test is written to say so.
+    #[test]
+    fn bundle_metadata_rejects_empty_paths_aliases_and_empty_manifests() {
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            publication_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+        };
+        let descriptor = |path: &str| ArtifactDescriptor {
+            path: path.to_string(),
+            kind: ArtifactKind::Graph,
+            artifact_schema_version: 1,
+            byte_size: 1,
+            blake3: "0".repeat(64),
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: 1,
+            algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+        };
+        let bundle_with = |artifacts: Vec<ArtifactDescriptor>| PublicationBundleV3 {
+            format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: 1,
+            artifacts,
+        };
+        let version = crate::snapshot::SNAPSHOT_FORMAT_VERSION;
+
+        // A normal single-artifact manifest still validates — otherwise the
+        // rejections below prove nothing.
+        bundle_with(vec![descriptor("graph.lbug")])
+            .validate_metadata(version)
+            .expect("an ordinary manifest must still validate");
+
+        // (1) The EMPTY path. `Path::new("")` is not absolute and yields no
+        // components, so both existing guards pass it by construction — while
+        // `validate_relative_path` in publication_operation.rs rejects it. Two
+        // validators in one subsystem disagreeing about the same string.
+        let error = bundle_with(vec![descriptor("")])
+            .validate_metadata(version)
+            .expect_err("an empty artifact path must be rejected");
+        assert!(
+            format!("{error:#}").contains("empty artifact path"),
+            "{error:#}"
+        );
+
+        // (2) A manifest describing NOTHING. Previously caught only by
+        // `resolve_selected_database` — after the pointer had moved.
+        let error = bundle_with(vec![])
+            .validate_metadata(version)
+            .expect_err("a zero-artifact manifest must be rejected");
+        assert!(format!("{error:#}").contains("no artifacts"), "{error:#}");
+
+        // (3) Path ALIASES: distinct strings naming one file. A raw-string
+        // duplicate check let the same artifact be described twice with
+        // different metadata for each.
+        for alias in ["a//b", "a/b/"] {
+            let error = bundle_with(vec![descriptor("a/b"), descriptor(alias)])
+                .validate_metadata(version)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("duplicate artifact"),
+                "{alias} must collide with a/b: {error:#}"
+            );
+        }
+
+        // (4) Case aliases. On a case-insensitive filesystem these are one
+        // file, so a manifest must not rely on case to tell artifacts apart —
+        // whether that works is a property of the READER's filesystem.
+        let error = bundle_with(vec![descriptor("graph.lbug"), descriptor("GRAPH.LBUG")])
+            .validate_metadata(version)
+            .expect_err("case-only differences must be rejected");
+        assert!(
+            format!("{error:#}").contains("differing only by case"),
+            "{error:#}"
+        );
+
+        // Genuinely distinct paths are still fine — the checks above must not
+        // have collapsed every multi-artifact manifest.
+        bundle_with(vec![descriptor("graph.lbug"), descriptor("pagerank.json")])
+            .validate_metadata(version)
+            .expect("distinct artifacts must still validate");
     }
 
     fn write_slot(root: &Path, identity: &nestweaver_store::PublicationIdentity) -> String {
