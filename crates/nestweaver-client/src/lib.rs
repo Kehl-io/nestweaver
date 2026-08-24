@@ -720,14 +720,14 @@ fn verify_requested_config_evidence(
     // larger action than that asks for — the same reasoning behind
     // `RefuseForeignIncumbent` never stopping a foreign daemon implicitly.
     // The remedy names `restart`, which is the command that owns that action.
-    anyhow::ensure!(
-        health.version == env!("CARGO_PKG_VERSION"),
-        "the running daemon is version {} but this client is {}; the upgrade has NOT been \
-         applied and its new behaviour is not active. {}",
-        health.version,
-        env!("CARGO_PKG_VERSION"),
-        restart_with_requested_config_remedy(db_path, requested)
-    );
+    if let Some(skew) =
+        nestweaver_schema::describe_version_skew(&health.version, env!("CARGO_PKG_VERSION"))
+    {
+        anyhow::bail!(
+            "{skew} {}",
+            restart_with_requested_config_remedy(db_path, requested)
+        );
+    }
     anyhow::ensure!(health.pid != 0, "running daemon HealthCheck returned PID 0");
     anyhow::ensure!(
         binding.pid == health.pid,

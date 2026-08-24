@@ -6715,11 +6715,34 @@ async fn inline_connect_daemon(
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
 
-    Ok(
+    let mut client =
         nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
             .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024),
-    )
+            .max_encoding_message_size(256 * 1024 * 1024);
+
+    // nw-201 landed a version check on `daemon start --config` only. This path
+    // — how every MCP tool reaches the daemon — had NONE: `inline_ensure_daemon`
+    // returns as soon as the socket accepts a connection, and this function
+    // never issued a HealthCheck at all. So after an upgrade an agent kept
+    // talking to the previous binary, indexing through the old engine, with
+    // nothing anywhere reporting a skew. The commit that added that check cites
+    // "`brain status` looked healthy" as the tell; this is the path that made it
+    // look healthy.
+    //
+    // Verified HERE rather than at the six call sites, so a new caller cannot
+    // reintroduce the gap by forgetting it.
+    let health = client
+        .health_check(nestweaver_proto::HealthCheckRequest {})
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon health check failed: {e}"))?
+        .into_inner();
+    if let Some(skew) =
+        nestweaver_schema::describe_version_skew(&health.version, env!("CARGO_PKG_VERSION"))
+    {
+        anyhow::bail!("{skew} Restart the daemon to apply it.");
+    }
+
+    Ok(client)
 }
 
 /// Ensure the daemon is running (spawning it if needed) and return the

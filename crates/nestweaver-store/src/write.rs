@@ -1495,7 +1495,7 @@ impl GraphStore {
         file_symbol_edges: &[(&str, &str)],
         services: &[Service],
         service_symbol_edges: &[(&str, &str)],
-    ) -> Result<(usize, usize), StoreError> {
+    ) -> Result<(usize, usize, Vec<String>), StoreError> {
         Self::validate_bulk_reindex_input(
             repo_uid,
             files,
@@ -1508,7 +1508,8 @@ impl GraphStore {
         let conn = self.begin_transaction()?;
 
         // Delete old data within the transaction.
-        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        let (file_count, symbol_count, deleted_symbol_uids) =
+            Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
         Self::clear_repo_derived_nodes_on(&conn, repo_uid)?;
 
         // Insert replacement data in the same transaction.
@@ -1525,7 +1526,7 @@ impl GraphStore {
         Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
 
         self.commit_transaction(&conn)?;
-        Ok(counts)
+        Ok((file_count, symbol_count, deleted_symbol_uids))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4221,7 +4222,9 @@ impl GraphStore {
             let conn = self.begin_transaction()?;
             let mutation = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid);
             let counts = match mutation {
-                Ok(counts) => counts,
+                // This path reports counts only; the deleted UIDs matter to
+                // the re-index epilogue, not to fault-injection bookkeeping.
+                Ok((file_count, symbol_count, _)) => (file_count, symbol_count),
                 Err(error) => {
                     let rollback = self.rollback_transaction(&conn);
                     return Err(match rollback {
@@ -4515,9 +4518,10 @@ impl GraphStore {
         repo_uid: &str,
     ) -> Result<(usize, usize), StoreError> {
         let conn = self.begin_transaction()?;
-        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        let (file_count, symbol_count, _deleted_symbol_uids) =
+            Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
         self.commit_transaction(&conn)?;
-        Ok(counts)
+        Ok((file_count, symbol_count))
     }
 
     /// Like [`bulk_delete_repo_files_and_symbols`](Self::bulk_delete_repo_files_and_symbols)
@@ -4529,29 +4533,35 @@ impl GraphStore {
     // time. Incident-profile readings of a full node-group scan / O(n²) in
     // relationships deleted are refuted; see benches/remove_repo_benchmarks.rs
     // for the regression benchmark and the full refuted-claims record.
+    /// Returns `(file_count, symbol_count, deleted_symbol_uids)`.
     pub fn bulk_delete_repo_files_and_symbols_on(
         conn: &lbug::Connection<'_>,
         repo_uid: &str,
-    ) -> Result<(usize, usize), StoreError> {
+    ) -> Result<(usize, usize, Vec<String>), StoreError> {
         let rid = lbug::Value::String(repo_uid.to_string());
 
-        // Count before deleting so the caller can log what was removed.
-        let sym_count: usize = {
+        // Collect the UIDS, not just a count. nw-204: the caller needs to know
+        // WHICH symbols went away so the epilogue can tombstone the embeddings
+        // of the ones that do not come back. Returning only a count made the
+        // whole-repo re-index path silently skip tombstoning entirely, which is
+        // the exact leak nw-204 set out to close, on the path its own commit
+        // message listed as covered.
+        let deleted_symbol_uids: Vec<String> = {
             let mut stmt = conn
-                .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid RETURN count(s)")
-                .map_err(|e| StoreError::Query(format!("prepare count symbols: {e}")))?;
+                .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid RETURN s.uid")
+                .map_err(|e| StoreError::Query(format!("prepare list symbols: {e}")))?;
             let rows = conn
                 .execute(&mut stmt, vec![("rid", rid.clone())])
-                .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
+                .map_err(|e| StoreError::Query(format!("list symbols: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
+                    lbug::Value::String(uid) => Some(uid.clone()),
                     _ => None,
                 })
             })
-            .next()
-            .unwrap_or(0)
+            .collect()
         };
+        let sym_count = deleted_symbol_uids.len();
         let file_count: usize = {
             let mut stmt = conn
                 .prepare("MATCH (f:File) WHERE f.repo_uid = $rid RETURN count(f)")
@@ -4581,7 +4591,7 @@ impl GraphStore {
         conn.execute(&mut stmt, vec![("rid", rid)])
             .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
 
-        Ok((file_count, sym_count))
+        Ok((file_count, sym_count, deleted_symbol_uids))
     }
 
     /// Delete a Repo node (and its REPO_HAS_FILE edges) by UID.

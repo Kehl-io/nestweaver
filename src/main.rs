@@ -15072,6 +15072,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     nestweaver_client::autostart::daemon_boot_timeout(),
                                 )) {
                                     Ok(health) => {
+                                        // nw-201 covered `start --config` ONLY, and
+                                        // this configless branch is the DEFAULT path —
+                                        // the one `nestweaver daemon start` and MCP
+                                        // autostart both take. It reported
+                                        // "Daemon already running." and exit 0 while a
+                                        // previous binary kept serving, which is
+                                        // verbatim the incident nw-201 exists to
+                                        // prevent, with one flag omitted.
+                                        if let Some(skew) = nestweaver_schema::describe_version_skew(
+                                            &health.version,
+                                            env!("CARGO_PKG_VERSION"),
+                                        ) {
+                                            anyhow::bail!(
+                                                "{skew} Run `nestweaver daemon --db {} restart` \
+                                                 to apply it.",
+                                                db_path_abs.display()
+                                            );
+                                        }
                                         // A retry after a slow configless launchd boot
                                         // is allowed to finish the pending reset, but
                                         // only when the live binding for the healthy
@@ -15511,6 +15529,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             nestweaver_client::autostart::daemon_boot_timeout(),
                                         ),
                                     )?;
+                                    // Same gap as the macOS branch: the
+                                    // configless path is the DEFAULT path and
+                                    // had no version check at all.
+                                    if let Some(skew) = nestweaver_schema::describe_version_skew(
+                                        &health.version,
+                                        env!("CARGO_PKG_VERSION"),
+                                    ) {
+                                        anyhow::bail!(
+                                            "{skew} Run `nestweaver daemon --db {} restart` to \
+                                             apply it.",
+                                            db_path.display()
+                                        );
+                                    }
                                     let binding = nestweaver_daemon::lifecycle::
                                         read_effective_config_binding_for_verified_pid(
                                             &instance_id,
