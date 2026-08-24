@@ -7896,6 +7896,11 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // three correctly; only this flag conflated them.
         let is_stale = match &current_head {
             Some(head) => head != &repo.indexed_sha,
+            // Working tree gone: HEAD is unknowable, so "behind HEAD" cannot
+            // be asserted. The stored counter is a leftover from the last
+            // successful check. `status: "missing"` + `needs_reindex` carry
+            // the actionable truth without guessing.
+            None if local_missing => false,
             None => commits_behind > 0,
         };
 
@@ -13857,6 +13862,47 @@ mod stale_check_tool_tests {
              what made this command contradict itself: {result}"
         );
         assert_eq!(result["any_stale"], false, "{result}");
+    }
+
+    /// The same repo, but with a NONZERO stored staleness counter — the case
+    /// the test above missed by pinning only `staleness_commits_behind: 0`.
+    ///
+    /// With the tree deleted there is no HEAD to compare against, so the stored
+    /// counter is a leftover from the last successful check. Falling back to it
+    /// reported `is_stale: true` — a stale guess presented as a fact — for a
+    /// repo whose staleness is simply unknowable.
+    #[test]
+    fn a_deleted_working_tree_does_not_inherit_its_last_known_staleness() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:gone".to_string(),
+                url: format!("file://{gone_path}"),
+                indexed_sha: "abc".to_string(),
+                // The only difference from the test above.
+                staleness_commits_behind: 7,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(gone_path.clone()),
+            })
+            .expect("insert repo");
+        std::fs::remove_dir_all(gone.path()).unwrap();
+
+        let result = tool_stale_check(&store).expect("stale check");
+        let repo = &result["repos"][0];
+        assert_eq!(repo["status"], "missing", "{result}");
+        assert_eq!(repo["needs_reindex"], true, "{result}");
+        assert_eq!(
+            repo["is_stale"], false,
+            "HEAD is unknowable with the tree deleted, so a stored counter must \
+             not be reported as staleness: {result}"
+        );
+        assert_eq!(result["any_stale"], false, "{result}");
+        // The count itself is still reported — it is the last thing known,
+        // and hiding it would lose information. Only the VERDICT was wrong.
+        assert_eq!(repo["staleness_commits_behind"], 7, "{result}");
     }
 
     /// A repo whose SHA was committed but whose content never landed

@@ -18574,7 +18574,12 @@ fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
-            let repos = store.list_repos(None).unwrap_or_default();
+            // A freshness GATE that cannot read the database must fail, not
+            // report "No repos indexed." and exit 0. The daemon path already
+            // propagates this; only the direct path swallowed it.
+            let repos = store
+                .list_repos(None)
+                .map_err(|error| anyhow::anyhow!("list repos: {error}"))?;
 
             let mut any_stale = false;
             let mut any_needs_reindex = false;
@@ -18634,6 +18639,13 @@ fn run_brain(
                 // `is_stale: true` without a daemon and `false` with one.
                 let is_stale = match &current_head {
                     Some(head) => head != &repo.indexed_sha,
+                    // The working tree is GONE, so HEAD is unknowable and
+                    // "behind HEAD" cannot be asserted. The stored counter is
+                    // a leftover from the last successful check; reporting it
+                    // as staleness presents a stale guess as a fact. `status`
+                    // says "missing" and `needs_reindex` is true, which is the
+                    // actionable truth.
+                    None if local_missing => false,
                     None => commits_behind > 0,
                 };
                 // A repo whose SHA was committed but whose content never

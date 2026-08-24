@@ -810,6 +810,32 @@ fn validate_target_slot(
     }
     for descriptor in &bundle.artifacts {
         let artifact = slot.join(&descriptor.path);
+        // Hashing OPENS the path, and opening follows symlinks — so a described
+        // artifact that is a symlink would validate against bytes living
+        // outside the slot entirely, while the reverse inventory below (which
+        // does not follow links) could not see it. A sealed slot contains
+        // exactly what it declares; a link is not a shape we ever write.
+        let metadata = std::fs::symlink_metadata(&artifact).map_err(|error| {
+            anyhow::anyhow!("stat target artifact {}: {error}", artifact.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} is a symbolic link; a sealed slot must contain \
+                 real files only",
+                descriptor.path
+            ))
+            .into());
+        }
+        // Belt and braces on containment: `validate_metadata` rejects absolute
+        // and `..` paths, but the bytes about to be trusted are worth proving
+        // are inside the slot rather than inferring it.
+        if !artifact.starts_with(&slot) {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} resolves outside the publication slot",
+                descriptor.path
+            ))
+            .into());
+        }
         let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
             anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
         })?;
@@ -849,6 +875,18 @@ fn validate_target_slot(
     for entry in walkdir::WalkDir::new(&slot).into_iter() {
         let entry = entry
             .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?;
+        // `WalkDir` does not follow symlinks, so a link reports neither file
+        // nor dir — it would fall through this filter and be INVISIBLE to the
+        // undescribed-file check while still being openable by the digest
+        // check above. Refuse it explicitly instead.
+        if entry.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target slot contains a symbolic link ({}); a sealed slot must contain \
+                 real files only",
+                entry.path().display()
+            ))
+            .into());
+        }
         // Directories are containers, not artifacts; the manifest describes the
         // files inside them.
         if !entry.file_type().is_file() {
@@ -1229,6 +1267,39 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("checksum mismatch")
+        );
+    }
+
+    /// A symlink defeated "a sealed slot contains exactly what it declares"
+    /// from BOTH directions: hashing opens the path and so follows the link to
+    /// bytes outside the slot, while the reverse inventory walks without
+    /// following and so reports a link as neither file nor directory — making
+    /// an undescribed one invisible.
+    #[test]
+    fn a_symlink_in_the_target_slot_is_refused_from_either_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let state = create_operation(dir.path(), plan.clone()).unwrap();
+        let validating = advance_to_validating(dir.path(), &plan, state);
+        write_target_bundle(dir.path(), &plan);
+        let slot =
+            crate::publication::slot_path(dir.path(), &plan.target_publication_uuid).unwrap();
+
+        // Bytes deliberately OUTSIDE the slot, which is the whole point.
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, b"not part of this publication").unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join("smuggled.bin")).unwrap();
+
+        let error = mark_ready(dir.path(), &plan.operation_uuid, validating.revision)
+            .expect_err("a symlink in a sealed slot must be refused");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("symbolic link"), "{rendered}");
+        // Permanent, like a digest mismatch: a retry sees the same directory.
+        assert!(
+            error
+                .downcast_ref::<PermanentPublicationFailure>()
+                .is_some(),
+            "refusal must be permanent, not retried forever: {rendered}"
         );
     }
 
