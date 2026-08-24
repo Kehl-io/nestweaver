@@ -1405,6 +1405,11 @@ impl DaemonClient {
                 force,
             })
             .await
+            // The message carries an operator remedy — a pastable TOML
+            // stanza — and `tonic::Status`'s Display escapes it through
+            // `{:?}`, turning newlines into literal `\n`. Take the message
+            // verbatim so the remedy survives the transport.
+            .map_err(|status| anyhow::anyhow!("{}", status.message()))
             .context("watch_code RPC failed")?;
         Ok(resp.into_inner())
     }
@@ -1469,6 +1474,47 @@ impl DaemonClient {
             .await
             .context("purge_instance RPC failed")?;
         Ok(resp.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod status_rendering_tests {
+    /// nw-203 formatted a pastable TOML stanza at column 0 so an operator
+    /// could copy it straight into `instance.toml`. The CLI is that message's
+    /// only consumer, and `tonic::Status`'s Display writes
+    /// `", message: {:?}"` — `{:?}` on a `&str` ESCAPES newlines and quotes.
+    /// So the whole formatting effort was undone in transit and the operator
+    /// saw one long line of literal `\n` and `\"`.
+    ///
+    /// The existing test asserted on `status.message()`, the unescaped
+    /// server-side string, so it could not see the transport rendering at all.
+    #[test]
+    fn a_multi_line_remedy_survives_the_transport_but_not_status_display() {
+        let remedy = "vault path /home/me/brain is not in the allow-list.\n\nAdd this to                       your instance.toml:\n\n[[repos]]\ntype = \"vault\"\nurl =                       \"file:///home/me/brain\"";
+        let status = tonic::Status::invalid_argument(remedy);
+
+        // What the operator USED to get: escaped, single line, unpastable.
+        let via_display = format!("{status}");
+        assert!(
+            via_display.contains("\\n"),
+            "precondition: Status::Display escapes newlines: {via_display}"
+        );
+        assert!(
+            !via_display.contains("\n[[repos]]"),
+            "precondition: the stanza does not survive Display"
+        );
+
+        // What the fix takes instead: the message verbatim.
+        let error = anyhow::anyhow!("{}", status.message());
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("\n[[repos]]\ntype = \"vault\""),
+            "the TOML stanza must arrive pastable, on its own lines: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\\n"),
+            "no literal escape sequences may reach the operator: {rendered}"
+        );
     }
 }
 

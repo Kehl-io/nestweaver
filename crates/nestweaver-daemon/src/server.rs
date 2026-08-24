@@ -5356,22 +5356,18 @@ impl NestWeaverDaemon for DaemonService {
             // tombstoned rows, so running it alone on a brain whose orphans
             // were never tombstoned reclaims exactly nothing — which is the
             // state every pre-fix brain is in.
-            let reclaimed = state.store.reconcile_embedding_index()?;
+            state.store.reconcile_embedding_index()?;
             if state.store.embedding_index_occupancy().tombstoned > 0 {
                 state.store.compact_embedding_index()?;
             }
 
             let after = state.store.embedding_index_occupancy();
-            Ok(CompactEmbeddingsResponse {
-                stored_before: before.stored as u64,
-                tombstoned_before: before.tombstoned as u64,
-                stored_after: after.stored as u64,
-                live_after: after.live as u64,
-                reclaimed: reclaimed as u64,
+            Ok(compact_embeddings_response(
+                before,
+                after,
                 bytes_before,
-                bytes_after: bytes_of(&sidecar),
-                dry_run: false,
-            })
+                bytes_of(&sidecar),
+            ))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?
@@ -8157,6 +8153,92 @@ mod depth_clamp_tests {
         let mut b = serde_json::json!({ "depth": "not-a-number" });
         clamp_traversal_depth(&mut b);
         assert_eq!(b["depth"], serde_json::json!("not-a-number"));
+    }
+}
+
+/// Build the `compact_embeddings` reply from the occupancy measured either
+/// side of the run.
+///
+/// `reclaimed` is what actually LEFT the index — `stored_before -
+/// stored_after`. It used to be `reconcile_embedding_index`'s return value,
+/// i.e. only the orphans that pass newly DISCOVERED. Rows tombstoned earlier
+/// by the incremental epilogue are reclaimed by the compaction that follows
+/// and were counted nowhere, so on a post-fix brain the command printed
+/// "Reclaimed 0 dead vector(s)" directly above a stored-before/stored-after
+/// pair differing by thousands, and a several-hundred-megabyte byte drop.
+///
+/// Pure, so the arithmetic is testable without standing up a daemon — which is
+/// why the bug shipped: this RPC had no test of any kind.
+fn compact_embeddings_response(
+    before: nestweaver_store::EmbeddingIndexOccupancy,
+    after: nestweaver_store::EmbeddingIndexOccupancy,
+    bytes_before: u64,
+    bytes_after: u64,
+) -> CompactEmbeddingsResponse {
+    CompactEmbeddingsResponse {
+        stored_before: before.stored as u64,
+        tombstoned_before: before.tombstoned as u64,
+        stored_after: after.stored as u64,
+        live_after: after.live as u64,
+        // Saturating: compaction never grows the index, but a count that went
+        // backwards must not wrap into billions.
+        reclaimed: before.stored.saturating_sub(after.stored) as u64,
+        bytes_before,
+        bytes_after,
+        dry_run: false,
+    }
+}
+
+#[cfg(test)]
+mod compact_embeddings_response_tests {
+    use super::compact_embeddings_response;
+    use nestweaver_store::EmbeddingIndexOccupancy;
+
+    fn occupancy(live: usize, tombstoned: usize) -> EmbeddingIndexOccupancy {
+        EmbeddingIndexOccupancy {
+            live,
+            tombstoned,
+            stored: live + tombstoned,
+        }
+    }
+
+    /// The case that shipped wrong: a brain whose orphans were ALREADY
+    /// tombstoned by the incremental epilogue. `reconcile` discovers nothing
+    /// new, so reporting its return value said "Reclaimed 0" while compaction
+    /// dropped 5,000 rows in the same breath.
+    #[test]
+    fn reclaimed_counts_what_left_the_index_not_what_reconcile_discovered() {
+        let response = compact_embeddings_response(
+            occupancy(1_000, 5_000),
+            occupancy(1_000, 0),
+            600_000_000,
+            120_000_000,
+        );
+        assert_eq!(
+            response.reclaimed, 5_000,
+            "reclaimed must equal stored_before - stored_after"
+        );
+        assert_eq!(response.stored_before, 6_000);
+        assert_eq!(response.stored_after, 1_000);
+        assert_eq!(response.tombstoned_before, 5_000);
+        assert_eq!(response.live_after, 1_000);
+        // A reclaim count of zero beside a byte drop is the contradiction the
+        // report named; they must move together.
+        assert!(response.bytes_before > response.bytes_after);
+
+        // Nothing to do: no tombstones, nothing leaves, and the count is
+        // honestly zero rather than incidentally zero.
+        let idle = compact_embeddings_response(occupancy(1_000, 0), occupancy(1_000, 0), 42, 42);
+        assert_eq!(idle.reclaimed, 0);
+        assert_eq!(idle.stored_before, idle.stored_after);
+
+        // An index that somehow grew must not wrap a subtraction into
+        // billions.
+        let grown = compact_embeddings_response(occupancy(1, 0), occupancy(9, 0), 1, 1);
+        assert_eq!(
+            grown.reclaimed, 0,
+            "a negative delta must saturate, not wrap"
+        );
     }
 }
 

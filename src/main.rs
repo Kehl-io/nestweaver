@@ -8401,6 +8401,19 @@ fn restore_parent_stderr_tracing() {
         .try_init();
 }
 
+/// Convert a daemon `tonic::Status` into an error that renders its message
+/// VERBATIM.
+///
+/// `tonic::Status`'s `Display` writes `", message: {:?}"` — `{:?}` on a `&str`
+/// escapes newlines and quotes. So a multi-line operator remedy arrives as one
+/// long line of literal `\n` and `\"`, and the daemon's carefully
+/// column-0-indented TOML stanza is unpastable by the time a human sees it.
+/// The CLI is that message's only consumer, so the formatting effort was
+/// entirely undone in transit.
+fn daemon_status_error(status: tonic::Status) -> anyhow::Error {
+    anyhow::anyhow!("{}", status.message())
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
@@ -13760,7 +13773,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
-            if let Some(value) = try_hybrid_json_rpc_checked(
+            let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -13774,7 +13787,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "recency_weight": recency_weight,
                     "recency_half_life_days": recency_half_life_days,
                 }),
-            )? {
+            );
+            // A project that does not exist is NOT FOUND, not a generic
+            // failure. The direct path returns `EXIT_NOT_FOUND` with an
+            // actionable message; the daemon path propagated the tool error and
+            // exited 1, so the same command answered with a different exit code
+            // depending on whether a daemon happened to be running — and a
+            // script could not distinguish "no such project" from "the query
+            // failed".
+            let daemon_value = match daemon_result {
+                Ok(value) => value,
+                Err(error) if format!("{error:#}").contains("not found") => {
+                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(value) = daemon_value {
                 render_project_context_daemon_response(&value, json, token_budget);
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -18953,6 +18982,7 @@ fn run_brain(
                         .watch_vault(req)
                         .await
                         .map(|r| r.into_inner())
+                        .map_err(daemon_status_error)
                 })?;
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
@@ -21622,6 +21652,13 @@ fn project_context_json_value(
     if !external_refs.is_null() {
         resp["external_refs"] = external_refs.clone();
     }
+    // Measured on the FINISHED object, so every optional field above is
+    // counted. Same 4-bytes-per-token rule the daemon path uses.
+    let actual_tokens = serde_json::to_string(&resp)
+        .map(|serialized| serialized.len().div_ceil(4))
+        .unwrap_or(0);
+    resp["tokens_used"] = serde_json::json!(actual_tokens);
+    resp["budget_exceeded"] = serde_json::json!(actual_tokens > token_budget);
     resp
 }
 

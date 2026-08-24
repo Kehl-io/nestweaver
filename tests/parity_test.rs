@@ -858,6 +858,21 @@ fn parity_export_scope_direct_vs_daemon() {
     }
 }
 
+/// nw-188's honesty fields — `more_available`, `truncated`, `budget_exceeded`,
+/// `seed_tokens_charged` — were added to the daemon/MCP path only, so the same
+/// command answered with four extra keys and a different `tokens_used`
+/// depending on whether a daemon happened to be running. A tight budget is
+/// used deliberately: it is the case that produced the original report.
+#[test]
+fn parity_project_context_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "project-context",
+        &["project-context", "demo", "--token-budget", "200"],
+    );
+}
+
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never

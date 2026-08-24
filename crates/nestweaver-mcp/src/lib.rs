@@ -150,13 +150,32 @@ pub fn run_stdio_server(
         (Some(config), Some(source))
     } else {
         let sibling = db_path.parent().map(|d| d.join("instance.toml"));
-        match sibling.as_deref().and_then(|s| {
-            nestweaver_engine::InstanceConfig::from_file(s)
-                .ok()
-                .map(|c| (c, s.display().to_string()))
-        }) {
-            Some((c, path)) => (Some(c), Some(path)),
-            None => (None, None),
+        // A MISSING sibling is normal and stays silent. A sibling that exists
+        // and fails to parse is an operator error and must not be.
+        //
+        // `.ok()` used to swallow both. That was survivable while unknown keys
+        // were merely dropped: one typo cost you that key. With
+        // `deny_unknown_fields` a single typo fails the WHOLE file, so every
+        // setting — ranking priors, response tuning, cache sizing, the
+        // configured result limit — silently reverted to defaults with nothing
+        // logged anywhere. The explicit `--config` path fails loudly; this one
+        // did not, so the strictness landed hardest exactly where it was
+        // invisible.
+        match sibling.as_deref() {
+            Some(path) if path.exists() => match nestweaver_engine::InstanceConfig::from_file(path)
+            {
+                Ok(config) => (Some(config), Some(path.display().to_string())),
+                Err(error) => {
+                    tracing::warn!(
+                        config = %path.display(),
+                        "instance config found beside the database but could NOT be parsed, so \
+                         NO configured setting is in effect (ranking, limits, response, cache \
+                         and projects all fall back to defaults): {error:#}"
+                    );
+                    (None, None)
+                }
+            },
+            _ => (None, None),
         }
     };
     if let Some(cfg) = instance_cfg {

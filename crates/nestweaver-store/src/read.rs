@@ -1454,6 +1454,77 @@ impl GraphStore {
     /// Sound because the file set is exactly the set the caller deleted from:
     /// a UID can only reappear in a file the run wrote, and the rename path
     /// touches both the source and destination paths.
+    /// The Note and Heading UIDs owned by `note_uid` that currently carry an
+    /// embedding candidate — collected BEFORE a cascade delete so the caller
+    /// can tombstone whatever does not come back.
+    ///
+    /// Mirrors `delete_note_cascade_on`'s own two passes: ownership by the
+    /// `note_uid` PROPERTY and by the `NOTE_HAS_SECTION`/`NOTE_HAS_HEADING`
+    /// EDGE. The cascade runs both because the edge is not guaranteed, so
+    /// collecting by only one of them would miss exactly the fragments the
+    /// cascade exists to catch.
+    pub fn note_embedding_candidate_uids(&self, note_uid: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        // Same `\'` escaping as `symbol_uids_for_files`: these queries and the
+        // cascade's must select the SAME rows for the liveness difference to
+        // be sound.
+        let safe = note_uid.replace('\'', "\\'");
+        let mut uids = vec![note_uid.to_string()];
+        for query in [
+            format!("MATCH (h:Heading) WHERE h.note_uid = '{safe}' RETURN h.uid"),
+            format!(
+                "MATCH (n:Note {{uid: '{safe}'}})-[:NOTE_HAS_HEADING]->(h:Heading) RETURN h.uid"
+            ),
+        ] {
+            let Ok(mut stmt) = conn.prepare(&query) else {
+                // A schema without that edge type is not an error here; the
+                // property pass still covers ownership.
+                continue;
+            };
+            let rows = conn
+                .execute(&mut stmt, vec![])
+                .map_err(|e| StoreError::Query(format!("note embedding candidates: {e}")))?;
+            for row in rows {
+                if let Some(Value::String(uid)) = row.first() {
+                    uids.push(uid.clone());
+                }
+            }
+        }
+        uids.sort();
+        uids.dedup();
+        Ok(uids)
+    }
+
+    /// Which of `candidates` still exist as a Note or Heading.
+    pub fn live_vault_node_uids(
+        &self,
+        candidates: &[String],
+    ) -> Result<HashSet<String>, StoreError> {
+        let mut live = HashSet::new();
+        if candidates.is_empty() {
+            return Ok(live);
+        }
+        let conn = self.conn()?;
+        for candidate in candidates {
+            let safe = candidate.replace('\'', "\\'");
+            for label in ["Note", "Heading"] {
+                let query =
+                    format!("MATCH (n:{label}) WHERE n.uid = '{safe}' RETURN n.uid LIMIT 1");
+                let Ok(mut stmt) = conn.prepare(&query) else {
+                    continue;
+                };
+                let rows = conn
+                    .execute(&mut stmt, vec![])
+                    .map_err(|e| StoreError::Query(format!("live vault nodes: {e}")))?;
+                if rows.into_iter().next().is_some() {
+                    live.insert(candidate.clone());
+                    break;
+                }
+            }
+        }
+        Ok(live)
+    }
+
     pub fn symbol_uids_for_files(
         &self,
         repo_uid: &str,

@@ -2029,6 +2029,50 @@ impl GraphStore {
     /// Returns the number of vectors removed.
     ///
     /// [`reconcile_embedding_index`]: Self::reconcile_embedding_index
+    /// Tombstone the embeddings of vault nodes that a delete removed for good.
+    ///
+    /// The vault half of the graph had NO synchronous tombstoning at all: a
+    /// `brain refresh` that dropped 200 notes left every note and heading
+    /// vector live and scored, and only a writable daemon's periodic
+    /// reconciler ever repaired it — so a CLI-only run, or a read-only daemon
+    /// (which does not spawn the reconciler), leaked indefinitely.
+    ///
+    /// Takes CANDIDATES collected before the delete and applies the same
+    /// liveness difference the symbol path uses: an EDITED note is deleted and
+    /// re-inserted under the same UID, so tombstoning the raw candidate list
+    /// would drop live vectors — a far worse bug than the orphans it fixes.
+    pub fn tombstone_deleted_vault_embeddings(
+        &self,
+        candidate_uids: &[String],
+    ) -> Result<usize, StoreError> {
+        if candidate_uids.is_empty() {
+            return Ok(0);
+        }
+        let live = self.live_vault_node_uids(candidate_uids)?;
+        let dead: Vec<String> = candidate_uids
+            .iter()
+            .filter(|uid| !live.contains(uid.as_str()))
+            .cloned()
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let removed = {
+            let mut idx = self
+                .embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            idx.tombstone_uids(&dead)
+        };
+        // Nothing was held for those UIDs, so a flush would rewrite the
+        // sidecar for no change — same reasoning as the symbol path.
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.flush_embedding_index()?;
+        Ok(removed)
+    }
+
     pub fn tombstone_deleted_symbol_embeddings(
         &self,
         repo_uid: &str,
