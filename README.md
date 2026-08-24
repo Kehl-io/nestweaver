@@ -235,6 +235,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 |---------|-------------|
 | `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Indexing does NOT refresh trigrams implicitly — the daemon's reconcile loop owns that (see `[indexing] trigram_reconcile_interval`). `--with-trigrams` forces an inline refresh for one run (CI, scripted reindex), `--no-trigrams` suppresses it (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. The direct `--local` path still refreshes inline, since no daemon exists there to drain for it. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
+| `watch-stop` | Stop the daemon's active watcher. The watcher slot is global and the daemon keeps no liveness check on the CLI that registered it, so a watch killed without a clean shutdown (SIGKILL, or a closed terminal) leaves the slot occupied and every later watch refused; this releases it without restarting the daemon |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
@@ -264,7 +265,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain context` | Get unified context spanning both code symbols and notes (skips the semantic leg entirely when the DB has no embeddings; identical concurrent calls coalesce single-flight) |
 | `brain list` | List all registered vaults |
 | `brain status` | Show vault counts, per-vault staleness, and index health |
-| `brain watch` | Watch vaults for changes and re-index automatically |
+| `brain watch` | Watch vaults for changes and re-index automatically. `--force` adopts an existing watcher registration instead of being refused by it — the vault counterpart of `watch --force` |
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
 | `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. `any_stale` / `is_stale` mean *behind HEAD* specifically |

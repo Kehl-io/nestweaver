@@ -985,6 +985,18 @@ pub struct DaemonState {
     /// handles, so a discarded handle would let that teardown race a write in
     /// progress — against a store that is not crash-safe (nw-126).
     pub trigram_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Join handle for the embedding reconcile loop.
+    ///
+    /// Retained for exactly the reason stated above, which this task violated
+    /// by being spawned detached: it performs the same kind of unabortable
+    /// blocking store write on a `spawn_blocking` thread. The write gate
+    /// covers the common case, but `ConnectionGuard::write` reads
+    /// `shutdown_started` with `Relaxed` and then increments `active_writes`
+    /// — a pass that slips between those two steps is invisible to the drain,
+    /// so teardown could remove the socket, the pidfile and the INSTANCE LOCK
+    /// while the outgoing process was still rewriting the sidecar, letting a
+    /// successor daemon open the same database concurrently.
+    pub embedding_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Handle to the `serve_ui` web-server task plus the port it is bound
     /// to, aborted by `stop_ui` so the listen port is released when the CLI
     /// exits (LOW: ui port leak). The port is tracked so a repeated
@@ -1501,7 +1513,20 @@ async fn run_embedding_reconciler(state: Arc<DaemonState>, period: Duration) {
         let lease = state.write_gate.lock("embedding_reconcile").await;
         let reconcile_state = Arc::clone(&state);
         let outcome = tokio::task::spawn_blocking(move || {
-            let removed = reconcile_state.store.reconcile_embedding_index()?;
+            // Occupancy either side of the pass, for the same reason
+            // `compact_embeddings` reports `stored_before - stored_after`:
+            // `reconcile_embedding_index` returns only the orphans THIS pass
+            // discovered, while the compaction below drops every tombstoned
+            // row — including all those the synchronous delete epilogue
+            // tombstoned earlier, which this count never saw. On a brain that
+            // tombstones as it deletes, a pass could log `removed=0` beside
+            // "reclaimed vectors for deleted nodes" while a full base rewrite
+            // dropped tens of thousands.
+            //
+            // This is the twin of the `compact_embeddings` accounting bug; the
+            // two paths share the defect because they share the shape.
+            let before = reconcile_state.store.embedding_index_occupancy();
+            let discovered = reconcile_state.store.reconcile_embedding_index()?;
             // Compaction is deliberately here and NOT in `flush_embedding_index`:
             // the watcher flushes on every save, and compaction rewrites the
             // whole base.
@@ -1511,21 +1536,30 @@ async fn run_embedding_reconciler(state: Arc<DaemonState>, period: Duration) {
             } else {
                 false
             };
-            Ok::<_, nestweaver_store::StoreError>((removed, compacted))
+            let after = reconcile_state.store.embedding_index_occupancy();
+            // Saturating: a pass never grows the index, but a count that went
+            // backwards must not wrap.
+            let reclaimed = before.stored.saturating_sub(after.stored);
+            Ok::<_, nestweaver_store::StoreError>((discovered, reclaimed, compacted))
         })
         .await;
         drop(lease);
 
         match outcome {
-            Ok(Ok((removed, compacted))) => {
+            Ok(Ok((discovered, reclaimed, compacted))) => {
                 consecutive_failures = 0;
                 backoff_until = None;
                 // Only advance the watermark on success, so a failed pass is
                 // retried rather than skipped.
                 last_generation = Some(generation);
-                if removed > 0 || compacted {
+                if reclaimed > 0 || discovered > 0 || compacted {
                     tracing::info!(
-                        removed,
+                        // What actually LEFT the index…
+                        reclaimed,
+                        // …and how much of it this pass had to find itself.
+                        // Reporting both keeps the backstop's own contribution
+                        // visible without letting it stand in for the total.
+                        discovered,
                         compacted,
                         generation,
                         "embedding reconcile: reclaimed vectors for deleted nodes"
@@ -3847,6 +3881,7 @@ impl NestWeaverDaemon for DaemonService {
         let instance_id =
             resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
+        let force = req.force;
 
         if !vault_path.exists() || !vault_path.is_dir() {
             return Ok(Response::new(WatchVaultResponse {
@@ -3903,12 +3938,20 @@ impl NestWeaverDaemon for DaemonService {
         let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, false) {
+        // `force` now reaches here, as it always has for `watch_code`: the
+        // watcher slot is global and has no client-liveness check, so an
+        // orphaned registration otherwise blocks every later vault watch until
+        // the daemon restarts.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
             Ok(id) => id,
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchVaultResponse {
                     ok: false,
-                    message: "A watcher is already running. Stop it first with StopWatch."
+                    // Names COMMANDS, not an RPC. The previous wording said
+                    // "Stop it first with StopWatch" — an RPC no CLI
+                    // subcommand exposed, so the advice could not be followed.
+                    message: "A watcher is already running. Stop it with \
+                              `nestweaver watch-stop`, or retry with --force to adopt it."
                         .to_string(),
                 }));
             }
@@ -4016,8 +4059,8 @@ impl NestWeaverDaemon for DaemonService {
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
                     ok: false,
-                    message: "A watcher is already running. Stop it first with StopWatch \
-                              (or retry with --force)."
+                    message: "A watcher is already running. Stop it with \
+                              `nestweaver watch-stop`, or retry with --force to adopt it."
                         .to_string(),
                 }));
             }
@@ -9877,6 +9920,7 @@ pub async fn run_server(
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
         trigram_reconciler_handle: std::sync::Mutex::new(None),
+        embedding_reconciler_handle: std::sync::Mutex::new(None),
         ui_server: std::sync::Mutex::new(None),
     });
 
@@ -10054,10 +10098,14 @@ pub async fn run_server(
             interval_secs = EMBEDDING_RECONCILE_INTERVAL.as_secs(),
             "embedding reconcile loop enabled"
         );
-        tokio::spawn(run_embedding_reconciler(
+        let embedding_handle = tokio::spawn(run_embedding_reconciler(
             Arc::clone(&state),
             EMBEDDING_RECONCILE_INTERVAL,
         ));
+        *state
+            .embedding_reconciler_handle
+            .lock()
+            .expect("embedding_reconciler_handle mutex poisoned") = Some(embedding_handle);
     }
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
@@ -11287,6 +11335,17 @@ pub async fn run_server(
         .and_then(|mut guard| guard.take());
     if let Some(handle) = reconciler_handle {
         tracing::info!("draining trigram reconcile loop before exit");
+        let _ = handle.await;
+    }
+    // Awaited BEFORE the socket, pidfile and instance lock are released
+    // below, for the same reason as the trigram loop.
+    let embedding_handle = state
+        .embedding_reconciler_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = embedding_handle {
+        tracing::info!("draining embedding reconcile loop before exit");
         let _ = handle.await;
     }
 
@@ -16318,6 +16377,7 @@ mod startup_helper_tests {
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
+            embedding_reconciler_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -16400,6 +16460,7 @@ credential_method = "gh"
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
+            embedding_reconciler_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -18003,6 +18064,7 @@ external_model = "unavailable-test-model"
                 vault_name: "test-vault".to_string(),
                 instance_id: String::new(),
                 extra_ignore_patterns: Vec::new(),
+                force: false,
             }))
             .await
             .expect("WatchVault RPC")
@@ -19529,6 +19591,73 @@ mod watcher_e2e_tests {
             r3.ok,
             "force watch must adopt the orphaned slot: {}",
             r3.message
+        );
+
+        // The VAULT half of the same contract. `WatchVaultRequest` had no
+        // `force` field at all while its sibling `WatchCodeRequest` did, so an
+        // orphaned watcher — the state simulated above — refused every later
+        // `brain watch` for the daemon's lifetime with no way to adopt it.
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let mk_vault_req = |force: bool| nestweaver_proto::WatchVaultRequest {
+            vault_path: vault.to_string_lossy().to_string(),
+            vault_name: "test-vault".to_string(),
+            instance_id: String::new(),
+            extra_ignore_patterns: Vec::new(),
+            force,
+        };
+
+        let v1 = client
+            .watch_vault(mk_vault_req(false))
+            .await
+            .expect("watch_vault")
+            .into_inner();
+        assert!(
+            !v1.ok,
+            "a vault watch must still be refused while a watcher is registered"
+        );
+        assert!(
+            v1.message.contains("already running"),
+            "unexpected refusal message: {}",
+            v1.message
+        );
+        // The refusal must name something a user can actually RUN. It used to
+        // say "Stop it first with StopWatch" — an RPC no CLI subcommand
+        // exposed, so the advice could not be followed.
+        assert!(
+            v1.message.contains("watch-stop") || v1.message.contains("--force"),
+            "the refusal must name a runnable remedy: {}",
+            v1.message
+        );
+
+        let v2 = client
+            .watch_vault(mk_vault_req(true))
+            .await
+            .expect("watch_vault")
+            .into_inner();
+        assert!(
+            v2.ok,
+            "force must let a vault watch adopt the orphaned slot: {}",
+            v2.message
+        );
+
+        // And `StopWatch` empties the slot, which is what the new
+        // `nestweaver watch-stop` subcommand issues.
+        let stopped = client
+            .stop_watch(nestweaver_proto::StopWatchRequest {})
+            .await
+            .expect("stop_watch")
+            .into_inner();
+        assert!(stopped.ok, "stop_watch must report stopping the watcher");
+        let v3 = client
+            .watch_vault(mk_vault_req(false))
+            .await
+            .expect("watch_vault")
+            .into_inner();
+        assert!(
+            v3.ok,
+            "after a stop, a plain vault watch must succeed: {}",
+            v3.message
         );
 
         // Shutdown with the watcher ACTIVE must stop it and exit
