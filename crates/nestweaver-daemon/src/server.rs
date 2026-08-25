@@ -357,6 +357,29 @@ pub struct EmbedProgressSnapshot {
     pub scope: String,
 }
 
+/// Reconcile embed counts with whether the sidecar flush actually persisted.
+///
+/// A failed flush means NOTHING persisted, so nothing succeeded — the vectors
+/// counted as written move to `failed`. Returning `succeeded` unchanged is the
+/// fsyncgate shape: PostgreSQL spent twenty years reporting durable success for
+/// writes the kernel had discarded, and the remedy was to stop counting what it
+/// thought it had written.
+///
+/// The CLI's embed path already did this. The daemon route — the DEFAULT route
+/// — did not, and the CLI prints the daemon's number verbatim as
+/// "Done: N embedding(s) generated", so a user was told N vectors persisted
+/// when zero had.
+///
+/// Pure, so the decision is testable without a gRPC harness: the property worth
+/// pinning is "a failed flush cannot leave a positive success count", which
+/// belongs to the arithmetic rather than to any transport.
+fn settle_embed_counts(succeeded: u32, failed: u32, flush_ok: bool) -> (u32, u32) {
+    if flush_ok {
+        return (succeeded, failed);
+    }
+    (0, failed.saturating_add(succeeded))
+}
+
 fn unix_now_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4995,8 +5018,31 @@ impl NestWeaverDaemon for DaemonService {
                             Ok(n) => {
                                 tracing::info!(docs = n, "Tantivy reindexed after vault indexing")
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing")
+                            // Report the failure instead of walking into the
+                            // DONE phase below with a full set of counts.
+                            //
+                            // `refresh_vault_since` — the sibling roughly 80
+                            // lines down, doing the same rebuild after the same
+                            // kind of commit — already emits Phase::Error and
+                            // returns. This one warned to the log and then told
+                            // the user it was finished, so a vault re-index
+                            // looked clean while BM25 search kept serving the
+                            // PRE-INDEX corpus. The graph write did land, which
+                            // is why the message says so explicitly rather than
+                            // implying the whole operation failed.
+                            Err(error) => {
+                                tracing::error!(error = %error, "Tantivy reindex failed after vault indexing");
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    phase: Phase::Error as i32,
+                                    message: format!(
+                                        "IndexVault committed graph changes but Tantivy rebuild failed: {error:#}"
+                                    ),
+                                    files_processed: result.index.notes_count as u64,
+                                    files_total: result.index.notes_count as u64,
+                                    symbols_found: result.index.headings_count as u64,
+                                    ..Default::default()
+                                }));
+                                return;
                             }
                         }
                     }
@@ -7441,22 +7487,48 @@ impl NestWeaverDaemon for DaemonService {
                     }
                 }
 
-                if succeeded > 0
-                    && let Err(e) = store.flush_embedding_index()
-                {
-                    tracing::warn!("failed to flush embedding index: {e}");
-                }
-
-                // Stamp the fingerprint only from vectors this run produced:
-                // a daemon embed that produced nothing must not invent (or
-                // overwrite) metadata. The daemon route previously never
-                // stamped at all, leaving daemon-populated databases without a
-                // fingerprint for the startup and CLI guards to check.
+                // A failed flush means NOTHING persisted, so nothing
+                // succeeded. Logging the error and returning `succeeded`
+                // unchanged is the fsyncgate shape: PostgreSQL spent twenty
+                // years reporting durable success for writes the kernel had
+                // discarded, and the remedy was to stop counting what it
+                // thought it had written.
+                //
+                // The CLI's own embed path already does exactly this
+                // (src/main.rs, `error_count += success_count; success_count =
+                // 0`) with that reasoning written out. The daemon route — the
+                // DEFAULT route — was the unfixed half, and the CLI prints the
+                // daemon's number verbatim as "Done: N embedding(s)
+                // generated". A user was told N vectors persisted when zero
+                // had.
+                // Stamp the pipeline BEFORE flushing. `flush_embedding_index`
+                // refuses without it ("embedding vectors have no pipeline-v2
+                // metadata"), so with the old order the FIRST daemon embed
+                // against a database that had none always failed to flush —
+                // and, because that failure was only logged, still reported
+                // every vector as succeeded. The CLI has always done these two
+                // in this order; the daemon had them reversed.
+                //
+                // Only from vectors this run produced: an embed that produced
+                // nothing must not invent or overwrite metadata.
                 if let Some(pipeline) = produced_pipeline.as_ref()
                     && let Err(e) = store.set_embedding_pipeline(pipeline)
                 {
                     tracing::warn!("failed to record embedding model metadata: {e}");
                 }
+
+                let flush = if succeeded > 0 {
+                    store.flush_embedding_index()
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = &flush {
+                    tracing::error!(
+                        "failed to flush embedding index, reporting {succeeded} \
+                         unpersisted vector(s) as failures: {e}"
+                    );
+                }
+                let (succeeded, failed) = settle_embed_counts(succeeded, failed, flush.is_ok());
 
                 log_pass_progress(true);
                 tracing::info!(
@@ -17379,6 +17451,16 @@ external_model = "unavailable-test-model"
     /// `set_embedding_metadata` at all, so daemon-populated databases had no
     /// fingerprint for any downstream guard — this test fails there because
     /// the metadata stays `None`.
+    ///
+    /// It now ALSO pins the order of the two operations, and that is the
+    /// sharper thing it guards. `flush_embedding_index` refuses without
+    /// pipeline metadata, so while the handler flushed BEFORE stamping, the
+    /// first embed against a database that had none could never persist. This
+    /// test passed anyway, because the failed flush was only logged and
+    /// `succeeded` was returned unchanged — the assertion below read 1 for a
+    /// run that wrote nothing to disk. Once a failed flush zeroes the count,
+    /// `succeeded == 1` means the vectors actually reached the sidecar, so
+    /// reversing the order here fails this test.
     #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embed_handler_stamps_the_loaded_models_fingerprint_after_a_productive_run() {
@@ -19987,5 +20069,62 @@ mod watcher_e2e_tests {
                 }
             }
         }
+    }
+}
+
+/// nw-212: the daemon must not report success for work that did not persist.
+#[cfg(test)]
+mod daemon_honesty_tests {
+    use super::settle_embed_counts;
+
+    /// The fsyncgate case. The CLI's embed path already zeroed its success
+    /// count on a failed flush; the daemon route returned the count unchanged,
+    /// and the CLI prints the daemon's number verbatim as
+    /// "Done: N embedding(s) generated".
+    #[test]
+    fn a_failed_flush_leaves_no_successes() {
+        let (succeeded, failed) = settle_embed_counts(4821, 0, false);
+
+        assert_eq!(
+            succeeded, 0,
+            "nothing persisted, so nothing succeeded — a count of successes \
+             must mean 'confirmed persisted'"
+        );
+        assert_eq!(
+            failed, 4821,
+            "the vectors did not vanish; they failed, and the total must still \
+             account for every item attempted"
+        );
+    }
+
+    /// Pre-existing failures are kept, not overwritten. Assigning rather than
+    /// adding would under-report the total.
+    #[test]
+    fn a_failed_flush_adds_to_existing_failures() {
+        let (succeeded, failed) = settle_embed_counts(10, 3, false);
+
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, 13, "3 already-failed plus 10 unpersisted");
+    }
+
+    /// The counterweight: a SUCCESSFUL flush must leave both counts alone. A
+    /// helper that always zeroed would pass the two tests above while making
+    /// every successful embed report zero successes.
+    #[test]
+    fn a_successful_flush_changes_nothing() {
+        assert_eq!(settle_embed_counts(4821, 0, true), (4821, 0));
+        assert_eq!(settle_embed_counts(10, 3, true), (10, 3));
+        assert_eq!(settle_embed_counts(0, 0, true), (0, 0));
+    }
+
+    /// Saturating, not wrapping: an absurd count must not roll over into a
+    /// small number, which would turn "everything failed" into "almost nothing
+    /// failed" — the same lie in the opposite direction.
+    #[test]
+    fn the_failure_total_saturates_rather_than_wrapping() {
+        let (succeeded, failed) = settle_embed_counts(u32::MAX, u32::MAX, false);
+
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, u32::MAX);
     }
 }
