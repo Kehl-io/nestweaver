@@ -9751,60 +9751,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // ── Seed-based context: always try daemon first ──────────
-            // The daemon runs the full hybrid pipeline (PPR + BM25 +
-            // semantic) so we get better results and avoid the ~300ms
-            // double-RPC latency of the old name-resolution-then-fallback
-            // pattern.
-            let effective_limit = limit.unwrap_or(30);
+            // ── Seed-based context: daemon first, same algorithm either way ──
+            //
+            // This used to send `brain_context` — the code+notes HYBRID with
+            // taxonomy-alias seed resolution — while the fallback below ran
+            // code-only PPR. One command, two algorithms over two different
+            // node sets, and which one you got depended on whether a daemon
+            // happened to be running. `code_context` is the RPC for what this
+            // command actually means; `nestweaver brain context` is where the
+            // hybrid lives, and it is still there.
+            //
+            // Both routes now produce a `ContextResult` and render through the
+            // same code below, so the transport cannot change the answer.
+            let mut routed_via_daemon = false;
+            let mut context_result: Option<nestweaver_engine::ContextResult> = None;
             if use_daemon {
-                let hybrid_args = serde_json::json!({
-                    "seeds": seeds.clone(),
-                    "token_budget": token_budget.unwrap_or(0),
-                    "intent": intent.clone().unwrap_or_default(),
-                    "include_seeds": true,
-                });
+                let mut code_args = serde_json::json!({ "seeds": seeds.clone() });
+                // Omit rather than default: absent `--limit` means "no cap" on
+                // the direct path, and the schema rejects a 0.
+                if let Some(limit) = limit {
+                    code_args["limit"] = serde_json::json!(limit);
+                }
+                if let Some(intent) = intent.as_deref().filter(|value| !value.is_empty()) {
+                    code_args["intent"] = serde_json::json!(intent);
+                }
                 if let Some(result_json) = try_hybrid_json_rpc_checked(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
-                    "brain_context",
-                    hybrid_args,
+                    "code_context",
+                    code_args,
                 )? {
-                    let result: nestweaver_engine::BrainContextResult =
-                        serde_json::from_value(result_json)?;
-                    let cut = match token_budget {
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
-                        None => effective_limit.min(result.connected.len()),
-                    };
-                    if json {
-                        print_brain_context_json(&result, cut)?;
-                    } else {
-                        print_brain_context_text(&result, cut, token_budget);
-                    }
-                    let stats = format!(
-                        "{} seeds, {} connected nodes in {} (via hybrid)",
-                        result.seeds.len(),
-                        cut,
-                        format_elapsed(t0.elapsed())
-                    );
-                    return Ok((EXIT_SUCCESS, Some(stats)));
+                    context_result = Some(serde_json::from_value(result_json)?);
+                    routed_via_daemon = true;
                 }
             }
 
             // ── Local fallback (daemon unavailable) ──────────────────
-            let store = open_store(Some(&db_path))?;
-            match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
+            let built = match context_result {
+                Some(result) => Ok(result),
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    build_context_with_intent(&store, &seeds, parsed_intent, limit)
+                }
+            };
+            match built {
                 Ok(mut result) => {
                     if let Some(budget) = token_budget {
                         let cut = context_token_budgeted_truncate(&result.connected, budget);
                         result.connected.truncate(cut);
                     }
                     let stats = format!(
-                        "{} seeds, {} connected nodes in {} (local fallback)",
+                        "{} seeds, {} connected nodes in {} ({})",
                         result.seeds.len(),
                         result.connected.len(),
-                        format_elapsed(t0.elapsed())
+                        format_elapsed(t0.elapsed()),
+                        if routed_via_daemon {
+                            "via daemon"
+                        } else {
+                            "local fallback"
+                        }
                     );
                     if json {
                         println!("{}", serde_json::to_string_pretty(&result)?);

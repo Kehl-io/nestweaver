@@ -782,6 +782,11 @@ service NestWeaverDaemon {
   // Read RPCs — typed hot-path
   rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
   rpc GetContext(BrainContextRequest) returns (BrainContextResponse);
+  // CODE-only context: PPR over the symbol graph, no notes and no alias
+  // resolution. Distinct from GetContext, which runs the hybrid. `nestweaver
+  // context` had no RPC of its own, so its daemon route sent the hybrid while
+  // its direct path ran code-only PPR — one command, two algorithms.
+  rpc CodeContext(JsonRequest) returns (JsonResponse);
   rpc GetProjectContext(ProjectContextRequest) returns (ProjectContextResponse);
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);

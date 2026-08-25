@@ -10507,6 +10507,7 @@ pub fn dispatch_via_daemon(
                     "count_patterns" => client.count_patterns(req).await,
                     "cross_repo_contracts" => client.cross_repo_contracts(req).await,
                     "contract_drift" => client.contract_drift(req).await,
+                    "code_context" => client.code_context(req).await,
                     "dead_code" => client.dead_code(req).await,
                     "brain_broken_links" => client.brain_broken_links(req).await,
                     "brain_orphan_documents" => client.brain_orphan_documents(req).await,
