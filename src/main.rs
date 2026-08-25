@@ -8583,19 +8583,27 @@ fn impact_truncation_note(
 /// without mutating process-global environment variables (which race under
 /// parallel `cargo test`). The daemon bypass is permitted when an explicit
 /// local opt-in is set, or when we are running under a CI system.
-fn no_daemon_allowed_from(allow_optin: bool, github_actions: bool, ci: Option<&str>) -> bool {
-    if allow_optin || github_actions {
-        return true;
-    }
-    // `CI` is set to a truthy value by virtually every CI provider. Treat the
-    // conventional falsey spellings as "not CI" so `CI=0`/`CI=false` don't count.
-    match ci {
-        Some(v) => {
-            let v = v.trim();
-            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
-        }
-        None => false,
-    }
+fn no_daemon_allowed_from(allow_optin: bool, _github_actions: bool, _ci: Option<&str>) -> bool {
+    // `CI` and `GITHUB_ACTIONS` confer NOTHING. They used to permit the bypass,
+    // which meant an ambient variable set by dozens of unrelated tools decided
+    // whether this database could have two writers.
+    //
+    // `CI` is not ours. Every CI provider sets it, so do many Docker images,
+    // shell profiles and wrapper scripts, and developers set it locally to
+    // reproduce CI failures. The canonical incident is Netlify beginning to set
+    // `CI=true` in 2020, which broke thousands of Create React App builds
+    // overnight — for a COSMETIC setting. This one decided writer exclusivity.
+    //
+    // The closest analogue in Rust is `RUSTC_BOOTSTRAP`, which leaked so far
+    // beyond its intended use that the compiler team proposed renaming it to
+    // force a conscious decision. An inherited, invisible, ambiently-settable
+    // channel is exactly wrong for a mode nobody should enter by accident.
+    //
+    // Correctness no longer depends on this answer in any case:
+    // `require_exclusive_store_access` takes the lock at the moment of the
+    // write. In CI no daemon is running, so the lock is free and everything
+    // works with no gate at all.
+    allow_optin
 }
 
 /// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
@@ -8774,6 +8782,83 @@ fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: b
         return false;
     }
     force_on || config_enabled
+}
+
+/// Refuse a DIRECT write when anything else holds the database.
+///
+/// This is the arbiter for every write path that does not go through the
+/// daemon, and it replaces a policy check that could not work. The previous
+/// design asked "is the bypass permitted in this environment?" — a question
+/// about an env var, answered once, at a moment that is not the moment of the
+/// write. Eight write paths honoured that answer and opened the store
+/// read-write with no check for a running daemon at all.
+///
+/// The lock is the only thing that can answer the question that matters: is
+/// someone else holding this database RIGHT NOW. It lives on the database file
+/// itself, so unlike the pidfile an operator's `rm` cannot erase it, and the
+/// kernel releases it on process exit so there is no stale state to reap.
+///
+/// `Unknown` fails CLOSED. A lock state we could not read is not evidence of
+/// freedom, and the cost of being wrong is two writers on a store that is not
+/// crash-safe.
+///
+/// This is what every comparable system does — SQLite, RocksDB, LMDB, DuckDB
+/// and Kuzu all hold an `fcntl`/`flock` for the handle's lifetime, and Kuzu's
+/// own documentation recommends exactly this architecture ("route all
+/// modifications through a single API server process"). Elasticsearch shipped
+/// a gated multi-writer escape hatch (`node.max_local_storage_nodes`) and
+/// removed it in 8.0.
+fn require_exclusive_store_access(
+    db_path: &std::path::Path,
+    operation: &str,
+) -> anyhow::Result<()> {
+    exclusive_access_verdict(
+        nestweaver_daemon::lifecycle::db_write_lock(db_path),
+        db_path,
+        operation,
+    )
+}
+
+/// The decision `require_exclusive_store_access` makes, separated from the
+/// probe that feeds it.
+///
+/// Split out because `fcntl` locks are held per-PROCESS: a handle open in the
+/// CALLING process reports as free, so a unit test cannot manufacture a `Held`
+/// by opening the store itself. That is correct POSIX behaviour, and exactly
+/// why the concern is a DIFFERENT process — but it leaves the interesting
+/// branches unreachable from any test that goes through the probe. Testing the
+/// verdict directly covers all three, including the fail-closed `Unknown` that
+/// nothing could otherwise reach.
+fn exclusive_access_verdict(
+    lock: nestweaver_daemon::lifecycle::DbWriteLock,
+    db_path: &std::path::Path,
+    operation: &str,
+) -> anyhow::Result<()> {
+    use nestweaver_daemon::lifecycle::DbWriteLock;
+    match lock {
+        DbWriteLock::Free => Ok(()),
+        DbWriteLock::Held { pid } => {
+            let holder = match pid {
+                Some(pid) => format!("process {pid}"),
+                None => "another process (the kernel named no holder)".to_string(),
+            };
+            anyhow::bail!(
+                "cannot {operation} directly: {holder} holds the database at {}.\n\
+                 Route through the daemon (drop --no-daemon), or stop the holder first with \
+                 `nestweaver daemon --db {} stop`.",
+                db_path.display(),
+                db_path.display()
+            )
+        }
+        DbWriteLock::Unknown => anyhow::bail!(
+            "cannot {operation} directly: the write-lock state of {} could not be read, so it \
+             is NOT known to be free.\n\
+             Refusing rather than risking a second writer against a store that is not \
+             crash-safe. Route through the daemon, or investigate the database file's \
+             permissions.",
+            db_path.display()
+        ),
+    }
 }
 
 fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
@@ -14730,6 +14815,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 })
                 .unwrap_or_else(|| "local".to_string());
 
+            // The direct index path writes the graph AND four sidecars
+            // (filemeta, resolution deps, parsed cache, pagerank), then git
+            // activity, cochange, and the trigram index below. None of that
+            // checked whether a daemon already held the database; the only
+            // gate was an env var answered long before this point.
+            require_exclusive_store_access(&db_path, "index directly")?;
+
             let (files_count, symbols_count, edges_count);
             let skipped_files;
 
@@ -18150,7 +18242,10 @@ fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
+            // Direct-write fallback (`--no-daemon`). It writes the graph and
+            // the Tantivy index; neither checked for a live daemon holding the
+            // same database.
+            require_exclusive_store_access(&db_path, "add a vault directly")?;
             let result = index_markdown_directory_with_ignore(
                 &path,
                 &db_path,
@@ -19401,6 +19496,10 @@ fn run_brain(
                 }
                 return Ok((EXIT_SUCCESS, None));
             }
+
+            // Both refresh arms below write the graph and rebuild Tantivy on
+            // the direct path.
+            require_exclusive_store_access(&db_path, "refresh a vault directly")?;
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -22019,18 +22118,19 @@ where
         );
     }
 
-    // Lock trap: the direct write open below fails against a running
-    // daemon's write lock with a raw store error. Detect it up front and say
-    // exactly what to do instead.
-    if daemon_process_running_for_db(path) {
-        anyhow::bail!(
-            "a nestweaver daemon is running for {} and holds the write lock. \
-             Stop it first with `nestweaver daemon --db {} stop` (or embed \
-             through the daemon by dropping --endpoint/--local).",
-            path.display(),
-            path.display()
-        );
-    }
+    // The LOCK, not a pidfile read. This was
+    // `if daemon_process_running_for_db(path)` — a point-in-time check of a
+    // different file, followed by a write that can run for hours. CWE-367
+    // exactly, and MITRE's mitigation leads with the fix: "ensure that locking
+    // occurs before the check, as opposed to afterwards."
+    //
+    // The window here is not theoretical. Every `DaemonClient::connect`
+    // autostarts a daemon, so an ordinary `nestweaver search` in another
+    // terminal mid-embed hands the store to a second writer while this one is
+    // still rewriting `.embeddings.bin`. A pidfile also cannot survive PID
+    // reuse, and an operator's `rm` erases it; the database lock has neither
+    // hole.
+    require_exclusive_store_access(path, "embed directly")?;
 
     let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
         anyhow::anyhow!(
@@ -26002,27 +26102,45 @@ mod incumbent_displacement_tests {
 mod no_daemon_gate_tests {
     use super::*;
 
+    /// `CI` and `GITHUB_ACTIONS` must confer NOTHING.
+    ///
+    /// They used to permit the bypass, so an ambient variable set by dozens of
+    /// unrelated tools decided whether this database could have two writers.
+    /// `CI` is not ours: every provider sets it, so do many Docker images and
+    /// shell profiles, and developers set it locally to reproduce CI failures.
+    /// The canonical incident is Netlify beginning to set `CI=true` in 2020,
+    /// breaking thousands of Create React App builds overnight — for a
+    /// COSMETIC setting. This one decided writer exclusivity.
     #[test]
-    fn bypass_refused_outside_ci() {
-        // No opt-in, not GitHub Actions, and CI unset/falsey → refuse the bypass.
-        assert!(!no_daemon_allowed_from(false, false, None));
-        assert!(!no_daemon_allowed_from(false, false, Some("")));
-        assert!(!no_daemon_allowed_from(false, false, Some("0")));
-        assert!(!no_daemon_allowed_from(false, false, Some("false")));
-        assert!(!no_daemon_allowed_from(false, false, Some("False")));
-        assert!(!no_daemon_allowed_from(false, false, Some("  ")));
+    fn ci_environment_variables_confer_no_privileges() {
+        for ci in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("True"),
+            Some("1"),
+            Some("yes"),
+        ] {
+            assert!(
+                !no_daemon_allowed_from(false, false, ci),
+                "CI={ci:?} must not permit the bypass"
+            );
+            assert!(
+                !no_daemon_allowed_from(false, true, ci),
+                "GITHUB_ACTIONS must not permit the bypass either (CI={ci:?})"
+            );
+        }
     }
 
+    /// The explicit opt-in is the ONLY thing that still answers yes — and even
+    /// then it now means only "do not autostart a daemon". Correctness no
+    /// longer rests on this answer: `require_exclusive_store_access` takes the
+    /// lock at the moment of the write.
     #[test]
-    fn bypass_allowed_in_ci_or_with_optin() {
-        // Explicit local opt-in.
+    fn only_the_explicit_opt_in_permits_the_bypass() {
         assert!(no_daemon_allowed_from(true, false, None));
-        // GitHub Actions.
-        assert!(no_daemon_allowed_from(false, true, None));
-        // Generic CI truthy spellings.
-        assert!(no_daemon_allowed_from(false, false, Some("1")));
-        assert!(no_daemon_allowed_from(false, false, Some("true")));
-        assert!(no_daemon_allowed_from(false, false, Some("yes")));
+        assert!(no_daemon_allowed_from(true, true, Some("1")));
     }
 }
 
@@ -26173,6 +26291,74 @@ mod restore_guard_tests {
         std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
         ensure_no_live_daemon_for_restore(data_dir.path())
             .expect_err("garbage must still fail closed");
+    }
+}
+
+#[cfg(test)]
+mod store_access_guard_tests {
+    use super::*;
+
+    /// A database nothing holds is writable directly.
+    #[test]
+    fn an_unheld_database_permits_a_direct_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        drop(store);
+        require_exclusive_store_access(&db, "test")
+            .expect("nothing holds this database, so a direct write is allowed");
+    }
+
+    /// A HELD database refuses, and the refusal names the holder and a remedy
+    /// the caller can actually run.
+    ///
+    /// The previous design could not detect this at all: it asked whether an
+    /// env var permitted the bypass, which is not a question about whether
+    /// anyone is holding the database.
+    #[test]
+    fn a_held_database_refuses_and_names_the_holder_and_the_remedy() {
+        use nestweaver_daemon::lifecycle::DbWriteLock;
+        let db = std::path::Path::new("/tmp/brain.lbug");
+
+        let error =
+            exclusive_access_verdict(DbWriteLock::Held { pid: Some(4711) }, db, "index directly")
+                .expect_err("a held database must refuse a second writer");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("index directly"), "{rendered}");
+        assert!(
+            rendered.contains("4711"),
+            "the refusal must name the holder so the operator can find it: {rendered}"
+        );
+        assert!(rendered.contains("daemon"), "{rendered}");
+
+        // The kernel does not always name a holder. Still a refusal, and it
+        // must not imply it knows who.
+        let anonymous =
+            exclusive_access_verdict(DbWriteLock::Held { pid: None }, db, "index directly")
+                .expect_err("still held even when the kernel names nobody");
+        assert!(format!("{anonymous:#}").contains("another process"));
+    }
+
+    /// `Unknown` must fail CLOSED.
+    ///
+    /// A lock state that could not be read is not evidence of freedom, and the
+    /// cost of being wrong is two writers on a store that is not crash-safe.
+    /// `DbWriteLock`'s own doc says callers "must treat this as 'possibly
+    /// owned', never as free" — this holds us to it, and it is unreachable
+    /// through the real probe.
+    #[test]
+    fn an_unreadable_lock_state_fails_closed() {
+        use nestweaver_daemon::lifecycle::DbWriteLock;
+        let error = exclusive_access_verdict(
+            DbWriteLock::Unknown,
+            std::path::Path::new("/tmp/brain.lbug"),
+            "index directly",
+        )
+        .expect_err("an unreadable lock state must NOT be treated as free");
+        assert!(
+            format!("{error:#}").contains("NOT known to be free"),
+            "the refusal must say the state is UNKNOWN, not that it is held"
+        );
     }
 }
 
