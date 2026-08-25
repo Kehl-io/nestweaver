@@ -373,6 +373,23 @@ pub struct EmbedProgressSnapshot {
 /// Pure, so the decision is testable without a gRPC harness: the property worth
 /// pinning is "a failed flush cannot leave a positive success count", which
 /// belongs to the arithmetic rather than to any transport.
+/// Whether a `brain_memory_consolidate` request will actually move files.
+///
+/// Decides whether the call takes the write gate, so being wrong in either
+/// direction costs something: too eager and every dry-run preview queues behind
+/// in-flight writes; too lax and a file move runs unserialized against a backup
+/// or an index pass.
+///
+/// A body that will not parse counts as NOT applying — the dispatcher rejects
+/// it before anything reaches the filesystem, so gating on it would only slow a
+/// request that is already going to fail.
+fn request_is_applying(args_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args_json)
+        .ok()
+        .and_then(|args| args.get("apply").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn settle_embed_counts(succeeded: u32, failed: u32, flush_ok: bool) -> (u32, u32) {
     if flush_ok {
         return (succeeded, failed);
@@ -6495,10 +6512,46 @@ impl NestWeaverDaemon for DaemonService {
         json_rpc!(self, r, "brain_memory_lint")
     }
 
+    /// `apply: true` MOVES VAULT FILES — `fs::rename`, and a copy + `remove_file`
+    /// fallback across filesystems (see `brain_memory::memory_consolidate`).
+    ///
+    /// It is listed in `MUTATING_TOOLS`, so the `json_rpc!` macro already
+    /// required the admin token. What it did NOT get was the write gate:
+    /// `dispatch_json_tool` takes `ConnectionGuard::read`, so a memory
+    /// consolidation could move files concurrently with a backup staging those
+    /// same sidecars, an index pass, or a vault watcher — and, because
+    /// `active_writes` is the shutdown drain's exit condition and only
+    /// `ConnectionGuard::write` increments it, the drain could not see the
+    /// in-flight file moves either. Its fellow `MUTATING_TOOLS` entry
+    /// `set_extension` has taken both since it was written.
+    ///
+    /// Gated on `apply` rather than taken unconditionally. The default
+    /// (`apply: false`) is a pure dry-run that proposes and touches nothing;
+    /// making a preview queue behind the write gate — during a drain, for
+    /// minutes — would be a real regression for the common call, and this tool
+    /// is used mostly to look.
     async fn brain_memory_consolidate(
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
+        // Peek at `apply` before consuming the request. A malformed body is
+        // left to the dispatcher, which produces the standard
+        // `tool <name> failed:` error — treating it as "not applying" here is
+        // right, because a request that cannot be parsed will not move a file.
+        let applying = request_is_applying(&r.get_ref().args_json);
+
+        if !applying {
+            return json_rpc!(self, r, "brain_memory_consolidate");
+        }
+
+        // Guard BEFORE the gate, for the reason spelled out on `set_extension`:
+        // during a drain the gate is held for as long as the in-flight write
+        // runs, so taking it first means the caller waits minutes only to learn
+        // it was refused, and sees DEADLINE_EXCEEDED instead of the explanatory
+        // UNAVAILABLE.
+        let _guard = ConnectionGuard::write(&self.state)?;
+        let _write_lock = self.state.write_gate.lock("brain_memory_consolidate").await;
+
         json_rpc!(self, r, "brain_memory_consolidate")
     }
 
@@ -20115,6 +20168,39 @@ mod daemon_honesty_tests {
         assert_eq!(settle_embed_counts(4821, 0, true), (4821, 0));
         assert_eq!(settle_embed_counts(10, 3, true), (10, 3));
         assert_eq!(settle_embed_counts(0, 0, true), (0, 0));
+    }
+
+    /// `apply: true` moves vault files, so it must take the write gate. The
+    /// default must NOT, or every dry-run preview queues behind in-flight
+    /// writes — during a drain, for minutes.
+    #[test]
+    fn only_an_applying_consolidate_takes_the_write_gate() {
+        use super::request_is_applying;
+
+        assert!(request_is_applying(r#"{"apply": true}"#));
+        assert!(request_is_applying(r#"{"apply": true, "limit": 5}"#));
+
+        assert!(!request_is_applying(r#"{"apply": false}"#));
+        assert!(
+            !request_is_applying(r#"{}"#),
+            "omitted `apply` defaults to a dry run"
+        );
+        assert!(
+            !request_is_applying(r#"{"limit": 5}"#),
+            "an unrelated field must not be read as consent to move files"
+        );
+    }
+
+    /// A body that will not parse counts as NOT applying, and so does a
+    /// right-key-wrong-type value: only a real boolean `true` is consent.
+    #[test]
+    fn an_unparseable_body_does_not_take_the_write_gate() {
+        use super::request_is_applying;
+
+        assert!(!request_is_applying("not json at all"));
+        assert!(!request_is_applying(""));
+        assert!(!request_is_applying(r#"{"apply": "true"}"#));
+        assert!(!request_is_applying(r#"{"apply": 1}"#));
     }
 
     /// Saturating, not wrapping: an absurd count must not roll over into a
