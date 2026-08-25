@@ -535,6 +535,43 @@ fn check_parity_json_semantic(db_path: &Path, command: &str, args: &[&str]) {
 /// The default helper appends `--json` unconditionally; for a command that does
 /// not accept it, BOTH routes fail with an identical clap usage error and the
 /// byte comparison passes on two failures.
+/// Both routes must REFUSE the same way.
+///
+/// Distinct from [`check_parity`], which requires success. A refusal is a real
+/// contract too — "msgpack cannot represent the vault" must not depend on
+/// whether a daemon is running — but asserting it needs care, because "both
+/// failed identically" is exactly the hole that made every parity test vacuous
+/// before `assert_both_ran_for_real`.
+///
+/// The difference is that failure is EXPECTED here and checked: both must fail,
+/// with the same code, and each message must name `expected_reason`. A command
+/// that failed for an unrelated reason — a typo'd flag, a missing database —
+/// does not pass.
+fn check_parity_of_refusal(db_path: &Path, command: &str, args: &[&str], expected_reason: &str) {
+    let direct = run_direct(db_path, args);
+    let _guard = DaemonGuard::new(db_path);
+    start_daemon(db_path);
+    let daemon = run_via_daemon(db_path, args);
+
+    for (route, output) in [("direct", &direct), ("daemon", &daemon)] {
+        assert!(
+            !output.status.success(),
+            "{command} ({route}): expected a REFUSAL, but it succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            stderr.contains(&expected_reason.to_lowercase()),
+            "{command} ({route}): refused for the wrong reason — expected \
+             {expected_reason:?}, got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "{command}: the two routes refused with DIFFERENT exit codes"
+    );
+}
+
 fn check_parity_single_format(db_path: &Path, command: &str, args: &[&str]) {
     let direct = run_direct(db_path, args);
     let _guard = DaemonGuard::new(db_path);
@@ -1082,6 +1119,34 @@ fn parity_detect_changes_direct_vs_daemon() {
 // asserted nothing about the four nw-188 honesty fields it was written for.
 // Re-add it with a fixture that materializes a project; a vacuous test is
 // worse than a missing one because it reports coverage that does not exist.
+
+/// msgpack must honour `--scope` on BOTH routes.
+///
+/// Direct mode handled msgpack BEFORE parsing `--scope`, so `--scope vault`
+/// produced a code-only file and reported success, and an INVALID scope
+/// succeeded too — the parse that would have rejected it never ran. The daemon
+/// route rejected vault. Two routes, two answers, for a flag that is supposed
+/// to mean one thing.
+#[test]
+fn parity_msgpack_scope_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    // A scope msgpack CANNOT satisfy must be refused identically, and for the
+    // stated reason — not merely fail.
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "export msgpack --scope vault",
+        &["export", "--format", "msgpack", "--scope", "vault"],
+        "code-only",
+    );
+    // An INVALID scope must fail on both, not slip through whichever route
+    // happens to dispatch on format first.
+    check_parity_of_refusal(
+        &fixture.db_path,
+        "export msgpack --scope nonsense",
+        &["export", "--format", "msgpack", "--scope", "nonsense"],
+        "unknown export scope",
+    );
+}
 
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
