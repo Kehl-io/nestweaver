@@ -417,7 +417,11 @@ mod counted_symbol_search_tests {
 // ── Context command types ─────────────────────────────────────────────────────
 
 /// A single node returned by `build_context`.
-#[derive(Debug, Serialize)]
+// Deserialize so the daemon's `code_context` reply round-trips back into the
+// same type the direct path builds, and BOTH render through one function.
+// Without it the two routes would need separate renderers, which is how
+// `context` came to mean different things on different transports.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContextNode {
     pub uid: String,
     pub name: String,
@@ -429,7 +433,11 @@ pub struct ContextNode {
 }
 
 /// A cross-repo relationship surfaced during context building.
-#[derive(Debug, Serialize)]
+// Deserialize so the daemon's `code_context` reply round-trips back into the
+// same type the direct path builds, and BOTH render through one function.
+// Without it the two routes would need separate renderers, which is how
+// `context` came to mean different things on different transports.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CrossRepoLink {
     pub package: String,
     pub link_type: String,
@@ -437,7 +445,11 @@ pub struct CrossRepoLink {
 }
 
 /// The full result returned by `build_context`.
-#[derive(Debug, Serialize)]
+// Deserialize so the daemon's `code_context` reply round-trips back into the
+// same type the direct path builds, and BOTH render through one function.
+// Without it the two routes would need separate renderers, which is how
+// `context` came to mean different things on different transports.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContextResult {
     pub seeds: Vec<ContextNode>,
     pub connected: Vec<ContextNode>,

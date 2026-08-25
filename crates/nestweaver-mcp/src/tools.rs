@@ -192,6 +192,7 @@ fn all_tool_schemas() -> Vec<Value> {
 fn all_tool_schemas_undecorated() -> Vec<Value> {
     vec![
         tool_schema_brain_context(),
+        tool_schema_code_context(),
         tool_schema_brain_search(),
         tool_schema_note_get(),
         tool_schema_backlinks(),
@@ -530,7 +531,7 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
-    fn registry_contains_exactly_the_41_advertised_unique_names() {
+    fn registry_contains_exactly_the_42_advertised_unique_names() {
         let expected: BTreeSet<&str> = [
             "affected_tests",
             "backlinks",
@@ -538,6 +539,7 @@ mod tool_schema_validation_tests {
             "brain_add_source",
             "brain_broken_links",
             "brain_context",
+            "code_context",
             "brain_diff",
             "brain_doc_stats",
             "brain_guide",
@@ -580,8 +582,8 @@ mod tool_schema_validation_tests {
         let schemas = all_tool_schemas();
         assert_eq!(
             schemas.len(),
-            41,
-            "registry must contain exactly 41 schemas"
+            42,
+            "registry must contain exactly 42 schemas"
         );
         let names: BTreeSet<&str> = schemas
             .iter()
@@ -866,7 +868,7 @@ mod tool_schema_validation_tests {
 
     /// nw-175. EVERY registered tool must reject unknown argument names.
     ///
-    /// Only 11 of 41 did. The consequence is not cosmetic: a mistyped argument
+    /// Only 11 of 42 did. The consequence is not cosmetic: a mistyped argument
     /// was silently dropped and the handler used its default, so the caller got
     /// a plausible answer to a question they did not ask. That exact failure
     /// was hit twice in one review round — `flow_trace` accepting `max_dpeth`
@@ -1031,7 +1033,8 @@ mod tool_schema_validation_tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 35);
+        // 42 registered minus the mutating tools direct read-only hides.
+        assert_eq!(names.len(), 36);
         for mutator in crate::http::MUTATING_TOOLS {
             assert!(!names.contains(mutator), "direct mode advertised {mutator}");
             let error = dispatch(&store, None, mutator, json!({}), None)
@@ -1451,6 +1454,7 @@ mod tool_schema_validation_tests {
 pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
     let categories: &[(&str, &str)] = &[
         ("brain_context", "Core retrieval"),
+        ("code_context", "Core retrieval"),
         ("brain_search", "Core retrieval"),
         ("note_get", "Core retrieval"),
         ("backlinks", "Core retrieval"),
@@ -1735,6 +1739,7 @@ fn dispatch_uncached(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
+        "code_context" => tool_code_context(store, args),
         "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -3188,6 +3193,34 @@ fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
 
 // ── 1. brain_context ────────────────────────────────────────────────────────
 
+fn tool_schema_code_context() -> Value {
+    json!({
+        "name": "code_context",
+        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names or `sym:` UIDs\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seeds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Symbol names or `sym:` UIDs to seed the traversal."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum connected symbols to return. Omit for no cap, which is what the CLI does when --limit is absent."
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
+                }
+            },
+            "required": ["seeds"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
@@ -3302,6 +3335,74 @@ fn tool_schema_brain_context() -> Value {
             "required": ["seeds"]
         }
     })
+}
+
+/// `code_context` — the CODE-only structural subgraph around seed symbols.
+///
+/// Distinct from `brain_context`, and the distinction is the whole point.
+/// `brain_context` runs a HYBRID over code and notes with taxonomy-alias seed
+/// resolution; this runs PPR over the symbol graph alone.
+///
+/// It exists because `nestweaver context` had no RPC of its own. Its daemon
+/// route sent `brain_context`, while its direct path called
+/// `build_context_with_intent` — so one command ran a different algorithm over
+/// a different node set depending on whether a daemon happened to be running,
+/// and the relevance numbers differed for the same query. The command's own
+/// help says "structural subgraph around seed symbols", so the direct path was
+/// the correct one and the daemon route was silently substituting a different
+/// capability.
+fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let seeds: Vec<String> = args
+        .get("seeds")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if seeds.is_empty() {
+        anyhow::bail!("code_context requires at least one seed");
+    }
+    // `Option<usize>`, matching the engine: absent means "no cap", which is
+    // what the CLI passes when `--limit` is omitted. Defaulting to a number
+    // here would silently truncate a route the direct path does not.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let intent = args
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<nestweaver_store::ranking::QueryIntent>()
+                .map_err(|error| anyhow::anyhow!("invalid intent: {error}"))
+        })
+        .transpose()?;
+
+    let result = nestweaver_engine::build_context_with_intent(store, &seeds, intent, limit)?;
+
+    let render = |node: &nestweaver_engine::ContextNode| {
+        json!({
+            "uid": node.uid,
+            "name": node.name,
+            "kind": node.kind,
+            "file_path": node.file_path,
+            "start_line": node.start_line,
+            "signature": node.signature,
+            "relevance": node.relevance,
+        })
+    };
+    Ok(json!({
+        "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
+        "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
+        "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
+        "seeds_resolved": result.seeds.len(),
+        "connected_count": result.connected.len(),
+    }))
 }
 
 fn tool_brain_context(

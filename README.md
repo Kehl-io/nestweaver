@@ -61,7 +61,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 </td>
 <td width="50%" valign="top">
 
-**41-Tool MCP Server**<br>
+**42-Tool MCP Server**<br>
 Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
@@ -345,7 +345,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (41 tools, or 6 in lite mode; auto-starts daemon) |
+| `mcp` | Start the MCP server (42 tools, or 6 in lite mode; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
 | `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
 | `server` | Server management utilities (`init-tls`, `backup`, `status`) |
@@ -645,7 +645,7 @@ CLI commands (`search`, `brain search`, `brain context`) also respect this setti
 
 ## MCP Server
 
-NestWeaver exposes 41 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes 42 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
@@ -654,7 +654,7 @@ NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug   # rea
 ```
 
 Direct mode advertises 35 read-only tools and rejects mutations before
-dispatch. Daemon-backed stdio exposes all 41 tools. `--tools` names are exact,
+dispatch. Daemon-backed stdio exposes all 42 tools. `--tools` names are exact,
 case-sensitive registry names; unknown, duplicate, empty, or transport-
 unavailable names fail at startup instead of silently producing an empty tool
 surface.
@@ -667,7 +667,7 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 pgrep -af "nestweaver daemon"                     # find running daemons (Linux)
 ```
 
-41 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.
+42 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.
 
 ### Key capabilities
 
