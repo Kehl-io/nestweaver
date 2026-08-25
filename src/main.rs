@@ -4269,13 +4269,25 @@ enum BrainCommands {
     Remove {
         /// Vault directory path (the same path passed to `brain add`).
         path: PathBuf,
-        #[arg(long, help = "Instance ID [default: default]")]
+        #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        // `brain add` and `brain refresh` have always taken this; `brain
+        // remove` never did. The documented split-graph recovery is
+        // `brain remove <path> --instance <wrong-id>` then
+        // `brain add <path> --config …` — but pinning the config on the
+        // REMOVE half was rejected as an unknown argument, so the command
+        // silently targeted instance "default" and ./nestweaver.lbug: the
+        // exact state that procedure exists to repair.
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — uses its instance_id and db field"
+        )]
+        config: Option<PathBuf>,
     },
     /// Rebuild the Tantivy BM25 search index from the current graph
     /// state. Use after a fresh `brain add`, or to recover from an
@@ -19689,10 +19701,20 @@ fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
 
-        BrainCommands::Remove { path, instance, db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
-            let instance_specified = instance.is_some();
-            let instance_id = instance.as_deref().unwrap_or("default");
+        BrainCommands::Remove {
+            path,
+            instance,
+            db,
+            config,
+        } => {
+            // The SAME two helpers `brain add` and `brain refresh` use, so all
+            // three resolve a pinned config identically. Hand-rolling
+            // `db.unwrap_or_else(default_db_path)` and `unwrap_or("default")`
+            // here is what made this command ignore a config its siblings honour.
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let instance_specified = instance.is_some() || config.is_some();
+            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id = instance_id_owned.as_str();
 
             let canonical = abs_for_daemon(&path);
             let canon_str = canonical.to_string_lossy();
@@ -19707,17 +19729,33 @@ fn run_brain(
                     if let Some(inst) = inst_filter {
                         args["instance"] = serde_json::json!(inst);
                     }
-                    if let Some(value) =
-                        try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)?
-                    {
-                        Ok(
-                            serde_json::from_value(unwrap_hybrid_payload(value))
-                                .unwrap_or_default(),
-                        )
-                    } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
-                        Ok(store.list_vaults(inst_filter).unwrap_or_default())
+                    if let Some(value) = try_hybrid_json_rpc(
+                        use_daemon,
+                        &db_path,
+                        config.as_deref(),
+                        "list_vaults",
+                        args,
+                    )? {
+                        // Was `.unwrap_or_default()`. This list decides WHICH
+                        // vault gets removed, so a decode failure turning into
+                        // an empty list means the command reports "no vault
+                        // found" and exits successfully, having done nothing —
+                        // for a destructive command, silently doing nothing on
+                        // an error is its own kind of wrong answer.
+                        serde_json::from_value(unwrap_hybrid_payload(value))
+                            .context("decode vault list from daemon")
                     } else {
-                        Ok(Vec::new())
+                        // The guard every other fallback site in this file
+                        // takes, and it matters more here now that this command
+                        // accepts `--config`: the direct store cannot honour a
+                        // pinned config, so falling back would silently target
+                        // a different instance than the one the caller named —
+                        // the precise failure `brain remove` is used to repair.
+                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())?;
+                        let store = GraphStore::open_read_only(&db_path).with_context(|| {
+                            format!("open {} to list vaults", db_path.display())
+                        })?;
+                        store.list_vaults(inst_filter).map_err(Into::into)
                     }
                 };
 
@@ -19828,12 +19866,41 @@ fn run_brain(
                     }
                 }
             }
-            println!(
-                "Removed vault '{}' ({} note(s) dropped, {} row(s) cleaned). \
-                 Tantivy + PPR sidecars may be stale; run \
-                 `nestweaver brain reindex-search` if you want to clear them too.",
-                vault_name, total_dropped, rows_cleaned
-            );
+            // `brain add` and `brain refresh` both rebuild Tantivy after
+            // mutating vault notes; this command only printed that the index
+            // "may be stale" and left it to the user. The asymmetry matters
+            // more here than on the other two: a stale index after an ADD
+            // merely MISSES new notes, while a stale index after a REMOVE
+            // keeps RETURNING notes from a vault the user deliberately
+            // dropped. Wrong answers, not missing ones.
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let reindex = TantivyIndex::open_or_create(&tantivy_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|tantivy| {
+                    let store_for_tantivy = open_store(Some(&db_path))?;
+                    tantivy
+                        .reindex_from_store(&store_for_tantivy)
+                        .map_err(anyhow::Error::from)
+                });
+
+            match reindex {
+                Ok(count) => println!(
+                    "Removed vault '{vault_name}' ({total_dropped} note(s) dropped, \
+                     {rows_cleaned} row(s) cleaned). Search index rebuilt \
+                     ({count} document(s))."
+                ),
+                // Named in the OUTPUT, not just the log. The removal itself
+                // succeeded and is not being rolled back, so the exit code
+                // stays 0 — but the user has to be told that search will keep
+                // answering with the vault they just removed until they act.
+                Err(error) => println!(
+                    "Removed vault '{vault_name}' ({total_dropped} note(s) dropped, \
+                     {rows_cleaned} row(s) cleaned).\n\
+                     WARNING: the search index could NOT be rebuilt ({error:#}), so \
+                     `brain search` will keep returning notes from this vault. Run \
+                     `nestweaver brain reindex-search` to clear them."
+                ),
+            }
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -21583,6 +21650,14 @@ mod cli_help_contract_tests {
             "nestweaver brain doc-stats",
             "nestweaver brain orphans",
             "nestweaver brain refresh",
+            // nw-217 A4: added deliberately. `brain remove` is a vault command
+            // like `add` and `refresh`, and the documented split-graph recovery
+            // pins --config on all three. It resolves the pair through the same
+            // `resolve_db_with_config` / `resolve_instance_id` helpers its two
+            // siblings use, so it inherits their behaviour rather than an
+            // unrelated fallback — which is what this inventory exists to force
+            // a decision about.
+            "nestweaver brain remove",
             "nestweaver brain search",
             "nestweaver brain status",
             "nestweaver brain tag-graph",
@@ -30690,6 +30765,81 @@ mod embed_metadata_truth_tests {
         assert_eq!(
             recorded_metadata(&db_path),
             Some(("external-model-a".to_string(), 3)),
+        );
+    }
+}
+
+/// nw-217 A4: the three vault commands must agree on how a config is pinned.
+///
+/// `brain add` and `brain refresh` have always taken `--config`; `brain remove`
+/// did not. CLAUDE.md's documented split-graph recovery is
+/// `brain remove <path> --instance <wrong-id>` followed by
+/// `brain add <path> --config …`, and the vault guide tells you to pin the
+/// config on EVERY vault command. Pinning it on the remove half was rejected as
+/// an unknown argument, so the command silently targeted instance "default" and
+/// `./nestweaver.lbug` — the exact state that procedure exists to repair.
+#[cfg(test)]
+mod vault_command_config_parity_tests {
+    use super::*;
+
+    /// Runs on a big stack: `Cli::try_parse_from` walks the whole 40+ command
+    /// tree and overflows the default 2 MiB test thread.
+    fn parse(args: Vec<String>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn every_vault_command_accepts_a_pinned_config() {
+        for subcommand in ["add", "refresh", "remove"] {
+            let args = argv(&[
+                "nestweaver",
+                "brain",
+                subcommand,
+                "/tmp/v",
+                "--config",
+                "i.toml",
+            ]);
+            assert!(
+                parse(args).is_ok(),
+                "`brain {subcommand}` must accept --config; the vault guide says to \
+                 pin it on every vault command, and a command that REJECTS it \
+                 silently targets the default instance instead"
+            );
+        }
+    }
+
+    /// The value must actually reach the command, not merely parse. A flag
+    /// accepted and dropped would pass the test above while changing nothing.
+    #[test]
+    fn brain_remove_carries_the_config_through_to_the_command() {
+        let cli = parse(argv(&[
+            "nestweaver",
+            "brain",
+            "remove",
+            "/tmp/vault",
+            "--config",
+            "/etc/nestweaver/instance.toml",
+        ]))
+        .expect("must parse");
+
+        let Commands::Brain { command } = cli.command else {
+            panic!("expected `brain`");
+        };
+        let BrainCommands::Remove { config, .. } = *command else {
+            panic!("expected `brain remove`");
+        };
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("/etc/nestweaver/instance.toml"))
         );
     }
 }
