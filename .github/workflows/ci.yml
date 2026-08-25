@@ -6,6 +6,23 @@ on:
   pull_request:
     branches: [main, staging]
 
+# Cancel a PR's earlier run when a new commit supersedes it.
+#
+# There was no concurrency group at all, so every push to a branch left its
+# previous run going: a full matrix — Build & Tests ~1h, Daemon Integration
+# ~55m, E2E ~50m, Cold Metal ~43m, mutants ~45m — computing an answer about
+# a commit nobody would look at again. With one shared runner pool that is not
+# just waste, it is HEAD-OF-LINE BLOCKING: those obsolete jobs sit in front of
+# every other PR's real work, which is why runs queued for over an hour while
+# several PRs were open.
+#
+# `cancel-in-progress` is deliberately scoped to pull_request. A push to main
+# must NEVER be cancelled — release-please and the publish flow run there, and
+# cancelling one mid-flight would leave a release half-cut.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -625,7 +642,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: mutants
+          # Share the `build` cache the other Rust jobs populate, instead of a
+          # private key that starts cold on every PR. This job is ADVISORY, and
+          # it was spending most of its ~45m rebuilding a workspace three other
+          # jobs had already built. `save-if: false` so an advisory job never
+          # writes over the cache the gating jobs depend on.
+          shared-key: build
+          save-if: false
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install cargo-mutants
