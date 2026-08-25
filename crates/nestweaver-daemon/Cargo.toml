@@ -57,4 +57,10 @@ tokenizers = "0.23"
 
 [features]
 embed = ["dep:nestweaver-embed", "nestweaver-engine/embed", "nestweaver-mcp/embed"]
+# Metal passthrough, for the same reason `acme` has one below: without it,
+# `-p nestweaver-daemon --features metal` is an error, so the Metal CI job had
+# to test the daemon with a DIFFERENT feature set than it shipped — which
+# rebuilt the whole candle stack and meant the tested binary was not the one
+# the smoke test then ran.
+metal = ["nestweaver-embed?/metal"]
 acme = ["dep:tokio-rustls-acme", "dep:async-trait"]
