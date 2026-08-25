@@ -451,6 +451,57 @@ pub fn concat_fanout(local: &Value, server: &Value) -> Value {
 /// Merge two JSON responses, preserving structured schemas (e.g. brain_context's
 /// `{ seeds, connected, unresolved_seeds, expansion_terms }`) when detected.
 /// Falls back to flat `{ results: [...] }` envelope for non-structured responses.
+/// Union of both tiers' `cross_repo_links`, deduplicated on (package, link_type).
+///
+/// Where both tiers report the same link, the higher `confidence` wins: they are
+/// two independent estimates of one fact, not two facts.
+fn merge_cross_repo_links(local: &Value, server: &Value) -> Vec<Value> {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut best: HashMap<(String, String), Value> = HashMap::new();
+
+    for tier in [local, server] {
+        let Some(links) = tier.get("cross_repo_links").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for link in links {
+            let key = (
+                link.get("package")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                link.get("link_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let confidence = link
+                .get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            match best.get(&key) {
+                Some(existing) => {
+                    let existing_confidence = existing
+                        .get("confidence")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                    if confidence > existing_confidence {
+                        best.insert(key, link.clone());
+                    }
+                }
+                None => {
+                    order.push(key.clone());
+                    best.insert(key, link.clone());
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| best.remove(&key))
+        .collect()
+}
+
 pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
     let local_connected = local.get("connected").and_then(|v| v.as_array());
     let server_connected = server.get("connected").and_then(|v| v.as_array());
@@ -533,6 +584,40 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             if let Some(val) = local.get(key) {
                 result[key] = val.clone();
             }
+        }
+
+        // `cross_repo_links` is a UNION, not a local-only copy: an upstream tier
+        // sees links a local graph cannot. Dropping it entirely — which this
+        // rebuilt envelope did — is worse than either, because
+        // `ContextResult::cross_repo_links` is a REQUIRED field, so the CLI's
+        // `serde_json::from_value` failed outright the moment both tiers
+        // answered. `nestweaver context` was broken for anyone with an upstream
+        // configured, and only for them.
+        //
+        // Deduplicated on (package, link_type) keeping the HIGHER confidence:
+        // the same dependency seen by both tiers is one link, and the stronger
+        // of two independent estimates is the better one to report.
+        let merged_links = merge_cross_repo_links(local, server);
+        if !merged_links.is_empty() {
+            result["cross_repo_links"] = Value::Array(merged_links);
+        } else if local.get("cross_repo_links").is_some()
+            || server.get("cross_repo_links").is_some()
+        {
+            // Present-but-empty is not the same as absent to a required field.
+            result["cross_repo_links"] = Value::Array(Vec::new());
+        }
+
+        // RECOMPUTED from the merged payload, never summed. `rrf_merge`
+        // deduplicates, so `local + server` overcounts by exactly the overlap —
+        // and these two describe the arrays the caller is holding, unlike the
+        // additive accounting above which describes work done by each tier.
+        if local.get("seeds_resolved").is_some() || server.get("seeds_resolved").is_some() {
+            let seeds_len = result["seeds"].as_array().map_or(0, Vec::len);
+            result["seeds_resolved"] = Value::from(seeds_len);
+        }
+        if local.get("connected_count").is_some() || server.get("connected_count").is_some() {
+            let connected_len = result["connected"].as_array().map_or(0, Vec::len);
+            result["connected_count"] = Value::from(connected_len);
         }
         // This envelope is rebuilt key by key above, so anything not re-added
         // here is silently dropped. `semantic_applied` / `degraded_components`
@@ -676,6 +761,137 @@ mod tests {
         let l2 = json!({ "results": [], "truncated": false });
         let s2 = json!({ "results": [], "truncated": false });
         assert_eq!(concat_fanout(&l2, &s2)["truncated"], json!(false));
+    }
+
+    /// `nestweaver context` was BROKEN for anyone with an upstream configured.
+    /// `merge_structured_results` rebuilds its envelope key by key, and
+    /// `cross_repo_links` was not among the keys re-added — but it is a
+    /// REQUIRED field of `ContextResult`, so the CLI's `serde_json::from_value`
+    /// failed outright the moment both tiers answered. Single-tier users never
+    /// saw it, because the merge path is only taken when both succeed.
+    #[test]
+    fn cross_repo_links_survive_a_two_tier_merge() {
+        let local = serde_json::json!({
+            "seeds": [], "connected": [],
+            "cross_repo_links": [{ "package": "serde", "link_type": "dependency", "confidence": 0.5 }],
+        });
+        let server = serde_json::json!({
+            "seeds": [], "connected": [],
+            "cross_repo_links": [{ "package": "tokio", "link_type": "dependency", "confidence": 0.9 }],
+        });
+
+        let merged = merge_structured_results(&local, &server);
+        let links = merged["cross_repo_links"]
+            .as_array()
+            .expect("must be present");
+
+        assert_eq!(links.len(), 2, "the union of both tiers, got {links:?}");
+        let packages: Vec<&str> = links
+            .iter()
+            .filter_map(|l| l.get("package").and_then(|v| v.as_str()))
+            .collect();
+        assert!(packages.contains(&"serde") && packages.contains(&"tokio"));
+    }
+
+    /// The same dependency seen by both tiers is ONE link, and the stronger of
+    /// two independent estimates is the better one to report. Without this, a
+    /// federated caller sees every shared dependency twice.
+    #[test]
+    fn a_link_both_tiers_report_is_deduplicated_at_the_higher_confidence() {
+        let local = serde_json::json!({
+            "seeds": [], "connected": [],
+            "cross_repo_links": [{ "package": "serde", "link_type": "dependency", "confidence": 0.4 }],
+        });
+        let server = serde_json::json!({
+            "seeds": [], "connected": [],
+            "cross_repo_links": [{ "package": "serde", "link_type": "dependency", "confidence": 0.8 }],
+        });
+
+        let merged = merge_structured_results(&local, &server);
+        let links = merged["cross_repo_links"].as_array().unwrap();
+
+        assert_eq!(links.len(), 1, "one dependency, one link");
+        assert_eq!(links[0]["confidence"], serde_json::json!(0.8));
+    }
+
+    /// Present-but-empty is not the same as absent to a required field.
+    #[test]
+    fn an_empty_cross_repo_links_stays_present_rather_than_vanishing() {
+        let local = serde_json::json!({ "seeds": [], "connected": [], "cross_repo_links": [] });
+        let server = serde_json::json!({ "seeds": [], "connected": [], "cross_repo_links": [] });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert_eq!(merged["cross_repo_links"], serde_json::json!([]));
+    }
+
+    /// `rrf_merge` DEDUPLICATES, so summing the tiers overcounts by exactly the
+    /// overlap. These two describe the arrays the caller is holding, unlike the
+    /// additive token accounting, which describes work each tier did.
+    #[test]
+    fn counts_describe_the_merged_payload_not_the_sum_of_tiers() {
+        let node = |uid: &str| serde_json::json!({ "uid": uid, "name": uid, "relevance": 1.0 });
+        let local = serde_json::json!({
+            "seeds": [node("sym:a")],
+            "connected": [node("sym:shared"), node("sym:local_only")],
+            "connected_count": 2, "seeds_resolved": 1,
+        });
+        let server = serde_json::json!({
+            "seeds": [],
+            "connected": [node("sym:shared")],
+            "connected_count": 1, "seeds_resolved": 0,
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        let actual = merged["connected"].as_array().unwrap().len();
+        assert_eq!(
+            merged["connected_count"].as_u64().unwrap() as usize,
+            actual,
+            "connected_count must equal the array it describes, not 2 + 1"
+        );
+        assert_eq!(
+            merged["seeds_resolved"].as_u64().unwrap() as usize,
+            merged["seeds"].as_array().unwrap().len()
+        );
+    }
+
+    /// The CLASS guard, not the instance. This envelope is rebuilt key by key,
+    /// so any field a tool adds later is dropped SILENTLY — which is exactly how
+    /// `cross_repo_links` broke `nestweaver context` without a single test
+    /// noticing. A new key must either survive the merge or be added to the
+    /// intentionally-dropped list here, deliberately and with a reason.
+    #[test]
+    fn no_local_field_is_dropped_without_being_declared_intentional() {
+        // Per-tier bookkeeping that is meaningless after a merge.
+        const INTENTIONALLY_DROPPED: &[&str] = &["_meta"];
+
+        let local = serde_json::json!({
+            "seeds": [], "connected": [], "cross_repo_links": [],
+            "unresolved_seeds": ["ghost"], "expansion_terms": ["term"],
+            "seeds_expanded": 1, "tokens_used": 10, "token_budget": 100,
+            "project": "p", "project_uid": "proj:p", "external_refs": [],
+            "seeds_resolved": 0, "connected_count": 0,
+            "semantic_applied": true, "degraded_components": [],
+            "_meta": { "sources": ["local"] },
+        });
+        let server = serde_json::json!({ "seeds": [], "connected": [] });
+
+        let merged = merge_structured_results(&local, &server);
+
+        let dropped: Vec<&String> = local
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !INTENTIONALLY_DROPPED.contains(&key.as_str()))
+            .filter(|key| merged.get(key.as_str()).is_none())
+            .collect();
+
+        assert!(
+            dropped.is_empty(),
+            "these fields vanished in the merge: {dropped:?} — carry them through \
+             merge_structured_results, or add them to INTENTIONALLY_DROPPED with a reason"
+        );
     }
 
     #[test]

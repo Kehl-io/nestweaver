@@ -9927,7 +9927,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(result) => Ok(result),
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    build_context_with_intent(&store, &seeds, parsed_intent, limit)
+                    // The SAME default the `code_context` tool applies. A cap on
+                    // one route only is how these two drifted apart before.
+                    let effective = limit.unwrap_or(nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT);
+                    build_context_with_intent(&store, &seeds, parsed_intent, Some(effective))
                 }
             };
             match built {

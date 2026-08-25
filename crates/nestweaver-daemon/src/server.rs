@@ -1834,7 +1834,21 @@ impl DaemonService {
                 let effective_limit = state
                     .safeguards
                     .effective_result_limit(&tool_name, client_limit);
-                if args.get("limit").is_some() {
+                // Written back UNCONDITIONALLY. Guarding on `args.get("limit")`
+                // meant `effective_result_limit`'s `None => default` arm was
+                // computed and thrown away: a caller that simply omitted the
+                // field escaped the configured cap entirely, so the safeguard
+                // was advertised and inert. Only tools with a configured
+                // default are touched — `effective_result_limit` falls back to
+                // 100 otherwise, so restrict this to tools that opted in, or a
+                // tool that legitimately returns everything would start
+                // truncating at a number nobody chose for it.
+                if args.get("limit").is_some()
+                    || state
+                        .safeguards
+                        .default_result_limits
+                        .contains_key(&tool_name)
+                {
                     args["limit"] = serde_json::json!(effective_limit);
                 }
                 Some(dr)
