@@ -13590,6 +13590,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             edge_type: &'a str,
                             confidence: f32,
                             depth: u32,
+                            // The daemon path emits this and the tool
+                            // description names it as the sort key ("results
+                            // sorted by impact_score, highest risk first"), so
+                            // a caller told to rank by it got nothing to rank
+                            // by on the direct path.
+                            impact_score: f64,
                         }
                         let json_nodes: Vec<_> = nodes
                             .iter()
@@ -13601,6 +13607,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 edge_type: &n.edge_type,
                                 confidence: n.confidence,
                                 depth: n.depth,
+                                impact_score: n.impact_score,
                             })
                             .collect();
                         let note = truncated.then(|| {
@@ -13615,8 +13622,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
-                                None,
-                                None,
+                                // `total` is the RESULT-SET size, matching the
+                                // daemon, which computes `nodes.len()` after
+                                // its visibility retain and regardless of
+                                // truncation. The truncation flags carry the
+                                // "this set is a FLOOR" meaning; `total` does
+                                // not.
+                                //
+                                // An earlier version of this emitted `None`
+                                // when truncated, reasoning that the
+                                // PRE-truncation universe is unknown here. True
+                                // but irrelevant — that is a different
+                                // quantity than the one the daemon reports
+                                // under the same key, so it reintroduced the
+                                // divergence it was meant to close, in the one
+                                // case the happy-path parity fixture cannot
+                                // reach.
+                                Some(json_nodes.len() as u64),
+                                Some(json_nodes.len() as u64),
                                 note,
                             ))?
                         );
