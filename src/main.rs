@@ -8808,54 +8808,41 @@ fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: b
 /// modifications through a single API server process"). Elasticsearch shipped
 /// a gated multi-writer escape hatch (`node.max_local_storage_nodes`) and
 /// removed it in 8.0.
+#[must_use = "the lease must be HELD for the duration of the write; dropping it \
+              immediately reduces this to a probe, which is the check-then-act \
+              race it exists to remove"]
 fn require_exclusive_store_access(
     db_path: &std::path::Path,
     operation: &str,
-) -> anyhow::Result<()> {
-    exclusive_access_verdict(
-        nestweaver_daemon::lifecycle::db_write_lock(db_path),
-        db_path,
-        operation,
-    )
-}
+) -> anyhow::Result<nestweaver_daemon::lifecycle::DbWriteLease> {
+    use nestweaver_daemon::lifecycle::WriteLeaseError;
 
-/// The decision `require_exclusive_store_access` makes, separated from the
-/// probe that feeds it.
-///
-/// Split out because `fcntl` locks are held per-PROCESS: a handle open in the
-/// CALLING process reports as free, so a unit test cannot manufacture a `Held`
-/// by opening the store itself. That is correct POSIX behaviour, and exactly
-/// why the concern is a DIFFERENT process — but it leaves the interesting
-/// branches unreachable from any test that goes through the probe. Testing the
-/// verdict directly covers all three, including the fail-closed `Unknown` that
-/// nothing could otherwise reach.
-fn exclusive_access_verdict(
-    lock: nestweaver_daemon::lifecycle::DbWriteLock,
-    db_path: &std::path::Path,
-    operation: &str,
-) -> anyhow::Result<()> {
-    use nestweaver_daemon::lifecycle::DbWriteLock;
-    match lock {
-        DbWriteLock::Free => Ok(()),
-        DbWriteLock::Held { pid } => {
-            let holder = match pid {
-                Some(pid) => format!("process {pid}"),
-                None => "another process (the kernel named no holder)".to_string(),
+    match nestweaver_daemon::lifecycle::acquire_db_write_lease(db_path) {
+        Ok(lease) => Ok(lease),
+        Err(WriteLeaseError::Held) => {
+            // The lease says someone holds it; the PROBE can often say who,
+            // which is the difference between an actionable message and a
+            // shrug. Probe failure is not fatal here — the lease already
+            // answered the question that matters.
+            let holder = match nestweaver_daemon::lifecycle::db_write_lock(db_path) {
+                nestweaver_daemon::lifecycle::DbWriteLock::Held { pid: Some(pid) } => {
+                    format!("process {pid}")
+                }
+                _ => "another process".to_string(),
             };
             anyhow::bail!(
-                "cannot {operation} directly: {holder} holds the database at {}.\n\
+                "cannot {operation} directly: {holder} holds the write lease for {}.\n\
                  Route through the daemon (drop --no-daemon), or stop the holder first with \
                  `nestweaver daemon --db {} stop`.",
                 db_path.display(),
                 db_path.display()
             )
         }
-        DbWriteLock::Unknown => anyhow::bail!(
-            "cannot {operation} directly: the write-lock state of {} could not be read, so it \
-             is NOT known to be free.\n\
+        Err(WriteLeaseError::Unavailable(error)) => anyhow::bail!(
+            "cannot {operation} directly: the write lease for {} could not be taken \
+             ({error}), so exclusivity is NOT established.\n\
              Refusing rather than risking a second writer against a store that is not \
-             crash-safe. Route through the daemon, or investigate the database file's \
-             permissions.",
+             crash-safe.",
             db_path.display()
         ),
     }
@@ -14820,7 +14807,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // activity, cochange, and the trigram index below. None of that
             // checked whether a daemon already held the database; the only
             // gate was an env var answered long before this point.
-            require_exclusive_store_access(&db_path, "index directly")?;
+            // BOUND, not discarded: the lease must outlive the whole index — graph,
+            // filemeta, resolution deps, parsed cache, pagerank, git activity,
+            // cochange and the trigram rebuild below. Dropping it here would
+            // make this a probe again.
+            let _write_lease = require_exclusive_store_access(&db_path, "index directly")?;
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
@@ -18245,7 +18236,7 @@ fn run_brain(
             // Direct-write fallback (`--no-daemon`). It writes the graph and
             // the Tantivy index; neither checked for a live daemon holding the
             // same database.
-            require_exclusive_store_access(&db_path, "add a vault directly")?;
+            let _write_lease = require_exclusive_store_access(&db_path, "add a vault directly")?;
             let result = index_markdown_directory_with_ignore(
                 &path,
                 &db_path,
@@ -19499,7 +19490,8 @@ fn run_brain(
 
             // Both refresh arms below write the graph and rebuild Tantivy on
             // the direct path.
-            require_exclusive_store_access(&db_path, "refresh a vault directly")?;
+            let _write_lease =
+                require_exclusive_store_access(&db_path, "refresh a vault directly")?;
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -19789,6 +19781,25 @@ fn run_brain(
                     }
                 }
             }
+
+            // `open_store` below is READ-ONLY, but `open_or_create` on the
+            // sidecar is a WRITE, and Tantivy enforces a single writer via its
+            // own `INDEX_WRITER_LOCK`. Against a daemon that holds it this
+            // either fails with `DirectoryLockBusy` or — because that lock is
+            // released whenever the daemon's writer is dropped — succeeds and
+            // races it on segment and meta writes.
+            //
+            // The database lock is the right gate even though the contended
+            // resource is the sidecar: the daemon takes the database lock for
+            // its whole life, so "nobody holds the database" is what makes the
+            // derived index safe to rewrite. Guarding on Tantivy's own lock
+            // would only narrow the window, not close it.
+            // Held across the Tantivy rebuild. This is the site the probe could not
+            // protect: `open_store` below is read-only, so nothing else holds the
+            // database while the sidecar is rewritten, and any client connect
+            // autostarts a daemon.
+            let _write_lease =
+                require_exclusive_store_access(&db_path, "rebuild the search index directly")?;
 
             let sidecar = tantivy_sidecar_path_for(&db_path);
             let store = open_store(Some(&db_path))?;
@@ -22130,7 +22141,8 @@ where
     // still rewriting `.embeddings.bin`. A pidfile also cannot survive PID
     // reuse, and an operator's `rm` erases it; the database lock has neither
     // hole.
-    require_exclusive_store_access(path, "embed directly")?;
+    // Held for the whole pass, which can run for hours.
+    let _write_lease = require_exclusive_store_access(path, "embed directly")?;
 
     let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
         anyhow::anyhow!(
@@ -26295,74 +26307,6 @@ mod restore_guard_tests {
 }
 
 #[cfg(test)]
-mod store_access_guard_tests {
-    use super::*;
-
-    /// A database nothing holds is writable directly.
-    #[test]
-    fn an_unheld_database_permits_a_direct_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("brain.lbug");
-        let store = nestweaver_store::GraphStore::create(&db).unwrap();
-        drop(store);
-        require_exclusive_store_access(&db, "test")
-            .expect("nothing holds this database, so a direct write is allowed");
-    }
-
-    /// A HELD database refuses, and the refusal names the holder and a remedy
-    /// the caller can actually run.
-    ///
-    /// The previous design could not detect this at all: it asked whether an
-    /// env var permitted the bypass, which is not a question about whether
-    /// anyone is holding the database.
-    #[test]
-    fn a_held_database_refuses_and_names_the_holder_and_the_remedy() {
-        use nestweaver_daemon::lifecycle::DbWriteLock;
-        let db = std::path::Path::new("/tmp/brain.lbug");
-
-        let error =
-            exclusive_access_verdict(DbWriteLock::Held { pid: Some(4711) }, db, "index directly")
-                .expect_err("a held database must refuse a second writer");
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("index directly"), "{rendered}");
-        assert!(
-            rendered.contains("4711"),
-            "the refusal must name the holder so the operator can find it: {rendered}"
-        );
-        assert!(rendered.contains("daemon"), "{rendered}");
-
-        // The kernel does not always name a holder. Still a refusal, and it
-        // must not imply it knows who.
-        let anonymous =
-            exclusive_access_verdict(DbWriteLock::Held { pid: None }, db, "index directly")
-                .expect_err("still held even when the kernel names nobody");
-        assert!(format!("{anonymous:#}").contains("another process"));
-    }
-
-    /// `Unknown` must fail CLOSED.
-    ///
-    /// A lock state that could not be read is not evidence of freedom, and the
-    /// cost of being wrong is two writers on a store that is not crash-safe.
-    /// `DbWriteLock`'s own doc says callers "must treat this as 'possibly
-    /// owned', never as free" — this holds us to it, and it is unreachable
-    /// through the real probe.
-    #[test]
-    fn an_unreadable_lock_state_fails_closed() {
-        use nestweaver_daemon::lifecycle::DbWriteLock;
-        let error = exclusive_access_verdict(
-            DbWriteLock::Unknown,
-            std::path::Path::new("/tmp/brain.lbug"),
-            "index directly",
-        )
-        .expect_err("an unreadable lock state must NOT be treated as free");
-        assert!(
-            format!("{error:#}").contains("NOT known to be free"),
-            "the refusal must say the state is UNKNOWN, not that it is held"
-        );
-    }
-}
-
-#[cfg(test)]
 mod snapshot_build_guard_tests {
     use super::*;
 
@@ -26530,6 +26474,83 @@ mod snapshot_build_guard_tests {
         std::fs::write(&watcher_lock, i32::MAX.to_string()).unwrap();
         ensure_no_live_daemon_for_snapshot_build(&db)
             .expect("a stale watcher lock must not block snapshot build");
+    }
+}
+
+#[cfg(test)]
+mod store_access_guard_tests {
+    use super::*;
+
+    /// A database nothing holds is writable directly, and the lease is
+    /// RELEASED when it drops — so a second attempt succeeds.
+    #[test]
+    fn an_unheld_database_permits_a_direct_write_and_releases_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        {
+            let _lease =
+                require_exclusive_store_access(&db, "test").expect("nothing holds this database");
+        }
+        let _again = require_exclusive_store_access(&db, "test")
+            .expect("the lease is released on drop, so a later write may take it");
+    }
+
+    /// While a lease is HELD, a second claim is refused.
+    ///
+    /// This is the property a probe cannot provide. The previous version
+    /// checked the lock and returned; the write then ran for as long as it
+    /// ran, with nothing holding anything — so a daemon autostarted by any
+    /// client (every `DaemonClient::connect` does) could begin writing
+    /// underneath it. Holding the lease is what closes that window.
+    #[test]
+    fn a_held_lease_refuses_a_second_writer_and_names_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let held =
+            require_exclusive_store_access(&db, "index directly").expect("first claim succeeds");
+
+        let error = require_exclusive_store_access(&db, "index directly")
+            .expect_err("a held lease must refuse a second writer");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("index directly"), "{rendered}");
+        assert!(
+            rendered.contains("daemon"),
+            "the refusal must name a runnable remedy: {rendered}"
+        );
+
+        drop(held);
+        require_exclusive_store_access(&db, "index directly")
+            .expect("released on drop, with no stale state to reap");
+    }
+
+    /// The lease lives on its OWN file, never the database.
+    ///
+    /// POSIX record locks are per-PROCESS: closing ANY descriptor to a file
+    /// drops every lock the process holds on it, so a lease taken on the
+    /// database would be destroyed by the store's own routine open/close —
+    /// silently admitting a second writer. `db_write_lock` documents that
+    /// hazard; this pins the design decision that avoids it.
+    #[test]
+    fn the_lease_is_held_on_a_dedicated_file_not_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let lease_path = nestweaver_daemon::lifecycle::write_lease_path(&db);
+        assert_ne!(
+            lease_path, db,
+            "the lease must NOT be taken on the database file itself"
+        );
+
+        let lease = require_exclusive_store_access(&db, "test").expect("claim");
+        assert_eq!(lease.path(), lease_path.as_path());
+
+        // Opening and closing the database must not disturb the lease — the
+        // exact sequence that would drop an fcntl record lock.
+        {
+            let store = nestweaver_store::GraphStore::create(&db).unwrap();
+            drop(store);
+        }
+        require_exclusive_store_access(&db, "test")
+            .expect_err("the lease must SURVIVE an unrelated open/close of the database");
     }
 }
 

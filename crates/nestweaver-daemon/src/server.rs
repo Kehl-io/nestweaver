@@ -9575,6 +9575,37 @@ pub async fn run_server(
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
+    // The WRITE LEASE, held for the daemon's whole life. This is what makes a
+    // direct CLI write safe to refuse: without the daemon participating, a
+    // CLI-side lease would only exclude other CLI writers and the daemon —
+    // the writer that actually matters — would be invisible to it.
+    //
+    // Deliberately a different claim from the pidfile lock above. That one is
+    // about instance identity and lives on an inode an operator's `rm` can
+    // erase; this one is about who may write this database, and nothing but
+    // the lease ever opens its file.
+    //
+    // A daemon that cannot take it must not start: something else is already
+    // writing, and two writers against a store that is not crash-safe is the
+    // failure this exists to prevent.
+    let _write_lease = match lifecycle::acquire_db_write_lease(&db_path) {
+        Ok(lease) => lease,
+        Err(lifecycle::WriteLeaseError::Held) => {
+            anyhow::bail!(
+                "another process holds the write lease for {}. Stop it before starting a \
+                 daemon — two writers against this store risk corruption.",
+                db_path.display()
+            );
+        }
+        Err(lifecycle::WriteLeaseError::Unavailable(error)) => {
+            anyhow::bail!(
+                "could not take the write lease for {}: {error}. Refusing to start rather \
+                 than write without exclusivity.",
+                db_path.display()
+            );
+        }
+    };
+
     // The pidfile lock is NOT sufficient proof of ownership. It is held on an
     // inode: if anyone unlinked `daemon.pid` (which is exactly what an operator
     // does while recovering a stuck instance), the live owner keeps its lock on

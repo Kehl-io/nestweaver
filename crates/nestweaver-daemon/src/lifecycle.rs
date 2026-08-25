@@ -877,6 +877,90 @@ fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
     }
 }
 
+/// Path of the dedicated write-lease file for a database.
+///
+/// A SEPARATE file, deliberately. The obvious choice — lock the database file
+/// itself — is unsafe with POSIX record locks, and `db_write_lock` above
+/// documents why: `fcntl` locks are held per PROCESS, so closing ANY
+/// descriptor to that file drops every lock this process holds on it. A lease
+/// taken on the database would be destroyed by the store's own routine
+/// open/close, silently admitting a second writer. Nothing but the lease
+/// opens this file, so nothing can drop it by accident.
+pub fn write_lease_path(db_path: &Path) -> PathBuf {
+    let canonical = canonical_db_path(db_path);
+    let mut name = canonical.as_os_str().to_owned();
+    name.push(".write.lock");
+    PathBuf::from(name)
+}
+
+/// An exclusive claim on a database's write access, held for as long as the
+/// value lives and released by the kernel when the process exits.
+///
+/// `flock`, not `fcntl`: `flock` is per-DESCRIPTOR, so it survives unrelated
+/// opens and closes of the database, and the kernel drops it on exit with no
+/// stale state to reap. That is the property a pidfile does not have and the
+/// reason this can be trusted where a probe cannot.
+///
+/// A probe answers "was anyone holding this a moment ago". Only a held lease
+/// answers "is anyone holding this for as long as I am writing", which is the
+/// question a check-then-write cannot ask. Every comparable embedded store —
+/// SQLite, RocksDB, LMDB, DuckDB, Kuzu — holds a lock for the lifetime of the
+/// handle for exactly this reason.
+#[derive(Debug)]
+pub struct DbWriteLease {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl DbWriteLease {
+    /// The lease file this claim is held on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Why a write lease could not be taken.
+#[derive(Debug)]
+pub enum WriteLeaseError {
+    /// Someone else holds it. They are writing right now.
+    Held,
+    /// The lease file itself could not be created or locked.
+    Unavailable(std::io::Error),
+}
+
+/// Take an exclusive, non-blocking write lease on `db_path`.
+///
+/// Non-blocking on purpose: a caller that would block has a live writer to
+/// report, and telling the operator who holds the database is more useful than
+/// hanging. Callers that genuinely want to wait can retry.
+pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = write_lease_path(db_path);
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(WriteLeaseError::Unavailable)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(WriteLeaseError::Unavailable)?;
+
+    // LOCK_NB so a contended lease fails immediately instead of hanging.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.kind() {
+            std::io::ErrorKind::WouldBlock => Err(WriteLeaseError::Held),
+            _ => Err(WriteLeaseError::Unavailable(error)),
+        };
+    }
+    Ok(DbWriteLease { _file: file, path })
+}
+
 /// PID of the process on the other end of a connected unix socket, as
 /// reported by the kernel. Unlike the pidfile (whose contents can be
 /// overwritten while the daemon still holds its flock), this cannot be faked
