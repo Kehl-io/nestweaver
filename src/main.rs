@@ -22578,7 +22578,19 @@ where
             Ok(()) => {
                 if let Err(e) = store.flush_embedding_index() {
                     eprintln!("Warning: failed to save embedding sidecar: {e}");
+                    // NOTHING persisted, so nothing succeeded. `error_count +=
+                    // success_count` without zeroing reported both — "4821
+                    // embedding(s) generated, 4821 error(s)", and with --stats
+                    // 9642 outcomes for 4821 items.
+                    //
+                    // This is the fsyncgate shape: PostgreSQL spent twenty
+                    // years reporting durable success for writes the kernel had
+                    // discarded, and the remedy was to treat a failed flush as
+                    // fatal rather than to keep counting what it thought it had
+                    // written. A count of successes must mean "confirmed
+                    // persisted".
                     error_count += success_count;
+                    success_count = 0;
                 }
             }
             Err(e) => {
@@ -22587,7 +22599,10 @@ where
                 eprintln!(
                     "Warning: failed to record embedding pipeline; sidecar was not saved: {e}"
                 );
+                // Same reasoning: the sidecar was not saved, so the successes
+                // did not survive the run.
                 error_count += success_count;
+                success_count = 0;
             }
         }
     } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
