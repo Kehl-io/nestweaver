@@ -368,7 +368,86 @@ fn normalize_regex_diagnostics(stdout: &[u8], mode_label: &str) -> Vec<u8> {
 /// Regex execution timings are intentionally measured independently by each
 /// route, so only those elapsed values are normalized; results and every work
 /// counter remain byte-for-byte compared.
+/// Both runs must have SUCCEEDED, and the daemon run must actually have used
+/// the daemon.
+///
+/// `assert_parity` compared only exit code and stdout bytes. `main()` sends
+/// every error to stderr and exits 1 with stdout untouched — on BOTH routes —
+/// so any shared failure produced byte-identical empty stdout and equal codes,
+/// and passed. Every parity test in this file was green if the command was
+/// completely broken.
+///
+/// The second half is subtler. When an RPC fails, the CLI falls back to the
+/// direct path and warns on STDERR ONLY, which byte-comparison never reads. So
+/// a test could pass by running the direct implementation TWICE — the daemon
+/// branch never executing is indistinguishable from it agreeing. That is
+/// precisely the divergence class these tests exist to catch, so a silent
+/// fallback has to be a failure, not a pass.
+fn assert_both_ran_for_real(command: &str, mode_label: &str, direct: &Output, daemon: &Output) {
+    for (route, output) in [("direct", direct), ("daemon", daemon)] {
+        assert!(
+            output.status.success(),
+            "{command} ({mode_label}, {route}): expected success, got {:?}. Parity between \
+             two FAILURES is not parity.\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let daemon_stderr = String::from_utf8_lossy(&daemon.stderr);
+    assert!(
+        !daemon_stderr.contains("the daemon could not serve"),
+        "{command} ({mode_label}): the daemon run FELL BACK to the direct path, so this \
+         compared one implementation against itself.\nstderr:\n{daemon_stderr}"
+    );
+}
+
+/// Key ORDER is not a contract (RFC 8259 §4 — an object is an unordered
+/// collection); key PRESENCE is. A missing `truncated` or `total` must fail
+/// loudly rather than pass as "just ordering".
+fn assert_same_key_sets(command: &str, direct: &Output, daemon: &Output) {
+    fn key_paths(value: &serde_json::Value, prefix: &str, into: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let path = format!("{prefix}.{key}");
+                    into.push(path.clone());
+                    key_paths(child, &path, into);
+                }
+            }
+            // Index-free: array length is data, not shape, and two runs may
+            // legitimately return different counts.
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    key_paths(item, &format!("{prefix}[]"), into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let parse = |raw: &Output| -> Option<serde_json::Value> {
+        serde_json::from_str(&String::from_utf8_lossy(&raw.stdout)).ok()
+    };
+    let (Some(direct_json), Some(daemon_json)) = (parse(direct), parse(daemon)) else {
+        return;
+    };
+    let mut direct_keys = Vec::new();
+    let mut daemon_keys = Vec::new();
+    key_paths(&direct_json, "", &mut direct_keys);
+    key_paths(&daemon_json, "", &mut daemon_keys);
+    direct_keys.sort();
+    direct_keys.dedup();
+    daemon_keys.sort();
+    daemon_keys.dedup();
+    assert_eq!(
+        direct_keys, daemon_keys,
+        "{command} (json): the two routes emit DIFFERENT KEYS. Order is not a contract; \
+         presence is — a field on one route only is exactly the drift these tests exist \
+         to catch."
+    );
+}
+
 fn assert_parity(command: &str, mode_label: &str, direct: &Output, daemon: &Output) {
+    assert_both_ran_for_real(command, mode_label, direct, daemon);
     assert_eq!(
         direct.status.code(),
         daemon.status.code(),
@@ -403,6 +482,67 @@ fn assert_parity(command: &str, mode_label: &str, direct: &Output, daemon: &Outp
 /// Run one command in both output formats, direct mode FIRST (before the
 /// daemon starts, since a running daemon may hold the DB lock), then daemon
 /// mode, and assert byte-identical stdout + equal exit codes for both formats.
+/// Like [`check_parity`], but compares the JSON output SEMANTICALLY.
+///
+/// Byte equality is the default because it is the stronger guarantee and
+/// catches formatting drift as well as content drift. It is the wrong
+/// assertion only where the two paths serialize the same data through
+/// different types: the daemon route round-trips through `serde_json::Value`,
+/// whose object is a BTreeMap and therefore alphabetises keys, while a direct
+/// path serializing a struct keeps declaration order. JSON object key order
+/// carries no meaning, so demanding it would be conforming the product to the
+/// test. Field PRESENCE and VALUES are the contract, and those are compared.
+fn check_parity_json_semantic(db_path: &Path, command: &str, args: &[&str]) {
+    let mut json_args: Vec<&str> = args.to_vec();
+    json_args.push("--json");
+
+    let direct_human = run_direct(db_path, args);
+    let direct_json = run_direct(db_path, &json_args);
+
+    let _guard = DaemonGuard::new(db_path);
+    start_daemon(db_path);
+
+    let daemon_human = run_via_daemon(db_path, args);
+    let daemon_json = run_via_daemon(db_path, &json_args);
+
+    assert_parity(command, "human", &direct_human, &daemon_human);
+    assert_both_ran_for_real(command, "json", &direct_json, &daemon_json);
+    assert_same_key_sets(command, &direct_json, &daemon_json);
+
+    let parse = |label: &str, raw: &Output| -> serde_json::Value {
+        let text = String::from_utf8_lossy(&raw.stdout).into_owned();
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("{command} ({label}): stdout is not valid JSON: {error}\n{text}")
+        })
+    };
+    assert_eq!(
+        parse("direct", &direct_json),
+        parse("daemon", &daemon_json),
+        "{command} (json): parsed output diverged between direct and daemon mode\n\
+         --- direct ---\n{}\n--- daemon ---\n{}",
+        String::from_utf8_lossy(&direct_json.stdout),
+        String::from_utf8_lossy(&daemon_json.stdout)
+    );
+    assert_eq!(
+        direct_json.status.code(),
+        daemon_json.status.code(),
+        "{command} (json): exit code diverged"
+    );
+}
+
+/// [`check_parity`] for commands that have no `--json` flag.
+///
+/// The default helper appends `--json` unconditionally; for a command that does
+/// not accept it, BOTH routes fail with an identical clap usage error and the
+/// byte comparison passes on two failures.
+fn check_parity_single_format(db_path: &Path, command: &str, args: &[&str]) {
+    let direct = run_direct(db_path, args);
+    let _guard = DaemonGuard::new(db_path);
+    start_daemon(db_path);
+    let daemon = run_via_daemon(db_path, args);
+    assert_parity(command, "human", &direct, &daemon);
+}
+
 fn check_parity(db_path: &Path, command: &str, args: &[&str]) {
     let mut json_args: Vec<&str> = args.to_vec();
     json_args.push("--json");
@@ -837,7 +977,7 @@ fn parity_flow_trace_direct_vs_daemon() {
     check_parity(
         &fixture.db_path,
         "flow-trace",
-        &["flow-trace", "alpha", "--max-depth", "2"],
+        &["flow-trace", "mainA", "--max-depth", "2"],
     );
 }
 
@@ -850,7 +990,10 @@ fn parity_flow_trace_direct_vs_daemon() {
 fn parity_export_scope_direct_vs_daemon() {
     let fixture = setup_fixture();
     for scope in ["all", "code", "vault"] {
-        check_parity(
+        // `export` has no `--json`, and `check_parity` appends it — so the
+        // json leg failed on BOTH routes and the byte comparison passed on two
+        // identical usage errors. Compare only the real output.
+        check_parity_single_format(
             &fixture.db_path,
             &format!("export --scope {scope}"),
             &["export", "--format", "graphml", "--scope", scope],
@@ -858,20 +1001,87 @@ fn parity_export_scope_direct_vs_daemon() {
     }
 }
 
-/// nw-188's honesty fields — `more_available`, `truncated`, `budget_exceeded`,
-/// `seed_tokens_charged` — were added to the daemon/MCP path only, so the same
-/// command answered with four extra keys and a different `tokens_used`
-/// depending on whether a daemon happened to be running. A tight budget is
-/// used deliberately: it is the case that produced the original report.
+/// Coverage sweep. Thirty commands route through the daemon; fourteen had a
+/// parity case. Every transport divergence found in the 7.0.0 review was the
+/// same shape — right on one path, wrong or absent on the other — and CI
+/// caught none of them, because both paths pass their own tests. These are the
+/// remaining routed commands whose fixture requirements are already met.
+///
+/// A command is worth covering here even when it currently agrees: the value
+/// is catching the day it stops.
 #[test]
-fn parity_project_context_direct_vs_daemon() {
+fn parity_list_repos_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    // Semantic: the direct path serializes a struct (declaration order), the
+    // daemon path round-trips through `serde_json::Value` (alphabetised). Same
+    // fields, same values, different key order — which is not a contract.
+    check_parity_json_semantic(&fixture.db_path, "list-repos", &["list-repos"]);
+}
+
+/// KNOWN FAILING — kept runnable rather than deleted, because it found a real
+/// bug the moment the harness stopped passing on two identical failures.
+///
+/// `context mainA` diverges three ways between the direct and daemon routes:
+///
+///   1. kind rendering — `Function` vs `[Symbol/Function]`
+///   2. header — `Connected (3 symbols, …)` vs `Connected (3 of 3, …)`; only
+///      the daemon route discloses the total
+///   3. RELEVANCE SCORES DIFFER — 0.2096/0.2039/0.0208 direct versus
+///      0.3117/0.3046/0.0403 via daemon
+///
+/// (3) is the serious one: the same query returns different ranking values
+/// depending on whether a daemon happens to be running. That is not
+/// presentation drift, and it is not something byte-comparison could ever have
+/// surfaced while the harness accepted two failures as parity.
+#[test]
+#[ignore = "FOUND A REAL DIVERGENCE — see the comment above; unignore with the fix"]
+fn parity_brain_context_direct_vs_daemon() {
     let fixture = setup_fixture();
     check_parity(
         &fixture.db_path,
-        "project-context",
-        &["project-context", "demo", "--token-budget", "200"],
+        "context",
+        // Seeds are POSITIONAL; `--seeds` is not a flag. The original spelling
+        // failed clap on BOTH routes, and the byte comparison passed on two
+        // identical usage errors.
+        &["context", "mainA"],
     );
 }
+
+#[test]
+fn parity_brain_impact_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "impact", &["impact", "mainA"]);
+}
+
+#[test]
+fn parity_search_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "search", &["search", "helper"]);
+}
+
+#[test]
+fn parity_read_symbols_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "read-symbols", &["read-symbols", "mainA"]);
+}
+
+#[test]
+fn parity_detect_changes_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "detect-changes",
+        &["detect-changes", "--files", CHANGED_FILES],
+    );
+}
+
+// `parity_project_context_direct_vs_daemon` is deliberately absent until the
+// fixture can carry a project. `setup_fixture` indexes four plain `.js` files
+// and creates no Project node, so `project-context demo` exited NOT_FOUND on
+// both routes — the byte comparison then passed on two identical failures and
+// asserted nothing about the four nw-188 honesty fields it was written for.
+// Re-add it with a fixture that materializes a project; a vacuous test is
+// worse than a missing one because it reports coverage that does not exist.
 
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
