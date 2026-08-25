@@ -26115,6 +26115,23 @@ mod exit_code_contract_tests {
     /// drift read as a pass, a crashed check read as drift.
     #[test]
     fn stale_check_help_states_the_real_exit_contract() {
+        // Rendered on a thread with a LARGER STACK. `Cli::command()` builds the
+        // whole 40-plus-command tree and `render_long_help` walks it
+        // recursively; on CI's default 2 MiB test-thread stack that overflows,
+        // while macOS's larger default hid it locally.
+        //
+        // Worth the awkwardness: asserting against a hand-copied string would
+        // pass while the real help said something else, which is the exact
+        // drift this test exists to catch.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_stale_check_help_contract)
+            .expect("spawn a deeper-stacked thread")
+            .join()
+            .expect("the help assertions must not panic");
+    }
+
+    fn assert_stale_check_help_contract() {
         use clap::CommandFactory;
         let mut command = Cli::command();
         let help = command
