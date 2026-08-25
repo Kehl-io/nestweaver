@@ -543,6 +543,18 @@ pub fn load_summaries(db_path: &Path, expected_generation: u64) -> Result<Option
 /// Truncate a list of summaries to fit within a token budget.
 ///
 /// Returns the subset of summaries that fits, in order.
+/// Approximate token cap `summary` applies when the caller names none.
+///
+/// ONE constant, shared by the CLI flag and the `get_summary` MCP tool. nw-182
+/// bounded this on the CLI because `summary --level file --json` emitted 8.3 MB
+/// — output proportional to the corpus rather than to the question — and the
+/// reason recorded for fixing it was, verbatim, "this is exposed as an MCP tool
+/// where that is a context-window bomb". The cap was then applied only to the
+/// CLI, so the surface the fix was FOR kept emitting the 8.3 MB.
+///
+/// `0` still means unlimited on both surfaces.
+pub const SUMMARY_DEFAULT_TOKEN_BUDGET: usize = 20_000;
+
 pub fn truncate_to_budget(summaries: &[Summary], token_budget: usize) -> Vec<&Summary> {
     let mut used = 0usize;
     let mut result = Vec::new();

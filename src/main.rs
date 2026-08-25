@@ -2978,7 +2978,7 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(
             long,
-            default_value_t = 20_000,
+            default_value_t = nestweaver_engine::SUMMARY_DEFAULT_TOKEN_BUDGET,
             help = "Approximate token limit for output; 0 = unlimited"
         )]
         token_budget: usize,
