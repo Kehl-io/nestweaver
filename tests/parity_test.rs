@@ -276,6 +276,22 @@ fn run_via_daemon(db_path: &Path, args: &[&str]) -> Output {
 
 // ─── Assertions ──────────────────────────────────────────────────────────────
 
+/// Flatten a miette-rendered error to one lowercase line.
+///
+/// miette hard-wraps its message body and prefixes continuations with `│`, so
+/// a phrase the code emits contiguously — "holds the write lease" — can reach a
+/// test as "write\n  │ lease". A substring assertion against the raw bytes then
+/// fails for a rendering reason while the message is exactly right, which reads
+/// as a product bug and is not one.
+fn flatten_miette(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Contract assertion: exit 0 with non-empty, non-error stdout.
 fn assert_successful_output(output: &Output, context: &str) {
     assert!(
@@ -1155,4 +1171,82 @@ fn parity_msgpack_scope_direct_vs_daemon() {
 fn parity_stale_check_direct_vs_daemon() {
     let fixture = setup_fixture();
     check_parity(&fixture.db_path, "stale-check", &["stale-check"]);
+}
+
+// ─── nw-210: the daemon owns the writes, and that is TESTED ──────────────────
+
+/// The CLI and the daemon both call `TantivyIndex::open_or_create` +
+/// `reindex_from_store` on the SAME index. Tantivy enforces a single writer via
+/// `INDEX_WRITER_LOCK`, and `tantivy_index.rs`'s `state.lock()` is an
+/// IN-PROCESS mutex that coordinates nothing across processes — so the CLI path
+/// either failed with `DirectoryLockBusy` or raced on segment writes. The plain
+/// JSON sidecars (cochange, gitactivity, PageRank) had no lock at all.
+///
+/// The fix was not to make the two writers careful with each other. It was to
+/// give the database a single owner: the daemon takes a write lease for its
+/// whole lifetime, and every CLI write path takes the same lease before
+/// touching the store. With a daemon running, a CLI writer cannot start.
+///
+/// These tests exist because "the daemon owns writes" is an architectural
+/// claim, and an architectural claim with no test decays into a comment.
+#[test]
+fn a_cli_writer_is_refused_while_the_daemon_holds_the_lease() {
+    let fixture = setup_fixture();
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+
+    // `brain reindex-search` is the sharpest case: it rebuilds the Tantivy
+    // index the daemon also writes, and Tantivy's own lock would surface this
+    // as DirectoryLockBusy — an internal error about a lock file, rather than
+    // an answer about who owns the database.
+    //
+    // `run_direct` sets NESTWEAVER_NO_DAEMON, so this is the BYPASS path: the
+    // one that would otherwise open the store itself. Routed normally the same
+    // command reaches the daemon's ReindexSearch RPC and simply works, which is
+    // the point — the daemon is not a restriction, it is the owner.
+    let output = run_direct(&fixture.db_path, &["brain", "reindex-search"]);
+
+    assert!(
+        !output.status.success(),
+        "a second writer must be refused while the daemon holds the lease; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = flatten_miette(&output.stderr);
+    assert!(
+        stderr.contains("write lease"),
+        "the refusal must name the LEASE, not a Tantivy lock file or a generic \
+         I/O error — the operator needs to know who owns the database:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon"),
+        "and it must say what to do about it:\n{stderr}"
+    );
+}
+
+/// The other half. Without this, a guard that refused unconditionally — or a
+/// lease that was never released when the daemon stopped — would pass the test
+/// above while making the CLI permanently unusable.
+#[test]
+fn the_same_cli_writer_succeeds_once_the_daemon_is_gone() {
+    let fixture = setup_fixture();
+
+    {
+        let _guard = DaemonGuard::new(&fixture.db_path);
+        start_daemon(&fixture.db_path);
+        let refused = run_direct(&fixture.db_path, &["brain", "reindex-search"]);
+        assert!(
+            !refused.status.success(),
+            "precondition: refused with daemon"
+        );
+    } // DaemonGuard stops the daemon, which drops the lease.
+
+    let output = run_direct(&fixture.db_path, &["brain", "reindex-search"]);
+
+    assert!(
+        output.status.success(),
+        "the lease must be RELEASED when the daemon stops, or the CLI is \
+         permanently broken after any daemon ever ran; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
