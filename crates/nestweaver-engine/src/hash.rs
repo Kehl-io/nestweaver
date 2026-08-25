@@ -57,6 +57,39 @@ pub fn blake3_hex_short(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A KNOWN-ANSWER test against the official BLAKE3 vectors.
+    ///
+    /// Every other test here compares blake3 to itself, so all of them would
+    /// pass unchanged if the digest function changed entirely — a dependency
+    /// bump, or an accidental swap to a different hash. These digests are
+    /// stored: `content_blake3` gates publication artifact identity and
+    /// incremental-index reuse, so a silent change would invalidate every
+    /// stored hash while the suite stayed green.
+    ///
+    /// Vectors from the BLAKE3 reference test set. They are constants of the
+    /// specification, not of our code — if this fails, the hash changed, and
+    /// nothing downstream that recorded a digest is still valid.
+    #[test]
+    fn digests_match_the_published_blake3_vectors() {
+        assert_eq!(
+            super::blake3_hex_bytes(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "empty-input digest changed — stored content_blake3 values are invalid"
+        );
+        assert_eq!(
+            super::blake3_hex_bytes(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+        // The streaming path must agree with the same vector, since that is the
+        // path `blake3_file` takes for real content.
+        let (size, streamed) = super::blake3_stream(std::io::Cursor::new(b"abc")).unwrap();
+        assert_eq!(size, 3);
+        assert_eq!(
+            streamed,
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+    }
+
     #[test]
     fn streaming_digest_matches_in_memory_digest_across_chunks() {
         let bytes = vec![0x5a; 64 * 1024 + 17];

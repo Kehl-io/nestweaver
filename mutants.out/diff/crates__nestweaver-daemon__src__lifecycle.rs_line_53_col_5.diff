@@ -1,0 +1,25 @@
+--- crates/nestweaver-daemon/src/lifecycle.rs
++++ replace last_successful_config_temp_path -> PathBuf with Default::default()
+@@ -45,21 +45,17 @@
+     parent.join(format!(
+         ".{EFFECTIVE_CONFIG_BINDING_FILE}.{}.{}.tmp",
+         std::process::id(),
+         sequence
+     ))
+ }
+ 
+ fn last_successful_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
+-    parent.join(format!(
+-        ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.tmp",
+-        std::process::id(),
+-        sequence
+-    ))
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
+     parent.join(format!(
+         ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.bak",
+         std::process::id(),
+         sequence
+     ))

@@ -1,0 +1,25 @@
+--- crates/nestweaver-daemon/src/lifecycle.rs
++++ replace last_successful_config_backup_path -> PathBuf with Default::default()
+@@ -53,21 +53,17 @@
+     parent.join(format!(
+         ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.tmp",
+         std::process::id(),
+         sequence
+     ))
+ }
+ 
+ fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
+-    parent.join(format!(
+-        ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.bak",
+-        std::process::id(),
+-        sequence
+-    ))
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Canonical path to use when *naming* a brain's local state.
+ ///
+ /// Identity must survive a publication cutover, so it is anchored to the
+ /// stable base database rather than the currently-selected slot. See
+ /// [`nestweaver_engine::publication::instance_anchor_database`] (nw-145).
+ ///

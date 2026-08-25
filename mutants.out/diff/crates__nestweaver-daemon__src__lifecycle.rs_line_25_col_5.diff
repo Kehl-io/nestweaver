@@ -1,0 +1,21 @@
+--- crates/nestweaver-daemon/src/lifecycle.rs
++++ replace mark_verified_nestweaver_managed_start with ()
+@@ -17,17 +17,17 @@
+ /// Process-local proof that this daemon was started through NestWeaver's
+ /// managed `daemon start` path. Unlike an environment variable, an external
+ /// supervisor cannot accidentally inherit or forge this marker. The command
+ /// sets it only after acquiring or validating the locked spawn descriptor.
+ static VERIFIED_NESTWEAVER_MANAGED_START: std::sync::atomic::AtomicBool =
+     std::sync::atomic::AtomicBool::new(false);
+ 
+ pub fn mark_verified_nestweaver_managed_start() {
+-    VERIFIED_NESTWEAVER_MANAGED_START.store(true, std::sync::atomic::Ordering::Release);
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ pub fn clear_verified_nestweaver_managed_start() {
+     VERIFIED_NESTWEAVER_MANAGED_START.store(false, std::sync::atomic::Ordering::Release);
+ }
+ 
+ pub fn is_verified_nestweaver_managed_start() -> bool {
+     VERIFIED_NESTWEAVER_MANAGED_START.load(std::sync::atomic::Ordering::Acquire)
