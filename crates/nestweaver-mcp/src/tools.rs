@@ -5731,7 +5731,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content — but a count of `null` means it could NOT BE READ, which is NOT zero and is not a reason to re-index. Check `unavailable` (and `counts_complete`) before acting on any count\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nServer-mode and daemon-runtime fields (server_mode, indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder, write_holder_seconds, embedding_status) are ALWAYS present in the document. `write_queue_depth` counts write RPCs blocked on the daemon write lock — a different population from `queue_depth`, which counts index jobs. Inside `embedding_status`, `pass_active` / `pass_processed` / `pass_total` / `pass_started_at` / `pass_scope` describe an in-flight embedding pass. While a pass runs, `state` reads `embedding` rather than `ready` — a strictly narrower `ready`, so the daemon can still answer semantic queries; prefer the boolean `pass_active` over matching the state string. `pass_total` is 0 until the eligibility preflight finishes, which means \"not yet counted\", not \"nothing to do\". Only a live daemon can answer the daemon-owned fields honestly (`server_mode` is the exception — a bool that is simply `false` off-daemon): they carry live values on the daemon's gRPC surface and explicit nulls when no daemon serves the answer (direct `--no-daemon`, MCP-over-HTTP, in-process MCP — nothing was bypassed there, so `degraded_components` stays empty). The CLI's daemon-bypassed fallback additionally marks the nulls via `degraded_components: [\"daemon_runtime\"]` and a `daemon_bypassed` warning.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5774,11 +5774,39 @@ pub fn brain_status_json(
     let repos = store
         .list_repos(None)
         .map_err(|e| anyhow::anyhow!("brain_status: failed to list repos: {e}"))?;
-    let notes = store.count_notes().unwrap_or(0);
-    let headings = store.count_headings().unwrap_or(0);
-    let sections = store.count_sections().unwrap_or(0);
-    let tags = store.count_tags().unwrap_or(0);
-    let wikilinks = store.count_wikilink_edges().unwrap_or(0);
+    // A count that could not be READ is not a count of zero.
+    //
+    // These were `unwrap_or(0)`, which is CWE-390 — "Detection of Error
+    // Condition Without Action" — and aggravated here because `0` is
+    // semantically loaded: this tool's own description tells the caller "if
+    // counts are zero, use brain_add_source to index content". A single failed
+    // query therefore advised re-indexing a healthy vault.
+    //
+    // Note the asymmetry that gave it away: `list_vaults` and `list_repos`
+    // eight lines up already `map_err` the identical error class.
+    //
+    // Null, plus an `unavailable` list naming what could not be read, follows
+    // Google AIP-217: never return incomplete data silently — enumerate what
+    // is missing, or fail. Nothing here makes the whole answer meaningless
+    // (vaults and repos still list), so it degrades and says so rather than
+    // failing outright.
+    let mut unavailable: Vec<&'static str> = Vec::new();
+    let mut count_or_null =
+        |label: &'static str, result: Result<usize, nestweaver_store::StoreError>| -> Value {
+            match result {
+                Ok(count) => json!(count),
+                Err(error) => {
+                    tracing::warn!("brain_status: {label} count unavailable: {error}");
+                    unavailable.push(label);
+                    Value::Null
+                }
+            }
+        };
+    let notes = count_or_null("notes", store.count_notes());
+    let headings = count_or_null("headings", store.count_headings());
+    let sections = count_or_null("sections", store.count_sections());
+    let tags = count_or_null("tags", store.count_tags());
+    let wikilinks = count_or_null("wikilinks", store.count_wikilink_edges());
 
     let db_path = match current_db_path(store) {
         Ok(p) => Some(p),
@@ -5966,6 +5994,11 @@ pub fn brain_status_json(
         "sections": sections,
         "tags": tags,
         "wikilinks": wikilinks,
+        // AIP-217. Empty on a healthy brain; a subsystem named here means its
+        // count is `null` because it could not be READ — not that it is zero.
+        // A caller must not act on a null the way it would act on a 0.
+        "unavailable": unavailable,
+        "counts_complete": unavailable.is_empty(),
         "repos": repos_json,
         "repo_count": repos.len(),
         "server_mode": is_server_mode(),
@@ -7413,9 +7446,21 @@ fn build_flow_tree(
 
     let mut children = Vec::new();
 
-    if depth < opts.max_depth
-        && let Ok(callees) = store.callees_with_edge_types_of(uid)
-    {
+    // A failed callee lookup is NOT "this function calls nothing".
+    //
+    // This was `if let Ok(callees) = ...`, so a store error produced
+    // `"children": []` — byte-identical to a genuine leaf, with no flag and no
+    // note, on the flagship "what does this call" surface. The cancellation
+    // path a few lines above already refuses to serve a truncated tree as a
+    // real answer; an unreadable one is no different, and this function
+    // already returns a `Result` to say so.
+    if depth < opts.max_depth {
+        let callees = store.callees_with_edge_types_of(uid).map_err(|error| {
+            anyhow::anyhow!(
+                "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
+                 report an empty call tree, which is indistinguishable from a leaf."
+            )
+        })?;
         for (callee, edge_type) in &callees {
             if visited.contains(&callee.uid) {
                 continue;
@@ -13937,6 +13982,56 @@ mod brain_impact_uid_resolution_tests {
         assert_eq!(result["status"], "ok", "{result}");
         assert_eq!(result["total"], 0);
         assert!(result["impact_nodes"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod honest_count_tests {
+    use super::*;
+
+    /// A healthy brain reports numbers, an empty `unavailable`, and
+    /// `counts_complete: true`.
+    ///
+    /// The contract this pins is the DISTINCTION: a number means "counted",
+    /// `null` means "could not be read". They used to be the same value —
+    /// `unwrap_or(0)` — which is CWE-390, and aggravated because this tool's
+    /// own description says "if counts are zero, use brain_add_source to index
+    /// content". One failed query advised re-indexing a healthy vault.
+    #[test]
+    fn a_healthy_brain_reports_counts_and_declares_them_complete() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let status = brain_status_json(&store, None).expect("status");
+
+        assert_eq!(
+            status["unavailable"],
+            serde_json::json!([]),
+            "nothing failed, so nothing is unavailable: {status}"
+        );
+        assert_eq!(status["counts_complete"], true, "{status}");
+        for field in ["notes", "headings", "sections", "tags", "wikilinks"] {
+            assert!(
+                status[field].is_number(),
+                "{field} must be a NUMBER when it was actually counted, never null: {status}"
+            );
+        }
+    }
+
+    /// The description must not tell a caller to treat `null` like `0`.
+    ///
+    /// The advice is what made the false zero dangerous rather than merely
+    /// wrong, so the advice is part of the fix.
+    #[test]
+    fn the_description_separates_unreadable_from_zero() {
+        let schema = tool_schema_brain_status();
+        let description = schema["description"].as_str().expect("description");
+        assert!(
+            description.contains("could NOT BE READ"),
+            "the description must distinguish an unreadable count from a zero one"
+        );
+        assert!(
+            description.contains("unavailable"),
+            "the description must point the caller at the field that names what failed"
+        );
     }
 }
 
