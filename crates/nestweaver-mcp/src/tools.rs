@@ -14601,3 +14601,81 @@ mod destructive_tool_contract_tests {
         }
     }
 }
+
+/// The END-TO-END half of the `cross_repo_links` regression.
+///
+/// `crates/nestweaver-federation` has the merge tests, but it cannot import
+/// `nestweaver-engine`, so it can only assert that a KEY survives. What
+/// actually broke `nestweaver context` was the next step: the CLI deserializing
+/// the merged envelope into `ContextResult`, where a missing `cross_repo_links`
+/// is not a missing key but a hard `Error("missing field")`.
+///
+/// This crate sees both, so it can assert the thing the user experiences. A
+/// federated `context` call has no other test that gets this far — the parity
+/// suite configures no upstream, which is precisely why a High-severity break
+/// shipped with 24 parity tests green.
+#[cfg(all(test, feature = "daemon"))]
+mod federated_context_roundtrip_tests {
+    use serde_json::json;
+
+    /// A `code_context` reply that has been through a two-tier merge must still
+    /// parse as the type the CLI parses it as.
+    #[test]
+    fn a_merged_code_context_reply_still_deserializes_for_the_cli() {
+        let node = |uid: &str| {
+            json!({
+                "uid": uid, "name": uid, "kind": "Function",
+                "file_path": "a.rs", "start_line": 1,
+                "signature": "fn", "relevance": 0.5,
+            })
+        };
+        let local = json!({
+            "seeds": [node("sym:seed")],
+            "connected": [node("sym:local")],
+            "cross_repo_links": [{ "package": "serde", "link_type": "dependency", "confidence": 0.5 }],
+            "seeds_resolved": 1,
+            "connected_count": 1,
+        });
+        let server = json!({
+            "seeds": [],
+            "connected": [node("sym:upstream")],
+            "cross_repo_links": [{ "package": "tokio", "link_type": "dependency", "confidence": 0.9 }],
+            "seeds_resolved": 0,
+            "connected_count": 1,
+        });
+
+        let merged = nestweaver_federation::results::merge_structured_results(&local, &server);
+
+        // Exactly what `Commands::Context` does with the daemon's reply.
+        let parsed: nestweaver_engine::ContextResult = serde_json::from_value(merged.clone())
+            .unwrap_or_else(|error| {
+                panic!("the CLI could not parse a merged reply: {error}\nmerged = {merged}")
+            });
+
+        assert_eq!(
+            parsed.cross_repo_links.len(),
+            2,
+            "both tiers' links must survive into the parsed result"
+        );
+        assert_eq!(
+            parsed.connected.len(),
+            2,
+            "both tiers' connected symbols must survive"
+        );
+    }
+
+    /// The single-tier path, which is what every existing test exercised — kept
+    /// so a fix that only works when both tiers answer cannot pass unnoticed.
+    #[test]
+    fn an_unmerged_reply_deserializes_too() {
+        let local = json!({
+            "seeds": [], "connected": [], "cross_repo_links": [],
+            "seeds_resolved": 0, "connected_count": 0,
+        });
+
+        let parsed: nestweaver_engine::ContextResult =
+            serde_json::from_value(local).expect("the un-merged shape must parse");
+
+        assert!(parsed.cross_repo_links.is_empty());
+    }
+}
