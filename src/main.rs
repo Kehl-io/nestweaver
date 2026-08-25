@@ -8601,8 +8601,17 @@ fn no_daemon_allowed_from(allow_optin: bool, _github_actions: bool, _ci: Option<
     //
     // Correctness no longer depends on this answer in any case:
     // `require_exclusive_store_access` takes the lock at the moment of the
-    // write. In CI no daemon is running, so the lock is free and everything
-    // works with no gate at all.
+    // write, so a wrong answer here costs a confusing refusal, never a second
+    // writer.
+    //
+    // An earlier version of this comment claimed "in CI no daemon is running,
+    // so the lock is free and everything works with no gate at all". CI
+    // disproved it: with the bypass no longer conferred, `--no-daemon` was
+    // IGNORED, so the step's index command autostarted a daemon that took the
+    // lease, and the embed command that followed refused. Removing an implicit
+    // permission does not make a job daemon-free — it makes it daemon-ROUTED,
+    // which is a different thing. Jobs that want isolation now set
+    // NESTWEAVER_ALLOW_NO_DAEMON explicitly.
     allow_optin
 }
 
@@ -8860,7 +8869,7 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
         eprintln!(
             "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
              bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
-             daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 (or run in CI) to force the bypass."
+             daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 to force the bypass."
         );
     }
     true
@@ -14811,7 +14820,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // filemeta, resolution deps, parsed cache, pagerank, git activity,
             // cochange and the trigram rebuild below. Dropping it here would
             // make this a probe again.
-            let _write_lease = require_exclusive_store_access(&db_path, "index directly")?;
+            let _write_lease = require_exclusive_store_access(&db_path, "index")?;
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
@@ -18236,7 +18245,7 @@ fn run_brain(
             // Direct-write fallback (`--no-daemon`). It writes the graph and
             // the Tantivy index; neither checked for a live daemon holding the
             // same database.
-            let _write_lease = require_exclusive_store_access(&db_path, "add a vault directly")?;
+            let _write_lease = require_exclusive_store_access(&db_path, "add a vault")?;
             let result = index_markdown_directory_with_ignore(
                 &path,
                 &db_path,
@@ -19490,8 +19499,7 @@ fn run_brain(
 
             // Both refresh arms below write the graph and rebuild Tantivy on
             // the direct path.
-            let _write_lease =
-                require_exclusive_store_access(&db_path, "refresh a vault directly")?;
+            let _write_lease = require_exclusive_store_access(&db_path, "refresh a vault")?;
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -19799,7 +19807,7 @@ fn run_brain(
             // database while the sidecar is rewritten, and any client connect
             // autostarts a daemon.
             let _write_lease =
-                require_exclusive_store_access(&db_path, "rebuild the search index directly")?;
+                require_exclusive_store_access(&db_path, "rebuild the search index")?;
 
             let sidecar = tantivy_sidecar_path_for(&db_path);
             let store = open_store(Some(&db_path))?;
@@ -22142,7 +22150,7 @@ where
     // reuse, and an operator's `rm` erases it; the database lock has neither
     // hole.
     // Held for the whole pass, which can run for hours.
-    let _write_lease = require_exclusive_store_access(path, "embed directly")?;
+    let _write_lease = require_exclusive_store_access(path, "embed")?;
 
     let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
         anyhow::anyhow!(
