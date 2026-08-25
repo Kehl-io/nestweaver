@@ -8596,8 +8596,7 @@ fn tool_schema_project_context() -> Value {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 16000,
-                    "default": 3000,
-                    "description": "Approximate token cap for the result (chars / 4, 1-16000). Increase for comprehensive context, decrease for quick overview."
+                    "description": "Approximate token cap for the result (chars / 4, 1-16000). When omitted the budget follows `response_format`: ~1000 for concise (the default), ~3000 for detailed. Increase for comprehensive context, decrease for quick overview."
                 },
                 "kinds": {
                     "type": "array",
@@ -8636,6 +8635,7 @@ fn tool_schema_project_context() -> Value {
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
+                    "default": "concise",
                     "description": "'concise' (default) returns kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds uid + relevance and uses a ~3000-token budget."
                 },
                 "repos": {
@@ -9769,7 +9769,8 @@ fn tool_schema_get_summary() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate token cap for the result. Default unlimited.",
+                    "minimum": 0,
+                    "description": "Approximate token cap for the result. Defaults to 20000; pass 0 for unlimited. The response reports `total_available` and sets `truncated` when the cap applied.",
                 }
             }
         }
@@ -9787,10 +9788,19 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         .get("target")
         .and_then(|v| v.as_str())
         .or_else(|| args.get("name").and_then(|v| v.as_str()));
-    let token_budget = args
+    // Defaults to the SAME constant the CLI's `--token-budget` defaults to, and
+    // `0` still means unlimited on both. nw-182 bounded this on the CLI because
+    // `summary --level file --json` emitted 8.3 MB — output proportional to the
+    // corpus, not the question — and the reason recorded for fixing it was
+    // "this is exposed as an MCP tool where that is a context-window bomb".
+    // The cap then went in on the CLI only, so the surface the fix was FOR kept
+    // emitting the 8.3 MB, to an agent, unasked.
+    let requested_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
+        .map(|n| n as usize)
+        .unwrap_or(nestweaver_engine::SUMMARY_DEFAULT_TOKEN_BUDGET);
+    let token_budget = (requested_budget > 0).then_some(requested_budget);
 
     // ── Symbol level: bounded, target-pushed-down path (nw-079) ───────────────
     // Symbol summaries are O(symbols × per-symbol caller/callee queries). An
@@ -14677,5 +14687,116 @@ mod federated_context_roundtrip_tests {
             serde_json::from_value(local).expect("the un-merged shape must parse");
 
         assert!(parsed.cross_repo_links.is_empty());
+    }
+}
+
+/// nw-215: a schema `default` must be what the handler actually applies.
+///
+/// JSON Schema's `default` is annotation-only — nothing in the MCP stack reads
+/// it and substitutes the value. Its ONLY consumer is the model reading
+/// `tools/list`. So a `default` that disagrees with the handler is not harmless
+/// duplication, it is misinformation delivered straight into the agent's
+/// reasoning about how much a call will cost.
+///
+/// `project_context` advertised `token_budget: 3000` while the handler applied
+/// 1000 in its default configuration, because `response_format` defaults to
+/// concise and the budget follows it.
+#[cfg(test)]
+mod schema_default_honesty_tests {
+    use super::*;
+
+    /// Every advertised default must be a value the schema itself would accept.
+    /// A default outside its own `minimum`/`maximum`, or off an `enum`, is
+    /// self-contradictory before any handler is involved.
+    #[test]
+    fn every_advertised_default_satisfies_its_own_constraints() {
+        let mut offenders: Vec<String> = Vec::new();
+
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("?").to_string();
+            let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (field, spec) in props {
+                let Some(default) = spec.get("default") else {
+                    continue;
+                };
+                if let Some(values) = spec.get("enum").and_then(|v| v.as_array())
+                    && !values.contains(default)
+                {
+                    offenders.push(format!("{name}.{field}: default {default} not in enum"));
+                }
+                if let Some(number) = default.as_i64() {
+                    if let Some(min) = spec.get("minimum").and_then(serde_json::Value::as_i64)
+                        && number < min
+                    {
+                        offenders.push(format!("{name}.{field}: default {number} < minimum {min}"));
+                    }
+                    if let Some(max) = spec.get("maximum").and_then(serde_json::Value::as_i64)
+                        && number > max
+                    {
+                        offenders.push(format!("{name}.{field}: default {number} > maximum {max}"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "self-contradictory defaults: {offenders:#?}"
+        );
+    }
+
+    /// The specific regression: `project_context.token_budget` must not
+    /// advertise a fixed default at all, because the value it applies depends
+    /// on `response_format`. JSON Schema cannot express a conditional default,
+    /// and a wrong one is worse than none — the description carries the truth.
+    #[test]
+    fn project_context_does_not_advertise_a_budget_it_may_not_apply() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "project_context")
+            .expect("project_context must be registered");
+        let budget = &tool["inputSchema"]["properties"]["token_budget"];
+
+        assert!(
+            budget.get("default").is_none(),
+            "the applied budget follows response_format (1000 concise / 3000 detailed), \
+             so a fixed `default` here is a claim the handler does not honour"
+        );
+        let description = budget["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("1000") && description.contains("3000"),
+            "the description must state BOTH budgets, since the schema cannot: {description}"
+        );
+
+        // And the format that decides it must advertise its own default, which
+        // IS expressible and was missing while the prose claimed one.
+        assert_eq!(
+            tool["inputSchema"]["properties"]["response_format"]["default"],
+            json!("concise")
+        );
+    }
+
+    /// `get_summary` must advertise the bound it now applies. nw-182 bounded
+    /// this on the CLI *because* it is an MCP tool, then bounded only the CLI.
+    #[test]
+    fn get_summary_advertises_the_bound_it_applies() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "get_summary")
+            .expect("get_summary must be registered");
+        let description = tool["inputSchema"]["properties"]["token_budget"]["description"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            !description.contains("Default unlimited"),
+            "the handler no longer defaults to unlimited: {description}"
+        );
+        assert!(
+            description.contains(&nestweaver_engine::SUMMARY_DEFAULT_TOKEN_BUDGET.to_string()),
+            "the advertised default must be the constant the handler uses: {description}"
+        );
     }
 }
