@@ -349,21 +349,60 @@ fn setup_claude_code(
 /// graph alternatives when the agent falls back to grep/find.
 fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyhow::Error> {
     let settings_path = base.join(".claude/settings.json");
+    // `unwrap_or_else(|_| json!({}))` here was silent DATA LOSS. A settings
+    // file with a trailing comma, a merge-conflict marker, or a half-saved
+    // edit parsed as an error, became an empty object, and was then written
+    // back containing only NestWeaver's hooks — destroying the user's
+    // permissions, env, model config and every other hook they had. The
+    // command then reported "hooks installed".
+    //
+    // `merge_json_mcp` — the same operation on the same kind of file, 500
+    // lines below in this file — already refuses and says why. This is that
+    // behaviour, so the two agree.
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+        match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(error) => anyhow::bail!(
+                "{} contains invalid JSON: {error}. Fix it manually or delete it. \
+                 Refusing to overwrite it, because doing so would discard \
+                 every setting it holds.",
+                settings_path.display()
+            ),
+        }
     } else {
         serde_json::json!({})
     };
 
-    let hooks = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
+    // Valid JSON that is not an object — `[]`, `"text"`, `null` — reached
+    // `.as_object_mut().unwrap()` and PANICKED. Refuse for the same reason as
+    // above: whatever it is, it is the user's, and overwriting it is not this
+    // command's call to make.
+    let kind = match &settings {
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Object(_) => "an object",
+    };
+    let Some(root) = settings.as_object_mut() else {
+        anyhow::bail!(
+            "{} is valid JSON but not an object (found {kind}). Fix it manually \
+             or delete it.",
+            settings_path.display(),
+        );
+    };
+    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
 
     // Check if NestWeaver hooks already installed
-    let hooks_obj = hooks.as_object_mut().unwrap();
+    let Some(hooks_obj) = hooks.as_object_mut() else {
+        anyhow::bail!(
+            "{} has a \"hooks\" key that is not an object. Fix it manually or \
+             remove that key.",
+            settings_path.display()
+        );
+    };
     let already_installed = hooks_obj
         .get("SessionStart")
         .and_then(|v| v.as_array())
@@ -1667,5 +1706,132 @@ args = [
         assert_eq!(lite[1], "--lite");
         assert_eq!(&full[1..], &lite[2..]);
         assert!(full.contains(&"--db".to_string()));
+    }
+}
+
+/// nw-212 / nw-217: `setup` must not destroy the file it is editing.
+///
+/// `install_claude_hooks` read `.claude/settings.json`, and on a parse error
+/// substituted an empty object — then wrote that back containing only
+/// NestWeaver's hooks. A trailing comma, a merge-conflict marker or a
+/// half-saved edit therefore DISCARDED the user's permissions, env, model
+/// config and every other hook, and the command reported "hooks installed".
+///
+/// `merge_json_mcp`, the same operation on the same kind of file 500 lines
+/// above, already refused and said why. This is the sibling gap closed, and
+/// pinned so it cannot reopen.
+#[cfg(test)]
+mod settings_preservation_tests {
+    use super::*;
+
+    fn claude_settings(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".claude/settings.json")
+    }
+
+    fn write_settings(dir: &std::path::Path, content: &str) -> std::path::PathBuf {
+        let path = claude_settings(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The data-loss case. The file must come back BYTE-IDENTICAL — asserting
+    /// only that the call failed would still pass if it errored after
+    /// truncating.
+    #[test]
+    fn malformed_settings_are_refused_and_left_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real trailing comma, the single most common way this file breaks,
+        // wrapped around settings that matter.
+        let original =
+            "{\n  \"permissions\": { \"allow\": [\"Bash(ls:*)\"] },\n  \"model\": \"opus\",\n}\n";
+        let path = write_settings(dir.path(), original);
+
+        let result = install_claude_hooks("/tmp/x.lbug", dir.path());
+
+        let error = result.expect_err("invalid JSON must be refused, not silently replaced");
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid JSON"),
+            "the error must say what is wrong: {message}"
+        );
+        assert!(
+            message.contains("settings.json"),
+            "and which file: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the user's settings must be untouched — a refusal that still \
+             truncates is the same data loss with a better error message"
+        );
+    }
+
+    /// Valid JSON that is not an object reached `.as_object_mut().unwrap()` and
+    /// PANICKED. A panic is not a refusal: it leaves the operator with a
+    /// backtrace instead of an instruction.
+    #[test]
+    fn non_object_settings_are_refused_without_panicking() {
+        for content in ["[1, 2, 3]", "\"just a string\"", "null", "42"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_settings(dir.path(), content);
+
+            let error = install_claude_hooks("/tmp/x.lbug", dir.path())
+                .expect_err("non-object settings must be refused");
+
+            assert!(
+                error.to_string().contains("not an object"),
+                "for {content:?} the error must name the problem: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                content,
+                "for {content:?} the file must be untouched"
+            );
+        }
+    }
+
+    /// The half that keeps the fix honest: a VALID file must still be edited,
+    /// and every key the user already had must survive. A guard that refused
+    /// everything would pass both tests above.
+    #[test]
+    fn valid_settings_keep_every_existing_key_when_hooks_are_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            r#"{"permissions":{"allow":["Bash(ls:*)"]},"model":"opus","hooks":{"Stop":[{"matcher":"","hooks":[]}]}}"#,
+        );
+
+        install_claude_hooks("/tmp/x.lbug", dir.path()).expect("valid settings must be edited");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["model"], serde_json::json!("opus"), "model dropped");
+        assert_eq!(
+            after["permissions"]["allow"][0],
+            serde_json::json!("Bash(ls:*)"),
+            "permissions dropped"
+        );
+        assert!(
+            after["hooks"]["Stop"].is_array(),
+            "an unrelated hook the user had was dropped: {after}"
+        );
+        assert!(
+            after["hooks"]["SessionStart"].is_array(),
+            "the NestWeaver hook was not actually installed: {after}"
+        );
+    }
+
+    /// A missing file is not an error — that is the first-run path.
+    #[test]
+    fn absent_settings_are_created_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+
+        install_claude_hooks("/tmp/x.lbug", dir.path()).expect("first run must succeed");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude_settings(dir.path())).unwrap())
+                .unwrap();
+        assert!(after["hooks"]["SessionStart"].is_array());
     }
 }
