@@ -72,7 +72,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.metal == 'true'
     runs-on: macos-latest
-    timeout-minutes: 60
+    # 60 did not fit a COLD cache. Measured on the run that failed: 36m14s to
+    # build the release binary, then 5m51s + 12m51s of release test gates, and
+    # the wall hit during the fourth step — so the job died having reached NONE
+    # of the Metal smoke steps it exists for, and reported that as a Metal
+    # failure.
+    #
+    # It was also self-perpetuating: dying with rustc still writing target/
+    # made rust-cache's save step fail with "file changed as we read it", so
+    # nothing was cached and the next run was cold too. Two PRs failed this way
+    # back to back. The budget has to cover a cold build, not just a warm one.
+    timeout-minutes: 90
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.3"
       NESTWEAVER_METAL_SMOKE_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
@@ -90,9 +100,17 @@ jobs:
         run: brew install protobuf
       - name: Build Metal-enabled CLI
         run: cargo build --locked --release --features metal
+      # `--features metal`, NOT `--features embed`. `metal` is additive on top
+      # of `default = ["embed"]`, so this step was verifying the daemon's
+      # cache-only contract under a DIFFERENT feature set than the binary the
+      # smoke steps below actually run — the one place in this job where that
+      # contract is checked, checked against an artifact that does not ship.
+      # The same applies to the two gates after it. Aligning them is about
+      # testing the shipped configuration; it is not a speed fix, and the
+      # timeout above is what addresses the duration.
       - name: Verify daemon cache-only contract
         run: |
-          cargo test --locked --release -p nestweaver-daemon --features embed \
+          cargo test --locked --release -p nestweaver-daemon --features metal \
             daemon_embedding_startup_constructs_cached_model_offline
       # nw-194: this job used to run ONLY the one named test above, so every
       # macOS-specific failure was invisible to CI while being the first thing a
@@ -110,13 +128,13 @@ jobs:
       # at all. That is how a daemon-crate flake hid the store and engine
       # suites entirely. Every other test job here already passes it.
       - name: Workspace unit tests (macOS portability gate)
-        run: cargo test --locked --release --workspace --lib --no-fail-fast
+        run: cargo test --locked --release --features metal --workspace --lib --no-fail-fast
       # The --lib gate above did not cover INTEGRATION tests, and two of them
       # were failing on macOS the whole time: one #[cfg(target_os = "macos")]
       # test Linux CI can never run, and one gc test that passes on Linux but
       # diverges on macOS. Both are fixed; this keeps them fixed.
       - name: Daemon integration tests (macOS portability gate)
-        run: cargo test --locked --release --test daemon_test
+        run: cargo test --locked --release --features metal --test daemon_test
       - name: Configure isolated smoke paths
         shell: bash
         run: |
@@ -571,6 +589,85 @@ jobs:
         with:
           name: coverage-report
           path: lcov.info
+
+  mutants:
+    name: Mutation testing (advisory)
+    needs: changes
+    # ADVISORY ONLY — nothing gates on this, and there is deliberately no
+    # mutation-score threshold.
+    #
+    # A score target invites tests written to kill mutants rather than to check
+    # behaviour (Goodhart). Google's deployment reports surface individual
+    # SURVIVING mutants on the diff under review and never show developers a
+    # score; that is the model here.
+    #
+    # Why it exists: the post-7.0.0 review found ~20 tests that pass with the
+    # fix they guard reverted — several guarding named tickets, so they read as
+    # coverage while guarding nothing. Coverage cannot see that class; mutant
+    # detection correlates with real fault detection INDEPENDENTLY of coverage
+    # (Just et al., FSE 2014).
+    #
+    # `--in-diff` keeps it to the PR's own changes, which is what makes the
+    # runtime tolerable — a full baseline is a separate, occasional run.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+      - uses: actions/checkout@v7
+        with:
+          # `--in-diff` needs the base commit to diff against.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: mutants
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Compute the PR diff
+        run: git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
+      - name: Mutate only what this PR changed
+        # A timeout because an unkilled mutant can hang a test that would
+        # otherwise exit; without it one pathological mutant stalls the job.
+        # NESTWEAVER_NO_DAEMON keeps each run hermetic — cargo-mutants requires
+        # non-flaky tests, and a shared daemon would make results
+        # irreproducible.
+        run: |
+          cargo mutants --in-diff /tmp/pr.diff --timeout 300 --no-shuffle -- --no-fail-fast || true
+        env:
+          NESTWEAVER_NO_DAEMON: "1"
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
+      - name: Surviving mutants (read these — each one is a test that cannot fail)
+        if: always()
+        run: |
+          if [ -s mutants.out/missed.txt ]; then
+            echo "### Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Each line is a change to this PR's code that NO test noticed." >> "$GITHUB_STEP_SUMMARY"
+            echo "That is not automatically a defect — but it is a test that would" >> "$GITHUB_STEP_SUMMARY"
+            echo "not have caught the bug it appears to guard." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No surviving mutants in this diff." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: ignore
 
   audit:
     name: Security Audit

@@ -13671,6 +13671,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             edge_type: &'a str,
                             confidence: f32,
                             depth: u32,
+                            // The daemon path emits this and the tool
+                            // description names it as the sort key ("results
+                            // sorted by impact_score, highest risk first"), so
+                            // a caller told to rank by it got nothing to rank
+                            // by on the direct path.
+                            impact_score: f64,
                         }
                         let json_nodes: Vec<_> = nodes
                             .iter()
@@ -13682,6 +13688,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 edge_type: &n.edge_type,
                                 confidence: n.confidence,
                                 depth: n.depth,
+                                impact_score: n.impact_score,
                             })
                             .collect();
                         let note = truncated.then(|| {
@@ -13696,8 +13703,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::to_value(&json_nodes)?,
                                 result.truncated_by_threshold,
                                 result.truncated_by_depth,
-                                None,
-                                None,
+                                // `total` is the RESULT-SET size, matching the
+                                // daemon, which computes `nodes.len()` after
+                                // its visibility retain and regardless of
+                                // truncation. The truncation flags carry the
+                                // "this set is a FLOOR" meaning; `total` does
+                                // not.
+                                //
+                                // An earlier version of this emitted `None`
+                                // when truncated, reasoning that the
+                                // PRE-truncation universe is unknown here. True
+                                // but irrelevant — that is a different
+                                // quantity than the one the daemon reports
+                                // under the same key, so it reintroduced the
+                                // divergence it was meant to close, in the one
+                                // case the happy-path parity fixture cannot
+                                // reach.
+                                Some(json_nodes.len() as u64),
+                                Some(json_nodes.len() as u64),
                                 note,
                             ))?
                         );
@@ -22675,7 +22698,19 @@ where
             Ok(()) => {
                 if let Err(e) = store.flush_embedding_index() {
                     eprintln!("Warning: failed to save embedding sidecar: {e}");
+                    // NOTHING persisted, so nothing succeeded. `error_count +=
+                    // success_count` without zeroing reported both — "4821
+                    // embedding(s) generated, 4821 error(s)", and with --stats
+                    // 9642 outcomes for 4821 items.
+                    //
+                    // This is the fsyncgate shape: PostgreSQL spent twenty
+                    // years reporting durable success for writes the kernel had
+                    // discarded, and the remedy was to treat a failed flush as
+                    // fatal rather than to keep counting what it thought it had
+                    // written. A count of successes must mean "confirmed
+                    // persisted".
                     error_count += success_count;
+                    success_count = 0;
                 }
             }
             Err(e) => {
@@ -22684,7 +22719,10 @@ where
                 eprintln!(
                     "Warning: failed to record embedding pipeline; sidecar was not saved: {e}"
                 );
+                // Same reasoning: the sidecar was not saved, so the successes
+                // did not survive the run.
                 error_count += success_count;
+                success_count = 0;
             }
         }
     } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
