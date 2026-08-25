@@ -490,6 +490,16 @@ pub fn build_context(
 /// When `intent` is `Some`, the intent's parameters override the defaults.
 /// When `intent` is `None` but auto-detection is desired, use
 /// [`QueryIntent`] with [`detect_intent`] on the resolved seeds.
+/// Connected symbols `code_context` returns when the caller omits a limit.
+///
+/// ONE constant, deliberately. `nestweaver context` and the `code_context` MCP
+/// tool are two routes to the same answer, and the moment a cap lives on only
+/// one of them the two stop agreeing — which is the whole defect class the
+/// `code_context` RPC was added to close. An omitted limit used to mean
+/// `usize::MAX` here, which made the advertised 500-result safeguard
+/// unreachable by simply not sending the field.
+pub const CODE_CONTEXT_DEFAULT_LIMIT: usize = 500;
+
 pub fn build_context_with_intent(
     store: &GraphStore,
     inputs: &[String],

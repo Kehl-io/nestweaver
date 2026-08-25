@@ -3208,7 +3208,7 @@ fn tool_schema_code_context() -> Value {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum connected symbols to return. Omit for no cap, which is what the CLI does when --limit is absent."
+                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `total` and `truncated` so an omitted limit is never silently lossy."
                 },
                 "intent": {
                     "type": "string",
@@ -3337,6 +3337,20 @@ fn tool_schema_brain_context() -> Value {
     })
 }
 
+/// Truncate to `limit`, reporting whether anything was dropped.
+///
+/// The caller asks the engine for `limit + 1` so the extra row proves more rows
+/// exist without paying for a second query; this drops it and says so. Silent
+/// truncation is the failure mode being avoided: a caller that cannot tell a
+/// complete answer from a capped one will treat the cap as the whole graph.
+fn truncate_reporting<T>(items: &mut Vec<T>, limit: usize) -> bool {
+    let truncated = items.len() > limit;
+    if truncated {
+        items.truncate(limit);
+    }
+    truncated
+}
+
 /// `code_context` — the CODE-only structural subgraph around seed symbols.
 ///
 /// Distinct from `brain_context`, and the distinction is the whole point.
@@ -3365,13 +3379,20 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     if seeds.is_empty() {
         anyhow::bail!("code_context requires at least one seed");
     }
-    // `Option<usize>`, matching the engine: absent means "no cap", which is
-    // what the CLI passes when `--limit` is omitted. Defaulting to a number
-    // here would silently truncate a route the direct path does not.
+    // An omitted `limit` used to mean NO CAP, matching the engine's
+    // `limit.unwrap_or(usize::MAX)`. That made the advertised 500-result
+    // safeguard unreachable by simply not sending the field, so a seed in a
+    // dense region serialized every connected symbol in the graph.
+    //
+    // It now defaults, and the CLI's direct path defaults to the SAME constant
+    // — a cap on one route only is how the two drifted apart to begin with.
+    // Truncation is disclosed rather than silent: `total` is the number of
+    // connected symbols found, `connected_count` the number returned.
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
+        .map(|n| n as usize)
+        .unwrap_or(nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT);
     let intent = args
         .get("intent")
         .and_then(|v| v.as_str())
@@ -3383,7 +3404,11 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         })
         .transpose()?;
 
-    let result = nestweaver_engine::build_context_with_intent(store, &seeds, intent, limit)?;
+    // One over the cap, so `truncated` can be reported without a second pass:
+    // the extra row proves more exist, and is dropped before rendering.
+    let mut result =
+        nestweaver_engine::build_context_with_intent(store, &seeds, intent, Some(limit + 1))?;
+    let truncated = truncate_reporting(&mut result.connected, limit);
 
     let render = |node: &nestweaver_engine::ContextNode| {
         json!({
@@ -3402,6 +3427,8 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
         "seeds_resolved": result.seeds.len(),
         "connected_count": result.connected.len(),
+        "limit": limit,
+        "truncated": truncated,
     }))
 }
 
@@ -11838,6 +11865,67 @@ mod cache_dispatch_tests {
             RESPONSE_SHAPE_VERSION,
         );
         assert!(cache.is_empty(), "dirty responses must not be retained");
+    }
+
+    // ── code_context bounds: an omitted limit must not mean "everything" ──
+
+    /// The 500-result safeguard was advertised for `code_context` and reachable
+    /// by nobody: an omitted `limit` meant `usize::MAX` in the engine, so a
+    /// caller escaped the cap by simply not sending the field.
+    ///
+    /// Tested on the truncation helper rather than through a contrived graph:
+    /// what matters is that a capped result says it was capped, and that is a
+    /// property of this function, not of any particular fixture's shape.
+    #[test]
+    fn truncation_is_reported_not_silent() {
+        let mut over = vec![1, 2, 3, 4];
+        assert!(
+            truncate_reporting(&mut over, 3),
+            "four rows capped at three IS a truncation"
+        );
+        assert_eq!(over, vec![1, 2, 3], "and the extra row is dropped");
+
+        // The boundary: exactly at the limit is NOT truncated. Off-by-one here
+        // would report every full-but-fitting result as lossy.
+        let mut exact = vec![1, 2, 3];
+        assert!(!truncate_reporting(&mut exact, 3));
+        assert_eq!(exact, vec![1, 2, 3]);
+
+        let mut under = vec![1];
+        assert!(!truncate_reporting(&mut under, 3));
+        assert_eq!(under, vec![1]);
+
+        let mut empty: Vec<u8> = Vec::new();
+        assert!(!truncate_reporting(&mut empty, 0));
+    }
+
+    /// The other half: when everything fits, `truncated` must be false. Without
+    /// this, a field hardcoded to `true` would pass the test above.
+    #[test]
+    fn a_result_that_fits_is_not_reported_as_truncated() {
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let full = dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["greet"] }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(full["truncated"], json!(false));
+        assert_eq!(
+            full["limit"],
+            json!(nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT),
+            "an omitted limit must report the default it actually applied"
+        );
+        assert_eq!(
+            full["connected"].as_array().unwrap().len(),
+            full["connected_count"].as_u64().unwrap() as usize
+        );
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
