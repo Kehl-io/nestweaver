@@ -28,6 +28,18 @@ id_ed25519
 *.sqlite
 *.db
 
+# Sidecars and lock files that live BESIDE the database. `*.lbug` does not
+# match these — it anchors at the end — so without this line an ordinary
+# `nestweaver index` leaves untracked files in `git status`.
+#
+# `*.lbug.write.lock` is a LIVE lock, not leftover scratch: the daemon holds an
+# advisory flock on that inode for as long as it owns the database. Deleting it
+# while a daemon is running does not release the lock, it detaches the name from
+# the locked inode — so the next writer creates a fresh file, takes a lock on a
+# DIFFERENT inode, and both processes then believe they hold exclusive access.
+# Never remove one by hand; stop the holder with `nestweaver daemon stop`.
+*.lbug.*
+
 # OS files
 Thumbs.db
 

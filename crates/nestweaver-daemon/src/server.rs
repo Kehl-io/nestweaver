@@ -997,6 +997,22 @@ pub struct DaemonState {
     /// while the outgoing process was still rewriting the sidecar, letting a
     /// successor daemon open the same database concurrently.
     pub embedding_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Join handles for every watcher task this daemon has spawned.
+    ///
+    /// Same invariant as the two reconcile loops above, and it was missing for
+    /// the watchers: both `watch_vault` and `watch_code` spawned with a bare
+    /// `spawn_blocking(...)` whose handle was dropped. Shutdown's
+    /// `stop_active_watcher` SIGNALS the watcher but cannot await it, so
+    /// teardown could remove the socket, the pidfile and the INSTANCE LOCK
+    /// while a watcher write was still running — against a store that is not
+    /// crash-safe.
+    ///
+    /// A Vec rather than an Option because a FORCE-RETIRED watcher is still
+    /// draining: `register_watcher(force)` stops the incumbent and immediately
+    /// registers a replacement, so at shutdown there may be several tasks
+    /// winding down. Awaiting the collection covers them without any extra
+    /// bookkeeping.
+    pub watcher_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Handle to the `serve_ui` web-server task plus the port it is bound
     /// to, aborted by `stop_ui` so the listen port is released when the CLI
     /// exits (LOW: ui port leak). The port is tracked so a repeated
@@ -3969,7 +3985,7 @@ impl NestWeaverDaemon for DaemonService {
             self.state.store.clone(),
         );
 
-        tokio::task::spawn_blocking(move || {
+        let watcher_task = tokio::task::spawn_blocking(move || {
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3984,6 +4000,16 @@ impl NestWeaverDaemon for DaemonService {
 
             clear_watcher_registration(&state, watcher_id);
         });
+        // Retained so shutdown can AWAIT it before releasing the socket,
+        // pidfile and instance lock — a watcher write that outlives teardown
+        // is the hazard the reconcile loops already guard against.
+        if let Ok(mut tasks) = self.state.watcher_tasks.lock() {
+            // Drop handles for tasks that already finished, so a long-lived
+            // daemon that starts and stops many watchers does not accumulate
+            // them.
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(watcher_task);
+        }
 
         Ok(Response::new(WatchVaultResponse {
             ok: true,
@@ -4076,7 +4102,7 @@ impl NestWeaverDaemon for DaemonService {
             self.state.store.clone(),
         );
 
-        tokio::task::spawn_blocking(move || {
+        let watcher_task = tokio::task::spawn_blocking(move || {
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4091,6 +4117,16 @@ impl NestWeaverDaemon for DaemonService {
 
             clear_watcher_registration(&state, watcher_id);
         });
+        // Retained so shutdown can AWAIT it before releasing the socket,
+        // pidfile and instance lock — a watcher write that outlives teardown
+        // is the hazard the reconcile loops already guard against.
+        if let Ok(mut tasks) = self.state.watcher_tasks.lock() {
+            // Drop handles for tasks that already finished, so a long-lived
+            // daemon that starts and stops many watchers does not accumulate
+            // them.
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(watcher_task);
+        }
 
         Ok(Response::new(WatchCodeResponse {
             ok: true,
@@ -9562,6 +9598,37 @@ pub async fn run_server(
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
+    // The WRITE LEASE, held for the daemon's whole life. This is what makes a
+    // direct CLI write safe to refuse: without the daemon participating, a
+    // CLI-side lease would only exclude other CLI writers and the daemon —
+    // the writer that actually matters — would be invisible to it.
+    //
+    // Deliberately a different claim from the pidfile lock above. That one is
+    // about instance identity and lives on an inode an operator's `rm` can
+    // erase; this one is about who may write this database, and nothing but
+    // the lease ever opens its file.
+    //
+    // A daemon that cannot take it must not start: something else is already
+    // writing, and two writers against a store that is not crash-safe is the
+    // failure this exists to prevent.
+    let _write_lease = match lifecycle::acquire_db_write_lease(&db_path) {
+        Ok(lease) => lease,
+        Err(lifecycle::WriteLeaseError::Held) => {
+            anyhow::bail!(
+                "another process holds the write lease for {}. Stop it before starting a \
+                 daemon — two writers against this store risk corruption.",
+                db_path.display()
+            );
+        }
+        Err(lifecycle::WriteLeaseError::Unavailable(error)) => {
+            anyhow::bail!(
+                "could not take the write lease for {}: {error}. Refusing to start rather \
+                 than write without exclusivity.",
+                db_path.display()
+            );
+        }
+    };
+
     // The pidfile lock is NOT sufficient proof of ownership. It is held on an
     // inode: if anyone unlinked `daemon.pid` (which is exactly what an operator
     // does while recovering a stuck instance), the live owner keeps its lock on
@@ -9944,6 +10011,7 @@ pub async fn run_server(
         worker_handle: std::sync::Mutex::new(None),
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
+        watcher_tasks: std::sync::Mutex::new(Vec::new()),
         ui_server: std::sync::Mutex::new(None),
     });
 
@@ -11370,6 +11438,28 @@ pub async fn run_server(
     if let Some(handle) = embedding_handle {
         tracing::info!("draining embedding reconcile loop before exit");
         let _ = handle.await;
+    }
+
+    // Watchers LAST, and before the socket/pidfile/instance-lock teardown
+    // below. `stop_active_watcher` above only SIGNALS them; a `spawn_blocking`
+    // watcher cannot be aborted, so without this the outgoing process could
+    // still be writing while a successor claims the instance.
+    //
+    // Includes force-retired watchers: `register_watcher(force)` stops an
+    // incumbent and registers a replacement, so several may be winding down.
+    let watcher_tasks: Vec<_> = state
+        .watcher_tasks
+        .lock()
+        .map(|mut tasks| std::mem::take(&mut *tasks))
+        .unwrap_or_default();
+    if !watcher_tasks.is_empty() {
+        tracing::info!(
+            count = watcher_tasks.len(),
+            "draining watcher task(s) before exit"
+        );
+        for task in watcher_tasks {
+            let _ = task.await;
+        }
     }
 
     let _ = std::fs::remove_file(&sock_path);
@@ -16401,6 +16491,7 @@ mod startup_helper_tests {
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            watcher_tasks: std::sync::Mutex::new(Vec::new()),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -16484,6 +16575,7 @@ credential_method = "gh"
             worker_handle: std::sync::Mutex::new(None),
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
+            watcher_tasks: std::sync::Mutex::new(Vec::new()),
             ui_server: std::sync::Mutex::new(None),
         })
     }
@@ -19464,6 +19556,79 @@ mod watch_path_allowed_tests {
         // Unregistered path rejected.
         let other = std::fs::canonicalize(tmp.path()).unwrap();
         assert!(watch_path_allowed(Some(&repos), &other, "repo", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod watcher_task_tracking_tests {
+    /// Watcher tasks must be TRACKED so shutdown can await them.
+    ///
+    /// Both watch RPCs used to spawn with a bare `spawn_blocking(...)` whose
+    /// handle was dropped. `stop_active_watcher` only SIGNALS a watcher, and a
+    /// `spawn_blocking` task cannot be aborted — so teardown could release the
+    /// socket, the pidfile and the instance lock while a watcher write was
+    /// still running, against a store that is not crash-safe. That is the
+    /// invariant the two reconcile loops already state in their own doc
+    /// comments; the watchers were the gap.
+    ///
+    /// This pins the BOOKKEEPING — that live handles survive and finished ones
+    /// are reaped — because the await itself happens inside `run_server`'s
+    /// teardown, which no unit test can drive. Its behavioural counterpart is
+    /// `daemon_e2e_pid_watch_force_and_shutdown`, which asserts a daemon with
+    /// an ACTIVE watcher still exits promptly.
+    #[tokio::test]
+    async fn tracking_keeps_live_tasks_and_reaps_finished_ones() {
+        let tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(Vec::new());
+
+        let record = |task: tokio::task::JoinHandle<()>| {
+            let mut guard = tasks.lock().expect("mutex poisoned");
+            guard.retain(|existing| !existing.is_finished());
+            guard.push(task);
+        };
+
+        // A finished task, and two that are still running.
+        let finished = tokio::spawn(async {});
+        finished.await.expect("join the finished task");
+        let finished_again = tokio::spawn(async {});
+        finished_again.await.expect("join");
+
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let live_one = tokio::spawn(async move {
+            let _ = hold.await;
+        });
+        let (release_two, hold_two) = tokio::sync::oneshot::channel::<()>();
+        let live_two = tokio::spawn(async move {
+            let _ = hold_two.await;
+        });
+
+        record(live_one);
+        record(live_two);
+        assert_eq!(
+            tasks.lock().unwrap().len(),
+            2,
+            "a force-retired watcher is still draining, so BOTH must be tracked"
+        );
+
+        // Let them finish, then record another: the reap must clear the dead
+        // ones so a long-lived daemon does not accumulate handles forever.
+        let _ = release.send(());
+        let _ = release_two.send(());
+        for _ in 0..200 {
+            if tasks.lock().unwrap().iter().all(|t| t.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (_keep, hold_three) = tokio::sync::oneshot::channel::<()>();
+        record(tokio::spawn(async move {
+            let _ = hold_three.await;
+        }));
+        assert_eq!(
+            tasks.lock().unwrap().len(),
+            1,
+            "finished handles must be reaped, leaving only the live one"
+        );
     }
 }
 

@@ -168,6 +168,13 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Populate model cache on CPU
         shell: bash
+        env:
+          # THE failure this fixes. Without it, `--no-daemon` was ignored, the
+          # index step autostarted a daemon against the seed DB, that daemon took
+          # the write lease, and the embed step below refused — correctly — to
+          # become a second writer. Two commands, one intended to be isolated,
+          # silently disagreeing about whether a daemon was in play.
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
         run: |
           set -euo pipefail
           BIN="$PWD/target/release/nestweaver"
@@ -410,6 +417,11 @@ jobs:
         # federation, mcp, …) — where most of the logic lives.
         run: cargo test --locked --workspace --no-fail-fast -- --skip daemon_
         env:
+          # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
+          # the bypass. An ambient variable set by dozens of unrelated tools must
+          # not decide whether a database can have two writers; a job that wants
+          # the escape hatch now says so.
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
 
   clippy:
@@ -566,6 +578,11 @@ jobs:
         # package (see the Tests step note on the [package]+[workspace] manifest).
         run: cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
         env:
+          # Explicit, because this PR stops `CI`/`GITHUB_ACTIONS` from conferring
+          # the bypass. An ambient variable set by dozens of unrelated tools must
+          # not decide whether a database can have two writers; a job that wants
+          # the escape hatch now says so.
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
@@ -732,6 +749,8 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     env:
+      # See the note on the Tests step: the bypass is explicit now.
+      NESTWEAVER_ALLOW_NO_DAEMON: "1"
       NESTWEAVER_NO_DAEMON: "1"
     steps:
       - name: Free disk space
@@ -779,6 +798,8 @@ jobs:
           sleep 2
           cargo build
       - name: Index test data
+        env:
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
         run: ./target/debug/nestweaver --no-daemon index --repo testdata/js --db /tmp/test.lbug
       - name: Install Playwright browsers
         working-directory: crates/nestweaver-web/frontend
