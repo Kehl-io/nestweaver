@@ -763,7 +763,6 @@ mod tests {
         assert_eq!(concat_fanout(&l2, &s2)["truncated"], json!(false));
     }
 
-    #[test]
     /// `nestweaver context` was BROKEN for anyone with an upstream configured.
     /// `merge_structured_results` rebuilds its envelope key by key, and
     /// `cross_repo_links` was not among the keys re-added — but it is a
@@ -895,6 +894,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn merge_structured_sums_token_accounting() {
         // tokens_used / seeds_expanded / token_budget must reflect BOTH tiers,
         // since `connected` is the merge of both.
