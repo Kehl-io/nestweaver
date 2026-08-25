@@ -1055,23 +1055,22 @@ fn parity_list_repos_direct_vs_daemon() {
     check_parity_json_semantic(&fixture.db_path, "list-repos", &["list-repos"]);
 }
 
-/// KNOWN FAILING — kept runnable rather than deleted, because it found a real
-/// bug the moment the harness stopped passing on two identical failures.
-///
-/// `context mainA` diverges three ways between the direct and daemon routes:
+/// This one found a real bug the moment the harness stopped passing on two
+/// identical failures. `context mainA` diverged three ways between routes:
 ///
 ///   1. kind rendering — `Function` vs `[Symbol/Function]`
-///   2. header — `Connected (3 symbols, …)` vs `Connected (3 of 3, …)`; only
-///      the daemon route discloses the total
-///   3. RELEVANCE SCORES DIFFER — 0.2096/0.2039/0.0208 direct versus
+///   2. header — `Connected (3 symbols, …)` vs `Connected (3 of 3, …)`
+///   3. RELEVANCE SCORES DIFFERED — 0.2096/0.2039/0.0208 direct versus
 ///      0.3117/0.3046/0.0403 via daemon
 ///
-/// (3) is the serious one: the same query returns different ranking values
-/// depending on whether a daemon happens to be running. That is not
-/// presentation drift, and it is not something byte-comparison could ever have
-/// surfaced while the harness accepted two failures as parity.
+/// (3) was the serious one, and (1) and (2) were downstream of it: the daemon
+/// route was answering with `brain_context`, the code+notes hybrid, because
+/// `context` had no RPC of its own. The same query returned different rankings
+/// depending on whether a daemon happened to be running. `code_context` is the
+/// RPC for what this command means, and both routes now build a
+/// `ContextResult` and render through one function — so this is a byte
+/// comparison again, and it holds.
 #[test]
-#[ignore = "FOUND A REAL DIVERGENCE — see the comment above; unignore with the fix"]
 fn parity_brain_context_direct_vs_daemon() {
     let fixture = setup_fixture();
     check_parity(

@@ -58,6 +58,7 @@ impl QuerySafeguards {
         for tool in &[
             "brain_search",
             "brain_context",
+            "code_context",
             "regex_search",
             "read_symbols",
             "count_patterns",
@@ -107,7 +108,7 @@ impl QuerySafeguards {
         hard_caps.insert("dead_code".to_string(), Duration::from_secs(120));
 
         // Standard hard caps
-        for tool in &["brain_search", "brain_context"] {
+        for tool in &["brain_search", "brain_context", "code_context"] {
             hard_caps.insert(tool.to_string(), Duration::from_secs(60));
         }
         hard_caps.insert("regex_search".to_string(), Duration::from_secs(30));
@@ -136,7 +137,7 @@ impl QuerySafeguards {
         }
 
         // Context tools: 500 default, 5000 cap
-        for tool in &["brain_context", "project_context"] {
+        for tool in &["brain_context", "code_context", "project_context"] {
             default_result_limits.insert(tool.to_string(), 500);
             max_result_limits.insert(tool.to_string(), 5_000);
         }

@@ -76,6 +76,7 @@ pub async fn dispatch_json_rpc_authed(
         "count_patterns" => client.count_patterns(request).await,
         "cross_repo_contracts" => client.cross_repo_contracts(request).await,
         "contract_drift" => client.contract_drift(request).await,
+        "code_context" => client.code_context(request).await,
         "dead_code" => client.dead_code(request).await,
         "brain_broken_links" => client.brain_broken_links(request).await,
         "brain_orphan_documents" => client.brain_orphan_documents(request).await,

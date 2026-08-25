@@ -5772,6 +5772,20 @@ impl NestWeaverDaemon for DaemonService {
         }))
     }
 
+    /// CODE-only context, distinct from `get_context`'s hybrid.
+    ///
+    /// `nestweaver context` had no RPC of its own, so its daemon route sent
+    /// `brain_context` — code AND notes with alias resolution — while its
+    /// direct path ran PPR over the symbol graph alone. One command, two
+    /// algorithms over two different node sets, chosen by whether a daemon
+    /// happened to be running.
+    async fn code_context(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        json_rpc!(self, r, "code_context")
+    }
+
     async fn get_context(
         &self,
         r: Request<BrainContextRequest>,

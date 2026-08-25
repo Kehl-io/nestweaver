@@ -605,7 +605,8 @@ fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
     let tools = frames[0]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    // 42 registered minus the mutating tools direct read-only hides.
+    assert_eq!(tools.len(), 36);
     for mutator in nestweaver_mcp::http::MUTATING_TOOLS {
         assert!(
             tools.iter().all(|tool| tool["name"] != *mutator),

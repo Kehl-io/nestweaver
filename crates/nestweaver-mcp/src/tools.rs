@@ -192,6 +192,7 @@ fn all_tool_schemas() -> Vec<Value> {
 fn all_tool_schemas_undecorated() -> Vec<Value> {
     vec![
         tool_schema_brain_context(),
+        tool_schema_code_context(),
         tool_schema_brain_search(),
         tool_schema_note_get(),
         tool_schema_backlinks(),
@@ -530,7 +531,7 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
-    fn registry_contains_exactly_the_41_advertised_unique_names() {
+    fn registry_contains_exactly_the_42_advertised_unique_names() {
         let expected: BTreeSet<&str> = [
             "affected_tests",
             "backlinks",
@@ -538,6 +539,7 @@ mod tool_schema_validation_tests {
             "brain_add_source",
             "brain_broken_links",
             "brain_context",
+            "code_context",
             "brain_diff",
             "brain_doc_stats",
             "brain_guide",
@@ -580,8 +582,8 @@ mod tool_schema_validation_tests {
         let schemas = all_tool_schemas();
         assert_eq!(
             schemas.len(),
-            41,
-            "registry must contain exactly 41 schemas"
+            42,
+            "registry must contain exactly 42 schemas"
         );
         let names: BTreeSet<&str> = schemas
             .iter()
@@ -866,7 +868,7 @@ mod tool_schema_validation_tests {
 
     /// nw-175. EVERY registered tool must reject unknown argument names.
     ///
-    /// Only 11 of 41 did. The consequence is not cosmetic: a mistyped argument
+    /// Only 11 of 42 did. The consequence is not cosmetic: a mistyped argument
     /// was silently dropped and the handler used its default, so the caller got
     /// a plausible answer to a question they did not ask. That exact failure
     /// was hit twice in one review round — `flow_trace` accepting `max_dpeth`
@@ -1031,7 +1033,8 @@ mod tool_schema_validation_tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 35);
+        // 42 registered minus the mutating tools direct read-only hides.
+        assert_eq!(names.len(), 36);
         for mutator in crate::http::MUTATING_TOOLS {
             assert!(!names.contains(mutator), "direct mode advertised {mutator}");
             let error = dispatch(&store, None, mutator, json!({}), None)
@@ -1451,6 +1454,7 @@ mod tool_schema_validation_tests {
 pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
     let categories: &[(&str, &str)] = &[
         ("brain_context", "Core retrieval"),
+        ("code_context", "Core retrieval"),
         ("brain_search", "Core retrieval"),
         ("note_get", "Core retrieval"),
         ("backlinks", "Core retrieval"),
@@ -1735,6 +1739,7 @@ fn dispatch_uncached(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
+        "code_context" => tool_code_context(store, args),
         "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -3188,6 +3193,34 @@ fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
 
 // ── 1. brain_context ────────────────────────────────────────────────────────
 
+fn tool_schema_code_context() -> Value {
+    json!({
+        "name": "code_context",
+        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names or `sym:` UIDs\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seeds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Symbol names or `sym:` UIDs to seed the traversal."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum connected symbols to return. Omit for no cap, which is what the CLI does when --limit is absent."
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
+                }
+            },
+            "required": ["seeds"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
@@ -3302,6 +3335,74 @@ fn tool_schema_brain_context() -> Value {
             "required": ["seeds"]
         }
     })
+}
+
+/// `code_context` — the CODE-only structural subgraph around seed symbols.
+///
+/// Distinct from `brain_context`, and the distinction is the whole point.
+/// `brain_context` runs a HYBRID over code and notes with taxonomy-alias seed
+/// resolution; this runs PPR over the symbol graph alone.
+///
+/// It exists because `nestweaver context` had no RPC of its own. Its daemon
+/// route sent `brain_context`, while its direct path called
+/// `build_context_with_intent` — so one command ran a different algorithm over
+/// a different node set depending on whether a daemon happened to be running,
+/// and the relevance numbers differed for the same query. The command's own
+/// help says "structural subgraph around seed symbols", so the direct path was
+/// the correct one and the daemon route was silently substituting a different
+/// capability.
+fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let seeds: Vec<String> = args
+        .get("seeds")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if seeds.is_empty() {
+        anyhow::bail!("code_context requires at least one seed");
+    }
+    // `Option<usize>`, matching the engine: absent means "no cap", which is
+    // what the CLI passes when `--limit` is omitted. Defaulting to a number
+    // here would silently truncate a route the direct path does not.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let intent = args
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<nestweaver_store::ranking::QueryIntent>()
+                .map_err(|error| anyhow::anyhow!("invalid intent: {error}"))
+        })
+        .transpose()?;
+
+    let result = nestweaver_engine::build_context_with_intent(store, &seeds, intent, limit)?;
+
+    let render = |node: &nestweaver_engine::ContextNode| {
+        json!({
+            "uid": node.uid,
+            "name": node.name,
+            "kind": node.kind,
+            "file_path": node.file_path,
+            "start_line": node.start_line,
+            "signature": node.signature,
+            "relevance": node.relevance,
+        })
+    };
+    Ok(json!({
+        "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
+        "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
+        "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
+        "seeds_resolved": result.seeds.len(),
+        "connected_count": result.connected.len(),
+    }))
 }
 
 fn tool_brain_context(
@@ -9203,7 +9304,7 @@ fn tool_dead_code(
 fn tool_schema_hub_nodes() -> Value {
     json!({
         "name": "hub_nodes",
-        "description": "Identify the most connected symbols in the codebase ranked by total degree (incoming + outgoing edges). These are the architectural core.\n\nGuidelines:\n- Use for quick orientation on which abstractions are most central\n- Includes optional cluster membership when clustering sidecar exists\n- For chokepoints between communities use bridge_nodes instead\n\nLimitations:\n- Degree centrality only — does not account for path importance (use bridge_nodes for betweenness)\n- For specific symbol dependencies use brain_impact or flow_trace",
+        "description": "Identify the most connected symbols in the codebase ranked by total degree (incoming + outgoing edges). These are the architectural core.\n\nGuidelines:\n- Use for quick orientation on which abstractions are most central\n- Includes optional cluster membership when clustering sidecar exists\n- For chokepoints between communities use bridge_nodes instead\n\nLimitations:\n- Degree centrality only — does not account for path importance (use bridge_nodes for betweenness)\n- For specific symbol dependencies use brain_impact or flow_trace\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9285,9 +9386,14 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         "clustering_available": clustering_available,
     });
     if !clustering_available {
-        resp["note"] = json!(
-            "cluster_id is null because clustering has not been computed. Run 'nestweaver cluster' to populate."
+        attach_note(
+            &mut resp,
+            "cluster_id is null because clustering has not been computed. Run 'nestweaver cluster' to populate.".to_string(),
         );
+    }
+    if let Some(note) = ranking_staleness_note(store) {
+        resp["rankings_stale"] = json!(true);
+        attach_note(&mut resp, note);
     }
     Ok(resp)
 }
@@ -9297,7 +9403,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_bridge_nodes() -> Value {
     json!({
         "name": "bridge_nodes",
-        "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact",
+        "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact\n- If `rankings_stale` is true, some repos were indexed before the nw-103 import-fan-out fix and these scores are computed over unrepaired edges — read `note` and re-index before trusting them",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -9361,11 +9467,16 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         })
         .collect();
 
-    Ok(json!({
+    let mut resp = json!({
         "top_n": top_n,
         "count": nodes_json.len(),
         "bridges": nodes_json,
-    }))
+    });
+    if let Some(note) = ranking_staleness_note(store) {
+        resp["rankings_stale"] = json!(true);
+        attach_note(&mut resp, note);
+    }
+    Ok(resp)
 }
 
 // ── 21. blast_radius ─────────────────────────────────────────────────────
@@ -10451,6 +10562,7 @@ pub fn dispatch_via_daemon(
                     "count_patterns" => client.count_patterns(req).await,
                     "cross_repo_contracts" => client.cross_repo_contracts(req).await,
                     "contract_drift" => client.contract_drift(req).await,
+                    "code_context" => client.code_context(req).await,
                     "dead_code" => client.dead_code(req).await,
                     "brain_broken_links" => client.brain_broken_links(req).await,
                     "brain_orphan_documents" => client.brain_orphan_documents(req).await,
@@ -11067,6 +11179,46 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
     let db_path = current_db_path(store)?;
     let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
     Ok(serde_json::to_value(result)?)
+}
+
+/// The nw-103 resolver-staleness disclosure, for tools whose numbers it invalidates.
+///
+/// The CLI has warned about this at four call sites since nw-103. The MCP
+/// surface warned nowhere — so an AGENT asking for hub or bridge rankings got
+/// confidently-wrong numbers with nothing to indicate it, while a human running
+/// the same query through the CLI was told. The rankings are computed over
+/// edges the import-fan-out fix could not repair on disk; upgrading does not
+/// correct them, only re-indexing does.
+///
+/// Kubernetes shipped this exact bug and fixed it the same way in 1.19: the
+/// warning moved out of kubectl and into the API layer, because the CLI is not
+/// the only caller.
+///
+/// This belongs in the RESULT, never in `_meta`. `_meta` is client/UI-facing
+/// and is typically hidden from the model, so a disclosure placed there would
+/// be invisible to precisely the reader that needs it. It is a
+/// natural-language sentence because the model reads text.
+fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
+    let db_path = current_db_path(store).ok()?;
+    let repos = store.list_repos(None).ok()?;
+    let uids: Vec<String> = repos.into_iter().map(|repo| repo.uid).collect();
+    if uids.is_empty() {
+        return None;
+    }
+    nestweaver_engine::resolver_generation::staleness_note(&db_path, &uids)
+}
+
+/// Attach a disclosure to a tool result without dropping one already there.
+///
+/// `note` is this surface's existing human-readable channel and some tools
+/// already set it for a different reason (clustering absent). Overwriting it
+/// would trade one silent omission for another, so applicable notes accumulate.
+fn attach_note(resp: &mut Value, note: String) {
+    let merged = match resp.get("note").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{existing} {note}"),
+        _ => note,
+    };
+    resp["note"] = json!(merged);
 }
 
 fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {
@@ -11686,6 +11838,96 @@ mod cache_dispatch_tests {
             RESPONSE_SHAPE_VERSION,
         );
         assert!(cache.is_empty(), "dirty responses must not be retained");
+    }
+
+    // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
+
+    /// hub_nodes and bridge_nodes rank over edges the nw-103 import-fan-out fix
+    /// could not repair on disk. The CLI has warned about that at four call
+    /// sites; the MCP surface warned nowhere, so an agent got
+    /// confidently-wrong numbers with nothing to indicate it.
+    ///
+    /// Asserted on the RESULT, which is what becomes structuredContent. A
+    /// disclosure in `_meta` would not count: `_meta` is client/UI-facing and
+    /// is typically hidden from the model.
+    #[test]
+    fn stale_rankings_are_disclosed_to_the_agent_in_the_result() {
+        for tool in ["hub_nodes", "bridge_nodes"] {
+            let (_dir, db_path) = index_on_disk();
+            set_current_db_path(db_path.clone());
+            let store = GraphStore::open(&db_path).unwrap();
+
+            // Age the fixture: `index_directory` records a CURRENT generation,
+            // so the sidecar has to go for the repo to look pre-fix — which is
+            // exactly the on-disk state of any graph indexed before nw-103.
+            let sidecar = nestweaver_engine::sidecar_path(
+                &db_path,
+                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+            );
+            fs::remove_file(&sidecar).unwrap();
+
+            let value = dispatch(&store, None, tool, json!({}), None).unwrap();
+
+            assert_eq!(
+                value.get("rankings_stale").and_then(Value::as_bool),
+                Some(true),
+                "{tool} must flag stale rankings"
+            );
+            let note = value
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                note.contains("nw-103") && note.contains("index"),
+                "{tool} note must say what is wrong AND how to fix it, got: {note}"
+            );
+        }
+    }
+
+    /// The other half, and the half that makes the test above mean something:
+    /// once the repos ARE current, the disclosure must go away. Without this,
+    /// a helper hardcoded to always warn would pass.
+    #[test]
+    fn current_rankings_carry_no_staleness_disclosure() {
+        for tool in ["hub_nodes", "bridge_nodes"] {
+            let (_dir, db_path) = index_on_disk();
+            set_current_db_path(db_path.clone());
+            let store = GraphStore::open(&db_path).unwrap();
+
+            for repo in store.list_repos(None).unwrap() {
+                nestweaver_engine::resolver_generation::record(&db_path, &repo.uid).unwrap();
+            }
+
+            let value = dispatch(&store, None, tool, json!({}), None).unwrap();
+
+            assert!(
+                value.get("rankings_stale").is_none(),
+                "{tool} must not flag staleness once every repo is current"
+            );
+            let note = value
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !note.contains("nw-103"),
+                "{tool} must not carry the staleness note once current, got: {note}"
+            );
+        }
+    }
+
+    /// `note` is a shared channel — hub_nodes already used it to say clustering
+    /// is absent. Adding a second disclosure must not silently drop the first,
+    /// which would trade one silent omission for another.
+    #[test]
+    fn a_second_disclosure_does_not_overwrite_the_first() {
+        let mut resp = json!({ "note": "first." });
+        attach_note(&mut resp, "second.".to_string());
+        assert_eq!(resp["note"], json!("first. second."));
+
+        let mut empty = json!({});
+        attach_note(&mut empty, "only.".to_string());
+        assert_eq!(empty["note"], json!("only."));
     }
 
     // ── nw-C2: index-publication wait, classification, and status ───────
