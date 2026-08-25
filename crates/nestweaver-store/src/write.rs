@@ -1203,6 +1203,36 @@ impl GraphStore {
             services,
             service_symbol_edges,
         )?;
+
+        // Invalidate the regex scope for every repo this write touched.
+        //
+        // `bulk_reindex_write` has always done this; this sibling never did.
+        // The consequence was not subtle: a plain `nestweaver index` over an
+        // already-indexed repo left the regex scope acknowledged at its old
+        // epoch, so `regex_search` kept serving the PREVIOUS candidate set —
+        // missing every new symbol, and returning text from code that had been
+        // deleted — until someone happened to run `index --force`.
+        //
+        // Marked here rather than inside `bulk_index_write_on`, because
+        // `bulk_reindex_write` composes that function and then marks the scope
+        // itself; doing it there would advance the epoch twice per reindex.
+        //
+        // Derived from the payload rather than taken as a parameter: this
+        // signature has no repo, and a single write can legitimately span
+        // several (cross-repo service edges). Deduplicated so a repo with
+        // thousands of symbols is marked once.
+        let mut marked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for repo_uid in files
+            .iter()
+            .map(|file| file.repo_uid.as_str())
+            .chain(symbols.iter().map(|symbol| symbol.repo_uid.as_str()))
+            .chain(services.iter().map(|service| service.repo_uid.as_str()))
+        {
+            if !repo_uid.is_empty() && marked.insert(repo_uid) {
+                Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
+            }
+        }
+
         self.commit_transaction(&conn)?;
         Ok(())
     }
@@ -10343,5 +10373,141 @@ mod tests {
             .next()
             .unwrap_or_default();
         assert_eq!(count, 1, "vault preflight failure must preserve old graph");
+    }
+}
+
+/// nw-217 A1: a plain index write must invalidate the regex scope.
+///
+/// `bulk_reindex_write` marked the scope dirty; `bulk_index_write` — its
+/// sibling, reached by an ordinary `nestweaver index` — never did. The regex
+/// scope stayed acknowledged at its old epoch, so `regex_search` kept serving
+/// the PREVIOUS candidate set: missing every new symbol, and returning text
+/// from code that had been deleted, until someone ran `index --force`.
+#[cfg(test)]
+mod regex_scope_invalidation_tests {
+    use super::*;
+    use nestweaver_schema::{File, Repo, Symbol, SymbolKind, Visibility};
+
+    fn store_with_repo(dir: &std::path::Path, repo_uid: &str) -> GraphStore {
+        let store = GraphStore::open_or_create(&dir.join("regex-scope.lbug")).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: "file:///regex-scope".to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some("regex-scope".to_string()),
+                root_path: Some("/regex-scope".to_string()),
+            })
+            .unwrap();
+        store
+    }
+
+    fn one_file_and_symbol(repo_uid: &str, tag: &str) -> (File, Symbol) {
+        let file = File {
+            uid: format!("file:{repo_uid}:{tag}"),
+            path: format!("src/{tag}.rs"),
+            repo_uid: repo_uid.to_string(),
+            content_hash: tag.to_string(),
+        };
+        let symbol = Symbol {
+            uid: format!("sym:{repo_uid}:{tag}"),
+            name: format!("fn_{tag}"),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.path.clone(),
+            start_line: 1,
+            end_line: 2,
+            signature: String::new(),
+            summary: None,
+            content_hash: tag.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        (file, symbol)
+    }
+
+    #[test]
+    fn a_plain_index_write_leaves_the_regex_scope_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_uid = "repo:test:regex-scope";
+        let store = store_with_repo(dir.path(), repo_uid);
+        let (file, symbol) = one_file_and_symbol(repo_uid, "alpha");
+
+        store
+            .bulk_index_write(
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&symbol),
+                &[(repo_uid, file.uid.as_str())],
+                &[(file.uid.as_str(), symbol.uid.as_str())],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.pending_regex_scope_count().unwrap(),
+            1,
+            "the write changed the graph, so regex_search's candidate set is \
+             stale and the scope must be queued for rebuild — otherwise \
+             regex_search serves deleted code until `index --force`"
+        );
+    }
+
+    /// The counterweight. A write that touches NO repo must not queue anything,
+    /// or every no-op write would schedule a needless regex rebuild — and a fix
+    /// that marked unconditionally would pass the test above.
+    #[test]
+    fn an_empty_write_queues_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_uid = "repo:test:regex-scope";
+        let store = store_with_repo(dir.path(), repo_uid);
+
+        store
+            .bulk_index_write(&[], &[], &[], &[], &[], &[])
+            .unwrap();
+
+        assert_eq!(store.pending_regex_scope_count().unwrap(), 0);
+    }
+
+    /// Deduplicated: a repo with many symbols is one scope, marked once. Two
+    /// repos in one write are two scopes.
+    #[test]
+    fn each_touched_repo_is_queued_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_uid = "repo:test:regex-scope";
+        let store = store_with_repo(dir.path(), repo_uid);
+        let (file_a, symbol_a) = one_file_and_symbol(repo_uid, "alpha");
+        let (file_b, symbol_b) = one_file_and_symbol(repo_uid, "beta");
+
+        store
+            .bulk_index_write(
+                &[file_a.clone(), file_b.clone()],
+                &[symbol_a.clone(), symbol_b.clone()],
+                &[
+                    (repo_uid, file_a.uid.as_str()),
+                    (repo_uid, file_b.uid.as_str()),
+                ],
+                &[
+                    (file_a.uid.as_str(), symbol_a.uid.as_str()),
+                    (file_b.uid.as_str(), symbol_b.uid.as_str()),
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.pending_regex_scope_count().unwrap(),
+            1,
+            "four payload entries, one repo, one queued scope"
+        );
     }
 }
