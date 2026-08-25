@@ -124,6 +124,14 @@ const EXIT_NOT_FOUND: i32 = 2;
 /// opposite responses.
 const EXIT_NEEDS_REINDEX: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
+/// A command was invoked incorrectly — unknown flag, bad value, missing
+/// argument.
+///
+/// `EX_USAGE` from BSD `sysexits.h`. Deliberately NOT clap's default of 2:
+/// that collided with `EXIT_NEEDS_REINDEX`, so a CI gate could not tell
+/// `nestweaver stale-chekc` from "your graph is stale". The sysexits range
+/// starts at 64 precisely to avoid clashing with codes programs already use.
+const EXIT_USAGE: i32 = 64;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Explicit device policy for direct local embedding.
@@ -2101,7 +2109,15 @@ enum Commands {
     },
     /// Check if the indexed graph is stale by comparing each repo's
     /// indexed SHA against git HEAD. (Same as `brain stale-check`.)
-    /// Exits 1 when any repo is stale or its working tree is missing —
+    /// Exit codes: 0 = every repo is fresh · 2 = at least one needs a
+    /// re-index · 1 = the check itself could not run · 64 = bad usage.
+    ///
+    /// Gate CI on 2, never on 1: those two demand opposite responses, and a
+    /// gate that treats them alike either re-indexes on a crash or passes on
+    /// real drift. This said "exits 1 when any repo is stale" while the code
+    /// exited 2, which inverted both.
+    ///
+    /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
@@ -4159,7 +4175,15 @@ enum BrainCommands {
     },
     /// Check if the indexed graph is stale by comparing each repo's
     /// indexed SHA against git HEAD.
-    /// Exits 1 when any repo is stale or its working tree is missing —
+    /// Exit codes: 0 = every repo is fresh · 2 = at least one needs a
+    /// re-index · 1 = the check itself could not run · 64 = bad usage.
+    ///
+    /// Gate CI on 2, never on 1: those two demand opposite responses, and a
+    /// gate that treats them alike either re-indexes on a crash or passes on
+    /// real drift. This said "exits 1 when any repo is stale" while the code
+    /// exited 2, which inverted both.
+    ///
+    /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
@@ -8450,7 +8474,37 @@ fn main() {
     }))
     .ok();
 
-    let cli = Cli::parse();
+    // Parse by hand so a USAGE error does not exit 2.
+    //
+    // clap's `Error::exit` uses exit code 2, and `stale-check` uses 2 to mean
+    // "re-index needed" — so `nestweaver stale-chekc` and "your graph is
+    // stale" were the SAME code, and a CI gate could not tell a typo from a
+    // finding. That collision is what made the tri-state unusable, not the
+    // tri-state itself.
+    //
+    // 64 is `EX_USAGE` from BSD `sysexits.h`, whose stated purpose is exactly
+    // this: a base high enough "to reduce the possibility of clashing with
+    // other exit statuses that random programs may already return". `--help`
+    // and `--version` still exit 0 — they are successful requests, and clap
+    // already prints them to stdout.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                    let _ = error.print();
+                    EXIT_SUCCESS
+                }
+                _ => {
+                    let _ = error.print();
+                    EXIT_USAGE
+                }
+            };
+            process::exit(code);
+        }
+    };
 
     // The daemon `run` process installs its own INFO-level, file-based tracing
     // subscriber in run_server. Installing a global stderr subscriber here first
@@ -26056,6 +26110,86 @@ mod incumbent_displacement_tests {
             )
             .unwrap(),
             nestweaver_client::RestartConfig::CompiledDefaults
+        );
+    }
+}
+
+#[cfg(test)]
+mod exit_code_contract_tests {
+    use super::*;
+
+    /// Every documented exit code must mean exactly ONE thing to the command
+    /// that can return it.
+    ///
+    /// `stale-check` used 2 for "re-index needed" while clap used 2 for a
+    /// usage error, so `nestweaver stale-chekc` and "your graph is stale" were
+    /// indistinguishable to a CI gate. That collision — not the tri-state — is
+    /// what made the contract unusable.
+    #[test]
+    fn no_two_meanings_share_an_exit_code() {
+        // NOT_FOUND and NEEDS_REINDEX deliberately share 2: they are disjoint
+        // BY COMMAND (`stale-check` never returns not-found, and no lookup
+        // returns needs-reindex), which is the same per-command scoping POSIX
+        // `grep` and `diff` rely on. Usage is the one that had to move, because
+        // EVERY command can return it — including the gated one.
+        assert_eq!(EXIT_NOT_FOUND, EXIT_NEEDS_REINDEX);
+        for (name, code) in [
+            ("success", EXIT_SUCCESS),
+            ("error", EXIT_ERROR),
+            ("needs-reindex", EXIT_NEEDS_REINDEX),
+            ("ambiguous", EXIT_AMBIGUOUS),
+        ] {
+            assert_ne!(
+                code, EXIT_USAGE,
+                "{name} must not collide with a usage error, which any command can return"
+            );
+        }
+        assert_eq!(EXIT_USAGE, 64, "EX_USAGE from sysexits.h");
+    }
+
+    /// The `--help` text must state the codes the binary actually returns.
+    ///
+    /// It said "exits 1 when any repo is stale" while the code exited 2 —
+    /// inverting BOTH failure modes for anyone who scripted from it: real
+    /// drift read as a pass, a crashed check read as drift.
+    #[test]
+    fn stale_check_help_states_the_real_exit_contract() {
+        // Rendered on a thread with a LARGER STACK. `Cli::command()` builds the
+        // whole 40-plus-command tree and `render_long_help` walks it
+        // recursively; on CI's default 2 MiB test-thread stack that overflows,
+        // while macOS's larger default hid it locally.
+        //
+        // Worth the awkwardness: asserting against a hand-copied string would
+        // pass while the real help said something else, which is the exact
+        // drift this test exists to catch.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_stale_check_help_contract)
+            .expect("spawn a deeper-stacked thread")
+            .join()
+            .expect("the help assertions must not panic");
+    }
+
+    fn assert_stale_check_help_contract() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("stale-check")
+            .expect("stale-check exists")
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            !help.contains("Exits 1 when any repo is stale"),
+            "help must not document an exit code the binary does not return: {help}"
+        );
+        assert!(
+            help.contains("2 = at least one needs a"),
+            "help must name 2 as the re-index code: {help}"
+        );
+        assert!(
+            help.contains("Gate CI on 2, never on 1"),
+            "help must steer the reader away from the inverted gate: {help}"
         );
     }
 }

@@ -409,13 +409,18 @@ full-suite run as the safety net, and use `rts-eval report` to learn what your
 ## Index freshness gate
 
 `affected_tests` and blast-radius results are only as current as the index.
-`stale-check` doubles as a CI freshness gate, with three distinct exit codes:
+`stale-check` doubles as a CI freshness gate, with four distinct exit codes:
 
 | Exit | Meaning | CI response |
 |------|---------|-------------|
 | `0` | Every repo is current and completely indexed | proceed |
 | `1` | **The check itself failed** (bad `--db`, unreachable daemon, git error) | investigate — this is not a staleness signal |
 | `2` | At least one repo needs re-indexing | re-index, then re-run |
+| `64` | The command was invoked incorrectly (unknown flag, bad value) | fix the invocation — `EX_USAGE` from `sysexits.h` |
+
+Usage errors exit `64`, not clap's default of `2`. They used to share `2` with
+"needs re-indexing", so `nestweaver stale-chekc` and real drift were the same
+signal and a gate could not tell a typo from a finding.
 
 Exit `1` is reserved for a check that could not answer, following the same
 convention as `terraform plan -detailed-exitcode` and `git diff --exit-code`.
@@ -445,10 +450,11 @@ name an `incomplete` or `missing` repo.
     # `run:` executes under `bash -e`, so a non-zero exit would abort the
     # step before `case` ever runs. Capture the status instead.
     rc=0
-    nestweaver stale-check --db nestweaver.lbug || rc=$?   # 0 ok · 1 failed · 2 re-index
+    nestweaver stale-check --db nestweaver.lbug || rc=$?   # 0 ok · 1 failed · 2 re-index · 64 bad usage
     case $rc in
       0) ;;
       2) echo "::error::NestWeaver index is out of date"; exit 1 ;;
+      64) echo "::error::stale-check was invoked incorrectly"; exit 1 ;;
       *) echo "::error::stale-check could not run"; exit 1 ;;
     esac
 ```
