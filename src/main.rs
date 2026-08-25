@@ -11331,7 +11331,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Direct-write fallback (NESTWEAVER_NO_DAEMON=1).
             let store = open_store(db.as_deref())?;
 
+            // Parse the scope BEFORE dispatching on format.
+            //
+            // msgpack was handled first, so `--scope` was never parsed on this
+            // path: `--scope vault` produced a code-only file and reported
+            // success, and an INVALID scope succeeded too, because the parse
+            // that would have rejected it never ran. The daemon route rejected
+            // vault, so the two disagreed on both.
+            let export_scope: ExportScope = scope.parse()?;
+
             if format == "msgpack" {
+                // msgpack carries the code graph only. A vault scope is a
+                // request it cannot satisfy, and `all` is the DEFAULT — so
+                // saying nothing there is the nw-173 defect verbatim: a command
+                // named `export` emitting less than it advertises, silently.
+                // The text formats got both halves; msgpack got the refusal on
+                // one transport and no notice anywhere.
+                if export_scope == ExportScope::Vault {
+                    anyhow::bail!(
+                        "msgpack export is code-only and cannot represent the vault \
+                         subgraph; use --format graphml for --scope vault"
+                    );
+                }
+                if export_scope == ExportScope::All {
+                    out.status(
+                        "msgpack is a code-only format: this export contains the code \
+                         subgraph, not the vault. Use --format graphml for the whole graph.",
+                    );
+                }
                 let graph = export_in_memory_graph(&store)?;
                 let bytes = rmp_serde::to_vec(&graph)
                     .with_context(|| "failed to serialize graph to msgpack")?;
@@ -11372,9 +11399,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
-            // Parsed once, before dispatch, so an invalid scope fails before any
-            // output is written rather than half way through a 163 MB file.
-            let export_scope: ExportScope = scope.parse()?;
             // Unknown formats keep their friendly listing and EXIT_ERROR
             // rather than becoming a generic error chain.
             if !matches!(format.as_str(), "cypher" | "graphml" | "mermaid") {

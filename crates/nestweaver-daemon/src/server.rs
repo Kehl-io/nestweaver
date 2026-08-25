@@ -4239,6 +4239,15 @@ impl NestWeaverDaemon for DaemonService {
                         "nodes": graph.uids.len(),
                         "edges": graph.edges.len(),
                         "bytes": bytes.len(),
+                        // The text formats carry this; msgpack did not, so the
+                        // DEFAULT scope silently emitted a code-only file and
+                        // called it a success — the nw-173 defect, surviving in
+                        // the one format that never got the second half of the
+                        // fix.
+                        "notice": (scope == nestweaver_engine::ExportScope::All).then_some(
+                            "msgpack is a code-only format: this export contains the code \
+                             subgraph, not the vault. Use --format graphml for the whole graph."
+                        ),
                     }))
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
