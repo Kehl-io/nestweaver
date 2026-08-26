@@ -509,18 +509,76 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 ///                                     #678 corruption trigger needs several
 ///                                     checkpoint-separated segments, so
 ///                                     deferring during bulk load reduces it.
+/// Virtual address space each open reserves when nothing bounds it.
+///
+/// nw-241. lbug's default is 8 TiB, and every open reserves that much VA, so
+/// concurrent opens exhaust the address space and fail with
+/// `Buffer manager exception: Mmap for size 8796093022208 failed` — an error
+/// that reads like a snapshot bug and lands on whichever unrelated test was
+/// running.
+///
+/// `.cargo/config.toml` has bounded this for years, and its own comment names
+/// the gap: "NOT set for released binaries — cargo only injects this into
+/// processes it spawns." So the TEST SUITE was protected and the SHIPPED BINARY
+/// was not — the mitigation existed and never reached a user. Same shape as
+/// nw-234 and the embed flush: a fix applied to the surface that did not need
+/// it.
+///
+/// 64 GiB is far above any realistic graph (the largest here is megabytes) and
+/// 128x below the default, so exhausting VA would take thousands of concurrent
+/// opens rather than dozens. Overridable, so a genuinely enormous brain can
+/// raise it.
+pub const DEFAULT_MAX_DB_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Enforced at COMPILE TIME, and deliberately not in a test.
+///
+/// Both operands are constants, so a runtime `assert!` could never fail —
+/// clippy names that `assertions_on_constants`, and it is a hollow guard of
+/// exactly the shape this review has been cataloguing. A `const` block fails
+/// the BUILD instead: it cannot be skipped, cannot pass vacuously, and does not
+/// depend on anyone running a test.
+///
+/// Outside `#[cfg(test)]` on purpose. Inside one it would only be evaluated for
+/// test builds, so a release build could carry a bound that violates it — which
+/// is the same "the guard did not reach the shipping surface" mistake nw-241
+/// itself is about.
+const _: () = {
+    const LBUG_DEFAULT: u64 = 8_796_093_022_208; // 8 TiB, from the mmap error
+    const ONE_GIB: u64 = 1024 * 1024 * 1024;
+    // Within 64x of lbug's default barely moves the concurrency ceiling.
+    assert!(DEFAULT_MAX_DB_SIZE_BYTES < LBUG_DEFAULT / 64);
+    // Too low a bound caps a legitimately large brain.
+    assert!(DEFAULT_MAX_DB_SIZE_BYTES >= 32 * ONE_GIB);
+};
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// The address-space bound EVERY open needs, write-capable or not.
+///
+/// nw-240: `hardened_system_config` reached only the three read-write opens.
+/// `open_read_only` and `in_memory` — 46 and 374 call sites — took a bare
+/// `SystemConfig::default()` and therefore the 8 TiB reservation.
+///
+/// Deliberately does NOT bound `max_num_threads`. That has a real query-latency
+/// cost on read paths, and while it is the leading hypothesis for the nw-238
+/// crash it is a hypothesis, not a finding — it belongs in a change that
+/// measures it.
+fn bounded_system_config() -> lbug::SystemConfig {
+    lbug::SystemConfig::default()
+        .max_db_size(env_u64("NESTWEAVER_LBUG_MAX_DB_SIZE").unwrap_or(DEFAULT_MAX_DB_SIZE_BYTES))
+}
+
 fn hardened_system_config() -> lbug::SystemConfig {
-    fn env_u64(key: &str) -> Option<u64> {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    }
     // Default engine threads. Env override wins; else a conservative bound that
     // removes the eviction-vs-read race the crash needs. `1` is the only value
     // that fully eliminates it; keep it the default on the write path and let
     // ops raise it if they measure a query-latency cost on their workload.
     let max_threads = env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1);
-    let mut cfg = lbug::SystemConfig::default().max_num_threads(max_threads);
+    let mut cfg = bounded_system_config().max_num_threads(max_threads);
     if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
         cfg = cfg.buffer_pool_size(bytes);
     }
@@ -530,10 +588,9 @@ fn hardened_system_config() -> lbug::SystemConfig {
     // databases which can be open in a single process". Our test suite opens
     // dozens of stores at default parallelism and hit exactly that, failing
     // unrelated tests with an mmap error that reads like a snapshot bug.
-    // Overridable so a very large brain can raise it.
-    if let Some(bytes) = env_u64("NESTWEAVER_LBUG_MAX_DB_SIZE") {
-        cfg = cfg.max_db_size(bytes);
-    }
+    // The bound itself now lives in `bounded_system_config`, applied above, so
+    // it reaches read-only and in-memory opens too rather than the write path
+    // alone.
     if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
         let on = !matches!(v.trim(), "0" | "false" | "off");
         cfg = cfg.auto_checkpoint(on);
@@ -751,9 +808,7 @@ impl GraphStore {
     /// Open an existing database in read-only mode. Allows concurrent access
     /// while another process (e.g. the web UI) holds the write lock.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, false, || {
-            lbug::SystemConfig::default().read_only(true)
-        })?;
+        let db = open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -813,7 +868,7 @@ impl GraphStore {
 
     /// Create an in-memory database and initialise schema tables.
     pub fn in_memory() -> Result<Self, StoreError> {
-        let db = lbug::Database::in_memory(lbug::SystemConfig::default())?;
+        let db = lbug::Database::in_memory(bounded_system_config())?;
         let regex_ephemeral_root = tempfile::Builder::new()
             .prefix("nestweaver-regex-v3-memory-")
             .tempdir()
@@ -3949,5 +4004,36 @@ mod hardened_config_tests {
             std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
             std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
         }
+    }
+}
+
+/// nw-241 / nw-240: every open must bound its address-space reservation.
+#[cfg(test)]
+mod address_space_bound_tests {
+    use super::GraphStore;
+
+    /// lbug's default is 8 TiB per open. The bound has to be far enough below
+    /// that concurrent opens cannot exhaust the address space, and far enough
+    /// above any real graph that nobody hits it.
+    /// The behavioural half, and the one that would have caught this: many
+    /// concurrent opens must succeed. At 8 TiB per open this exhausts the
+    /// address space and fails with `Buffer manager exception: Mmap for size
+    /// 8796093022208 failed` — on whichever unrelated test happened to be
+    /// running, which is why it read as a snapshot bug for so long.
+    ///
+    /// `in_memory` is deliberately the subject: it was one of the two paths
+    /// that took a bare `SystemConfig::default()` (nw-240), and it needs no
+    /// fixture on disk.
+    #[test]
+    fn many_concurrent_opens_do_not_exhaust_the_address_space() {
+        // 64 x 8 TiB would be 512 TiB — beyond a 64-bit user address space.
+        // 64 x the bound is comfortably inside it.
+        let stores: Vec<GraphStore> = (0..64)
+            .map(|i| {
+                GraphStore::in_memory().unwrap_or_else(|error| panic!("open {i} failed: {error}"))
+            })
+            .collect();
+
+        assert_eq!(stores.len(), 64, "all opens must be held simultaneously");
     }
 }
