@@ -6156,7 +6156,6 @@ pub fn brain_status_json(
 
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
-    let mut unavailable = unavailable;
     if vault_count_failures > 0 {
         unavailable.push("per-vault note counts");
     }
