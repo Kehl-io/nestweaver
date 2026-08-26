@@ -624,17 +624,31 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
-// ── nw-073: lbug optimisticRead crash recurrence ──────────────────────────────
+// ── nw-073 / nw-238: lbug crash recurrence ───────────────────────────────────
 //
-// nw-073 ships MITIGATED, not fixed. Write-capable opens bound the lbug engine
-// thread pool to remove the concurrency the eviction-vs-read race needs, but
-// that rests on an analysis of a crash which was never reproduced locally — and
-// nothing in the product could tell you whether the race was still firing.
-// This scan is that signal, and it is worth more than the root-cause fix,
-// because it says whether the root cause still matters.
+// nw-073 ships MITIGATED, not fixed, and nothing in the product could tell you
+// whether it was still firing. This scan is that signal.
+//
+// nw-239: it could not fire. The signature was the single literal string
+// "optimisticRead", taken from an ANALYSIS of the fault rather than from a
+// report of it — and when the crash was finally captured, the faulting frames
+// were `VectorVersionInfo::getSelVectorForScan` -> `VersionInfo::getSelVectorToScan`
+// -> `ChunkedNodeGroup::scan`, with `optimisticRead` appearing ZERO times. The
+// detector was tuned to a hypothesis, so it stayed silent through every real
+// occurrence and made the mitigation look like it was holding.
+//
+// It now matches on what a report of THIS class actually contains: an lbug
+// frame reached from lbug's own worker pool. That is broad enough to survive
+// the next re-diagnosis, which is the property the previous signature lacked.
 
-/// Stack frame identifying the nw-073 fault.
-const LBUG_CRASH_FRAME: &str = "optimisticRead";
+/// Frames identifying a fault inside lbug. ANY of these is enough — a report
+/// naming lbug's scheduler or storage internals is ours to know about, whatever
+/// the current root-cause theory happens to be.
+const LBUG_CRASH_FRAMES: &[&str] = &[
+    "lbug::storage::",
+    "lbug::processor::",
+    "lbug::common::TaskScheduler",
+];
 
 /// Process-name fragment selecting reports that belong to this product.
 const CRASH_REPORT_PROCESS: &str = "nestweaver";
@@ -670,7 +684,10 @@ fn is_candidate_crash_report(file_name: &str) -> bool {
 
 /// True when a crash report carries the nw-073 signature.
 fn crash_report_matches_signature(file_name: &str, contents: &str) -> bool {
-    is_candidate_crash_report(file_name) && contents.contains(LBUG_CRASH_FRAME)
+    is_candidate_crash_report(file_name)
+        && LBUG_CRASH_FRAMES
+            .iter()
+            .any(|frame| contents.contains(frame))
 }
 
 /// Outcome of a crash-report sweep.
@@ -723,7 +740,7 @@ fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
             "no crash-report directory could be read, so recurrence is UNKNOWN — this is not a clean bill of health; set {CRASH_REPORT_DIRS_ENV} to point at readable directories"
         ),
         _ if !scan.matched_reports.is_empty() => format!(
-            "nw-073 IS STILL FIRING — {} crash report(s) carry the {LBUG_CRASH_FRAME} signature; the thread-pool mitigation is not holding and the root-cause fix (BM_MALLOC reader pinning) is required",
+            "AN LBUG CRASH IS FIRING — {} crash report(s) carry an lbug frame. The thread-pool mitigation is not holding. Do NOT assume the nw-073 eviction-vs-read analysis: the captured fault (nw-238) was a NULL deref in VectorVersionInfo::getSelVectorForScan with optimisticRead absent entirely, so read the report before choosing a remedy",
             scan.matched_reports.len()
         ),
         "partial" => format!(
@@ -732,7 +749,7 @@ fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
             scan.unreadable.len()
         ),
         _ => format!(
-            "no crash reports carry the {LBUG_CRASH_FRAME} signature across {} directories ({} candidate report(s) examined); the mitigation appears to be holding",
+            "no crash reports carry an lbug frame across {} directories ({} candidate report(s) examined); the mitigation appears to be holding",
             scan.directories_read, scan.reports_examined
         ),
     }
@@ -740,8 +757,8 @@ fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
 
 fn crash_recurrence_value(scan: &CrashRecurrenceScan) -> serde_json::Value {
     serde_json::json!({
-        "backlog_id": "nw-073",
-        "signature": format!("lbug::storage::BufferManager::{LBUG_CRASH_FRAME}"),
+        "backlog_id": "nw-238",
+        "signature": LBUG_CRASH_FRAMES,
         "status": scan.status(),
         // Null rather than 0 when nothing was scanned: a zero here would be a
         // claim the scan never earned.
@@ -20019,11 +20036,20 @@ fn run_brain(
 
             let mut total_dropped = 0usize;
             let mut rows_cleaned = 0usize;
+            let mut reconciliation_failures: Vec<String> = Vec::new();
             for uid in &uids_to_remove {
                 match rt.block_on(client.remove_vault(uid)) {
                     Ok(resp) => {
                         total_dropped += resp.notes_deleted as usize;
                         rows_cleaned += 1;
+                        // The daemon already rebuilt the search index as part
+                        // of the removal, and already reports whether that
+                        // succeeded. Its answer is the one to relay.
+                        reconciliation_failures.extend(
+                            resp.reconciliation_failures
+                                .iter()
+                                .map(|failure| failure.message.clone()),
+                        );
                     }
                     Err(e) => {
                         eprintln!("Error: failed to remove vault '{uid}': {e}.");
@@ -20031,40 +20057,38 @@ fn run_brain(
                     }
                 }
             }
-            // `brain add` and `brain refresh` both rebuild Tantivy after
-            // mutating vault notes; this command only printed that the index
-            // "may be stale" and left it to the user. The asymmetry matters
-            // more here than on the other two: a stale index after an ADD
-            // merely MISSES new notes, while a stale index after a REMOVE
-            // keeps RETURNING notes from a vault the user deliberately
-            // dropped. Wrong answers, not missing ones.
-            let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let reindex = TantivyIndex::open_or_create(&tantivy_path)
-                .map_err(anyhow::Error::from)
-                .and_then(|tantivy| {
-                    let store_for_tantivy = open_store(Some(&db_path))?;
-                    tantivy
-                        .reindex_from_store(&store_for_tantivy)
-                        .map_err(anyhow::Error::from)
-                });
-
-            match reindex {
-                Ok(count) => println!(
+            // The rebuild is the DAEMON's, and this command always routes
+            // through it — `DaemonClient::connect` above autostarts one.
+            //
+            // nw-242: this used to open Tantivy from the CLI and rebuild it
+            // here. That could never work: the daemon it just talked to holds
+            // tantivy's INDEX_WRITER_LOCK for its lifetime, so
+            // `open_or_create` was refused every time, and the refusal was
+            // reported as "the search index could NOT be rebuilt … brain
+            // search will keep returning notes from this vault" — on EVERY
+            // SUCCESSFUL removal, for work the daemon had already done
+            // (`rebuild_tantivy_after_mutation` in `remove_vault`).
+            //
+            // The concern behind it was right — a stale index after a REMOVE
+            // keeps RETURNING notes from a dropped vault, which is worse than
+            // the misses a stale index after an ADD causes. It was already
+            // handled one layer down, and I did not check before adding a
+            // second writer.
+            if reconciliation_failures.is_empty() {
+                println!(
                     "Removed vault '{vault_name}' ({total_dropped} note(s) dropped, \
-                     {rows_cleaned} row(s) cleaned). Search index rebuilt \
-                     ({count} document(s))."
-                ),
-                // Named in the OUTPUT, not just the log. The removal itself
-                // succeeded and is not being rolled back, so the exit code
-                // stays 0 — but the user has to be told that search will keep
-                // answering with the vault they just removed until they act.
-                Err(error) => println!(
+                     {rows_cleaned} row(s) cleaned). Search index rebuilt."
+                );
+            } else {
+                println!(
                     "Removed vault '{vault_name}' ({total_dropped} note(s) dropped, \
                      {rows_cleaned} row(s) cleaned).\n\
-                     WARNING: the search index could NOT be rebuilt ({error:#}), so \
-                     `brain search` will keep returning notes from this vault. Run \
-                     `nestweaver brain reindex-search` to clear them."
-                ),
+                     WARNING: {} post-commit step(s) failed, so `brain search` may \
+                     keep returning notes from this vault. Run \
+                     `nestweaver brain reindex-search` to clear them:\n  {}",
+                    reconciliation_failures.len(),
+                    reconciliation_failures.join("\n  ")
+                );
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -29011,6 +29035,53 @@ mod diagnostics_cli_tests {
     /// routinely contain `optimisticRead`, because it is a hot read path. If
     /// they counted, the tool would announce a use-after-free on every warm
     /// index run.
+    /// nw-239. The signature was the literal "optimisticRead", taken from an
+    /// ANALYSIS of the fault rather than a report of it — so when the crash was
+    /// finally captured, the detector stayed silent and the mitigation looked
+    /// like it was holding.
+    ///
+    /// The frames below are from the real report
+    /// (nestweaver_engine-…-2026-08-26-074946.ips, nw-238). `optimisticRead`
+    /// does not appear in it, which is the whole point.
+    #[test]
+    fn the_real_captured_crash_is_recognised() {
+        let real_frames = "\
+            3   nestweaver_engine  lbug::storage::VectorVersionInfo::getSelVectorForScan\n\
+            4   nestweaver_engine  lbug::storage::VersionInfo::getSelVectorToScan\n\
+            5   nestweaver_engine  lbug::storage::ChunkedNodeGroup::scan\n\
+            9   nestweaver_engine  lbug::common::TaskScheduler::runWorkerThread\n";
+
+        assert!(
+            !real_frames.contains("optimisticRead"),
+            "fixture must reflect the real report, where that frame is absent"
+        );
+        assert!(
+            crash_report_matches_signature(
+                "nestweaver_engine-abc-2026-08-26-074946.ips",
+                real_frames
+            ),
+            "the detector must recognise the crash that actually happened"
+        );
+    }
+
+    /// The counterweight: an unrelated crash in another process must NOT match,
+    /// or the alarm becomes noise and gets ignored — which is the same
+    /// end-state as never firing.
+    #[test]
+    fn an_unrelated_crash_does_not_match() {
+        let foreign = "2  someotherapp  std::sys::unix::thread::Thread::new\n";
+
+        assert!(!crash_report_matches_signature(
+            "someotherapp-2026-08-26.ips",
+            foreign
+        ));
+        // Right process, but nothing to do with lbug.
+        assert!(!crash_report_matches_signature(
+            "nestweaver-2026-08-26.ips",
+            "1  nestweaver  core::panicking::panic_fmt\n"
+        ));
+    }
+
     #[test]
     fn resource_diagnostics_are_not_crash_reports() {
         let sampled_frame = "6   lbug::storage::BufferManager::optimisticRead(...)";
@@ -29129,7 +29200,15 @@ mod diagnostics_cli_tests {
         assert_eq!(value["status"], "scanned");
         assert_eq!(value["crash_reports_matched"], 1);
         let note = value["note"].as_str().unwrap_or_default();
-        assert!(note.contains("STILL FIRING"), "note was: {note}");
+        assert!(note.contains("IS FIRING"), "note was: {note}");
+        // nw-239: the note must NOT assert the old eviction-vs-read diagnosis,
+        // which the captured crash falsified. Saying "the mitigation is not
+        // holding" is a fact about the alarm; naming a root cause is a claim
+        // the report has to support.
+        assert!(
+            note.contains("read the report before choosing a remedy"),
+            "note was: {note}"
+        );
     }
 
     /// End-to-end over a fixture directory, via the documented override. This
