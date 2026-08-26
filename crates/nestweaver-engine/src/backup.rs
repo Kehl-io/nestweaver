@@ -952,8 +952,11 @@ fn backup_artifact_contract(
             Some(".manifests.json") => anyhow::bail!(
                 "repository manifest contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),
+            // v2: repo-keyed. Bumped with the format, or a restore would
+            // reintroduce a v1 flat payload under a v2 contract claim — the
+            // artifact vouching for a shape it does not have.
             Some(".gitactivity.json") => {
-                (ArtifactKind::GitActivity, 1, "nestweaver-git-activity-v1")
+                (ArtifactKind::GitActivity, 2, "nestweaver-git-activity-v2")
             }
             Some(".cochange.json") => (ArtifactKind::Cochange, 1, "nestweaver-cochange-v1"),
             Some(".interactions.json") => {

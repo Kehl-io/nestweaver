@@ -112,6 +112,15 @@ pub fn run_stdio_server(
         store.load_interaction_cache(scores);
     }
 
+    // nw-234: and the git-activity sidecar, which this path also skipped. The
+    // comment above the PageRank load says "same behaviour as the CLI" — it was
+    // not: the CLI loads three sidecars and this loaded two, so
+    // `--with-git-activity` had no effect on anything an agent asked for.
+    let ga_path = nestweaver_engine::sidecar_path(db_path, ".gitactivity.json");
+    if let Err(error) = store.load_git_activity_sidecar(&ga_path) {
+        tracing::debug!(error = %error, "git-activity sidecar not loaded; ranking stays neutral");
+    }
+
     // Open the Tantivy index sidecar in read-only mode. The MCP server
     // only searches — it never writes to the index. Reader-only mode
     // avoids contending for the writer lock with a running brain watcher.

@@ -17,6 +17,11 @@ pub struct SymbolBasic {
     pub name: String,
     pub file_path: String,
     pub kind: String,
+    /// Needed because `file_path` is REPO-RELATIVE. Any per-file lookup keyed
+    /// on the path alone matches the wrong repo whenever two repos share a
+    /// name — `src/main.rs`, `README.md` (nw-233). Parsing it back out of `uid`
+    /// is not an option: `repo_uid` itself contains colons.
+    pub repo_uid: String,
 }
 
 /// Edge data for clustering: (source_uid, target_uid, confidence).
@@ -2000,7 +2005,7 @@ impl GraphStore {
     pub fn load_code_symbols_and_edges(&self) -> Result<CodeGraph, StoreError> {
         let conn = self.conn()?;
 
-        let q = "MATCH (s:Symbol) RETURN s.uid, s.name, s.file_path, s.kind";
+        let q = "MATCH (s:Symbol) RETURN s.uid, s.name, s.file_path, s.kind, s.repo_uid";
         let result = conn
             .query(q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -2010,11 +2015,13 @@ impl GraphStore {
             let name = extract_string(&row, 1)?;
             let file_path = extract_string(&row, 2)?;
             let kind = extract_string(&row, 3)?;
+            let repo_uid = extract_string(&row, 4)?;
             symbols.push(SymbolBasic {
                 uid,
                 name,
                 file_path,
                 kind,
+                repo_uid,
             });
         }
 

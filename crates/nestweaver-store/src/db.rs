@@ -311,7 +311,11 @@ pub struct GraphStore {
     /// demoted relative to actively-developed code. Absent file → neutral
     /// (multiplier 1.0). Loaded from the `<db>.gitactivity.json` sidecar; never
     /// affects the PPR fixpoint.
-    pub(crate) git_activity_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// repo uid -> (repo-relative path -> recency score).
+    ///
+    /// The repo dimension is load-bearing: paths here are REPO-RELATIVE, so a
+    /// flat map made two repos collide on every shared name (nw-233).
+    pub(crate) git_activity_cache: Mutex<Option<HashMap<String, HashMap<String, f64>>>>,
     /// Feature F12: the `[ranking] git_activity_weight` to use when applying the
     /// recency multiplier. Defaults to [`crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT`]
     /// (1.2); `set_git_activity_weight` overrides it from config.
@@ -943,7 +947,7 @@ impl GraphStore {
     /// `pagerank_score` is multiplied at read time by a clamped recency factor
     /// (see [`git_activity_multiplier`]). Passing an empty map is equivalent to
     /// not loading at all (every file → neutral).
-    pub fn load_git_activity_cache(&self, scores: HashMap<String, f64>) {
+    pub fn load_git_activity_cache(&self, scores: HashMap<String, HashMap<String, f64>>) {
         *self
             .git_activity_cache
             .lock()
@@ -964,20 +968,37 @@ impl GraphStore {
         if path.exists() {
             let json = std::fs::read_to_string(path)
                 .map_err(|e| StoreError::Query(format!("read: {e}")))?;
-            let scores: HashMap<String, f64> = serde_json::from_str(&json)
-                .map_err(|e| StoreError::Query(format!("deserialize: {e}")))?;
-            self.load_git_activity_cache(scores);
+            // Version-checked and repo-keyed. A v1 flat map fails this parse
+            // and is treated as absent, which is neutral rather than wrong.
+            let sidecar: crate::git_activity_sidecar::GitActivitySidecar =
+                match serde_json::from_str(&json) {
+                    Ok(sidecar) => sidecar,
+                    Err(error) => {
+                        tracing::debug!(
+                            path = %path.display(),
+                            error = %error,
+                            "git-activity sidecar corrupt or legacy v1 flat format; ignoring"
+                        );
+                        return Ok(());
+                    }
+                };
+            self.load_git_activity_cache(sidecar.repos);
         }
         Ok(())
     }
 
-    /// Return the git-activity recency score for a repo-relative file `path`,
-    /// or `None` when no score is loaded for it (→ neutral multiplier).
-    pub fn git_activity_score(&self, path: &str) -> Option<f64> {
-        self.git_activity_cache
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|m| m.get(path).copied()))
+    /// Return the git-activity recency score for a file, or `None` when none is
+    /// loaded for it (→ neutral multiplier of exactly 1.0).
+    ///
+    /// Keyed by repo FIRST. `path` is repo-relative, so without the repo uid
+    /// two repos sharing `src/main.rs` returned each other's recency.
+    pub fn git_activity_score(&self, repo_uid: &str, path: &str) -> Option<f64> {
+        self.git_activity_cache.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|repos| repos.get(repo_uid))
+                .and_then(|paths| paths.get(path).copied())
+        })
     }
 
     /// True when git-activity recency scores are loaded (Feature F12 active).

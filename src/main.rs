@@ -15057,8 +15057,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     out.status("No usable git history found; git-activity sidecar not written.");
                 } else {
                     let ga_path = nestweaver_engine::sidecar_path(&db_path, ".gitactivity.json");
-                    nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path)
-                        .with_context(|| "save git activity sidecar")?;
+                    // Same derivation the indexer uses, because `result` is
+                    // scoped to the branch above. The sidecar is repo-keyed
+                    // now, so this call has to name a repo.
+                    let ga_repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_url);
+                    nestweaver_engine::git_activity::save_git_activity_for_repo(
+                        &ga_repo_uid,
+                        &scores,
+                        &ga_path,
+                    )
+                    .with_context(|| "save git activity sidecar")?;
                     out.status(&format!(
                         "Git activity sidecar written ({} files scored).",
                         scores.len()
@@ -17426,7 +17434,7 @@ fn run_ranking(
                 .get(&resolved)
                 .copied()
                 .unwrap_or(0.0);
-            let git_activity_score = store.git_activity_score(&sym.file_path);
+            let git_activity_score = store.git_activity_score(&sym.repo_uid, &sym.file_path);
             let weight = store.git_activity_weight();
             let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
             let final_rank = base_pagerank * multiplier;

@@ -1273,8 +1273,15 @@ impl GraphStore {
                 scores.get(&sym.uid).copied().map(|score| {
                     let effective = match &git_activity {
                         Some(ga) => {
-                            let mult =
-                                git_activity_multiplier(ga.get(&sym.file_path).copied(), ga_weight);
+                            // Repo-keyed. `file_path` is REPO-RELATIVE, so the
+                            // old flat lookup returned another repo's recency
+                            // for any shared name (nw-233).
+                            let mult = git_activity_multiplier(
+                                ga.get(&sym.repo_uid)
+                                    .and_then(|paths| paths.get(&sym.file_path))
+                                    .copied(),
+                                ga_weight,
+                            );
                             score * mult
                         }
                         None => score,
@@ -3399,6 +3406,52 @@ mod tests {
     }
 
     #[test]
+    /// nw-233's read half: `file_path` is REPO-RELATIVE, so a flat lookup
+    /// returned another repo's recency for any shared name. A score filed under
+    /// a DIFFERENT repo must not reach these symbols at all.
+    #[test]
+    fn a_score_filed_under_another_repo_does_not_reach_this_ones_symbols() {
+        let store = test_store();
+        let mut sym = make_symbol("F", "shared_name");
+        sym.file_path = "src/main.rs".to_string();
+        store.insert_symbol(&sym).unwrap();
+        store
+            .compute_pagerank(0.85, 30, &crate::GraphScope::code_only())
+            .unwrap();
+
+        let baseline = store
+            .symbols_by_pagerank(None)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.uid == "F")
+            .unwrap()
+            .pagerank_score
+            .unwrap();
+
+        // Same relative path, WRONG repo — the classic collision.
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("src/main.rs".to_string(), 0.95);
+        let mut ga = std::collections::HashMap::new();
+        ga.insert("repo-SOMEONE-ELSE".to_string(), paths);
+        store.load_git_activity_cache(ga);
+
+        let after = store
+            .symbols_by_pagerank(None)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.uid == "F")
+            .unwrap()
+            .pagerank_score
+            .unwrap();
+
+        assert!(
+            (after - baseline).abs() < 1e-9,
+            "another repo's src/main.rs must not change this repo's ranking \
+             ({baseline} -> {after})"
+        );
+    }
+
+    #[test]
     fn git_activity_demotes_stale_file_at_read_time() {
         // Two symbols with identical structural position but different files.
         // Both get the same base pagerank; loading git-activity scores that
@@ -3430,9 +3483,12 @@ mod tests {
         );
 
         // Load recency scores and re-read.
+        // Repo-keyed (nw-233). `make_symbol` files everything under "repo-1".
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("src/fresh.rs".to_string(), 0.95);
+        paths.insert("src/stale.rs".to_string(), 0.05);
         let mut ga = std::collections::HashMap::new();
-        ga.insert("src/fresh.rs".to_string(), 0.95);
-        ga.insert("src/stale.rs".to_string(), 0.05);
+        ga.insert("repo-1".to_string(), paths);
         store.load_git_activity_cache(ga);
 
         let ranked = store.symbols_by_pagerank(None).unwrap();
@@ -3474,8 +3530,10 @@ mod tests {
             .pagerank_score
             .unwrap();
 
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("src/scored.rs".to_string(), 0.9); // only A's file
         let mut ga = std::collections::HashMap::new();
-        ga.insert("src/scored.rs".to_string(), 0.9); // only A's file
+        ga.insert("repo-1".to_string(), paths);
         store.load_git_activity_cache(ga);
 
         let after_b = store

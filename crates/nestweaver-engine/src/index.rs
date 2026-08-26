@@ -47,6 +47,12 @@ struct HandlerFileData {
 /// derived because the contract-status fields are asserted on in tests.
 #[derive(Debug, Clone)]
 pub struct IndexResult {
+    /// Which repo this run indexed.
+    ///
+    /// Callers that write REPO-KEYED sidecars need it, and previously had to
+    /// re-derive it from (instance_id, url) or go without — which is how the
+    /// git-activity sidecar ended up with no repo dimension at all (nw-233).
+    pub repo_uid: String,
     pub symbols_count: usize,
     pub edges_count: usize,
     pub files_count: usize,
@@ -405,6 +411,32 @@ fn remove_repo_sidecar_slices_with_io(
             Some(repo_uid),
             format!("{}: {error:#}", resolution_deps_path.display()),
         );
+    }
+
+    // gitactivity — nw-233. Could not be sliced before, because the sidecar had
+    // no repo dimension to slice ON; the whole file was one flat map. Now that
+    // it is repo-keyed, the deleted repo's rows must go with it, or removing
+    // and re-adding a repo at the same path resurrects recency scores mined
+    // from a graph state that no longer exists.
+    //
+    // A SAFE stage, not a required one: a stale slice biases ranking toward
+    // whatever those paths used to be, which is a quality issue rather than a
+    // correctness one — unlike resolution_deps, where a durable slice for a
+    // deleted UID can change what a later incremental resolution RESOLVES TO.
+    let gitactivity_path = crate::sidecar_path(db_path, ".gitactivity.json");
+    if gitactivity_path.exists() {
+        let mut sidecar = crate::git_activity::load_git_activity_sidecar(&gitactivity_path);
+        if sidecar.repos.remove(repo_uid).is_some()
+            && let Err(error) =
+                crate::git_activity::save_git_activity_sidecar(&sidecar, &gitactivity_path)
+        {
+            tracing::debug!(
+                path = %gitactivity_path.display(),
+                repo = %repo_uid,
+                error = %error,
+                "git-activity slice for the deleted repo could not be removed"
+            );
+        }
     }
 }
 
@@ -3947,6 +3979,7 @@ where
         );
 
         let result = IndexResult {
+            repo_uid: r_uid.clone(),
             symbols_count,
             edges_count,
             files_count,

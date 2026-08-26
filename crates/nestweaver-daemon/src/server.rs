@@ -4831,9 +4831,13 @@ impl NestWeaverDaemon for DaemonService {
                                 &state.db_path,
                                 ".gitactivity.json",
                             );
-                            if let Err(e) = nestweaver_engine::git_activity::save_git_activity(
-                                &scores, &ga_path,
-                            ) {
+                            if let Err(e) =
+                                nestweaver_engine::git_activity::save_git_activity_for_repo(
+                                    &result.repo_uid,
+                                    &scores,
+                                    &ga_path,
+                                )
+                            {
                                 tracing::warn!("save git activity sidecar failed: {e}");
                             } else {
                                 let _ = tx.blocking_send(Ok(IndexProgress {
@@ -9944,6 +9948,20 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
     let interactions_load_ms = interactions_started.elapsed().as_millis() as u64;
+
+    // nw-234: the daemon never loaded this, so `--with-git-activity` mined the
+    // history, wrote the sidecar, reported "N files scored", and then changed
+    // NOTHING for anyone querying through the daemon — which is the default
+    // route. The CLI's direct path loaded all three sidecars; this loaded two.
+    // A flag that costs time at index and affects nothing at query is a success
+    // message for work with no effect.
+    //
+    // Absent or old-format is neutral by construction (a missing score yields a
+    // multiplier of exactly 1.0), so this cannot make results worse.
+    let ga_path = nestweaver_engine::sidecar_path(&db_path, ".gitactivity.json");
+    if let Err(error) = store.load_git_activity_sidecar(&ga_path) {
+        tracing::debug!(error = %error, "git-activity sidecar not loaded; ranking stays neutral");
+    }
 
     // Open the Tantivy index. A read-only snapshot replica intentionally
     // disables search reconciliation and uses a reader when one is available.
