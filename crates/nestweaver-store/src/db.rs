@@ -4010,7 +4010,7 @@ mod hardened_config_tests {
 /// nw-241 / nw-240: every open must bound its address-space reservation.
 #[cfg(test)]
 mod address_space_bound_tests {
-    use super::{DEFAULT_MAX_DB_SIZE_BYTES, GraphStore};
+    use super::GraphStore;
 
     /// lbug's default is 8 TiB per open. The bound has to be far enough below
     /// that concurrent opens cannot exhaust the address space, and far enough
