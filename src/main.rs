@@ -8978,8 +8978,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
-                        let repos: Vec<nestweaver_schema::Repo> =
-                            serde_json::from_value(value).unwrap_or_default();
+                        // `unwrap_or_default()` here printed "No repositories
+                        // found." when a single field failed to decode — while
+                        // `repo_count`, computed from the SAME payload three
+                        // lines up, said otherwise. An empty list is a fact
+                        // about the graph; a decode failure is a fact about
+                        // this process, and the two must not look alike.
+                        let repos: Vec<nestweaver_schema::Repo> = serde_json::from_value(value)
+                            .with_context(|| {
+                                format!("decode {repo_count} repo(s) from the daemon")
+                            })?;
                         if repos.is_empty() {
                             println!("No repositories found.");
                         } else {
@@ -9279,8 +9287,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
+                        // Same shape as `list-repos` above: a decode failure
+                        // must not read as "the graph has none".
                         let services: Vec<nestweaver_schema::Service> =
-                            serde_json::from_value(value).unwrap_or_default();
+                            serde_json::from_value(value)
+                                .context("decode service list from the daemon")?;
                         if services.is_empty() {
                             println!("No services found.");
                         } else {

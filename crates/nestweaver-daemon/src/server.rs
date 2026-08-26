@@ -6322,6 +6322,18 @@ impl NestWeaverDaemon for DaemonService {
                 .list_repos(None)
                 .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
 
+            // `unwrap_or(0)` made a failed read indistinguishable from a repo
+            // that genuinely has no symbols — which reads as "this repo was
+            // never indexed", the single most alarming thing this response can
+            // say, produced by a transient query error.
+            //
+            // `symbol_count` is an `i64` on the wire, so there is no null to
+            // return. The alternatives are a sentinel (which every caller would
+            // have to know about) or failing the RPC — and failing is what the
+            // sibling read three lines up already does: `list_repos` maps its
+            // error to `Status::internal`. These counts ARE this response, so a
+            // response that cannot compute them is not a degraded answer, it is
+            // no answer.
             let repo_states: Vec<RepoState> = repos
                 .into_iter()
                 .map(|r| {
@@ -6329,8 +6341,10 @@ impl NestWeaverDaemon for DaemonService {
                         .store
                         .symbol_names_by_repo(&r.uid)
                         .map(|v| v.len() as i64)
-                        .unwrap_or(0);
-                    RepoState {
+                        .map_err(|e| {
+                            Status::internal(format!("symbol count for {} failed: {e:#}", r.uid))
+                        })?;
+                    Ok(RepoState {
                         repo_uid: r.uid,
                         repo_url: r.url.clone(),
                         repo_name: r.name.clone().unwrap_or_else(|| {
@@ -6338,9 +6352,9 @@ impl NestWeaverDaemon for DaemonService {
                         }),
                         indexed_sha: r.indexed_sha,
                         symbol_count,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Status>>()?;
 
             Ok::<_, Status>(RepoStatesResponse { repos: repo_states })
         })

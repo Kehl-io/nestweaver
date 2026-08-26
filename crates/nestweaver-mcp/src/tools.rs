@@ -4356,13 +4356,25 @@ fn tool_brain_search(
     let fetched_symbol_candidates = symbol_page.results.len();
     let mut code_hits = symbol_page.results;
     if let Some(repos) = restricted_repos {
-        code_hits.retain(|candidate| {
-            store
-                .lookup_symbol(&candidate.uid)
-                .ok()
-                .is_some_and(|symbol| {
-                    !symbol.repo_uid.trim().is_empty() && repos.contains(&symbol.repo_uid)
-                })
+        // Dropping a candidate whose symbol cannot be read is FAIL-CLOSED, and
+        // for an authorization filter that is the right default — including a
+        // hit we cannot attribute to a repo would leak it. The behaviour stays.
+        //
+        // What was wrong is that it was SILENT: a store error and a genuine
+        // authz exclusion were indistinguishable, so a scoped search could
+        // return fewer results (or none) with nothing anywhere saying a read
+        // had failed. `authorized_symbol_total` accounts for the filtering, not
+        // for the failure.
+        code_hits.retain(|candidate| match store.lookup_symbol(&candidate.uid) {
+            Ok(symbol) => !symbol.repo_uid.trim().is_empty() && repos.contains(&symbol.repo_uid),
+            Err(error) => {
+                tracing::warn!(
+                    uid = %candidate.uid,
+                    "brain_search: dropping candidate whose symbol could not be read \
+                     during repo-scope filtering: {error}"
+                );
+                false
+            }
         });
     }
     let symbol_total = if restricted_repos.is_some() {
@@ -5808,9 +5820,15 @@ fn resolve_note_by_title(
     }
 
     // Uses list_notes_lite to avoid loading full note bodies during the scan.
-    let Ok(all_notes) = store.list_notes_lite(None) else {
-        return Ok(None);
-    };
+    //
+    // Propagated, not swallowed. `let Ok(..) else { return Ok(None) }` turned a
+    // failed scan into "no such note", so a store error reached the caller as a
+    // proven absence — and the caller renders that as
+    // "no note found with title '<title>'", which is a claim about the VAULT
+    // made on the strength of a failure to read it.
+    let all_notes = store
+        .list_notes_lite(None)
+        .with_context(|| format!("scan notes while resolving title '{title}'"))?;
     let needle = title.to_lowercase();
     let wanted_slug = slug_normalize(title);
     let stem_of = |path: &str| {
@@ -5828,7 +5846,15 @@ fn resolve_note_by_title(
             })
         });
     match hit {
-        Some(hit) => Ok(store.lookup_note(&hit.uid).ok()),
+        // `.ok()` here was the sharpest form of the same defect: the title
+        // MATCHED a row, and then a failed hydration of that row became `None`
+        // — "no note found with that title" about a note we had just found.
+        // The uid branch at the top of this function already propagates with
+        // `with_context(...)?`; same function, opposite handling.
+        Some(hit) => store
+            .lookup_note(&hit.uid)
+            .map(Some)
+            .with_context(|| format!("hydrate note '{}' matched by title", hit.uid)),
         None => Ok(None),
     }
 }
@@ -5962,11 +5988,32 @@ pub fn brain_status_json(
         }
     };
 
+    // Counted rather than named per vault, because `unavailable` is a list of
+    // stable labels and a vault name is neither stable nor bounded.
+    let mut vault_count_failures = 0usize;
     let vaults_json: Vec<Value> = vaults
         .iter()
         .map(|v| {
-            let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
-            let note_count = notes.len();
+            // Same defect as the totals above, and it survived the fix that
+            // wrote that comment: `unwrap_or_default()` turns a failed read
+            // into a vault holding zero notes. The per-vault number is the one
+            // a caller actually looks at when deciding whether a vault indexed
+            // correctly, so a confident zero here is the most misleading of
+            // the set.
+            let (notes, note_count) = match store.list_notes(Some(&v.uid)) {
+                Ok(notes) => {
+                    let count = notes.len();
+                    (notes, json!(count))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        vault = %v.uid,
+                        "brain_status: per-vault note count unavailable: {error}"
+                    );
+                    vault_count_failures += 1;
+                    (Vec::new(), Value::Null)
+                }
+            };
             // Prefer the extension-store timestamp (actual indexer run);
             // fall back to max(note.modified_at) for older databases.
             let ext_ts = db_path
@@ -6123,6 +6170,12 @@ pub fn brain_status_json(
         })
     });
 
+    // Fold the per-vault failures into the same disclosure the totals use, so
+    // a caller has ONE place to look for "what could not be read".
+    if vault_count_failures > 0 {
+        unavailable.push("per-vault note counts");
+    }
+
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
         // path gains them additively so both paths serve one schema.
@@ -6142,7 +6195,9 @@ pub fn brain_status_json(
         // count is `null` because it could not be READ — not that it is zero.
         // A caller must not act on a null the way it would act on a 0.
         "unavailable": unavailable,
-        "counts_complete": unavailable.is_empty(),
+        // `counts_complete` must account for the PER-VAULT counts too, or it
+        // claims completeness for a payload that carries nulls.
+        "counts_complete": unavailable.is_empty() && vault_count_failures == 0,
         "repos": repos_json,
         "repo_count": repos.len(),
         "server_mode": is_server_mode(),
@@ -8143,11 +8198,20 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
         let is_valid_sha =
             repo.indexed_sha.len() == 40 && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-        let commits_behind = match (&current_head, repo.local_root()) {
+        //
+        // `unwrap_or(0)` here produced a CONTRADICTION rather than a missed
+        // staleness: this branch is only reached when HEAD differs from the
+        // indexed SHA, so `is_stale` is already true — and the row then read
+        // "stale, 0 commits behind". Exactly the kind of self-inconsistent
+        // output nw-163 (below) was raised to remove.
+        //
+        // `None` means "we could not count", which is what a failed `git
+        // rev-list` actually tells us, and is distinguishable from a real zero.
+        let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
             (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
-                count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
+                count_commits_between(path, &repo.indexed_sha, head)
             }
-            _ => repo.staleness_commits_behind as u64,
+            _ => Some(repo.staleness_commits_behind as u64),
         };
 
         // nw-163: `is_stale` means BEHIND HEAD, and nothing else.
@@ -8164,7 +8228,10 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             // successful check. `status: "missing"` + `needs_reindex` carry
             // the actionable truth without guessing.
             None if local_missing => false,
-            None => commits_behind > 0,
+            // An uncountable distance is not a claim of zero: if HEAD is
+            // unknown AND the stored counter cannot be read, staleness is
+            // simply not assertable here.
+            None => commits_behind.is_some_and(|behind| behind > 0),
         };
 
         // A repo whose SHA was committed but whose content never landed
@@ -11958,6 +12025,58 @@ mod cache_dispatch_tests {
             full["connected"].as_array().unwrap().len(),
             full["connected_count"].as_u64().unwrap() as usize
         );
+    }
+
+    // ── nw-212: a value that could not be READ is not a value of zero ──
+    //
+    // These are the sites where a store error was converted into a confident
+    // answer — a count of zero, an empty list, a "not found" — so the caller
+    // could not tell "we looked and there is nothing" from "we failed to look".
+
+    /// `brain_status` already disclosed unreadable TOTALS via `unavailable` +
+    /// nulls. The per-vault note count, twenty lines below that block, still
+    /// reported a failed read as a vault holding zero notes. This pins the
+    /// disclosure contract both counts now share.
+    #[test]
+    fn brain_status_reports_complete_counts_on_a_healthy_store() {
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let status = dispatch(&store, None, "brain_status", json!({}), None).unwrap();
+
+        assert_eq!(
+            status["counts_complete"],
+            json!(true),
+            "nothing failed, so nothing may be listed as unavailable: {}",
+            status["unavailable"]
+        );
+        assert_eq!(status["unavailable"], json!([]));
+        // The per-vault counts must be REAL numbers on a healthy store, not
+        // nulls — the disclosure path must not fire when nothing is wrong.
+        for vault in status["vaults"].as_array().unwrap_or(&Vec::new()) {
+            assert!(
+                vault["note_count"].is_number(),
+                "a readable vault must report a number, got {vault}"
+            );
+        }
+    }
+
+    /// `resolve_note_by_title` matched a row and then hydrated it with `.ok()`,
+    /// so a failed hydration became "no note found with that title" — a claim
+    /// about the vault made on the strength of a failure to read it. A genuine
+    /// miss must still be a clean `None`, or the fix would just trade one wrong
+    /// answer for a spurious error.
+    #[test]
+    fn a_title_that_matches_nothing_is_still_a_clean_miss() {
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let resolved = resolve_note_by_title(&store, "no such note exists anywhere")
+            .expect("a miss is not an error");
+
+        assert!(resolved.is_none());
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
