@@ -9942,17 +9942,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The SAME default the `code_context` tool applies. A cap on
                     // one route only is how these two drifted apart before.
                     let effective = limit.unwrap_or(nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT);
-                    build_context_with_intent(&store, &seeds, parsed_intent, Some(effective))
+                    // Ask for one MORE than the cap, exactly as the
+                    // `code_context` tool does, so the extra row proves more
+                    // exist. Without this the direct path applied the same 500
+                    // cap as the daemon route but could not TELL it had — a
+                    // capped answer rendered identically to a complete one,
+                    // which is the silent truncation the cap was supposed to
+                    // stop being.
+                    build_context_with_intent(
+                        &store,
+                        &seeds,
+                        parsed_intent,
+                        Some(effective.saturating_add(1)),
+                    )
+                    .map(|mut result| {
+                        let truncated = result.connected.len() > effective;
+                        if truncated {
+                            result.connected.truncate(effective);
+                        }
+                        result.limit = Some(effective);
+                        result.truncated = Some(truncated);
+                        result
+                    })
                 }
             };
             match built {
                 Ok(mut result) => {
                     if let Some(budget) = token_budget {
                         let cut = context_token_budgeted_truncate(&result.connected, budget);
+                        if cut < result.connected.len() {
+                            result.truncated = Some(true);
+                        }
                         result.connected.truncate(cut);
                     }
+                    // Say so. A capped result that renders identically to a
+                    // complete one is the whole defect this reports on: the
+                    // caller cannot tell "this is the answer" from "this is
+                    // the first N of the answer".
+                    let truncation = match (result.truncated, result.limit) {
+                        (Some(true), Some(limit)) => {
+                            format!(", TRUNCATED at limit {limit} — pass --limit for more")
+                        }
+                        _ => String::new(),
+                    };
                     let stats = format!(
-                        "{} seeds, {} connected nodes in {} ({})",
+                        "{} seeds, {} connected nodes in {} ({}){}",
                         result.seeds.len(),
                         result.connected.len(),
                         format_elapsed(t0.elapsed()),
@@ -9960,7 +9994,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "via daemon"
                         } else {
                             "local fallback"
-                        }
+                        },
+                        truncation
                     );
                     if json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
