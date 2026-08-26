@@ -3753,7 +3753,16 @@ fn daemon_start_recovers_graph_applied_vault_tantivy_scope() {
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     write_test_repo(&repo_dir);
     write_test_vault(&vault_dir);
-    create_db(&repo_dir, &db_path);
+    // nw-246: seed the repo under "old" as well.
+    //
+    // This test migrates an instance from "old" to "new", so its fixture needs
+    // the database to BE "old". It previously indexed the repo config-lessly
+    // (recording "default") and then added the vault under "old" — a
+    // two-instance database, which is precisely the fork nw-246 now refuses to
+    // create. The subject here is migration, not instance policy, so the fix is
+    // to make the fixture internally consistent rather than to route around the
+    // guard.
+    create_db_for_instance(&repo_dir, &db_path, "old");
 
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
