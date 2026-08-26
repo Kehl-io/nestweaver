@@ -1,5 +1,0 @@
-crates/nestweaver-daemon/src/lifecycle.rs:9:52: replace * with +
-crates/nestweaver-daemon/src/lifecycle.rs:12:50: replace * with +
-crates/nestweaver-daemon/src/lifecycle.rs:25:5: replace mark_verified_nestweaver_managed_start with ()
-crates/nestweaver-daemon/src/lifecycle.rs:29:5: replace clear_verified_nestweaver_managed_start with ()
-crates/nestweaver-daemon/src/lifecycle.rs:33:5: replace is_verified_nestweaver_managed_start -> bool with false
