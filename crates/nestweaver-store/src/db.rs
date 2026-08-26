@@ -570,6 +570,29 @@ fn env_u64(key: &str) -> Option<u64> {
 fn bounded_system_config() -> lbug::SystemConfig {
     lbug::SystemConfig::default()
         .max_db_size(env_u64("NESTWEAVER_LBUG_MAX_DB_SIZE").unwrap_or(DEFAULT_MAX_DB_SIZE_BYTES))
+        // nw-240 / nw-238: the engine thread bound now applies to READ opens
+        // too, not only write-capable ones.
+        //
+        // Two independent crash captures — 2026-08-26 07:49 and 15:29, on
+        // different SHAs and different builds — carry the identical faulting
+        // stack: a NULL deref (KERN_INVALID_ADDRESS at 0x0) in
+        // `VectorVersionInfo::getSelVectorForScan` -> `VersionInfo::getSelVectorToScan`
+        // -> `ChunkedNodeGroup::scan` -> `NodeTableScanState::scanNext`, reached
+        // from `ScanNodeTable::getNextTuplesInternal` on an lbug worker thread.
+        //
+        // That is MVCC version-chain traversal during a PARALLEL NODE-TABLE
+        // SCAN — squarely a read path. `hardened_system_config` bounded threads
+        // only on the three read-write opens, so `open_read_only` and
+        // `in_memory` (46 and 374 call sites) ran the very pool that faulted at
+        // full parallelism, and NESTWEAVER_LBUG_MAX_THREADS could not reach it.
+        //
+        // NOTE THE STATUS OF THIS CHANGE: it is a MEASURED EXPERIMENT, not a
+        // proven fix. The crash is intermittent at roughly 11% per run (2 in 18
+        // pooled), so a handful of clean runs proves nothing — 40 consecutive
+        // clean runs are needed to put a false pass under 1%. If it only
+        // REDUCES the rate rather than eliminating it, that is a different
+        // finding and the bar has to be recomputed from the new rate.
+        .max_num_threads(env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1))
 }
 
 fn hardened_system_config() -> lbug::SystemConfig {
@@ -577,8 +600,9 @@ fn hardened_system_config() -> lbug::SystemConfig {
     // removes the eviction-vs-read race the crash needs. `1` is the only value
     // that fully eliminates it; keep it the default on the write path and let
     // ops raise it if they measure a query-latency cost on their workload.
-    let max_threads = env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1);
-    let mut cfg = bounded_system_config().max_num_threads(max_threads);
+    // The thread bound now lives in `bounded_system_config`, so write and read
+    // opens share ONE rule rather than two that drifted apart.
+    let mut cfg = bounded_system_config();
     if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
         cfg = cfg.buffer_pool_size(bytes);
     }
