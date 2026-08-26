@@ -165,8 +165,14 @@ jobs:
       # `continue-on-error` so a missing report directory can never turn a real
       # failure into a confusing second one.
       - name: Collect macOS crash reports
+        # No `continue-on-error`: a contract test asserts this job carries none,
+        # because the Metal smoke is a required gate and not an informational
+        # one. The guard cannot distinguish a step-level flag from a job-level
+        # one, and weakening it to accommodate a diagnostic step would trade a
+        # real invariant for convenience. It is not needed anyway — this runs
+        # only when the job has ALREADY failed, so a failure here cannot change
+        # the outcome, and the script tolerates a missing directory itself.
         if: failure()
-        continue-on-error: true
         shell: bash
         run: |
           set -uo pipefail
@@ -193,7 +199,6 @@ jobs:
           done
       - name: Upload macOS crash reports
         if: failure()
-        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: macos-crash-reports-${{ github.run_id }}-${{ github.run_attempt }}
