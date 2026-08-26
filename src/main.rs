@@ -1986,6 +1986,21 @@ mod daemon_status_renderer_tests {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Read the custom annotations agents write via the `set_extension` MCP tool.
+    ///
+    /// nw-229: `set_extension` and `query_extensions` were BOTH agent-only, so
+    /// an agent could write key/value annotations that influence a human's
+    /// results — the CLI consumes the sidecar internally for alias matching and
+    /// `external_refs` — with no command to read them back. Write-only-for-
+    /// agents is a defensible design; write-AND-read-only-for-agents makes a
+    /// persistent store that affects output unauditable by its owner.
+    #[command(
+        after_help = "Examples:\n  nestweaver extensions list\n  nestweaver extensions list --uid sym:repo:abc\n  nestweaver extensions list --key owner --value platform-team\n  nestweaver extensions list --json"
+    )]
+    Extensions {
+        #[command(subcommand)]
+        command: ExtensionCommands,
+    },
     /// List all indexed repositories
     ListRepos {
         #[arg(long, help = "Filter by instance ID")]
@@ -4123,6 +4138,31 @@ enum RtsEvalCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExtensionCommands {
+    /// List annotations. With no filter, every annotated node.
+    List {
+        /// Show only this node's annotations.
+        #[arg(long)]
+        uid: Option<String>,
+        /// Show only nodes carrying this key (with `--value`, this exact value).
+        #[arg(long)]
+        key: Option<String>,
+        /// Requires `--key`. Exact match only, matching the MCP tool.
+        #[arg(long)]
+        value: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
 }
 
@@ -8950,6 +8990,77 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         !matches!(cli.command, Commands::Daemon { .. }),
     );
     match cli.command {
+        Commands::Extensions {
+            command:
+                ExtensionCommands::List {
+                    uid,
+                    key,
+                    value,
+                    json,
+                    db,
+                    config,
+                },
+        } => {
+            if value.is_some() && key.is_none() {
+                anyhow::bail!("--value requires --key");
+            }
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = nestweaver_engine::extensions::load_extensions(&db_path);
+
+            // Filtering mirrors `query_extensions` exactly, including EXACT
+            // match on value — a CLI that matched differently would show a
+            // human a different answer than the agent acted on, which is the
+            // opposite of an audit.
+            let mut rows: Vec<(
+                &String,
+                &std::collections::HashMap<String, serde_json::Value>,
+            )> = store
+                .iter()
+                .filter(|(node_uid, props)| {
+                    if let Some(wanted) = uid.as_deref()
+                        && node_uid.as_str() != wanted
+                    {
+                        return false;
+                    }
+                    match (key.as_deref(), value.as_deref()) {
+                        (Some(k), Some(v)) => {
+                            props.get(k).and_then(|found| found.as_str()) == Some(v)
+                                || props.get(k).map(ToString::to_string).as_deref() == Some(v)
+                        }
+                        (Some(k), None) => props.contains_key(k),
+                        _ => true,
+                    }
+                })
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+
+            if json {
+                let payload: serde_json::Map<String, serde_json::Value> = rows
+                    .iter()
+                    .map(|(node_uid, props)| {
+                        (
+                            (*node_uid).clone(),
+                            serde_json::to_value(props).unwrap_or(serde_json::Value::Null),
+                        )
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if rows.is_empty() {
+                println!("No extension annotations found.");
+            } else {
+                for (node_uid, props) in &rows {
+                    println!("{node_uid}");
+                    let mut keys: Vec<&String> = props.keys().collect();
+                    keys.sort();
+                    for k in keys {
+                        println!("  {k}: {}", props[k]);
+                    }
+                }
+            }
+            let stats = format!("{} annotated node(s)", rows.len());
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
         Commands::ListRepos {
             instance,
             json,
@@ -21669,6 +21780,10 @@ mod cli_help_contract_tests {
             "nestweaver count-patterns",
             "nestweaver cross-repo-contracts",
             "nestweaver detect-changes",
+            // nw-229: added deliberately. It reads the extension sidecar
+            // beside the database, so it resolves the pair through the same
+            // `resolve_db_with_config` helper every other entry here uses.
+            "nestweaver extensions list",
             "nestweaver flow-trace",
             "nestweaver generate-guide",
             "nestweaver hubs",
@@ -30834,6 +30949,64 @@ mod vault_command_config_parity_tests {
 
     /// The value must actually reach the command, not merely parse. A flag
     /// accepted and dropped would pass the test above while changing nothing.
+    /// nw-229. `set_extension` and `query_extensions` were BOTH agent-only, so
+    /// an agent could write annotations that influence a human's results — the
+    /// CLI consumes the sidecar internally — with no command to read them back.
+    #[test]
+    fn a_human_can_read_back_what_agents_annotate() {
+        let cli = parse(argv(&["nestweaver", "extensions", "list"])).expect("must parse");
+
+        let Commands::Extensions { command } = cli.command else {
+            panic!("expected `extensions`");
+        };
+        let ExtensionCommands::List {
+            uid, key, value, ..
+        } = command;
+        assert!(
+            uid.is_none() && key.is_none() && value.is_none(),
+            "an unfiltered list must be the default — auditing starts with 'show me everything'"
+        );
+    }
+
+    /// Filters mirror `query_extensions`: by uid, or by key (+ optional value).
+    #[test]
+    fn the_filters_match_the_mcp_tools_two_modes() {
+        let by_uid = parse(argv(&[
+            "nestweaver",
+            "extensions",
+            "list",
+            "--uid",
+            "sym:repo:abc",
+        ]))
+        .expect("uid mode must parse");
+        let Commands::Extensions {
+            command: ExtensionCommands::List { uid, .. },
+        } = by_uid.command
+        else {
+            panic!("expected `extensions list`");
+        };
+        assert_eq!(uid.as_deref(), Some("sym:repo:abc"));
+
+        let by_kv = parse(argv(&[
+            "nestweaver",
+            "extensions",
+            "list",
+            "--key",
+            "owner",
+            "--value",
+            "platform",
+        ]))
+        .expect("key+value mode must parse");
+        let Commands::Extensions {
+            command: ExtensionCommands::List { key, value, .. },
+        } = by_kv.command
+        else {
+            panic!("expected `extensions list`");
+        };
+        assert_eq!(key.as_deref(), Some("owner"));
+        assert_eq!(value.as_deref(), Some("platform"));
+    }
+
     #[test]
     fn brain_remove_carries_the_config_through_to_the_command() {
         let cli = parse(argv(&[

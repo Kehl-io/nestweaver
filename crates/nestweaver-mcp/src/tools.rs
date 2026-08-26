@@ -1705,7 +1705,7 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
             "index publication WEDGED: ranked queries are failing closed because {} exists \
              and {writer} (marker age {age}). {preamble} The PageRank and generation sidecars \
              may predate the committed graph, so serving them would return wrong ranks. \
-             Recover with: {repair}{}",
+             A HUMAN must recover with (there is no MCP tool for this): {repair}{}",
             status.marker_path,
             if status.writer_reason.as_deref()
                 == Some(nestweaver_store::index_publication::MARKER_REASON_CANCELLED)
@@ -3224,7 +3224,7 @@ fn tool_schema_code_context() -> Value {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; run the `nestweaver repair` command named in the error, or check brain_status.index_publication.",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -8584,7 +8584,7 @@ fn tool_brain_diff(
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; run the `nestweaver repair` command named in the error, or check brain_status.index_publication.",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- May fail with 'index publication TRANSIENT/WEDGED' while an index is being published. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14776,6 +14776,35 @@ mod schema_default_honesty_tests {
             tool["inputSchema"]["properties"]["response_format"]["default"],
             json!("concise")
         );
+    }
+
+    /// nw-230. MCP error text told the agent to "run the `nestweaver repair`
+    /// command" — but `repair` has no MCP tool, so the agent was instructed to
+    /// do something it cannot do from the surface it is on. Repair is
+    /// destructive publication recovery, so requiring a human is the right
+    /// call; the message just has to SAY so.
+    #[test]
+    fn repair_guidance_names_who_can_actually_run_it() {
+        let has_repair_tool = all_tool_schemas()
+            .iter()
+            .any(|tool| tool["name"].as_str() == Some("repair"));
+        assert!(
+            !has_repair_tool,
+            "a repair TOOL now exists; this test and the guidance text must change together"
+        );
+
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("?").to_string();
+            let description = tool["description"].as_str().unwrap_or_default().to_string();
+            if !description.contains("nestweaver repair") {
+                continue;
+            }
+            assert!(
+                description.contains("ASK THE OPERATOR"),
+                "{name} tells the agent to run `nestweaver repair` without saying a \
+                 human has to do it: {description}"
+            );
+        }
     }
 
     /// `get_summary` must advertise the bound it now applies. nw-182 bounded
