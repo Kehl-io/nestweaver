@@ -530,6 +530,27 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 /// raise it.
 pub const DEFAULT_MAX_DB_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Enforced at COMPILE TIME, and deliberately not in a test.
+///
+/// Both operands are constants, so a runtime `assert!` could never fail —
+/// clippy names that `assertions_on_constants`, and it is a hollow guard of
+/// exactly the shape this review has been cataloguing. A `const` block fails
+/// the BUILD instead: it cannot be skipped, cannot pass vacuously, and does not
+/// depend on anyone running a test.
+///
+/// Outside `#[cfg(test)]` on purpose. Inside one it would only be evaluated for
+/// test builds, so a release build could carry a bound that violates it — which
+/// is the same "the guard did not reach the shipping surface" mistake nw-241
+/// itself is about.
+const _: () = {
+    const LBUG_DEFAULT: u64 = 8_796_093_022_208; // 8 TiB, from the mmap error
+    const ONE_GIB: u64 = 1024 * 1024 * 1024;
+    // Within 64x of lbug's default barely moves the concurrency ceiling.
+    assert!(DEFAULT_MAX_DB_SIZE_BYTES < LBUG_DEFAULT / 64);
+    // Too low a bound caps a legitimately large brain.
+    assert!(DEFAULT_MAX_DB_SIZE_BYTES >= 32 * ONE_GIB);
+};
+
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key)
         .ok()
@@ -3994,21 +4015,6 @@ mod address_space_bound_tests {
     /// lbug's default is 8 TiB per open. The bound has to be far enough below
     /// that concurrent opens cannot exhaust the address space, and far enough
     /// above any real graph that nobody hits it.
-    #[test]
-    fn the_default_bound_is_well_under_lbugs_and_well_over_any_real_graph() {
-        const LBUG_DEFAULT: u64 = 8_796_093_022_208; // 8 TiB, from the mmap error
-        const ONE_GIB: u64 = 1024 * 1024 * 1024;
-
-        assert!(
-            DEFAULT_MAX_DB_SIZE_BYTES < LBUG_DEFAULT / 64,
-            "a bound within 64x of the default barely moves the concurrency ceiling"
-        );
-        assert!(
-            DEFAULT_MAX_DB_SIZE_BYTES >= 32 * ONE_GIB,
-            "too low a bound caps a legitimately large brain"
-        );
-    }
-
     /// The behavioural half, and the one that would have caught this: many
     /// concurrent opens must succeed. At 8 TiB per open this exhausts the
     /// address space and fails with `Buffer manager exception: Mmap for size
