@@ -152,6 +152,54 @@ jobs:
       # diverges on macOS. Both are fixed; this keeps them fixed.
       - name: Daemon integration tests (macOS portability gate)
         run: cargo test --locked --release --features metal --test daemon_test
+      # nw-222: the ONE artifact that would identify the recurring SIGSEGV.
+      #
+      # A test binary has died with `signal: 11` on ~15% of runs of this job,
+      # including on a PR that changed zero Rust. Every occurrence has been
+      # diagnosed from cargo's one-line summary, which names the binary and
+      # nothing else — not the faulting thread, not a symbolized frame, not the
+      # fault address. macOS writes all of that to a `.ips` in
+      # DiagnosticReports, and we have simply never collected it.
+      #
+      # `if: failure()` so it costs nothing on a green run, and
+      # `continue-on-error` so a missing report directory can never turn a real
+      # failure into a confusing second one.
+      - name: Collect macOS crash reports
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          dest="$RUNNER_TEMP/crash-reports"
+          mkdir -p "$dest"
+          for dir in "$HOME/Library/Logs/DiagnosticReports" \
+                     "$HOME/Library/Logs/DiagnosticReports/Retired" \
+                     "/Library/Logs/DiagnosticReports"; do
+            [ -d "$dir" ] || continue
+            # Only ours. A runner image ships unrelated reports, and a folder
+            # of noise is how a useful artifact gets ignored.
+            find "$dir" -maxdepth 1 -type f \( -name 'nestweaver*' -o -name 'cargo*' \
+              -o -name 'lbug*' -o -name '*nestweaver*' \) -exec cp {} "$dest/" \; 2>/dev/null || true
+          done
+          count=$(find "$dest" -type f | wc -l | tr -d ' ')
+          echo "collected $count crash report(s)"
+          # Surface the decisive lines in the log itself, so a reader does not
+          # have to download an artifact to learn whether this was the SIGSEGV.
+          for report in "$dest"/*; do
+            [ -f "$report" ] || continue
+            echo "── $(basename "$report") ──"
+            head -c 4000 "$report"
+            echo
+          done
+      - name: Upload macOS crash reports
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-crash-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-reports
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Configure isolated smoke paths
         shell: bash
         run: |
