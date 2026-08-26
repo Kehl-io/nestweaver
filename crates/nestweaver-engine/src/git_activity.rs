@@ -247,18 +247,73 @@ pub fn compute_git_activity(repo_path: &Path) -> HashMap<String, f64> {
     score_commits(&commits, now_epoch_secs())
 }
 
-/// Persist a `path -> score` map to the sidecar at `path` (JSON).
-pub fn save_git_activity(scores: &HashMap<String, f64>, path: &Path) -> std::io::Result<()> {
-    let json = serde_json::to_string(scores).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+pub use nestweaver_store::git_activity_sidecar::{GITACTIVITY_VERSION, GitActivitySidecar};
+
+/// Replace ONE repo's slice, conserving every other repo's.
+///
+/// The old implementation was a plain `fs::write` of just the incoming repo,
+/// which is what erased the rest. This mirrors `save_filemeta_for_repo`:
+/// load, replace this repo's entry, write atomically. Replace-not-merge within
+/// the repo is deliberate — a re-index recomputes that repo's scores in full,
+/// so stale paths must not survive.
+pub fn save_git_activity_for_repo(
+    repo_uid: &str,
+    scores: &HashMap<String, f64>,
+    path: &Path,
+) -> Result<(), anyhow::Error> {
+    let mut sidecar = load_git_activity_sidecar(path);
+    sidecar.repos.insert(repo_uid.to_string(), scores.clone());
+    save_git_activity_sidecar(&sidecar, path)
 }
 
-/// Load the `path -> score` sidecar map. Returns an empty map on missing /
-/// corrupt file (the neutral path).
-pub fn load_git_activity(path: &Path) -> HashMap<String, f64> {
+/// Write the sidecar atomically. The previous `fs::write` was not atomic, so a
+/// crash mid-write left a truncated file — which `load_git_activity_sidecar`
+/// then reads as empty, i.e. silently neutral ranking.
+pub fn save_git_activity_sidecar(
+    sidecar: &GitActivitySidecar,
+    path: &Path,
+) -> Result<(), anyhow::Error> {
+    let json = serde_json::to_string(sidecar)?;
+    crate::manifest::atomic_replace_file(path, |file| {
+        use std::io::Write;
+        file.write_all(json.as_bytes())
+    })
+}
+
+/// Load the sidecar. Missing, corrupt, or OLD-FORMAT files yield an empty one.
+///
+/// A v1 flat map fails to deserialize into this shape and is discarded rather
+/// than migrated. Migration is not merely unnecessary here, it is UNSOUND: a v1
+/// key carries no repo dimension, so attributing it to any repo is the exact
+/// mis-attribution the format change exists to prevent. Discarding costs one
+/// re-index and is the honest outcome — the same call `FileMetaSidecar` makes.
+///
+/// Degrading to empty is safe by construction: a missing score yields a
+/// multiplier of exactly 1.0, so the ranking reverts to unmodified PageRank
+/// rather than to something wrong.
+pub fn load_git_activity_sidecar(path: &Path) -> GitActivitySidecar {
     match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+        Ok(data) => match serde_json::from_str::<GitActivitySidecar>(&data) {
+            Ok(sidecar) if sidecar.version == GITACTIVITY_VERSION => sidecar,
+            Ok(sidecar) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    found_version = sidecar.version,
+                    expected_version = GITACTIVITY_VERSION,
+                    "git-activity sidecar version mismatch; discarding (re-index to restore)"
+                );
+                GitActivitySidecar::default()
+            }
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "git-activity sidecar corrupt or legacy v1 flat format; discarding"
+                );
+                GitActivitySidecar::default()
+            }
+        },
+        Err(_) => GitActivitySidecar::default(),
     }
 }
 
@@ -412,15 +467,114 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert("src/a.rs".to_string(), 0.8);
         scores.insert("src/b.rs".to_string(), 0.2);
-        save_git_activity(&scores, &path).unwrap();
-        let loaded = load_git_activity(&path);
-        assert_eq!(loaded.len(), 2);
-        assert!((loaded["src/a.rs"] - 0.8).abs() < 1e-9);
+        save_git_activity_for_repo("repo:test", &scores, &path).unwrap();
+        let loaded = load_git_activity_sidecar(&path);
+        assert_eq!(loaded.repos["repo:test"].len(), 2);
+        assert!((loaded.repos["repo:test"]["src/a.rs"] - 0.8).abs() < 1e-9);
     }
 
     #[test]
     fn load_missing_sidecar_is_empty() {
-        let loaded = load_git_activity(Path::new("/nonexistent/path.json"));
-        assert!(loaded.is_empty());
+        let loaded = load_git_activity_sidecar(Path::new("/nonexistent/path.json"));
+        assert!(loaded.repos.is_empty());
+    }
+}
+
+/// nw-233: the sidecar must survive a multi-repo database.
+#[cfg(test)]
+mod repo_dimension_tests {
+    use super::*;
+
+    fn scores(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs
+            .iter()
+            .map(|(path, score)| ((*path).to_string(), *score))
+            .collect()
+    }
+
+    /// THE BUG. `save_git_activity` was a plain write of just the incoming
+    /// repo, so in a 42-repo database indexing any repo erased the other 41.
+    #[test]
+    fn writing_one_repo_conserves_every_other_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.gitactivity.json");
+
+        save_git_activity_for_repo("repo:a", &scores(&[("src/main.rs", 0.9)]), &path).unwrap();
+        save_git_activity_for_repo("repo:b", &scores(&[("src/main.rs", 0.1)]), &path).unwrap();
+
+        let loaded = load_git_activity_sidecar(&path);
+        assert_eq!(
+            loaded.repos.len(),
+            2,
+            "indexing repo B must not erase repo A"
+        );
+        // And the collision: BOTH repos have `src/main.rs`, and each keeps its
+        // OWN score. A flat map could not represent this at all.
+        assert_eq!(loaded.repos["repo:a"]["src/main.rs"], 0.9);
+        assert_eq!(loaded.repos["repo:b"]["src/main.rs"], 0.1);
+    }
+
+    /// Within a repo it is REPLACE, not merge: a re-index recomputes that
+    /// repo's scores in full, so a path that no longer exists must not survive.
+    #[test]
+    fn reindexing_a_repo_replaces_its_slice_rather_than_accumulating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.gitactivity.json");
+
+        save_git_activity_for_repo("repo:a", &scores(&[("gone.rs", 0.5)]), &path).unwrap();
+        save_git_activity_for_repo("repo:a", &scores(&[("kept.rs", 0.7)]), &path).unwrap();
+
+        let loaded = load_git_activity_sidecar(&path);
+        assert_eq!(loaded.repos["repo:a"].len(), 1);
+        assert!(
+            !loaded.repos["repo:a"].contains_key("gone.rs"),
+            "a deleted path must not linger in the repo's slice"
+        );
+    }
+
+    /// A v1 flat map is DISCARDED, not migrated. Migration is unsound: a v1 key
+    /// carries no repo, so attributing it to one is the exact mis-attribution
+    /// the format exists to prevent. Degrading to empty is safe — a missing
+    /// score is a multiplier of exactly 1.0.
+    #[test]
+    fn a_legacy_v1_flat_file_is_discarded_not_misattributed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.gitactivity.json");
+        std::fs::write(&path, r#"{"src/main.rs":0.9,"README.md":0.4}"#).unwrap();
+
+        let loaded = load_git_activity_sidecar(&path);
+
+        assert!(
+            loaded.repos.is_empty(),
+            "a v1 flat map has no repo dimension; inventing one would be the bug"
+        );
+        assert_eq!(loaded.version, GITACTIVITY_VERSION);
+    }
+
+    /// A future version is discarded too, not read as if it were ours.
+    #[test]
+    fn a_newer_version_is_discarded_rather_than_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.gitactivity.json");
+        std::fs::write(
+            &path,
+            r#"{"version":99,"repos":{"repo:a":{"src/main.rs":0.9}}}"#,
+        )
+        .unwrap();
+
+        assert!(load_git_activity_sidecar(&path).repos.is_empty());
+    }
+
+    /// The counterweight: a well-formed current-version file must round-trip,
+    /// or "discard on mismatch" would quietly become "discard everything".
+    #[test]
+    fn a_current_version_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.gitactivity.json");
+
+        save_git_activity_for_repo("repo:a", &scores(&[("src/main.rs", 0.9)]), &path).unwrap();
+
+        let loaded = load_git_activity_sidecar(&path);
+        assert_eq!(loaded.repos["repo:a"]["src/main.rs"], 0.9);
     }
 }

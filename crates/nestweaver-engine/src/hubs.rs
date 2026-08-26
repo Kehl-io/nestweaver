@@ -124,7 +124,9 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
         let base = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
         let pagerank = if ga_active {
             base * nestweaver_store::git_activity_multiplier(
-                store.git_activity_score(&sym.file_path),
+                // Repo-keyed for the same reason as the ranking path: a
+                // repo-relative path alone matches the wrong repo (nw-233).
+                store.git_activity_score(&sym.repo_uid, &sym.file_path),
                 ga_weight,
             )
         } else {
@@ -339,9 +341,13 @@ mod tests {
             .compute_pagerank(0.85, 30, &nestweaver_store::GraphScope::code_only())
             .unwrap();
 
+        // Repo-keyed now (nw-233): the fixture's symbols all belong to
+        // "repo-1", and a score filed under any other repo must not reach them.
+        let mut paths = HashMap::new();
+        paths.insert("src/fresh.rs".to_string(), 0.95);
+        paths.insert("src/stale.rs".to_string(), 0.05);
         let mut ga = HashMap::new();
-        ga.insert("src/fresh.rs".to_string(), 0.95);
-        ga.insert("src/stale.rs".to_string(), 0.05);
+        ga.insert("repo-1".to_string(), paths);
         store.load_git_activity_cache(ga);
 
         let hubs = find_hub_nodes(&store, 10).unwrap();

@@ -4,6 +4,7 @@ pub mod db;
 pub mod durable_sidecar;
 pub mod error;
 pub mod generation;
+pub mod git_activity_sidecar;
 pub mod index_publication;
 pub mod ranking;
 pub mod read;
