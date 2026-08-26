@@ -91,3 +91,6 @@ __pycache__/
 # Internal orchestration/planning scratch — never commit to the public repo
 /PLAN.md
 /TEST_PLAN.md
+
+# cargo-mutants scratch output — regenerated per run, uploaded as a CI artifact
+mutants.out/

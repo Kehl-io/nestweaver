@@ -1,5 +1,0 @@
-crates/nestweaver-daemon/src/lifecycle.rs:9:52: replace * with /
-crates/nestweaver-daemon/src/lifecycle.rs:12:50: replace * with /
-crates/nestweaver-daemon/src/lifecycle.rs:33:5: replace is_verified_nestweaver_managed_start -> bool with true
-crates/nestweaver-daemon/src/lifecycle.rs:45:5: replace effective_config_temp_path -> PathBuf with Default::default()
-crates/nestweaver-daemon/src/lifecycle.rs:53:5: replace last_successful_config_temp_path -> PathBuf with Default::default()
