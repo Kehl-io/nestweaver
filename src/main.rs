@@ -24267,10 +24267,25 @@ fn run_mcp_hybrid(
     let mut reader = stdin.lock();
 
     // Write tools that must bypass hybrid routing.
-    let write_tools: std::collections::HashSet<&str> =
-        ["brain_add_source", "brain_remove_source", "prune_stale"]
-            .into_iter()
-            .collect();
+    //
+    // Taken from `MUTATING_TOOLS`, not restated. This was a hardcoded literal
+    // holding three of the six, and the three it omitted —
+    // `compact_embeddings`, `set_extension`, `brain_memory_consolidate` — were
+    // therefore routed as ordinary reads into `hybrid.query`, reached
+    // `dispatch_json_rpc`, found no arm, and failed with "unsupported tool for
+    // JSON dispatch". They were still advertised in `tools/list`, so an agent
+    // with an upstream configured saw the tools, called them, and got an
+    // internal-sounding error every time.
+    //
+    // `MUTATING_TOOLS` calls itself "the SINGLE canonical list" and every other
+    // consumer — the daemon's `json_rpc!` gate, the read-only refusals in
+    // tools.rs — already reads it. This was the only place that restated it,
+    // and a second copy cannot be kept in sync by discipline: the tools were
+    // added to the canonical list and nobody knew to add them here.
+    let write_tools: std::collections::HashSet<&str> = nestweaver_mcp::http::MUTATING_TOOLS
+        .iter()
+        .copied()
+        .collect();
 
     loop {
         line.clear();

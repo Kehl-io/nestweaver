@@ -14800,3 +14800,41 @@ mod schema_default_honesty_tests {
         );
     }
 }
+
+/// nw-232: the three places that encode "this tool mutates" must agree.
+///
+/// `MUTATING_TOOLS` calls itself the SINGLE canonical list, and most consumers
+/// read it. Two did not: the federation router restated a local-only set, and
+/// the hybrid stdio server restated a write-tool set as a literal. Both had
+/// drifted — `compact_embeddings` was missing from each, so it was advertised
+/// in `tools/list` and failed with "unsupported tool for JSON dispatch" for
+/// every caller with an upstream configured.
+///
+/// The stdio copy is now derived. The router's set cannot simply BE the
+/// canonical list — it is a deliberate superset that also covers local-only
+/// READS like `query_extensions` and the memory tools — so the invariant is
+/// containment, and it is pinned here rather than left to discipline.
+#[cfg(all(test, feature = "daemon"))]
+mod mutating_tool_routing_invariant_tests {
+    /// A mutation routed anywhere but locally would write to someone else's
+    /// graph. There is no tool for which that is acceptable, so this is a
+    /// containment check over the whole canonical list, not a spot check.
+    #[test]
+    fn every_mutating_tool_is_local_only() {
+        use nestweaver_federation::routing::{ToolRouting, tool_routing};
+
+        let stragglers: Vec<&str> = crate::http::MUTATING_TOOLS
+            .iter()
+            .copied()
+            .filter(|tool| tool_routing(tool) != ToolRouting::LocalOnly)
+            .collect();
+
+        assert!(
+            stragglers.is_empty(),
+            "these mutating tools are not routed LocalOnly: {stragglers:?} — they would \
+             be sent upstream, or fall to LocalFirst and fail in dispatch_json_rpc with \
+             'unsupported tool for JSON dispatch' while still being advertised. Add them \
+             to the Admin/mutation arm in nestweaver-federation's routing.rs"
+        );
+    }
+}

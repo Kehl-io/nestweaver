@@ -80,11 +80,25 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
             ToolRouting::LocalOnly
         }
 
-        // Admin/mutation tools — local-only
+        // Admin/mutation tools — local-only.
+        //
+        // EVERY entry of `nestweaver_mcp::http::MUTATING_TOOLS` must appear
+        // here: a mutation sent upstream would write to someone else's graph.
+        // `compact_embeddings` was missing, so it fell to the `LocalFirst`
+        // default below, reached `dispatch_json_rpc`, found no arm, and failed
+        // with "unsupported tool for JSON dispatch" — advertised in
+        // `tools/list` and broken for every caller with an upstream.
+        //
+        // This arm is deliberately a SUPERSET: `query_extensions` and the
+        // memory tools are local-only reads over a personal vault, not
+        // mutations. That is why it cannot simply BE the canonical list — but
+        // the containment is pinned by
+        // `every_mutating_tool_is_local_only` in nestweaver-mcp.
         "brain_add_source"
         | "brain_remove_source"
         | "prune_stale"
         | "set_extension"
+        | "compact_embeddings"
         | "query_extensions" => ToolRouting::LocalOnly,
 
         // Everything else — local-first (safe default)
@@ -101,6 +115,11 @@ mod tests {
         assert_eq!(tool_routing("brain_search"), ToolRouting::Merge);
         assert_eq!(tool_routing("brain_context"), ToolRouting::Merge);
         assert_eq!(tool_routing("code_context"), ToolRouting::Merge);
+        assert_eq!(
+            tool_routing("compact_embeddings"),
+            ToolRouting::LocalOnly,
+            "a mutation must never be routed upstream"
+        );
         assert_eq!(tool_routing("project_context"), ToolRouting::Merge);
         assert_eq!(tool_routing("search_symbols"), ToolRouting::Merge);
     }
