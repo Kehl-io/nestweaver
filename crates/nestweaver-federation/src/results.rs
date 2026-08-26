@@ -615,6 +615,47 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             let seeds_len = result["seeds"].as_array().map_or(0, Vec::len);
             result["seeds_resolved"] = Value::from(seeds_len);
         }
+        // `limit` and `truncated` must survive AND be re-honoured.
+        //
+        // Carrying them through is not enough: each tier caps at the SAME
+        // requested limit independently, so a merge of two capped tiers returns
+        // up to 2x the cap. A caller asking for 1 could receive 2; an omitted
+        // limit could return 1000 against a documented default of 500. Worse,
+        // `truncated` from a single tier says nothing about whether the MERGED
+        // list is short of the total.
+        //
+        // So the cap is reapplied to the merged array, and `truncated` is the
+        // OR of "either tier truncated" and "the merge itself overflowed".
+        let requested_limit = local
+            .get("limit")
+            .or_else(|| server.get("limit"))
+            .and_then(Value::as_u64);
+        let mut merged_overflowed = false;
+        if let Some(limit) = requested_limit {
+            let limit = limit as usize;
+            if let Some(connected) = result["connected"].as_array_mut()
+                && connected.len() > limit
+            {
+                connected.truncate(limit);
+                merged_overflowed = true;
+            }
+            result["limit"] = Value::from(limit);
+        }
+        if local.get("truncated").is_some()
+            || server.get("truncated").is_some()
+            || merged_overflowed
+        {
+            let tier_truncated = |tier: &Value| {
+                tier.get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            result["truncated"] =
+                Value::from(merged_overflowed || tier_truncated(local) || tier_truncated(server));
+        }
+
+        // Recomputed AFTER the cap above, so it describes the array the caller
+        // is holding rather than the pre-truncation merge.
         if local.get("connected_count").is_some() || server.get("connected_count").is_some() {
             let connected_len = result["connected"].as_array().map_or(0, Vec::len);
             result["connected_count"] = Value::from(connected_len);
@@ -856,6 +897,73 @@ mod tests {
         );
     }
 
+    /// Each tier caps at the SAME requested limit independently, so a merge of
+    /// two capped tiers returns up to 2x the cap unless it is reapplied. A
+    /// caller asking for 1 could receive 2; an omitted limit could return 1000
+    /// against a documented default of 500.
+    #[test]
+    fn the_requested_limit_is_reapplied_after_merging_both_tiers() {
+        let node = |uid: &str| serde_json::json!({ "uid": uid, "name": uid, "relevance": 1.0 });
+        let local = serde_json::json!({
+            "seeds": [], "connected": [node("sym:a")],
+            "limit": 1, "truncated": true, "connected_count": 1,
+        });
+        let server = serde_json::json!({
+            "seeds": [], "connected": [node("sym:b")],
+            "limit": 1, "truncated": true, "connected_count": 1,
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert_eq!(
+            merged["connected"].as_array().unwrap().len(),
+            1,
+            "a limit of 1 must return 1, not one row per tier"
+        );
+        assert_eq!(merged["limit"], serde_json::json!(1));
+        assert_eq!(merged["truncated"], serde_json::json!(true));
+        assert_eq!(
+            merged["connected_count"],
+            serde_json::json!(1),
+            "the count must describe the post-cap array"
+        );
+    }
+
+    /// The counterweight: a merge that fits under the cap must NOT be reported
+    /// as truncated, or every federated call would claim to be lossy.
+    #[test]
+    fn a_merge_that_fits_is_not_reported_as_truncated() {
+        let node = |uid: &str| serde_json::json!({ "uid": uid, "name": uid, "relevance": 1.0 });
+        let local = serde_json::json!({
+            "seeds": [], "connected": [node("sym:a")], "limit": 500, "truncated": false,
+        });
+        let server = serde_json::json!({
+            "seeds": [], "connected": [node("sym:b")], "limit": 500, "truncated": false,
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert_eq!(merged["connected"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["truncated"], serde_json::json!(false));
+    }
+
+    /// One tier truncating means the MERGED answer is short of the total, even
+    /// if the merge itself fit under the cap.
+    #[test]
+    fn a_tier_that_truncated_makes_the_merge_truncated() {
+        let node = |uid: &str| serde_json::json!({ "uid": uid, "name": uid, "relevance": 1.0 });
+        let local = serde_json::json!({
+            "seeds": [], "connected": [node("sym:a")], "limit": 500, "truncated": true,
+        });
+        let server = serde_json::json!({
+            "seeds": [], "connected": [node("sym:b")], "limit": 500, "truncated": false,
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert_eq!(merged["truncated"], serde_json::json!(true));
+    }
+
     /// The CLASS guard, not the instance. This envelope is rebuilt key by key,
     /// so any field a tool adds later is dropped SILENTLY — which is exactly how
     /// `cross_repo_links` broke `nestweaver context` without a single test
@@ -872,6 +980,7 @@ mod tests {
             "seeds_expanded": 1, "tokens_used": 10, "token_budget": 100,
             "project": "p", "project_uid": "proj:p", "external_refs": [],
             "seeds_resolved": 0, "connected_count": 0,
+            "limit": 500, "truncated": false,
             "semantic_applied": true, "degraded_components": [],
             "_meta": { "sources": ["local"] },
         });

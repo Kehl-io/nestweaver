@@ -3208,7 +3208,14 @@ fn tool_schema_code_context() -> Value {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `total` and `truncated` so an omitted limit is never silently lossy."
+                    // A bound, because the handler asks the engine for
+                    // `limit + 1` and an unbounded value overflows that: a
+                    // debug panic, or a wrap to zero in release. The schema is
+                    // not the only defence — the handler saturates too — but a
+                    // knob with a minimum and no maximum is an omission either
+                    // way.
+                    "maximum": 5000,
+                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count` and `truncated` so an omitted limit is never silently lossy."
                 },
                 "intent": {
                     "type": "string",
@@ -3406,8 +3413,17 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 
     // One over the cap, so `truncated` can be reported without a second pass:
     // the extra row proves more exist, and is dropped before rendering.
-    let mut result =
-        nestweaver_engine::build_context_with_intent(store, &seeds, intent, Some(limit + 1))?;
+    // `saturating_add`, not `+`. Schema validation bounds `limit` on the MCP
+    // path, but this function is also reached from routes that do not validate
+    // against the schema, and `usize::MAX + 1` is a debug panic and a silent
+    // wrap to ZERO in release — which would turn "give me everything" into
+    // "give me nothing".
+    let mut result = nestweaver_engine::build_context_with_intent(
+        store,
+        &seeds,
+        intent,
+        Some(limit.saturating_add(1)),
+    )?;
     let truncated = truncate_reporting(&mut result.connected, limit);
 
     let render = |node: &nestweaver_engine::ContextNode| {
@@ -11606,6 +11622,12 @@ mod cache_dispatch_tests {
 
     /// Index a small JS repo to an on-disk db and return its path + the repo
     /// source dir (kept alive by the returned tempdir).
+    /// Shared with the federated round-trip guard, which needs a real store to
+    /// get real tool output.
+    pub(super) fn index_on_disk_for_merge_guard() -> (tempfile::TempDir, std::path::PathBuf) {
+        index_on_disk()
+    }
+
     fn index_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
@@ -14671,6 +14693,56 @@ mod federated_context_roundtrip_tests {
             parsed.connected.len(),
             2,
             "both tiers' connected symbols must survive"
+        );
+    }
+
+    /// THE GUARD THAT SHOULD HAVE CAUGHT THIS, and did not.
+    ///
+    /// The federation crate has a "no field is silently dropped" test, but its
+    /// input is a HAND-WRITTEN fixture — so it only protects the keys someone
+    /// remembered to list. When `code_context` later grew `limit` and
+    /// `truncated`, the fixture did not, and the merger dropped both while that
+    /// guard stayed green. A guard against silent drift that is itself
+    /// maintained by hand has the same weakness as the thing it guards.
+    ///
+    /// This one takes its field set from the REAL tool output, so a field added
+    /// to `code_context` is covered the moment it exists, with nobody having to
+    /// remember anything.
+    #[test]
+    fn every_field_the_real_tool_emits_survives_the_merge() {
+        let (_dir, db_path) = super::cache_dispatch_tests::index_on_disk_for_merge_guard();
+        super::set_current_db_path(db_path.clone());
+        let store = super::GraphStore::open(&db_path).unwrap();
+
+        let real = super::dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["greet"] }),
+            None,
+        )
+        .expect("the tool must answer");
+
+        // Merged against itself: the point is which KEYS survive, and a second
+        // tier of the same shape is the honest stand-in for an upstream.
+        let merged = nestweaver_federation::results::merge_structured_results(&real, &real);
+
+        // Per-tier bookkeeping that is meaningless after a merge.
+        const INTENTIONALLY_DROPPED: &[&str] = &["_meta"];
+
+        let dropped: Vec<&String> = real
+            .as_object()
+            .expect("tool output is an object")
+            .keys()
+            .filter(|key| !INTENTIONALLY_DROPPED.contains(&key.as_str()))
+            .filter(|key| merged.get(key.as_str()).is_none())
+            .collect();
+
+        assert!(
+            dropped.is_empty(),
+            "code_context emits these and the merge loses them: {dropped:?}
+             real = {real}
+merged = {merged}"
         );
     }
 

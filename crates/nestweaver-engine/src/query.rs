@@ -454,6 +454,21 @@ pub struct ContextResult {
     pub seeds: Vec<ContextNode>,
     pub connected: Vec<ContextNode>,
     pub cross_repo_links: Vec<CrossRepoLink>,
+    /// The cap that was applied, and whether it dropped anything.
+    ///
+    /// Without these the daemon's completeness metadata was DISCARDED at the
+    /// deserialization boundary: `code_context` computes `limit`/`truncated`,
+    /// and this struct — what the CLI parses the reply into — had nowhere to
+    /// put them, so a capped answer arrived looking complete.
+    ///
+    /// `Option`, and `#[serde(default)]`, so a reply from an older daemon (or
+    /// any producer that does not set them) still deserializes. `None` means
+    /// "not reported", which is distinct from `Some(false)` meaning "reported,
+    /// and nothing was dropped".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 /// Detect whether an input string looks like a file path.
@@ -631,6 +646,12 @@ pub fn build_context_with_intent(
         seeds,
         connected,
         cross_repo_links,
+        // The engine applies whatever cap it was given but does not know what
+        // the CALLER meant by it, so it reports nothing here. Callers that
+        // impose a cap (the `code_context` tool, the CLI's direct path) set
+        // these after deciding whether the extra row they asked for arrived.
+        limit: None,
+        truncated: None,
     })
 }
 
