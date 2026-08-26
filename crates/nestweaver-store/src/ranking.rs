@@ -3405,7 +3405,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// nw-233's read half: `file_path` is REPO-RELATIVE, so a flat lookup
     /// returned another repo's recency for any shared name. A score filed under
     /// a DIFFERENT repo must not reach these symbols at all.

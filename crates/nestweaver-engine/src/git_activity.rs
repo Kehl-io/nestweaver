@@ -28,7 +28,6 @@
 //! (or larger configured weights) cannot push the multiplier outside
 //! `[0.4, 1.6]`.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
