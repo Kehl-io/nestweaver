@@ -250,6 +250,209 @@ url = "{}"
     assert_eq!(entries, vec![std::ffi::OsString::from("instance.toml")]);
 }
 
+/// nw-256: `stale_check`'s commit distance must be `null` when it cannot be
+/// counted — never `0`.
+///
+/// The MCP route was fixed to `Option<u64>` in #310; the CLI kept
+/// `.unwrap_or(0)`, so the two routes answered differently for the same repo.
+/// That is the SECOND time this function pair diverged for this reason — the
+/// comment recording the first (`is_stale`, nw-163) sits four lines below the
+/// defect.
+///
+/// A zero here is not a missed detection, it is a self-contradiction: the
+/// branch is only reached when HEAD already differs from the indexed SHA, so
+/// the row reads "STALE, 0 commits behind".
+///
+/// Provoked the way it actually happens — a repo whose history was replaced
+/// (re-clone, force-push, squash). HEAD reads fine, but `indexed_sha..HEAD`
+/// spans no common ancestor and `git rev-list` fails.
+#[test]
+fn stale_check_reports_an_uncountable_commit_distance_as_null_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir(&repo_dir).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() {}").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "initial"]);
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Replace the history wholesale. HEAD is still a perfectly readable sha —
+    // it simply has no path back to the indexed one.
+    std::fs::remove_dir_all(repo_dir.join(".git")).unwrap();
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() { return 1; }").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "unrelated history"]);
+
+    let output = nestweaver_cmd()
+        .args([
+            "stale-check",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stale-check --json: {e}\n{stdout}"));
+
+    let repos = parsed["repos"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `repos` array in:\n{stdout}"));
+    let repo = repos.first().expect("exactly one repo was indexed");
+
+    // The counterweight: the row really is stale. Without this, a `null` count
+    // could just mean the whole check declined to look.
+    assert_eq!(
+        repo["is_stale"].as_bool(),
+        Some(true),
+        "the fixture must actually be stale for the count to be meaningful:\n{stdout}"
+    );
+    assert!(
+        repo["staleness_commits_behind"].is_null(),
+        "an uncountable commit distance must be null, not a fabricated 0 — \
+         `stale, 0 commits behind` is a contradiction:\n{stdout}"
+    );
+
+    // And the human-facing renderer must not collapse it back to a real zero.
+    let text = nestweaver_cmd()
+        .args(["stale-check", "--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("unavailable"),
+        "the text renderer must say the count is unavailable rather than print \
+         the row as if nothing were behind:\n{text}"
+    );
+}
+
+/// nw-257: `extensions list` documents its filtering as mirroring
+/// `query_extensions` "exactly", and did not.
+///
+/// `property_matches` treats a scalar query as a membership test against an
+/// array-valued property, because that is the shape real sidecars have
+/// (`aliases: ["Widget","widget"]`) — nw-109 added it for exactly that reason.
+/// The CLI restated the filter as equality only, so the audit command printed
+/// "No extension annotations found." for data the agent matched.
+///
+/// The existing guards stop at clap: replacing the whole match arm with
+/// `_ => true` passes both of them, and the one named
+/// `the_filters_match_the_mcp_tools_two_modes` guards precisely the property
+/// that was broken.
+#[test]
+fn extensions_list_matches_array_valued_properties_like_the_mcp_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"aliases": ["Widget", "widget"], "owner": "platform"}}"#,
+    )
+    .unwrap();
+
+    let matched = nestweaver_cmd()
+        .args([
+            "extensions",
+            "list",
+            "--db",
+            &db_path.display().to_string(),
+            "--key",
+            "aliases",
+            "--value",
+            "Widget",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&matched.stdout);
+    assert!(
+        stdout.contains("sym:repo:widget"),
+        "a scalar --value must match a member of an array-valued property, the \
+         way `query_extensions` does:\n{stdout}"
+    );
+
+    // The counterweight: membership must not have become an any-of that
+    // matches everything. A value that is in no array still finds nothing.
+    let absent = nestweaver_cmd()
+        .args([
+            "extensions",
+            "list",
+            "--db",
+            &db_path.display().to_string(),
+            "--key",
+            "aliases",
+            "--value",
+            "Gadget",
+        ])
+        .output()
+        .unwrap();
+    let absent = String::from_utf8_lossy(&absent.stdout);
+    assert!(
+        !absent.contains("sym:repo:widget"),
+        "membership must stay a filter — a value in no array must not match:\n{absent}"
+    );
+}
+
+/// nw-257: the audit command must not report "0 annotated node(s)" because it
+/// could not read the sidecar.
+///
+/// `load_extensions` folds both a parse failure and an I/O failure into an
+/// empty map. In a command whose entire purpose is reporting what is
+/// annotated, that turns "I cannot tell you" into "there is nothing", and
+/// exits 0 while doing it.
+#[test]
+fn extensions_list_fails_loudly_on_an_unreadable_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    // The counterweight, first: NO sidecar is not an error. Nothing has been
+    // annotated yet, and "0 annotated node(s)" is the honest answer.
+    nestweaver_cmd()
+        .args(["extensions", "list", "--db", &db_path.display().to_string()])
+        .assert()
+        .success();
+
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        "{ this is not json",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["extensions", "list", "--db", &db_path.display().to_string()])
+        .assert()
+        .failure()
+        .stdout(contains("0 annotated node(s)").not());
+}
+
 /// nw-244: PR #307 taught `brain remove` to honour `--config` like its two
 /// sibling vault commands, but both of its guards stop at clap — one asserts
 /// the flag is *accepted*, the other that it lands in the parsed struct.

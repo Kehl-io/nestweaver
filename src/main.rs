@@ -9100,12 +9100,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 anyhow::bail!("--value requires --key");
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let store = nestweaver_engine::extensions::load_extensions(&db_path);
+            // nw-257: `load_extensions` folds a corrupt or unreadable sidecar
+            // into an empty map, which in THIS command would print
+            // "0 annotated node(s)" and exit 0 — an audit reporting nothing
+            // wrong because it could not look. The checked loader still treats
+            // an absent sidecar as an empty store.
+            let store = nestweaver_engine::extensions::load_extensions_checked(&db_path)?;
 
-            // Filtering mirrors `query_extensions` exactly, including EXACT
-            // match on value — a CLI that matched differently would show a
-            // human a different answer than the agent acted on, which is the
-            // opposite of an audit.
+            // Filtering mirrors `query_extensions` exactly — by CALLING the
+            // same predicate rather than restating it. nw-257: the restatement
+            // did equality only and drifted from `property_matches`'s
+            // scalar-in-array membership, so `--key aliases --value Widget`
+            // printed "No extension annotations found." for data the agent
+            // matched. A CLI that answers a different question than the tool is
+            // the opposite of an audit.
             let mut rows: Vec<(
                 &String,
                 &std::collections::HashMap<String, serde_json::Value>,
@@ -9118,10 +9126,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return false;
                     }
                     match (key.as_deref(), value.as_deref()) {
-                        (Some(k), Some(v)) => {
-                            props.get(k).and_then(|found| found.as_str()) == Some(v)
-                                || props.get(k).map(ToString::to_string).as_deref() == Some(v)
-                        }
+                        (Some(k), Some(v)) => props.get(k).is_some_and(|found| {
+                            // `--value` is a string on the command line, so the
+                            // shared predicate is asked the string question.
+                            nestweaver_engine::extensions::property_matches(
+                                found,
+                                &serde_json::Value::String(v.to_string()),
+                            )
+                                // Retained from the pre-nw-257 CLI so this stays
+                                // a widening: `--value 42` still matches a
+                                // stored number and `--value '["a","b"]'` still
+                                // matches that whole array. Compared
+                                // STRUCTURALLY rather than by serialised text,
+                                // so the match does not depend on serde's
+                                // spacing. A `--value` that is not valid JSON
+                                // (the common `--value Widget`) simply falls
+                                // through to the string question above.
+                                || serde_json::from_str::<serde_json::Value>(v)
+                                    .is_ok_and(|query| found == &query)
+                        }),
                         (Some(k), None) => props.contains_key(k),
                         _ => true,
                     }
@@ -19284,19 +19307,25 @@ fn run_brain(
                                 .as_str()
                                 .map(|h| &h[..8.min(h.len())])
                                 .unwrap_or("unknown");
-                            let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
+                            // nw-256: `null` means the distance could not be
+                            // counted, and `unwrap_or(0)` made that print
+                            // identically to a real zero — undoing the fix one
+                            // layer down. Rendered as three distinct states.
+                            let behind = r["staleness_commits_behind"].as_u64();
                             let marker = match r["status"].as_str() {
                                 Some("missing") => "missing",
                                 Some("incomplete") => "incomplete",
                                 _ if stale => "STALE",
                                 _ => "ok",
                             };
-                            if stale && behind > 0 {
-                                println!(
+                            match behind {
+                                Some(behind) if stale && behind > 0 => println!(
                                     "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                                );
-                            } else {
-                                println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                                ),
+                                None if stale => println!(
+                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+                                ),
+                                _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
                             }
                         }
                     }
@@ -19348,7 +19377,17 @@ fn run_brain(
 
                 let is_valid_sha = repo.indexed_sha.len() == 40
                     && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-                let commits_behind = match (&current_head, repo.local_root()) {
+                // nw-256: `Option<u64>`, mirroring `tool_stale_check`. The
+                // note directly below is about `is_stale` diverging between
+                // these two routes for exactly this reason; #310 fixed the
+                // daemon side of the COUNT and left this one on
+                // `unwrap_or(0)`, so the same defect recurred in the same
+                // function pair. A failed `git rev-list` means "could not
+                // count", and this branch is only reached when HEAD already
+                // differs from the indexed SHA — so a zero here is a
+                // self-contradiction ("stale, 0 commits behind"), not an
+                // answer.
+                let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
                     (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                         std::process::Command::new("git")
                             .args([
@@ -19367,9 +19406,8 @@ fn run_brain(
                                     .parse::<u64>()
                                     .ok()
                             })
-                            .unwrap_or(0)
                     }
-                    _ => repo.staleness_commits_behind as u64,
+                    _ => Some(repo.staleness_commits_behind as u64),
                 };
                 // nw-163: BEHIND HEAD and nothing else — a deleted working
                 // tree is `status: "missing"` and `needs_reindex: true`, not
@@ -19385,7 +19423,10 @@ fn run_brain(
                     // says "missing" and `needs_reindex` is true, which is the
                     // actionable truth.
                     None if local_missing => false,
-                    None => commits_behind > 0,
+                    // An uncountable distance is not a claim of zero: if HEAD
+                    // is unknown AND the stored counter cannot be read,
+                    // staleness is simply not assertable here.
+                    None => commits_behind.is_some_and(|behind| behind > 0),
                 };
                 // A repo whose SHA was committed but whose content never
                 // landed (interrupted index) compares equal to HEAD yet
@@ -19475,19 +19516,25 @@ fn run_brain(
                         .as_str()
                         .map(|h| &h[..8.min(h.len())])
                         .unwrap_or("unknown");
-                    let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
+                    // nw-256: `null` means the distance could not be counted,
+                    // and `unwrap_or(0)` made that print identically to a real
+                    // zero — undoing the fix one layer down. Rendered as three
+                    // distinct states.
+                    let behind = r["staleness_commits_behind"].as_u64();
                     let marker = match r["status"].as_str() {
                         Some("missing") => "missing",
                         Some("incomplete") => "incomplete",
                         _ if stale => "STALE",
                         _ => "ok",
                     };
-                    if stale && behind > 0 {
-                        println!(
+                    match behind {
+                        Some(behind) if stale && behind > 0 => println!(
                             "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                        );
-                    } else {
-                        println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                        ),
+                        None if stale => println!(
+                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+                        ),
+                        _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
                     }
                 }
             }
