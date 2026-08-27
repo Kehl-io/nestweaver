@@ -4541,3 +4541,164 @@ fn daemon_gc_help_presents_db_as_optional() {
         "daemon gc --help presents --db as optional; keep behaviour and help in step"
     );
 }
+
+/// nw-246 (second hole), direct route: the ambiguity refusal must be
+/// REACHABLE.
+///
+/// `resolve_instance_id_for_db` returned the recorded identity before ever
+/// consulting `observed_instance_ids`, which made the refusal below dead code
+/// for any database that has a record. `ensure_data_instance_id` runs on every
+/// repo index and never replaces an existing value, so that is every database
+/// created or indexed under 8.0.0 — only a pre-nw-246 database could reach a
+/// refusal the runbook promises for everyone.
+///
+/// The sequence is entirely supported behaviour, which is what makes it bad:
+/// two STATED indexes pass by design (instance switching is a feature), and
+/// leave a database holding two instances whose record still names the first.
+/// A config-less index then adopted that record and silently re-keyed the
+/// repo — the nw-246 fork, produced by the guard meant to prevent it.
+///
+/// Reverting the ordering leaves the whole suite green without this test. That
+/// is why it exists.
+#[test]
+fn a_recorded_identity_does_not_mask_an_ambiguous_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+
+    let mut repos = Vec::new();
+    for name in ["first", "second", "third"] {
+        let repo = dir.path().join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = StdCommand::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git failed to spawn");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.js"), format!("function {name}() {{}}")).unwrap();
+        git(&["add", "a.js"]);
+        git(&["commit", "-m", "init"]);
+        repos.push(repo);
+    }
+
+    // Two STATED indexes. Both must succeed — instance switching is a
+    // supported operation, and a guard that refused these would have retired
+    // the capability rather than closed the hole.
+    for (repo, instance) in [(&repos[0], "one"), (&repos[1], "two")] {
+        nestweaver_cmd()
+            .args([
+                "index",
+                "--repo",
+                &repo.display().to_string(),
+                "--db",
+                &db_path.display().to_string(),
+                "--instance",
+                instance,
+            ])
+            .assert()
+            .success();
+    }
+
+    // Now the database holds two instances and its record names "one". A
+    // config-less index has no safe default.
+    let refused = nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repos[2].display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a config-less index against a database holding two instances must be \
+         refused; adopting the recorded one silently re-keys the repo"
+    );
+    let stderr = flatten_miette(&refused.stderr);
+    assert!(
+        stderr.contains("one") && stderr.contains("two"),
+        "the refusal must name the instances it found:\n{stderr}"
+    );
+
+    // Counterweight: stating an instance still resolves it. Without this, the
+    // refusal is indistinguishable from an index that has stopped working.
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repos[2].display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "one",
+        ])
+        .assert()
+        .success();
+}
+
+/// nw-246 (third hole): `nestweaver index` must actually RECORD the instance.
+///
+/// `ensure_data_instance_id`'s only caller was
+/// `index_directory_with_store_inner`, which is not the funnel the CLI index
+/// reaches — the CLI goes through `index_into_store_with_write_gate`. So the
+/// call ran on no real path, `data_instance_id()` returned `None` for every
+/// database, and the mint-once mechanism the whole item rests on was inert.
+///
+/// Nothing failed visibly, which is why it survived: `resolve_instance_id_for_db`
+/// falls back to inferring the instance from existing UIDs, and inference gives
+/// the same answer as the record in every single-instance case. The two only
+/// disagree where it matters — and there, silence looked like agreement.
+///
+/// Asserted against the store directly because the record has no CLI surface;
+/// `brain status` reports OBSERVED instances, which is the fallback, not this.
+#[test]
+fn indexing_records_the_data_instance_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git failed to spawn");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.js"), "function hello() {}").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "init"]);
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "recorded-one",
+        ])
+        .assert()
+        .success();
+
+    let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+    assert_eq!(
+        store.data_instance_id().unwrap().as_deref(),
+        Some("recorded-one"),
+        "an index must record the instance its data belongs to; without it the \
+         database can only ever INFER its identity from existing UIDs, and the \
+         inference agrees with the record in exactly the cases where neither \
+         matters"
+    );
+}
