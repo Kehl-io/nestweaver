@@ -1190,6 +1190,175 @@ pub fn compare_and_swap_current(
     .with_context(|| format!("durably replace CURRENT pointer {}", path.display()))
 }
 
+/// Whether a slot's artifact bytes are still bound to the digests its
+/// manifest declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactBytes {
+    /// Activation: the slot was just sealed and nothing has been allowed to
+    /// open it for writing, so every artifact must still hash to its
+    /// descriptor.
+    Verified,
+    /// Rollback: the target was previously selected, and a selected graph
+    /// stays writable after cutover (see `resolve_selected_database`), so its
+    /// live size and checksum legitimately advance past the sealed baseline.
+    /// Shape is still checkable; bytes are not.
+    Live,
+}
+
+/// Enforce the structural guarantees a slot must hold before a pointer may
+/// select it, for every route into publication (nw-253).
+///
+/// nw-149 gave the activation route three guards -- a symlink refusal, a
+/// per-artifact size/digest check, and a reverse inventory proving the slot
+/// holds nothing the manifest does not describe -- but wired them only into
+/// `validate_target_slot`, whose two call sites are both activations
+/// (`mark_ready`, `activate_operation`). Rollback reached
+/// `compare_and_swap_current` having checked the manifest's own metadata and
+/// identity and nothing about the directory those bytes describe, so a
+/// predecessor slot whose artifacts had been replaced with symbolic links was
+/// admitted. The downstream reader does not compensate:
+/// `resolve_selected_database` inspects the graph artifact with
+/// `std::fs::metadata`, which FOLLOWS links, so `is_file()` is true of a link
+/// pointing anywhere on the filesystem.
+///
+/// `ArtifactBytes` is the one honest asymmetry between the routes. Everything
+/// else -- containment, "real files only", `described == present` -- is a
+/// property of how a slot is WRITTEN, and the publisher never writes a link or
+/// an undescribed file on either route.
+pub(crate) fn validate_slot_contents(
+    slot: &Path,
+    bundle: &PublicationBundleV3,
+    bytes: ArtifactBytes,
+) -> anyhow::Result<()> {
+    use crate::publication_operation::PermanentPublicationFailure;
+
+    for descriptor in &bundle.artifacts {
+        let artifact = slot.join(&descriptor.path);
+        // Hashing OPENS the path, and opening follows symlinks — so a described
+        // artifact that is a symlink would validate against bytes living
+        // outside the slot entirely, while the reverse inventory below (which
+        // does not follow links) could not see it. A sealed slot contains
+        // exactly what it declares; a link is not a shape we ever write.
+        let metadata = std::fs::symlink_metadata(&artifact).map_err(|error| {
+            anyhow::anyhow!("stat target artifact {}: {error}", artifact.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} is a symbolic link; a sealed slot must contain \
+                 real files only",
+                descriptor.path
+            ))
+            .into());
+        }
+        // Belt and braces on containment: `validate_metadata` rejects absolute
+        // and `..` paths, but the bytes about to be trusted are worth proving
+        // are inside the slot rather than inferring it.
+        if !artifact.starts_with(slot) {
+            return Err(PermanentPublicationFailure(format!(
+                "target artifact {} resolves outside the publication slot",
+                descriptor.path
+            ))
+            .into());
+        }
+        if bytes == ArtifactBytes::Verified {
+            let (byte_size, digest) = crate::hash::blake3_file(&artifact).map_err(|error| {
+                anyhow::anyhow!("stream target artifact {}: {error}", artifact.display())
+            })?;
+            if byte_size != descriptor.byte_size || digest != descriptor.blake3 {
+                // Permanent: a retry revalidates the same bytes (nw-148).
+                return Err(PermanentPublicationFailure(format!(
+                    "target artifact {} failed size or digest validation",
+                    descriptor.path
+                ))
+                .into());
+            }
+        }
+    }
+
+    // nw-149: and the REVERSE. The loop above only proves every DESCRIBED file
+    // is present and intact; it says nothing about files present but not
+    // described, so anything dropped into a sealed slot was invisible to
+    // validation and travelled with the publication. `validate_backup_publication_inventory`
+    // already required `described == present` for the same artifacts — this
+    // path simply never got the other half.
+    //
+    // Filed as a hardening asymmetry rather than a proven escape: the probe
+    // matrix achieved no exploit. It closes a gap in an invariant; it does not
+    // patch a known attack.
+    let described: std::collections::BTreeSet<&str> = bundle
+        .artifacts
+        .iter()
+        .map(|descriptor| descriptor.path.as_str())
+        .collect();
+    // Walk RECURSIVELY and compare the same shape the manifest uses. Artifact
+    // paths are relative and `/`-joined (`build_backup_publication_bundle` ->
+    // `normalized_relative_path`), and nested ones are routine: the BM25 and
+    // regex sidecars are whole DIRECTORIES, described file by file as
+    // `<db>.tantivy/meta.json` and friends. A non-recursive `read_dir` would
+    // compare the bare directory name `<db>.tantivy` against those paths,
+    // match nothing, and fail every real publication permanently.
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in walkdir::WalkDir::new(slot).into_iter() {
+        let entry = entry
+            .map_err(|error| anyhow::anyhow!("read target slot {}: {error}", slot.display()))?;
+        // `WalkDir` does not follow symlinks, so a link reports neither file
+        // nor dir — it would fall through this filter and be INVISIBLE to the
+        // undescribed-file check while still being openable by the digest
+        // check above. Refuse it explicitly instead.
+        if entry.file_type().is_symlink() {
+            return Err(PermanentPublicationFailure(format!(
+                "target slot contains a symbolic link ({}); a sealed slot must contain \
+                 real files only",
+                entry.path().display()
+            ))
+            .into());
+        }
+        // Directories are containers, not artifacts; the manifest describes the
+        // files inside them.
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(slot)
+            .map_err(|error| anyhow::anyhow!("target slot entry outside the slot: {error}"))?;
+        let mut components = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(value) => {
+                    components.push(value.to_string_lossy().into_owned())
+                }
+                // A slot is written by us; anything else is not a shape we
+                // describe, so refuse rather than guess at a normal form.
+                _ => anyhow::bail!("unsafe target slot entry path: {}", entry.path().display()),
+            }
+        }
+        let name = components.join("/");
+        // The manifest describes the artifacts; it does not describe itself.
+        if name == PUBLICATION_MANIFEST_FILE {
+            continue;
+        }
+        present.insert(name);
+    }
+    let undescribed: Vec<&String> = present
+        .iter()
+        .filter(|name| !described.contains(name.as_str()))
+        .collect();
+    if !undescribed.is_empty() {
+        // Permanent for the same reason as a digest mismatch: a retry sees the
+        // same directory.
+        return Err(PermanentPublicationFailure(format!(
+            "target slot contains {} file(s) the manifest does not describe: {:?}; \
+             a sealed slot must contain exactly what it declares",
+            undescribed.len(),
+            undescribed
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Roll back exactly one selected publication while the active graph is
 /// quiesced. The first cutover returns to the implicit legacy/base database by
 /// removing `CURRENT`; later cutovers select the retained predecessor slot.
@@ -1272,6 +1441,11 @@ pub fn rollback_current_under_lock(
     {
         anyhow::bail!("rollback predecessor manifest identity does not match CURRENT");
     }
+    // nw-253: the predecessor slot has to satisfy the same structural
+    // guarantees as an activation target. Bytes are `Live` here because this
+    // slot was already selected once and its graph stayed writable after that
+    // cutover.
+    validate_slot_contents(&previous_slot, &bundle, ArtifactBytes::Live)?;
     let previous_identity = nestweaver_store::PublicationIdentity {
         brain_uuid: bundle.brain_uuid,
         publication_uuid: bundle.publication_uuid,
@@ -1731,6 +1905,81 @@ mod tests {
             read_current(&root).unwrap().unwrap().publication_uuid,
             first.publication_uuid,
             "a second rollback must not toggle back to the abandoned slot"
+        );
+        lease.release().unwrap();
+    }
+
+    /// nw-253: rollback must refuse a predecessor slot whose artifacts are
+    /// symbolic links.
+    ///
+    /// Before the fix, `rollback_current_under_lock` read the predecessor's
+    /// manifest, validated its metadata and identity, and went straight to
+    /// `compare_and_swap_current` -- it never looked at the directory those
+    /// bytes describe. So a graph artifact swapped for a link pointing OUTSIDE
+    /// the slot was selected, and nothing downstream compensated:
+    /// `resolve_selected_database` inspects the graph with `std::fs::metadata`,
+    /// which follows links, so `is_file()` is true of the link.
+    ///
+    /// The predecessor is admitted under `ArtifactBytes::Live` (a selected
+    /// graph stays writable after cutover), so the size/digest guard is
+    /// deliberately NOT what fails here. Only the symlink refusal can.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_a_predecessor_slot_containing_a_symlinked_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let base_store = nestweaver_store::GraphStore::create(&base).unwrap();
+        let base_identity = base_store.publication_identity().unwrap().unwrap();
+        drop(base_store);
+
+        let first_identity = base_identity.next_publication().unwrap();
+        let first = write_resolvable_slot(&base, &first_identity);
+        let second_identity = first_identity.next_publication().unwrap();
+        let second_without_predecessor = write_resolvable_slot(&base, &second_identity);
+        let second = CurrentPublicationPointer::new(
+            &second_identity,
+            Some(first_identity.publication_uuid.clone()),
+            second_without_predecessor.manifest_blake3,
+        )
+        .unwrap();
+        let root = default_publication_root(&base);
+        std::fs::write(
+            current_pointer_path(&root),
+            serde_json::to_vec_pretty(&second).unwrap(),
+        )
+        .unwrap();
+
+        // Move the predecessor's graph OUT of its slot and leave a link behind:
+        // the bytes rollback is about to select now live wherever the link
+        // points, which is precisely what a sealed slot promises cannot happen.
+        let previous_slot = slot_path(&root, &first.publication_uuid).unwrap();
+        let in_slot_graph = previous_slot.join(PUBLICATION_GRAPH_FILE);
+        let outside = dir.path().join("outside-the-slot.lbug");
+        std::fs::rename(&in_slot_graph, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &in_slot_graph).unwrap();
+
+        let predecessor = retained_predecessor_database(
+            &base,
+            second.expected_previous_publication_uuid.as_deref(),
+        )
+        .unwrap();
+        // Opening FOLLOWS the link, so the graph is perfectly usable and the
+        // lease/identity checks all pass -- which is why nothing noticed.
+        let predecessor_store = nestweaver_store::GraphStore::open(&predecessor).unwrap();
+        let lease = predecessor_store.acquire_index_publication_lease().unwrap();
+
+        let error = rollback_current(&root, &lease, &second.publication_uuid)
+            .expect_err("rollback must refuse a predecessor slot containing a symbolic link");
+        let message = error.to_string();
+        assert!(message.contains("symbolic link"), "{message}");
+        assert!(
+            crate::publication_operation::PermanentPublicationFailure::is_permanent(&error),
+            "a link in a sealed slot is not a transient condition: {message}"
+        );
+        assert_eq!(
+            read_current(&root).unwrap().unwrap().publication_uuid,
+            second.publication_uuid,
+            "a refused rollback must leave CURRENT untouched"
         );
         lease.release().unwrap();
     }
