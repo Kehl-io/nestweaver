@@ -5032,6 +5032,29 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Rebuild Tantivy search index so BM25 search reflects
                     // the freshly indexed vault content.
+                    //
+                    // nw-249: when there is NO writer this whole block was
+                    // skipped and the DONE phase below still reported a full
+                    // set of counts — so an index that could not touch the
+                    // search index at all looked identical to one that
+                    // rebuilt it. Unlike a failed rebuild, this is not an
+                    // error: a read-only replica legitimately has no writer.
+                    // So it is disclosed rather than failed, and the phrasing
+                    // says which of the two happened.
+                    let search_index_rebuilt = state
+                        .tantivy
+                        .as_ref()
+                        .is_some_and(|tantivy| tantivy.has_writer());
+                    if !search_index_rebuilt {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "note: the graph was updated but the BM25 search index \
+                                      was NOT rebuilt (this daemon holds no search-index \
+                                      writer), so `brain search` will not reflect this \
+                                      index until one does"
+                                .to_string(),
+                            ..Default::default()
+                        }));
+                    }
                     if let Some(ref tantivy) = state.tantivy
                         && tantivy.has_writer()
                     {

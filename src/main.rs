@@ -2937,7 +2937,17 @@ enum Commands {
     /// outsized blast radius. Useful for identifying fragile connectors.
     #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
     Bridges {
-        #[arg(long, default_value = "10", help = "Number of top bridges to show")]
+        // nw-251: bounded like `hubs --top`, which has carried
+        // `range(1..=1000)` all along. Unbounded, `--top 0` asked for nothing
+        // and a huge value asked the betweenness walk for the whole graph —
+        // and the MCP `bridge_nodes` schema bounds its own `top_n` to the same
+        // 1..=1000, so the two surfaces disagreed on what was even accepted.
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Number of top bridges to show (1-1000; matches the MCP bridge_nodes schema)"
+        )]
         top: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -10643,10 +10653,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // both output modes match direct output byte-for-byte
                 // (the daemon envelope carries _meta/count the direct
                 // path never prints).
-                let hubs: Vec<HubNode> = value
-                    .get("hubs")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                // nw-249: `.ok().unwrap_or_default()` turned a DECODE FAILURE
+                // into an empty list, which the branch below then renders as
+                // "No hub nodes found (graph may be empty)" — a confident claim
+                // about the graph made on the strength of a parse error. Same
+                // shape as the `list-repos` / `list-services` defect.
+                let hubs: Vec<HubNode> = match value.get("hubs") {
+                    Some(raw) => serde_json::from_value(raw.clone())
+                        .context("decode hub nodes from the daemon")?,
+                    None => Vec::new(),
+                };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&hubs)?);
                 } else if hubs.is_empty() {
@@ -10746,13 +10762,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 )? {
                     // Deserialize the tool's `bridges` array into the
                     // direct path's type so both modes render identically.
-                    let bridges: Vec<nestweaver_engine::BridgeNode> = serde_json::from_value(
-                        strip_hybrid_meta(value)
-                            .get("bridges")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                    )
-                    .unwrap_or_default();
+                    // nw-249: same defect as `hubs` above — a decode failure
+                    // became an empty list and rendered as "graph may be
+                    // empty". A `null` (no `bridges` key at all) is still an
+                    // honest empty result and stays one.
+                    let bridges: Vec<nestweaver_engine::BridgeNode> =
+                        match strip_hybrid_meta(value).get("bridges").cloned() {
+                            Some(serde_json::Value::Null) | None => Vec::new(),
+                            Some(raw) => serde_json::from_value(raw)
+                                .context("decode bridge nodes from the daemon")?,
+                        };
                     if json {
                         println!("{}", serde_json::to_string_pretty(&bridges)?);
                     } else if bridges.is_empty() {
@@ -12067,8 +12086,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             } else {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: provide either --files or --base-ref");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             };
 
             if changed_files.is_empty() {
@@ -12217,8 +12240,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: --refresh-wiki-hours requires --config");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
             let repo_path = match repo {
                 Some(p) => p,
@@ -19455,8 +19482,12 @@ fn run_brain(
             force,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: --refresh-wiki-hours requires --config");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
@@ -31155,6 +31186,27 @@ mod vault_command_config_parity_tests {
     /// nw-229. `set_extension` and `query_extensions` were BOTH agent-only, so
     /// an agent could write annotations that influence a human's results — the
     /// CLI consumes the sidecar internally — with no command to read them back.
+    /// nw-251. `hubs --top` has been bounded 1..=1000 all along and
+    /// `bridges --top` was not, while the MCP `bridge_nodes` schema bounds its
+    /// `top_n` to the same range — so the two surfaces disagreed on what was
+    /// even accepted.
+    #[test]
+    fn bridges_top_is_bounded_like_its_siblings() {
+        for bad in ["0", "1001"] {
+            let args = argv(&["nestweaver", "bridges", "--top", bad]);
+            assert!(
+                parse(args).is_err(),
+                "--top {bad} must be rejected, as `hubs --top` already rejects it"
+            );
+        }
+        // The counterweight: the range itself must still be usable, or a bound
+        // that rejected everything would pass the assertions above.
+        for good in ["1", "10", "1000"] {
+            let args = argv(&["nestweaver", "bridges", "--top", good]);
+            assert!(parse(args).is_ok(), "--top {good} must be accepted");
+        }
+    }
+
     #[test]
     fn a_human_can_read_back_what_agents_annotate() {
         let cli = parse(argv(&["nestweaver", "extensions", "list"])).expect("must parse");
