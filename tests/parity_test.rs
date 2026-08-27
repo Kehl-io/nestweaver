@@ -1398,3 +1398,59 @@ fn the_same_cli_writer_succeeds_once_the_daemon_is_gone() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// nw-267: `watch` and `brain watch` must take the WRITE LEASE before running
+/// a direct watcher.
+///
+/// Both fell back to a direct watcher after a point-in-time
+/// `daemon_process_running_for_db` probe — a check of a different file,
+/// followed by a writer that runs for HOURS. That is CWE-367, and it is
+/// verbatim the construct `embed` removed; `embed`'s comment is still in the
+/// tree calling it "CWE-367 exactly" and quoting MITRE's mitigation: *"ensure
+/// that locking occurs before the check, as opposed to afterwards."*
+///
+/// Of five production write paths, these two were the ones that never took the
+/// lease. The `.lock` PID file they write is a hint for readers, not a lock —
+/// it cannot survive PID reuse and an operator's `rm` erases it.
+///
+/// Probed the same way as `a_cli_writer_is_refused_while_the_daemon_holds_the_lease`:
+/// with the daemon holding the lease, a direct watcher must refuse rather than
+/// start indexing into a store it does not own.
+#[test]
+fn a_direct_watcher_is_refused_while_the_daemon_holds_the_lease() {
+    let fixture = setup_fixture();
+    let repo_dir = fixture.db_path.parent().unwrap().join("watched-repo");
+    write_repo_files(
+        &repo_dir,
+        &[("src/a.js", "export function one() { return 1; }\n")],
+    );
+    let vault_dir = fixture.db_path.parent().unwrap().join("watched-vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Note\n").unwrap();
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+
+    let repo_arg = repo_dir.display().to_string();
+    let vault_arg = vault_dir.display().to_string();
+    for (label, args) in [
+        ("watch", vec!["watch", repo_arg.as_str()]),
+        ("brain watch", vec!["brain", "watch", vault_arg.as_str()]),
+    ] {
+        let output = run_direct(&fixture.db_path, &args);
+
+        assert!(
+            !output.status.success(),
+            "`{label}` must refuse to run a direct watcher while the daemon \
+             holds the lease; a watcher that starts here writes into a store it \
+             does not own, for hours.\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = flatten_miette(&output.stderr);
+        assert!(
+            stderr.contains("write lease") || stderr.contains("holds the write lock"),
+            "`{label}`'s refusal must name who owns the database, not surface a \
+             generic I/O error:\n{stderr}"
+        );
+    }
+}

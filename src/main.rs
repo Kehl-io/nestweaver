@@ -2400,7 +2400,16 @@ enum Commands {
         #[arg(long)]
         local_changes: bool,
         /// Maximum transitive depth for impact analysis (default: 3)
-        #[arg(long, default_value = "3")]
+        // nw-268: bounded, so a mistyped depth is a usage error at parse time
+        // rather than an unbounded graph walk. Shares its ceiling with the
+        // gRPC handler.
+        #[arg(
+            long,
+            default_value = "3",
+            value_parser = clap::value_parser!(u32).range(
+                1..=nestweaver_engine::atomic_changes::MAX_IMPACT_DEPTH as i64
+            )
+        )]
         max_depth: u32,
         /// Include test files in impact results
         #[arg(long)]
@@ -9048,6 +9057,30 @@ fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: b
 #[must_use = "the lease must be HELD for the duration of the write; dropping it \
               immediately reduces this to a probe, which is the check-then-act \
               race it exists to remove"]
+/// Render a count that may be UNKNOWN.
+///
+/// nw-269: `unwrap_or(0)` on a count the producer deliberately nulled turns "I
+/// could not read this" into "there are none" — the two states a reader most
+/// needs told apart. The MCP route already emits `null` on a failed per-vault
+/// `list_notes`; both CLI renderers collapsed it back to `0`, so a vault whose
+/// notes could not be read displayed as "0 notes" beside vaults that genuinely
+/// had none.
+///
+/// Shared rather than restated, because this is the third count in this file
+/// to need it (top-level `brain status` totals, per-vault note counts, and
+/// `stale-check`'s commits-behind in nw-256) and each hand-rolled copy has
+/// drifted back to `unwrap_or(0)` at least once.
+fn render_optional_count(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::Null) | None => {
+            "unavailable (could not be read — NOT zero)".to_string()
+        }
+        Some(found) => found
+            .as_u64()
+            .map_or_else(|| found.to_string(), |n| n.to_string()),
+    }
+}
+
 fn require_exclusive_store_access(
     db_path: &std::path::Path,
     operation: &str,
@@ -10965,12 +10998,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // full-store scan would hang, so cap it and push any `target` filter
             // ahead of the per-symbol queries. A targeted or capped set is partial,
             // so it must NOT be persisted to the sidecar as the canonical summaries.
+            // nw-270: `SymbolSummaries` carries `matched_total` and `capped`
+            // — its own doc says "so callers can report honest truncation" —
+            // and this discarded both, keeping only `summaries`. `truncated`
+            // was then computed as `display.len() < total` where `total` is
+            // the ALREADY-CAPPED length, so a 500-of-40,000 answer reported
+            // `total: 500, truncated: false`. The cap is invisible in exactly
+            // the field that exists to disclose it.
+            let mut cap_dropped = 0usize;
             let after_filter: Vec<Summary> = if parsed_level == SummaryLevel::Symbol {
                 let out = nestweaver_engine::generate_symbol_summaries_bounded(
                     &store,
                     target.as_deref(),
                     nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP,
                 )?;
+                if out.capped {
+                    cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
+                }
                 out.summaries
             } else {
                 let summaries = generate_summaries(&store, parsed_level)?;
@@ -11002,14 +11046,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .cloned()
                     .collect()
             };
-            let truncated = display.len() < total;
+            // Truncation is either cause: the symbol cap upstream, or the
+            // token budget here. Reporting only the second made the first
+            // vanish.
+            let truncated = display.len() < total || cap_dropped > 0;
 
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "summaries": display,
-                        "total": total,
+                        // `total` now counts what MATCHED, not what survived
+                        // the cap — otherwise `returned == total` beside
+                        // `truncated: true` is a contradiction.
+                        "total": total + cap_dropped,
                         "returned": display.len(),
                         "truncated": truncated,
                     }))?
@@ -12407,6 +12457,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Fallback: run watcher directly.
+            //
+            // nw-267: take the LOCK, not a pidfile read. The arm above guards
+            // with `daemon_process_running_for_db`, a point-in-time check of a
+            // different file, followed by a watcher that runs for HOURS
+            // writing to the store. That is CWE-367, and it is verbatim the
+            // construct `embed` removed — its comment is still in this file,
+            // calling it "CWE-367 exactly" and quoting MITRE's mitigation:
+            // "ensure that locking occurs before the check, as opposed to
+            // afterwards."
+            //
+            // The window is not theoretical here either: every
+            // `DaemonClient::connect` autostarts a daemon, so an ordinary
+            // `nestweaver search` in another terminal after the probe hands
+            // the store to a second writer while this watcher is still
+            // indexing into it. `watch` was the one write path of five that
+            // never took the lease.
+            //
+            // Held for the whole watch, which is the point — the lease's
+            // lifetime has to cover the writes, not just the decision to
+            // start.
+            let _write_lease = require_exclusive_store_access(&db_path, "watch")?;
+
             let watcher =
                 CodeWatcher::new(&db_path, &repo_path, &instance_id).with_limits(index_limits);
             let stop = watcher.shutdown_handle();
@@ -12801,7 +12873,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
-                    let candidates = hybrid_search_candidates_from_value(value);
+                    let candidates = hybrid_search_candidates_from_value(value)?;
                     if candidates.is_empty() {
                         println!("No symbols found matching '{query}'.");
                     } else {
@@ -13997,8 +14069,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             confidence: f32,
                             depth: u32,
                         }
-                        let nodes: Vec<DaemonImpactNode> =
-                            serde_json::from_value(arr.clone()).unwrap_or_default();
+                        // nw-271: `unwrap_or_default()` on a DECODE turns "I
+                        // could not read the daemon's answer" into "the answer
+                        // was empty", and the branch below then prints a
+                        // confident "no impact". Same defect nw-249 fixed
+                        // three call sites up — its comment is at the top of
+                        // this file.
+                        let node_count = arr.as_array().map(Vec::len).unwrap_or(0);
+                        let nodes: Vec<DaemonImpactNode> = serde_json::from_value(arr.clone())
+                            .with_context(|| {
+                                format!("decode {node_count} impact node(s) from the daemon")
+                            })?;
                         let count = nodes.len();
                         if nodes.is_empty() {
                             if !out.quiet {
@@ -14938,8 +15019,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)?
                 {
+                    // nw-271: a decode failure must not print "No implicit
+                    // projects detected" — that is a claim about the vault,
+                    // made from a failure to read the response.
                     let detected: Vec<String> =
-                        serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default();
+                        serde_json::from_value(unwrap_hybrid_payload(value))
+                            .context("decode detected implicit projects from the daemon")?;
                     if detected.is_empty() {
                         println!("No implicit projects detected in {}", vault.display());
                     } else {
@@ -18480,10 +18565,16 @@ fn regex_truncation_label(
     }
 }
 
+/// nw-271: propagates instead of returning an empty Vec.
+///
+/// `unwrap_or_default()` here made a malformed daemon payload indistinguishable
+/// from "no candidates matched" — a fact about this process presented as a fact
+/// about the graph.
 fn hybrid_search_candidates_from_value(
     value: serde_json::Value,
-) -> Vec<nestweaver_engine::SymbolCandidate> {
-    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
+) -> anyhow::Result<Vec<nestweaver_engine::SymbolCandidate>> {
+    serde_json::from_value(unwrap_hybrid_payload(value))
+        .context("decode search candidates from the daemon")
 }
 
 fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>)> {
@@ -18905,7 +18996,10 @@ fn run_brain(
                         }
                         for v in vaults {
                             let name = v["name"].as_str().unwrap_or("?");
-                            let note_count = v["note_count"].as_u64().unwrap_or(0);
+                            // nw-269: the MCP route nulls this when a
+                            // per-vault `list_notes` fails; `unwrap_or(0)`
+                            // printed that as "0 notes".
+                            let note_count = render_optional_count(v.get("note_count"));
                             let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
                             let ambiguous = name_counts.get(name).copied().unwrap_or(0) > 1;
                             let unnamed = name.is_empty();
@@ -18941,16 +19035,7 @@ fn run_brain(
                     // The MCP client can inspect the null itself; a human
                     // reading the text render cannot. So this surface is the
                     // one that most needs the disclosure, not the least.
-                    let count = |key: &str| -> String {
-                        match value.get(key) {
-                            Some(serde_json::Value::Null) | None => {
-                                "unavailable (could not be read — NOT zero)".to_string()
-                            }
-                            Some(found) => found
-                                .as_u64()
-                                .map_or_else(|| found.to_string(), |n| n.to_string()),
-                        }
-                    };
+                    let count = |key: &str| -> String { render_optional_count(value.get(key)) };
                     println!("  Notes:     {}", count("notes"));
                     println!("  Headings:  {}", count("headings"));
                     println!("  Sections:  {}", count("sections"));
@@ -19151,7 +19236,21 @@ fn run_brain(
                     *name_counts.entry(v.name.as_str()).or_insert(0) += 1;
                 }
                 for v in &vaults {
-                    let vault_note_count = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                    // nw-269: `unwrap_or_default().len()` is the same defect
+                    // one layer earlier — the error never even becomes a null,
+                    // it becomes an empty Vec and then a confident `0`. The
+                    // MCP route logs the failure and emits null; this route
+                    // silently agreed that the vault was empty.
+                    let vault_note_count = match store.list_notes(Some(&v.uid)) {
+                        Ok(notes) => notes.len().to_string(),
+                        Err(error) => {
+                            tracing::warn!(
+                                vault = %v.uid,
+                                "per-vault note count unavailable: {error}"
+                            );
+                            render_optional_count(Some(&serde_json::Value::Null))
+                        }
+                    };
                     let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
                     let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
@@ -19389,21 +19488,25 @@ fn run_brain(
                     .map(|p| !std::path::Path::new(p).exists())
                     .unwrap_or(false);
 
-                let current_head = if local_missing {
-                    None
-                } else if let Some(path) = repo.local_root() {
-                    std::process::Command::new("git")
-                        .args(["-C", path, "rev-parse", "HEAD"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                };
+                // nw-266: the `else` here was a hardcoded `None`, while the
+                // MCP route asked the REMOTE. `local_root()` is `None`
+                // whenever `root_path` is empty and the url is not `file://`,
+                // which is exactly the case `remote_head` exists to serve — so
+                // the CLI reported `ok` and exited 0 for a repo the daemon
+                // called stale, and a CI gate built on it passed.
+                //
+                // Third divergence in this function pair, after nw-163
+                // (`is_stale`) and nw-256 (`commits_behind`). Both of those
+                // fixes left a comment saying the routes must not drift, and
+                // the next divergence appeared underneath it — so the decision
+                // now lives in one place both routes CALL.
+                let current_head = nestweaver_engine::repo_head::current_head(
+                    local_missing,
+                    repo.local_root(),
+                    &repo.url,
+                );
 
-                let is_valid_sha = repo.indexed_sha.len() == 40
-                    && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
+                let is_valid_sha = nestweaver_engine::repo_head::is_full_sha(&repo.indexed_sha);
                 // nw-256: `Option<u64>`, mirroring `tool_stale_check`. The
                 // note directly below is about `is_stale` diverging between
                 // these two routes for exactly this reason; #310 fixed the
@@ -19416,23 +19519,7 @@ fn run_brain(
                 // answer.
                 let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
                     (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
-                        std::process::Command::new("git")
-                            .args([
-                                "-C",
-                                path,
-                                "rev-list",
-                                "--count",
-                                &format!("{}..{}", repo.indexed_sha, head),
-                            ])
-                            .output()
-                            .ok()
-                            .filter(|o| o.status.success())
-                            .and_then(|o| {
-                                String::from_utf8_lossy(&o.stdout)
-                                    .trim()
-                                    .parse::<u64>()
-                                    .ok()
-                            })
+                        nestweaver_engine::repo_head::commits_between(path, &repo.indexed_sha, head)
                     }
                     _ => Some(repo.staleness_commits_behind as u64),
                 };
@@ -19711,6 +19798,16 @@ fn run_brain(
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
             }
+
+            // nw-267 (sibling): `brain watch` runs the same direct-watcher
+            // fallback as `watch` and had the same hole — a long-running
+            // writer with no write lease. Fixing one route and leaving its
+            // twin is the exact pattern this batch exists to stop, and the
+            // PID lock file written below is a HINT to readers, not a lock:
+            // it cannot survive PID reuse and an operator's `rm` erases it.
+            //
+            // Held for the whole watch.
+            let _write_lease = require_exclusive_store_access(&db_path, "brain watch")?;
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
@@ -27973,10 +28070,29 @@ credential_method = "ssh"
             }
         });
 
-        let candidates = hybrid_search_candidates_from_value(value);
+        let candidates = hybrid_search_candidates_from_value(value).expect("well-formed payload");
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "processPayment");
+    }
+
+    /// nw-271: the counterweight to the test above. A payload that cannot be
+    /// decoded must ERROR, not come back as an empty Vec — otherwise "the
+    /// daemon sent something I could not read" and "nothing matched your
+    /// search" are the same answer, and only one of them is true.
+    #[test]
+    fn a_malformed_search_payload_errors_rather_than_reading_as_empty() {
+        let malformed = serde_json::json!({
+            "results": [{ "uid": "sym:1", "start_line": "not-a-number" }]
+        });
+
+        let error = hybrid_search_candidates_from_value(malformed)
+            .expect_err("a malformed payload must not decode to an empty result set");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("decode search candidates"),
+            "and the failure must say what could not be read: {rendered}"
+        );
     }
 
     #[test]
@@ -31388,6 +31504,38 @@ mod vault_command_config_parity_tests {
         assert_eq!(
             config.as_deref(),
             Some(std::path::Path::new("/etc/nestweaver/instance.toml"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod optional_count_rendering_tests {
+    use super::render_optional_count;
+
+    /// nw-269: the whole point is that "unreadable" and "zero" must not print
+    /// the same. Both directions asserted, because either alone is satisfiable
+    /// by a renderer that always says one thing.
+    #[test]
+    fn unknown_and_zero_do_not_render_alike() {
+        let unknown = render_optional_count(Some(&serde_json::Value::Null));
+        let absent = render_optional_count(None);
+        let zero = render_optional_count(Some(&serde_json::json!(0)));
+        let real = render_optional_count(Some(&serde_json::json!(42)));
+
+        assert_eq!(zero, "0", "a real zero must render as a plain 0");
+        assert_eq!(real, "42", "a real count must render as itself");
+        assert_ne!(
+            unknown, zero,
+            "an unreadable count must not render like a real zero — that is the \
+             entire defect"
+        );
+        assert_eq!(
+            unknown, absent,
+            "an explicit null and a missing key are the same state: not read"
+        );
+        assert!(
+            unknown.contains("unavailable") && unknown.contains("NOT zero"),
+            "and it must say so in words a reader cannot mistake: {unknown}"
         );
     }
 }

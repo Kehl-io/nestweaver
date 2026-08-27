@@ -12102,8 +12102,13 @@ fn impact_analysis_impl(
         });
     }
 
+    // nw-268: clamped, like the sibling traversal at `remaining_depth` already
+    // was. Unbounded here meant a single request could walk the whole graph
+    // transitively with no ceiling — and the CLI half had no `value_parser`, so
+    // a mistyped `--max-depth` arrived as a real instruction rather than a
+    // usage error.
     let max_depth = if req.max_depth > 0 {
-        req.max_depth as u32
+        (req.max_depth as u32).min(nestweaver_engine::atomic_changes::MAX_IMPACT_DEPTH)
     } else {
         3 // default
     };

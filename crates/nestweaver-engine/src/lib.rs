@@ -261,6 +261,7 @@ pub mod query;
 pub mod read_symbols;
 pub mod recency;
 pub mod registry;
+pub mod repo_head;
 pub mod rerank;
 pub mod resolution_cache;
 pub mod resolver_generation;

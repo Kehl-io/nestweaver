@@ -8187,17 +8187,13 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .unwrap_or(false);
 
         // Local working tree → read HEAD from disk; otherwise ask the remote.
-        let current_head = if local_missing {
-            None
-        } else if let Some(path) = repo.local_root() {
-            get_git_head(path)
-        } else {
-            get_remote_head(&repo.url)
-        };
+        // nw-266: shared with the CLI route, which hand-rolled this and
+        // dropped the remote branch entirely. See `repo_head`.
+        let current_head =
+            nestweaver_engine::repo_head::current_head(local_missing, repo.local_root(), &repo.url);
 
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
-        let is_valid_sha =
-            repo.indexed_sha.len() == 40 && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
+        let is_valid_sha = nestweaver_engine::repo_head::is_full_sha(&repo.indexed_sha);
         //
         // `unwrap_or(0)` here produced a CONTRADICTION rather than a missed
         // staleness: this branch is only reached when HEAD differs from the
@@ -8209,7 +8205,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // rev-list` actually tells us, and is distinguishable from a real zero.
         let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
             (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
-                count_commits_between(path, &repo.indexed_sha, head)
+                nestweaver_engine::repo_head::commits_between(path, &repo.indexed_sha, head)
             }
             _ => Some(repo.staleness_commits_behind as u64),
         };
@@ -8281,61 +8277,6 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         "any_needs_reindex": any_needs_reindex,
         "repos": results,
     }))
-}
-
-/// Get the current HEAD sha for a git repo at the given path.
-fn get_git_head(repo_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// Count commits between two SHAs in a local repo.
-fn count_commits_between(repo_path: &str, from_sha: &str, to_sha: &str) -> Option<u64> {
-    let range = format!("{from_sha}..{to_sha}");
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["rev-list", "--count", &range])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-            .ok()
-    } else {
-        None
-    }
-}
-
-/// Get the current HEAD sha for a remote git repo via `git ls-remote`.
-/// Works for SSH (`git@github.com:...`) and HTTPS (`https://...`) URLs.
-///
-/// Stderr is suppressed so SSH key errors or other diagnostics don't leak
-/// into MCP responses.
-fn get_remote_head(url: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["ls-remote", "--exit-code", url, "HEAD"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output format: "<sha>\tHEAD\n"
-    stdout.split_whitespace().next().map(|s| s.to_string())
 }
 
 // ── 14. set_extension ──────────────────────────────────────────────────────

@@ -4702,3 +4702,198 @@ fn indexing_records_the_data_instance_id() {
          matters"
     );
 }
+
+/// nw-268: `pre-push-impact --max-depth` is bounded at parse time.
+///
+/// It had no `value_parser`, so a mistyped `--max-depth 100000` arrived as a
+/// real instruction and became an unbounded transitive graph walk. The gRPC
+/// half accepted whatever it was sent, while its own sibling traversal
+/// (`remaining_depth`) had clamped at 64 all along — two limits, one absent.
+///
+/// Asserts WHICH error, not merely that the command failed. My first version
+/// checked only a non-zero exit and passed with the bound removed, because
+/// `pre-push-impact` without `--local-changes` or `--diff` already exits
+/// non-zero for an unrelated reason. A refusal is only evidence when it is the
+/// refusal you asked for.
+#[test]
+fn pre_push_impact_depth_is_bounded_at_parse_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    let depth_error = |depth: &str| -> String {
+        let out = nestweaver_cmd()
+            .args([
+                "pre-push-impact",
+                "--db",
+                &db_path.display().to_string(),
+                "--max-depth",
+                depth,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "`--max-depth {depth}` unexpectedly succeeded"
+        );
+        String::from_utf8_lossy(&out.stderr).to_lowercase()
+    };
+
+    // Past the ceiling: a PARSE error naming the range.
+    let past = depth_error("100000");
+    assert!(
+        past.contains("invalid value") || past.contains("not in"),
+        "an out-of-range --max-depth must be refused by the parser, naming the \
+         range — not accepted and turned into an unbounded walk:\n{past}"
+    );
+
+    // The counterweight: an in-range depth must get PAST parsing. It still
+    // fails, on the missing `--local-changes`/`--diff` — which is exactly the
+    // error that made the naive version of this test vacuous, so asserting it
+    // here is what proves the two cases are distinguishable at all.
+    let ok = depth_error("8");
+    assert!(
+        ok.contains("--local-changes") || ok.contains("--diff"),
+        "a depth within the bound must parse and fail later, on the missing \
+         change source:\n{ok}"
+    );
+
+    // The boundary, as LITERALS. Deriving these from the constant would make
+    // the test agree with whatever the constant says.
+    let at_limit = depth_error("64");
+    assert!(
+        at_limit.contains("--local-changes") || at_limit.contains("--diff"),
+        "64 is the documented ceiling and must parse:\n{at_limit}"
+    );
+    let past_limit = depth_error("65");
+    assert!(
+        past_limit.contains("invalid value") || past_limit.contains("not in"),
+        "65 is past the documented ceiling and must be refused by the parser:\n{past_limit}"
+    );
+}
+
+/// nw-269: an unreadable count must render as unavailable, never as `0`.
+///
+/// Unit-level because the failure it guards — a per-vault `list_notes` erroring
+/// — cannot be provoked from the CLI without corrupting a store mid-run. What
+/// CAN be pinned exactly is the rendering decision, which is where all three
+/// instances of this bug have lived: `unwrap_or(0)` on a value the producer
+/// deliberately nulled.
+///
+/// Three counts in `main.rs` have needed this (top-level `brain status`
+/// totals, per-vault note counts, and `stale-check`'s commits-behind in
+/// nw-256), and each hand-rolled copy drifted back to `unwrap_or(0)` at least
+/// once — so the renderer is shared and this pins the shared one.
+#[test]
+fn an_unreadable_count_is_never_rendered_as_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    // A vault with genuinely nothing in it must still say "0 notes" — the
+    // counterweight. Without it, a renderer that called EVERYTHING unavailable
+    // would pass the assertion that matters.
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "brain status on an empty database must succeed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unavailable (could not be read"),
+        "a database that reads fine must report real counts, not unavailable:\n{stdout}"
+    );
+}
+
+/// nw-270: `summary --json` must disclose the symbol cap.
+///
+/// `SymbolSummaries` carries `matched_total` and `capped` — its own doc says
+/// "so callers can report honest truncation" — and this caller kept only
+/// `summaries`. `truncated` was then computed against the ALREADY-CAPPED
+/// length, so a 500-of-N answer reported `total: 500, truncated: false`. The
+/// cap was invisible in exactly the field that exists to disclose it.
+///
+/// Needs a corpus larger than `DEFAULT_SYMBOL_SUMMARY_CAP` (500) for the cap
+/// to bind at all — a smaller fixture cannot distinguish the states and the
+/// test would pass either way.
+#[test]
+fn summary_json_discloses_the_symbol_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let mut src = String::new();
+    for i in 0..640 {
+        src.push_str(&format!("export function fn{i}() {{ return {i}; }}\n"));
+    }
+    std::fs::write(repo.join("many.js"), src).unwrap();
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git failed to spawn");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "many.js"]);
+    git(&["commit", "-m", "init"]);
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args([
+            "summary",
+            "--db",
+            &db_path.display().to_string(),
+            "--level",
+            "symbol",
+            "--token-budget",
+            "0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("summary --json: {e}\n{}", &stdout[..stdout.len().min(400)]));
+
+    let returned = parsed["returned"].as_u64().expect("returned");
+    let total = parsed["total"].as_u64().expect("total");
+    let truncated = parsed["truncated"].as_bool().expect("truncated");
+
+    // The counterweight: the cap must actually have bound. If the indexer
+    // produced fewer than 500 symbols this proves nothing, and would pass
+    // against the unfixed code.
+    assert_eq!(
+        returned, 500,
+        "the fixture must exceed the 500-symbol cap for this to test anything; \
+         got {returned} returned of {total}"
+    );
+    assert!(
+        truncated,
+        "a capped answer must report truncated: true — reporting false is the \
+         defect:\n returned={returned} total={total}"
+    );
+    assert!(
+        total > returned,
+        "`total` must count what MATCHED, not what survived the cap; \
+         returned == total beside truncated:true is a contradiction \
+         (returned={returned}, total={total})"
+    );
+}
