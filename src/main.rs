@@ -18877,21 +18877,52 @@ fn run_brain(
                             }
                         }
                     }
-                    let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let headings = value.get("headings").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let sections = value.get("sections").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let tags = value.get("tags").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let wikilinks = value.get("wikilinks").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let repo_count = value
-                        .get("repo_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("  Notes:     {notes}");
-                    println!("  Headings:  {headings}");
-                    println!("  Sections:  {sections}");
-                    println!("  Tags:      {tags}");
-                    println!("  Wikilinks: {wikilinks}");
-                    println!("  Repos:     {repo_count}");
+                    // nw-249(a): `unwrap_or(0)` collapsed a DELIBERATE null.
+                    //
+                    // The emitter sets these to `null` when the count could
+                    // not be READ, and `brain_status`'s own description says:
+                    // "a count of `null` means it could NOT BE READ, which is
+                    // NOT zero and is not a reason to re-index. Check
+                    // `unavailable` (and `counts_complete`) before acting on
+                    // any count." This render did exactly what that sentence
+                    // forbids — printed `Notes: 0`, which reads as "empty, go
+                    // re-index", for a vault that is merely unreadable.
+                    //
+                    // The MCP client can inspect the null itself; a human
+                    // reading the text render cannot. So this surface is the
+                    // one that most needs the disclosure, not the least.
+                    let count = |key: &str| -> String {
+                        match value.get(key) {
+                            Some(serde_json::Value::Null) | None => {
+                                "unavailable (could not be read — NOT zero)".to_string()
+                            }
+                            Some(found) => found
+                                .as_u64()
+                                .map_or_else(|| found.to_string(), |n| n.to_string()),
+                        }
+                    };
+                    println!("  Notes:     {}", count("notes"));
+                    println!("  Headings:  {}", count("headings"));
+                    println!("  Sections:  {}", count("sections"));
+                    println!("  Tags:      {}", count("tags"));
+                    println!("  Wikilinks: {}", count("wikilinks"));
+                    println!("  Repos:     {}", count("repo_count"));
+                    // And name what failed, so the reader is not left to infer
+                    // it from which rows say "unavailable".
+                    if let Some(unavailable) = value.get("unavailable").and_then(|v| v.as_array())
+                        && !unavailable.is_empty()
+                    {
+                        let names: Vec<String> = unavailable
+                            .iter()
+                            .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+                            .collect();
+                        println!(
+                            "  NOTE: {} count(s) could not be read ({}). These are NOT zero, \
+                             and re-indexing is not the remedy.",
+                            names.len(),
+                            names.join(", ")
+                        );
+                    }
                     // One-line publication state when dirty — the "(see
                     // warning)" pointer is only printed when a warning
                     // actually follows (wedged), not for a routine in-flight
