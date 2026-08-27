@@ -34,8 +34,32 @@ pub fn local_head(repo_path: &str) -> Option<String> {
 /// Works for SSH (`git@github.com:…`) and HTTPS URLs. Stderr is suppressed so
 /// SSH key errors and other diagnostics do not leak into tool responses.
 pub fn remote_head(url: &str) -> Option<String> {
+    // nw-276: guardrails, because nw-266 made a code path that previously
+    // performed NO network call start performing one — on a command the
+    // codebase itself calls a CI freshness gate.
+    //
+    // * `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS`/`SSH_ASKPASS` — a private
+    //   repo with no usable credentials otherwise PROMPTS. In CI there is
+    //   nobody to answer.
+    // * `stdin(null)` — inherited stdin is what lets a prompt block forever.
+    //   Suppressing the prompt and leaving stdin attached still hangs on
+    //   `ssh`'s own host-key confirmation.
+    // * `--exit-code` keeps "reachable but empty" distinct from "unreachable".
+    //
+    // A timeout is deliberately NOT implemented with a thread+kill dance here:
+    // `git` honours these env vars by failing fast, and the mechanisms above
+    // remove the cases that hang. `stale-check`'s callers apply their own
+    // budget.
     let output = std::process::Command::new("git")
         .args(["ls-remote", "--exit-code", url, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new",
+        )
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -201,5 +225,77 @@ mod tests {
             None,
             "an unreachable range cannot be counted, and must not be reported as 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_guardrail_tests {
+    use super::*;
+
+    /// nw-276: an unreachable remote must FAIL, not hang waiting for input.
+    ///
+    /// nw-266 made this branch perform a network call where it previously made
+    /// none, on a command the codebase calls a CI freshness gate. Without
+    /// `GIT_TERMINAL_PROMPT=0`, a null stdin, and SSH batch mode, a private
+    /// repo with no usable credentials prompts — and in CI nobody answers.
+    ///
+    /// A nonexistent local path is the cheapest unreachable remote there is:
+    /// no network, no waiting, and `git` still takes the same credential and
+    /// prompt paths.
+    #[test]
+    fn an_unreachable_remote_returns_none_promptly() {
+        let started = std::time::Instant::now();
+        let resolved = remote_head("/nonexistent/definitely-not-a-repo.git");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resolved, None,
+            "an unreachable remote must resolve to None, not a fabricated sha"
+        );
+        // Generous, because this asserts "did not hang", not a latency budget.
+        // A prompt-blocked `git` never returns at all.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "resolving an unreachable remote took {elapsed:?} — it should fail \
+             fast, not block on a credential or host-key prompt"
+        );
+    }
+
+    /// The counterweight: the guardrails must not have broken the working case.
+    /// Without this, a `remote_head` that always returned `None` would satisfy
+    /// the assertion above perfectly.
+    #[test]
+    fn the_guardrails_do_not_break_a_reachable_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let bare = dir.path().join("origin.git");
+        std::fs::create_dir(&work).unwrap();
+        let git = |d: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(d)
+                .status()
+                .expect("git must be available");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&work, &["init"]);
+        git(&work, &["config", "user.email", "t@t.com"]);
+        git(&work, &["config", "user.name", "T"]);
+        std::fs::write(work.join("a.txt"), "hello").unwrap();
+        git(&work, &["add", "a.txt"]);
+        git(&work, &["commit", "-m", "one"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let head = remote_head(bare.to_str().unwrap())
+            .expect("a reachable remote must still resolve with the guardrails on");
+        assert!(is_full_sha(&head), "expected a 40-hex sha, got {head:?}");
     }
 }

@@ -9,8 +9,14 @@ change `CURRENT` until every artifact validates.
 
 Stop the daemon and any external watchers, then run:
 
+> `daemon stop` takes `--db`, not `--config`: the daemon subtree has no
+> config-based database resolution, so `--config` is rejected outright and a
+> bare `daemon stop` fails with "No database path provided". Its siblings
+> `daemon start` and `publication rebuild` DO take `--config`, which is what
+> makes this easy to miss.
+
 ```sh
-nestweaver daemon stop --config /path/to/instance.toml
+nestweaver daemon --db /path/to/brain.lbug stop
 nestweaver publication rebuild --config /path/to/instance.toml
 nestweaver daemon start --config /path/to/instance.toml
 ```
@@ -83,7 +89,7 @@ The predecessor remains retained after activation. If post-cutover validation
 finds a problem, stop the daemon and switch back without rebuilding:
 
 ```sh
-nestweaver daemon stop --config /path/to/instance.toml
+nestweaver daemon --db /path/to/brain.lbug stop
 nestweaver publication rollback --config /path/to/instance.toml
 nestweaver daemon start --config /path/to/instance.toml
 ```

@@ -906,6 +906,17 @@ pub fn write_lease_path(db_path: &Path) -> PathBuf {
 /// question a check-then-write cannot ask. Every comparable embedded store —
 /// SQLite, RocksDB, LMDB, DuckDB, Kuzu — holds a lock for the lifetime of the
 /// handle for exactly this reason.
+// nw-274: `#[must_use]` on the TYPE, not only on the helper that returns it.
+//
+// The single `#[must_use]` guarding this lived on `require_exclusive_store_access`
+// in `main.rs`, and an unrelated function inserted above it silently detached
+// the attribute — the fifth docblock detachment this release. A per-function
+// attribute protects one function and can be separated from it by an edit
+// elsewhere; on the type it covers every present and future producer, and
+// nothing can come between them.
+#[must_use = "the lease must be HELD for the duration of the write; dropping it \
+              immediately reduces this to a probe, which is the check-then-act \
+              race it exists to remove"]
 #[derive(Debug)]
 pub struct DbWriteLease {
     _file: std::fs::File,

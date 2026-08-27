@@ -931,14 +931,23 @@ pub struct DaemonState {
     /// repo/symbol/note we write, so users see and type one name everywhere
     /// (nw-019). Config-less starts collapse it back onto `instance_id`.
     pub data_instance_id: String,
-    /// nw-246: instances observed in a database that stated none, when there is
-    /// more than one. Empty in the normal case.
+    /// nw-246/nw-275: whether the daemon's own configuration NAMED an
+    /// instance.
     ///
-    /// Carried rather than fatal at startup: refusing to boot would block
-    /// READS, and reads are instance-agnostic. The ambiguity only has to be
-    /// refused where it can actually fork the graph, which is a write that
-    /// states no instance of its own.
-    pub ambiguous_instance_ids: Vec<String>,
+    /// This is a fact about how the daemon was started, so it is genuinely
+    /// immutable for the process's lifetime — unlike the set of instances the
+    /// database holds, which is not. That set was originally snapshotted here
+    /// at boot and read frozen by ten consumers, so a database that became
+    /// multi-instance DURING the daemon's lifetime stayed unguarded for the
+    /// rest of it, while the CLI re-read on every invocation. The two routes
+    /// nw-246 aligned would have diverged again on staleness rather than
+    /// logic.
+    ///
+    /// The ambiguity itself is now queried live at the write choke point.
+    /// `observed_instance_ids` scans only Repo and Vault nodes with DISTINCT,
+    /// so it costs a small query on writes that state no instance — and
+    /// nothing at all on the ones that do.
+    pub instance_stated_by_config: bool,
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
     pub active_writes: Arc<AtomicU32>,
@@ -1146,11 +1155,26 @@ fn build_daemon_permission_source(
 /// `default` and split the graph. It sends empty now, and a config-less
 /// daemon's `data_instance_id` is "default" rather than a db-path hash, so the
 /// two paths agree without either compensating for the other.
-fn resolve_effective_instance_id(
-    requested: &str,
-    configured: &str,
-    ambiguous: &[String],
-) -> Result<String, Status> {
+/// The PURE half: request beats configured default, and the winner is
+/// validated.
+///
+/// Split from the policy below so it stays testable by value. The ambiguity
+/// guard needs the store (nw-275 made it a live query, not a boot snapshot);
+/// this does not, and forcing a `DaemonState` through it would have made a
+/// handful of table-driven validation tests build a daemon.
+fn pick_effective_instance_id(requested: &str, configured: &str) -> Result<String, Status> {
+    let effective = if requested.is_empty() {
+        configured
+    } else {
+        requested
+    };
+    nestweaver_engine::validate_instance_id(effective)
+        .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+    Ok(effective.to_string())
+}
+
+fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result<String, Status> {
+    let configured = state.data_instance_id.as_str();
     // nw-246: a request that states no instance, against a database holding
     // several and having stated none itself, has no safe default. Adopting one
     // is how the fork deepens.
@@ -1165,24 +1189,39 @@ fn resolve_effective_instance_id(
     // `merge`/`purge` state both ids explicitly and so pass through untouched —
     // which matters, because `instance merge` is the documented REMEDY for
     // this exact state and must not be refused by the guard warning about it.
-    if requested.is_empty() && !ambiguous.is_empty() {
+    // nw-275: queried LIVE, not read from a boot snapshot. A database can
+    // become multi-instance while this daemon is running — an explicitly
+    // instanced write is exactly how — and the guard has to see the database
+    // as it is at the moment of the write, not as it was at startup.
+    let ambiguous: Vec<String> = if requested.is_empty() && !state.instance_stated_by_config {
+        state.store.observed_instance_ids().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if requested.is_empty() && ambiguous.len() > 1 {
         return Err(Status::failed_precondition(format!(
+            // nw-277: `--config` is NOT offered here, deliberately. This
+            // refusal comes from a RUNNING daemon, and `IndexRepoRequest`
+            // carries no config field — the daemon's own configuration is
+            // fixed at start. A user who follows a `--config` suggestion
+            // re-runs the command, sends the same empty instance, and gets the
+            // same refusal, having done exactly what the error told them to.
+            //
+            // `--instance` IS carried per-request, so it works. Restarting the
+            // daemon under a config also works, and is named as the second
+            // option because it is the one a `--config` user actually wants.
             "this database holds data under {} instances ({}), and neither this \
              request nor the daemon's configuration named one, so there is no safe \
-             default.\nName one with `--instance <id>` or a `--config`, or \
-             consolidate them with `nestweaver instance merge --from <one> --to <keep>`.",
+             default.\nName one per-request with `--instance <id>`; or restart the \
+             daemon under a config that names one (`nestweaver daemon --db <path> \
+             stop`, then `start --config <path>`) — a `--config` on this command \
+             cannot reach a daemon that is already running; or consolidate them \
+             with `nestweaver instance merge --from <one> --to <keep>`.",
             ambiguous.len(),
             ambiguous.join(", ")
         )));
     }
-    let effective = if requested.is_empty() {
-        configured
-    } else {
-        requested
-    };
-    nestweaver_engine::validate_instance_id(effective)
-        .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
-    Ok(effective.to_string())
+    pick_effective_instance_id(requested, configured)
 }
 
 /// Build the terminal `Phase::Done` message for `IndexRepo`. When
@@ -2354,11 +2393,11 @@ mod instance_id_validation_tests {
     #[test]
     fn effective_instance_id_uses_request_then_configured_default() {
         assert_eq!(
-            resolve_effective_instance_id("request-id", "configured-id", &[]).unwrap(),
+            pick_effective_instance_id("request-id", "configured-id").unwrap(),
             "request-id"
         );
         assert_eq!(
-            resolve_effective_instance_id("", "configured-id", &[]).unwrap(),
+            pick_effective_instance_id("", "configured-id").unwrap(),
             "configured-id"
         );
     }
@@ -2373,7 +2412,7 @@ mod instance_id_validation_tests {
             ("", "configured:bad"),
             ("", "configured bad"),
         ] {
-            let error = resolve_effective_instance_id(requested, configured, &[]).unwrap_err();
+            let error = pick_effective_instance_id(requested, configured).unwrap_err();
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(
                 error.message().contains("instance_id"),
@@ -3984,11 +4023,7 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
 
@@ -4125,11 +4160,7 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let force = req.force;
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
 
         if !repo_path.exists() || !repo_path.is_dir() {
             return Ok(Response::new(WatchCodeResponse {
@@ -4407,11 +4438,7 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let state = self.state.clone();
-        let watch_instance = resolve_effective_instance_id(
-            &req.watch_instance_id,
-            &state.data_instance_id,
-            &state.ambiguous_instance_ids,
-        )?;
+        let watch_instance = resolve_effective_instance_id(&req.watch_instance_id, &state)?;
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
@@ -4658,11 +4685,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Some(req.name.clone())
         };
-        let effective_instance = resolve_effective_instance_id(
-            &req.instance_id,
-            &state.data_instance_id,
-            &state.ambiguous_instance_ids,
-        )?;
+        let effective_instance = resolve_effective_instance_id(&req.instance_id, &state)?;
         let index_limits = if req.max_source_file_bytes == 0 {
             state
                 .instance_cfg
@@ -5022,11 +5045,7 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -5190,11 +5209,7 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let since = std::time::UNIX_EPOCH
             .checked_add(Duration::from_secs(req.since_unix_seconds))
             .ok_or_else(|| Status::invalid_argument("since_unix_seconds is out of range"))?;
@@ -5305,11 +5320,7 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         // Configuration I/O and parsing do not mutate the graph and must not
         // occupy the sole writer while a slow filesystem is being read.
         let instance_config =
@@ -5635,16 +5646,8 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let req = request.into_inner();
-        let from_id = resolve_effective_instance_id(
-            &req.from_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
-        let to_id = resolve_effective_instance_id(
-            &req.to_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let from_id = resolve_effective_instance_id(&req.from_id, &self.state)?;
+        let to_id = resolve_effective_instance_id(&req.to_id, &self.state)?;
         if from_id == to_id {
             return Err(Status::invalid_argument(
                 "source and target instance IDs must differ",
@@ -5712,11 +5715,7 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let req = request.into_inner();
-        let instance_id = resolve_effective_instance_id(
-            &req.instance_id,
-            &self.state.data_instance_id,
-            &self.state.ambiguous_instance_ids,
-        )?;
+        let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -10303,7 +10302,7 @@ pub async fn run_server(
         read_only,
         instance_id: instance_id.clone(),
         data_instance_id: data_instance_id.clone(),
-        ambiguous_instance_ids: ambiguous_instance_ids.clone(),
+        instance_stated_by_config: instance_cfg.is_some(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
         active_writes: Arc::new(AtomicU32::new(0)),
@@ -11835,7 +11834,13 @@ fn flow_trace_continue_impl(
     // Hard-cap depth: a peer daemon could send a huge remaining_depth, and the recursive
     // walk_trace below would otherwise overflow the stack. This typed RPC bypasses the
     // JSON-dispatch depth clamp, so it needs its own bound.
-    let max_depth = (req.remaining_depth.max(0) as usize).min(64);
+    // nw-277: shares `MAX_IMPACT_DEPTH` with the handler and the CLI flag.
+    // nw-268 introduced that constant with a doc comment saying "64 matches the
+    // sibling that already had it" — and left the sibling as a literal, so the
+    // claim was true only by coincidence and the next edit to either would have
+    // ended it.
+    let max_depth = (req.remaining_depth.max(0) as usize)
+        .min(nestweaver_engine::atomic_changes::MAX_IMPACT_DEPTH as usize);
     let trace_id = req.trace_id.clone();
 
     // Build the visited set from the request.
@@ -15680,7 +15685,7 @@ mod startup_helper_tests {
         // The reported case: a client with no config of its own now sends
         // EMPTY, and the daemon's configured identity wins.
         assert_eq!(
-            resolve_effective_instance_id("", "kory-brain", &[]).unwrap(),
+            pick_effective_instance_id("", "kory-brain").unwrap(),
             "kory-brain",
             "an unspecified instance must defer to the daemon, not override it"
         );
@@ -15688,7 +15693,7 @@ mod startup_helper_tests {
         // A caller that NAMES an instance is still obeyed — multi-instance
         // targeting is a real feature and this must not break it.
         assert_eq!(
-            resolve_effective_instance_id("other-brain", "kory-brain", &[]).unwrap(),
+            pick_effective_instance_id("other-brain", "kory-brain").unwrap(),
             "other-brain"
         );
 
@@ -15697,13 +15702,13 @@ mod startup_helper_tests {
         // mismatch is what forced clients to send "default" explicitly — the
         // compensation that caused the override.
         assert_eq!(
-            resolve_effective_instance_id("", "default", &[]).unwrap(),
+            pick_effective_instance_id("", "default").unwrap(),
             "default"
         );
 
         // An invalid instance is still rejected at this trust boundary rather
         // than silently producing an ambiguous uid.
-        assert!(resolve_effective_instance_id("a:b", "default", &[]).is_err());
+        assert!(pick_effective_instance_id("a:b", "default").is_err());
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
@@ -16783,7 +16788,7 @@ mod startup_helper_tests {
             db_path,
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
-            ambiguous_instance_ids: Vec::new(),
+            instance_stated_by_config: false,
             start_time: Instant::now(),
             active_reads: Arc::new(AtomicU32::new(0)),
             active_writes: Arc::new(AtomicU32::new(0)),
@@ -16868,7 +16873,7 @@ credential_method = "gh"
             db_path: std::path::PathBuf::from(":memory:"),
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
-            ambiguous_instance_ids: Vec::new(),
+            instance_stated_by_config: false,
             start_time: Instant::now(),
             active_reads: Arc::new(AtomicU32::new(0)),
             active_writes: Arc::new(AtomicU32::new(0)),

@@ -4236,6 +4236,18 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        // nw-280: `--config` like `list-repos` and `list-projects`, the two
+        // commands this one is documented alongside. The upgrade runbook's
+        // step 4 ("verify one convention everywhere") tells a config-driven
+        // user to add `--config` to all three; on this one it was rejected,
+        // and dropping it silently reads `./nestweaver.lbug` — the wrong
+        // database, reporting a clean result. A verification step that cannot
+        // be run as written is worse than one that is absent.
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — uses its instance_id and db field"
+        )]
+        config: Option<PathBuf>,
     },
     /// Show overall brain status: vault count, note count, source kinds.
     Status {
@@ -9057,30 +9069,6 @@ fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: b
 #[must_use = "the lease must be HELD for the duration of the write; dropping it \
               immediately reduces this to a probe, which is the check-then-act \
               race it exists to remove"]
-/// Render a count that may be UNKNOWN.
-///
-/// nw-269: `unwrap_or(0)` on a count the producer deliberately nulled turns "I
-/// could not read this" into "there are none" — the two states a reader most
-/// needs told apart. The MCP route already emits `null` on a failed per-vault
-/// `list_notes`; both CLI renderers collapsed it back to `0`, so a vault whose
-/// notes could not be read displayed as "0 notes" beside vaults that genuinely
-/// had none.
-///
-/// Shared rather than restated, because this is the third count in this file
-/// to need it (top-level `brain status` totals, per-vault note counts, and
-/// `stale-check`'s commits-behind in nw-256) and each hand-rolled copy has
-/// drifted back to `unwrap_or(0)` at least once.
-fn render_optional_count(value: Option<&serde_json::Value>) -> String {
-    match value {
-        Some(serde_json::Value::Null) | None => {
-            "unavailable (could not be read — NOT zero)".to_string()
-        }
-        Some(found) => found
-            .as_u64()
-            .map_or_else(|| found.to_string(), |n| n.to_string()),
-    }
-}
-
 fn require_exclusive_store_access(
     db_path: &std::path::Path,
     operation: &str,
@@ -9115,6 +9103,30 @@ fn require_exclusive_store_access(
              crash-safe.",
             db_path.display()
         ),
+    }
+}
+
+/// Render a count that may be UNKNOWN.
+///
+/// nw-269: `unwrap_or(0)` on a count the producer deliberately nulled turns "I
+/// could not read this" into "there are none" — the two states a reader most
+/// needs told apart. The MCP route already emits `null` on a failed per-vault
+/// `list_notes`; both CLI renderers collapsed it back to `0`, so a vault whose
+/// notes could not be read displayed as "0 notes" beside vaults that genuinely
+/// had none.
+///
+/// Shared rather than restated, because this is the third count in this file
+/// to need it (top-level `brain status` totals, per-vault note counts, and
+/// `stale-check`'s commits-behind in nw-256) and each hand-rolled copy has
+/// drifted back to `unwrap_or(0)` at least once.
+fn render_optional_count(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::Null) | None => {
+            "unavailable (could not be read — NOT zero)".to_string()
+        }
+        Some(found) => found
+            .as_u64()
+            .map_or_else(|| found.to_string(), |n| n.to_string()),
     }
 }
 
@@ -9160,6 +9172,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 anyhow::bail!("--value requires --key");
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-281: read-only command — fail `db_not_found` on a missing
+            // `--db` like its 36 siblings, rather than reading a sidecar beside
+            // a database that does not exist and reporting "0 annotated
+            // node(s)". A typo'd `--db` is not an empty store.
+            require_existing_db(&db_path)?;
             // nw-257: `load_extensions` folds a corrupt or unreadable sidecar
             // into an empty map, which in THIS command would print
             // "0 annotated node(s)" and exit 0 — an audit reporting nothing
@@ -11072,6 +11089,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if !text.ends_with('\n') {
                     println!();
                 }
+                // nw-277: the cap disclosure reached `--json` and stopped
+                // there. A human reading the default output saw 500 summaries
+                // and nothing telling them the other 39,500 exist — the same
+                // silence nw-270 removed from the JSON, left in place on the
+                // route most people actually use.
+                if truncated {
+                    let shown = display.len();
+                    let matched = total + cap_dropped;
+                    eprintln!(
+                        "note: showing {shown} of {matched} — output was capped. \
+                         Narrow it with `--target <substring>`, or raise \
+                         `--token-budget` (0 for unlimited)."
+                    );
+                }
             }
 
             let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
@@ -12372,11 +12403,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // daemon up — an instance mismatch of the nw-019 class).
             let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
 
+            // nw-273: `--refresh-wiki-hours` honours nothing on EITHER route,
+            // and claimed it did.
+            //
+            // The periodic thread is spawned only on the direct-watcher
+            // fallback, and it reaches the daemon via `DaemonClient::connect`,
+            // which AUTOSTARTS one. nw-267 gave the direct watcher the write
+            // lease it should always have had, and the daemon correctly refuses
+            // to start against a held lease. The thread swallows that into
+            // `tracing::warn!`, so the refresh silently stopped. On the
+            // daemon-routed branch the thread is never spawned at all — that
+            // route never honoured the flag. Both printed "Wiki refresh
+            // scheduled every {h}h" regardless.
+            //
+            // NOT restored in-process, deliberately. `materialize_projects` is
+            // callable directly, but serialising it against the watcher's own
+            // writes needs the `WatchMutationLeaseFactory` that only the daemon
+            // constructs. A second in-process writer without it trades a silent
+            // no-op for possible corruption — a worse bug than this one. The
+            // thread below is left unreachable rather than deleted: it is the
+            // starting point for a real implementation, and git history is a
+            // poor place to look for one.
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
-                    "Wiki refresh scheduled every {}h (via materialize-projects)",
-                    hours
+                    "Error: --refresh-wiki-hours is not implemented (requested {hours}h).\n\
+                     It scheduled nothing on the daemon route, and since the watcher took \
+                     its write lease it schedules nothing on the direct route either — \
+                     while reporting that it had.\n\
+                     Run the refresh on your own schedule instead:\n  \
+                     nestweaver materialize-projects --config <path>"
                 );
+                return Ok((EXIT_USAGE, None));
             }
 
             // Route through the daemon when enabled. Choose ONE path up front
@@ -14330,25 +14387,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
-                try_hybrid_json_rpc_checked(
+                // nw-277: three separate ways this reported "no projects" for
+                // reasons that had nothing to do with the graph.
+                //
+                // `.ok()` on the decode turned a malformed payload into a
+                // fallback; the fallback skipped
+                // `ensure_direct_store_fallback_allowed`, so a pinned
+                // `--config` was silently ignored and the direct read targeted
+                // a different instance than the caller named (nw-217 exactly);
+                // and both the open failure and `list_projects` itself
+                // collapsed into an empty Vec, so "I could not look" printed
+                // as "there is nothing".
+                match try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config.as_deref(),
                     "list_projects",
                     args,
-                )?
-                .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
-                .unwrap_or_else(|| {
-                    // Daemon unreachable / RPC failed — fall back to a direct read, but
-                    // never panic on a bad --db path; warn and return empty on error.
-                    match open_store(Some(&resolved_db)) {
-                        Ok(store) => store.list_projects().unwrap_or_default(),
-                        Err(e) => {
-                            eprintln!("Warning: could not open store: {e}");
-                            Vec::new()
-                        }
+                )? {
+                    Some(value) => serde_json::from_value(unwrap_hybrid_payload(value))
+                        .context("decode projects from the daemon")?,
+                    None => {
+                        // The direct store cannot honour a pinned config, so
+                        // falling back would silently target a different
+                        // instance than the caller named.
+                        ensure_direct_store_fallback_allowed(&resolved_db, config.as_deref())?;
+                        let store = open_store(Some(&resolved_db))?;
+                        store.list_projects().map_err(|e| anyhow::anyhow!(e))?
                     }
-                })
+                }
             } else {
                 let store = open_store(Some(&resolved_db))?;
                 store.list_projects().map_err(|e| anyhow::anyhow!(e))?
@@ -18877,13 +18944,22 @@ fn run_brain(
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
-        BrainCommands::List { json, db } => {
-            let db_default = default_db_path();
-            let db_path = db.as_deref().unwrap_or(&db_default);
+        BrainCommands::List { json, db, config } => {
+            // nw-280: resolved through the same helper as its two documented
+            // siblings, so a pinned `--config` selects the database its
+            // `db` field names instead of silently falling back to
+            // `./nestweaver.lbug`.
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let db_path = db_path.as_path();
 
             if use_daemon
-                && let Some(value) =
-                    try_hybrid_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))?
+                && let Some(value) = try_hybrid_json_rpc(
+                    true,
+                    db_path,
+                    config.as_deref(),
+                    "list_vaults",
+                    serde_json::json!({}),
+                )?
             {
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok((EXIT_SUCCESS, None));
@@ -19697,11 +19773,18 @@ fn run_brain(
             let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_cfg = load_instance_config_opt(config.as_deref());
 
+            // nw-273: same refusal as `watch` — see the comment there for why
+            // this is refused rather than restored in-process.
             if let Some(hours) = refresh_wiki_hours {
-                out.status(&format!(
-                    "Wiki refresh scheduled every {}h (via materialize-projects)",
-                    hours
-                ));
+                eprintln!(
+                    "Error: --refresh-wiki-hours is not implemented (requested {hours}h).\n\
+                     It scheduled nothing on the daemon route, and since the watcher took \
+                     its write lease it schedules nothing on the direct route either — \
+                     while reporting that it had.\n\
+                     Run the refresh on your own schedule instead:\n  \
+                     nestweaver materialize-projects --config <path>"
+                );
+                return Ok((EXIT_USAGE, None));
             }
 
             // Respect watch config when --config is provided.
@@ -22140,6 +22223,20 @@ mod cli_help_contract_tests {
             "nestweaver brain broken-links",
             "nestweaver brain context",
             "nestweaver brain doc-stats",
+            // nw-280: added deliberately. The upgrade runbook's step 4
+            // ("verify one convention everywhere") tells a config-driven user
+            // to add `--config` to `list-repos`, `list-projects` AND
+            // `brain list`; the first two took it and this one rejected it, so
+            // the verification step could not be run as written. Dropping the
+            // flag is worse than failing: without it the command reads
+            // `./nestweaver.lbug`, which is the wrong database, and reports a
+            // clean result — a verification step that cannot fail.
+            //
+            // Resolved through `resolve_db_with_config`, the same helper its
+            // two documented siblings use, so it inherits their behaviour
+            // rather than an unrelated fallback — which is exactly what this
+            // inventory exists to force a decision about.
+            "nestweaver brain list",
             "nestweaver brain orphans",
             "nestweaver brain refresh",
             // nw-217 A4: added deliberately. `brain remove` is a vault command
@@ -27318,7 +27415,11 @@ mod store_access_guard_tests {
         );
 
         drop(held);
-        require_exclusive_store_access(&db, "index directly")
+        // Bound rather than discarded: nw-274 put `#[must_use]` on the LEASE
+        // TYPE, and this is the one place the value is genuinely not needed —
+        // the assertion is that re-acquisition SUCCEEDS, not that the second
+        // lease does anything.
+        let _reacquired = require_exclusive_store_access(&db, "index directly")
             .expect("released on drop, with no stale state to reap");
     }
 

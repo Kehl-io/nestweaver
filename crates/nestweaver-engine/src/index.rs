@@ -2679,8 +2679,6 @@ where
     // scan/parse/collection so worker threads can fan out expensive parsing and
     // only serialize LadybugDB writes.
     let r_uid = repo_uid(instance_id, repo_url);
-    // The funnel the CLI index actually reaches (nw-246).
-    record_data_instance(store, instance_id);
 
     // Re-identify detection MUST happen before the scan/parse phases: the
     // filemeta sidecar was recorded when this working tree's graph rows
@@ -3289,6 +3287,18 @@ where
     };
 
     let _write_guard = acquire_write_guard()?;
+
+    // nw-246/nw-277: minted INSIDE the write guard, not ~600 lines earlier.
+    //
+    // `ensure_data_instance_id` never replaces an existing value, so recording
+    // before the guard meant an index that failed during scan or parse — a bad
+    // path, an unreadable file, a cancellation — had already stamped the
+    // database's identity permanently, under an instance whose write never
+    // landed. The identity of the data has to be established where the data
+    // is, which is here.
+    //
+    // This is also the funnel the CLI index actually reaches (nw-246).
+    record_data_instance(store, instance_id);
 
     let contract_plan = match contract_plan_result {
         Ok(plan) => plan,
