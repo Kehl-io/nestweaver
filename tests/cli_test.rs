@@ -652,6 +652,11 @@ credential_method = "gh"
         &["bridges", "--json"][..],
         &["clusters", "--json"][..],
         &["brain", "status", "--json"][..],
+        // nw-280: `brain list` joins the matrix the moment it gained
+        // `--config`, as the inventory guard in `main.rs` requires — a command
+        // that takes both flags must be shown to HONOUR the config, not merely
+        // to accept it.
+        &["brain", "list", "--json"][..],
     ] {
         nestweaver_cmd()
             .current_dir(&unrelated_cwd)
@@ -4772,20 +4777,24 @@ fn pre_push_impact_depth_is_bounded_at_parse_time() {
     );
 }
 
-/// nw-269: an unreadable count must render as unavailable, never as `0`.
+/// nw-269 / nw-277: this is the COUNTERWEIGHT half, and it is named for what
+/// it actually asserts.
 ///
-/// Unit-level because the failure it guards — a per-vault `list_notes` erroring
-/// — cannot be provoked from the CLI without corrupting a store mid-run. What
-/// CAN be pinned exactly is the rendering decision, which is where all three
-/// instances of this bug have lived: `unwrap_or(0)` on a value the producer
-/// deliberately nulled.
+/// It was called `an_unreadable_count_is_never_rendered_as_zero`, which is not
+/// what it does: a per-vault `list_notes` failure cannot be provoked from the
+/// CLI without corrupting a store mid-run, so this only ever exercised the
+/// readable case. A test whose NAME claims the guarantee while its body checks
+/// the opposite direction is worse than no test — it answers the question for
+/// anyone who greps for it.
 ///
-/// Three counts in `main.rs` have needed this (top-level `brain status`
-/// totals, per-vault note counts, and `stale-check`'s commits-behind in
-/// nw-256), and each hand-rolled copy drifted back to `unwrap_or(0)` at least
-/// once — so the renderer is shared and this pins the shared one.
+/// The guarantee itself is pinned by value in
+/// `optional_count_rendering_tests::unknown_and_zero_do_not_render_alike`,
+/// which asserts both directions against the shared renderer. This one earns
+/// its place as the other half of that pair: a renderer that called EVERYTHING
+/// unavailable would satisfy the unit test's "unknown != zero" assertion and
+/// fail here.
 #[test]
-fn an_unreadable_count_is_never_rendered_as_zero() {
+fn a_readable_database_reports_real_counts_not_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");
     drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
@@ -4896,4 +4905,259 @@ fn summary_json_discloses_the_symbol_cap() {
          returned == total beside truncated:true is a contradiction \
          (returned={returned}, total={total})"
     );
+
+    // nw-277: the TEXT route must disclose it too. The nw-270 fix reached
+    // `--json` and stopped there, leaving the default output — the one most
+    // people actually read — showing 500 summaries with nothing saying the
+    // rest exist.
+    let text = nestweaver_cmd()
+        .args([
+            "summary",
+            "--db",
+            &db_path.display().to_string(),
+            "--level",
+            "symbol",
+            "--token-budget",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    let notice = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        notice.contains("capped") || notice.contains("showing"),
+        "the text route must say the output was capped, not just the JSON \
+         one:\n{notice}"
+    );
+}
+
+/// nw-273: `--refresh-wiki-hours` must REFUSE, not claim to have scheduled
+/// something.
+///
+/// The periodic refresh thread is spawned only on the direct-watcher fallback
+/// and reaches the daemon via `DaemonClient::connect`, which autostarts one —
+/// and nw-267 gave the direct watcher the write lease, so that autostart now
+/// correctly fails. The thread swallowed it into `tracing::warn!`. On the
+/// daemon route the thread is never spawned at all. Both routes printed
+/// "Wiki refresh scheduled every {h}h" regardless.
+///
+/// Our own fix produced this: nw-267's blast radius was not traced to the
+/// feature sitting beside it.
+#[test]
+fn refresh_wiki_hours_refuses_rather_than_claiming_to_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let vault = dir.path().join("vault");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(vault.join("n.md"), "# n\n").unwrap();
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"instance_id = "wiki-refusal"
+db = "{}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/wiki-refusal/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/wiki-refusal/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            toml_basic_string(&db_path),
+        ),
+    )
+    .unwrap();
+
+    let cfg = config.display().to_string();
+    let vault_s = vault.display().to_string();
+    let repo_s = repo.display().to_string();
+    for (label, args) in [
+        (
+            "watch",
+            vec![
+                "watch",
+                &repo_s,
+                "--config",
+                &cfg,
+                "--refresh-wiki-hours",
+                "6",
+            ],
+        ),
+        (
+            "brain watch",
+            vec![
+                "brain",
+                "watch",
+                &vault_s,
+                "--config",
+                &cfg,
+                "--refresh-wiki-hours",
+                "6",
+            ],
+        ),
+    ] {
+        // Timed out deliberately. Without the refusal these commands START A
+        // WATCHER and block forever, so a regression would HANG this test
+        // rather than fail it — CI would eventually kill the job and report a
+        // timeout instead of the assertion that explains why. A test whose
+        // failure mode is a hang tells you almost nothing.
+        let out = nestweaver_cmd()
+            .args(&args)
+            .timeout(std::time::Duration::from_secs(20))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            !out.status.success(),
+            "`{label} --refresh-wiki-hours` must refuse; it honours nothing.\
+             \nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("not implemented"),
+            "`{label}` must say the flag is not implemented:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("materialize-projects"),
+            "`{label}`'s refusal must name the remedy the user can actually \
+             run:\n{stderr}"
+        );
+        // The specific lie this replaces. A refusal that still printed it
+        // would be no better than the no-op.
+        assert!(
+            !stdout.contains("Wiki refresh scheduled")
+                && !stderr.contains("Wiki refresh scheduled"),
+            "`{label}` must not still claim it scheduled a refresh:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
+/// nw-281: `extensions list` must fail on a missing `--db`, like its siblings.
+///
+/// It resolved a db path and read the sidecar beside it without ever checking
+/// the database existed — so a typo'd `--db` reported "0 annotated node(s)"
+/// and exited 0. In an auditing command that is the same defect nw-257 fixed
+/// one layer up: a fact about this invocation presented as a fact about the
+/// store. 36 other read commands call `require_existing_db`; this one did not.
+#[test]
+fn extensions_list_refuses_a_database_that_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-created.lbug");
+
+    let refused = nestweaver_cmd()
+        .args(["extensions", "list", "--db", &missing.display().to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a missing --db must be an error, not an empty audit"
+    );
+    assert!(
+        !String::from_utf8_lossy(&refused.stdout).contains("annotated node"),
+        "and it must not print a count as though it had looked:\n{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    // The counterweight: a database that DOES exist with no sidecar is still
+    // a successful, empty audit — that is a real answer, not a failure.
+    let present = dir.path().join("real.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&present).unwrap());
+    nestweaver_cmd()
+        .args(["extensions", "list", "--db", &present.display().to_string()])
+        .assert()
+        .success();
+}
+
+/// nw-280: the three commands the upgrade runbook names must all accept
+/// `--config`.
+///
+/// `instance-id-migration.md` step 4 — "verify one convention everywhere" —
+/// tells a config-driven user to add `--config` to `list-repos`,
+/// `list-projects` and `brain list`. The first two took it; `brain list` did
+/// not, so the verification step could not be run as written. Dropping the
+/// flag doesn't rescue it either: without `--config` the command silently
+/// reads `./nestweaver.lbug`, which is the wrong database, and reports a clean
+/// result — a verification step that cannot fail.
+#[test]
+fn every_command_the_upgrade_runbook_names_accepts_a_pinned_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("configured.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"instance_id = "runbook-parity"
+db = "{}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/runbook-parity/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/runbook-parity/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            toml_basic_string(&db_path),
+        ),
+    )
+    .unwrap();
+
+    // Run from somewhere else entirely, so a fallback to `./nestweaver.lbug`
+    // cannot succeed by accident — which is the failure mode being guarded.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+
+    for args in [
+        &["list-repos", "--json"][..],
+        &["list-projects", "--json"][..],
+        &["brain", "list", "--json"][..],
+    ] {
+        let out = nestweaver_cmd()
+            .current_dir(&unrelated_cwd)
+            .env_remove("NESTWEAVER_DB")
+            .args(args)
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "`{args:?} --config` must work — the upgrade runbook tells users to \
+             run exactly this:\n{stderr}"
+        );
+        // Specifically NOT an unknown-argument rejection, which is how this
+        // failed before: a bare non-zero exit would also be produced by a
+        // missing database, and the two mean very different things.
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "`{args:?}` must ACCEPT --config, not reject it as unknown:\n{stderr}"
+        );
+    }
 }

@@ -5507,3 +5507,119 @@ fn daemon_refuses_a_configless_write_when_the_database_is_ambiguous() {
         .assert()
         .success();
 }
+
+/// nw-275: the ambiguity guard must see the database as it is AT THE WRITE,
+/// not as it was at boot.
+///
+/// It was computed once in `run_server` and stored as a plain `Vec<String>`,
+/// read frozen by ten consumers. A database that became multi-instance DURING
+/// the daemon's lifetime stayed unguarded for the rest of it — while the CLI
+/// re-read on every invocation. The two routes nw-246 aligned would have
+/// diverged again, on staleness rather than logic.
+///
+/// The sequence is ordinary: start a daemon against a single-instance
+/// database (nothing ambiguous at boot), add a second instance through that
+/// same daemon with an explicit `--instance` (allowed by design), then make an
+/// unqualified write. Under the boot snapshot the third write sails through
+/// against a database that is now genuinely ambiguous.
+#[test]
+fn ambiguity_arising_after_boot_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    let third = dir.path().join("third");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&first);
+    write_test_repo(&second);
+    write_test_repo(&third);
+
+    // Single instance at boot: nothing for the guard to complain about.
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &first.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "one",
+        ])
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // The counterweight, and it has to come first: an unqualified write must
+    // SUCCEED while the database is still unambiguous. Without this the test
+    // would pass against a daemon that refuses everything.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &second.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Now make it ambiguous THROUGH THE RUNNING DAEMON — a stated instance,
+    // which is a supported operation and precisely how this happens in life.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &third.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "two",
+        ])
+        .assert()
+        .success();
+
+    // The same unqualified write that succeeded a moment ago must now be
+    // refused. Under the boot snapshot it was not.
+    let refused = daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &second.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "the database became multi-instance while this daemon was running; an \
+         unqualified write must be refused with the state as it IS, not as it \
+         was at boot"
+    );
+    let stderr: String = String::from_utf8_lossy(&refused.stderr)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        stderr.contains("one") && stderr.contains("two"),
+        "the refusal must name both instances it can now see:\n{stderr}"
+    );
+
+    // nw-277: the remedy must be one this route can actually carry.
+    // `IndexRepoRequest` has no config field and a running daemon's
+    // configuration is fixed at start, so telling the user to pass `--config`
+    // sends them to re-run the command, send the same empty instance, and get
+    // the same refusal — having done exactly what the error asked.
+    assert!(
+        stderr.contains("--instance"),
+        "the refusal must offer `--instance`, which the request DOES carry:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("or a `--config`"),
+        "the refusal must not offer a bare `--config` as the fix; this request \
+         cannot carry one:\n{stderr}"
+    );
+}

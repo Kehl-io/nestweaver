@@ -214,3 +214,63 @@ fn uncancelled_reader_index_still_reads_and_writes() {
     );
     assert!(!store.list_repos(None).unwrap().is_empty());
 }
+
+/// nw-277: a failed index must not permanently mint the data instance id.
+///
+/// `ensure_data_instance_id` never replaces an existing value, and
+/// `record_data_instance` used to run ~600 lines BEFORE the write guard. An
+/// index that died after that point — during scan, parse, or on the guard
+/// itself — had already stamped the database's identity under an instance
+/// whose data never landed, and the stamp is permanent.
+///
+/// The write guard is an injectable closure, which makes this exact: a guard
+/// that REFUSES is a failure that lands squarely between the old minting
+/// point and the write. A missing repo path is not — that fails before the
+/// funnel is entered, which is why the first version of this test passed with
+/// the fix reverted.
+#[test]
+fn an_index_that_fails_at_the_write_gate_does_not_mint_the_instance_id() {
+    let store = GraphStore::in_memory().unwrap();
+    let reader = FilesystemReader::new(&testdata_js());
+
+    let result = nestweaver_engine::index_with_reader_and_write_gate(
+        &reader,
+        &store,
+        "never-landed",
+        "file:///test/js",
+        "abc",
+        None,
+        None,
+        || Err::<(), anyhow::Error>(anyhow::anyhow!("write gate refused")),
+    );
+
+    assert!(result.is_err(), "the guard refused, so the index must fail");
+    assert_eq!(
+        store.data_instance_id().unwrap(),
+        None,
+        "an index that never reached the write must not have minted an \
+         identity — `ensure_data_instance_id` never replaces, so this one \
+         would be permanent and would describe nothing in the graph"
+    );
+
+    // The counterweight: the SAME call with a guard that succeeds must mint.
+    // Without it, simply deleting `record_data_instance` would pass above.
+    let store = GraphStore::in_memory().unwrap();
+    let reader = FilesystemReader::new(&testdata_js());
+    nestweaver_engine::index_with_reader_and_write_gate(
+        &reader,
+        &store,
+        "did-land",
+        "file:///test/js",
+        "abc",
+        None,
+        None,
+        || Ok::<(), anyhow::Error>(()),
+    )
+    .expect("an unobstructed index must succeed");
+    assert_eq!(
+        store.data_instance_id().unwrap().as_deref(),
+        Some("did-land"),
+        "a successful index must still mint the identity"
+    );
+}
