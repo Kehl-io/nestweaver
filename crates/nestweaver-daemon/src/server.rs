@@ -5032,6 +5032,29 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Rebuild Tantivy search index so BM25 search reflects
                     // the freshly indexed vault content.
+                    //
+                    // nw-249: when there is NO writer this whole block was
+                    // skipped and the DONE phase below still reported a full
+                    // set of counts — so an index that could not touch the
+                    // search index at all looked identical to one that
+                    // rebuilt it. Unlike a failed rebuild, this is not an
+                    // error: a read-only replica legitimately has no writer.
+                    // So it is disclosed rather than failed, and the phrasing
+                    // says which of the two happened.
+                    let search_index_rebuilt = state
+                        .tantivy
+                        .as_ref()
+                        .is_some_and(|tantivy| tantivy.has_writer());
+                    if !search_index_rebuilt {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "note: the graph was updated but the BM25 search index \
+                                      was NOT rebuilt (this daemon holds no search-index \
+                                      writer), so `brain search` will not reflect this \
+                                      index until one does"
+                                .to_string(),
+                            ..Default::default()
+                        }));
+                    }
                     if let Some(ref tantivy) = state.tantivy
                         && tantivy.has_writer()
                     {
@@ -17870,6 +17893,60 @@ external_model = "unavailable-test-model"
             res.is_err(),
             "set_extension must block on the write gate while it is held \
              (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
+    }
+
+    /// nw-244: PR #308 wired `brain_memory_consolidate` to the write gate ONLY
+    /// when `apply: true`. The existing guards test `request_is_applying` as a
+    /// pure function, so the *wiring* was unasserted: replacing the call site
+    /// with `let applying = false;` left the whole suite green while every
+    /// file-moving consolidation ran ungated and invisible to the shutdown
+    /// drain.
+    ///
+    /// Probed like `set_extension_holds_write_gate`, but in BOTH directions —
+    /// the gating is conditional, so one direction alone cannot pin it:
+    /// `apply: true` must block on a held gate, and `apply: false` (a pure
+    /// dry-run) must NOT, because making the common preview call queue behind
+    /// a minutes-long drain is the regression the conditional exists to avoid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_applying_memory_consolidate_blocks_on_the_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_gate.mutex().lock_owned().await;
+
+        let applying = {
+            let mut req = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "apply": true }).to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                service.brain_memory_consolidate(req),
+            )
+            .await
+        };
+        assert!(
+            applying.is_err(),
+            "an APPLYING memory consolidate moves vault files and must block on              the write gate while it is held; it returned without waiting"
+        );
+
+        let preview = {
+            let mut req = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "apply": false }).to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                service.brain_memory_consolidate(req),
+            )
+            .await
+        };
+        assert!(
+            preview.is_ok(),
+            "a DRY-RUN memory consolidate touches nothing and must NOT queue              behind the write gate; it blocked"
         );
 
         drop(gate);

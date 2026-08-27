@@ -2937,7 +2937,17 @@ enum Commands {
     /// outsized blast radius. Useful for identifying fragile connectors.
     #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
     Bridges {
-        #[arg(long, default_value = "10", help = "Number of top bridges to show")]
+        // nw-251: bounded like `hubs --top`, which has carried
+        // `range(1..=1000)` all along. Unbounded, `--top 0` asked for nothing
+        // and a huge value asked the betweenness walk for the whole graph —
+        // and the MCP `bridge_nodes` schema bounds its own `top_n` to the same
+        // 1..=1000, so the two surfaces disagreed on what was even accepted.
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Number of top bridges to show (1-1000; matches the MCP bridge_nodes schema)"
+        )]
         top: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -9090,12 +9100,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 anyhow::bail!("--value requires --key");
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let store = nestweaver_engine::extensions::load_extensions(&db_path);
+            // nw-257: `load_extensions` folds a corrupt or unreadable sidecar
+            // into an empty map, which in THIS command would print
+            // "0 annotated node(s)" and exit 0 — an audit reporting nothing
+            // wrong because it could not look. The checked loader still treats
+            // an absent sidecar as an empty store.
+            let store = nestweaver_engine::extensions::load_extensions_checked(&db_path)?;
 
-            // Filtering mirrors `query_extensions` exactly, including EXACT
-            // match on value — a CLI that matched differently would show a
-            // human a different answer than the agent acted on, which is the
-            // opposite of an audit.
+            // Filtering mirrors `query_extensions` exactly — by CALLING the
+            // same predicate rather than restating it. nw-257: the restatement
+            // did equality only and drifted from `property_matches`'s
+            // scalar-in-array membership, so `--key aliases --value Widget`
+            // printed "No extension annotations found." for data the agent
+            // matched. A CLI that answers a different question than the tool is
+            // the opposite of an audit.
             let mut rows: Vec<(
                 &String,
                 &std::collections::HashMap<String, serde_json::Value>,
@@ -9108,10 +9126,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return false;
                     }
                     match (key.as_deref(), value.as_deref()) {
-                        (Some(k), Some(v)) => {
-                            props.get(k).and_then(|found| found.as_str()) == Some(v)
-                                || props.get(k).map(ToString::to_string).as_deref() == Some(v)
-                        }
+                        (Some(k), Some(v)) => props.get(k).is_some_and(|found| {
+                            // `--value` is a string on the command line, so the
+                            // shared predicate is asked the string question.
+                            nestweaver_engine::extensions::property_matches(
+                                found,
+                                &serde_json::Value::String(v.to_string()),
+                            )
+                                // Retained from the pre-nw-257 CLI so this stays
+                                // a widening: `--value 42` still matches a
+                                // stored number and `--value '["a","b"]'` still
+                                // matches that whole array. Compared
+                                // STRUCTURALLY rather than by serialised text,
+                                // so the match does not depend on serde's
+                                // spacing. A `--value` that is not valid JSON
+                                // (the common `--value Widget`) simply falls
+                                // through to the string question above.
+                                || serde_json::from_str::<serde_json::Value>(v)
+                                    .is_ok_and(|query| found == &query)
+                        }),
                         (Some(k), None) => props.contains_key(k),
                         _ => true,
                     }
@@ -10643,10 +10676,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // both output modes match direct output byte-for-byte
                 // (the daemon envelope carries _meta/count the direct
                 // path never prints).
-                let hubs: Vec<HubNode> = value
-                    .get("hubs")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                // nw-249: `.ok().unwrap_or_default()` turned a DECODE FAILURE
+                // into an empty list, which the branch below then renders as
+                // "No hub nodes found (graph may be empty)" — a confident claim
+                // about the graph made on the strength of a parse error. Same
+                // shape as the `list-repos` / `list-services` defect.
+                let hubs: Vec<HubNode> = match value.get("hubs") {
+                    Some(raw) => serde_json::from_value(raw.clone())
+                        .context("decode hub nodes from the daemon")?,
+                    None => Vec::new(),
+                };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&hubs)?);
                 } else if hubs.is_empty() {
@@ -10746,13 +10785,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 )? {
                     // Deserialize the tool's `bridges` array into the
                     // direct path's type so both modes render identically.
-                    let bridges: Vec<nestweaver_engine::BridgeNode> = serde_json::from_value(
-                        strip_hybrid_meta(value)
-                            .get("bridges")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                    )
-                    .unwrap_or_default();
+                    // nw-249: same defect as `hubs` above — a decode failure
+                    // became an empty list and rendered as "graph may be
+                    // empty". A `null` (no `bridges` key at all) is still an
+                    // honest empty result and stays one.
+                    let bridges: Vec<nestweaver_engine::BridgeNode> =
+                        match strip_hybrid_meta(value).get("bridges").cloned() {
+                            Some(serde_json::Value::Null) | None => Vec::new(),
+                            Some(raw) => serde_json::from_value(raw)
+                                .context("decode bridge nodes from the daemon")?,
+                        };
                     if json {
                         println!("{}", serde_json::to_string_pretty(&bridges)?);
                     } else if bridges.is_empty() {
@@ -12067,8 +12109,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             } else {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: provide either --files or --base-ref");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             };
 
             if changed_files.is_empty() {
@@ -12217,8 +12263,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: --refresh-wiki-hours requires --config");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
             let repo_path = match repo {
                 Some(p) => p,
@@ -18850,21 +18900,52 @@ fn run_brain(
                             }
                         }
                     }
-                    let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let headings = value.get("headings").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let sections = value.get("sections").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let tags = value.get("tags").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let wikilinks = value.get("wikilinks").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let repo_count = value
-                        .get("repo_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("  Notes:     {notes}");
-                    println!("  Headings:  {headings}");
-                    println!("  Sections:  {sections}");
-                    println!("  Tags:      {tags}");
-                    println!("  Wikilinks: {wikilinks}");
-                    println!("  Repos:     {repo_count}");
+                    // nw-249(a): `unwrap_or(0)` collapsed a DELIBERATE null.
+                    //
+                    // The emitter sets these to `null` when the count could
+                    // not be READ, and `brain_status`'s own description says:
+                    // "a count of `null` means it could NOT BE READ, which is
+                    // NOT zero and is not a reason to re-index. Check
+                    // `unavailable` (and `counts_complete`) before acting on
+                    // any count." This render did exactly what that sentence
+                    // forbids — printed `Notes: 0`, which reads as "empty, go
+                    // re-index", for a vault that is merely unreadable.
+                    //
+                    // The MCP client can inspect the null itself; a human
+                    // reading the text render cannot. So this surface is the
+                    // one that most needs the disclosure, not the least.
+                    let count = |key: &str| -> String {
+                        match value.get(key) {
+                            Some(serde_json::Value::Null) | None => {
+                                "unavailable (could not be read — NOT zero)".to_string()
+                            }
+                            Some(found) => found
+                                .as_u64()
+                                .map_or_else(|| found.to_string(), |n| n.to_string()),
+                        }
+                    };
+                    println!("  Notes:     {}", count("notes"));
+                    println!("  Headings:  {}", count("headings"));
+                    println!("  Sections:  {}", count("sections"));
+                    println!("  Tags:      {}", count("tags"));
+                    println!("  Wikilinks: {}", count("wikilinks"));
+                    println!("  Repos:     {}", count("repo_count"));
+                    // And name what failed, so the reader is not left to infer
+                    // it from which rows say "unavailable".
+                    if let Some(unavailable) = value.get("unavailable").and_then(|v| v.as_array())
+                        && !unavailable.is_empty()
+                    {
+                        let names: Vec<String> = unavailable
+                            .iter()
+                            .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+                            .collect();
+                        println!(
+                            "  NOTE: {} count(s) could not be read ({}). These are NOT zero, \
+                             and re-indexing is not the remedy.",
+                            names.len(),
+                            names.join(", ")
+                        );
+                    }
                     // One-line publication state when dirty — the "(see
                     // warning)" pointer is only printed when a warning
                     // actually follows (wedged), not for a routine in-flight
@@ -19226,19 +19307,25 @@ fn run_brain(
                                 .as_str()
                                 .map(|h| &h[..8.min(h.len())])
                                 .unwrap_or("unknown");
-                            let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
+                            // nw-256: `null` means the distance could not be
+                            // counted, and `unwrap_or(0)` made that print
+                            // identically to a real zero — undoing the fix one
+                            // layer down. Rendered as three distinct states.
+                            let behind = r["staleness_commits_behind"].as_u64();
                             let marker = match r["status"].as_str() {
                                 Some("missing") => "missing",
                                 Some("incomplete") => "incomplete",
                                 _ if stale => "STALE",
                                 _ => "ok",
                             };
-                            if stale && behind > 0 {
-                                println!(
+                            match behind {
+                                Some(behind) if stale && behind > 0 => println!(
                                     "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                                );
-                            } else {
-                                println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                                ),
+                                None if stale => println!(
+                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+                                ),
+                                _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
                             }
                         }
                     }
@@ -19290,7 +19377,17 @@ fn run_brain(
 
                 let is_valid_sha = repo.indexed_sha.len() == 40
                     && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-                let commits_behind = match (&current_head, repo.local_root()) {
+                // nw-256: `Option<u64>`, mirroring `tool_stale_check`. The
+                // note directly below is about `is_stale` diverging between
+                // these two routes for exactly this reason; #310 fixed the
+                // daemon side of the COUNT and left this one on
+                // `unwrap_or(0)`, so the same defect recurred in the same
+                // function pair. A failed `git rev-list` means "could not
+                // count", and this branch is only reached when HEAD already
+                // differs from the indexed SHA — so a zero here is a
+                // self-contradiction ("stale, 0 commits behind"), not an
+                // answer.
+                let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
                     (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                         std::process::Command::new("git")
                             .args([
@@ -19309,9 +19406,8 @@ fn run_brain(
                                     .parse::<u64>()
                                     .ok()
                             })
-                            .unwrap_or(0)
                     }
-                    _ => repo.staleness_commits_behind as u64,
+                    _ => Some(repo.staleness_commits_behind as u64),
                 };
                 // nw-163: BEHIND HEAD and nothing else — a deleted working
                 // tree is `status: "missing"` and `needs_reindex: true`, not
@@ -19327,7 +19423,10 @@ fn run_brain(
                     // says "missing" and `needs_reindex` is true, which is the
                     // actionable truth.
                     None if local_missing => false,
-                    None => commits_behind > 0,
+                    // An uncountable distance is not a claim of zero: if HEAD
+                    // is unknown AND the stored counter cannot be read,
+                    // staleness is simply not assertable here.
+                    None => commits_behind.is_some_and(|behind| behind > 0),
                 };
                 // A repo whose SHA was committed but whose content never
                 // landed (interrupted index) compares equal to HEAD yet
@@ -19417,19 +19516,25 @@ fn run_brain(
                         .as_str()
                         .map(|h| &h[..8.min(h.len())])
                         .unwrap_or("unknown");
-                    let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
+                    // nw-256: `null` means the distance could not be counted,
+                    // and `unwrap_or(0)` made that print identically to a real
+                    // zero — undoing the fix one layer down. Rendered as three
+                    // distinct states.
+                    let behind = r["staleness_commits_behind"].as_u64();
                     let marker = match r["status"].as_str() {
                         Some("missing") => "missing",
                         Some("incomplete") => "incomplete",
                         _ if stale => "STALE",
                         _ => "ok",
                     };
-                    if stale && behind > 0 {
-                        println!(
+                    match behind {
+                        Some(behind) if stale && behind > 0 => println!(
                             "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                        );
-                    } else {
-                        println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                        ),
+                        None if stale => println!(
+                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+                        ),
+                        _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
                     }
                 }
             }
@@ -19455,8 +19560,12 @@ fn run_brain(
             force,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
                 eprintln!("Error: --refresh-wiki-hours requires --config");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
@@ -31155,6 +31264,27 @@ mod vault_command_config_parity_tests {
     /// nw-229. `set_extension` and `query_extensions` were BOTH agent-only, so
     /// an agent could write annotations that influence a human's results — the
     /// CLI consumes the sidecar internally — with no command to read them back.
+    /// nw-251. `hubs --top` has been bounded 1..=1000 all along and
+    /// `bridges --top` was not, while the MCP `bridge_nodes` schema bounds its
+    /// `top_n` to the same range — so the two surfaces disagreed on what was
+    /// even accepted.
+    #[test]
+    fn bridges_top_is_bounded_like_its_siblings() {
+        for bad in ["0", "1001"] {
+            let args = argv(&["nestweaver", "bridges", "--top", bad]);
+            assert!(
+                parse(args).is_err(),
+                "--top {bad} must be rejected, as `hubs --top` already rejects it"
+            );
+        }
+        // The counterweight: the range itself must still be usable, or a bound
+        // that rejected everything would pass the assertions above.
+        for good in ["1", "10", "1000"] {
+            let args = argv(&["nestweaver", "bridges", "--top", good]);
+            assert!(parse(args).is_ok(), "--top {good} must be accepted");
+        }
+    }
+
     #[test]
     fn a_human_can_read_back_what_agents_annotate() {
         let cli = parse(argv(&["nestweaver", "extensions", "list"])).expect("must parse");

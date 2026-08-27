@@ -250,6 +250,348 @@ url = "{}"
     assert_eq!(entries, vec![std::ffi::OsString::from("instance.toml")]);
 }
 
+/// nw-256: `stale_check`'s commit distance must be `null` when it cannot be
+/// counted — never `0`.
+///
+/// The MCP route was fixed to `Option<u64>` in #310; the CLI kept
+/// `.unwrap_or(0)`, so the two routes answered differently for the same repo.
+/// That is the SECOND time this function pair diverged for this reason — the
+/// comment recording the first (`is_stale`, nw-163) sits four lines below the
+/// defect.
+///
+/// A zero here is not a missed detection, it is a self-contradiction: the
+/// branch is only reached when HEAD already differs from the indexed SHA, so
+/// the row reads "STALE, 0 commits behind".
+///
+/// Provoked the way it actually happens — a repo whose history was replaced
+/// (re-clone, force-push, squash). HEAD reads fine, but `indexed_sha..HEAD`
+/// spans no common ancestor and `git rev-list` fails.
+#[test]
+fn stale_check_reports_an_uncountable_commit_distance_as_null_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir(&repo_dir).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .expect("git command failed to spawn");
+        assert!(status.success(), "git {args:?} failed with {status:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() {}").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "initial"]);
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Replace the history wholesale. HEAD is still a perfectly readable sha —
+    // it simply has no path back to the indexed one.
+    std::fs::remove_dir_all(repo_dir.join(".git")).unwrap();
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_dir.join("a.js"), "function hello() { return 1; }").unwrap();
+    git(&["add", "a.js"]);
+    git(&["commit", "-m", "unrelated history"]);
+
+    let output = nestweaver_cmd()
+        .args([
+            "stale-check",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stale-check --json: {e}\n{stdout}"));
+
+    let repos = parsed["repos"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `repos` array in:\n{stdout}"));
+    let repo = repos.first().expect("exactly one repo was indexed");
+
+    // The counterweight: the row really is stale. Without this, a `null` count
+    // could just mean the whole check declined to look.
+    assert_eq!(
+        repo["is_stale"].as_bool(),
+        Some(true),
+        "the fixture must actually be stale for the count to be meaningful:\n{stdout}"
+    );
+    assert!(
+        repo["staleness_commits_behind"].is_null(),
+        "an uncountable commit distance must be null, not a fabricated 0 — \
+         `stale, 0 commits behind` is a contradiction:\n{stdout}"
+    );
+
+    // And the human-facing renderer must not collapse it back to a real zero.
+    let text = nestweaver_cmd()
+        .args(["stale-check", "--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("unavailable"),
+        "the text renderer must say the count is unavailable rather than print \
+         the row as if nothing were behind:\n{text}"
+    );
+}
+
+/// nw-257: `extensions list` documents its filtering as mirroring
+/// `query_extensions` "exactly", and did not.
+///
+/// `property_matches` treats a scalar query as a membership test against an
+/// array-valued property, because that is the shape real sidecars have
+/// (`aliases: ["Widget","widget"]`) — nw-109 added it for exactly that reason.
+/// The CLI restated the filter as equality only, so the audit command printed
+/// "No extension annotations found." for data the agent matched.
+///
+/// The existing guards stop at clap: replacing the whole match arm with
+/// `_ => true` passes both of them, and the one named
+/// `the_filters_match_the_mcp_tools_two_modes` guards precisely the property
+/// that was broken.
+#[test]
+fn extensions_list_matches_array_valued_properties_like_the_mcp_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"aliases": ["Widget", "widget"], "owner": "platform"}}"#,
+    )
+    .unwrap();
+
+    let matched = nestweaver_cmd()
+        .args([
+            "extensions",
+            "list",
+            "--db",
+            &db_path.display().to_string(),
+            "--key",
+            "aliases",
+            "--value",
+            "Widget",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&matched.stdout);
+    assert!(
+        stdout.contains("sym:repo:widget"),
+        "a scalar --value must match a member of an array-valued property, the \
+         way `query_extensions` does:\n{stdout}"
+    );
+
+    // The counterweight: membership must not have become an any-of that
+    // matches everything. A value that is in no array still finds nothing.
+    let absent = nestweaver_cmd()
+        .args([
+            "extensions",
+            "list",
+            "--db",
+            &db_path.display().to_string(),
+            "--key",
+            "aliases",
+            "--value",
+            "Gadget",
+        ])
+        .output()
+        .unwrap();
+    let absent = String::from_utf8_lossy(&absent.stdout);
+    assert!(
+        !absent.contains("sym:repo:widget"),
+        "membership must stay a filter — a value in no array must not match:\n{absent}"
+    );
+}
+
+/// nw-257: the audit command must not report "0 annotated node(s)" because it
+/// could not read the sidecar.
+///
+/// `load_extensions` folds both a parse failure and an I/O failure into an
+/// empty map. In a command whose entire purpose is reporting what is
+/// annotated, that turns "I cannot tell you" into "there is nothing", and
+/// exits 0 while doing it.
+#[test]
+fn extensions_list_fails_loudly_on_an_unreadable_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    // The counterweight, first: NO sidecar is not an error. Nothing has been
+    // annotated yet, and "0 annotated node(s)" is the honest answer.
+    nestweaver_cmd()
+        .args(["extensions", "list", "--db", &db_path.display().to_string()])
+        .assert()
+        .success();
+
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        "{ this is not json",
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["extensions", "list", "--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a sidecar that cannot be parsed must fail the audit, not be reported \
+         as an empty one"
+    );
+    // Asserted POSITIVELY. `.stdout(contains("0 annotated node(s)").not())`
+    // was the obvious way to write this and is the wrong one: a negative
+    // substring check passes for every reason a string can be absent,
+    // including a rendering change or a line wrap, so it would keep passing
+    // after the fix was undone in some other way.
+    let stderr = flatten_miette(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("extension sidecar"),
+        "the failure must name the sidecar as the thing it could not read:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("annotated node"),
+        "an unreadable sidecar must not also print a count as though it had \
+         looked:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// nw-244: PR #307 taught `brain remove` to honour `--config` like its two
+/// sibling vault commands, but both of its guards stop at clap — one asserts
+/// the flag is *accepted*, the other that it lands in the parsed struct.
+/// Reverting the resolution itself leaves the flag parsing perfectly and the
+/// whole suite green, which is precisely the nw-217 bug returning: the command
+/// silently targets instance "default" and `./nestweaver.lbug`.
+///
+/// The behaviour that actually closes that hole is a REFUSAL. The direct
+/// (no-daemon) store cannot honour a pinned instance config, so rather than
+/// quietly acting on some other instance, `brain remove --config` fails and
+/// names the config it could not honour. Silence is the defect; the error is
+/// the fix.
+///
+/// Both halves are asserted, because the refusal alone would also be satisfied
+/// by a command that is simply broken: with the same vault and the same store
+/// addressed by `--db` instead, the remove must succeed.
+#[test]
+fn brain_remove_refuses_a_pinned_config_it_cannot_honor_rather_than_silently_defaulting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("configured.lbug");
+    let vault_dir = dir.path().join("vault");
+    std::fs::create_dir(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Note\n\nBody.\n").unwrap();
+
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"instance_id = "vault-config-parity"
+db = "{}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/vault-config-parity/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/vault-config-parity/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            toml_basic_string(&db_path),
+        ),
+    )
+    .unwrap();
+
+    // Run from somewhere that is neither the configured DB's directory nor the
+    // repository, so a fallback to `./nestweaver.lbug` cannot make anything
+    // pass by accident.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success();
+    assert!(
+        db_path.exists(),
+        "`brain add --config` must have created the database the config names, \
+         at {}; it went somewhere else",
+        db_path.display()
+    );
+
+    let refused = nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "remove"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "`brain remove --config` must not silently succeed against some other \
+         instance; that is the nw-217 defect"
+    );
+    let stderr = flatten_miette(&refused.stderr);
+    assert!(
+        stderr.contains("cannot be honored by the direct store"),
+        "the refusal must say WHY, and name the config it could not honour — \
+         a bare non-zero exit leaves the caller guessing:\n{stderr}"
+    );
+    // Compared with ALL whitespace removed, on both sides: miette breaks the
+    // line wherever the width runs out, and on a long macOS
+    // `/var/folders/...` temp path that break lands INSIDE the path itself.
+    // Any check that tolerates wrapping only between words still fails there.
+    let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    assert!(
+        squeeze(&stderr).contains(&squeeze(&config_path.display().to_string())),
+        "the refusal must name the config path it could not honour:\n{stderr}"
+    );
+
+    // The counterweight: the very same removal, addressed without a config,
+    // succeeds. Without this the refusal above would be indistinguishable from
+    // a `brain remove` that cannot remove anything at all.
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "remove"])
+        .arg(&vault_dir)
+        .args(["--db", &db_path.display().to_string()])
+        .args(["--instance", "vault-config-parity"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn commands_honor_database_declared_by_config() {
     let dir = tempfile::tempdir().unwrap();
@@ -3123,6 +3465,22 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .assert()
         .failure()
         .stderr(contains("colon"));
+}
+
+/// Flatten miette's rendered diagnostic into a single line.
+///
+/// miette hard-wraps a message to the terminal width and prefixes continuation
+/// lines with `\u{2502}`, so a `contains("...")` on any phrase long enough to
+/// span the wrap is really an assertion about the WIDTH — and the width here
+/// depends on the length of the temp path, which differs between a macOS
+/// `/var/folders/...` and a Linux `/tmp/...`. CI caught exactly that: the
+/// message was correct and the assertion still failed.
+fn flatten_miette(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn toml_basic_string(path: &std::path::Path) -> String {

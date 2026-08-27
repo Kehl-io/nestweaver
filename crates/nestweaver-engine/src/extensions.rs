@@ -297,6 +297,19 @@ pub fn save_extensions(db_path: &Path, store: &ExtensionStore) -> Result<(), any
     write_extension_store_durable(&path, store)
 }
 
+/// Load the extension sidecar for `db_path`, surfacing read and parse errors.
+///
+/// nw-257: the auditing commands must not use [`load_extensions`], which folds
+/// a corrupt or unreadable sidecar into an empty map. A command whose whole
+/// purpose is to report what is annotated cannot answer "0 annotated node(s)"
+/// and exit 0 when the truth is that it could not read the file.
+///
+/// A sidecar that simply does not exist is still not an error — nothing has
+/// been annotated yet — so that case returns an empty store.
+pub fn load_extensions_checked(db_path: &Path) -> Result<ExtensionStore, anyhow::Error> {
+    Ok(load_extensions_strict(&sidecar_path(db_path))?.unwrap_or_default())
+}
+
 fn load_extensions_strict(path: &Path) -> Result<Option<ExtensionStore>, anyhow::Error> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -2210,7 +2223,13 @@ pub fn query_by_property<'a>(
 /// Widget", had no expressible form. Membership makes the mode usable without
 /// weakening exact matching: an array query still compares whole-array, so
 /// `["Widget","widget"]` matches only that exact array.
-fn property_matches(stored: &serde_json::Value, query: &serde_json::Value) -> bool {
+///
+/// nw-257: `pub` because `nestweaver extensions list` documents its filtering
+/// as mirroring `query_extensions` "exactly". It had a second, hand-rolled
+/// equality-only implementation instead, so the CLI silently answered a
+/// different question than the tool. Two implementations of one documented
+/// contract is the divergence; sharing this one removes it.
+pub fn property_matches(stored: &serde_json::Value, query: &serde_json::Value) -> bool {
     if stored == query {
         return true;
     }

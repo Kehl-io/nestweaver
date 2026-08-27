@@ -9520,7 +9520,13 @@ fn tool_schema_bridge_nodes() -> Value {
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "Number of top bridges to return. Default 10.",
+                    // nw-251: bounded to match `top_n` below. `limit` carried
+                    // NEITHER bound while its alias carried both — and the
+                    // handler PREFERS `limit`, so the bounded field was the
+                    // one that never applied.
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Number of top bridges to return (1-1000). Default 10.",
                     "default": 10
                 },
                 "top_n": {

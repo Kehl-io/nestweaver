@@ -1163,10 +1163,158 @@ fn parity_msgpack_scope_direct_vs_daemon() {
     );
 }
 
-/// `stale-check` is a freshness gate: it exits 1 when the index is
-/// stale. The fixture here is freshly indexed (not stale), but regardless we
-/// only assert stdout equality and equal exit codes across modes — never
-/// success.
+/// nw-244: `export`'s default scope is a CONTRACT, and only its help text
+/// asserted it.
+///
+/// The default moved from `code` to `all` deliberately, and reverting it kept
+/// the suite green — because nothing ran `export` with no `--scope` and checked
+/// what came out. A help string is not the behaviour.
+///
+/// `graphml` is the format that honours all three scopes, so it is the one that
+/// can tell them apart: under `all` the export carries vault nodes, under
+/// `code` it does not.
+#[test]
+fn export_defaults_to_the_all_scope_not_code() {
+    // A fixture with BOTH code and vault content. `setup_fixture` alone is
+    // code-only, so `all` and `code` produce identical output there and the
+    // test would pass under either default — the assertion at the bottom
+    // catches exactly that, and it fired the first time I wrote this.
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[("src/a.js", "export function one() { return 1; }\n")],
+    );
+    std::fs::write(
+        vault_dir.join("note.md"),
+        "# A Note\n\nSome vault content.\n",
+    )
+    .unwrap();
+    create_db(&repo_dir, &db_path);
+    no_daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db", &db_path.display().to_string()])
+        .assert()
+        .success();
+    let fixture = Fixture { _dir: dir, db_path };
+
+    let defaulted = run_direct(&fixture.db_path, &["export", "--format", "graphml"]);
+    assert!(
+        defaulted.status.success(),
+        "export with no --scope must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&defaulted.stderr)
+    );
+    let explicit_all = run_direct(
+        &fixture.db_path,
+        &["export", "--format", "graphml", "--scope", "all"],
+    );
+    let explicit_code = run_direct(
+        &fixture.db_path,
+        &["export", "--format", "graphml", "--scope", "code"],
+    );
+
+    assert_eq!(
+        defaulted.stdout, explicit_all.stdout,
+        "no --scope must behave exactly as `--scope all`"
+    );
+    // The counterweight, and the half that makes the assertion above mean
+    // something: `all` and `code` must actually DIFFER on this fixture. If they
+    // produced identical output the test would pass under either default and
+    // prove nothing.
+    assert_ne!(
+        explicit_all.stdout, explicit_code.stdout,
+        "the fixture cannot distinguish `all` from `code`, so this test would \
+         pass under either default — it needs vault content to be meaningful"
+    );
+}
+
+/// nw-244: the exit CODE is the contract, and nothing asserted it.
+///
+/// `stale_check_help_states_the_real_exit_contract` asserts against `--help`
+/// TEXT, so it passes with the runtime logic inverted. `parity_stale_check_...`
+/// below asserts the two routes AGREE, so it passes if both regress together.
+/// And its own doc comment said "exits 1" — the code is 2. Reverting
+/// `EXIT_NEEDS_REINDEX` to `EXIT_ERROR` kept the whole suite green.
+///
+/// This exercises the stale path for real: index, then advance the repo one
+/// commit so HEAD differs from the indexed SHA.
+#[test]
+fn stale_check_exits_needs_reindex_not_generic_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[("src/a.js", "export function one() { return 1; }\n")],
+    );
+    create_db(&repo_dir, &db_path);
+
+    // Advance HEAD past the indexed SHA.
+    std::fs::write(
+        repo_dir.join("src/b.js"),
+        "export function two() { return 2; }\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "second",
+        ],
+    ] {
+        StdCommand::new("git")
+            .args(&args)
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+    }
+
+    let output = run_direct(&db_path, &["stale-check"]);
+    let code = output.status.code();
+
+    // 2 is EXIT_NEEDS_REINDEX; 1 is EXIT_ERROR. The distinction is the whole
+    // point — a CI gate keying on "stale" must not fire on an unrelated
+    // failure, and vice versa. Asserting `!= 0` would pass with them merged.
+    assert_eq!(
+        code,
+        Some(2),
+        "a stale index must exit EXIT_NEEDS_REINDEX (2), not EXIT_ERROR (1) or success; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The counterweight: a FRESH index must exit 0. Without it, a change making
+/// stale-check always return 2 would pass the test above.
+#[test]
+fn stale_check_exits_zero_when_the_index_is_current() {
+    let fixture = setup_fixture();
+
+    let output = run_direct(&fixture.db_path, &["stale-check"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a freshly indexed repo is not stale; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `stale-check` is a freshness gate. The fixture here is freshly indexed, so
+/// this asserts only that the two routes agree — the exit-code contract itself
+/// is pinned by the two tests above.
 #[test]
 fn parity_stale_check_direct_vs_daemon() {
     let fixture = setup_fixture();
