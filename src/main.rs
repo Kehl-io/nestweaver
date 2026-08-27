@@ -5500,33 +5500,39 @@ fn explicit_instance_id(flag: Option<&str>, config: Option<&Path>) -> Option<Str
 }
 
 /// Resolve the instance for a command that touches `db_path`, consulting the
-/// DATABASE before any ambient input.
+/// DATABASE when — and only when — the caller did not name one.
 ///
-/// nw-246. `resolve_instance_id` answers from the flag, then the config, then
-/// the literal `"default"` — all ambient, none of them aware of what the
-/// database already contains. That is what let 8.0.0's change of default
-/// silently RE-IDENTIFY existing data and fork a graph in place.
+/// nw-246. The defect was a SILENT fork: a config-less `nestweaver index`
+/// resolved the instance from ambient inputs (a db-path hash in 7.0.0, the
+/// literal `"default"` in 8.0.0), so changing that derivation re-identified
+/// existing data with no user intent and no warning. Two repo rows for one
+/// path, two UIDs per symbol with an identical `canonical_id`, `stale-check`
+/// permanently non-zero, and `prune-stale` unable to clean it.
 ///
-/// The precedence here is etcd's: consult the store first, and fall back to
-/// ambient inputs only when the store has nothing to say.
+/// The guard is therefore scoped to the INFERRED case. Naming an instance —
+/// with `--instance` or a `--config` — is a deliberate act, and a database
+/// holding several instances is a SUPPORTED configuration that config
+/// switching manages, not a damage state. The daemon implements exactly that
+/// (`resolve_effective_instance_id`, the per-RPC override) and
+/// `daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown`
+/// pins it: same database, restarted under a second config, new repos landing
+/// under the new instance. An unconditional guard would have retired that
+/// capability while claiming only to stop accidental forks.
 ///
-/// 1. Database records an instance -> that wins. An explicit flag or config
-///    that DISAGREES is refused, not silently honoured: disagreement is a
-///    mistake, not an instruction to fork. (The nw-098 vault guard already
-///    reached this conclusion for one command; this applies it to all of them.)
-/// 2. No record, but the graph already contains exactly one instance -> adopt
-///    it. This is the upgrade path: a 7.0.0 database keeps working untouched.
-/// 3. No record and SEVERAL instances present -> already forked. Refuse and
-///    name them, rather than picking one and compounding the damage.
-/// 4. Nothing at all -> a genuinely new database; use the ambient answer.
+/// Precedence when nothing was stated is etcd's: consult the store first, and
+/// fall back to ambient inputs only when it has nothing to say.
 fn resolve_instance_id_for_db(
     flag: Option<String>,
     config: Option<&Path>,
     db_path: &Path,
 ) -> anyhow::Result<String> {
-    let explicit = explicit_instance_id(flag.as_deref(), config);
+    let stated = explicit_instance_id(flag.as_deref(), config).is_some();
     let ambient = resolve_instance_id(flag, config)?;
 
+    // Stated intent passes through untouched.
+    if stated {
+        return Ok(ambient);
+    }
     // A database that does not exist yet cannot have an opinion.
     if !db_path.exists() {
         return Ok(ambient);
@@ -5537,38 +5543,23 @@ fn resolve_instance_id_for_db(
         return Ok(ambient);
     };
 
+    // Recorded identity wins over the ambient default.
     if let Ok(Some(recorded)) = store.data_instance_id() {
-        if let Some(asked) = explicit.as_deref()
-            && asked != recorded
-        {
-            store
-                .assert_data_instance_id(asked)
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-        }
         return Ok(recorded);
     }
 
-    // Legacy database: infer from the UIDs already written.
+    // Legacy database with no record: infer from the UIDs already written.
     match store.observed_instance_ids() {
-        Ok(observed) if observed.len() == 1 => {
-            let existing = observed.into_iter().next().unwrap_or(ambient.clone());
-            if let Some(asked) = explicit.as_deref()
-                && asked != existing
-            {
-                anyhow::bail!(
-                    "this database's data was written under instance '{existing}', but \
-                     '{asked}' was requested. Indexing under a different instance would FORK \
-                     the graph — every repo, vault and project UID embeds the instance.\n\
-                     Use instance '{existing}', or migrate deliberately with \
-                     `nestweaver instance merge --from {existing} --to {asked}`."
-                );
-            }
-            Ok(existing)
-        }
+        Ok(observed) if observed.len() == 1 => Ok(observed.into_iter().next().unwrap_or(ambient)),
+        // Several instances present and nothing stated. This IS ambiguous —
+        // adopting one at random is how the fork would deepen — so refuse and
+        // name them. Stating an instance resolves it, which is why this arm is
+        // unreachable when the caller named one.
         Ok(observed) if observed.len() > 1 => anyhow::bail!(
-            "this database already contains data under {} different instances: {}.\n\
-             That is a split graph, and continuing would deepen it. Consolidate first with \
-             `nestweaver instance merge --from <one> --to <keep>`, then re-run.",
+            "this database holds data under {} instances ({}), and no instance was \
+             specified, so there is no safe default.\n\
+             Name one with `--instance <id>` or a `--config`, or consolidate them with \
+             `nestweaver instance merge --from <one> --to <keep>`.",
             observed.len(),
             observed.join(", ")
         ),
