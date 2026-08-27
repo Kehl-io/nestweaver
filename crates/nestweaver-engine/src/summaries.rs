@@ -1131,3 +1131,70 @@ mod tests {
         assert_eq!(sym_count, 1, "symbol summaries should be saved");
     }
 }
+
+#[cfg(test)]
+mod cap_disclosure_tests {
+    use super::*;
+
+    /// nw-270: `capped` and `matched_total` exist so callers can disclose the
+    /// cap, and the `summary --json` caller discarded both — reporting
+    /// `total: 500, truncated: false` for a 500-of-N answer. The cap was
+    /// invisible in precisely the field that exists to reveal it.
+    ///
+    /// Pinned here, at the producer, because the guarantee callers depend on is
+    /// that these two fields describe the PRE-cap world.
+    #[test]
+    fn capped_results_report_the_pre_cap_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        for i in 0..12 {
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: format!("sym:test:s{i}"),
+                    name: format!("s{i}"),
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: "repo:test:demo".to_string(),
+                    file_path: "a.js".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: format!("fn s{i}()"),
+                    summary: None,
+                    content_hash: "hash".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+
+        let capped = generate_symbol_summaries_bounded(&store, None, 5).unwrap();
+        assert_eq!(capped.summaries.len(), 5, "the cap must actually bind");
+        assert!(capped.capped, "a bound cap must be disclosed as capped");
+        assert!(
+            capped.matched_total > capped.summaries.len(),
+            "matched_total must describe the PRE-cap world ({} matched vs {} returned)",
+            capped.matched_total,
+            capped.summaries.len()
+        );
+
+        // The counterweight: a cap that does NOT bind must not claim it did.
+        // Without this, always-true `capped` would satisfy the assertion above.
+        let uncapped = generate_symbol_summaries_bounded(&store, None, 1000).unwrap();
+        assert!(
+            !uncapped.capped,
+            "a cap larger than the corpus must not report truncation"
+        );
+        assert_eq!(
+            uncapped.matched_total,
+            uncapped.summaries.len(),
+            "and its total must equal what it returned"
+        );
+    }
+}

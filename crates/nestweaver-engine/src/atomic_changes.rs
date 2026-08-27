@@ -751,6 +751,19 @@ pub fn is_test_file(path: &str) -> bool {
         || path.ends_with("_test.py")
 }
 
+/// Upper bound on transitive impact depth.
+///
+/// nw-268: the `ImpactAnalysis` gRPC handler accepted any `max_depth` a caller
+/// sent, while its sibling traversal clamped at 64 — and the CLI half
+/// (`pre-push-impact --max-depth`) had no `value_parser` at all, so a typo like
+/// `--max-depth 100000` became an unbounded graph walk rather than a usage
+/// error.
+///
+/// Defined here, once, because the divergence was two independent limits — one
+/// of them absent. 64 matches the sibling that already had it; a depth beyond
+/// that has traversed the entire graph on any real repository.
+pub const MAX_IMPACT_DEPTH: u32 = 64;
+
 // ── Server-side impact analysis (Task 7) ─────────────────────────────
 
 /// Server-side impact analysis: given atomic changes, query the graph store
