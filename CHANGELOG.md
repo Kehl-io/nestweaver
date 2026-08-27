@@ -1,5 +1,96 @@
 # Changelog
 
+## [8.0.0](https://github.com/Kehl-io/nestweaver/compare/v7.0.0...v8.0.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine,mcp,cli:** PageRank artifacts must declare `algorithm_parameters`, so `backup` and `publish` refuse a sidecar written before this change until a re-index regenerates it. `stale-check --json` gains `needs_reindex_repos`, and its text banner now reads "NEEDS REINDEX" rather than "INDEX IS STALE".
+* **mcp,daemon:** a database now carries its own instance identity, minted at creation and adopted thereafter. **No re-index is required to upgrade.** An earlier commit in this release changed a config-less daemon to store under instance "default" rather than a db-path hash, which would have re-keyed an existing graph; that was superseded later in the same release — a config-less command now ADOPTS the identity already recorded in the database rather than forking it. An explicitly stated `--instance` or `--config` still wins, so config-driven instance switching is unchanged. MCP tools now reject undeclared arguments instead of ignoring them.
+* **cli,daemon:** a write that states no instance against a database already holding MORE THAN ONE instance is now REFUSED rather than resolved. Under 7.0.0 it silently picked the db-path hash. The error names every instance present and the command to consolidate them. This affects mixed-convention databases — see `docs/guide/instance-id-migration.md`. Naming an instance with `--instance` or a `--config` resolves it.
+* **cli:** `--refresh-wiki-hours` on `watch` and `brain watch` now refuses at invocation instead of silently doing nothing. It never functioned on EITHER route — the "Wiki refresh scheduled" message printed before the execution path was chosen, so the claim was false whether or not a daemon was running. Use `nestweaver materialize-projects --config <path>`.
+* **cli,export:** `stale-check` now exits 2 (not 1) when a repo needs re-indexing; exit 1 means the check failed. Gate on `any_needs_reindex` or exit 2. `export --format graphml` now includes the vault subgraph by default; pass `--scope code` for the previous output. The default format, `cypher`, is code-only and is unaffected — only graphml honours `--scope`.
+* **embeddings:** `GraphStore::delete_symbols_in_file` and `delete_symbols_in_file_on` return `Vec<String>` instead of `usize`. Callers wanting the count use `.len()`.
+* **index:** `GraphStore::update_symbol_file_paths` and `update_symbol_file_paths_on` are removed. A rename re-keys symbols; delete and re-insert them instead.
+
+### Features
+
+* **cli:** let a human read back what agents annotate, and say who can repair ([5453853](https://github.com/Kehl-io/nestweaver/commit/5453853c5e5bf2aeee191465ad3a98ee719ded80))
+* **daemon,cli:** give `context` its own RPC so both routes run one algorithm ([2460331](https://github.com/Kehl-io/nestweaver/commit/246033190170e0a764d5ae5367b5e69c3b1e73c9))
+* **mcp:** add code_context, the code-only counterpart to brain_context ([b0cc037](https://github.com/Kehl-io/nestweaver/commit/b0cc037e8b8f16eae7ee69c7902939be13ff130e))
+
+
+### Bug Fixes
+
+* **cache:** stop staging the response cache through a shared temp name ([5817f77](https://github.com/Kehl-io/nestweaver/commit/5817f7780868f167a6ec5e07bd7532e2753fd24f))
+* **ci,store,daemon:** close the v8.0.0 test-quality debt — mutation scope, unlocked recovery, dead lifecycle guards ([c0838ff](https://github.com/Kehl-io/nestweaver/commit/c0838ff3b99bb0798b52b9a73586208f64c827d0))
+* **ci:** derive the package list from the same diff that generates mutants ([dc6caa9](https://github.com/Kehl-io/nestweaver/commit/dc6caa9ee4198b2705c480ea5159751413336c00))
+* **ci:** mutate the packages the diff touches, not the whole workspace ([dadd45b](https://github.com/Kehl-io/nestweaver/commit/dadd45b4267efcfb7ffa39e0d18787bd62058de3))
+* **ci:** mutate the workspace, not just the root package, and bound the job ([6c30bc4](https://github.com/Kehl-io/nestweaver/commit/6c30bc40db7cd848816a0a89982ef9da597b0b3d))
+* **cli,ci:** make the daemon bypass explicit where CI relied on it implicitly ([68ec6da](https://github.com/Kehl-io/nestweaver/commit/68ec6da664a4c7d86409adc0516117f88d049045))
+* **cli,export:** give stale-check an honest exit contract and export the whole graph ([aa3720a](https://github.com/Kehl-io/nestweaver/commit/aa3720afb4e4d9f6537179e125f168dab93326ec))
+* **cli,mcp,daemon:** contract divergences — one route fixed, its twin left behind ([2d2134b](https://github.com/Kehl-io/nestweaver/commit/2d2134bdfaeda1201c7935ac669d24a62824078b))
+* **cli,mcp,daemon:** stop five commands claiming things they never verified ([#284](https://github.com/Kehl-io/nestweaver/issues/284)) ([c211e5c](https://github.com/Kehl-io/nestweaver/commit/c211e5cff878e7ba3d08ae5cd5327dc104daf53a))
+* **cli,mcp,daemon:** three contracts that said one thing and did another ([fdab0e8](https://github.com/Kehl-io/nestweaver/commit/fdab0e8a0398c3628c9a9572be8a27d3ab2fb965))
+* **cli:** make `brain remove` behave like its two sibling vault commands ([a3da11d](https://github.com/Kehl-io/nestweaver/commit/a3da11d7a722849d3d372a6bc4268a37b164badb))
+* **cli:** resolve watch-stop's database the way every config-aware command does ([45be48b](https://github.com/Kehl-io/nestweaver/commit/45be48b4c9743f93e777c81ea8c3c86cd0465d79))
+* **cli:** stop `brain status` printing an unreadable count as zero ([d2fc406](https://github.com/Kehl-io/nestweaver/commit/d2fc40677e3d45ea80cf72ac43112cad4d909e91))
+* **cli:** stop brain remove warning on success, and make the crash detector work ([a0ed21e](https://github.com/Kehl-io/nestweaver/commit/a0ed21ea285d6962d55eb9485e71237c00d4c29a))
+* **cli:** stop usage errors and "needs re-index" sharing exit code 2 ([b666502](https://github.com/Kehl-io/nestweaver/commit/b666502056c30375aa022b5a0fc6cac164cc2214))
+* **cli:** two routes that answered differently than the tool they mirror ([22535af](https://github.com/Kehl-io/nestweaver/commit/22535afa9bd8ef2ead3e8935114cdd58016bb7cb))
+* **daemon,cli,engine:** nw-246 was unfixed on the default path ([8b4bf8e](https://github.com/Kehl-io/nestweaver/commit/8b4bf8e422e8484e799441c4e81bee0ca73c4591))
+* **daemon,cli:** HOLD the write lease for the duration, do not probe and hope ([f147062](https://github.com/Kehl-io/nestweaver/commit/f147062da86ebb7cabe14ddf6b1893aa586dd9a2))
+* **daemon,cli:** let the lock decide who may write, not an environment variable ([d133e21](https://github.com/Kehl-io/nestweaver/commit/d133e21447c4d4c80bb6ff6655f28696602f7880))
+* **daemon,cli:** reclaim an orphaned watcher, and stop the reconciler racing teardown ([2478f3c](https://github.com/Kehl-io/nestweaver/commit/2478f3cf797b60092632d997de0e2a84a69a99ce))
+* **daemon,config,mcp,cli:** close five validated reports; document a sixth ([#285](https://github.com/Kehl-io/nestweaver/issues/285)) ([327c2f0](https://github.com/Kehl-io/nestweaver/commit/327c2f08d99a19fd5b473871faf74911278b6dbc))
+* **daemon,mcp,index:** check daemon version on the paths users take, and stop leaking vectors on a full re-index ([3e5c121](https://github.com/Kehl-io/nestweaver/commit/3e5c121ada408faf752ef8a138235afb613c734c))
+* **daemon:** refuse a stale-version incumbent instead of reporting success ([#283](https://github.com/Kehl-io/nestweaver/issues/283)) ([4eedf2e](https://github.com/Kehl-io/nestweaver/commit/4eedf2ea2396f38087d6317913c7c4d0690e9973))
+* **daemon:** serialize brain_memory_consolidate's file moves behind the write gate ([e78ea02](https://github.com/Kehl-io/nestweaver/commit/e78ea02de40097d494c5e60795b1127d9fcb7c11))
+* **daemon:** stop reporting success for embeds and vault indexes that failed ([9b837ac](https://github.com/Kehl-io/nestweaver/commit/9b837ac260b4e7658199a54fdf1bcad68a6dbba1))
+* **daemon:** track watcher tasks so shutdown awaits them before releasing the lock ([2fc6ea0](https://github.com/Kehl-io/nestweaver/commit/2fc6ea077f8caf70e185e88be7820a341eaf750e))
+* **embeddings,cli,mcp:** close the review findings against 7.0.0's own fixes ([3e857e7](https://github.com/Kehl-io/nestweaver/commit/3e857e7aec4692e1115939b9fb3e959bf1a96d9c))
+* **embeddings,daemon,mcp:** close the review findings against 7.0.0's own fixes ([a42df2f](https://github.com/Kehl-io/nestweaver/commit/a42df2f9670ae3d9abc164d703f2999edd7dd712))
+* **embeddings:** restore the test attribute the new test displaced ([7e2a360](https://github.com/Kehl-io/nestweaver/commit/7e2a360e3af070b91b6b5e1bb48afc7a37027f6e))
+* **embeddings:** stop a tombstoned pending upsert wedging every later flush ([073ee06](https://github.com/Kehl-io/nestweaver/commit/073ee0600460286418cc207ca38b9e21306f1711))
+* **embeddings:** tombstone deleted nodes so dead vectors stop being scored ([#281](https://github.com/Kehl-io/nestweaver/issues/281)) ([520a5d9](https://github.com/Kehl-io/nestweaver/commit/520a5d9bf4b8fad23f088a3ae9ed190d1fb68f4a))
+* **engine,mcp,cli:** close five defects review found in this branch ([3666c1e](https://github.com/Kehl-io/nestweaver/commit/3666c1efa8d180e6877512245d3a0235022d976a))
+* **engine,store,cli:** declare pagerank parameters, match tag descendants, seal publication slots ([1187d18](https://github.com/Kehl-io/nestweaver/commit/1187d18fcd5f426a1e5bebee8a0307cae6a8c456))
+* **engine:** validate the slot on rollback, not just on activation ([28c3ff7](https://github.com/Kehl-io/nestweaver/commit/28c3ff7cc426e3f145e1475841d0eca7beb81623))
+* **export,cli,daemon:** make --scope reach the route users actually take ([3d92649](https://github.com/Kehl-io/nestweaver/commit/3d926496ad2f4d5c50fbd3ed7ffb2078f54e0c40))
+* **export,store,mcp:** make a scoped export the subgraph it names ([4ef762e](https://github.com/Kehl-io/nestweaver/commit/4ef762ebad8e6c507f52b36dec7f5ce5d7056a01))
+* **export:** make msgpack honour --scope on both routes ([9504eb6](https://github.com/Kehl-io/nestweaver/commit/9504eb68b405d51698692e08387fb5dfa1a3d1e4))
+* **federation,mcp,cli:** re-honour code_context's limit across a merge ([b293e70](https://github.com/Kehl-io/nestweaver/commit/b293e7053fa23265f8e55ec815db4616569d8ad0))
+* **federation,mcp:** stop the structured merger dropping required fields ([7d2598e](https://github.com/Kehl-io/nestweaver/commit/7d2598ee96ee0f04ecd5c432388b3e1a905bd846))
+* **federation:** restore the #[test] my insertion stole ([5d05ed3](https://github.com/Kehl-io/nestweaver/commit/5d05ed3d0c3e03dc5b3b0d24f9ba5ac3b8dd1694))
+* give the database its own instance identity, established at creation ([1ca38f5](https://github.com/Kehl-io/nestweaver/commit/1ca38f51a275d8198ea0ffb0ab441aad4e9643a6))
+* **impact:** report the same `total` the daemon does, including when pruned ([fc6c55f](https://github.com/Kehl-io/nestweaver/commit/fc6c55f8355102d78273280474708f8e1e6c8c9c))
+* **index:** stop a parseable-to-parseable rename failing the whole index ([#280](https://github.com/Kehl-io/nestweaver/issues/280)) ([970f57e](https://github.com/Kehl-io/nestweaver/commit/970f57e86880b57b2079371395b9103a0ccf41c3))
+* **mcp,cli,daemon:** stop turning failed reads into confident answers ([52b167d](https://github.com/Kehl-io/nestweaver/commit/52b167da68bf4cc272cff69ea4e617f3c3190eff))
+* **mcp,cli:** stop reporting a failed read as a confident zero ([d0c2b5c](https://github.com/Kehl-io/nestweaver/commit/d0c2b5ce178be23868885900726ad326005979b8))
+* **mcp,daemon,cli:** close two MCP/CLI parity gaps — code_context and stale-ranking disclosure ([181020b](https://github.com/Kehl-io/nestweaver/commit/181020b0ae743c818c5eeeff0d0f964b3e90d7af))
+* **mcp,daemon:** server-authoritative instance identity, and strict tool schemas ([b80001c](https://github.com/Kehl-io/nestweaver/commit/b80001c16b3f2ba4f35db598dd033ff8f0cd400b))
+* **mcp,federation:** stop restating which tools mutate ([282eef7](https://github.com/Kehl-io/nestweaver/commit/282eef7c168fc8d525867451b2953a9755083811))
+* **mcp:** apply the bounds and defaults the schemas advertise ([79c5b4c](https://github.com/Kehl-io/nestweaver/commit/79c5b4c7d3e95f5d2791426516c31c0ec3fc797b))
+* **mcp:** disclose stale rankings to the agent, not just to the human ([b7014a6](https://github.com/Kehl-io/nestweaver/commit/b7014a68c51a69057792e104ec12a646b92f2f9e))
+* **mcp:** drop a redundant rebinding clippy rejected ([71cf485](https://github.com/Kehl-io/nestweaver/commit/71cf48526f08abbf739473d890ba4e01571fc5ea))
+* **mcp:** reject scalar JSON-RPC params at the envelope ([dd18631](https://github.com/Kehl-io/nestweaver/commit/dd18631d7847e2402f9f550285b5aa4522557054))
+* nine delta findings, two of them regressions we introduced ([7d87c0f](https://github.com/Kehl-io/nestweaver/commit/7d87c0fae47cbe12c38cd8380218f45e793c40c3))
+* **nw-246:** scope the guard to the SILENT fork, not to stated intent ([a5d9148](https://github.com/Kehl-io/nestweaver/commit/a5d9148a0ea33dbdd58605edaed91a8504897398))
+* **pagerank:** check a declared configuration against this build's, not itself ([3ebe34a](https://github.com/Kehl-io/nestweaver/commit/3ebe34a581143f16f651daae78f5fdf793710ca7))
+* **publication,cli,mcp:** refuse symlinked slots and stop guessing staleness ([57bd286](https://github.com/Kehl-io/nestweaver/commit/57bd286acf5b8fcfed866c1e3e6639c4a98f31e2))
+* **ranking:** give the git-activity sidecar a repo dimension, and load it ([3b2d539](https://github.com/Kehl-io/nestweaver/commit/3b2d539d30e1eb3a2667d5788cedf7af3fba9cdb))
+* **setup:** stop `setup` destroying the settings file it is editing ([97d6912](https://github.com/Kehl-io/nestweaver/commit/97d69121ea9d9b4b4daf439d5313dd17bd7c8fd0))
+* six route divergences, three closed by sharing rather than restating ([1a6a281](https://github.com/Kehl-io/nestweaver/commit/1a6a281cf23257ecbd72b179241223444239fd09))
+* **store,engine:** remove a duplicated #[test] and a now-unused import ([684b2d1](https://github.com/Kehl-io/nestweaver/commit/684b2d109da4b5673404f0398bb06e59ed816879))
+* **store:** bound the address-space reservation on EVERY open, not just writes ([d67d031](https://github.com/Kehl-io/nestweaver/commit/d67d0310545c49eb03f66b69916b5377a0439fc4))
+* **store:** bound the engine thread pool on READ opens too ([16186d7](https://github.com/Kehl-io/nestweaver/commit/16186d73d9a960db536d084db978c049e3856d88))
+* **store:** bound the engine thread pool on READ opens too (nw-240, UNVERIFIED) ([0564e85](https://github.com/Kehl-io/nestweaver/commit/0564e851bf6ce673e4e4a7bce6d41cdc90846ce9))
+* **store:** drop an import orphaned by moving the const guard ([b527a01](https://github.com/Kehl-io/nestweaver/commit/b527a0191e9525b5bca56c98d1023c3d3ff845a9))
+* **store:** enforce the bound at compile time, not with a hollow assert ([ac902d2](https://github.com/Kehl-io/nestweaver/commit/ac902d2d78e164c10659e049899e3e9edbf66d79))
+* **store:** invalidate the regex scope on a plain index write ([926194b](https://github.com/Kehl-io/nestweaver/commit/926194b7df9d25b6f404b705a4a7ecd74ef0c239))
+* **store:** stop unlocked opens from clobbering an index migration ([3929692](https://github.com/Kehl-io/nestweaver/commit/39296924a7d668407d25b6022f74d7a9cef47b69))
+* **test:** render stale-check help on a deeper stack ([ec88027](https://github.com/Kehl-io/nestweaver/commit/ec8802771a93ab71ce321a8485dd7507b20fa6b0))
+
 ## [7.0.0](https://github.com/Kehl-io/nestweaver/compare/v6.4.0...v7.0.0) (2026-08-22)
 
 
