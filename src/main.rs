@@ -5553,26 +5553,53 @@ fn resolve_instance_id_for_db(
         return Ok(ambient);
     };
 
+    // Ambiguity is checked BEFORE the recorded value, not after.
+    //
+    // nw-246 (second hole): returning the record first made this arm
+    // unreachable for any database that HAS a record — and since
+    // `ensure_data_instance_id` runs on every repo index and never replaces an
+    // existing value, that is every database created or indexed under 8.0.0.
+    // Only a pre-nw-246 database could ever reach the refusal the runbook
+    // promises.
+    //
+    // The sequence was reachable entirely through supported behaviour:
+    // `index --instance one`, then `index --instance two` (stated, so it
+    // passes — that is the capability this rescope preserved), leaves a
+    // database holding two instances whose record still says `one`. A
+    // config-less index then adopted `one` and silently re-keyed the second
+    // repo. The nw-246 fork, verbatim, produced by the guard itself.
+    //
+    // A record is evidence of the last mint, not evidence that the graph is
+    // single-instance. `observed_instance_ids`' own contract says as much:
+    // more than one value is a damage state, and callers must refuse rather
+    // than pick.
+    let observed = store.observed_instance_ids();
+
+    if let Ok(ref ids) = observed
+        && ids.len() > 1
+    {
+        // Several instances present and nothing stated. Adopting one at random
+        // is how the fork would deepen, so refuse and name them. Stating an
+        // instance resolves it, which is why this is unreachable when the
+        // caller named one.
+        anyhow::bail!(
+            "this database holds data under {} instances ({}), and no instance was \
+             specified, so there is no safe default.\n\
+             Name one with `--instance <id>` or a `--config`, or consolidate them with \
+             `nestweaver instance merge --from <one> --to <keep>`.",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+
     // Recorded identity wins over the ambient default.
     if let Ok(Some(recorded)) = store.data_instance_id() {
         return Ok(recorded);
     }
 
     // Legacy database with no record: infer from the UIDs already written.
-    match store.observed_instance_ids() {
-        Ok(observed) if observed.len() == 1 => Ok(observed.into_iter().next().unwrap_or(ambient)),
-        // Several instances present and nothing stated. This IS ambiguous —
-        // adopting one at random is how the fork would deepen — so refuse and
-        // name them. Stating an instance resolves it, which is why this arm is
-        // unreachable when the caller named one.
-        Ok(observed) if observed.len() > 1 => anyhow::bail!(
-            "this database holds data under {} instances ({}), and no instance was \
-             specified, so there is no safe default.\n\
-             Name one with `--instance <id>` or a `--config`, or consolidate them with \
-             `nestweaver instance merge --from <one> --to <keep>`.",
-            observed.len(),
-            observed.join(", ")
-        ),
+    match observed {
+        Ok(ids) if ids.len() == 1 => Ok(ids.into_iter().next().unwrap_or(ambient)),
         _ => Ok(ambient),
     }
 }

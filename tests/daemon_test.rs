@@ -5246,3 +5246,264 @@ fn gc_spares_running_daemon_reaps_orphans_and_stop_leaves_nothing() {
         "clean stop must unlink the socket-fallback dir"
     );
 }
+
+/// nw-246 (daemon path): a config-less `nestweaver index` through a RUNNING
+/// DAEMON must adopt the instance the database records — not write `default`
+/// and fork the graph.
+///
+/// This is the test whose absence let the defect ship. The original nw-246
+/// repro ran with `NESTWEAVER_ALLOW_NO_DAEMON=1`, which exercises
+/// `resolve_instance_id_for_db` — the one route that already had the guard.
+/// The daemon branch in `src/main.rs` returns before ever reaching it, and the
+/// daemon's own fallback never consulted the store, so the documented default
+/// path was unguarded while the fix looked verified.
+///
+/// Deliberately uses `daemon_cmd()` (no `NESTWEAVER_NO_DAEMON`) with an
+/// explicitly started daemon, and asserts the daemon is actually serving before
+/// the assertion that matters — otherwise a silent fallback to the direct store
+/// would make this pass for exactly the wrong reason.
+#[test]
+fn daemon_configless_index_adopts_the_recorded_instance_not_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_repo = dir.path().join("first");
+    let second_repo = dir.path().join("second");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&first_repo);
+    write_test_repo(&second_repo);
+
+    // Establish the database's recorded identity as something that is NOT
+    // "default", so a fallback to the ambient default is visible.
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &first_repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "recorded-one",
+        ])
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // The daemon really is serving. Without this the test would still pass if
+    // the CLI quietly fell back to the direct store, which is the guarded
+    // route — i.e. it would pass for the reason that hid the bug.
+    let status = daemon_cmd()
+        .args(["daemon", "--db", &db_path.display().to_string(), "status"])
+        .output()
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        status.status.success() && status_text.contains("unning"),
+        "the daemon must be serving for this test to exercise the daemon \
+         route:\n{status_text}"
+    );
+
+    // Config-less, instance-less index of a SECOND repo through the daemon.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &second_repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let output = daemon_cmd()
+        .args([
+            "list-repos",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let repos: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("list-repos --json: {e}\n{stdout}"));
+    let arr = repos.as_array().expect("expected a JSON array of repos");
+
+    // Counterweight: BOTH repos must be present. If the second index silently
+    // no-opped, every row would trivially carry the recorded instance and the
+    // assertion below would prove nothing.
+    assert_eq!(
+        arr.len(),
+        2,
+        "both repos must be indexed for this to test anything:\n{stdout}"
+    );
+    for repo in arr {
+        assert_eq!(
+            repo["instance_id"].as_str(),
+            Some("recorded-one"),
+            "a config-less index through the daemon must adopt the instance the \
+             database RECORDS; writing `default` here is the nw-246 fork:\n{stdout}"
+        );
+    }
+}
+
+/// nw-246: the same guarantee for MCP `brain_add_source`, which is a separate
+/// entry point sending its own `instance_id: String::new()`.
+///
+/// "The daemon computation is shared" is an argument, not a test — and the
+/// argument is exactly what was believed about the CLI path.
+#[test]
+fn mcp_add_source_adopts_the_recorded_instance_not_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_repo = dir.path().join("first");
+    let second_repo = dir.path().join("second");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&first_repo);
+    write_test_repo(&second_repo);
+
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &first_repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "recorded-one",
+        ])
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let request = format!(
+        concat!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"#,
+            r#""name":"brain_add_source","arguments":{{"path":"{}"}}}}}}"#,
+            "\n"
+        ),
+        second_repo.display()
+    );
+    let mcp = daemon_cmd()
+        .args(["mcp", "--db", &db_path.display().to_string()])
+        .write_stdin(request)
+        .output()
+        .unwrap();
+    let mcp_out = String::from_utf8_lossy(&mcp.stdout).to_string();
+
+    let output = daemon_cmd()
+        .args([
+            "list-repos",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let repos: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("list-repos --json: {e}\n{stdout}"));
+    let arr = repos.as_array().expect("expected a JSON array of repos");
+
+    assert_eq!(
+        arr.len(),
+        2,
+        "brain_add_source must actually have added the second repo, or this \
+         asserts nothing.\nmcp said:\n{mcp_out}\nrepos:\n{stdout}"
+    );
+    for repo in arr {
+        assert_eq!(
+            repo["instance_id"].as_str(),
+            Some("recorded-one"),
+            "MCP add-source must adopt the recorded instance too:\n{stdout}"
+        );
+    }
+}
+
+/// nw-246 (second hole): the ambiguity refusal must be reachable, and must be
+/// reachable THROUGH THE DAEMON.
+///
+/// Two things were wrong. `resolve_instance_id_for_db` returned the recorded
+/// value before ever consulting `observed_instance_ids`, so the refusal was
+/// unreachable for any database that had a record — and since
+/// `ensure_data_instance_id` runs on every index and never replaces, that is
+/// every database written under 8.0.0. And the daemon had no refusal at all.
+///
+/// The sequence below is entirely supported behaviour: two STATED indexes,
+/// which pass by design, leave a database holding two instances. A third,
+/// config-less index then had no safe default — and silently picked one.
+#[test]
+fn daemon_refuses_a_configless_write_when_the_database_is_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_repo = dir.path().join("first");
+    let second_repo = dir.path().join("second");
+    let third_repo = dir.path().join("third");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&first_repo);
+    write_test_repo(&second_repo);
+    write_test_repo(&third_repo);
+
+    for (repo, instance) in [(&first_repo, "one"), (&second_repo, "two")] {
+        no_daemon_cmd()
+            .args([
+                "index",
+                "--repo",
+                &repo.display().to_string(),
+                "--db",
+                &db_path.display().to_string(),
+                "--instance",
+                instance,
+            ])
+            .assert()
+            .success();
+    }
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let refused = daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &third_repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a config-less index against a database holding two instances has no \
+         safe default and must be refused, not resolved to one of them"
+    );
+    let stderr: String = String::from_utf8_lossy(&refused.stderr)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        stderr.contains("one") && stderr.contains("two"),
+        "the refusal must NAME the instances it found, so the caller can pick \
+         one or merge them:\n{stderr}"
+    );
+
+    // Counterweight: STATING an instance resolves the ambiguity. Without this
+    // the refusal above would be indistinguishable from a daemon that has
+    // simply stopped accepting indexes.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &third_repo.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "one",
+        ])
+        .assert()
+        .success();
+}

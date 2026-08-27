@@ -2163,6 +2163,47 @@ pub fn index_directory_with_store_cancellable_and_limits(
     )
 }
 
+/// nw-246: record the instance this database's data belongs to, once.
+///
+/// `ensure_data_instance_id` never replaces an existing value — a database that
+/// already knows its instance keeps it, and returns it.
+///
+/// Called from EVERY index funnel. nw-246's original wiring put it in
+/// `index_directory_with_store_inner` only, which is not the funnel the CLI
+/// index actually uses — so the record was never written, `data_instance_id()`
+/// returned `None` for every database, and the mint-once mechanism the whole
+/// item is built on was inert. One helper, called from both, so the next funnel
+/// added cannot quietly miss it.
+///
+/// A stated instance that differs from the record is `--config`-driven instance
+/// switching, which is supported — so this reports the disagreement rather than
+/// refusing it. The disagreement that IS a defect (an INFERRED instance
+/// differing from the record) is resolved upstream, where the distinction
+/// between stated and inferred still exists; by here that information is gone.
+///
+/// Best-effort: a store that cannot record it still indexes correctly, it just
+/// falls back to inferring the instance from its own UIDs next time. Logged at
+/// WARN, not DEBUG — this is the one write that establishes identity.
+fn record_data_instance(store: &GraphStore, instance_id: &str) {
+    match store.ensure_data_instance_id(instance_id) {
+        Ok(recorded) if recorded != instance_id => {
+            tracing::info!(
+                recorded = %recorded,
+                writing_as = %instance_id,
+                "this database records a different instance; writing under the \
+                 stated one (instance switching). `nestweaver list-repos` shows both."
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                instance = %instance_id,
+                "could not record the data instance id: {error}"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_directory_with_store_inner(
     store: &GraphStore,
@@ -2179,22 +2220,7 @@ fn index_directory_with_store_inner(
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
-    // nw-246: record the instance this database's data belongs to, once.
-    //
-    // This is the funnel every repo index passes through, so it is where the
-    // database's identity gets established. `ensure_data_instance_id` never
-    // replaces an existing value — a database that already knows its instance
-    // keeps it, and the CLI resolver refuses a disagreeing request before
-    // reaching here.
-    //
-    // Best-effort: a store that cannot record it still indexes correctly, it
-    // just falls back to inferring the instance from its own UIDs next time.
-    if let Err(error) = store.ensure_data_instance_id(instance_id) {
-        tracing::debug!(
-            instance = %instance_id,
-            "could not record the data instance id: {error}"
-        );
-    }
+    record_data_instance(store, instance_id);
     // Capture generation-N derived state before graph publication advances to
     // N+2. Loading it after the graph commit would correctly reject it as
     // stale and, historically, `unwrap_or_default` then discarded every other
@@ -2653,6 +2679,8 @@ where
     // scan/parse/collection so worker threads can fan out expensive parsing and
     // only serialize LadybugDB writes.
     let r_uid = repo_uid(instance_id, repo_url);
+    // The funnel the CLI index actually reaches (nw-246).
+    record_data_instance(store, instance_id);
 
     // Re-identify detection MUST happen before the scan/parse phases: the
     // filemeta sidecar was recorded when this working tree's graph rows
