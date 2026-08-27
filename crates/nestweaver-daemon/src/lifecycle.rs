@@ -4689,4 +4689,138 @@ mod tests {
             assert!(fb.exists());
         });
     }
+
+    /// nw-245: `EFFECTIVE_CONFIG_BINDING_MAX_BYTES` is `64 * 1024`. Turning
+    /// that `*` into a `+` yields 1088 — still large enough for every small
+    /// record the other tests write, so nothing noticed. Pin the ceiling from
+    /// both sides at literal sizes chosen so multiplication and addition
+    /// disagree: an 8 KiB record must be ACCEPTED (1088 would reject it), and
+    /// an oversize record must report the real 65536 limit back to the caller.
+    #[test]
+    fn effective_config_binding_ceiling_accepts_eight_kib_and_reports_sixty_four_kib() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let binding =
+                EffectiveConfigBinding::new(4242, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding("padded", &binding).unwrap();
+            let path = effective_config_binding_path("padded");
+
+            // Trailing whitespace keeps the payload valid JSON, so the only
+            // thing 8 KiB changes is whether the size gate lets it through.
+            let mut bytes = serde_json::to_vec(&binding).unwrap();
+            assert!(
+                bytes.len() < 8192,
+                "the unpadded record must be smaller than the padding target"
+            );
+            bytes.resize(8192, b' ');
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+
+            let read_back = read_effective_config_binding("padded").unwrap_or_else(|error| {
+                panic!(
+                    "an 8192-byte binding is under the 64 KiB ceiling and must be read back, \
+                     got {error}"
+                )
+            });
+            assert_eq!(read_back, binding);
+
+            // The ceiling the reader hands back must be the real one. A `+`
+            // mutant would surface 1088 here.
+            std::fs::write(&path, vec![b' '; 70_000]).unwrap();
+            match read_effective_config_binding("padded") {
+                Err(EffectiveConfigBindingError::TooLarge { size, max, .. }) => {
+                    assert_eq!(size, 70_000);
+                    assert_eq!(max, 65_536, "the binding ceiling must be 64 * 1024");
+                }
+                other => panic!("expected TooLarge for a 70000-byte binding, got {other:?}"),
+            }
+        });
+    }
+
+    /// nw-245: same arithmetic mutant on `LAST_SUCCESSFUL_CONFIG_MAX_BYTES`.
+    /// `64 + 1024` = 1088 still round-trips the tiny records the existing
+    /// tests write, and the existing oversize test sizes its payload FROM the
+    /// constant, so it moves with the mutation. Use literal sizes instead.
+    #[test]
+    fn last_successful_config_ceiling_accepts_eight_kib_and_reports_sixty_four_kib() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let db = temp.path().join("brain.lbug");
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+            let record = write_last_successful_config(&db, &config).unwrap();
+            let path = last_successful_config_path(&db);
+
+            let mut bytes = serde_json::to_vec(&record).unwrap();
+            assert!(
+                bytes.len() < 8192,
+                "the unpadded record must be smaller than the padding target"
+            );
+            bytes.resize(8192, b' ');
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+
+            let read_back = read_last_successful_config(&db).unwrap_or_else(|error| {
+                panic!(
+                    "an 8192-byte record is under the 64 KiB ceiling and must be read back, \
+                     got {error}"
+                )
+            });
+            assert_eq!(read_back, record);
+
+            std::fs::write(&path, vec![b' '; 70_000]).unwrap();
+            match read_last_successful_config(&db) {
+                Err(LastSuccessfulConfigError::TooLarge { size, max, .. }) => {
+                    assert_eq!(size, 70_000);
+                    assert_eq!(max, 65_536, "the record ceiling must be 64 * 1024");
+                }
+                other => panic!("expected TooLarge for a 70000-byte record, got {other:?}"),
+            }
+        });
+    }
+
+    /// nw-245: `mark_verified_nestweaver_managed_start`,
+    /// `clear_verified_nestweaver_managed_start`, and
+    /// `is_verified_nestweaver_managed_start` are the whole gate behind the
+    /// `DaemonLifecycleOwner` a daemon publishes (`server.rs`). Nothing
+    /// observed the marker, so gutting `mark`/`clear` into `()` — or pinning
+    /// the reader to `false`, which downgrades EVERY daemon to
+    /// `ExternalOrUnknown` — changed real behaviour with the suite still
+    /// green. Observe the effect: set, read back, clear, read back.
+    ///
+    /// Holds `ENV_LOCK` because the marker is process-global and `server.rs`'s
+    /// in-process daemon e2e tests read it while they run under the same lock.
+    #[test]
+    fn verified_nestweaver_managed_start_marker_sets_clears_and_reads_back() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = is_verified_nestweaver_managed_start();
+
+        clear_verified_nestweaver_managed_start();
+        assert!(
+            !is_verified_nestweaver_managed_start(),
+            "an unmarked process must not claim a NestWeaver-managed start"
+        );
+
+        mark_verified_nestweaver_managed_start();
+        assert!(
+            is_verified_nestweaver_managed_start(),
+            "marking the managed start must be observable; otherwise every daemon \
+             publishes DaemonLifecycleOwner::ExternalOrUnknown"
+        );
+
+        // A second mark must stay idempotent rather than toggling.
+        mark_verified_nestweaver_managed_start();
+        assert!(is_verified_nestweaver_managed_start());
+
+        clear_verified_nestweaver_managed_start();
+        assert!(
+            !is_verified_nestweaver_managed_start(),
+            "clearing the marker must be observable; otherwise a failed spawn \
+             leaves the daemon falsely claiming NestWeaver management"
+        );
+
+        if previous {
+            mark_verified_nestweaver_managed_start();
+        }
+    }
 }

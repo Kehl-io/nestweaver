@@ -682,6 +682,19 @@ jobs:
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Backstop only. The mutation run bounds itself with `timeout` (see the
+    # "Mutate only what this PR changed" step) so that the reporting steps
+    # still run and can DISCLOSE a truncated run. This job-level limit exists
+    # for everything the wrapper can't cover — a wedged apt/cargo install, a
+    # hung cache restore. Cancelling the job here skips the disclosure, so it
+    # is set well above the mutation budget and should never be what fires.
+    #
+    # Nothing bounded total runtime before: `--timeout` is PER CARGO COMMAND,
+    # not per job. On PR #319 this job ran 2h04m without finishing (~5m was
+    # the norm) and was still holding a runner. With one shared runner pool
+    # that is head-of-line blocking for every other PR — see the `concurrency`
+    # note at the top of this file.
+    timeout-minutes: 55
     steps:
       - name: Free disk space
         run: |
@@ -711,31 +724,143 @@ jobs:
       - name: Compute the PR diff
         run: git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
       - name: Mutate only what this PR changed
-        # A timeout because an unkilled mutant can hang a test that would
-        # otherwise exit; without it one pathological mutant stalls the job.
+        id: mutate
+        # `--workspace` is load-bearing. This repo's root Cargo.toml is BOTH a
+        # [workspace] and a [package], so cargo-mutants defaults to the root
+        # package alone — src/main.rs and src/setup.rs. Measured: `--list`
+        # emitted 2065 mutants, every one of them in those two files, and not
+        # one of the 15 library crates (where essentially all the logic lives)
+        # had ever been mutated. On one PR's diff that was 1 mutant instead of
+        # 3; across a release, 96 instead of 572. Every "No surviving mutants
+        # in this diff" this job printed was therefore uninformative — the same
+        # manifest shape the Coverage job already works around with --workspace.
+        #
+        # `--timeout 300` bounds ONE cargo command, not the job: an unkilled
+        # mutant can hang a test that would otherwise exit, and without it one
+        # pathological mutant stalls everything. It says nothing about total
+        # runtime, and cargo-mutants (27.x) has no total-time flag — `--help`
+        # offers only per-command `--timeout`/`--build-timeout` and `--shard`.
+        # So the budget is enforced here with `timeout`, chosen over sharding
+        # (a shard matrix multiplies runners and cold builds for an advisory
+        # job) and over a mutant cap (which would silently drop mutants with no
+        # wall-clock guarantee anyway).
+        #
+        # SIGINT rather than SIGKILL so cargo-mutants shuts down cleanly and
+        # mutants.out/ keeps the results it had already written; --kill-after
+        # covers a process that ignores the interrupt. The exit status is
+        # recorded instead of swallowed by `|| true`, because the next step has
+        # to be able to tell a clean run from a cut-short one.
+        #
         # NESTWEAVER_NO_DAEMON keeps each run hermetic — cargo-mutants requires
         # non-flaky tests, and a shared daemon would make results
         # irreproducible.
+        #
+        # Not using `-j`: each parallel job needs its own copy of the tree and
+        # target dir, and disk (see "Free disk space") is the binding
+        # constraint on this runner, not CPU.
         run: |
-          cargo mutants --in-diff /tmp/pr.diff --timeout 300 --no-shuffle -- --no-fail-fast || true
+          set +e
+          timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
+            cargo mutants --workspace --in-diff /tmp/pr.diff \
+              --timeout 300 --no-shuffle -- --no-fail-fast
+          status=$?
+          set -e
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          # GNU timeout reports 124 when it had to interrupt, 137 when the
+          # --kill-after SIGKILL was needed.
+          if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Mutation testing hit its ${MUTANTS_BUDGET} budget and was cut short; the mutant list is partial."
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Advisory job: surviving mutants (2), timeouts (3) and unviable
+          # mutants (4) are findings to report, not build failures.
+          exit 0
         env:
+          # Deliberately shorter than the job's timeout-minutes so this wrapper,
+          # not the runner, is what stops a long run — the difference is the
+          # headroom the reporting steps need.
+          MUTANTS_BUDGET: 35m
           NESTWEAVER_NO_DAEMON: "1"
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
       - name: Surviving mutants (read these — each one is a test that cannot fail)
         if: always()
+        # An absent signal and a clean signal MUST NOT look the same. A run that
+        # stopped early, or never ran at all, reports that in place of the
+        # all-clear — it never gets to print "No surviving mutants".
+        env:
+          TRUNCATED: ${{ steps.mutate.outputs.truncated }}
+          MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
         run: |
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # How far did it actually get? Every mutant that produced a verdict
+          # lands in exactly one of these files; mutants.json is the full list
+          # generated up front.
+          tested=0
+          for f in caught missed timeout unviable; do
+            if [ -f "mutants.out/${f}.txt" ]; then
+              tested=$(( tested + $(wc -l < "mutants.out/${f}.txt") ))
+            fi
+          done
+          total=""
+          if [ -f mutants.out/mutants.json ]; then
+            total=$(jq 'length' mutants.out/mutants.json 2>/dev/null || echo "")
+          fi
+          progress="${tested} mutants"
+          if [ -n "${total}" ]; then
+            progress="${tested} of ${total} mutants"
+          fi
+
+          summary "## Mutation testing (advisory)"
+          summary ""
+
+          incomplete=false
+          if [ "${TRUNCATED}" = "true" ]; then
+            incomplete=true
+            summary "> [!WARNING]"
+            summary "> **TRUNCATED — this run hit its time budget and did not finish.**"
+            summary "> It got through **${progress}** before being stopped."
+            summary "> The list below is PARTIAL. A mutant missing from it was not"
+            summary "> killed — it was never reached. Do not read this as an all-clear."
+            summary ""
+          elif [ ! -d mutants.out ]; then
+            incomplete=true
+            summary "> [!WARNING]"
+            summary "> **cargo-mutants produced no report** (exit status \`${MUTANTS_STATUS:-unknown}\`)."
+            summary "> Nothing was mutated. This is a missing result, not a passing one."
+            summary ""
+          elif [ "${MUTANTS_STATUS}" = "1" ]; then
+            incomplete=true
+            summary "> [!WARNING]"
+            summary "> **cargo-mutants exited with an error** (status 1) — the run did not"
+            summary "> complete normally. Treat any list below as partial."
+            summary ""
+          fi
+
           if [ -s mutants.out/missed.txt ]; then
-            echo "### Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Each line is a change to this PR's code that NO test noticed." >> "$GITHUB_STEP_SUMMARY"
-            echo "That is not automatically a defect — but it is a test that would" >> "$GITHUB_STEP_SUMMARY"
-            echo "not have caught the bug it appears to guard." >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            summary "### Surviving mutants"
+            summary ""
+            summary "Each line is a change to this PR's code that NO test noticed."
+            summary "That is not automatically a defect — but it is a test that would"
+            summary "not have caught the bug it appears to guard."
+            summary ""
+            summary '```'
             cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            summary '```'
+          elif [ "${incomplete}" = "true" ]; then
+            if [ "${tested}" -eq 0 ]; then
+              summary "**No mutants were tested at all.** There is no result here to read."
+            else
+              summary "No surviving mutants among the ones this run did reach (${progress})."
+              summary "The rest were not tested."
+            fi
+          elif [ "${tested}" -eq 0 ]; then
+            # Not a pass and not a failure: the diff touched nothing mutable.
+            summary "This PR's diff generated no mutants — nothing in it was mutable."
           else
-            echo "No surviving mutants in this diff." >> "$GITHUB_STEP_SUMMARY"
+            summary "No surviving mutants in this diff (${progress} tested)."
           fi
       - name: Upload mutants report
         if: always()

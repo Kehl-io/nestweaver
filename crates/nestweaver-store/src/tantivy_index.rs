@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Collector, SegmentCollector, TopDocs};
+use tantivy::directory::error::LockError;
+use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory};
 use tantivy::query::{Query, QueryParser};
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::store::StoreReader;
@@ -447,9 +449,20 @@ impl TantivyIndex {
     /// returned instance will return `TantivyError::WriterUnavailable`.
     ///
     /// Returns `Err` if the index directory does not exist or is corrupt.
+    ///
+    /// This open is strictly **non-destructive**. It runs in every CLI, MCP
+    /// and web process and holds no lock, so it must never perform the
+    /// rename/delete recovery in [`recover_interrupted_reindex`]: an
+    /// in-flight [`Self::rebuild_current_schema_atomically`] leaves exactly
+    /// the same on-disk shape (target absent, recovery copy present) between
+    /// its two renames, and "recovering" it from here consumes the copy the
+    /// migration is about to roll back to, or removes the copy it is about to
+    /// retire itself. When an interrupted migration is visible this serves
+    /// whichever of the two directories is a readable index and leaves both
+    /// in place; a writer route repairs the state later, under a lock.
     pub fn open_reader_only(path: &Path) -> Result<Self, TantivyError> {
-        recover_interrupted_reindex(path)?;
-        let index = Index::open_in_dir(path)?;
+        let resolved = resolve_read_only_index_path(path);
+        let index = Index::open_in_dir(&resolved)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -461,7 +474,7 @@ impl TantivyIndex {
             reader,
             writer: None,
             fields: schema.fields,
-            path: path.to_path_buf(),
+            path: resolved,
             counted_search_supported: schema.current,
             migration_completed: AtomicBool::new(false),
         })
@@ -545,6 +558,27 @@ impl TantivyIndex {
             ));
         }
         drop(verification);
+
+        // Everything from here to the final `remove_dir_all(&backup)` mutates
+        // whole directories, and between the two renames below the target is
+        // absent while the recovery copy exists. Hold the recovery lock across
+        // that whole window so a concurrent opener's
+        // `recover_interrupted_reindex` cannot restore the backup over this
+        // migration or retire it out from under the cleanup at the end.
+        //
+        // Tantivy's own `INDEX_WRITER_LOCK` cannot cover this: it lives at
+        // `<index>/.tantivy-writer.lock`, so it travels with the directory the
+        // first rename moves aside and stops excluding anything.
+        let _recovery_guard = match try_acquire_reindex_lock(&self.path)? {
+            Some(guard) => guard,
+            None => {
+                return Err(TantivyError::Io(format!(
+                    "index recovery or migration is already in progress for {}; \
+                     retry shortly",
+                    self.path.display()
+                )));
+            }
+        };
 
         let backup = reindex_backup_path(&self.path);
         if backup.exists() {
@@ -1432,8 +1466,108 @@ fn reindex_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
+/// Name of the exclusive lock that serialises destructive index recovery
+/// against an in-flight schema migration.
+///
+/// It deliberately lives in the index directory's **parent**. The migration
+/// renames the index directory itself (`path` -> `path.reindexing`), so a lock
+/// file stored inside `path` would travel with that rename and a second
+/// process would end up locking a different inode — which is precisely why
+/// Tantivy's `INDEX_WRITER_LOCK` cannot be reused here.
+fn reindex_lock_file_name(path: &Path) -> std::ffi::OsString {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("tantivy")),
+    );
+    name.push(".reindex.lock");
+    name
+}
+
+/// Try to take the recovery lock for `path`.
+///
+/// `Ok(None)` means another process or thread already holds it, i.e. a
+/// migration or recovery is in flight and the caller must not touch either
+/// directory. The lock is deliberately **non-blocking**: it is taken on the
+/// index-open path, and a daemon that died holding a blocking lock would
+/// otherwise wedge every subsequent opener.
+fn try_acquire_reindex_lock(path: &Path) -> Result<Option<DirectoryLock>, TantivyError> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)?;
+    let directory = MmapDirectory::open(parent).map_err(|error| {
+        TantivyError::Io(format!(
+            "open index parent {} for recovery lock: {error}",
+            parent.display()
+        ))
+    })?;
+    let lock = Lock {
+        filepath: PathBuf::from(reindex_lock_file_name(path)),
+        is_blocking: false,
+    };
+    match directory.acquire_lock(&lock) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(LockError::LockBusy) => Ok(None),
+        Err(error) => Err(TantivyError::Io(format!(
+            "acquire index recovery lock for {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// True when `path` holds an index this build can open and interpret.
+fn index_is_readable(path: &Path) -> bool {
+    Index::open_in_dir(path)
+        .map_err(TantivyError::from)
+        .and_then(|index| inspect_schema(&index.schema()).map(|_| ()))
+        .is_ok()
+}
+
+/// Decide which directory a read-only open should serve, **without touching
+/// the filesystem**. See [`TantivyIndex::open_reader_only`].
+fn resolve_read_only_index_path(path: &Path) -> PathBuf {
+    let backup = reindex_backup_path(path);
+    if !backup.exists() {
+        return path.to_path_buf();
+    }
+    // An interrupted — or still running — migration is visible. Prefer the
+    // real target when it already holds a usable index (the migration got as
+    // far as installing the replacement), otherwise read through to the
+    // recovery copy. Either way both directories are left exactly as found.
+    if index_is_readable(path) {
+        return path.to_path_buf();
+    }
+    if index_is_readable(&backup) {
+        return backup;
+    }
+    // Neither is usable. Return the real target so the caller surfaces an
+    // error about the index it actually asked for.
+    path.to_path_buf()
+}
+
 fn recover_interrupted_reindex(path: &Path) -> Result<(), TantivyError> {
     let backup = reindex_backup_path(path);
+    if !backup.exists() {
+        return Ok(());
+    }
+
+    // Everything below renames and deletes whole directories, and a concurrent
+    // `rebuild_current_schema_atomically` mutates the same two paths. Between
+    // its two renames the target is absent and the backup present — exactly
+    // the state that drives this function down the restore branch. Serialise
+    // against it, and refuse rather than wait: this runs before the writer is
+    // acquired, on every open.
+    let Some(_guard) = try_acquire_reindex_lock(path)? else {
+        return Err(TantivyError::Io(format!(
+            "index recovery or migration is already in progress for {}; retry shortly",
+            path.display()
+        )));
+    };
+
+    // Re-read the state under the lock: the previous holder may have finished
+    // between the probe above and the acquisition.
     if !backup.exists() {
         return Ok(());
     }
@@ -2227,11 +2361,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interrupted_schema_migration_recovers_the_rename_aside_copy() {
-        let root = tempdir().unwrap();
-        let index_path = root.path().join("search-index");
-        let idx = TantivyIndex::open_or_create(&index_path).unwrap();
+    /// Seed `index_path` with one searchable note and close the handle.
+    fn seed_recoverable_index(index_path: &Path) {
+        let idx = TantivyIndex::open_or_create(index_path).unwrap();
         idx.update_note(
             "note:recover",
             "Payment Recovery",
@@ -2243,20 +2375,149 @@ mod tests {
         )
         .unwrap();
         drop(idx);
+    }
+
+    #[test]
+    fn interrupted_schema_migration_recovers_the_rename_aside_copy() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        seed_recoverable_index(&index_path);
 
         let recovery_path = reindex_backup_path(&index_path);
         std::fs::rename(&index_path, &recovery_path).unwrap();
-        let reopened = TantivyIndex::open_reader_only(&index_path).unwrap();
+        // Recovery is a writer-route responsibility (nw-254): only the path
+        // that can take the recovery lock is allowed to mutate these dirs.
+        let reopened = TantivyIndex::open_or_create(&index_path).unwrap();
         assert_eq!(reopened.search("payment", 10).unwrap().len(), 1);
         assert!(index_path.exists());
         assert!(!recovery_path.exists());
     }
 
+    /// nw-254: `open_reader_only` runs in every CLI/MCP process and takes no
+    /// lock. The state it sees here — target absent, recovery copy present —
+    /// is also what a *live* writer exposes between its two renames, so
+    /// "recovering" it would consume the directory that writer is about to
+    /// roll back to. A read-only open must serve the data and mutate nothing.
     #[test]
-    fn failed_schema_migration_leaves_the_old_index_usable() {
+    fn read_only_open_never_mutates_an_interrupted_migration() {
         let root = tempdir().unwrap();
         let index_path = root.path().join("search-index");
-        std::fs::create_dir(&index_path).unwrap();
+        seed_recoverable_index(&index_path);
+
+        let recovery_path = reindex_backup_path(&index_path);
+        std::fs::rename(&index_path, &recovery_path).unwrap();
+
+        let reader = TantivyIndex::open_reader_only(&index_path).unwrap();
+        assert_eq!(
+            reader.search("payment", 10).unwrap().len(),
+            1,
+            "read-only open should read through to the recovery copy"
+        );
+        assert!(
+            recovery_path.exists(),
+            "read-only open consumed the recovery copy a live migration owns"
+        );
+        assert!(
+            !index_path.exists(),
+            "read-only open restored the index directory a live migration owns"
+        );
+    }
+
+    /// The other interrupted shape: the replacement is already installed and
+    /// only the retirement of the old copy is outstanding. A reader must not
+    /// perform that retirement either — the migrating writer removes the very
+    /// same directory itself and would report a bogus failure on NotFound.
+    #[test]
+    fn read_only_open_leaves_a_pending_recovery_copy_in_place() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        seed_recoverable_index(&index_path);
+        let recovery_path = reindex_backup_path(&index_path);
+        seed_recoverable_index(&recovery_path);
+
+        let reader = TantivyIndex::open_reader_only(&index_path).unwrap();
+        assert_eq!(reader.search("payment", 10).unwrap().len(), 1);
+        assert!(
+            recovery_path.exists(),
+            "read-only open retired a recovery copy the migrating writer still owns"
+        );
+    }
+
+    /// The writer route may still recover, but only under the recovery lock.
+    /// While a migration holds that lock the opener must refuse outright: it
+    /// must neither restore the backup nor fabricate a fresh empty index at
+    /// the target the migration is about to rename its staging dir onto.
+    #[test]
+    fn open_or_create_refuses_recovery_while_the_reindex_lock_is_held() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        seed_recoverable_index(&index_path);
+
+        let recovery_path = reindex_backup_path(&index_path);
+        std::fs::rename(&index_path, &recovery_path).unwrap();
+
+        let held = try_acquire_reindex_lock(&index_path)
+            .unwrap()
+            .expect("recovery lock should be free");
+
+        let error = match TantivyIndex::open_or_create(&index_path) {
+            Ok(_) => panic!("open_or_create recovered while the lock was held"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            recovery_path.exists(),
+            "recovery copy consumed while a migration held the lock"
+        );
+        assert!(
+            !index_path.exists(),
+            "empty index fabricated at the target while a migration held the lock"
+        );
+
+        // Releasing the lock must restore normal recovery, so the refusal
+        // above is genuinely gated on the lock and not a permanent breakage.
+        drop(held);
+        let recovered = TantivyIndex::open_or_create(&index_path).unwrap();
+        assert_eq!(recovered.search("payment", 10).unwrap().len(), 1);
+        assert!(index_path.exists());
+        assert!(!recovery_path.exists());
+    }
+
+    /// Symmetric guard on the migration itself: it must not start its rename
+    /// sequence while someone else holds the recovery lock.
+    #[test]
+    fn schema_migration_refuses_while_the_reindex_lock_is_held() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        write_legacy_schema_index(&index_path);
+
+        let legacy = TantivyIndex::open_or_create(&index_path).unwrap();
+        let held = try_acquire_reindex_lock(&index_path)
+            .unwrap()
+            .expect("recovery lock should be free");
+
+        let error = legacy
+            .reindex_from_store(&GraphStore::in_memory().unwrap())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !reindex_backup_path(&index_path).exists(),
+            "migration moved the index aside despite a held recovery lock"
+        );
+        assert_eq!(legacy.search("payment", 10).unwrap().len(), 1);
+        drop(held);
+    }
+
+    /// Build an index at `index_path` whose schema predates the stored
+    /// `note_uid` field, i.e. one `reindex_from_store` must migrate.
+    fn write_legacy_schema_index(index_path: &Path) {
+        std::fs::create_dir_all(index_path).unwrap();
         let mut schema_builder = Schema::builder();
         let uid = schema_builder.add_text_field("uid", STRING | STORED);
         let kind = schema_builder.add_text_field("kind", STRING | STORED);
@@ -2264,7 +2525,7 @@ mod tests {
         let body = schema_builder.add_text_field("body", TEXT);
         let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
         let note_uid = schema_builder.add_text_field("note_uid", STRING);
-        let index = Index::create_in_dir(&index_path, schema_builder.build()).unwrap();
+        let index = Index::create_in_dir(index_path, schema_builder.build()).unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
         writer
             .add_document(doc!(
@@ -2279,6 +2540,13 @@ mod tests {
         writer.commit().unwrap();
         drop(writer);
         drop(index);
+    }
+
+    #[test]
+    fn failed_schema_migration_leaves_the_old_index_usable() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        write_legacy_schema_index(&index_path);
 
         let legacy = TantivyIndex::open_or_create(&index_path).unwrap();
         let recovery_path = reindex_backup_path(&index_path);
