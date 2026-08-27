@@ -446,11 +446,31 @@ fn extensions_list_fails_loudly_on_an_unreadable_sidecar() {
     )
     .unwrap();
 
-    nestweaver_cmd()
+    let output = nestweaver_cmd()
         .args(["extensions", "list", "--db", &db_path.display().to_string()])
-        .assert()
-        .failure()
-        .stdout(contains("0 annotated node(s)").not());
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a sidecar that cannot be parsed must fail the audit, not be reported \
+         as an empty one"
+    );
+    // Asserted POSITIVELY. `.stdout(contains("0 annotated node(s)").not())`
+    // was the obvious way to write this and is the wrong one: a negative
+    // substring check passes for every reason a string can be absent,
+    // including a rendering change or a line wrap, so it would keep passing
+    // after the fix was undone in some other way.
+    let stderr = flatten_miette(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("extension sidecar"),
+        "the failure must name the sidecar as the thing it could not read:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("annotated node"),
+        "an unreadable sidecar must not also print a count as though it had \
+         looked:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// nw-244: PR #307 taught `brain remove` to honour `--config` like its two
@@ -528,16 +548,35 @@ credential_method = "gh"
         db_path.display()
     );
 
-    nestweaver_cmd()
+    let refused = nestweaver_cmd()
         .current_dir(&unrelated_cwd)
         .env_remove("NESTWEAVER_DB")
         .args(["brain", "remove"])
         .arg(&vault_dir)
         .arg("--config")
         .arg(&config_path)
-        .assert()
-        .failure()
-        .stderr(contains("cannot be honored by the direct store"));
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "`brain remove --config` must not silently succeed against some other \
+         instance; that is the nw-217 defect"
+    );
+    let stderr = flatten_miette(&refused.stderr);
+    assert!(
+        stderr.contains("cannot be honored by the direct store"),
+        "the refusal must say WHY, and name the config it could not honour — \
+         a bare non-zero exit leaves the caller guessing:\n{stderr}"
+    );
+    // Compared with ALL whitespace removed, on both sides: miette breaks the
+    // line wherever the width runs out, and on a long macOS
+    // `/var/folders/...` temp path that break lands INSIDE the path itself.
+    // Any check that tolerates wrapping only between words still fails there.
+    let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    assert!(
+        squeeze(&stderr).contains(&squeeze(&config_path.display().to_string())),
+        "the refusal must name the config path it could not honour:\n{stderr}"
+    );
 
     // The counterweight: the very same removal, addressed without a config,
     // succeeds. Without this the refusal above would be indistinguishable from
@@ -3426,6 +3465,22 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .assert()
         .failure()
         .stderr(contains("colon"));
+}
+
+/// Flatten miette's rendered diagnostic into a single line.
+///
+/// miette hard-wraps a message to the terminal width and prefixes continuation
+/// lines with `\u{2502}`, so a `contains("...")` on any phrase long enough to
+/// span the wrap is really an assertion about the WIDTH — and the width here
+/// depends on the length of the temp path, which differs between a macOS
+/// `/var/folders/...` and a Linux `/tmp/...`. CI caught exactly that: the
+/// message was correct and the assertion still failed.
+fn flatten_miette(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn toml_basic_string(path: &std::path::Path) -> String {
