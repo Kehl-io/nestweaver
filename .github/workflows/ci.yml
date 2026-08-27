@@ -760,8 +760,36 @@ jobs:
         # constraint on this runner, not CPU.
         run: |
           set +e
+          # nw-272: mutate the packages this DIFF touches, not the whole
+          # workspace. `--workspace` (nw-243) made cargo-mutants build and run
+          # every crate's test suite as its BASELINE before evaluating a single
+          # mutant, and on a 15-crate workspace that alone exceeds the budget:
+          # on #322 and #323 it found 53 and 110 mutants and tested ZERO, each
+          # time burning the full 35m on the baseline and reporting a green
+          # advisory check. nw-243's intent was that library crates be
+          # REACHABLE — not that the workspace be rebuilt every run.
+          #
+          # `--in-diff` already restricts which mutants are GENERATED; `-p`
+          # restricts what gets BUILT and baselined, which is the expensive half.
+          pkgs=$(git diff --name-only "origin/${GITHUB_BASE_REF}"...HEAD \
+            | awk -F/ '/^crates\/[^\/]+\// { print $2 } /^(src|build\.rs)/ { print "nestweaver" }' \
+            | sort -u)
+          if [ -z "${pkgs}" ]; then
+            echo "no Rust package in this diff; nothing to mutate"
+            {
+              echo "status=0"
+              echo "truncated=false"
+              echo "no_packages=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pkg_args=""
+          for p in ${pkgs}; do pkg_args="${pkg_args} -p ${p}"; done
+          echo "mutating packages:${pkg_args}"
+          # shellcheck disable=SC2086  # word splitting is the point: pkg_args
+          # is a flat "-p a -p b" list and must expand to separate argv entries.
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
-            cargo mutants --workspace --in-diff /tmp/pr.diff \
+            cargo mutants ${pkg_args} --in-diff /tmp/pr.diff \
               --timeout 300 --no-shuffle -- --no-fail-fast
           status=$?
           set -e
@@ -770,7 +798,10 @@ jobs:
           # --kill-after SIGKILL was needed.
           if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
             echo "truncated=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Mutation testing hit its ${MUTANTS_BUDGET} budget and was cut short; the mutant list is partial."
+            # NOT "partial" — a run cut short during the baseline tests ZERO
+            # mutants, and "partial" reads identically whether it reached 80 or
+            # none. The job summary carries the real count.
+            echo "::warning::Mutation testing hit its ${MUTANTS_BUDGET} budget and was cut short. It may have tested NO mutants at all — read the job summary for how far it actually got before treating this as a clean result."
           else
             echo "truncated=false" >> "$GITHUB_OUTPUT"
           fi
@@ -791,9 +822,20 @@ jobs:
         # all-clear — it never gets to print "No surviving mutants".
         env:
           TRUNCATED: ${{ steps.mutate.outputs.truncated }}
+          NO_PACKAGES: ${{ steps.mutate.outputs.no_packages }}
           MUTANTS_STATUS: ${{ steps.mutate.outputs.status }}
         run: |
           summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # nw-272: no Rust package in the diff is legitimately nothing to do —
+          # distinct from "the report is missing", which the branch below treats
+          # as a non-result. Saying the wrong one of those is the whole defect
+          # this job keeps re-learning.
+          if [ "${NO_PACKAGES}" = "true" ]; then
+            summary "### Mutation testing"
+            summary "No Rust package in this diff, so no mutants were generated. Nothing to report."
+            exit 0
+          fi
 
           # How far did it actually get? Every mutant that produced a verdict
           # lands in exactly one of these files; mutants.json is the full list
