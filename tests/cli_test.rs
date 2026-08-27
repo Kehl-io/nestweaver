@@ -250,6 +250,106 @@ url = "{}"
     assert_eq!(entries, vec![std::ffi::OsString::from("instance.toml")]);
 }
 
+/// nw-244: PR #307 taught `brain remove` to honour `--config` like its two
+/// sibling vault commands, but both of its guards stop at clap — one asserts
+/// the flag is *accepted*, the other that it lands in the parsed struct.
+/// Reverting the resolution itself leaves the flag parsing perfectly and the
+/// whole suite green, which is precisely the nw-217 bug returning: the command
+/// silently targets instance "default" and `./nestweaver.lbug`.
+///
+/// The behaviour that actually closes that hole is a REFUSAL. The direct
+/// (no-daemon) store cannot honour a pinned instance config, so rather than
+/// quietly acting on some other instance, `brain remove --config` fails and
+/// names the config it could not honour. Silence is the defect; the error is
+/// the fix.
+///
+/// Both halves are asserted, because the refusal alone would also be satisfied
+/// by a command that is simply broken: with the same vault and the same store
+/// addressed by `--db` instead, the remove must succeed.
+#[test]
+fn brain_remove_refuses_a_pinned_config_it_cannot_honor_rather_than_silently_defaulting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("configured.lbug");
+    let vault_dir = dir.path().join("vault");
+    std::fs::create_dir(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Note\n\nBody.\n").unwrap();
+
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"instance_id = "vault-config-parity"
+db = "{}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/vault-config-parity/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/vault-config-parity/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            toml_basic_string(&db_path),
+        ),
+    )
+    .unwrap();
+
+    // Run from somewhere that is neither the configured DB's directory nor the
+    // repository, so a fallback to `./nestweaver.lbug` cannot make anything
+    // pass by accident.
+    let unrelated_cwd = dir.path().join("unrelated-cwd");
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success();
+    assert!(
+        db_path.exists(),
+        "`brain add --config` must have created the database the config names, \
+         at {}; it went somewhere else",
+        db_path.display()
+    );
+
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "remove"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(contains("cannot be honored by the direct store"));
+
+    // The counterweight: the very same removal, addressed without a config,
+    // succeeds. Without this the refusal above would be indistinguishable from
+    // a `brain remove` that cannot remove anything at all.
+    nestweaver_cmd()
+        .current_dir(&unrelated_cwd)
+        .env_remove("NESTWEAVER_DB")
+        .args(["brain", "remove"])
+        .arg(&vault_dir)
+        .args(["--db", &db_path.display().to_string()])
+        .args(["--instance", "vault-config-parity"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn commands_honor_database_declared_by_config() {
     let dir = tempfile::tempdir().unwrap();

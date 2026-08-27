@@ -17898,6 +17898,60 @@ external_model = "unavailable-test-model"
         drop(gate);
     }
 
+    /// nw-244: PR #308 wired `brain_memory_consolidate` to the write gate ONLY
+    /// when `apply: true`. The existing guards test `request_is_applying` as a
+    /// pure function, so the *wiring* was unasserted: replacing the call site
+    /// with `let applying = false;` left the whole suite green while every
+    /// file-moving consolidation ran ungated and invisible to the shutdown
+    /// drain.
+    ///
+    /// Probed like `set_extension_holds_write_gate`, but in BOTH directions —
+    /// the gating is conditional, so one direction alone cannot pin it:
+    /// `apply: true` must block on a held gate, and `apply: false` (a pure
+    /// dry-run) must NOT, because making the common preview call queue behind
+    /// a minutes-long drain is the regression the conditional exists to avoid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_applying_memory_consolidate_blocks_on_the_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_gate.mutex().lock_owned().await;
+
+        let applying = {
+            let mut req = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "apply": true }).to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                service.brain_memory_consolidate(req),
+            )
+            .await
+        };
+        assert!(
+            applying.is_err(),
+            "an APPLYING memory consolidate moves vault files and must block on              the write gate while it is held; it returned without waiting"
+        );
+
+        let preview = {
+            let mut req = Request::new(JsonRequest {
+                args_json: serde_json::json!({ "apply": false }).to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                service.brain_memory_consolidate(req),
+            )
+            .await
+        };
+        assert!(
+            preview.is_ok(),
+            "a DRY-RUN memory consolidate touches nothing and must NOT queue              behind the write gate; it blocked"
+        );
+
+        drop(gate);
+    }
+
     /// T6.2: the Shutdown RPC MUST set `state.drained` synchronously — before
     /// it spawns the drain wait loop — so the worker pool STOPS CLAIMING new
     /// jobs the instant shutdown begins. Otherwise, under continuous webhook
