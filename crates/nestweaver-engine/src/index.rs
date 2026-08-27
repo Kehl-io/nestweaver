@@ -2179,6 +2179,22 @@ fn index_directory_with_store_inner(
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
+    // nw-246: record the instance this database's data belongs to, once.
+    //
+    // This is the funnel every repo index passes through, so it is where the
+    // database's identity gets established. `ensure_data_instance_id` never
+    // replaces an existing value — a database that already knows its instance
+    // keeps it, and the CLI resolver refuses a disagreeing request before
+    // reaching here.
+    //
+    // Best-effort: a store that cannot record it still indexes correctly, it
+    // just falls back to inferring the instance from its own UIDs next time.
+    if let Err(error) = store.ensure_data_instance_id(instance_id) {
+        tracing::debug!(
+            instance = %instance_id,
+            "could not record the data instance id: {error}"
+        );
+    }
     // Capture generation-N derived state before graph publication advances to
     // N+2. Loading it after the graph commit would correctly reject it as
     // stale and, historically, `unwrap_or_default` then discarded every other

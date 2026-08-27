@@ -5499,6 +5499,74 @@ fn explicit_instance_id(flag: Option<&str>, config: Option<&Path>) -> Option<Str
         .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
 }
 
+/// Resolve the instance for a command that touches `db_path`, consulting the
+/// DATABASE when — and only when — the caller did not name one.
+///
+/// nw-246. The defect was a SILENT fork: a config-less `nestweaver index`
+/// resolved the instance from ambient inputs (a db-path hash in 7.0.0, the
+/// literal `"default"` in 8.0.0), so changing that derivation re-identified
+/// existing data with no user intent and no warning. Two repo rows for one
+/// path, two UIDs per symbol with an identical `canonical_id`, `stale-check`
+/// permanently non-zero, and `prune-stale` unable to clean it.
+///
+/// The guard is therefore scoped to the INFERRED case. Naming an instance —
+/// with `--instance` or a `--config` — is a deliberate act, and a database
+/// holding several instances is a SUPPORTED configuration that config
+/// switching manages, not a damage state. The daemon implements exactly that
+/// (`resolve_effective_instance_id`, the per-RPC override) and
+/// `daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown`
+/// pins it: same database, restarted under a second config, new repos landing
+/// under the new instance. An unconditional guard would have retired that
+/// capability while claiming only to stop accidental forks.
+///
+/// Precedence when nothing was stated is etcd's: consult the store first, and
+/// fall back to ambient inputs only when it has nothing to say.
+fn resolve_instance_id_for_db(
+    flag: Option<String>,
+    config: Option<&Path>,
+    db_path: &Path,
+) -> anyhow::Result<String> {
+    let stated = explicit_instance_id(flag.as_deref(), config).is_some();
+    let ambient = resolve_instance_id(flag, config)?;
+
+    // Stated intent passes through untouched.
+    if stated {
+        return Ok(ambient);
+    }
+    // A database that does not exist yet cannot have an opinion.
+    if !db_path.exists() {
+        return Ok(ambient);
+    }
+    let Ok(store) = nestweaver_store::GraphStore::open_read_only(db_path) else {
+        // Unreadable here is not a verdict — the caller's own open will report
+        // the real error with better context than this helper could.
+        return Ok(ambient);
+    };
+
+    // Recorded identity wins over the ambient default.
+    if let Ok(Some(recorded)) = store.data_instance_id() {
+        return Ok(recorded);
+    }
+
+    // Legacy database with no record: infer from the UIDs already written.
+    match store.observed_instance_ids() {
+        Ok(observed) if observed.len() == 1 => Ok(observed.into_iter().next().unwrap_or(ambient)),
+        // Several instances present and nothing stated. This IS ambiguous —
+        // adopting one at random is how the fork would deepen — so refuse and
+        // name them. Stating an instance resolves it, which is why this arm is
+        // unreachable when the caller named one.
+        Ok(observed) if observed.len() > 1 => anyhow::bail!(
+            "this database holds data under {} instances ({}), and no instance was \
+             specified, so there is no safe default.\n\
+             Name one with `--instance <id>` or a `--config`, or consolidate them with \
+             `nestweaver instance merge --from <one> --to <keep>`.",
+            observed.len(),
+            observed.join(", ")
+        ),
+        _ => Ok(ambient),
+    }
+}
+
 fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> anyhow::Result<String> {
     // nw-047: treat an empty `--instance ""` as unset (not a literal empty
     // instance) so it falls through to the config's `instance_id` / "default".
@@ -12175,7 +12243,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
             // with no --instance stamps symbols under "default" even with the
             // daemon up — an instance mismatch of the nw-019 class).
-            let instance_id = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
@@ -15076,7 +15144,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // treated `--instance ""` as a literal empty instance). Mirrors the
             // daemon path's nw-019 resolution so the no-daemon direct write
             // stamps nodes under the same logical instance the daemon would.
-            let instance_id = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
 
             // Identity: prefer the git origin remote when configured (used
             // only as an identity string — never fetched); fall back to a
@@ -18453,7 +18521,8 @@ fn run_brain(
             // the store open with a bare OS error.
             ensure_db_parent_dir(&db_path)?;
             // nw-019: --instance flag > config's instance_id > "default".
-            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id_owned =
+                resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_id = instance_id_owned.as_str();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -19402,7 +19471,7 @@ fn run_brain(
             });
             // Resolve and validate the same instance precedence as brain add,
             // brain refresh, top-level index, and top-level watch.
-            let instance_id = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_cfg = load_instance_config_opt(config.as_deref());
 
             if let Some(hours) = refresh_wiki_hours {
@@ -19671,7 +19740,7 @@ fn run_brain(
             let explicit = explicit_instance_id(instance.as_deref(), config.as_deref());
             let instance_id = match existing.as_slice() {
                 // Nothing registered here yet — a genuine create.
-                [] => resolve_instance_id(instance, config.as_deref())?,
+                [] => resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?,
                 [(registered, uid)] => match &explicit {
                     // An explicit instance that disagrees with the registration
                     // is a mistake, not an instruction to fork. Name both and
@@ -19895,7 +19964,8 @@ fn run_brain(
             // here is what made this command ignore a config its siblings honour.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let instance_specified = instance.is_some() || config.is_some();
-            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
+            let instance_id_owned =
+                resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_id = instance_id_owned.as_str();
 
             let canonical = abs_for_daemon(&path);

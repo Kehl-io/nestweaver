@@ -143,6 +143,22 @@ to the logical name.
 - `brain add`, `brain watch`, and `brain refresh` all resolve the instance the
   same way (`--instance` flag, then the config's `instance_id`, then
   `"default"`), so a `--config`-driven workflow stays consistent on its own.
+- **A command that names NO instance adopts the one the database already
+  holds**, rather than falling back to `"default"` and writing a second copy
+  (nw-246). This is what makes an upgrade safe: a database indexed under
+  7.0.0's db-path hash keeps that identity when you re-index without a config,
+  instead of forking into two repo rows for one path — with two UIDs per
+  symbol, `stale-check` permanently reporting a repo you just indexed as stale,
+  and `prune-stale` unable to clean it because nothing is actually orphaned.
+  The database records its instance on first write and reports it in
+  `list-repos`.
+- Naming an instance explicitly is still honoured, and a database may hold
+  several. That is a supported configuration — a daemon restarted under a
+  different `--config` writes new rows under the new instance, and
+  `nestweaver instance merge` consolidates them when you want one. What is
+  refused is the *ambiguous* case: an index with no `--instance` and no
+  `--config` against a database that already holds more than one instance,
+  where there is no safe default to pick.
 - `brain refresh` additionally resolves from an **existing registration** for
   that vault root, and prefers it over the `"default"` fallback (nw-098). A
   refresh with no `--instance`/`--config` therefore refreshes the vault that is

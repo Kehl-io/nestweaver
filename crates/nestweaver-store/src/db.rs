@@ -420,6 +420,25 @@ impl PublicationIdentity {
     }
 }
 
+/// The instance the DATA in this database was written under.
+///
+/// nw-246. Instance id is interpolated into every `repo_uid`, `vault_uid` and
+/// `project_uid`, so it is a property OF THE DATA — but it was re-derived from
+/// ambient inputs on every invocation: a db-path hash in 7.0.0, the literal
+/// `"default"` in 8.0.0. Changing the derivation therefore silently
+/// RE-IDENTIFIED existing data, forking a graph in place: two repo rows for one
+/// path, two UIDs per symbol, `stale-check` permanently non-zero, and
+/// `prune-stale` unable to clean it because nothing was actually orphaned.
+///
+/// Storing it is the same shape `PublicationIdentity` already uses for
+/// `brain_uuid` — mint once at creation, keep it in the database, read it
+/// thereafter, refuse on disagreement. That is also the established pattern
+/// outside this codebase: PostgreSQL's `system_identifier`, Terraform's state
+/// `lineage`, Kafka's `cluster.id`, etcd's cluster id. etcd states the
+/// precedence rule most plainly — consult the WAL first, and fall back to
+/// ambient flags ONLY when there is no WAL.
+const DATA_INSTANCE_ID_META_KEY: &str = "instance.data_instance_id";
+
 const BRAIN_UUID_META_KEY: &str = "publication.brain_uuid";
 const PUBLICATION_UUID_META_KEY: &str = "publication.publication_uuid";
 
@@ -2521,6 +2540,111 @@ impl GraphStore {
         Ok(identity)
     }
 
+    /// The instance the data in this database was written under, if recorded.
+    ///
+    /// `None` means a database predating nw-246, or one with no data yet.
+    pub fn data_instance_id(&self) -> Result<Option<String>, StoreError> {
+        let conn = self.conn()?;
+        Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)
+    }
+
+    /// Instance ids actually present in the graph, from the UIDs themselves.
+    ///
+    /// The backfill path for a database that predates nw-246. Its correct
+    /// instance cannot be MINTED the way `brain_uuid` can — the right value is
+    /// already baked into thousands of existing UIDs — so it has to be read
+    /// back out of them.
+    ///
+    /// More than one value means the database is ALREADY forked. That is a
+    /// damage state, not a question with an answer, so callers must refuse
+    /// rather than pick.
+    pub fn observed_instance_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Repo, Vault and Project are the three node kinds whose UIDs carry an
+        // instance. Symbols inherit theirs from the owning repo.
+        for query in [
+            "MATCH (r:Repo) RETURN DISTINCT r.instance_id",
+            "MATCH (v:Vault) RETURN DISTINCT v.instance_id",
+        ] {
+            let Ok(rows) = conn.query(query) else {
+                continue;
+            };
+            for row in rows {
+                if let Ok(value) = crate::read::extract_string(&row, 0)
+                    && !value.trim().is_empty()
+                {
+                    found.insert(value);
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
+    }
+
+    /// Record the instance this database's data belongs to, once.
+    ///
+    /// Mirrors `initialize_publication_identity`: the re-check happens INSIDE
+    /// the write transaction, so two concurrent openers cannot each publish a
+    /// different instance for the same database. An existing value is never
+    /// replaced — it is returned, and a caller proposing a different one is
+    /// told rather than silently overridden.
+    pub fn ensure_data_instance_id(&self, proposed: &str) -> Result<String, StoreError> {
+        let proposed = proposed.trim();
+        if proposed.is_empty() {
+            return Err(StoreError::Query(
+                "refusing to record an empty data instance id".to_string(),
+            ));
+        }
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|error| StoreError::Query(format!("begin data instance id: {error}")))?;
+        let result = (|| match Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)? {
+            Some(existing) => Ok(existing),
+            None => {
+                Self::create_publication_meta_on(&conn, DATA_INSTANCE_ID_META_KEY, proposed)?;
+                Ok(proposed.to_string())
+            }
+        })();
+        match result {
+            Ok(value) => {
+                conn.query("COMMIT").map_err(|error| {
+                    StoreError::Query(format!("commit data instance id: {error}"))
+                })?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.query("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Refuse when an explicitly requested instance disagrees with the one this
+    /// database's data was written under.
+    ///
+    /// Shaped after `assert_brain_uuid`, and refusing for the same reason every
+    /// comparable system refuses — PostgreSQL on `system_identifier`, Terraform
+    /// on state lineage, Kafka, etcd, Elasticsearch. Naming BOTH values matters:
+    /// the operator cannot fix a mismatch they cannot see.
+    pub fn assert_data_instance_id(&self, expected: &str) -> Result<(), StoreError> {
+        let Some(recorded) = self.data_instance_id()? else {
+            return Ok(());
+        };
+        if recorded == expected.trim() {
+            return Ok(());
+        }
+        Err(StoreError::Query(format!(
+            "this database's data was written under instance '{recorded}', but '{}' was \
+             requested. Indexing under a different instance would FORK the graph — every \
+             repo, vault and project UID embeds the instance, so the same content would \
+             appear twice and neither copy would supersede the other.\n\
+             Use instance '{recorded}', or migrate the database deliberately with \
+             `nestweaver instance merge --from {recorded} --to {}`.",
+            expected.trim(),
+            expected.trim()
+        )))
+    }
+
     fn initialize_publication_identity(
         &self,
         identity: &PublicationIdentity,
@@ -4059,5 +4183,108 @@ mod address_space_bound_tests {
             .collect();
 
         assert_eq!(stores.len(), 64, "all opens must be held simultaneously");
+    }
+}
+
+/// nw-246: the database owns its instance identity.
+#[cfg(test)]
+mod data_instance_identity_tests {
+    use super::GraphStore;
+
+    fn store(dir: &std::path::Path) -> GraphStore {
+        GraphStore::open_or_create(&dir.join("t.lbug")).unwrap()
+    }
+
+    /// Established once, then immutable. A later caller proposing a DIFFERENT
+    /// instance gets the recorded one back rather than overwriting it — the
+    /// same discipline `initialize_publication_identity` uses for brain_uuid,
+    /// and the reason a change of default cannot silently re-identify data.
+    #[test]
+    fn the_first_instance_recorded_is_the_one_that_sticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+
+        assert_eq!(
+            store.ensure_data_instance_id("2051a9da").unwrap(),
+            "2051a9da"
+        );
+        assert_eq!(
+            store.ensure_data_instance_id("default").unwrap(),
+            "2051a9da",
+            "a later proposal must not overwrite the identity the data was written under"
+        );
+        assert_eq!(
+            store.data_instance_id().unwrap().as_deref(),
+            Some("2051a9da")
+        );
+    }
+
+    /// It has to survive reopen, or it is a cache rather than an identity.
+    #[test]
+    fn the_recorded_instance_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = store(dir.path());
+            store.ensure_data_instance_id("2051a9da").unwrap();
+        }
+        let reopened = GraphStore::open(&dir.path().join("t.lbug")).unwrap();
+        assert_eq!(
+            reopened.data_instance_id().unwrap().as_deref(),
+            Some("2051a9da")
+        );
+    }
+
+    /// A disagreeing request is REFUSED, naming both values — the answer every
+    /// comparable system gives (PostgreSQL system_identifier, Terraform state
+    /// lineage, Kafka cluster.id, etcd). An error the operator cannot act on is
+    /// barely better than the silent fork.
+    #[test]
+    fn a_disagreeing_instance_is_refused_and_names_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.ensure_data_instance_id("2051a9da").unwrap();
+
+        let error = store
+            .assert_data_instance_id("default")
+            .expect_err("a disagreeing instance must be refused");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("2051a9da"),
+            "must name the recorded instance: {rendered}"
+        );
+        assert!(
+            rendered.contains("default"),
+            "must name the requested one: {rendered}"
+        );
+        assert!(
+            rendered.contains("FORK"),
+            "must say what would happen: {rendered}"
+        );
+    }
+
+    /// The counterweight: agreement must be silent. A guard that refused
+    /// everything would pass the test above while making the tool unusable.
+    #[test]
+    fn an_agreeing_instance_passes_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.ensure_data_instance_id("2051a9da").unwrap();
+
+        store.assert_data_instance_id("2051a9da").unwrap();
+        // And a database with no recorded identity cannot object to anything.
+        let fresh = GraphStore::open_or_create(&dir.path().join("fresh.lbug")).unwrap();
+        fresh.assert_data_instance_id("anything").unwrap();
+    }
+
+    /// An empty instance is not an identity. Recording one would make every
+    /// later comparison pass vacuously.
+    #[test]
+    fn an_empty_instance_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+
+        assert!(store.ensure_data_instance_id("   ").is_err());
+        assert!(store.data_instance_id().unwrap().is_none());
     }
 }
