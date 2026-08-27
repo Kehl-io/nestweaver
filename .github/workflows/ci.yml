@@ -722,7 +722,15 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Compute the PR diff
-        run: git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
+        # ONE range expression, two artifacts. nw-272: the package list and the
+        # mutant list must come from the SAME diff — computing the range twice
+        # lets them drift silently, so `--in-diff` could generate a mutant in a
+        # package `-p` never built (skipped, invisible) or `-p` could baseline
+        # packages with no mutants (the exact cost this scoping removes). Both
+        # failure modes look like a normal run.
+        run: |
+          git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
+          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.files
       - name: Mutate only what this PR changed
         id: mutate
         # `--workspace` is load-bearing. This repo's root Cargo.toml is BOTH a
@@ -771,10 +779,24 @@ jobs:
           #
           # `--in-diff` already restricts which mutants are GENERATED; `-p`
           # restricts what gets BUILT and baselined, which is the expensive half.
-          pkgs=$(git diff --name-only "origin/${GITHUB_BASE_REF}"...HEAD \
-            | awk -F/ '/^crates\/[^\/]+\// { print $2 } /^(src|build\.rs)/ { print "nestweaver" }' \
-            | sort -u)
-          if [ -z "${pkgs}" ]; then
+          # Derived from /tmp/pr.files, written by the same step and the same
+          # range expression that produced /tmp/pr.diff — see the comment there.
+          #
+          # `print $2` is the crate DIRECTORY name. That is only valid because
+          # every directory under crates/ is named for its package; a future
+          # crate where those differ would emit `-p <dir>` and fail loudly,
+          # which is the right way for that assumption to break.
+          #
+          # Patterns are anchored: `/^src\//` and `/^build\.rs$/`, not
+          # `/^(src|build\.rs)/`, which would also match `srcgen/` and print a
+          # package the diff never touched — a wasted baseline, which is the
+          # resource this whole change exists to conserve.
+          mapfile -t pkgs < <(awk -F/ '
+            /^crates\/[^\/]+\// { print $2 }
+            /^src\//            { print "nestweaver" }
+            /^build\.rs$/       { print "nestweaver" }
+          ' /tmp/pr.files | sort -u)
+          if [ "${#pkgs[@]}" -eq 0 ]; then
             echo "no Rust package in this diff; nothing to mutate"
             {
               echo "status=0"
@@ -783,13 +805,11 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pkg_args=""
-          for p in ${pkgs}; do pkg_args="${pkg_args} -p ${p}"; done
-          echo "mutating packages:${pkg_args}"
-          # shellcheck disable=SC2086  # word splitting is the point: pkg_args
-          # is a flat "-p a -p b" list and must expand to separate argv entries.
+          pkg_args=()
+          for pkg in "${pkgs[@]}"; do pkg_args+=(-p "${pkg}"); done
+          echo "mutating packages: ${pkgs[*]}"
           timeout --signal=INT --kill-after=120s "${MUTANTS_BUDGET}" \
-            cargo mutants ${pkg_args} --in-diff /tmp/pr.diff \
+            cargo mutants "${pkg_args[@]}" --in-diff /tmp/pr.diff \
               --timeout 300 --no-shuffle -- --no-fail-fast
           status=$?
           set -e
