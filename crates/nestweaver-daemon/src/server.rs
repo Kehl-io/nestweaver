@@ -4806,19 +4806,34 @@ impl NestWeaverDaemon for DaemonService {
                 ..Default::default()
             }));
 
-            match nestweaver_engine::index::index_directory_with_store_cancellable_and_limits(
-                &state.store,
-                &repo_path,
-                &state.db_path,
+            // Per-repo `exclude` globs come from the daemon's own instance
+            // config — the daemon is started with `--config`, so no new field
+            // is needed on the index RPC. A daemon running without a config
+            // resolves to no excludes, which is the prior behaviour.
+            let repo_excludes: Vec<String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
+                .unwrap_or_default();
+
+            let index_opts = nestweaver_engine::index::IndexOptions::new(
                 // nw-019: stamp the effective logical instance on indexed repos —
                 // an explicit request `--instance` overrides the daemon default.
                 &effective_instance,
                 &repo_url,
                 &indexed_sha,
-                force,
-                name.as_deref(),
-                &cancel_for_index,
-                index_limits,
+            )
+            .force(force)
+            .name(name.as_deref())
+            .limits(index_limits)
+            .excludes(&repo_excludes);
+
+            match nestweaver_engine::index::index_directory_with_store_opts(
+                &state.store,
+                &repo_path,
+                &state.db_path,
+                &index_opts,
+                Some(&cancel_for_index),
             ) {
                 Ok(result) => {
                     let skipped_count = result.skipped_files.len();
@@ -16248,6 +16263,7 @@ mod startup_helper_tests {
             use_git_activity: None,
             branch: None,
             poll: None,
+            exclude: Vec::new(),
         }
     }
 
@@ -19809,6 +19825,7 @@ mod watch_path_allowed_tests {
             use_git_activity: None,
             branch: None,
             poll: None,
+            exclude: Vec::new(),
         }
     }
 

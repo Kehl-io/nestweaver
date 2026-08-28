@@ -15418,17 +15418,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let (files_count, symbols_count, edges_count);
             let skipped_files;
 
+            // Per-repo `exclude` globs from `--config`. The daemon route
+            // resolves these from its own loaded config; this is the direct
+            // (`--no-daemon`) twin, so both routes exclude the same paths.
+            let repo_excludes: Vec<String> = load_instance_config_opt(config.as_deref())
+                .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
+                .unwrap_or_default();
+
             if force {
                 // Full re-index requested explicitly.
-                let result = nestweaver_engine::index::index_directory_with_options_and_limits(
-                    &repo_path,
-                    &db_path,
+                let opts = nestweaver_engine::index::IndexOptions::new(
                     &instance_id,
                     &repo_url,
                     &indexed_sha,
-                    true,
-                    name.as_deref(),
-                    index_limits,
+                )
+                .force(true)
+                .name(name.as_deref())
+                .limits(index_limits)
+                .excludes(&repo_excludes);
+                let result = nestweaver_engine::index::index_directory_with_opts(
+                    &repo_path, &db_path, &opts,
                 )
                 .context("index_directory")?;
 
@@ -15446,13 +15455,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 skipped_files = result.skipped_files;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = nestweaver_engine::index::incremental_index_with_name_and_limits(
+                let inc = nestweaver_engine::index::incremental_index_with_excludes(
                     &repo_path,
                     &db_path,
                     &instance_id,
                     &repo_url,
                     name.as_deref(),
                     index_limits,
+                    &repo_excludes,
                 )
                 .context("incremental_index")?;
 

@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::git_cmd::{apply_git_isolation, git_net_timeout, run_git_with_timeout};
 use crate::index_limits::{DEFAULT_MAX_SOURCE_FILE_BYTES, IndexLimits};
@@ -135,10 +136,28 @@ pub trait ContentReader: Send + Sync {
     }
 }
 
+/// Whether a repo-relative directory is excluded outright, so the walker can
+/// skip descending into it rather than filtering its contents afterwards.
+///
+/// Free rather than a method because the walker's `filter_entry` closure must
+/// be `'static` and therefore cannot borrow the reader.
+fn dir_is_excluded(dir_excludes: Option<&GlobSet>, rel: &Path) -> bool {
+    dir_excludes.is_some_and(|gs| gs.is_match(rel))
+}
+
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
 pub struct FilesystemReader {
     repo_path: PathBuf,
     limits: IndexLimits,
+    /// Configured `[[repos]] exclude` globs, matched against repo-relative
+    /// paths. `None` when the repo declares none — the common case.
+    excludes: Option<GlobSet>,
+    /// Directory-level companion to [`Self::excludes`], used to prune the walk
+    /// instead of filtering after descent. A pattern like `big/**` names only
+    /// the CONTENTS of `big`, so it never matches `big` itself; without this
+    /// the walker would still descend the whole excluded tree — 8.3 GB in the
+    /// case this feature was built for.
+    dir_excludes: Option<GlobSet>,
 }
 
 impl FilesystemReader {
@@ -146,6 +165,8 @@ impl FilesystemReader {
         Self {
             repo_path: repo_path.to_path_buf(),
             limits: IndexLimits::default(),
+            excludes: None,
+            dir_excludes: None,
         }
     }
 
@@ -153,7 +174,39 @@ impl FilesystemReader {
         Self {
             repo_path: repo_path.to_path_buf(),
             limits,
+            excludes: None,
+            dir_excludes: None,
         }
+    }
+
+    /// Attach `[[repos]] exclude` globs. These are matched against
+    /// repo-relative paths and are the ONLY way to skip code that git itself
+    /// tracks — `.gitignore`/`.git/info/exclude` already cover everything git
+    /// ignores, and the walker honours those.
+    ///
+    /// An invalid glob is an error rather than a silently-dropped pattern: a
+    /// typo that quietly indexed a vendored tree is the failure this exists to
+    /// prevent.
+    pub fn excluding(mut self, globs: &[String]) -> Result<Self> {
+        if globs.is_empty() {
+            return Ok(self);
+        }
+        let mut builder = GlobSetBuilder::new();
+        let mut dir_builder = GlobSetBuilder::new();
+        for g in globs {
+            builder.add(Glob::new(g).with_context(|| format!("invalid exclude glob {g:?}"))?);
+
+            // Derive the directory this pattern encloses so the walk can be
+            // pruned. `big/**` -> `big`; a pattern naming a directory outright
+            // (`docs/vendor`) already prunes via itself.
+            let dir_pattern = g.strip_suffix("/**").unwrap_or(g);
+            dir_builder.add(
+                Glob::new(dir_pattern).with_context(|| format!("invalid exclude glob {g:?}"))?,
+            );
+        }
+        self.excludes = Some(builder.build().context("build exclude globset")?);
+        self.dir_excludes = Some(dir_builder.build().context("build exclude globset")?);
+        Ok(self)
     }
 }
 
@@ -217,18 +270,27 @@ impl ContentReader for FilesystemReader {
         use ignore::WalkBuilder;
 
         let mut files = Vec::new();
+        let root = self.repo_path.clone();
+        let dir_excludes = self.dir_excludes.clone();
         let walker = WalkBuilder::new(&self.repo_path)
             .follow_links(false)
             .hidden(false)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
-            .filter_entry(|e| {
-                if e.file_type().is_some_and(|ft| ft.is_dir())
-                    && let Some(name) = e.file_name().to_str()
-                    && crate::index::SKIP_DIRS.contains(&name)
-                {
-                    return false;
+            .filter_entry(move |e| {
+                if e.file_type().is_some_and(|ft| ft.is_dir()) {
+                    if let Some(name) = e.file_name().to_str()
+                        && crate::index::SKIP_DIRS.contains(&name)
+                    {
+                        return false;
+                    }
+                    if let Ok(rel) = e.path().strip_prefix(&root)
+                        && !rel.as_os_str().is_empty()
+                        && dir_is_excluded(dir_excludes.as_ref(), rel)
+                    {
+                        return false;
+                    }
                 }
                 true
             })
@@ -245,6 +307,9 @@ impl ContentReader for FilesystemReader {
             if entry.file_type().is_some_and(|ft| ft.is_file())
                 && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
             {
+                if self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel)) {
+                    continue;
+                }
                 files.push(rel.to_path_buf());
             }
         }
@@ -845,6 +910,138 @@ mod tests {
             .collect();
         assert!(names.contains(&"real.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    #[test]
+    fn filesystem_reader_applies_configured_excludes() {
+        // Files are NOT gitignored (no git repo here), so only a configured
+        // exclude can keep them out — which is the whole point of the feature:
+        // skipping code that is legitimately tracked.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("web/wp-content/plugins/acme")).unwrap();
+        std::fs::write(dir.path().join("web/wp-content/plugins/acme/a.php"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("web/wp-content/themes/mine")).unwrap();
+        std::fs::write(dir.path().join("web/wp-content/themes/mine/b.php"), "").unwrap();
+
+        let reader = FilesystemReader::new(dir.path())
+            .excluding(&["web/wp-content/plugins/**".to_string()])
+            .unwrap();
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            names.contains(&"web/wp-content/themes/mine/b.php".to_string()),
+            "non-excluded file must survive: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("plugins")),
+            "excluded glob must be skipped: {names:?}"
+        );
+    }
+
+    #[test]
+    fn filesystem_reader_rejects_invalid_exclude_glob() {
+        let dir = TempDir::new().unwrap();
+        let result = FilesystemReader::new(dir.path()).excluding(&["web/[unclosed".to_string()]);
+        assert!(
+            result.is_err(),
+            "an invalid glob must be rejected, not silently dropped"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("web/[unclosed"),
+            "error must name the offending glob: {msg}"
+        );
+    }
+
+    #[test]
+    fn filesystem_reader_exclude_skips_nested_files() {
+        // Asserts only that nested files under an excluded glob are absent.
+        // It deliberately does NOT claim the walk was pruned — filtering after
+        // descent produces an identical list. Pruning is covered by
+        // `exclude_prunes_directory_before_descending`, which tests the
+        // predicate the walker actually branches on.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("big/nested/deep")).unwrap();
+        std::fs::write(dir.path().join("big/nested/deep/x.rs"), "").unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "").unwrap();
+
+        let reader = FilesystemReader::new(dir.path())
+            .excluding(&["big/**".to_string()])
+            .unwrap();
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(names.contains(&"keep.rs".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("big/")), "{names:?}");
+    }
+
+    #[test]
+    fn exclude_prunes_directory_before_descending() {
+        // The motivating repo holds 8.3 GB under one excluded directory, so
+        // filtering files after descent is not enough — the walker has to
+        // refuse to enter. `big/**` names only the CONTENTS of `big`, so a
+        // naive is_match("big") is false and the walk descends anyway. This
+        // pins the prefix behaviour that makes pruning work.
+        let dir = TempDir::new().unwrap();
+        let reader = FilesystemReader::new(dir.path())
+            .excluding(&["big/**".to_string(), "docs/vendor".to_string()])
+            .unwrap();
+
+        let dirs = reader.dir_excludes.as_ref();
+        assert!(
+            dir_is_excluded(dirs, Path::new("big")),
+            "`big/**` must prune the `big` directory itself"
+        );
+        assert!(
+            dir_is_excluded(dirs, Path::new("docs/vendor")),
+            "an exact directory pattern must prune that directory"
+        );
+        assert!(
+            !dir_is_excluded(dirs, Path::new("src")),
+            "unrelated directories must not be pruned"
+        );
+        assert!(
+            !dir_is_excluded(dirs, Path::new("bigger")),
+            "prefix match must respect path boundaries"
+        );
+    }
+
+    #[test]
+    fn filesystem_reader_excludes_file_shaped_globs() {
+        // A glob that matches FILES without enclosing a directory cannot be
+        // handled by pruning — the parent must still be walked to reach its
+        // siblings. This pins the file-level filter, which directory-shaped
+        // patterns like `big/**` would otherwise make look redundant.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.min.js"), "").unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), "").unwrap();
+
+        let reader = FilesystemReader::new(dir.path())
+            .excluding(&["**/*.min.js".to_string()])
+            .unwrap();
+        let names: Vec<String> = reader
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            names.contains(&"assets/app.js".to_string()),
+            "sibling in the same directory must survive: {names:?}"
+        );
+        assert!(
+            !names.contains(&"assets/app.min.js".to_string()),
+            "file-shaped glob must be excluded: {names:?}"
+        );
     }
 
     // ---------- GitBareReader tests ----------

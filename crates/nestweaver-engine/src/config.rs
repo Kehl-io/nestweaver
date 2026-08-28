@@ -4,6 +4,7 @@ use nestweaver_store::{PathDeboostRule, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_M
 pub use nestweaver_store::{SeedResolutionConfig, default_kind_priority};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Bounds applied to a ranking-prior multiplier and to the final product
 /// after a prior is applied. A multiplier below the floor would erase a
@@ -775,6 +776,20 @@ pub struct RepoConfig {
     pub branch: Option<String>,
     #[serde(default)]
     pub poll: Option<String>,
+    /// Glob patterns, matched against repo-relative paths, for code this repo
+    /// tracks but the graph should not hold.
+    ///
+    /// This is deliberately NOT a general ignore mechanism. The indexer walks
+    /// with `ignore::WalkBuilder` and already honours `.gitignore`, the global
+    /// gitignore, and `.git/info/exclude`, so anything git ignores is excluded
+    /// without configuration. This covers only the remaining case: source that
+    /// is legitimately committed but is not ours to reason about — a vendored
+    /// WordPress plugin tree, a checked-in SDK, generated bundles.
+    ///
+    /// A pattern ending in `/**` also prunes the directory it names, so an
+    /// excluded tree is never descended.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1016,7 +1031,39 @@ fn reject_obsolete_instance_shape(s: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Normalize a repo reference so a `file://` url, a bare path, and a git
+/// remote compare on equal terms. Trailing slashes are insignificant.
+fn normalize_repo_ref(value: &str) -> &str {
+    value
+        .strip_prefix("file://")
+        .unwrap_or(value)
+        .trim_end_matches('/')
+}
+
 impl InstanceConfig {
+    /// Exclude globs declared for a repo by a `[[repos]]` entry, or an empty
+    /// slice when it declares none — the common case, and why this returns a
+    /// slice rather than an Option.
+    ///
+    /// A `[[repos]] url` is matched against EITHER the repo's identity url or
+    /// its local checkout path, because the same repo is spelled three ways in
+    /// practice: `brain-setup.sh` indexes by path, the graph records the git
+    /// origin, and vault entries use a `file://` url. Requiring one spelling
+    /// would make a declared exclude silently do nothing.
+    pub fn exclude_globs_for(&self, repo_url: &str, repo_path: Option<&Path>) -> &[String] {
+        let path_str = repo_path.map(|p| p.to_string_lossy().to_string());
+        self.repos
+            .iter()
+            .find(|r| {
+                let declared = normalize_repo_ref(&r.url);
+                declared == normalize_repo_ref(repo_url)
+                    || path_str
+                        .as_deref()
+                        .is_some_and(|p| declared == normalize_repo_ref(p))
+            })
+            .map_or(&[][..], |r| r.exclude.as_slice())
+    }
+
     /// The DB path declared by this instance, if any.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
         self.db.as_ref().map(std::path::PathBuf::from)
@@ -1973,6 +2020,120 @@ use_git_activity = false
             .expect("vendored repo");
         assert_eq!(live.use_git_activity, None);
         assert_eq!(vendored.use_git_activity, Some(false));
+    }
+
+    #[test]
+    fn exclude_globs_for_resolves_by_repo_url() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "git@github.com:example/wordpress.git"
+exclude = ["web/wp-content/plugins/**"]
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+
+        assert_eq!(
+            cfg.exclude_globs_for("git@github.com:example/wordpress.git", None),
+            ["web/wp-content/plugins/**".to_string()]
+        );
+        assert!(
+            cfg.exclude_globs_for("git@github.com:example/other.git", None)
+                .is_empty(),
+            "an undeclared repo must resolve to no excludes, not inherit another repo's"
+        );
+    }
+
+    #[test]
+    fn exclude_globs_for_matches_url_or_local_path() {
+        // brain-setup.sh indexes local checkouts by PATH while the graph
+        // records the git origin as the repo url, and the vault is declared
+        // with a `file://` url. All three spellings must find the same entry,
+        // or a declared exclude silently does nothing.
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "git@github.com:example/wordpress.git"
+exclude = ["web/wp-content/plugins/**"]
+
+[[repos]]
+url = "file:///Users/me/dev/site"
+exclude = ["uploads/**"]
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+
+        // by git url
+        assert_eq!(
+            cfg.exclude_globs_for("git@github.com:example/wordpress.git", None),
+            ["web/wp-content/plugins/**".to_string()]
+        );
+        // by local path, when the url is the origin remote
+        assert_eq!(
+            cfg.exclude_globs_for(
+                "git@github.com:example/wordpress.git",
+                Some(Path::new("/anywhere/wordpress"))
+            ),
+            ["web/wp-content/plugins/**".to_string()]
+        );
+        // by local path against a file:// url
+        assert_eq!(
+            cfg.exclude_globs_for("whatever", Some(Path::new("/Users/me/dev/site"))),
+            ["uploads/**".to_string()]
+        );
+        // plain path url spelling also resolves
+        assert_eq!(
+            cfg.exclude_globs_for("/Users/me/dev/site", None),
+            ["uploads/**".to_string()]
+        );
+        assert!(
+            cfg.exclude_globs_for("git@github.com:example/other.git", None)
+                .is_empty(),
+            "an undeclared repo must not inherit another repo's excludes"
+        );
+    }
+
+    #[test]
+    fn per_repo_exclude_globs_parse_and_default_empty() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "https://github.com/example/plain"
+
+[[repos]]
+url = "https://github.com/example/wordpress"
+exclude = ["web/wp-content/plugins/**", "**/*.min.js"]
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        let plain = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/plain")
+            .expect("plain repo");
+        let wp = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/wordpress")
+            .expect("wordpress repo");
+
+        assert!(
+            plain.exclude.is_empty(),
+            "a repo declaring no excludes must default to none, not fail to parse"
+        );
+        assert_eq!(
+            wp.exclude,
+            vec![
+                "web/wp-content/plugins/**".to_string(),
+                "**/*.min.js".to_string()
+            ]
+        );
     }
 
     #[test]
