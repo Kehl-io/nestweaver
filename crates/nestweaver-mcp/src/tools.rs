@@ -2951,16 +2951,14 @@ fn tool_schema_count_patterns() -> Value {
 // ── F9: document-graph tools ──────────────────────────────────────────────
 
 fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let max_suggestions = args
-        .get("max_suggestions")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(5);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let max_suggestions = read_limit(&args, "max_suggestions", 5, 1, 50)?;
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
@@ -2977,16 +2975,15 @@ fn tool_schema_brain_broken_links() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "max_suggestions": {
-                    "type": "integer",
-                    "description": "Max suggested target UIDs per broken link (default 5).",
-                    "default": 5
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max broken links to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                // `maximum: 50`, not 1000: suggestions multiply PER broken
+                // link, so a 1000-suggestion cap across 1328 links is a cross
+                // product. 10x the default is the same ratio `clusters.members`
+                // uses against its own preview.
+                "max_suggestions": limit_schema(
+                    "Max suggested target UIDs per broken link (1-50, default 5).", 5, 1, 50),
+                "limit": limit_schema(
+                    "Max broken links to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -2996,11 +2993,13 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
     let vault = args.get("vault").and_then(|v| v.as_str());
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
     let total = all_orphans.len();
     let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
@@ -3024,11 +3023,9 @@ fn tool_schema_brain_orphan_documents() -> Value {
                     "items": { "type": "string" },
                     "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max orphan documents to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max orphan documents to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3039,11 +3036,13 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
         .get("resolution")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.5);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_clusters = topic_clusters(store, resolution)?;
     let total = all_clusters.len();
     let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
@@ -3065,22 +3064,22 @@ fn tool_schema_brain_topic_clusters() -> Value {
                     "description": "Community-detection resolution — higher yields more, smaller clusters (default 0.5).",
                     "default": 0.5
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max clusters to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max clusters to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
 }
 
 fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
     match args.get("tag") {
@@ -3109,22 +3108,16 @@ fn tool_schema_brain_tag_graph() -> Value {
             "additionalProperties": false,
             "properties": {
                 "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max tags to return in the all-tags listing (default 50). Ignored when a specific tag is queried.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max tags to return in the all-tags listing (1-1000, default 50). Ignored when a specific tag is queried.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
 }
 
 fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let top_tags_limit = args
-        .get("top_tags_limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(10);
+    let top_tags_limit = read_limit(&args, "top_tags_limit", 10, 1, RESULT_LIMIT_MAX)?;
     let stats = doc_stats(store, top_tags_limit)?;
     Ok(serde_json::to_value(&stats)?)
 }
@@ -3137,11 +3130,8 @@ fn tool_schema_brain_doc_stats() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "top_tags_limit": {
-                    "type": "integer",
-                    "description": "Max entries in top_tags (default 10).",
-                    "default": 10
-                }
+                "top_tags_limit": limit_schema(
+                    "Max entries in top_tags (1-1000, default 10).", 10, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3159,11 +3149,13 @@ fn now_epoch_secs() -> f64 {
 }
 
 fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let mut report = serde_json::to_value(memory_lint(store, now_epoch_secs())?)?;
     // Truncate each lint category to `limit` and report totals.
     if let Some(obj) = report.as_object_mut() {
@@ -3191,11 +3183,9 @@ fn tool_schema_brain_memory_lint() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results per lint category (default 50). Totals are always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max results per lint category (1-1000, default 50). Totals are always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3203,11 +3193,13 @@ fn tool_schema_brain_memory_lint() -> Value {
 
 fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
     // Truncate proposals to limit and report total.
     if let Some(obj) = manifest.as_object_mut() {
@@ -3238,11 +3230,13 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                     "description": "Opt into write-mode: move files to their promoted destinations (default false = safe dry-run).",
                     "default": false
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max proposals to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                // The ONE parameter on the entire mutating surface with
+                // unverified bounds (the other five mutators declare no numeric
+                // parameter at all). Fixed schema-side, so no write path had to
+                // be exercised to close it.
+                "limit": limit_schema(
+                    "Max proposals to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -7234,11 +7228,9 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max contract links to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max contract links to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -7252,11 +7244,13 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
     };
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     let refs = store
         .cross_repo_links(&uid)
@@ -7334,11 +7328,9 @@ fn tool_schema_contract_drift() -> Value {
             "additionalProperties": false,
             "properties": {
                 "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results per drift bucket (default 50). Totals are always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max results per drift bucket (1-1000, default 50). Totals are always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -7346,11 +7338,13 @@ fn tool_schema_contract_drift() -> Value {
 
 fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let repo = args.get("repo").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
     // Shared with the CLI's local path so the two serializations cannot drift
@@ -7403,11 +7397,13 @@ fn tool_brain_impact(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'symbol' is required"))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let concise = is_concise(&args);
     let owners = restricted_symbol_owners(store, visible)?;
     let uid_is_visible = |uid: &str| {
@@ -8628,11 +8624,9 @@ fn tool_schema_brain_diff() -> Value {
                     "type": "string",
                     "description": "Git SHA to compare against. Defaults to the repo's indexed_sha. Use a specific SHA to diff against an older baseline."
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max affected symbols to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max affected symbols to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             },
             "required": ["repo"]
         }
@@ -8651,11 +8645,13 @@ fn tool_brain_diff(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'repo' must be a string"))?;
     let since_sha_arg = args.get("since_sha").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     // Find the repo in the graph using the shared deterministic selector. The
     // caller supplies the already-visible repository set in authenticated
@@ -9458,11 +9454,13 @@ fn tool_dead_code(
     // with `total_symbols`/`reachable_symbols`/`dead_percentage`, which are
     // also unfiltered); `matching_count` is the post-`min_confidence` count;
     // `returned`/`truncated` disclose the cap.
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
@@ -9725,11 +9723,16 @@ fn tool_schema_blast_radius() -> Value {
                     "description": "Also follow data-dependence edges (type refs & field access). Higher recall, noisier; default false.",
                     "default": false
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Cap on returned affected_symbols (most-impactful first). Omit for the full set; a truncation note reports the true total.",
-                    "minimum": 1
-                },
+                // Found by asserting the bound over the REGISTRY rather than
+                // the ten sites the report named: this one declared `minimum`
+                // and no `maximum`. Omission still means "the full set" — the
+                // ceiling bounds an EXPLICIT request, so there is nothing to
+                // gain by asking for more than it.
+                "limit": bounded_integer_schema(
+                    "Cap on returned affected_symbols (most-impactful first, 1-1000). Omit for the full set; a truncation note reports the true total.",
+                    1,
+                    RESULT_LIMIT_MAX,
+                ),
                 "format": {
                     "type": "string",
                     "enum": ["json", "sarif"],
@@ -10243,6 +10246,269 @@ fn configured_result_limit_or(builtin: usize) -> usize {
     current_instance_config()
         .and_then(|cfg| cfg.limits.default_result_limit)
         .unwrap_or(builtin)
+}
+
+// ── The (bound, total, truncated) seam ──────────────────────────────────────
+//
+// `configured_result_limit_or` above governs the DEFAULT and nothing else —
+// not the clamp, not the reported total, not the truncation disclosure. So
+// the `(bound, total, truncated)` triple was reimplemented independently in
+// sixteen-plus places across this file and `src/main.rs`, under five key
+// spellings (`total`, `total_available`, `more_available`, `connected_count`,
+// `proposals_total`), ABSENT in two commands, and computed AFTER the cap in a
+// third — which is how `summary --level cluster` came to report
+// `{returned: 50, total: 50, truncated: false}` against 71,184 communities.
+//
+// The three items below are the seam that was missing. `limit_schema` emits
+// the declaration, `read_limit` parses the argument against the SAME bounds,
+// and `Bounded` captures `total` BEFORE the cut so a capped answer structurally
+// cannot report itself complete. New bounded tools call these rather than
+// writing a seventeenth copy.
+
+/// The upper bound every list-returning tool in this catalogue declares.
+///
+/// Not a new number: `brain_impact`, `detect_changes`, `dead_code`,
+/// `hub_nodes` and `bridge_nodes` already declare exactly this. A second
+/// ceiling for the params that lacked one would be the drift this seam exists
+/// to stop.
+pub(crate) const RESULT_LIMIT_MAX: usize = 1000;
+
+/// JSON Schema fragment for a limit-shaped integer parameter.
+///
+/// `minimum` is what turns a negative into a REJECTION. Without it
+/// `as_u64()` returns `None` for `-1`, `unwrap_or_else` fires, and the
+/// caller's explicit `-1` silently becomes the default — the caller is told
+/// nothing and gets a confident answer to a request they did not make.
+fn limit_schema(description: &str, default: usize, min: usize, max: usize) -> Value {
+    let mut schema = bounded_integer_schema(description, min, max);
+    schema["default"] = json!(default);
+    schema
+}
+
+/// The same bounds WITHOUT a `default` key, for a parameter whose omitted
+/// behaviour is not a number.
+///
+/// `blast_radius.limit` is the case: omitting it means "the full set", so
+/// advertising any default would be a claim the handler does not honour — the
+/// same dishonesty `clusters.resolution` and `project_context.token_budget`
+/// were corrected for.
+fn bounded_integer_schema(description: &str, min: usize, max: usize) -> Value {
+    json!({
+        "type": "integer",
+        "minimum": min,
+        "maximum": max,
+        "description": description,
+    })
+}
+
+/// Read a limit-shaped argument, REJECTING an out-of-range value rather than
+/// silently substituting the default.
+///
+/// Parses with `as_i64`, not `as_u64`: `as_u64` collapses "absent",
+/// "negative" and "not an integer" into one `None`, which the caller then
+/// converts into a confident default. The value the caller actually sent is
+/// examined here.
+///
+/// Schema validation already rejects out-of-range values on the MCP path, but
+/// `dispatch` is also reached from routes that never validate against the
+/// schema, so the bound is enforced in both places on purpose.
+fn read_limit(
+    args: &Value,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, anyhow::Error> {
+    let Some(raw) = args.get(key) else {
+        return Ok(default);
+    };
+    if raw.is_null() {
+        return Ok(default);
+    }
+    let value = raw
+        .as_i64()
+        .ok_or_else(|| anyhow!("invalid '{key}': expected an integer, got {raw}"))?;
+    let min_i64 = i64::try_from(min).unwrap_or(i64::MAX);
+    let max_i64 = i64::try_from(max).unwrap_or(i64::MAX);
+    if value < min_i64 || value > max_i64 {
+        anyhow::bail!("invalid '{key}': {value} is out of range (expected {min}..={max})");
+    }
+    Ok(usize::try_from(value).unwrap_or(default))
+}
+
+/// A list plus the two facts that make it honest: how many matched, and
+/// whether the caller is looking at all of them.
+///
+/// `total` is captured at construction, BEFORE the cut. That ordering is the
+/// whole point — every instance of this defect class in the codebase came
+/// from computing `total` on an already-truncated vector.
+pub(crate) struct Bounded<T> {
+    items: Vec<T>,
+    total: usize,
+}
+
+impl<T> Bounded<T> {
+    /// Cut `items` to `limit`, capturing the pre-cap total.
+    ///
+    /// `limit == 0` means unlimited, matching the CLI's documented
+    /// `--limit 0 = all` convention. A tool that does not offer that escape
+    /// hatch declares `minimum: 1` and never passes 0 here.
+    fn take(mut items: Vec<T>, limit: usize) -> Self {
+        let total = items.len();
+        if limit != 0 && total > limit {
+            items.truncate(limit);
+        }
+        Self { items, total }
+    }
+
+    /// For producers that already dropped rows upstream and separately know
+    /// the pre-cap total (a store query with its own `LIMIT`, a budget cut).
+    /// `total` is clamped up to `items.len()` so the pair can never claim to
+    /// have returned more than matched.
+    fn with_total(items: Vec<T>, total: usize) -> Self {
+        let total = total.max(items.len());
+        Self { items, total }
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+
+    fn returned(&self) -> usize {
+        self.items.len()
+    }
+
+    fn truncated(&self) -> bool {
+        self.items.len() < self.total
+    }
+
+    fn items(&self) -> &[T] {
+        &self.items
+    }
+
+    /// Render only what survived the cut. Rendering before the cut is the
+    /// other half of this defect class: work proportional to the corpus for
+    /// an answer bounded to the limit.
+    fn map<U>(self, f: impl FnMut(T) -> U) -> Bounded<U> {
+        Bounded {
+            items: self.items.into_iter().map(f).collect(),
+            total: self.total,
+        }
+    }
+}
+
+impl Bounded<Value> {
+    /// The one canonical disclosure shape: `{<key>: [...], returned, total,
+    /// truncated}`. `returned`/`total` are the spellings 8.0.0 standardised
+    /// `brain_impact` and `brain_search` on; every new bounded list uses them
+    /// so an agent parses one shape rather than five.
+    fn into_json(self, key: &str) -> Value {
+        let mut payload = json!({});
+        self.merge_into(&mut payload, key);
+        payload
+    }
+
+    /// Merge the triple into an existing object payload, for tools that carry
+    /// additional top-level keys.
+    fn merge_into(self, target: &mut Value, key: &str) {
+        let (returned, total, truncated) = (self.returned(), self.total(), self.truncated());
+        let Some(object) = target.as_object_mut() else {
+            return;
+        };
+        object.insert(key.to_string(), Value::Array(self.items));
+        object.insert("returned".to_string(), json!(returned));
+        object.insert("total".to_string(), json!(total));
+        object.insert("truncated".to_string(), json!(truncated));
+    }
+}
+
+#[cfg(test)]
+mod bounds_seam_tests {
+    use super::*;
+
+    #[test]
+    fn total_is_captured_before_the_cut() {
+        let bounded = Bounded::take((0..120).collect::<Vec<i32>>(), 5);
+        assert_eq!(bounded.returned(), 5);
+        assert_eq!(bounded.total(), 120, "total must count what MATCHED");
+        assert!(bounded.truncated());
+    }
+
+    #[test]
+    fn a_zero_limit_means_unlimited() {
+        let bounded = Bounded::take((0..7).collect::<Vec<i32>>(), 0);
+        assert_eq!(bounded.returned(), 7);
+        assert!(!bounded.truncated());
+    }
+
+    #[test]
+    fn with_total_cannot_claim_to_have_returned_more_than_matched() {
+        let bounded = Bounded::with_total(vec![json!(1), json!(2)], 1);
+        assert_eq!(bounded.total(), 2);
+        assert!(!bounded.truncated());
+    }
+
+    #[test]
+    fn into_json_emits_one_canonical_shape() {
+        let payload = Bounded::take(vec![json!("a"), json!("b"), json!("c")], 2).into_json("rows");
+        assert_eq!(payload["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["returned"], json!(2));
+        assert_eq!(payload["total"], json!(3));
+        assert_eq!(payload["truncated"], json!(true));
+    }
+
+    #[test]
+    fn a_negative_limit_is_rejected_rather_than_silently_defaulted() {
+        let error = read_limit(&json!({ "limit": -1 }), "limit", 50, 1, RESULT_LIMIT_MAX)
+            .expect_err("-1 must not become 50");
+        assert!(
+            format!("{error}").contains("out of range"),
+            "the rejection must name the violated bound: {error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_limit_takes_the_documented_default() {
+        assert_eq!(
+            read_limit(&json!({}), "limit", 50, 1, RESULT_LIMIT_MAX).unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn an_over_ceiling_limit_is_rejected() {
+        assert!(
+            read_limit(
+                &json!({ "limit": 999_999_999 }),
+                "limit",
+                50,
+                1,
+                RESULT_LIMIT_MAX
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_schema_fragment_and_the_parser_share_their_bounds() {
+        let schema = limit_schema("Max rows", 50, 1, RESULT_LIMIT_MAX);
+        let min = schema["minimum"].as_i64().unwrap();
+        let max = schema["maximum"].as_i64().unwrap();
+        // Whatever the declaration rejects, the parser must reject too.
+        for out_of_range in [min - 1, max + 1] {
+            assert!(
+                read_limit(
+                    &json!({ "limit": out_of_range }),
+                    "limit",
+                    50,
+                    1,
+                    RESULT_LIMIT_MAX
+                )
+                .is_err(),
+                "{out_of_range} is outside the declared bounds but the parser accepted it"
+            );
+        }
+    }
 }
 
 fn configured_index_limits() -> nestweaver_engine::index_limits::IndexLimits {
@@ -12104,8 +12370,6 @@ mod cache_dispatch_tests {
         assert!(!truncate_reporting(&mut empty, 0));
     }
 
-    /// The other half: when everything fits, `truncated` must be false. Without
-    /// this, a field hardcoded to `true` would pass the test above.
     #[test]
     fn a_result_that_fits_is_not_reported_as_truncated() {
         let (_dir, db_path) = index_on_disk();
@@ -15001,6 +15265,60 @@ merged = {merged}"
 #[cfg(test)]
 mod schema_default_honesty_tests {
     use super::*;
+
+    /// nw-304. Where a schema declares `minimum`/`maximum` the validator
+    /// enforces it perfectly. The gap is the ten params that declare a
+    /// `default` and NO bounds: `as_u64()` returns `None` for a negative, so
+    /// `limit: -1` silently became 50 — the caller's explicit request was
+    /// discarded and they were told nothing — and `limit: 999999999` returned
+    /// the whole dataset.
+    ///
+    /// Asserted over the REGISTRY so an eleventh unbounded param cannot be
+    /// added without failing here.
+    #[test]
+    fn every_limit_style_param_declares_both_bounds() {
+        const LIMIT_KEYS: &[&str] = &["limit", "top_n", "max_suggestions", "top_tags_limit"];
+        let mut offenders: Vec<String> = Vec::new();
+
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("?").to_string();
+            let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (field, spec) in props {
+                if !LIMIT_KEYS.contains(&field.as_str()) {
+                    continue;
+                }
+                if spec.get("minimum").is_none() {
+                    offenders.push(format!(
+                        "{name}.{field}: no `minimum` — a negative silently becomes the \
+                         default instead of being rejected"
+                    ));
+                }
+                if spec.get("maximum").is_none() {
+                    offenders.push(format!(
+                        "{name}.{field}: no `maximum` — the tool has no upper bound at all"
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unbounded limit params: {offenders:#?}"
+        );
+    }
+
+    /// The bound must be ENFORCED, not merely declared. A present-but-negative
+    /// value is a caller bug and must surface as one.
+    #[test]
+    fn a_negative_limit_is_rejected_rather_than_silently_defaulted() {
+        let error = validate_tool_arguments("brain_tag_graph", &json!({ "limit": -1 }))
+            .expect_err("limit: -1 must not validate");
+        assert!(
+            format!("{error}").contains("minimum"),
+            "the rejection must name the violated bound, not just fail: {error}"
+        );
+    }
 
     /// Every advertised default must be a value the schema itself would accept.
     /// A default outside its own `minimum`/`maximum`, or off an `enum`, is
