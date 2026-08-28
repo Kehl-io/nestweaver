@@ -542,10 +542,18 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// CI/testing only — bypass the daemon and open the database directly.
-    /// DO NOT use in normal operation. The daemon owns the write lock and
-    /// coordinates concurrent access; bypassing it risks WAL corruption.
-    /// Requires NESTWEAVER_NO_DAEMON=1 environment variable as a safety gate.
+    /// Test harnesses only — do not use in normal operation, including from
+    /// scripts and agents. Requests that this command skip autostarting a
+    /// daemon and open the database directly.
+    ///
+    /// The gate is `NESTWEAVER_ALLOW_NO_DAEMON`, NOT `NESTWEAVER_NO_DAEMON` —
+    /// the latter is a second way to REQUEST the bypass, not to permit it.
+    /// Without the gate this flag is ignored and the command routes through
+    /// the daemon.
+    ///
+    /// This is not what keeps the store single-writer: the write lease is
+    /// taken at the moment of the write and fails closed, so a bypass against
+    /// a daemon-owned database is refused, not silently doubled.
     #[arg(long, global = true, hide = true)]
     no_daemon: bool,
 
@@ -8867,14 +8875,18 @@ fn no_daemon_allowed_from(allow_optin: bool, _github_actions: bool, _ci: Option<
 /// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
 /// is permitted in the current environment.
 ///
-/// Bypassing the daemon writes to the store directly, which risks WAL corruption
-/// and is strictly a CI/test convenience — yet the env var kept getting set in
-/// interactive and agent contexts, silently engaging the unsafe path. So outside
-/// a CI context we now *refuse* it and route through the daemon instead. It is
-/// honored only when one of these is present:
-///   - `NESTWEAVER_ALLOW_NO_DAEMON` — explicit local-test opt-in, or
-///   - `GITHUB_ACTIONS` — set by GitHub Actions, or
-///   - `CI` set to a truthy value — set by virtually every CI system.
+/// Honored by exactly ONE thing: `NESTWEAVER_ALLOW_NO_DAEMON`. `GITHUB_ACTIONS`
+/// and `CI` confer nothing — they are still read and passed in, but only so
+/// [`no_daemon_allowed_from`]'s tests can pin that they never grant permission.
+/// See that function for why an ambient, inherited variable is the wrong
+/// channel for this decision.
+///
+/// What the answer actually controls is narrow: whether a command may skip
+/// autostarting a daemon. It is NOT what protects the store from two writers —
+/// [`require_exclusive_store_access`] takes the write lease at the moment of
+/// the write and fails closed if anyone holds it, so a bypass against a
+/// daemon-owned database is refused rather than silently doubled. A wrong
+/// answer here costs a confusing refusal, not corruption.
 fn no_daemon_allowed() -> bool {
     no_daemon_allowed_from(
         std::env::var_os("NESTWEAVER_ALLOW_NO_DAEMON").is_some(),
@@ -9140,9 +9152,10 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     }
     if warn {
         eprintln!(
-            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
-             bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
-             daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 to force the bypass."
+            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a test-harness-only escape \
+             hatch and is not permitted here. Routing through the daemon, which is the \
+             single writer for this database. If you are trying to stop a daemon that is \
+             holding the write lease, use `nestweaver daemon --db <path> stop`."
         );
     }
     true
