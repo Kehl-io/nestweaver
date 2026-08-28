@@ -28,24 +28,80 @@ use uuid::Uuid;
 use crate::protocol::{PROTOCOL_VERSION, error_code};
 use crate::tools;
 
-/// Tools that mutate server state and therefore require admin-level auth.
-/// Query tokens may only invoke read-only tools; mutating operations require
-/// the admin token when auth is configured.
+/// Declares the mutating-tool table once and projects it into the two shapes
+/// the codebase needs: the flat name list every gate already consults, and the
+/// per-tool MCP annotation classification the `tools/list` catalogue derives
+/// `destructiveHint`/`idempotentHint` from.
 ///
-/// This is the SINGLE canonical list of mutating MCP tool names. Both the
-/// HTTP/MCP gate (this module) and the daemon's gRPC gate
-/// (`nestweaver-daemon`) reference this const, so a new mutating tool cannot be
-/// added to one surface's gate while silently leaving the other open.
-pub const MUTATING_TOOLS: &[&str] = &[
-    "brain_add_source",
-    "brain_remove_source",
-    "brain_memory_consolidate",
-    "set_extension",
-    "prune_stale",
+/// A macro rather than two consts because nw-293 was caused by exactly this
+/// shape of restatement: `MUTATING_TOOLS` existed and was authoritative, but
+/// nothing projected it, so the wire had no idea which tools mutate. A second
+/// hand-written classification list would have re-opened the same gap the
+/// moment a seventh mutator arrived. Here it cannot: adding a name to this
+/// invocation requires classifying it in the same line.
+macro_rules! mutating_tools {
+    ($($(#[$meta:meta])* ($name:literal, $destructive:literal, $idempotent:literal)),* $(,)?) => {
+        /// Tools that mutate server state and therefore require admin-level auth.
+        /// Query tokens may only invoke read-only tools; mutating operations require
+        /// the admin token when auth is configured.
+        ///
+        /// This is the SINGLE canonical list of mutating MCP tool names. Both the
+        /// HTTP/MCP gate (this module) and the daemon's gRPC gate
+        /// (`nestweaver-daemon`) reference this const, so a new mutating tool cannot be
+        /// added to one surface's gate while silently leaving the other open.
+        pub const MUTATING_TOOLS: &[&str] = &[$($name),*];
+
+        /// `(name, destructiveHint, idempotentHint)` for every mutating tool,
+        /// in MCP `ToolAnnotations` terms. Projected from the same invocation
+        /// as [`MUTATING_TOOLS`], so the two can never disagree about
+        /// membership.
+        pub const MUTATING_TOOL_HINTS: &[(&str, bool, bool)] =
+            &[$(($name, $destructive, $idempotent)),*];
+    };
+}
+
+mutating_tools![
+    // Additive: it indexes content that was not in the graph. Idempotent by
+    // its own description — "re-indexing an existing source overwrites the
+    // previous index", so a repeat lands on the same state.
+    ("brain_add_source", false, true),
+    // "Removal is permanent." Idempotent because the tool documents re-running
+    // as the recovery path: "re-run only to retry the bookkeeping" — a second
+    // call against an already-removed target reports `committed: false` and
+    // changes nothing further.
+    ("brain_remove_source", true, true),
+    // Destructive because `apply: true` MOVES files the CALLER did not name,
+    // out of the paths they were at. Annotations are per-tool and cannot vary
+    // by argument, so the hint must describe the worst case, not the dry-run
+    // default. Non-idempotent because promotion follows a tier path
+    // (log -> idea -> project): re-running after an apply can promote the same
+    // note again.
+    ("brain_memory_consolidate", true, false),
+    // Writes exactly the one `(uid, key)` the caller named, to the value the
+    // caller supplied. Nothing the caller did not name is touched, and the
+    // same call twice leaves the same value.
+    ("set_extension", false, true),
+    // "Cannot undo — removed sources must be re-indexed." Idempotent for the
+    // same documented reason as `brain_remove_source`: a second run finds
+    // nothing further to prune.
+    ("prune_stale", true, true),
     // Rewrites the embedding artifact through the daemon's write gate. A
-    // read-only endpoint must neither advertise nor dispatch it.
-    "compact_embeddings",
+    // read-only endpoint must neither advertise nor dispatch it. NOT
+    // destructive: it reclaims only vectors that are already unreachable, so
+    // no live data is lost; a second run reclaims zero.
+    ("compact_embeddings", false, true),
 ];
+
+/// `(destructiveHint, idempotentHint)` for `name`, or `None` when the tool is
+/// not a mutator. The single lookup both the catalogue decorator and its test
+/// use, so neither can restate the table.
+#[must_use]
+pub fn mutating_tool_hints(name: &str) -> Option<(bool, bool)> {
+    MUTATING_TOOL_HINTS
+        .iter()
+        .find(|(tool, _, _)| *tool == name)
+        .map(|(_, destructive, idempotent)| (*destructive, *idempotent))
+}
 
 const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");

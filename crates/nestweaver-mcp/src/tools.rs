@@ -186,6 +186,45 @@ fn all_tool_schemas() -> Vec<Value> {
             })
         });
     }
+    // nw-293. Every tool must declare MCP `annotations`, DERIVED from
+    // `MUTATING_TOOLS` for exactly the reason the cache decoration above is
+    // derived from `CACHEABLE_TOOLS`: the classification already exists and is
+    // already authoritative (it is the gate both the HTTP surface and the
+    // daemon's gRPC surface enforce), so hand-annotating 42 schemas would
+    // create a second list that drifts the moment a seventh mutator lands.
+    // Zero of the 42 declared any annotation, which made `prune_stale`
+    // indistinguishable from `brain_status` on the wire.
+    //
+    // `annotations` is a SIBLING of `inputSchema` on the MCP `Tool` object, so
+    // it is inert for `tool_validators()` (which builds from
+    // `tool["inputSchema"]` only) and cannot affect `additionalProperties`.
+    for tool in &mut schemas {
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        // Not in the canonical mutating list => read-only, and a read-only
+        // tool is trivially non-destructive and idempotent.
+        let (read_only, destructive, idempotent) = match crate::http::mutating_tool_hints(name) {
+            Some((destructive, idempotent)) => (false, destructive, idempotent),
+            None => (true, false, true),
+        };
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "annotations".to_string(),
+            serde_json::json!({
+                "readOnlyHint": read_only,
+                "destructiveHint": destructive,
+                "idempotentHint": idempotent,
+                // Every tool here reads the LOCAL graph and local filesystem.
+                // `brain_add_source` is the only candidate for an open world
+                // and its own description rules it out: "Cannot index remote
+                // URLs directly — only local filesystem paths".
+                "openWorldHint": false,
+            }),
+        );
+    }
     schemas
 }
 
@@ -894,6 +933,126 @@ mod tool_schema_validation_tests {
             "these tools silently accept undeclared arguments, so a typo becomes a \
              wrong answer instead of an error: {permissive:?}"
         );
+    }
+
+    /// nw-293. Every registered tool must declare MCP `annotations`, and
+    /// `readOnlyHint` must be DERIVED from `MUTATING_TOOLS` rather than
+    /// restated by hand.
+    ///
+    /// Zero of 42 tools declared any annotation, so `prune_stale` and
+    /// `brain_status` were indistinguishable on the wire and no client could
+    /// build an auto-approve policy without hard-coding our tool names.
+    ///
+    /// Asserted over the REGISTRY, not a hand-listed set, so tool 43 cannot be
+    /// added without classifying it — the same rule
+    /// `every_registered_schema_rejects_unknown_arguments` enforces for
+    /// `additionalProperties`.
+    #[test]
+    fn every_registered_tool_declares_annotations_matching_the_mutating_list() {
+        const HINTS: &[&str] = &[
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ];
+
+        let payload = tool_list(false);
+        let tools = payload["tools"]
+            .as_array()
+            .expect("tool_list returns a tools array");
+
+        let mut missing = Vec::new();
+        let mut mislabelled = Vec::new();
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("registered tool has a name");
+            let Some(annotations) = tool.get("annotations").and_then(Value::as_object) else {
+                missing.push(name.to_string());
+                continue;
+            };
+            for hint in HINTS {
+                assert!(
+                    annotations.get(*hint).and_then(Value::as_bool).is_some(),
+                    "{name}.annotations.{hint} is absent or not a boolean; a client \
+                     cannot build an auto-approve policy from a partial annotation"
+                );
+            }
+            let declared_read_only = annotations["readOnlyHint"]
+                .as_bool()
+                .expect("checked above");
+            let actually_mutates = crate::http::MUTATING_TOOLS.contains(&name);
+            if declared_read_only == actually_mutates {
+                mislabelled.push(format!(
+                    "{name}: readOnlyHint={declared_read_only} but \
+                     MUTATING_TOOLS membership={actually_mutates}"
+                ));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these tools declare no `annotations`, so a mutating tool is \
+             indistinguishable from a read-only one on the wire: {missing:?}"
+        );
+        assert!(
+            mislabelled.is_empty(),
+            "`readOnlyHint` contradicts the authoritative MUTATING_TOOLS gate: {mislabelled:?}"
+        );
+
+        // The six mutators must additionally be recoverable as a SET from the
+        // annotations alone — that is the property an agent harness consumes.
+        let declared_mutators: BTreeSet<&str> = tools
+            .iter()
+            .filter(|t| t["annotations"]["readOnlyHint"] == json!(false))
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        let expected: BTreeSet<&str> = crate::http::MUTATING_TOOLS.iter().copied().collect();
+        assert_eq!(declared_mutators, expected);
+    }
+
+    /// A read-only tool must not claim it may destroy anything, and a mutator's
+    /// `destructiveHint`/`idempotentHint` must come from the single classified
+    /// table rather than a second hand-list.
+    #[test]
+    fn mutating_tool_hints_come_from_the_canonical_classification() {
+        let payload = tool_list(false);
+        let tools = payload["tools"].as_array().unwrap();
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = &tool["annotations"];
+            match crate::http::mutating_tool_hints(name) {
+                Some((destructive, idempotent)) => {
+                    assert_eq!(
+                        annotations["destructiveHint"],
+                        json!(destructive),
+                        "{name}: destructiveHint diverged from MUTATING_TOOL_HINTS"
+                    );
+                    assert_eq!(
+                        annotations["idempotentHint"],
+                        json!(idempotent),
+                        "{name}: idempotentHint diverged from MUTATING_TOOL_HINTS"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        annotations["destructiveHint"],
+                        json!(false),
+                        "{name} is read-only but advertises that it may destroy data"
+                    );
+                    assert_eq!(annotations["idempotentHint"], json!(true), "{name}");
+                }
+            }
+            // Every tool in this binary reads the LOCAL graph and local
+            // filesystem. `brain_add_source`, the only candidate for an open
+            // world, states in its own description that it "cannot index remote
+            // URLs directly — only local filesystem paths".
+            assert_eq!(
+                annotations["openWorldHint"],
+                json!(false),
+                "{name}: no tool in this server reaches an open world"
+            );
+        }
     }
 
     #[test]
