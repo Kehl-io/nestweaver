@@ -340,6 +340,48 @@ pin_sha = "abc123"    # optional: pin to a specific commit
 > `--config` the daemon falls back to a system-root denylist, and this list is
 > what prevents watching an entire home directory.
 
+##### `exclude` — skip code the repo tracks
+
+`exclude` takes glob patterns, matched against repo-relative paths, for source
+the repo commits but the graph should not hold.
+
+```toml
+[[repos]]
+url = "git@github.com:myorg/wordpress-site.git"
+exclude = [
+  "web/wp-content/plugins/**",   # vendored third-party plugins
+  "web/wp-content/themes/**",    # upstream theme
+  "**/*.min.js",                 # generated bundles
+]
+```
+
+**Reach for this last.** The indexer walks with `ignore::WalkBuilder` and
+already honours `.gitignore`, the global gitignore, and `.git/info/exclude`, so
+anything git ignores is skipped with no configuration at all. If the goal is to
+drop build output, dependencies, or media, put it in one of those files and
+every other tool benefits too. `exclude` exists for the case they cannot
+express: code that is *deliberately committed* and still not yours to reason
+about — a vendored plugin tree, a checked-in SDK, generated bundles.
+
+Notes:
+
+- **Matching.** The `url` is compared against the repo's identity url **or** its
+  local checkout path, so `git@github.com:myorg/site.git`,
+  `file:///Users/me/dev/site`, and `/Users/me/dev/site` all resolve to the same
+  entry. Requiring one spelling would let a declared exclude silently do
+  nothing.
+- **Pruning.** A pattern ending in `/**` also prunes the directory it names, so
+  an excluded tree is never descended rather than walked and filtered. That is
+  the difference between skipping 8 GB and reading it.
+- **Invalid globs fail the load.** A malformed pattern is an error naming the
+  offending glob, not a silently dropped rule — a typo that quietly indexed a
+  vendored tree is the failure this is guarding against.
+- **Excludes apply to every index route** — full, incremental, and the
+  first-index fallback — so a `--no-daemon` run and a daemon run index the same
+  files.
+- **Changing `exclude` needs a re-index** of that repo. Previously-indexed files
+  are not retroactively removed by editing the config alone.
+
 ### Optional sections
 
 #### `[daemon]` — Daemon lifecycle policy

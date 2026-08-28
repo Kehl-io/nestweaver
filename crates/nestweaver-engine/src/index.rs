@@ -2022,6 +2022,89 @@ pub fn index_directory_with_options(
     )
 }
 
+/// Everything an index run needs beyond the store and the two paths.
+///
+/// Introduced to stop the entry points growing a new name per knob — the four
+/// `_with_store` / `_cancellable` / `_and_limits` spellings above are that
+/// growth, and `index_directory_with_options_and_limits` was already named for
+/// "options" it never had. It also removes a real hazard: the previous
+/// signature passed `instance_id`, `repo_url` and `indexed_sha` as three
+/// adjacent `&str`, so any two could be swapped at a call site and still
+/// compile.
+///
+/// The older functions remain as thin wrappers that build this with no
+/// excludes, so existing callers are unaffected.
+#[derive(Debug, Clone)]
+pub struct IndexOptions {
+    pub instance_id: String,
+    pub repo_url: String,
+    pub indexed_sha: String,
+    pub force: bool,
+    pub name: Option<String>,
+    pub limits: crate::index_limits::IndexLimits,
+    /// `[[repos]] exclude` globs — code this repo tracks that the graph should
+    /// not hold. Empty for every caller that does not resolve an instance
+    /// config. See `InstanceConfig::exclude_globs_for`.
+    pub excludes: Vec<String>,
+}
+
+impl IndexOptions {
+    pub fn new(instance_id: &str, repo_url: &str, indexed_sha: &str) -> Self {
+        Self {
+            instance_id: instance_id.to_string(),
+            repo_url: repo_url.to_string(),
+            indexed_sha: indexed_sha.to_string(),
+            force: false,
+            name: None,
+            limits: crate::index_limits::IndexLimits::default(),
+            excludes: Vec::new(),
+        }
+    }
+
+    pub fn force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    pub fn name(mut self, name: Option<&str>) -> Self {
+        self.name = name.map(str::to_string);
+        self
+    }
+
+    pub fn limits(mut self, limits: crate::index_limits::IndexLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn excludes(mut self, excludes: &[String]) -> Self {
+        self.excludes = excludes.to_vec();
+        self
+    }
+}
+
+/// Index a directory using [`IndexOptions`], opening the store for writing.
+/// The CLI's entry point; mirrors `index_directory_with_options_and_limits`.
+pub fn index_directory_with_opts(
+    repo_path: &Path,
+    db_path: &Path,
+    opts: &IndexOptions,
+) -> Result<IndexResult, anyhow::Error> {
+    let store = open_store_for_writing_with_recovery(db_path)?;
+    index_directory_with_store_inner(&store, repo_path, db_path, opts, None)
+}
+
+/// Index into an existing store using [`IndexOptions`]. This is the funnel the
+/// older `_and_limits` entry points delegate to.
+pub fn index_directory_with_store_opts(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    opts: &IndexOptions,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_store_inner(store, repo_path, db_path, opts, cancel)
+}
+
 /// Index a directory with an explicit validated source-input ceiling.
 #[allow(clippy::too_many_arguments)]
 pub fn index_directory_with_options_and_limits(
@@ -2094,12 +2177,10 @@ pub fn index_directory_with_store_and_limits(
         store,
         repo_path,
         db_path,
-        instance_id,
-        repo_url,
-        indexed_sha,
-        force,
-        name,
-        limits,
+        &IndexOptions::new(instance_id, repo_url, indexed_sha)
+            .force(force)
+            .name(name)
+            .limits(limits),
         None,
     )
 }
@@ -2153,12 +2234,10 @@ pub fn index_directory_with_store_cancellable_and_limits(
         store,
         repo_path,
         db_path,
-        instance_id,
-        repo_url,
-        indexed_sha,
-        force,
-        name,
-        limits,
+        &IndexOptions::new(instance_id, repo_url, indexed_sha)
+            .force(force)
+            .name(name)
+            .limits(limits),
         Some(cancel),
     )
 }
@@ -2209,14 +2288,17 @@ fn index_directory_with_store_inner(
     store: &GraphStore,
     repo_path: &Path,
     db_path: &Path,
-    instance_id: &str,
-    repo_url: &str,
-    indexed_sha: &str,
-    force: bool,
-    name: Option<&str>,
-    limits: crate::index_limits::IndexLimits,
+    opts: &IndexOptions,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<IndexResult, anyhow::Error> {
+    // Bind the option fields to the names the body already uses, so this
+    // refactor changes the signature without touching the 700-line body.
+    let instance_id = opts.instance_id.as_str();
+    let repo_url = opts.repo_url.as_str();
+    let indexed_sha = opts.indexed_sha.as_str();
+    let force = opts.force;
+    let name = opts.name.as_deref();
+    let limits = opts.limits;
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
@@ -2235,7 +2317,8 @@ fn index_directory_with_store_inner(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
-    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .excluding(&opts.excludes)?;
     // Local filesystem index: the working tree location is `repo_path`.
     // Persisted as `root_path` on the Repo node so consumers never derive
     // a disk path from the identity `url`.
@@ -5124,10 +5207,38 @@ pub fn incremental_index_with_name_and_limits(
         repo_url,
         name,
         limits,
+        &[],
         &FileSystemIndexEpilogueIo,
     )
 }
 
+/// Incremental index honouring per-repo `exclude` globs.
+///
+/// The full-index route resolves excludes through [`IndexOptions`]; this is its
+/// twin, so a `--no-daemon` incremental run does not quietly index a tree the
+/// configured excludes remove.
+pub fn incremental_index_with_excludes(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_name_and_io(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        &FileSystemIndexEpilogueIo,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn incremental_index_with_name_and_io(
     repo_path: &Path,
     db_path: &Path,
@@ -5135,6 +5246,7 @@ fn incremental_index_with_name_and_io(
     repo_url: &str,
     name: Option<&str>,
     limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
     epilogue_io: &dyn IndexEpilogueIo,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // nw-C1: reconcile BEFORE the `old_sha == new_sha` short-circuit below,
@@ -5165,6 +5277,7 @@ fn incremental_index_with_name_and_io(
                     name,
                     force: false,
                     limits,
+                    excludes,
                     epilogue_io,
                 },
             );
@@ -5186,6 +5299,7 @@ fn incremental_index_with_name_and_io(
                     name,
                     force: false,
                     limits,
+                    excludes,
                     epilogue_io,
                 },
             );
@@ -5222,6 +5336,7 @@ fn incremental_index_with_name_and_io(
                 // graph and installs its replacement in one transaction.
                 force: true,
                 limits,
+                excludes,
                 epilogue_io,
             },
         );
@@ -5247,6 +5362,7 @@ fn incremental_index_with_name_and_io(
                 // graph and installs its replacement in one transaction.
                 force: true,
                 limits,
+                excludes,
                 epilogue_io,
             },
         );
@@ -5269,7 +5385,8 @@ fn incremental_index_with_name_and_io(
         "processing incremental changes"
     );
 
-    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .excluding(excludes)?;
     let mut result = IncrementalResult::default();
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
@@ -6438,6 +6555,10 @@ struct FullIndexFallback<'a> {
     name: Option<&'a str>,
     force: bool,
     limits: crate::index_limits::IndexLimits,
+    /// `[[repos]] exclude` globs. The fallback builds its OWN reader, so it
+    /// must carry these too — a fresh index takes this path, and without them
+    /// the very first index of a repo silently ignored its excludes.
+    excludes: &'a [String],
     epilogue_io: &'a dyn IndexEpilogueIo,
 }
 
@@ -6454,6 +6575,7 @@ fn full_index_fallback(
         name,
         force,
         limits,
+        excludes,
         epilogue_io,
     } = request;
     // Load filemeta sidecar for tiered change detection even in fallback.
@@ -6477,7 +6599,8 @@ fn full_index_fallback(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
-    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits);
+    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .excluding(excludes)?;
     let local_root = repo_path.display().to_string();
     // nw-022: capture a re-identified legacy file:// uid so its filemeta
     // slice is dropped below, mirroring index_directory_with_store_inner.
@@ -9653,6 +9776,61 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn index_applies_repo_exclude_globs() {
+        // End-to-end: an exclude declared in IndexOptions must reach the real
+        // index run, not just the reader. `vendor/**` cannot be relied on here
+        // (SKIP_DIRS already drops `vendor`), so use a directory the indexer
+        // would otherwise happily walk.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("plugins/acme")).unwrap();
+        fs::write(
+            src.join("plugins/acme/thirdparty.js"),
+            "function vendored() {}",
+        )
+        .unwrap();
+        fs::write(src.join("main.js"), "function visible() {}").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let opts = IndexOptions::new("test", "https://example.com/repo", "abc123")
+            .excludes(&["plugins/**".to_string()]);
+        let result = index_directory_with_store_opts(&store, &src, &db_path, &opts, None).unwrap();
+
+        assert_eq!(
+            result.files_count, 1,
+            "only main.js should survive the exclude"
+        );
+    }
+
+    #[test]
+    fn index_without_excludes_still_walks_everything() {
+        // Counterweight for the test above: the same tree with NO excludes must
+        // index both files. Without this, an exclude bug that dropped every
+        // file would still satisfy `files_count == 1` if the fixture happened
+        // to contain one file.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("plugins/acme")).unwrap();
+        fs::write(
+            src.join("plugins/acme/thirdparty.js"),
+            "function vendored() {}",
+        )
+        .unwrap();
+        fs::write(src.join("main.js"), "function visible() {}").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let opts = IndexOptions::new("test", "https://example.com/repo", "abc123");
+        let result = index_directory_with_store_opts(&store, &src, &db_path, &opts, None).unwrap();
+
+        assert_eq!(
+            result.files_count, 2,
+            "both files must index when nothing is excluded"
+        );
+    }
+
+    #[test]
     fn index_skips_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
@@ -12478,6 +12656,7 @@ function hello(name) { return "Hello " + name; }
             repo_url,
             None,
             crate::index_limits::IndexLimits::default(),
+            &[],
             &InjectedIndexEpilogueIo {
                 fail_generation: true,
                 fail_compute: true,
@@ -12553,6 +12732,7 @@ function hello(name) { return "Hello " + name; }
             repo_url,
             None,
             crate::index_limits::IndexLimits::default(),
+            &[],
             &InjectedIndexEpilogueIo {
                 fail_generation: true,
                 fail_compute: true,
