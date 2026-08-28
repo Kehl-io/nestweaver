@@ -13,19 +13,31 @@
   name: (identifier) @name) @definition.class
 
 ; Module-level variable assignments (NAME = value at top level)
+;
+; nw-326: the `(module)` anchor is what makes this pattern "top level only",
+; but the capture must sit on the ASSIGNMENT. Capture placement IS the span
+; contract in parse.rs, so anchoring and capturing on the same node gave every
+; module-level variable start_line 1 and end_line EOF+1 -- the WHOLE FILE --
+; plus the file's content_hash and the file's first line as its signature.
 (module
   (expression_statement
     (assignment
-      left: (identifier) @name))) @definition.variable
+      left: (identifier) @name) @definition.variable))
 
 ; Class-level attribute assignments (NAME = value inside class body)
+;
+; nw-326, same shape: the `(class_definition)` anchor scopes the pattern, the
+; capture belongs on the assignment. Anchoring and capturing on the class gave
+; every attribute the whole class as its span, hash and signature.
 (class_definition
   body: (block
     (expression_statement
       (assignment
-        left: (identifier) @name)))) @definition.property
+        left: (identifier) @name) @definition.property)))
 
 ; Instance attributes set via self.x = ... inside methods
+;
+; nw-326, same shape again.
 (class_definition
   body: (block
     (function_definition
@@ -34,7 +46,7 @@
           (assignment
             left: (attribute
               object: (identifier) @_self
-              attribute: (identifier) @name))))))) @definition.property
+              attribute: (identifier) @name)) @definition.property)))))
 
 ; Call expressions
 (call

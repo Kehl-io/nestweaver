@@ -2,18 +2,6 @@
 source: crates/nestweaver-parser/src/parse.rs
 expression: "parsed_symbols(\"simple.sv\", &source)"
 ---
-- name: compute_checksum
-  kind: Function
-  start_line: 1
-  end_line: 78
-  signature: "`include \"common_defs.svh\""
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-  scope_chain: ~
 - name: top_module
   kind: Module
   start_line: 6
@@ -86,6 +74,18 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   type_info: ~
   parent_name: packet
   scope_chain: packet
+- name: compute_checksum
+  kind: Function
+  start_line: 62
+  end_line: 68
+  signature: "function automatic int compute_checksum(input bit [7:0] data[], input int len);"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
 - name: sub_module
   kind: Module
   start_line: 70

@@ -2038,6 +2038,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn python_module_level_variable_span_is_the_assignment_not_the_file() {
+        // nw-326 / F-CODE-4: queries/python.scm attached `@definition.variable`
+        // to the `(module)` node, so parse.rs recorded start_line=1 and
+        // end_line=EOF+1 for every module-level assignment. `read-symbols` then
+        // returned the whole file for a one-line variable — strictly worse than
+        // reading the file.
+        let source = "\
+import os
+
+
+def helper():
+    return 1
+
+
+LOGGER = os.getcwd()
+MAX_RETRIES = 3
+";
+        let parsed = parse_source(Path::new("mod_vars.py"), source).unwrap();
+
+        let logger = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "LOGGER" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable LOGGER must be extracted");
+
+        assert_eq!(logger.start_line, 8, "span must start at the assignment");
+        assert_eq!(logger.end_line, 8, "a one-line assignment is a one-line span");
+
+        let max_retries = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable MAX_RETRIES must be extracted");
+        assert_eq!(max_retries.start_line, 9);
+        assert_eq!(max_retries.end_line, 9);
+
+        // Two distinct one-line variables must not share a content hash — with
+        // the capture on `(module)` both hashed the whole file.
+        assert_ne!(
+            logger.content_hash, max_retries.content_hash,
+            "distinct variables must not share the file's content hash"
+        );
+        // The signature is the assignment, not the file's first line.
+        assert_eq!(logger.signature, "LOGGER = os.getcwd()");
+
+        // Regression guard: functions and classes were already exact and must
+        // stay exact.
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!((helper.start_line, helper.end_line), (4, 5));
+    }
+
+    #[test]
+    fn python_class_and_instance_attribute_spans_are_the_assignment_not_the_class() {
+        // nw-326, the "where else" half: queries/python.scm has the SAME
+        // container-as-capture shape for class attributes and for
+        // `self.x = ...` instance attributes, both anchored on
+        // `(class_definition)` — so every attribute got the whole class as its
+        // span, its content hash and its signature.
+        let source = "\
+class Config:
+    DEBUG = False
+    RETRIES = 3
+
+    def __init__(self):
+        self.name = \"config\"
+        self.size = 0
+";
+        let parsed = parse_source(Path::new("config.py"), source).unwrap();
+        let prop = |n: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == n && s.kind == SymbolKind::Property)
+                .unwrap_or_else(|| panic!("property {n} must be extracted"))
+        };
+
+        assert_eq!((prop("DEBUG").start_line, prop("DEBUG").end_line), (2, 2));
+        assert_eq!((prop("RETRIES").start_line, prop("RETRIES").end_line), (3, 3));
+        assert_eq!((prop("name").start_line, prop("name").end_line), (6, 6));
+        assert_eq!((prop("size").start_line, prop("size").end_line), (7, 7));
+
+        assert_ne!(
+            prop("DEBUG").content_hash,
+            prop("RETRIES").content_hash,
+            "distinct attributes must not share the class's content hash"
+        );
+        // The class-body anchor must be preserved: the attribute still knows
+        // which class it belongs to.
+        assert_eq!(prop("DEBUG").parent_name.as_deref(), Some("Config"));
+        assert_eq!(prop("name").parent_name.as_deref(), Some("Config"));
+
+        // Regression guard: the class itself still spans the whole class.
+        let class = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .expect("class Config");
+        assert_eq!((class.start_line, class.end_line), (1, 7));
+    }
+
     // ── Hash test ──────────────────────────────────────────────────────────
 
     #[test]
@@ -3422,6 +3527,29 @@ use crate::config::{Settings, load as load_config};
             modules.iter().any(|s| s.name == "sub_module"),
             "should find module 'sub_module'; got: {:?}",
             modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sv_standalone_function_span_is_the_declaration_not_the_file() {
+        // nw-326, "where else does this property hold?": systemverilog.scm had
+        // the identical container-as-capture shape with the FILE ROOT as the
+        // container, so `compute_checksum` (simple.sv:62-68) was recorded as
+        // lines 1-78 with the file's leading `include as its signature. The
+        // checked-in snapshot had the defect baked in as expected output.
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let f = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute_checksum")
+            .expect("standalone function must be extracted");
+        assert_eq!((f.start_line, f.end_line), (62, 68));
+        assert!(
+            f.signature.starts_with("function automatic int compute_checksum"),
+            "signature must be the declaration, not the file's first line: {:?}",
+            f.signature
         );
     }
 
