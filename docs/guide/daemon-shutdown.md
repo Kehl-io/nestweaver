@@ -173,6 +173,43 @@ Restart=on-failure
 Even so, this is a **hard deadline** systemd enforces. It moves the exposure
 window; it does not remove it.
 
+### Stopping the wrong daemon — **the supervisor does not own the lock**
+
+`systemctl stop nestweaver` stops *the unit*. It does not stop "the daemon
+serving this database", and those are not always the same process.
+
+Every CLI command auto-starts a daemon on first use. So if the unit is stopped
+when an index runs, the index starts its **own ad-hoc daemon**, unsupervised and
+outside systemd's control. A later `systemctl stop` then reports success having
+stopped nothing, the ad-hoc daemon keeps the write lock, and the next write —
+typically `embed` — blocks against a daemon the operator does not know exists.
+
+Use the CLI, which resolves the owner rather than the supervisor:
+
+```sh
+nestweaver daemon --db /var/lib/nestweaver/brain.lbug stop
+```
+
+`daemon stop` checks the launchd job (macOS) *and* falls through to the
+pidfile/socket, so it only reports success once nothing is left serving the
+database. That fall-through exists precisely for this case.
+
+For a scripted refresh, start the supervised service **before** the first
+command that touches the database, so no ad-hoc daemon is ever created:
+
+```sh
+systemctl start nestweaver          # or: nestweaver daemon start --config <toml>
+nestweaver brain refresh ... --config <toml>
+```
+
+> **Linux status is currently ambiguous about this.** On macOS `daemon status`
+> distinguishes `Daemon is running (launchd agent)` from a bare PID. On Linux
+> both a systemd-supervised daemon and an ad-hoc one print
+> `Daemon is running (PID <n>)`, so status alone will not tell you which you
+> have. Until that is disclosed, treat `systemctl is-active` and
+> `nestweaver daemon status` as answering **different questions**: whether the
+> unit is up, versus whether something is serving the database.
+
 ### macOS, launchd — **was the tightest exposure of all; now partially fixed**
 
 `daemon start` on macOS installs a launch agent. The generated plist set **no
