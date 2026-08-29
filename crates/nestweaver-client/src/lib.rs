@@ -24,6 +24,17 @@ use tracing::{info, warn};
 
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
+/// A cheap predicate polled by [`DaemonClient::wait_ready`] that can end the
+/// wait early.
+///
+/// Returns `Some(reason)` once the daemon being waited on is KNOWN never to
+/// become ready. A readiness wait can only ever observe absence — the socket is
+/// not there yet — which is the same observation for "booting" and for "died
+/// before it could bind". This is the channel that tells them apart, so the
+/// caller who spawned the process can report its failure in milliseconds
+/// instead of at the boot ceiling (nw-309).
+pub type ReadinessAbort<'a> = &'a mut dyn FnMut() -> Option<String>;
+
 /// Client for the NestWeaver daemon.
 ///
 /// Wraps a tonic gRPC channel connected over a Unix domain socket.
@@ -1156,6 +1167,7 @@ impl DaemonClient {
         timeout: std::time::Duration,
         ignore_pid: Option<i32>,
         expected_config: &RestartConfig,
+        mut abort: Option<ReadinessAbort<'_>>,
     ) -> Result<nestweaver_proto::HealthCheckResponse> {
         let started = std::time::Instant::now();
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
@@ -1207,6 +1219,23 @@ impl DaemonClient {
                     tracing::debug!("wait_ready: daemon not connectable yet: {error:#}")
                 }
                 Err(_) => break,
+            }
+
+            // nw-309: the pidfile check below can only fire once a pidfile
+            // EXISTS. A daemon that dies before writing one — it cannot create
+            // its runtime directory, the config is rejected, the binary is
+            // wrong — leaves this loop nothing to observe, so "will never boot"
+            // is indistinguishable from "still booting" and the caller waits
+            // out the whole ceiling. `abort` is the other channel: the caller
+            // holding the spawned process can answer that question directly.
+            if let Some(abort) = abort.as_mut()
+                && let Some(reason) = abort()
+            {
+                anyhow::bail!(
+                    "daemon for {} will not become healthy: {reason}. Check the daemon logs: {}",
+                    db_path.display(),
+                    nestweaver_daemon::lifecycle::log_hint(&instance_id),
+                );
             }
 
             if let Some(pid) = autostart::read_pid(&pidfile)

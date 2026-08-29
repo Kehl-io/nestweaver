@@ -498,7 +498,7 @@ fn ensure_daemon_with_spawn_lock_impl(
         // The winner is not trusted merely because it accepted a Unix
         // connection. It must attest the same automatic/captured config plan
         // before this contender releases the transaction lock.
-        wait_for_daemon_ready(db_path, None, &restart_config)?;
+        wait_for_daemon_ready(db_path, None, &restart_config, None)?;
         return Ok(sock);
     }
 
@@ -509,7 +509,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     let stale_pid = read_pid(&pidfile);
 
     // Spawn the daemon as a detached child.
-    spawn_daemon(db_path, restart_config.as_path(), spawn_lock)?;
+    let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock)?;
 
     // Poll until the socket accepts connections, then release the spawn-lock so the next
     // waiter's re-check observes a ready daemon instead of spawning another.
@@ -517,7 +517,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     // Watch the pidfile here: this is the one path where the daemon we are
     // waiting on was just spawned by us, so a process that has already exited
     // means it will never bind and there is nothing to wait for.
-    let waited = wait_for_daemon_ready(db_path, stale_pid, &restart_config);
+    let waited = wait_for_daemon_ready(db_path, stale_pid, &restart_config, Some(&mut launcher));
     waited?;
 
     info!("daemon started, socket at {}", sock.display());
@@ -575,21 +575,91 @@ fn daemon_start_command(
     cmd
 }
 
+/// How much of the launcher's stderr to keep for the failure report.
+const LAUNCHER_STDERR_CAP: usize = 8 * 1024;
+
+/// The `nestweaver daemon … start` process we spawned, kept alive so its exit
+/// can be observed.
+///
+/// nw-309: this used to be `cmd.spawn()?;` — the `Child` dropped on the spot
+/// and all three streams sent to `/dev/null`. Two things went with it. The exit
+/// STATUS, which is the authoritative answer to "will this daemon ever bind"
+/// (the launcher itself waits for health and reports), and the stderr that says
+/// WHY. Without either, a daemon that died in 60 ms was indistinguishable from
+/// one still booting, and the caller waited out the full 30 s ceiling.
+struct SpawnedLauncher {
+    child: std::process::Child,
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl SpawnedLauncher {
+    /// `Some(reason)` once the launcher has exited unsuccessfully.
+    ///
+    /// Non-blocking, and deliberately silent about a launcher that exited
+    /// SUCCESSFULLY: that means the daemon booted, and the readiness wait is
+    /// then waiting on something that genuinely is coming.
+    fn failure(&mut self) -> Option<String> {
+        let status = self.child.try_wait().ok().flatten()?;
+        if status.success() {
+            return None;
+        }
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            Some(format!("`daemon start` exited with {status}"))
+        } else {
+            Some(format!("`daemon start` exited with {status}: {stderr}"))
+        }
+    }
+}
+
 /// Spawn `nestweaver daemon --db <path> start [--config <path>]` as a detached child.
-fn spawn_daemon(db_path: &Path, config_path: Option<&Path>, spawn_lock: &SpawnLock) -> Result<()> {
+fn spawn_daemon(
+    db_path: &Path,
+    config_path: Option<&Path>,
+    spawn_lock: &SpawnLock,
+) -> Result<SpawnedLauncher> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
     let mut cmd = daemon_start_command(&exe, db_path, config_path);
     spawn_lock.configure_child_handoff(&mut cmd)?;
-    cmd.stdin(std::process::Stdio::null())
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn daemon via {}", exe.display()))?;
 
-    Ok(())
+    // Drain stderr on a detached thread rather than reading it at failure time.
+    // Reading on demand would block forever if the daemon grandchild inherited
+    // the write end and kept it open, and an undrained pipe stalls a chatty
+    // launcher once the OS buffer fills — either would turn a diagnostic into a
+    // hang, which is worse than the stall being fixed.
+    let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(mut pipe) = child.stderr.take() {
+        let sink = std::sync::Arc::clone(&stderr);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let Ok(mut held) = sink.lock() else { break };
+                        if held.len() < LAUNCHER_STDERR_CAP {
+                            held.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(SpawnedLauncher { child, stderr })
 }
 
 /// Check legacy $TMPDIR-based socket paths for an old daemon and stop it.
@@ -721,17 +791,26 @@ fn wait_for_daemon_ready(
     db_path: &Path,
     ignore_pid: Option<i32>,
     expected_config: &crate::RestartConfig,
+    launcher: Option<&mut SpawnedLauncher>,
 ) -> Result<()> {
     let timeout = daemon_boot_timeout();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("create runtime for daemon readiness")?;
+    // Only the caller that SPAWNED the daemon can answer "is it already dead";
+    // every other waiter passes `None` and keeps today's behaviour (nw-309).
+    let mut probe = launcher.map(|l| move || l.failure());
+    let abort: Option<crate::ReadinessAbort<'_>> = match probe.as_mut() {
+        Some(f) => Some(f),
+        None => None,
+    };
     runtime.block_on(crate::DaemonClient::wait_ready(
         db_path,
         timeout,
         ignore_pid,
         expected_config,
+        abort,
     ))?;
     Ok(())
 }

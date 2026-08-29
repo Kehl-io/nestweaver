@@ -30,6 +30,117 @@ pub type CodeEdge = (String, String, f64);
 /// Edge data with type and evidence: (source_uid, target_uid, edge_type, confidence, evidence_json).
 pub type TypedEdge = (String, String, String, f64, String);
 
+/// One vault relation, described exactly once.
+///
+/// nw-288 was two independent enumerations of "the vault's edges" in one
+/// codebase — [`crate::GraphScope::notes_only`] ranked the subgraph over nine
+/// relations while `export` ranked it over zero — and only one of them was
+/// complete. Both now read this list, so a vault relation added to ranking
+/// cannot be missed by export a second time.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultRelation {
+    /// The relationship table name as it appears in the graph.
+    pub rel: &'static str,
+    pub from: &'static str,
+    pub to: &'static str,
+    /// Whether the relation carries a `confidence` property to select.
+    pub scored: bool,
+    /// Whether the relation belongs to [`crate::GraphScope::notes_only`].
+    ///
+    /// `VAULT_HAS_NOTE` does not: that scope declares Note/Heading/Section/Tag
+    /// nodes and no Vault node, so including the edge would point PPR at a
+    /// node it never enumerated. Export DOES declare Vault nodes, which is
+    /// why the inventory carries the relation and the scope filters it out
+    /// rather than the inventory omitting it.
+    pub in_notes_scope: bool,
+}
+
+/// Every relation wholly inside the vault domain.
+pub const VAULT_RELATIONS: &[VaultRelation] = &[
+    VaultRelation {
+        rel: "VAULT_HAS_NOTE",
+        from: "Vault",
+        to: "Note",
+        scored: false,
+        in_notes_scope: false,
+    },
+    VaultRelation {
+        rel: "NOTE_HAS_HEADING",
+        from: "Note",
+        to: "Heading",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "NOTE_HAS_SECTION",
+        from: "Note",
+        to: "Section",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "HEADING_HAS_SECTION",
+        from: "Heading",
+        to: "Section",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "HEADING_PARENT",
+        from: "Heading",
+        to: "Heading",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "WIKILINK_TO_NOTE",
+        from: "Section",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "WIKILINK_TO_HEADING",
+        from: "Section",
+        to: "Heading",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "NOTE_TAGGED_WITH",
+        from: "Note",
+        to: "Tag",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "SECTION_TAGGED_WITH",
+        from: "Section",
+        to: "Tag",
+        scored: false,
+        in_notes_scope: true,
+    },
+];
+
+/// The cross-domain bridges. Without these a "code + vault" export is two
+/// disconnected components rather than the unified graph the product claims.
+pub const VAULT_CODE_BRIDGE_RELATIONS: &[VaultRelation] = &[
+    VaultRelation {
+        rel: "REFERENCES_CODE_NOTE_TO_SYMBOL",
+        from: "Note",
+        to: "Symbol",
+        scored: true,
+        in_notes_scope: false,
+    },
+    VaultRelation {
+        rel: "REFERENCES_CODE_SECTION_TO_SYMBOL",
+        from: "Section",
+        to: "Symbol",
+        scored: true,
+        in_notes_scope: false,
+    },
+];
+
 /// Combined symbols and edges for clustering algorithms.
 pub type CodeGraph = (Vec<SymbolBasic>, Vec<CodeEdge>);
 
@@ -2156,6 +2267,77 @@ impl GraphStore {
             }
         }
 
+        Ok(edges)
+    }
+
+    /// Returns every vault-domain edge with its type label, in the same shape
+    /// as [`load_typed_edges`](Self::load_typed_edges).
+    ///
+    /// nw-288. `load_typed_edges` was written for the code graph and every one
+    /// of its Cypher patterns is `(a:Symbol)-[...]->(b:Symbol)` or
+    /// `(f:File)-[...]->(s:Symbol)`, so it is structurally incapable of
+    /// returning a vault edge. When the vault subgraph was added to `export`
+    /// nothing extended it, and `--scope vault` emitted 28,254 nodes and ZERO
+    /// edges against a graph with ~1,800 demonstrable wikilinks — a node list,
+    /// not a subgraph.
+    ///
+    /// `include_code_bridges` adds the Note/Section → Symbol relations, which
+    /// only belong in a scope that also declares Symbol nodes. Under
+    /// `--scope vault` the caller's endpoint filter would drop them anyway;
+    /// passing `false` says so rather than relying on that.
+    pub fn load_vault_typed_edges(
+        &self,
+        include_code_bridges: bool,
+    ) -> Result<Vec<TypedEdge>, StoreError> {
+        let conn = self.conn()?;
+        let mut edges: Vec<TypedEdge> = Vec::new();
+        let relations = VAULT_RELATIONS.iter().chain(
+            VAULT_CODE_BRIDGE_RELATIONS
+                .iter()
+                .filter(|_| include_code_bridges),
+        );
+        for relation in relations {
+            let query = if relation.scored {
+                format!(
+                    "MATCH (a:{})-[r:{}]->(b:{}) RETURN a.uid, b.uid, r.confidence",
+                    relation.from, relation.rel, relation.to
+                )
+            } else {
+                format!(
+                    "MATCH (a:{})-[:{}]->(b:{}) RETURN a.uid, b.uid",
+                    relation.from, relation.rel, relation.to
+                )
+            };
+            let result = match conn.query(&query) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::trace!(
+                        "load_vault_typed_edges: {} skipped (table may not exist): {error}",
+                        relation.rel
+                    );
+                    continue;
+                }
+            };
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                // Structural containment carries no confidence column; a
+                // wikilink whose score failed to read is still a real edge, so
+                // fall back to 1.0 rather than dropping it.
+                let confidence = if relation.scored {
+                    extract_f64(&row, 2).unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                edges.push((
+                    src,
+                    dst,
+                    relation.rel.to_string(),
+                    confidence,
+                    String::new(),
+                ));
+            }
+        }
         Ok(edges)
     }
 

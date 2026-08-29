@@ -6,6 +6,7 @@ pub mod error;
 pub mod generation;
 pub mod git_activity_sidecar;
 pub mod index_publication;
+mod open_crash_guard;
 pub mod ranking;
 pub mod read;
 pub mod regex;
@@ -33,6 +34,7 @@ pub use ranking::{
 };
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
+    VAULT_CODE_BRIDGE_RELATIONS, VAULT_RELATIONS, VaultRelation,
 };
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,

@@ -83,6 +83,10 @@ fn cypher_edge_label(db_label: &str) -> &str {
         "EXTENDS_SYM" => "EXTENDS",
         "IMPLEMENTS_SYM" => "IMPLEMENTS",
         "INCLUDES_SYM" => "INCLUDES",
+        // nw-288: the vault relation table names are already the clean labels
+        // (`WIKILINK_TO_NOTE`, `NOTE_HAS_SECTION`, …), so they fall through
+        // unchanged. Listed here only so the next reader does not have to
+        // check whether they need a mapping.
         other => other,
     }
 }
@@ -476,9 +480,30 @@ pub fn export_graphml_scoped(
     }
 
     // ── Edges ────────────────────────────────────────────────────────────
-    let typed_edges = store
-        .load_typed_edges()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    //
+    // nw-288: `load_typed_edges` returns ONLY Symbol->Symbol and File->Symbol
+    // relations, so before this the vault half of the export emitted nodes and
+    // NO EDGES AT ALL — a node list, not a subgraph, in the scope whose own
+    // doc comment promises "and their edges". The endpoint filter below was
+    // never the bug; there was nothing for it to filter.
+    let mut typed_edges = if scope.includes_code() {
+        store
+            .load_typed_edges()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        Vec::new()
+    };
+    if scope.includes_vault() {
+        // The cross-domain bridges only belong in a scope that also declares
+        // Symbol nodes; under `--scope vault` the endpoint filter would drop
+        // them anyway, and saying so is better than relying on that.
+        typed_edges.extend(
+            store
+                .load_vault_typed_edges(scope.includes_code())
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+    }
+    let typed_edges = typed_edges;
     // Only edges whose BOTH endpoints were declared above. Previously every
     // edge was written unconditionally, so `--scope vault` emitted every
     // CALLS/IMPORTS edge between `sym:` ids that the file never declared.
@@ -860,6 +885,196 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// nw-288 / F-EXPORT-1. A vault export with nodes and no edges is a node
+    /// list, not a subgraph.
+    ///
+    /// The sibling test above asserts vault NODES are emitted and that no edge
+    /// dangles — an invariant that is VACUOUSLY TRUE over an empty edge set,
+    /// which is exactly how a 28,254-node / 0-edge export passed CI against a
+    /// graph with ~1,800 demonstrable wikilinks. This test asserts the edges
+    /// POSITIVELY, per family, so neither an empty nor a partial edge set can
+    /// pass it.
+    #[test]
+    fn graphml_vault_export_emits_the_vault_edges_not_just_orphan_nodes() {
+        use nestweaver_schema::{Note, NoteKind, Tag, Vault};
+
+        let store = populated_store();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:test".to_string(),
+                name: "Test Vault".to_string(),
+                root_path: "/tmp/vault".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        for id in ["one", "two"] {
+            store
+                .insert_note(&Note {
+                    uid: format!("note:test:{id}"),
+                    vault_uid: "vlt:test".to_string(),
+                    file_path: format!("{id}.md"),
+                    title: format!("Note {id}"),
+                    note_kind: NoteKind::General,
+                    word_count: 3,
+                    content_hash: "hash".to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: "sec:test:one:0".to_string(),
+                note_uid: "note:test:one".to_string(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 3,
+                text_hash: "hash".to_string(),
+                text_content: "see [[two]]".to_string(),
+                word_count: 3,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .insert_tag(&Tag {
+                uid: "tag:test:topic".to_string(),
+                vault_uid: "vlt:test".to_string(),
+                name: "topic".to_string(),
+            })
+            .unwrap();
+
+        // The four edge families the export is supposed to carry.
+        store
+            .batch_insert_vault_note_edges(&[("vlt:test", "note:test:one")])
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[("note:test:one", "sec:test:one:0")])
+            .unwrap();
+        store
+            .batch_insert_wikilink_to_note_edges(&[(
+                "sec:test:one:0",
+                "note:test:two",
+                0.9f32,
+                "two",
+                "two",
+            )])
+            .unwrap();
+        store
+            .batch_insert_note_tag_edges(&[("note:test:one", "tag:test:topic")])
+            .unwrap();
+
+        let mut buf = Vec::new();
+        export_graphml_scoped(&store, &mut buf, ExportScope::Vault).unwrap();
+        let vault_only = String::from_utf8(buf).unwrap();
+
+        // THE ASSERTION THE OLD TEST COULD NOT MAKE: edges exist at all.
+        assert!(
+            vault_only.contains("<edge id="),
+            "a vault export with zero <edge> elements is a node list, not a subgraph"
+        );
+        // …and each family individually, so a partial fix cannot pass.
+        for (expected, family) in [
+            (
+                r#"source="vlt:test" target="note:test:one""#,
+                "vault -> note",
+            ),
+            (
+                r#"source="note:test:one" target="sec:test:one:0""#,
+                "note -> section structure",
+            ),
+            (
+                r#"source="sec:test:one:0" target="note:test:two""#,
+                "wikilink",
+            ),
+            (
+                r#"source="note:test:one" target="tag:test:topic""#,
+                "tag association",
+            ),
+        ] {
+            assert!(
+                vault_only.contains(expected),
+                "{family} edges are missing from the vault export"
+            );
+        }
+
+        // The default scope must carry them too — the report hit `--scope all`
+        // as well, where 432,232 edges were emitted and NOT ONE touched a
+        // vault node.
+        let mut all = Vec::new();
+        export_graphml_scoped(&store, &mut all, ExportScope::All).unwrap();
+        let all = String::from_utf8(all).unwrap();
+        assert!(
+            all.contains(r#"source="sec:test:one:0" target="note:test:two""#),
+            "the default scope drops vault edges too"
+        );
+        // …while still carrying the code graph it always carried.
+        assert!(all.contains(r#"<data key="kind">Function</data>"#));
+
+        // And the invariant the old test asserted must still hold.
+        for (name, graph) in [("vault", &vault_only), ("all", &all)] {
+            let declared: std::collections::HashSet<&str> = graph
+                .match_indices(r#"<node id=""#)
+                .filter_map(|(at, marker)| {
+                    let rest = &graph[at + marker.len()..];
+                    rest.find('"').map(|end| &rest[..end])
+                })
+                .collect();
+            for (at, marker) in graph.match_indices(r#"<edge id=""#) {
+                let rest = &graph[at + marker.len()..];
+                for attribute in [r#"source=""#, r#"target=""#] {
+                    let from = rest.find(attribute).expect("edge declares both endpoints")
+                        + attribute.len();
+                    let value = &rest[from..from + rest[from..].find('"').unwrap()];
+                    assert!(
+                        declared.contains(value),
+                        "{name}: endpoint {value} appears in no <node> element"
+                    );
+                }
+            }
+        }
+    }
+
+    /// nw-288, structurally. Two independent enumerations of "the vault's
+    /// edges" in one codebase is what let export miss every one of them while
+    /// ranking traversed nine. There is now one inventory; this pins that both
+    /// consumers read it, so adding a vault relation to ranking cannot silently
+    /// skip export a second time.
+    #[test]
+    fn vault_ranking_and_export_read_one_edge_inventory() {
+        let ranked: std::collections::HashSet<&str> = nestweaver_store::VAULT_RELATIONS
+            .iter()
+            .filter(|relation| relation.in_notes_scope)
+            .map(|relation| relation.rel)
+            .collect();
+        let scope = nestweaver_store::GraphScope::notes_only();
+        assert_eq!(
+            scope.edge_queries.len(),
+            ranked.len(),
+            "notes_only() must be generated from the shared inventory"
+        );
+        for relation in &ranked {
+            assert!(
+                scope
+                    .edge_queries
+                    .iter()
+                    .any(|query| query.query.contains(&format!(":{relation}]"))),
+                "{relation} is in the inventory but notes_only() does not traverse it"
+            );
+        }
+        // Export's loader covers the inventory INCLUDING the relations that
+        // ranking deliberately excludes (VAULT_HAS_NOTE has no Vault node in
+        // the notes scope; the code bridges have no Symbol node).
+        assert!(
+            nestweaver_store::VAULT_RELATIONS
+                .iter()
+                .any(|relation| relation.rel == "VAULT_HAS_NOTE" && !relation.in_notes_scope),
+            "the inventory must carry the relations export needs and ranking does not"
+        );
     }
 
     /// The scope policy both transports share.

@@ -1474,15 +1474,20 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
             // `--instance` IS carried per-request, so it works. Restarting the
             // daemon under a config also works, and is named as the second
             // option because it is the one a `--config` user actually wants.
+            //
+            // nw-310: the consolidation half used to emit
+            // `--from <one> --to <keep>` with `ambiguous` bound on the line
+            // below. Same renderer as the direct route, so the two routes
+            // cannot drift the way this pair already had.
             "this database holds data under {} instances ({}), and neither this \
              request nor the daemon's configuration named one, so there is no safe \
              default.\nName one per-request with `--instance <id>`; or restart the \
              daemon under a config that names one (`nestweaver daemon --db <path> \
              stop`, then `start --config <path>`) — a `--config` on this command \
-             cannot reach a daemon that is already running; or consolidate them \
-             with `nestweaver instance merge --from <one> --to <keep>`.",
+             cannot reach a daemon that is already running; or {}",
             ambiguous.len(),
-            ambiguous.join(", ")
+            ambiguous.join(", "),
+            nestweaver_engine::instance_remedy::instance_consolidation_remedy(&ambiguous, None)
         )));
     }
     // nw-286: the RESOLUTION is as live as the ambiguity check above. This

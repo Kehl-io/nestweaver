@@ -697,19 +697,31 @@ impl GraphScope {
                 "MATCH (s:Section) RETURN s.uid".to_string(),
                 "MATCH (t:Tag) RETURN t.uid".to_string(),
             ],
-            edge_queries: vec![
-                // Structural containment edges: no confidence property → defaults to 1.0.
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_HEADING]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_PARENT]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                // Wikilinks carry confidence — query the property explicitly.
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_NOTE]->(b:Note) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_HEADING]->(b:Heading) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
-                // Tag edges: no confidence property → defaults to 1.0.
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[:SECTION_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
-            ],
+            // nw-288: built from the ONE shared vault-relation inventory
+            // (`crate::read::VAULT_RELATIONS`) rather than hand-written here,
+            // so a relation added for ranking cannot go missing from export —
+            // which is exactly how a 28,254-node / 0-edge vault export shipped.
+            edge_queries: crate::read::VAULT_RELATIONS
+                .iter()
+                .filter(|relation| relation.in_notes_scope)
+                .map(|relation| ScopedEdgeQuery {
+                    query: if relation.scored {
+                        // Wikilinks carry confidence — query it explicitly.
+                        format!(
+                            "MATCH (a:{})-[r:{}]->(b:{}) RETURN a.uid, b.uid, r.confidence",
+                            relation.from, relation.rel, relation.to
+                        )
+                    } else {
+                        // Structural containment: no confidence property, so
+                        // `load_ppr_graph` fills the null column with 1.0.
+                        format!(
+                            "MATCH (a:{})-[:{}]->(b:{}) RETURN a.uid, b.uid",
+                            relation.from, relation.rel, relation.to
+                        )
+                    },
+                    edge_type: None,
+                })
+                .collect(),
         }
     }
 

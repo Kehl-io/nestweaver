@@ -5161,3 +5161,735 @@ credential_method = "gh"
         );
     }
 }
+
+// ── nw-284 / S2: a mutating command may infer its source OR its target ────
+
+/// nw-284 / S2. A bare `nestweaver index` — neither source nor target stated —
+/// must refuse, because it would otherwise index the current directory into
+/// whatever `NESTWEAVER_DB` happens to name. This fired against the production
+/// graph during the 8.0.0 post-release hunt (102 files, 2329 symbols, repos
+/// 43 -> 44) and exited 0.
+///
+/// The test owns its environment end to end: cwd is a temp dir, NESTWEAVER_DB
+/// is set to a path inside that same temp dir, and no assertion depends on any
+/// inherited variable.
+#[test]
+fn index_refuses_when_neither_repo_nor_db_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.py"), "def f():\n    return 1\n").unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .arg("index")
+        .assert()
+        .code(64)
+        // names the inferred SOURCE
+        .stderr(contains(cwd.display().to_string()))
+        // names the inferred TARGET and where it came from
+        .stderr(contains(ambient_db.display().to_string()))
+        .stderr(contains("NESTWEAVER_DB"))
+        // offers a remedy that actually discriminates
+        .stderr(contains("--repo").and(contains("--db")));
+
+    // The refusal must be total: nothing was written to the ambient target.
+    assert!(
+        !ambient_db.exists(),
+        "a refused index must not create or touch the ambient database"
+    );
+}
+
+/// The companion half of S2, and the reason the guard is not "make --repo
+/// required": stating EITHER end is intent, and must still work.
+#[test]
+fn index_still_runs_when_only_one_end_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.py"), "def f():\n    return 1\n").unwrap();
+    let stated_db = dir.path().join("stated.lbug");
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Source inferred from cwd, target stated -> allowed.
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["index", "--db"])
+        .arg(&stated_db)
+        .assert()
+        .success();
+    assert!(stated_db.exists());
+    assert!(!ambient_db.exists());
+
+    // Target inferred from the environment, source stated -> also allowed.
+    let second = dir.path().join("second.lbug");
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .env("NESTWEAVER_DB", &second)
+        .args(["index", "--repo"])
+        .arg(&cwd)
+        .assert()
+        .success();
+    assert!(second.exists());
+}
+
+/// S2 is a property, not a fix to `index`. `watch` shares the shape
+/// byte-for-byte and is strictly worse — it writes for as long as it runs — so
+/// it must refuse identically.
+#[test]
+fn watch_refuses_when_neither_repo_nor_db_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Bounded on purpose. Without the guard `watch` does not exit — it starts
+    // watching and writes to the ambient database for as long as it runs,
+    // which is precisely why this arm is a refusal and not a warning. An
+    // unbounded assert here would hang the suite on a regression instead of
+    // reporting one.
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .arg("watch")
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .code(64)
+        .stderr(contains("NESTWEAVER_DB"));
+    assert!(!ambient_db.exists());
+}
+
+/// `ui --watch` re-indexes continuously and had NO `--repo` flag at all, so
+/// its source was not even statable. The flag added by this fix is what makes
+/// the guard satisfiable rather than a dead end.
+#[test]
+fn ui_watch_refuses_a_wholly_inferred_write_and_can_be_corrected() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["ui", "--watch"])
+        .assert()
+        .code(64)
+        .stderr(contains("NESTWEAVER_DB"));
+
+    // The remedy the refusal names must exist on this command.
+    nestweaver_cmd()
+        .args(["ui", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--repo"));
+}
+
+/// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
+/// later widening of the guard cannot quietly break plain `nestweaver ui`.
+#[test]
+fn ui_without_watch_is_not_subject_to_the_s2_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Port 0 is refused by the server, so this cannot bind and hang; what
+    // matters is only that it is NOT the usage refusal.
+    let output = nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["ui", "--no-open", "--port", "0"])
+        .timeout(std::time::Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(64),
+        "plain `ui` reads; S2 must not refuse it: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── nw-285: a corrupt database must fail closed, not die on a signal ─────
+
+/// nw-285 / F-CLI-3. Opening a corrupted `.lbug` killed the process with
+/// SIGSEGV (exit 139) and printed nothing at all — indistinguishable from
+/// being killed by something else. The fault is in the vendored lbug C++
+/// (`StorageManager::recover` -> `PrimaryKeyIndex::load`), a pinned crates.io
+/// dependency, so this pins OUR half of the contract: whatever the engine does
+/// internally, the process terminates NORMALLY with a diagnosable message.
+///
+/// Corruption starts well PAST the header on purpose. A header/magic-byte
+/// check would pass the real reproduction — which overwrote 40%-60% of a
+/// 5.6 GB file — and would therefore pass its own regression test while
+/// missing the fault. That is the exact failure class this release exists to
+/// remove, so the fixture is built to rule it out.
+///
+/// Several ranges are exercised because WHICH range faults is a function of
+/// where this fixture's index pages happen to land: some return an ordinary
+/// `Err`, some take the process down. Both are acceptable outcomes; dying on a
+/// signal is not. Asserting the invariant over the set is what keeps this test
+/// honest at fixture scale instead of pinning one lucky offset.
+#[test]
+#[cfg(unix)]
+fn opening_a_corrupted_database_never_dies_on_a_signal() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Enough symbols that the on-disk index has real structure to corrupt: a
+    // near-empty database keeps all its data in the WAL, where this recipe
+    // would touch nothing and the test would pass vacuously.
+    for i in 0..120 {
+        let mut body = String::new();
+        for j in 0..20 {
+            body.push_str(&format!(
+                "def f{i}_{j}(x):\n    return x + {j}\n\nclass C{i}_{j}:\n    def g(self):\n        return f{i}_{j}(1)\n\n"
+            ));
+        }
+        std::fs::write(repo.join(format!("m{i}.py")), body).unwrap();
+    }
+    let pristine = dir.path().join("pristine.lbug");
+    nestweaver_cmd()
+        .args(["index", "--db"])
+        .arg(&pristine)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+
+    let size = std::fs::metadata(&pristine).unwrap().len();
+    assert!(
+        size > 1024 * 1024,
+        "the fixture database is {size} bytes — too small for the corruption to \
+         land on real on-disk index structures, which would make this test pass \
+         for the wrong reason"
+    );
+
+    let mut crashed_at_least_once = false;
+    for (index, (from, to)) in [(0.005, 0.2), (0.05, 0.95), (0.4, 0.6)].iter().enumerate() {
+        let db = dir.path().join(format!("corrupt{index}.lbug"));
+        std::fs::copy(&pristine, &db).unwrap();
+        let start = (size as f64 * from) as u64;
+        let end = (size as f64 * to) as u64;
+        assert!(
+            start > 8192,
+            "corruption must begin past any header, or a header check could \
+             satisfy this test without touching the fault"
+        );
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+            file.seek(SeekFrom::Start(start)).unwrap();
+            file.write_all(&vec![0xFFu8; (end - start) as usize])
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let output = nestweaver_cmd()
+            .args(["brain", "status", "--db"])
+            .arg(&db)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // THE PRIMARY ASSERTION.
+        assert!(
+            output.status.signal().is_none(),
+            "corrupting {from}-{to} of the database killed the process with \
+             signal {:?} (139 == SIGSEGV); it must fail closed instead. \
+             stderr: {stderr}",
+            output.status.signal()
+        );
+
+        if output.status.code() == Some(0) {
+            // This range did not disturb anything the open reads. Not a
+            // failure — just a range that proves nothing.
+            continue;
+        }
+
+        // Whatever the engine did, the user must be able to act on it.
+        // Matched on the FILE NAME, not the full path: miette hard-wraps the
+        // rendered diagnostic at the terminal width, so a long temp path is
+        // split across lines and a whole-path `contains` would fail on a
+        // message that does name it.
+        let file_name = db.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            stderr.contains(&file_name),
+            "the error must name the database it could not open: {stderr}"
+        );
+        if stderr.contains("the storage engine crashed while reading it") {
+            crashed_at_least_once = true;
+            assert!(
+                stderr.contains("restore") || stderr.contains("re-index"),
+                "a crash attribution must offer a way out: {stderr}"
+            );
+        }
+    }
+
+    // If NO range faulted, this fixture never exercised the guard and the test
+    // would be green while proving nothing — say so rather than pass.
+    assert!(
+        crashed_at_least_once,
+        "no corruption range reached the crashing code path, so this run did \
+         not exercise the crash-attribution guard at all"
+    );
+}
+
+// ── nw-309: an exists-but-unopenable --db must fail on the store ─────────
+
+/// nw-309 / F-CLI-1. A `--db` path that EXISTS but is not a database was
+/// admitted to the daemon-autostart route, and the client's boot-readiness
+/// wait has no failure channel for a daemon that never gets far enough to
+/// publish a live PID — so the caller paid the full 30s boot ceiling before
+/// the direct path produced the correct exit 1. A genuinely NONEXISTENT path
+/// was fast, because that case had a guard.
+///
+/// Pinned to the DAEMON route (`env_remove`) because the stall only existed on
+/// the route that dials. The ceiling is left at its default and the budget is
+/// far under it, so this test cannot be satisfied by shortening the timeout —
+/// only by giving the decision a failure channel.
+#[test]
+fn a_db_that_is_not_a_database_fails_fast_without_paying_the_boot_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake.lbug");
+    std::fs::write(&fake, b"hello not a db").unwrap();
+
+    let start = std::time::Instant::now();
+    let output = Command::cargo_bin("nestweaver")
+        .unwrap()
+        .args(["stale-check", "--db"])
+        .arg(&fake)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_DB")
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_ne!(output.status.code(), Some(0), "a broken DB must not exit 0");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?} against a 30s ceiling — an unopenable database is \
+         still being handed to the daemon route, where 'will never boot' is \
+         indistinguishable from 'still booting'. stderr: {stderr}"
+    );
+    // And the failure must say what is wrong, not just that something is.
+    assert!(
+        stderr.contains("fake.lbug"),
+        "the error must name the path: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a NestWeaver database"),
+        "the error must say WHY it is unusable: {stderr}"
+    );
+}
+
+/// The companion: a genuinely missing `--db` keeps its existing, different
+/// answer. nw-309 is about closing the gap between "missing" and "present but
+/// broken", not about collapsing them into one message.
+#[test]
+fn a_missing_db_still_reports_db_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.lbug");
+
+    nestweaver_cmd()
+        .args(["stale-check", "--db"])
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(contains("nope.lbug"));
+    assert!(
+        !missing.exists(),
+        "a failed lookup must not create a database"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-297 — a summary printed beside a truncated list must describe the
+// POPULATION, not the page.
+// ---------------------------------------------------------------------------
+
+/// Build a vault with a known, unequal split: six links that resolve at a lower
+/// confidence tier (unique global filename-stem match, 0.90) and three that
+/// resolve to nothing at all.
+///
+/// The store emits the low-confidence group first, so any page shorter than six
+/// is a pure sample of the benign category — which is exactly the shape that
+/// made a 226-unresolved vault print `0 unresolved (genuinely broken)`.
+fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
+    let vault = root.join("vault");
+    std::fs::create_dir_all(vault.join("targets")).unwrap();
+    std::fs::create_dir_all(vault.join("sources")).unwrap();
+    for i in 1..=6 {
+        // Title deliberately unlike the stem, so the link misses the 1.0
+        // unique-title tier and lands on the 0.90 global-stem tier.
+        std::fs::write(
+            vault.join(format!("targets/stemkey-{i}.md")),
+            format!("---\ntitle: Utterly Different Title {i}\n---\n\nbody\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join(format!("sources/src{i}.md")),
+            format!("---\ntitle: Source {i}\n---\n\nSee [[stemkey-{i}]]\n"),
+        )
+        .unwrap();
+    }
+    for i in 1..=3 {
+        std::fs::write(
+            vault.join(format!("sources/miss{i}.md")),
+            format!("---\ntitle: Miss {i}\n---\n\nSee [[Nonexistent Note {i}]]\n"),
+        )
+        .unwrap();
+    }
+    vault
+}
+
+fn indexed_broken_links_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let vault = broken_links_vault(dir.path());
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+/// The headline classification must not move when `--limit` moves. A page of
+/// four said `0 unresolved (genuinely broken)` on a vault holding three.
+#[test]
+fn broken_links_classification_counts_the_population_not_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let full = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "100", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let full = String::from_utf8(full.get_output().stdout.clone()).unwrap();
+    assert!(
+        full.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the whole population is 3 unresolved / 6 lower-tier: {full}"
+    );
+
+    let page = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let page = String::from_utf8(page.get_output().stdout.clone()).unwrap();
+    assert!(
+        page.contains("Broken / ambiguous wikilinks (4 of 9)"),
+        "the page itself is still bounded by --limit: {page}"
+    );
+    assert!(
+        page.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the classification describes the population, not the page: {page}"
+    );
+}
+
+/// `--json` must carry the same split, so an agent does not have to re-derive
+/// it from a page that cannot answer the question.
+#[test]
+fn broken_links_json_carries_the_population_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--json", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+    assert_eq!(value["total"], 9, "payload: {out}");
+    assert_eq!(value["returned"], 4, "payload: {out}");
+    assert_eq!(
+        value["unresolved"], 3,
+        "the genuinely-broken count is a property of the vault: {out}"
+    );
+    assert_eq!(
+        value["low_confidence"], 6,
+        "and so is the benign count: {out}"
+    );
+}
+
+/// `memory lint` is the second surface onto the same `broken_links` call, so it
+/// corroborated the first only because it shared the defect.
+#[test]
+fn memory_lint_splits_the_broken_wikilink_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["memory", "lint", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("broken wikilinks:      9 (3 genuinely broken, 6 lower-tier resolutions)"),
+        "the bare length conflates two categories: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-287 — a precondition must test the operation the caller will perform.
+// ---------------------------------------------------------------------------
+
+/// `chmod 000` on a directory leaves `stat(2)` working — that needs `+x` on the
+/// PARENT, not on the directory itself — so `exists()` and `is_dir()` both pass
+/// on a vault that cannot be ENUMERATED. Only `read_dir` fails, two layers down,
+/// where the empty scan was indistinguishable from "the user deleted every
+/// note": `brain refresh` reported rc=0 and dropped the whole vault.
+fn unreadable_vault(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("keep.md"),
+        "---\ntitle: Keep Me\n---\n\nimportant content\n",
+    )
+    .unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    (vault, db)
+}
+
+fn make_readable_again(vault: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(vault, std::fs::Permissions::from_mode(0o755));
+}
+
+fn note_count(db: &std::path::Path) -> String {
+    let out = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn brain_refresh_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error, not an empty vault: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must say the directory could not be READ, not that it is not a \
+         directory — it is one: {stderr}"
+    );
+
+    let status = note_count(&db);
+    assert!(
+        status.contains("Notes:     1"),
+        "the indexed note must survive a refresh that could not see it: {status}"
+    );
+}
+
+#[test]
+fn brain_watch_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "watch"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "watch must refuse before it starts a watcher on a directory it cannot \
+         enumerate: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}
+
+/// The same `!exists() || !is_dir()` shape guards `detect-implicit-projects`,
+/// which enumerates the vault too. Not named in the nw-287 report — found by
+/// asking where else the property has to hold.
+#[test]
+fn detect_implicit_projects_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["detect-implicit-projects", "--vault"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error here too: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-308 / F-DC-13 — `hubs` / `bridges` must disclose stale rankings on the
+// JSON payload, not only on stderr.
+// ---------------------------------------------------------------------------
+
+/// Index a small repo and return its database path.
+fn indexed_ranking_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("a.js"),
+        "import { b } from './b.js';\nexport function a() { return b(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("b.js"),
+        "export function b() { return 1; }\nexport function c() { return b(); }\n",
+    )
+    .unwrap();
+    let db = dir.path().join("graph.lbug");
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+fn ranking_json(db: &std::path::Path, command: &str) -> serde_json::Value {
+    let out = nestweaver_cmd()
+        .args([command, "--json", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{command} --json: {e}\n{stdout}"))
+}
+
+/// A database whose resolver-generation record is absent is exactly the
+/// upgrade case: every repo's edges predate the current resolver, so every
+/// ranking is stale. `warn_stale_resolver_rankings` already says so — on
+/// stderr, where the `--json` consumer most likely to act on it cannot see it.
+fn forget_resolver_generation(db: &std::path::Path) {
+    let sidecar = sidecar_path(db, ".resolver_generation.json");
+    std::fs::remove_file(&sidecar).unwrap();
+}
+
+#[test]
+fn hubs_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    // Freshly indexed: current by construction, and the disclosure must not
+    // cry wolf.
+    let fresh = ranking_json(&db, "hubs");
+    assert_eq!(
+        fresh["rankings_stale"], false,
+        "a repo indexed by this binary is not stale: {fresh}"
+    );
+    assert!(
+        fresh["hubs"].is_array(),
+        "the rows keep their own key: {fresh}"
+    );
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "hubs");
+    assert_eq!(
+        stale["rankings_stale"], true,
+        "no generation record means every repo predates the current resolver: {stale}"
+    );
+    assert!(
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "and the payload must name which repos, so the caller can re-index them: {stale}"
+    );
+}
+
+/// `bridges` is the same shape one screen away. Fixing only `hubs` would be
+/// the same scoping error this remediation is about.
+#[test]
+fn bridges_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    let fresh = ranking_json(&db, "bridges");
+    assert_eq!(fresh["rankings_stale"], false, "payload: {fresh}");
+    assert!(fresh["bridges"].is_array(), "payload: {fresh}");
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "bridges");
+    assert_eq!(stale["rankings_stale"], true, "payload: {stale}");
+    assert!(
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "payload: {stale}"
+    );
+}
