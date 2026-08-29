@@ -2299,18 +2299,14 @@ impl GraphStore {
                 return Ok(std::collections::HashSet::new());
             }
         };
-        let result =
-            match conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))]) {
-                Ok(r) => r,
-                // nw-295. A failed query and "nothing has been modified
-                // since then" are different facts and used to be the same
-                // value — so a broken query presented as a confidently
-                // narrowed result and the caller lost every Note and Section
-                // without being told why. The `prepare` fallback above is
-                // different and stays: a Note table that does not exist means
-                // there genuinely are no notes.
-                Err(e) => return Err(e.into()),
-            };
+        // nw-295. A failed query and "nothing has been modified since then"
+        // are different facts and used to be the same value — the execute
+        // error was swallowed into `Ok(HashSet::new())`, so a broken query
+        // presented as a confidently narrowed result and the caller lost
+        // every Note and Section without being told why. The `prepare`
+        // fallback above is different and stays: a Note table that does not
+        // exist means there genuinely are no notes.
+        let result = conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))])?;
         let mut uids = std::collections::HashSet::new();
         for row in result {
             if let Some(Value::String(uid)) = row.first() {
@@ -2344,13 +2340,9 @@ impl GraphStore {
                     return Ok(uids);
                 }
             };
-            let result =
-                match conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))]) {
-                    Ok(r) => r,
-                    // Same argument one layer down: `continue` silently
-                    // dropped one note's sections from the answer.
-                    Err(e) => return Err(e.into()),
-                };
+            // Same argument one layer down: the `continue` this replaces
+            // silently dropped one note's sections from the answer.
+            let result = conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))])?;
             for row in result {
                 if let Some(Value::String(uid)) = row.first() {
                     uids.insert(uid.clone());
