@@ -2158,6 +2158,20 @@ fn normalize_relative(source_folder: &str, key: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Split a vault-relative folder into lowercased path components.
+///
+/// Empty components are dropped so `""`, `"/"` and `"a//b"` normalise the way
+/// callers expect, and the vault root becomes the empty prefix that is an
+/// ancestor of every folder.
+fn folder_components(folder: &str) -> Vec<String> {
+    folder
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_lowercase())
+        .collect()
+}
+
 struct WikilinkLookup<'a> {
     /// Path key → note_uid. Path keys are lowercased, with optional ".md"
     /// stripped, normalised to forward slashes.
@@ -2173,11 +2187,14 @@ struct WikilinkLookup<'a> {
     folder_by_note: HashMap<&'a str, &'a str>,
     /// note_uid → heading slug → heading_uid. For anchor resolution.
     headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>>,
-    /// (folder, lowercased title OR filename stem) → list of note_uids in
-    /// that folder. Drives priority-3 same-folder resolution: lets a
-    /// wikilink target match a sibling note by title OR by `note-name`
-    /// even when no global title match exists.
-    by_folder_name: HashMap<(String, String), Vec<&'a str>>,
+    /// (folder, lowercased filename stem) → note_uids in that folder.
+    ///
+    /// Stems ONLY. This map used to hold titles as well, under the same key
+    /// space, which broke its own `len() == 1` uniqueness test two ways: a note
+    /// whose title equalled its own stem pushed itself twice, and a folder
+    /// holding one title-match plus one stem-match looked ambiguous when those
+    /// are two different tiers by design (nw-290).
+    by_folder_stem: HashMap<(String, String), Vec<&'a str>>,
     /// All known note UIDs (F11: lets frontmatter reference a canonical UID).
     known_uids: HashSet<&'a str>,
 }
@@ -2190,7 +2207,7 @@ impl<'a> WikilinkLookup<'a> {
         let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
-        let mut by_folder_name: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
+        let mut by_folder_stem: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
         let mut known_uids: HashSet<&'a str> = HashSet::new();
 
         for note in notes {
@@ -2222,17 +2239,12 @@ impl<'a> WikilinkLookup<'a> {
             // filename stem. Lets `[[my-note]]` resolve to `folder/my-note.md`
             // even when no other note shares that title globally.
             let folder = note.folder.to_string();
-            let title_lc = note.title.to_lowercase();
-            by_folder_name
-                .entry((folder.clone(), title_lc))
-                .or_default()
-                .push(note.note_uid.as_str());
             if let Some(stem) = std::path::Path::new(&note.rel_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
             {
                 let stem_lc = stem.to_lowercase();
-                by_folder_name
+                by_folder_stem
                     .entry((folder, stem_lc.clone()))
                     .or_default()
                     .push(note.note_uid.as_str());
@@ -2256,7 +2268,7 @@ impl<'a> WikilinkLookup<'a> {
             by_stem,
             folder_by_note,
             headings_by_note,
-            by_folder_name,
+            by_folder_stem,
             known_uids,
         }
     }
@@ -2266,16 +2278,47 @@ impl<'a> WikilinkLookup<'a> {
     /// must never score below a later one, so downstream consumers can
     /// threshold on confidence without inverting the resolver's own ordering.
     ///
+    /// **FILENAME BEFORE TITLE; DIRECTORY PROXIMITY BEFORE GLOBALITY.**
+    ///
     /// - Priority 1: path match — target contains `/` and matches a known
-    ///   path (lowercased, with/without `.md`) → confidence 1.0.
-    /// - Priority 2: unique title match → confidence 1.0.
-    /// - Priority 3: same-folder match (filename stem or title scoped to the
-    ///   source's folder) → confidence 0.95.
-    /// - Priority 3b: unique global filename-stem match (Obsidian
-    ///   shortest-path) → confidence 0.9.
-    /// - Priority 4: alias match → unique 0.7, ambiguous split.
-    /// - Priority 5: ambiguous title match → same-folder narrowing 0.5,
+    ///   path (lowercased, with/without `.md`) → 1.0.
+    /// - Priority 2: same-folder filename stem → 0.95.
+    /// - Priority 3: NEAREST-ANCESTOR filename stem → 0.92.
+    /// - Priority 4: unique global filename stem (Obsidian shortest-path) → 0.90.
+    /// - Priority 5: unique global title → 1.0 when NO file in the vault
+    ///   carries that stem, otherwise 0.80.
+    /// - Priority 6: alias match → unique 0.7, ambiguous split.
+    /// - Priority 7: path-qualified fallback to the last segment → 0.85.
+    /// - Priority 8: ambiguous title match → same-folder narrowing 0.5,
     ///   otherwise split across all candidates.
+    ///
+    /// There is deliberately NO same-folder TITLE tier. Placed above priority 5
+    /// it made proximity DECREASE confidence — a title link to a sibling scored
+    /// 0.85 while the identical link written from another folder scored 1.0 —
+    /// and its only unique job, preferring a co-located note when a title is
+    /// ambiguous vault-wide, is already priority 8's narrowing. Adding it would
+    /// also push every same-folder title link into `broken_wikilinks`, which is
+    /// the surface nw-297 exists to keep readable.
+    ///
+    /// The title tier used to sit at priority 2, ABOVE every filename tier, and
+    /// return 1.0. One note that lost its `# ` heading therefore fell back to
+    /// its bare stem as a title, became the unique global title match, and
+    /// captured every unqualified `[[Name]]` in the vault — 12 of them across
+    /// five unrelated workspaces — at exactly the confidence
+    /// `GraphStore::broken_wikilinks` is defined to ignore (`WHERE r.confidence
+    /// < 1.0`). The wrong edge was unreportable by construction (nw-290).
+    ///
+    /// Priority 6's conditional is the precise statement of that: reaching the
+    /// title tier at all means NO filename tier matched. If the vault holds no
+    /// file with that stem, the title is the only evidence and 1.0 is honest.
+    /// If it does, the title match is a guess made AGAINST filename evidence
+    /// and must not claim certainty.
+    ///
+    /// Priority 3 is new (nw-306). Directory scoping used to be exact-folder
+    /// equality only, so `**Up:** [[_Overview]]` written one directory below
+    /// its hub matched nothing: the same-folder tier saw the wrong folder and
+    /// the global-stem tier required vault-wide uniqueness among 21 files named
+    /// `_Overview.md`. 38 real hub links were reported broken.
     fn resolve(&self, target: &str, source_folder: &str) -> ResolveOutcome {
         let key = target.trim().replace('\\', "/").to_lowercase();
         // nw-166: markdown links keep their extension (`[x](codebase-recon.md)`),
@@ -2332,37 +2375,37 @@ impl<'a> WikilinkLookup<'a> {
             }
         }
 
-        // Priority 2: unique title match.
-        if let Some(uids) = self.by_title.get(&key)
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 1.0,
-            }]);
-        }
-
-        // Priority 3: same-folder match.
-        // A wikilink `[[target]]` in note F/x.md resolves to F/y.md when
-        // F/y.md has either a title or a filename stem equal to `target`.
-        // This is the priority that lets sibling-relative links work
-        // without forcing the user to add aliases or write the full path.
-        // Also acts as ambiguity-breaker when multiple notes share a
-        // title and the source is co-located with one of them.
+        // Priority 2: same-folder filename stem.
+        // A wikilink `[[target]]` in note F/x.md resolves to F/target.md.
+        // This is the tier that lets sibling-relative links work without
+        // forcing the user to add aliases or write the full path, and it now
+        // runs ABOVE the title tiers — a filename is a stronger claim on a bare
+        // `[[Name]]` than a heading is (nw-290).
+        //
+        // It must stay at 0.95, not 1.0: `broken_wikilinks` selects
+        // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
+        // depends on a same-folder match remaining visible there as a
+        // resolved-but-lower-tier row.
         if let Some(uids) = self
-            .by_folder_name
+            .by_folder_stem
             .get(&(source_folder.to_string(), key.clone()))
             && uids.len() == 1
         {
             return ResolveOutcome::Resolved(vec![ResolveCandidate {
                 note_uid: uids[0].to_string(),
-                // Must stay above priority 3b's 0.9: this tier outranks the
-                // global-stem match, and confidence must not invert priority.
                 confidence: 0.95,
             }]);
         }
 
-        // Priority 3b: global filename-stem match (Obsidian shortest-path).
+        // Priority 3: nearest-ancestor filename stem (nw-306).
+        if let Some(uid) = self.nearest_ancestor_stem(&key, source_folder) {
+            return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: uid,
+                confidence: 0.92,
+            }]);
+        }
+
+        // Priority 4: global filename-stem match (Obsidian shortest-path).
         if let Some(uids) = self.by_stem.get(&key)
             && uids.len() == 1
         {
@@ -2372,7 +2415,23 @@ impl<'a> WikilinkLookup<'a> {
             }]);
         }
 
-        // Priority 4: alias match (unique → 0.7, ambiguous → split).
+        // Priority 5: unique global title. Full confidence ONLY when no file in
+        // the vault carries this stem — see the tier table above for why.
+        if let Some(uids) = self.by_title.get(&key)
+            && uids.len() == 1
+        {
+            let confidence = if self.by_stem.contains_key(&key) {
+                0.80
+            } else {
+                1.0
+            };
+            return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence,
+            }]);
+        }
+
+        // Priority 6: alias match (unique → 0.7, ambiguous → split).
         if let Some(uids) = self.by_alias.get(&key) {
             if uids.len() == 1 {
                 return ResolveOutcome::Resolved(vec![ResolveCandidate {
@@ -2420,9 +2479,14 @@ impl<'a> WikilinkLookup<'a> {
             }
         }
 
-        // Priority 5: ambiguous title match (was bundled inside priority
-        // 2; now it's the last-resort tier so we always try alias / same-
-        // folder first when the global title is non-unique).
+        // Priority 8: ambiguous title match (was bundled inside the unique
+        // title tier; now it's the last-resort tier so we always try alias /
+        // same-folder first when the global title is non-unique).
+        //
+        // Deliberately NOT extended to ambiguous STEMS. Two same-named files in
+        // unrelated folders are exactly the case the resolver should decline
+        // rather than guess at — the ancestor tier above already narrows the
+        // cases where the directory tree carries a real signal.
         if let Some(uids) = self.by_title.get(&key) {
             // Try same-folder narrowing inside the title-multiple case.
             let same_folder: Vec<&&str> = uids
@@ -2447,6 +2511,51 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         ResolveOutcome::Unresolved
+    }
+
+    /// Of the notes whose filename stem is `key`, return the one living in the
+    /// DEEPEST folder that is an ancestor of `source_folder`. `None` when no
+    /// candidate is an ancestor, or when two candidates tie at that depth.
+    ///
+    /// This is the vault's strongest structural signal — "the one nearest in
+    /// the directory tree" — and nothing consulted it: the only directory tier
+    /// was exact-folder string equality, and the global-stem tier required
+    /// vault-wide uniqueness (nw-306).
+    ///
+    /// Comparison is COMPONENT-WISE, not `str::starts_with`: the latter would
+    /// accept `Workspaces/Cortina` as an ancestor of
+    /// `Workspaces/Cortina Precision/plans`. Both sides are lowercased and
+    /// forward-slashed the way priority 1 already normalises paths.
+    fn nearest_ancestor_stem(&self, key: &str, source_folder: &str) -> Option<String> {
+        let uids = self.by_stem.get(key)?;
+        let source = folder_components(source_folder);
+
+        let mut best_depth: Option<usize> = None;
+        let mut best: Option<&str> = None;
+        let mut tied = false;
+        for uid in uids {
+            let folder = self.folder_by_note.get(uid).copied().unwrap_or("");
+            let candidate = folder_components(folder);
+            // The vault root (no components) is an ancestor of everything.
+            if candidate.len() > source.len() || candidate[..] != source[..candidate.len()] {
+                continue;
+            }
+            match best_depth {
+                Some(depth) if candidate.len() < depth => {}
+                Some(depth) if candidate.len() == depth => tied = true,
+                _ => {
+                    best_depth = Some(candidate.len());
+                    best = Some(uid);
+                    tied = false;
+                }
+            }
+        }
+        // Two notes with the same stem at the same ancestor depth carry equal
+        // evidence. Declining is the honest answer; guessing is nw-290.
+        if tied {
+            return None;
+        }
+        best.map(|uid| uid.to_string())
     }
 
     fn find_heading(&self, note_uid: &str, slug: &str) -> Option<String> {
@@ -2961,6 +3070,157 @@ mod tests {
         .expect("re-refreshing an already-empty vault deletes nothing");
         assert_eq!(second.index.notes_count, 0);
         assert_eq!(second.notes_deleted, 0);
+    }
+
+    /// nw-290: a note that falls back to a BARE title must not capture another
+    /// workspace's unqualified basename link. `Workspaces/NW/Backlog.md` has no
+    /// `# ` heading, so its title is the bare word "Backlog" and it is the
+    /// unique global title match — which today short-circuits above every
+    /// filename tier, at confidence 1.0.
+    #[test]
+    fn a_bare_title_does_not_steal_a_sibling_filename_link() {
+        let (_dir, root) = make_vault(&[
+            (
+                "Workspaces/Cortina/_Overview.md",
+                "# Cortina — Overview\n\n- [[Backlog]] — execution backlog\n",
+            ),
+            (
+                "Workspaces/Cortina/Backlog.md",
+                "# Cortina — Backlog\n\nbody\n",
+            ),
+            // No `# ` heading: title falls back to the bare stem "Backlog".
+            ("Workspaces/NW/Backlog.md", "some body, no heading\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let uid_of = |frag: &str| {
+            notes
+                .iter()
+                .find(|n| n.file_path.contains(frag))
+                .map(|n| n.uid.clone())
+                .unwrap()
+        };
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, uid_of("Workspaces/Cortina/_Overview.md"));
+        assert_eq!(
+            edges[0].1,
+            uid_of("Workspaces/Cortina/Backlog.md"),
+            "nw-290: the sibling FILENAME must win; a bare title in another \
+             workspace must not capture the link"
+        );
+    }
+
+    /// nw-290, second half: when a title match is the surviving evidence AND
+    /// files with that stem exist, it must not claim confidence 1.0 — that is
+    /// the band `broken_wikilinks` is defined to ignore (read.rs `WHERE
+    /// r.confidence < 1.0`), so a wrong-but-confident edge is unreportable.
+    #[test]
+    fn a_title_match_competing_with_filenames_never_scores_full_confidence() {
+        let (_dir, root) = make_vault(&[
+            ("logs/day.md", "# Day\n\nSee [[Backlog]].\n"),
+            ("Workspaces/NW/Backlog.md", "no heading here\n"),
+            ("Workspaces/Orbit/Backlog.md", "# Orbit — Backlog\n"),
+        ]);
+        let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let suspect = store.broken_wikilinks().unwrap();
+        let row = suspect
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("Backlog"))
+            .expect(
+                "nw-290: a 1-of-2 filename guess must be visible to broken-links; \
+                 today it resolves at 1.0 and never appears here",
+            );
+        assert!(row.confidence < 1.0, "got {}", row.confidence);
+    }
+
+    /// nw-306: `**Up:** [[_Overview]]` from a subfolder must resolve to the
+    /// nearest ancestor's `_Overview.md`. Today the only directory tier is
+    /// exact-folder equality, and the global-stem tier requires vault-wide
+    /// uniqueness, so 38 real hub links are reported broken.
+    #[test]
+    fn an_unqualified_basename_resolves_to_the_nearest_ancestor() {
+        let (_dir, root) = make_vault(&[
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            ("Workspaces/Orbit/_Overview.md", "# Orbit — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro-homepage.md",
+                "# Astro Homepage\n\n**Up:** [[_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.wikilinks_unresolved, 0,
+            "nw-306: a hub `Up:` link one directory down must not read as broken"
+        );
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let uid_of = |frag: &str| {
+            notes
+                .iter()
+                .find(|n| n.file_path.contains(frag))
+                .map(|n| n.uid.clone())
+                .unwrap()
+        };
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1,
+            uid_of("Workspaces/Cortina/_Overview.md"),
+            "the NEAREST ancestor wins; Orbit's identically-named hub must not"
+        );
+    }
+
+    /// The guard that keeps the nw-306 tier from becoming nw-290: an ancestor
+    /// tier must not fire when NO candidate is an ancestor. Companion to the
+    /// existing `ambiguous_global_stem_stays_unresolved`.
+    #[test]
+    fn the_ancestor_tier_does_not_fire_for_unrelated_directories() {
+        let (_dir, root) = make_vault(&[
+            ("logs/daily.md", "# Daily\n\nSee [[target]].\n"),
+            ("f/target.md", "# Alpha\n"),
+            ("g/target.md", "# Beta\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(
+            result.wikilinks_unresolved, 1,
+            "no candidate is an ancestor of logs/, so the resolver must still decline"
+        );
+    }
+
+    /// nw-306, the depth tie-break: two ancestors both carry the stem, so the
+    /// DEEPEST must win. A prefix comparison that stopped at "is an ancestor"
+    /// would be ambiguous here and decline.
+    #[test]
+    fn the_nearest_ancestor_wins_over_a_shallower_one() {
+        let (_dir, root) = make_vault(&[
+            ("_Overview.md", "# Vault Root Overview\n"),
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro.md",
+                "# Astro\n\n**Up:** [[_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.wikilinks_unresolved, 0);
+
+        let notes = store.list_notes(None).unwrap();
+        let cortina = notes
+            .iter()
+            .find(|n| n.file_path.contains("Workspaces/Cortina/_Overview.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1, cortina,
+            "the nearest ancestor must beat the vault-root one"
+        );
     }
 
     #[test]
