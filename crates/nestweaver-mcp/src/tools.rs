@@ -1725,6 +1725,76 @@ pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
 ///
 /// When `--tools` was specified, calls to tools outside the allowlist
 /// are rejected with a descriptive error.
+/// The one author of result provenance, and the type that proves it ran.
+///
+/// # What nw-315 claimed, and what was true
+///
+/// Lane D-2 landed "author result provenance once, at the tool layer" and
+/// asserted it with `every_tool_that_answers_stamps_its_provenance`, which
+/// calls [`dispatch`]. That test passed. The claim was still false: there are
+/// **two** dispatch tables in this file, not one.
+///
+/// - [`dispatch_cancellable`] — the in-process seam. Stamped.
+/// - [`dispatch_via_daemon`] — a PEER, not a caller: a second, complete tool
+///   table used whenever a daemon is running, which is the default
+///   single-machine setup (`src/main.rs` picks it at `run_stdio_server_daemon`).
+///   It stamped nothing.
+///
+/// Within that second table the behaviour split again, by whether the daemon
+/// RPC is a typed proto or a JSON pass-through. `hub_nodes` and
+/// `brain_doc_stats` forward `result_json` verbatim, so the daemon's own stamp
+/// survived; `brain_search` is a typed `BrainSearchResponse` with no `_meta`
+/// field, and the client then REBUILDS a fresh object in
+/// `daemon_brain_search_response_to_json`. That is why `brain_search` over MCP
+/// carried no `_meta` while `brain search --json` did, and why `hub_nodes` over
+/// MCP carried one while `hubs --json` did not.
+///
+/// # Why this is a type and not a convention
+///
+/// A test cannot cover the daemon seam: reaching a successful response there
+/// needs a live daemon, so every existing assertion about it (tools.rs:1143,
+/// 1222, 1234) is on the ERROR path. A convention that cannot be tested is how
+/// this defect got here. So the invariant is carried by the compiler instead:
+/// [`Unstamped`]'s field is private to THIS MODULE, and [`stamp`] is the only
+/// thing that can take a `Value` back out. A dispatch seam that returns an
+/// `Unstamped` has no way to hand it to a caller without the stamp having run,
+/// and a third seam added later cannot forget, because there is nothing else
+/// for it to return.
+mod provenance_seam {
+    use serde_json::Value;
+
+    /// A tool result that has NOT yet crossed the provenance seam.
+    pub(super) struct Unstamped(Value);
+
+    impl Unstamped {
+        pub(super) fn new(value: Value) -> Self {
+            Self(value)
+        }
+    }
+
+    /// Stamp `_meta` and release the value. The only way out of [`Unstamped`].
+    ///
+    /// `ensure` and not `set`: a federating caller knows strictly more than this
+    /// layer does (it can name upstreams and a background staleness verdict this
+    /// process cannot compute without I/O), so its richer stamp wins — including
+    /// the daemon's own stamp arriving through a `result_json` pass-through.
+    /// What this layer can say honestly is that the answer came from the local
+    /// graph, and saying that is what makes the absence of a richer verdict
+    /// legible.
+    pub(super) fn stamp(result: Unstamped) -> Value {
+        let mut value = result.0;
+        nestweaver_schema::provenance::ensure(
+            &mut value,
+            nestweaver_schema::provenance::SCOPE_LOCAL,
+            &[nestweaver_schema::provenance::SOURCE_LOCAL],
+            &[],
+        );
+        value
+    }
+}
+
+use provenance_seam::Unstamped;
+
 pub fn dispatch(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -1799,15 +1869,7 @@ pub fn dispatch_cancellable(
     // process cannot compute without I/O), so its richer stamp wins. What this
     // layer can say honestly is that the answer came from the local graph, and
     // saying that is what makes the absence of a richer verdict legible.
-    let result = result.map(|mut value| {
-        nestweaver_schema::provenance::ensure(
-            &mut value,
-            nestweaver_schema::provenance::SCOPE_LOCAL,
-            &[nestweaver_schema::provenance::SOURCE_LOCAL],
-            &[],
-        );
-        value
-    });
+    let result = result.map(|value| provenance_seam::stamp(Unstamped::new(value)));
 
     // Tools that do not consult PageRank still succeed during a dirty
     // publication, so the classification is applied to the ERROR rather than
@@ -10955,6 +11017,20 @@ pub fn dispatch_via_daemon(
     name: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
+    dispatch_via_daemon_inner(client, rt, name, args).map(provenance_seam::stamp)
+}
+
+/// The daemon-route tool table. Returns [`Unstamped`] so that no arm — the
+/// typed-proto rebuilds, the hand-built `json!` early returns, or the generic
+/// `result_json` pass-through — can reach a caller without crossing the
+/// provenance seam. See [`provenance_seam`].
+#[cfg(feature = "daemon")]
+fn dispatch_via_daemon_inner(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<Unstamped, anyhow::Error> {
     use nestweaver_proto::JsonRequest;
 
     // The daemon-proxy path must enforce the same --tools/--lite gate
@@ -10968,7 +11044,7 @@ pub fn dispatch_via_daemon(
     // brain_add_source is special: it maps to IndexRepo or IndexVault
     // (streaming RPCs) depending on the path content.
     if name == "brain_add_source" {
-        return dispatch_add_source_via_daemon(client, rt, args);
+        return dispatch_add_source_via_daemon(client, rt, args).map(Unstamped::new);
     }
 
     // brain_remove_source uses typed RemoveRepo/RemoveVault RPCs.
@@ -11006,7 +11082,7 @@ pub fn dispatch_via_daemon(
                 }))
                 .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
-            return Ok(json!({
+            return Ok(Unstamped::new(json!({
                 "kind": "repo",
                 "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
                 "uid": repo.uid,
@@ -11017,7 +11093,7 @@ pub fn dispatch_via_daemon(
                 // never as an RPC error that reads as "nothing happened".
                 "committed": inner.committed,
                 "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            }));
+            })));
         }
 
         // Not a repo — resolve as a vault (by uid, name, or root path).
@@ -11059,14 +11135,14 @@ pub fn dispatch_via_daemon(
                 }))
                 .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
-            return Ok(json!({
+            return Ok(Unstamped::new(json!({
                 "kind": "vault",
                 "name": vault.name.clone(),
                 "uid": vault.uid,
                 "notes_deleted": inner.notes_deleted,
                 "committed": inner.committed,
                 "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            }));
+            })));
         }
 
         return Err(anyhow::anyhow!(
@@ -11080,10 +11156,10 @@ pub fn dispatch_via_daemon(
             .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
             .map_err(|e| anyhow::anyhow!("prune_stale RPC failed: {}", e.message()))?;
         let inner = resp.into_inner();
-        return Ok(json!({
+        return Ok(Unstamped::new(json!({
             "removed_repos": inner.removed_repos,
             "removed_vaults": inner.removed_vaults
-        }));
+        })));
     }
 
     // Helper to parse string arrays from JSON args.
@@ -11274,6 +11350,42 @@ pub fn dispatch_via_daemon(
                 let resp = client.hub_nodes(req).await.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
+            // `compact_embeddings` is a typed RPC, not a `JsonRequest`, so the
+            // generic arm below cannot carry it — and it was absent from this
+            // table entirely. The tool is advertised by `tool_list` and answers
+            // on the direct route (`tool_compact_embeddings` dials a daemon of
+            // its own), but over MCP with a daemon running — the default — it
+            // fell through to `unknown` and failed.
+            //
+            // This is the THIRD list to drift the same way. nw-232 fixed the
+            // federation router and the hybrid stdio server after
+            // `compact_embeddings` went missing from both; nothing then checked
+            // this table, because nothing enumerated it. See
+            // `every_registered_tool_routes_to_a_real_arm_on_the_daemon_seam`,
+            // which found this one.
+            "compact_embeddings" => {
+                let req = tonic::Request::new(nestweaver_proto::CompactEmbeddingsRequest {
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                });
+                let resp = client
+                    .compact_embeddings(req)
+                    .await
+                    .map_err(grpc_status_err)?;
+                let inner = resp.into_inner();
+                Ok(serde_json::to_string(&json!({
+                    "dry_run": inner.dry_run,
+                    "reclaimed": inner.reclaimed,
+                    "live": inner.live_after,
+                    "stored_before": inner.stored_before,
+                    "stored_after": inner.stored_after,
+                    "tombstoned_before": inner.tombstoned_before,
+                    "bytes_before": inner.bytes_before,
+                    "bytes_after": inner.bytes_after
+                }))?)
+            }
             // ── JSON pass-through RPCs ───────────────────────────────
             other => {
                 let req = tonic::Request::new(JsonRequest {
@@ -11324,7 +11436,9 @@ pub fn dispatch_via_daemon(
         }
     })?;
 
-    serde_json::from_str(&result_json).map_err(Into::into)
+    serde_json::from_str(&result_json)
+        .map(Unstamped::new)
+        .map_err(Into::into)
 }
 
 /// Handle `brain_add_source` by routing to `IndexRepo` or `IndexVault`
@@ -12545,6 +12659,18 @@ mod cache_dispatch_tests {
     /// provenance was authored per-command instead of at the seam every route
     /// passes through. So this asserts over the REGISTRY: every registered
     /// read-only tool that answers at all must carry provenance.
+    ///
+    /// SCOPE, stated because this test's original name over-claimed it: the
+    /// registry it iterates is the WIRE SURFACE, but the thing it exercises is
+    /// `dispatch` — ONE of the two implementations behind that surface. It said
+    /// "every tool that answers"; it proved "every tool that answers *through
+    /// the in-process seam*". `dispatch_via_daemon` is a peer of `dispatch`,
+    /// not a caller of it, and it stamped nothing — so `brain_search` over MCP
+    /// returned no `_meta` while this test was green. The daemon seam cannot be
+    /// executed here (a successful response needs a live daemon), so its half of
+    /// the property is carried by the type system in `provenance_seam` and its
+    /// registry COVERAGE by
+    /// `every_registered_tool_routes_to_a_real_arm_on_the_daemon_seam` below.
     #[test]
     fn every_tool_that_answers_stamps_its_provenance() {
         reset_session();
@@ -12594,6 +12720,122 @@ mod cache_dispatch_tests {
              server's own `initialize` instructions tell the agent \"Results \
              include _meta.sources indicating which data sources contributed\": \
              {missing:?}"
+        );
+    }
+
+    /// nw-315 follow-up. The sweep disproved "author result provenance once, at
+    /// the tool layer" in both directions: `brain_search` over MCP returned NO
+    /// `_meta` while `brain search --json` did, and CLI `hubs --json` had none
+    /// while MCP `hub_nodes` did.
+    ///
+    /// The cause was a SECOND dispatch table — `dispatch_via_daemon`, used
+    /// whenever a daemon is running, which is the default — that stamped
+    /// nothing. Within it the behaviour split again by RPC shape: a typed proto
+    /// (`BrainSearchResponse`, no `_meta` field) forced the client to rebuild a
+    /// fresh object and lose the daemon's stamp, while a `result_json`
+    /// pass-through (`hub_nodes`, `brain_doc_stats`) carried it through
+    /// verbatim. Same table, opposite outcomes, no test on either.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every arm of that second
+    /// table, for every tool the registry advertises. Two halves, because the
+    /// seam cannot be executed without a daemon:
+    ///
+    /// 1. THAT IT STAMPS — carried by the compiler, not by this test.
+    ///    `dispatch_via_daemon_inner` returns `provenance_seam::Unstamped`,
+    ///    whose field is private to that module, and `stamp` is the only way to
+    ///    get a `Value` back out. Every arm — typed rebuild, hand-built `json!`
+    ///    early return, and the generic `result_json` pass-through — is covered
+    ///    by construction, and an arm added later cannot forget.
+    ///
+    /// 2. THAT EVERY REGISTERED TOOL REACHES AN ARM — this test. The second
+    ///    table ends in `unknown => Err("unknown tool for daemon dispatch")`,
+    ///    so a tool present in the registry but absent from that table answers
+    ///    on the direct route and fails on the daemon route. Dialling a dead
+    ///    port makes any name that DID route fail with a transport error
+    ///    instead, which is what separates "routed" from "not in the table" —
+    ///    the same trick `daemon_proxy_enforces_tools_allowlist_and_lite_mode`
+    ///    uses. Add tool #43 and forget the daemon table and this goes red.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn every_registered_tool_routes_to_a_real_arm_on_the_daemon_seam() {
+        reset_session();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let channel = {
+            let _guard = runtime.enter();
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy()
+        };
+        let mut client = DaemonGrpcClient::new(channel);
+
+        let schemas = all_tool_schemas();
+        let mut routed = 0_usize;
+        let mut unrouted: Vec<String> = Vec::new();
+        for tool in &schemas {
+            let Some(name) = tool["name"].as_str() else {
+                continue;
+            };
+            let args = smallest_valid_args(&tool["inputSchema"]);
+            match dispatch_via_daemon(&mut client, &runtime, name, args) {
+                // A dead port cannot answer, so a success here would mean the
+                // arm never reached the wire. None currently do; if one starts
+                // to, it is a locally-fabricated answer and must still stamp —
+                // which `Unstamped` guarantees, so accept it as routed.
+                Ok(value) => {
+                    assert!(
+                        value["_meta"]["sources"].as_array().is_some(),
+                        "`{name}` answered on the daemon seam without provenance"
+                    );
+                    routed += 1;
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if text.contains("unknown tool for daemon dispatch") {
+                        unrouted.push(name.to_string());
+                    } else {
+                        routed += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unrouted.is_empty(),
+            "these tools are advertised by `tool_list` but fall through to the \
+             `unknown` arm of `dispatch_via_daemon`, so they answer on the \
+             direct route and fail whenever a daemon is running — which is the \
+             default: {unrouted:?}"
+        );
+        // Vacuity guard: if the registry or the harness ever stops producing
+        // calls, `unrouted.is_empty()` passes for the wrong reason.
+        assert!(
+            routed >= schemas.len(),
+            "only {routed} of {} registered tools were exercised",
+            schemas.len()
+        );
+    }
+
+    /// The single arm the sweep caught, pinned end to end through the seam.
+    ///
+    /// `daemon_brain_search_response_to_json` is the client-side rebuild that
+    /// loses the daemon's stamp: `BrainSearchResponse` is a typed proto with no
+    /// `_meta` field, so the daemon's `dispatch_tool_json` stamp is discarded at
+    /// the proto boundary and this function constructs a fresh object from the
+    /// scalars. Asserted in two steps so a regression names its own cause:
+    /// the rebuild really does arrive bare, and the seam really does fix it.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn the_typed_proto_rebuild_arrives_bare_and_leaves_the_seam_stamped() {
+        let response = nestweaver_proto::BrainSearchResponse::default();
+        let rebuilt = daemon_brain_search_response_to_json(&response, false);
+        assert!(
+            rebuilt.get("_meta").is_none(),
+            "the premise of this test is that the typed rebuild is bare; if it \
+             stamps on its own, delete the seam wrapper rather than both"
+        );
+        let stamped = provenance_seam::stamp(Unstamped::new(rebuilt));
+        assert_eq!(
+            stamped["_meta"]["sources"],
+            serde_json::json!([nestweaver_schema::provenance::SOURCE_LOCAL]),
+            "the daemon seam must stamp what the proto boundary dropped"
         );
     }
 
