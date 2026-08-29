@@ -375,7 +375,12 @@ fn detect_dead_code_inner(
         })
         .collect();
 
-    let mut unreachable_symbols: Vec<UnreachableSymbol> = Vec::new();
+    // nw-291 (M5): carried alongside each row purely for ordering. `--limit N`
+    // takes the PREFIX of this order, so with no importance term it was
+    // "the first N alphabetically by path" — 726 of 1000 reported rows came
+    // from a single repo, stopping mid-`r`. PageRank is already loaded onto
+    // every symbol; it was simply never consulted.
+    let mut ranked: Vec<(f64, UnreachableSymbol)> = Vec::new();
     for sym in &all_symbols {
         if strong_reachable.contains(&sym.uid) {
             continue;
@@ -396,23 +401,36 @@ fn detect_dead_code_inner(
             infer_confidence(&sym.name, &visibility_str, &sym.file_path)
         };
 
-        unreachable_symbols.push(UnreachableSymbol {
-            uid: sym.uid.clone(),
-            name: sym.name.clone(),
-            kind: sym.kind.to_string(),
-            file_path: sym.file_path.clone(),
-            visibility: visibility_str,
-            confidence,
-        });
+        ranked.push((
+            sym.pagerank_score.unwrap_or(0.0),
+            UnreachableSymbol {
+                uid: sym.uid.clone(),
+                name: sym.name.clone(),
+                kind: sym.kind.to_string(),
+                file_path: sym.file_path.clone(),
+                visibility: visibility_str,
+                confidence,
+            },
+        ));
     }
 
-    // Sort by confidence descending, then by file path, then by name.
-    unreachable_symbols.sort_by(|a, b| {
+    // Sort by confidence descending, then by IMPORTANCE descending, then by
+    // file path and name for a total, deterministic order. The path/name tail
+    // is kept so equal-importance rows still sort stably; it is no longer the
+    // primary discriminator.
+    ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.confidence
             .cmp(&a.confidence)
+            .then_with(|| {
+                b_rank
+                    .partial_cmp(a_rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.file_path.cmp(&b.file_path))
             .then_with(|| a.name.cmp(&b.name))
     });
+    let unreachable_symbols: Vec<UnreachableSymbol> =
+        ranked.into_iter().map(|(_, sym)| sym).collect();
 
     let reachable_symbols = total_symbols - unreachable_symbols.len();
 
@@ -852,6 +870,90 @@ mod tests {
             infer_confidence("_helper", "inferred", "src/lib.py"),
             DeadCodeConfidence::High
         );
+    }
+
+    /// nw-291 / F-DC-2: the nw-155 guard above is asserted at unit level on an
+    /// input the pipeline cannot produce — `read.rs` rebuilt every symbol's
+    /// visibility as `Inferred`, so BOTH `public` guards and the
+    /// private/internal/protected guard in `infer_confidence` were unreachable
+    /// and the only live discriminator was `name.starts_with('_')`. Assert END
+    /// TO END, through the store.
+    #[test]
+    fn exported_underscore_symbol_is_not_high_confidence_through_the_store() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut sym = make_symbol_with_kind(
+            "wbg",
+            "__wbg_init",
+            SymbolKind::Function,
+            "src/wasm/glue.js",
+            false,
+        );
+        sym.visibility = Visibility::Public;
+        store.insert_symbol(&sym).unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        let row = result
+            .unreachable_symbols
+            .iter()
+            .find(|s| s.name == "__wbg_init")
+            .expect("symbol is unreachable and must be reported");
+
+        assert_ne!(
+            row.confidence,
+            DeadCodeConfidence::High,
+            "an explicitly public symbol must not reach the high tier; got visibility={:?}",
+            row.visibility
+        );
+        assert_eq!(
+            row.visibility, "public",
+            "visibility must survive a store round-trip"
+        );
+    }
+
+    /// Where else does this property hold? The private/internal/protected guard
+    /// is the same unreachable branch in the other direction — it must promote
+    /// an explicitly private symbol that no naming convention would catch.
+    #[test]
+    fn explicit_private_visibility_survives_the_store_round_trip() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut sym =
+            make_symbol_with_kind("p", "Helper", SymbolKind::Function, "src/lib.ts", false);
+        sym.visibility = Visibility::Private;
+        store.insert_symbol(&sym).unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        let row = result
+            .unreachable_symbols
+            .iter()
+            .find(|s| s.name == "Helper")
+            .expect("Helper must be reported");
+        assert_eq!(row.visibility, "private");
+        assert_eq!(row.confidence, DeadCodeConfidence::High);
+    }
+
+    /// nw-291 / F-DC-6: `--limit N` took the first N of a
+    /// (confidence, file_path, name) ordering, i.e. an ALPHABETICAL prefix —
+    /// 726 of 1000 rows came from one repo, stopping mid-`r`. There is no
+    /// importance term even though PageRank is loaded onto every symbol.
+    #[test]
+    fn limit_order_is_by_importance_not_alphabetical_path() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut trivial = make_symbol_with_kind(
+            "t",
+            "Trivial",
+            SymbolKind::Function,
+            "aaa/trivial.rs",
+            false,
+        );
+        trivial.pagerank_score = Some(0.001);
+        let mut important =
+            make_symbol_with_kind("i", "Important", SymbolKind::Function, "zzz/core.rs", false);
+        important.pagerank_score = Some(0.9);
+        store.insert_symbol(&trivial).unwrap();
+        store.insert_symbol(&important).unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.unreachable_symbols[0].name, "Important");
     }
 
     #[test]

@@ -1049,6 +1049,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
                 let name = name_arena.to_string();
 
+                // nw-291 (M4): `_` is a DISCARD binding, not a name. Rust's
+                // `const _: () = assert!(..)`, Go's blank identifier and JS's
+                // `const _ = require('lodash')` all produced a graph symbol
+                // literally called `_`, which nothing can import, call or
+                // reference by name — and which `dead-code` then reported as a
+                // high-confidence unreachable symbol.
+                //
+                // The guard lives here, next to the dedup, rather than in
+                // `rust.scm` / `javascript.scm`, because the property is
+                // language-independent: it holds for every query pattern in
+                // every one of the 49 grammars at once. Only the exact name
+                // `_` is filtered — `_helper` is a real, addressable name that
+                // merely follows a private-by-convention spelling.
+                if name == "_" {
+                    continue;
+                }
+
                 if !seen_symbols.insert((name.clone(), start_line)) {
                     continue;
                 }
@@ -2065,7 +2082,10 @@ MAX_RETRIES = 3
             .expect("module-level variable LOGGER must be extracted");
 
         assert_eq!(logger.start_line, 8, "span must start at the assignment");
-        assert_eq!(logger.end_line, 8, "a one-line assignment is a one-line span");
+        assert_eq!(
+            logger.end_line, 8,
+            "a one-line assignment is a one-line span"
+        );
 
         let max_retries = parsed
             .symbols
@@ -2120,7 +2140,10 @@ class Config:
         };
 
         assert_eq!((prop("DEBUG").start_line, prop("DEBUG").end_line), (2, 2));
-        assert_eq!((prop("RETRIES").start_line, prop("RETRIES").end_line), (3, 3));
+        assert_eq!(
+            (prop("RETRIES").start_line, prop("RETRIES").end_line),
+            (3, 3)
+        );
         assert_eq!((prop("name").start_line, prop("name").end_line), (6, 6));
         assert_eq!((prop("size").start_line, prop("size").end_line), (7, 7));
 
@@ -2141,6 +2164,32 @@ class Config:
             .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
             .expect("class Config");
         assert_eq!((class.start_line, class.end_line), (1, 7));
+    }
+
+    // ── nw-291 M4: discard bindings must not become symbols ────────────────
+
+    #[test]
+    fn a_discard_binding_is_not_a_symbol() {
+        // nw-291 / F-DC-5: `const _: () = assert!(..)` and
+        // `const _ = require('lodash')` produced a graph symbol literally named
+        // `_`, which then ranked as high-confidence dead code.
+        let rust = "const _: () = assert!(true);\npub fn keep() {}\n";
+        let parsed = parse_source(Path::new("src/db.rs"), rust).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a Rust discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "keep"));
+
+        let js = "const _ = require('lodash');\nexport const KEEP = 1;\n";
+        let parsed = parse_source(Path::new("src/a.js"), js).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a JS discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "KEEP"));
     }
 
     // ── Hash test ──────────────────────────────────────────────────────────
@@ -3547,7 +3596,8 @@ use crate::config::{Settings, load as load_config};
             .expect("standalone function must be extracted");
         assert_eq!((f.start_line, f.end_line), (62, 68));
         assert!(
-            f.signature.starts_with("function automatic int compute_checksum"),
+            f.signature
+                .starts_with("function automatic int compute_checksum"),
             "signature must be the declaration, not the file's first line: {:?}",
             f.signature
         );

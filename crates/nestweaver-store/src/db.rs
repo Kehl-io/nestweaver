@@ -2810,6 +2810,7 @@ impl GraphStore {
                 entry_point_kind STRING, \
                 framework_hint STRING, \
                 canonical_id STRING, \
+                visibility STRING, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -2825,6 +2826,16 @@ impl GraphStore {
         // Migration (Phase 4): add `canonical_id` for cross-boundary symbol matching.
         // Existing symbols get empty string until re-indexed with scope-chain extraction.
         let _ = conn.query("ALTER TABLE Symbol ADD canonical_id STRING DEFAULT ''");
+
+        // Migration (nw-291): add `visibility`. The parser has always inferred
+        // it, but nothing persisted it, so `read.rs` rebuilt every symbol as
+        // `Inferred` and BOTH visibility guards in `dead_code::infer_confidence`
+        // were unreachable branches — the only live discriminator left was a
+        // leading underscore. Existing symbols read back as the empty string,
+        // which maps to `Inferred`: the honest answer for a row written before
+        // the column existed, and identical to today's behaviour until
+        // `index --force`.
+        let _ = conn.query("ALTER TABLE Symbol ADD visibility STRING DEFAULT ''");
 
         // --- Relationship tables ---
         conn.query("CREATE REL TABLE IF NOT EXISTS REPO_HAS_FILE(FROM Repo TO File)")

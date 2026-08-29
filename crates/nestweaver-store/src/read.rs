@@ -185,6 +185,22 @@ fn parse_symbol_kind(s: &str) -> SymbolKind {
     }
 }
 
+/// Parse the `visibility` column back into a [`Visibility`].
+///
+/// nw-291: an empty value is what a row written before the column existed reads
+/// back as, and what a symbol the parser could not classify writes. Both mean
+/// "not stated", which is exactly `Inferred` — so the pre-migration behaviour
+/// is preserved without pretending an unknown value is `Public`.
+fn parse_visibility(s: &str) -> Visibility {
+    match s {
+        "public" => Visibility::Public,
+        "internal" => Visibility::Internal,
+        "protected" => Visibility::Protected,
+        "private" => Visibility::Private,
+        _ => Visibility::Inferred,
+    }
+}
+
 fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
     match s {
         "main" => Some(EntryPointKind::Main),
@@ -228,6 +244,12 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         .get(14)
         .and_then(|_| extract_opt_string(row, 14).ok().flatten())
         .filter(|s| !s.is_empty());
+    // Column 15 (visibility) is optional: added by the nw-291 migration.
+    let visibility = row
+        .get(15)
+        .and_then(|_| extract_opt_string(row, 15).ok().flatten())
+        .map(|s| parse_visibility(&s))
+        .unwrap_or(Visibility::Inferred);
 
     Ok(Symbol {
         uid,
@@ -244,7 +266,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         pagerank_score: Some(pagerank_score),
         is_entry_point,
         entry_point_kind,
-        visibility: Visibility::Inferred,
+        visibility,
         type_info: None,
         framework_hint,
         canonical_id,
@@ -266,7 +288,7 @@ fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
 
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
-     s.framework_hint, s.canonical_id";
+     s.framework_hint, s.canonical_id, s.visibility";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
      n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
