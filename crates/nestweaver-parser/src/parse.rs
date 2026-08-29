@@ -2166,6 +2166,96 @@ class Config:
         assert_eq!((class.start_line, class.end_line), (1, 7));
     }
 
+    // ── nw-323 defects C and D: TS/JS reference coverage ───────────────────
+
+    #[test]
+    fn ts_export_from_is_captured_as_an_import_reference() {
+        // A barrel re-export is an import edge for graph purposes: it is how
+        // `NotFoundError` reaches its importers through
+        // common/errors.ts -> errors/index.ts -> http-errors.ts.
+        let source = "export * from './errors/index.js';\n\
+                      export { AppError, isAppError } from './app-error.js';\n\
+                      export type { ErrorDetails } from './app-error.js';\n";
+        let parsed = parse_source(Path::new("src/common/errors.ts"), source).unwrap();
+
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            imports.contains(&"./errors/index.js"),
+            "`export * from` must yield an Import reference; got: {imports:?}"
+        );
+        assert!(
+            imports.contains(&"./app-error.js"),
+            "`export {{ … }} from` must yield an Import reference; got: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn js_export_from_is_captured_as_an_import_reference() {
+        // Where else does this property hold? javascript.scm has the identical
+        // gap; a plain-JS barrel is just as common as a TS one.
+        let source = "export * from './a.js';\nexport { b } from './b.js';\n";
+        let parsed = parse_source(Path::new("src/index.js"), source).unwrap();
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(imports.contains(&"./a.js"), "got: {imports:?}");
+        assert!(imports.contains(&"./b.js"), "got: {imports:?}");
+    }
+
+    #[test]
+    fn ts_new_expression_is_captured_as_a_call_reference() {
+        // `NotFoundError` (56 files) and `NotificationService` (5 constructors)
+        // are consumed almost exclusively via `new`. With no capture they have
+        // ZERO inbound references before resolution even begins, which is why
+        // `impact --min-score 0 --depth 10` still returned 0.
+        let source = "import { NotFoundError } from '../../../common/errors.js';\n\
+                      export function get(id: string) {\n\
+                        throw new NotFoundError('Discrepancy');\n\
+                      }\n";
+        let parsed = parse_source(Path::new("src/modules/a/service.ts"), source).unwrap();
+
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotFoundError"),
+            "`new NotFoundError(..)` must yield a Call reference; got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn js_new_expression_is_captured_as_a_call_reference() {
+        // Where else does this property hold? javascript.scm has the same gap.
+        let source = "const s = new NotificationService(deps);\n";
+        let parsed = parse_source(Path::new("src/app.js"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotificationService"),
+            "got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── nw-291 M4: discard bindings must not become symbols ────────────────
 
     #[test]

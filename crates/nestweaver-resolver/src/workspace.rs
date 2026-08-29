@@ -454,16 +454,29 @@ fn extract_tsconfig_aliases(
                 if let Some(target_str) = target.as_str()
                     && let Some(target_prefix) = target_str.strip_suffix('*')
                 {
+                    // nw-323 (defect A): the `./` strip used to live in the
+                    // `else` branch only, so the DEFAULT `npm create vite` +
+                    // shadcn shape -- `"baseUrl": "."` with
+                    // `"paths": {"@/*": ["./src/*"]}` -- kept its `./` prefix
+                    // and produced the target `"./src/"`. `known_files` holds
+                    // repo-relative paths with no `./`, so a pure string
+                    // lookup could never match and all 2207 `@/…` imports in
+                    // coyote-measurement/client resolved to nothing.
+                    //
+                    // Every existing alias test wrote `["src/*"]` without the
+                    // `./`, and the one test that used `["./*"]` set
+                    // `"baseUrl": "src"` -- which takes the branch that
+                    // already trimmed. The production combination was untested.
+                    let target_prefix = target_prefix.trim_start_matches("./");
                     // Resolve the target relative to baseUrl
                     let resolved_target = if base_url == "." || base_url.is_empty() {
                         target_prefix.to_string()
                     } else {
                         let base = base_url.trim_end_matches('/');
-                        let target_trimmed = target_prefix.trim_start_matches("./");
-                        if target_trimmed.is_empty() {
+                        if target_prefix.is_empty() {
                             format!("{base}/")
                         } else {
-                            format!("{base}/{target_trimmed}")
+                            format!("{base}/{target_prefix}")
                         }
                     };
 
@@ -578,6 +591,12 @@ pub fn extract_package_name(specifier: &str) -> &str {
 /// This is similar to Node.js module resolution: tries exact, then with
 /// `.ts`, `.tsx`, `.js`, `.jsx` extensions, then as a directory index.
 pub fn try_resolve_with_extensions(path: &str, known_files: &HashSet<&str>) -> Option<String> {
+    // nw-323 (defect A, belt and braces): `known_files` never carries a
+    // leading `./`, so the lookup must not depend on every caller having
+    // stripped it. A mangled alias target reached here as `./src/…` and
+    // silently missed.
+    let path = path.trim_start_matches("./");
+
     // Try exact
     if known_files.contains(path) {
         return Some(path.to_string());
@@ -599,6 +618,53 @@ pub fn try_resolve_with_extensions(path: &str, known_files: &HashSet<&str>) -> O
         }
     }
 
+    // nw-323 (defect B): the aliased form of the emitted-extension rewrite.
+    // `@/common/money.js` must reach `src/common/money.ts` exactly as
+    // `../money.js` must -- same defect, second ladder.
+    resolve_emitted_extension(path, known_files)
+}
+
+/// Source extensions TypeScript emits each JS extension from, in preference
+/// order. The literal extension is kept last so a repo that really does ship
+/// the `.js` file still resolves to it.
+const EMITTED_EXTENSION_SOURCES: &[(&str, &[&str])] = &[
+    (".js", &[".ts", ".tsx", ".js", ".jsx"]),
+    (".jsx", &[".tsx", ".jsx"]),
+    (".mjs", &[".mts", ".mjs"]),
+    (".cjs", &[".cts", ".cjs"]),
+];
+
+/// Resolve a specifier written with the EMITTED extension against the SOURCE
+/// file on disk.
+///
+/// nw-323 (defect B). TypeScript's `node16`/`nodenext` resolution REQUIRES
+/// authors to write the emitted `.js` extension while the file on disk is
+/// `.ts`. Both resolution ladders in this crate only ever APPENDED extensions,
+/// so `./money.js` probed `money.js.ts` and `money.js/index.ts` and never
+/// `money.ts` -- killing 1109 of 1112 relative imports in one real server repo.
+///
+/// Returns `None` for a specifier that does not end in an emitted extension,
+/// so this is purely a fallback after the literal ladders have missed.
+pub fn resolve_emitted_extension(path: &str, known_files: &HashSet<&str>) -> Option<String> {
+    for (emitted, sources) in EMITTED_EXTENSION_SOURCES {
+        let Some(stem) = path.strip_suffix(emitted) else {
+            continue;
+        };
+        for source_ext in *sources {
+            let candidate = format!("{stem}{source_ext}");
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+        // `./errors/index.js` where the directory itself is the module.
+        for source_ext in *sources {
+            let candidate = format!("{stem}/index{source_ext}");
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
     None
 }
 
@@ -920,5 +986,95 @@ mod tests {
         assert_eq!(ctx.packages[0].name, "@app/core");
         assert_eq!(ctx.aliases.len(), 1);
         assert_eq!(ctx.aliases[0].prefix, "@/");
+    }
+    // ── nw-323 defect A: a "./src/*" path target under baseUrl "." ────────
+
+    #[test]
+    fn dot_slash_path_target_is_normalised_to_repo_relative() {
+        // The default `npm create vite` + shadcn layout: a solution-style root
+        // tsconfig that only holds `references`, and the real `paths` in
+        // tsconfig.app.json written with a leading "./". 2207 client imports in
+        // coyote-measurement depend on this shape.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"files": [], "references": [{"path": "./tsconfig.app.json"},
+                                            {"path": "./tsconfig.node.json"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tsconfig.app.json"),
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@/*": ["./src/*"] }
+                },
+                "include": ["src"]
+            }"#,
+        )
+        .unwrap();
+
+        let aliases = load_tsconfig_aliases(root);
+        assert_eq!(
+            aliases,
+            vec![TsconfigAlias {
+                prefix: "@/".to_string(),
+                target: "src/".to_string()
+            }],
+            "a \"./src/*\" target must normalise to the repo-relative \"src/\"; \
+             known_files are stored without a leading \"./\""
+        );
+
+        // End-to-end: the alias must actually reach the file.
+        let known: HashSet<&str> = ["src/stores/auth-store.ts"].into_iter().collect();
+        let ctx = WorkspaceContext {
+            packages: vec![],
+            aliases,
+        };
+        assert_eq!(
+            crate::lang::javascript::resolve_import(
+                "src/providers/query-provider.tsx",
+                "@/stores/auth-store",
+                &known,
+                &ctx,
+            ),
+            Some("src/stores/auth-store.ts".to_string()),
+            "nw-323: `@/stores/auth-store` must resolve"
+        );
+    }
+
+    #[test]
+    fn a_bare_dot_slash_target_normalises_to_the_repo_root() {
+        // Where else does this property hold? The same `./`-prefixed target
+        // with no directory, and a target under a non-"." baseUrl (which
+        // already trimmed) must both stay repo-relative.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["./*"]}}}"#,
+        )
+        .unwrap();
+        let aliases = load_tsconfig_aliases(root);
+        assert_eq!(
+            aliases,
+            vec![TsconfigAlias {
+                prefix: "~/".to_string(),
+                target: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn try_resolve_with_extensions_normalises_a_dot_slash_path() {
+        // Belt and braces: known_files never carry a leading "./", so the
+        // lookup itself must not depend on the caller having stripped it.
+        let known: HashSet<&str> = ["src/stores/auth-store.ts"].into_iter().collect();
+        assert_eq!(
+            try_resolve_with_extensions("./src/stores/auth-store", &known),
+            Some("src/stores/auth-store.ts".to_string())
+        );
     }
 }

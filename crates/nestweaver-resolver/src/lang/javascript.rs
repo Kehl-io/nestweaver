@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::util::parent_dir;
 use crate::workspace::{
     TsconfigAlias, WorkspaceContext, WorkspacePackage, extract_package_name,
-    try_resolve_with_extensions,
+    resolve_emitted_extension, try_resolve_with_extensions,
 };
 
 /// Resolve a JavaScript/TypeScript import specifier to a file path.
@@ -74,7 +74,11 @@ fn resolve_relative(
         }
     }
 
-    None
+    // nw-323 (defect B): the specifier may carry the EMITTED extension while
+    // the file on disk is the TypeScript source. Both ladders above only
+    // append, so `../money.js` probed `money.js.ts` and never `money.ts`.
+    // Tried last, so a repo that genuinely ships `money.js` still wins.
+    resolve_emitted_extension(&normalized, known_files)
 }
 
 /// Resolve a specifier against tsconfig path aliases.
@@ -381,5 +385,96 @@ mod tests {
         let result = resolve_import("apps/web/main.ts", "@/shared", &known, &ctx);
         // Alias resolves "@/shared" -> "src/shared" -> "src/shared/index.ts"
         assert_eq!(result, Some("src/shared/index.ts".to_string()));
+    }
+    // ── nw-323 defect B: `.js` specifiers pointing at `.ts` sources ───────
+
+    #[test]
+    fn resolves_js_specifier_to_ts_source() {
+        // TypeScript ESM (module: node16/nodenext) requires the EMITTED ".js"
+        // extension in the specifier while the source on disk is ".ts".
+        // 1109 of 1112 relative imports in coyote-measurement/server look like
+        // this. `resolve_relative` APPENDS extensions, so `../money.js` probed
+        // `money.js.ts` and never found `money.ts`.
+        let known = set(&["src/common/money.ts", "src/common/__tests__/money.test.ts"]);
+        let result = resolve_import(
+            "src/common/__tests__/money.test.ts",
+            "../money.js",
+            &known,
+            &empty_ctx(),
+        );
+        assert_eq!(result, Some("src/common/money.ts".to_string()));
+    }
+
+    #[test]
+    fn resolves_js_specifier_to_ts_directory_index() {
+        let known = set(&["src/common/errors/index.ts"]);
+        let result = resolve_import(
+            "src/modules/discrepancies/services/discrepancy-service.ts",
+            "../../../common/errors/index.js",
+            &known,
+            &empty_ctx(),
+        );
+        assert_eq!(result, Some("src/common/errors/index.ts".to_string()));
+    }
+
+    #[test]
+    fn resolves_mjs_and_cjs_specifiers_to_their_typescript_sources() {
+        // Where else does this property hold? Every emitted-extension form
+        // node16/nodenext accepts, not just `.js`.
+        let known = set(&["src/a.mts", "src/b.cts", "src/c.tsx"]);
+        assert_eq!(
+            resolve_import("src/main.ts", "./a.mjs", &known, &empty_ctx()),
+            Some("src/a.mts".to_string())
+        );
+        assert_eq!(
+            resolve_import("src/main.ts", "./b.cjs", &known, &empty_ctx()),
+            Some("src/b.cts".to_string())
+        );
+        assert_eq!(
+            resolve_import("src/main.ts", "./c.jsx", &known, &empty_ctx()),
+            Some("src/c.tsx".to_string())
+        );
+    }
+
+    #[test]
+    fn a_real_js_file_still_wins_over_its_ts_rewrite() {
+        // Regression guard: the rewrite is a FALLBACK. A repo that really does
+        // ship `money.js` next to an unrelated `money.ts` must keep resolving
+        // the specifier it literally wrote.
+        let known = set(&["src/money.js", "src/money.ts"]);
+        assert_eq!(
+            resolve_import("src/main.js", "./money.js", &known, &empty_ctx()),
+            Some("src/money.js".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_extensionless_specifier_unchanged() {
+        // Regression guard: the .js -> .ts rewrite must not disturb the
+        // extensionless path that already works.
+        let known = set(&["src/utils.ts"]);
+        assert_eq!(
+            resolve_import("src/main.ts", "./utils", &known, &empty_ctx()),
+            Some("src/utils.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn an_aliased_js_specifier_also_reaches_its_ts_source() {
+        // Where else does this property hold? The tsconfig-alias path resolves
+        // through `try_resolve_with_extensions`, a different ladder, so the
+        // rewrite has to reach that one too.
+        let known = set(&["src/common/money.ts"]);
+        let ctx = WorkspaceContext {
+            packages: vec![],
+            aliases: vec![TsconfigAlias {
+                prefix: "@/".to_string(),
+                target: "src/".to_string(),
+            }],
+        };
+        assert_eq!(
+            resolve_import("src/main.ts", "@/common/money.js", &known, &ctx),
+            Some("src/common/money.ts".to_string())
+        );
     }
 }

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3807
 expression: "parsed_references(\"simple.js\", &source)"
 ---
 - name: fs
@@ -32,6 +31,11 @@ expression: "parsed_references(\"simple.js\", &source)"
   kind: ReadAccess
   start_line: 23
   context: "this.name + ' barks.'"
+  receiver: ~
+- name: Dog
+  kind: Call
+  start_line: 27
+  context: "dog = new Dog('Rex')"
   receiver: ~
 - name: greet
   kind: Call

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3821
 expression: "parsed_references(\"simple.ts\", &source)"
 ---
 - name: events
@@ -57,6 +56,11 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: TypeRef
   start_line: 33
   context: "import { EventEmitter } from 'events';"
+  receiver: ~
+- name: ConsoleGreeter
+  kind: Call
+  start_line: 34
+  context: return new ConsoleGreeter();
   receiver: ~
 - name: createGreeter
   kind: Call

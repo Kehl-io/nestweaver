@@ -640,14 +640,34 @@ fn resolve_single_reference(
         }
     }
 
-    // Priority 3: Re-exports
-    for (_, imported_file) in &imports {
-        let mut transitive_imports = graph.imports_of(imported_file);
-        transitive_imports.sort_by(|(_, a), (_, b)| a.cmp(b));
-        for (_, transitive_file) in &transitive_imports {
+    // Priority 3: Re-exports.
+    //
+    // nw-323 (defect C, second half): this walked exactly ONE hop, but a real
+    // TypeScript barrel chain is two or more -- `common/errors.ts ->
+    // errors/index.ts -> http-errors.ts` is the chain `NotFoundError` needs.
+    // Bounded at REEXPORT_MAX_HOPS with a visited set so a cyclic barrel (which
+    // TypeScript permits) cannot loop, and so the fan-out stays bounded: this
+    // tier is why nw-153's guards exist.
+    let mut frontier: Vec<String> = imports.iter().map(|(_, f)| f.to_string()).collect();
+    let mut visited: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+    visited.insert(file_path.to_string());
+    for _ in 0..REEXPORT_MAX_HOPS {
+        let mut next_frontier: Vec<String> = Vec::new();
+        for imported_file in &frontier {
+            let mut transitive_imports = graph.imports_of(imported_file);
+            transitive_imports.sort_by(|(_, a), (_, b)| a.cmp(b));
+            for (_, transitive_file) in &transitive_imports {
+                if !visited.insert(transitive_file.to_string()) {
+                    continue;
+                }
+                next_frontier.push(transitive_file.to_string());
+            }
+        }
+        next_frontier.sort();
+        for transitive_file in &next_frontier {
             if let Some(syms) = &candidates
                 && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                    f == transitive_file && receiver_denotes(f, sym, value_receiver)
+                    *f == transitive_file.as_str() && receiver_denotes(f, sym, value_receiver)
                 })
             {
                 let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
@@ -666,6 +686,10 @@ fn resolve_single_reference(
                 });
             }
         }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
     }
 
     // Priority 4: Same package/directory
@@ -1148,6 +1172,98 @@ mod tests {
                 .iter()
                 .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
             "store.query() must still resolve to the imported store.js: {edges:?}"
+        );
+    }
+
+    /// nw-323 / nw-324, end to end: the acceptance test for defect B.
+    #[test]
+    fn js_specifier_across_directories_produces_a_resolved_call_edge() {
+        // src/common/__tests__/money.test.ts imports '../money.js' (a .ts file)
+        // and calls roundMoney. The two files are in DIFFERENT directories, so
+        // the same-package fallback cannot rescue it: this was `unresolved:`.
+        let files = vec![
+            (
+                "src/common/money.ts".to_string(),
+                vec![make_symbol("roundMoney", 5)],
+                vec![],
+            ),
+            (
+                "src/common/__tests__/money.test.ts".to_string(),
+                vec![make_symbol("rounds to 2 decimal places", 6)],
+                vec![
+                    make_ref("../money.js", ReferenceKind::Import, 3),
+                    make_ref("roundMoney", ReferenceKind::Call, 7),
+                ],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls)
+            .expect("a CALLS edge must exist");
+        assert!(
+            !call.target_uid.starts_with("unresolved:"),
+            "nw-323/nw-324: `../money.js` must resolve to money.ts; got {}",
+            call.target_uid
+        );
+        let expected = confidence_score(MatchType::ImportResolved, Language::TypeScript);
+        assert!(
+            (call.confidence - expected).abs() < f32::EPSILON,
+            "must be import-resolved ({expected}), not the 0.50 same-package guess; got {}",
+            call.confidence
+        );
+        assert!(
+            edges.iter().any(|e| e.edge_type == EdgeType::Imports),
+            "an IMPORTS edge must also be emitted (resolve.rs pass 3a)"
+        );
+    }
+
+    /// nw-323 defect C, second half: the re-export tier walked exactly ONE hop,
+    /// but a real barrel chain is `errors.ts -> errors/index.ts ->
+    /// http-errors.ts` — two hops.
+    #[test]
+    fn a_two_hop_barrel_chain_resolves() {
+        let mut caller = make_symbol("get", 10);
+        caller.end_line = 20;
+        let files = vec![
+            (
+                "src/modules/a/service.ts".to_string(),
+                vec![caller],
+                vec![
+                    make_ref("../../common/errors.js", ReferenceKind::Import, 1),
+                    make_ref("NotFoundError", ReferenceKind::Call, 12),
+                ],
+            ),
+            (
+                "src/common/errors.ts".to_string(),
+                vec![],
+                vec![make_ref("./errors/index.js", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/common/errors/index.ts".to_string(),
+                vec![],
+                vec![make_ref("./http-errors.js", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/common/errors/http-errors.ts".to_string(),
+                vec![make_symbol("NotFoundError", 20)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        let expected = symbol_uid(
+            "repo:test:abc",
+            "src/common/errors/http-errors.ts",
+            "NotFoundError",
+            20,
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "a two-hop barrel chain must resolve: {edges:?}"
         );
     }
 
