@@ -2561,8 +2561,17 @@ impl GraphStore {
     pub fn observed_instance_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.conn()?;
         let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        // Repo, Vault and Project are the three node kinds whose UIDs carry an
+        // Repo and Vault are the PRIMARY node kinds whose UIDs carry an
         // instance. Symbols inherit theirs from the owning repo.
+        //
+        // `Project` also has an `instance_id` column and is deliberately NOT
+        // scanned. Projects are DERIVED — `materialize-projects` recreates
+        // them from vault notes — so a project left behind under a superseded
+        // instance is a stale derived artifact, not evidence that the graph
+        // itself is forked. Since nw-286 this function decides RESOLUTION as
+        // well as refusal, so widening it would refuse config-less writes on
+        // the strength of a regenerable row. The comment used to name Project
+        // here while the loop did not scan it; the loop is right.
         for query in [
             "MATCH (r:Repo) RETURN DISTINCT r.instance_id",
             "MATCH (v:Vault) RETURN DISTINCT v.instance_id",

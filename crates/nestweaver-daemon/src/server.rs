@@ -1079,6 +1079,61 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// The logical instance this database's data belongs to, **as of now**.
+    ///
+    /// nw-286: [`Self::data_instance_id`] is a BOOT SNAPSHOT of a mutable
+    /// database fact. The database's recorded identity is minted lazily, by the
+    /// first index (`ensure_data_instance_id`, via `record_data_instance`) —
+    /// and autostart guarantees the daemon that will serve that index booted
+    /// first, read `None`, and snapshotted the ambient `"default"`. A later
+    /// config-less write that stamped the snapshot forked the graph:
+    /// `repo:alpha:<hash>` AND `repo:default:<hash>` for one path.
+    ///
+    /// nw-275 made the AMBIGUITY CHECK live and left the RESOLUTION frozen —
+    /// one half of a twin pair. This accessor is the single reader, so the pair
+    /// cannot be split again: every consumer of the daemon's data identity goes
+    /// through here (the write choke point, the backup manifest, the
+    /// config-repo enqueue, the worker stamp, the poll scheduler, the repo
+    /// gauge).
+    ///
+    /// The `--config`-stated path is deliberately NOT re-read: an explicitly
+    /// stated instance is intent, is genuinely immutable for the process
+    /// (`instance_stated_by_config` — "a fact about how the daemon was
+    /// started"), and config-driven instance switching is a supported
+    /// operation. It also means a server-mode daemon, which is almost always
+    /// `--config`-driven, pays no store read at all.
+    pub fn effective_data_instance_id(&self) -> String {
+        if self.instance_stated_by_config {
+            return self.data_instance_id.clone();
+        }
+        let observed = self.store.observed_instance_ids().unwrap_or_default();
+        self.effective_data_instance_id_with_observed(&observed)
+    }
+
+    /// [`Self::effective_data_instance_id`] for a caller that has ALREADY paid
+    /// for `observed_instance_ids()` — the write choke point queries it for the
+    /// ambiguity refusal, and re-querying would double the cost of every
+    /// config-less write for no new information.
+    ///
+    /// Precedence mirrors the boot computation in `serve()` and the CLI's
+    /// `resolve_instance_id_for_db`, in that order and for the same reason:
+    /// several observed instances is a damage state with no answer, so it
+    /// yields to the ambient default (the write funnel refuses separately);
+    /// otherwise the database's own record wins; otherwise the single observed
+    /// id backfills a legacy database that predates the record.
+    fn effective_data_instance_id_with_observed(&self, observed: &[String]) -> String {
+        if self.instance_stated_by_config || observed.len() > 1 {
+            return self.data_instance_id.clone();
+        }
+        match self.store.data_instance_id() {
+            Ok(Some(recorded)) => recorded,
+            _ => observed
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.data_instance_id.clone()),
+        }
+    }
+
     /// Resolve the caller's per-repo visibility (R9/R9b — Blast Radius scoping)
     /// from a request's tonic extensions.
     ///
@@ -1174,7 +1229,6 @@ fn pick_effective_instance_id(requested: &str, configured: &str) -> Result<Strin
 }
 
 fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result<String, Status> {
-    let configured = state.data_instance_id.as_str();
     // nw-246: a request that states no instance, against a database holding
     // several and having stated none itself, has no safe default. Adopting one
     // is how the fork deepens.
@@ -1221,7 +1275,22 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
             ambiguous.join(", ")
         )));
     }
-    pick_effective_instance_id(requested, configured)
+    // nw-286: the RESOLUTION is as live as the ambiguity check above. This
+    // used to read the boot snapshot `state.data_instance_id`, so nw-275's
+    // live guard decided whether to refuse using the database as it is while
+    // the value it then returned described the database as it was at startup.
+    // With one instance present the ambiguity arm is inert, so the half that
+    // was fixed could never cover for the half that was not.
+    //
+    // `ambiguous` is reused rather than re-queried: it is already exactly
+    // `observed_instance_ids()` on the branch that needs it, and empty on the
+    // branches that do not read it.
+    let configured = if requested.is_empty() && !state.instance_stated_by_config {
+        state.effective_data_instance_id_with_observed(&ambiguous)
+    } else {
+        state.data_instance_id.clone()
+    };
+    pick_effective_instance_id(requested, &configured)
 }
 
 /// Build the terminal `Phase::Done` message for `IndexRepo`. When
@@ -3958,7 +4027,10 @@ impl NestWeaverDaemon for DaemonService {
             // contents, so stamp the logical instance (config name when set, else the
             // runtime hash) — not the runtime hash unconditionally. Restore keys
             // nothing on this field (checksum + schema-compat only), so it is safe.
-            instance_id: self.state.data_instance_id.clone(),
+            // nw-286: read live. The frozen field made this a claim about the
+            // instance the daemon BOOTED under, not the one whose data is in
+            // the archive.
+            instance_id: self.state.effective_data_instance_id(),
             workspace_path: if req.include_clones {
                 self.state.db_path.parent().map(|p| p.join("workspace"))
             } else {
@@ -10316,7 +10388,7 @@ pub async fn run_server(
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
-        data_instance_id: data_instance_id.clone(),
+        data_instance_id,
         instance_stated_by_config: instance_cfg.is_some(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
@@ -10692,7 +10764,12 @@ pub async fn run_server(
                 // nw-019: look up under the same logical instance the worker
                 // stamps on the repo, or the "already indexed?" check never
                 // matches and we re-enqueue on every boot.
-                let repo_uid = nestweaver_schema::repo_uid(&data_instance_id, &repo_cfg.url);
+                // nw-286: through the one accessor. This branch only runs
+                // under `state.instance_cfg`, so the accessor returns the
+                // stated instance and costs nothing — but it must not be the
+                // one site that still reads the frozen field.
+                let repo_uid =
+                    nestweaver_schema::repo_uid(&state.effective_data_instance_id(), &repo_cfg.url);
                 let needs_initial_index = state
                     .store
                     .lookup_repo(&repo_uid)
@@ -11277,7 +11354,12 @@ pub async fn run_server(
             let worker_store = Arc::clone(&state.store);
             let worker_db = db_path.clone();
             // nw-019: the worker stamps this on every repo it indexes.
-            let worker_instance = data_instance_id.clone();
+            // nw-286: a RESOLVER, not a boot-frozen clone — the worker asks
+            // once per job, so a database whose identity was minted after this
+            // daemon booted is stamped correctly rather than forked.
+            let worker_state = Arc::clone(&state);
+            let worker_instance: nestweaver_engine::worker::InstanceIdResolver =
+                Arc::new(move || worker_state.effective_data_instance_id());
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
             let worker_write_gate = state.write_gate.clone();
@@ -11419,7 +11501,9 @@ pub async fn run_server(
         let poll_store = Arc::clone(&state.store);
         // nw-019: must match the worker's stamp, or list_repos/repo_uid
         // lookups here find nothing and the scheduler never polls the repos.
-        let poll_instance = data_instance_id.clone();
+        // nw-286: which is why it reads through the same accessor the worker's
+        // resolver does, at the point of use, instead of freezing a copy here.
+        let poll_state = Arc::clone(&state);
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
@@ -11461,7 +11545,8 @@ pub async fn run_server(
             }
 
             // Also seed any already-indexed repos not in the config (legacy).
-            if let Ok(repos) = poll_store.list_repos(Some(&poll_instance)) {
+            if let Ok(repos) = poll_store.list_repos(Some(&poll_state.effective_data_instance_id()))
+            {
                 for repo in repos {
                     if seeded_urls.contains(&repo.url) {
                         continue;
@@ -11550,7 +11635,10 @@ pub async fn run_server(
                             };
                             // A completed ls-remote probe.
                             nestweaver_web::routes::metrics::POLL_CHECKS.inc();
-                            let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
+                            let r_uid = nestweaver_schema::repo_uid(
+                                &poll_state.effective_data_instance_id(),
+                                &url,
+                            );
                             let indexed_sha = poll_store.lookup_repo(&r_uid)
                                 .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
                             if remote_sha != indexed_sha {
@@ -11597,7 +11685,10 @@ pub async fn run_server(
         let metrics_job_queue = shared_job_queue_opt.clone();
         // nw-019: must match the worker's stamp, or the repo-count gauge
         // filters on the wrong instance and always reads zero.
-        let metrics_instance = data_instance_id.clone();
+        // nw-286: re-read each tick. This task outlives every identity change
+        // a running daemon can see, so a frozen copy meant the gauge silently
+        // reported zero for the daemon's whole life after the first mint.
+        let metrics_state = Arc::clone(&state);
         let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -11605,7 +11696,9 @@ pub async fn run_server(
             let mut last_metric_completed_at = 0_i64;
             loop {
                 // Update repo gauge.
-                if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
+                if let Ok(repos) =
+                    metrics_store.list_repos(Some(&metrics_state.effective_data_instance_id()))
+                {
                     metrics::REPOS_TOTAL
                         .with_label_values(&["indexed"])
                         .set(repos.len() as i64);
@@ -15724,6 +15817,124 @@ mod startup_helper_tests {
         // An invalid instance is still rejected at this trust boundary rather
         // than silently producing an ambiguous uid.
         assert!(pick_effective_instance_id("a:b", "default").is_err());
+    }
+
+    /// nw-286: the daemon's RESOLUTION must be as live as its ambiguity check.
+    ///
+    /// `test_state_with_writer` builds the exact F-INST-1 boot condition: a
+    /// config-less daemon that snapshotted `data_instance_id = "default"` from
+    /// a database that was still empty. That is not a contrived state — it is
+    /// the universal one, because the first `nestweaver index` both CREATES the
+    /// database and autostarts the daemon that will serve it, so the daemon
+    /// reads the identity at the one moment the database has nothing to say.
+    /// The database then mints `alpha` (what `index --instance alpha` does, via
+    /// `record_data_instance`). A later config-less write must ADOPT `alpha` —
+    /// the changelog's word — not stamp the boot snapshot and fork the graph.
+    ///
+    /// nw-275 made only the AMBIGUITY check live. With one instance present the
+    /// ambiguity arm is inert, so it cannot cover for a frozen resolution.
+    #[test]
+    fn a_configless_write_adopts_the_recorded_instance_minted_after_boot() {
+        let state = test_state_with_writer();
+
+        // Precondition: this is the boot snapshot F-INST-1 starts from.
+        assert_eq!(state.data_instance_id, "default");
+        assert!(!state.instance_stated_by_config);
+        assert_eq!(
+            state.store.data_instance_id().unwrap(),
+            None,
+            "the database is empty at daemon boot — that is the whole setup"
+        );
+
+        // STEP 1 equivalent: an explicitly instanced write mints the identity.
+        assert_eq!(
+            state.store.ensure_data_instance_id("alpha").unwrap(),
+            "alpha"
+        );
+
+        // STEP 2: a BARE write — empty `requested` is the protocol's
+        // "you decide" sentinel.
+        let effective = resolve_effective_instance_id("", &state)
+            .expect("a single-instance database must not refuse a config-less write");
+
+        assert_eq!(
+            effective, "alpha",
+            "a config-less write must adopt the identity the database records, \
+             not the boot snapshot; returning \"default\" here is the nw-246 fork \
+             (repo:alpha:<hash> AND repo:default:<hash> for one path)"
+        );
+    }
+
+    /// nw-286, the "where else" half: the choke point is one of SIX readers of
+    /// the daemon's data identity. The other five are off-struct — the backup
+    /// manifest, the config-repo enqueue, the worker stamp, the poll scheduler
+    /// and the repo gauge — and three of them carry comments requiring them to
+    /// MATCH the worker's stamp. Fixing only the choke point would make
+    /// resolution live while those stayed frozen, splitting the twin pair a
+    /// third time in the fix for a bug about splitting twin pairs.
+    ///
+    /// They therefore all read through this one accessor. Asserting on the
+    /// accessor is what makes "all six" checkable rather than asserted.
+    #[test]
+    fn the_shared_accessor_is_live_for_every_reader_of_the_data_identity() {
+        let state = test_state_with_writer();
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "default",
+            "an empty database has nothing to say; the ambient default stands"
+        );
+
+        state.store.ensure_data_instance_id("alpha").unwrap();
+
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "alpha",
+            "every consumer — backup manifest, config-repo enqueue, worker \
+             stamp, poll scheduler, repo gauge — reads through here, so a \
+             single assertion covers all of them"
+        );
+    }
+
+    /// The `--config`-stated path must NOT start paying for a store read, and
+    /// must keep returning the stated instance even when the database records
+    /// another — that is supported `--config`-driven instance switching, not a
+    /// fork. This is the regression fence for the half of nw-286 that must NOT
+    /// change.
+    #[test]
+    fn a_config_stated_instance_still_wins_over_the_recorded_one() {
+        let mut state = test_state_with_writer();
+        {
+            let state = Arc::get_mut(&mut state).expect("sole owner in test");
+            state.data_instance_id = "kory-brain".to_string();
+            state.instance_stated_by_config = true;
+        }
+        state.store.ensure_data_instance_id("alpha").unwrap();
+
+        assert_eq!(
+            resolve_effective_instance_id("", &state).unwrap(),
+            "kory-brain",
+            "a stated instance is intent and passes through untouched"
+        );
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "kory-brain",
+            "and the shared accessor agrees, so the worker stamp cannot \
+             diverge from the choke point"
+        );
+    }
+
+    /// A per-request `--instance` still beats the recorded identity: the
+    /// request is the most explicit statement of intent there is, and
+    /// `instance merge --from/--to` (the documented remedy for an already
+    /// forked database) depends on it being obeyed.
+    #[test]
+    fn a_requested_instance_still_beats_the_recorded_one() {
+        let state = test_state_with_writer();
+        state.store.ensure_data_instance_id("alpha").unwrap();
+        assert_eq!(
+            resolve_effective_instance_id("beta", &state).unwrap(),
+            "beta"
+        );
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
