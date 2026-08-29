@@ -5623,3 +5623,89 @@ fn ambiguity_arising_after_boot_is_still_refused() {
          cannot carry one:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// nw-299(b) — `clusters` text mode must honour `--limit` on BOTH routes.
+// ---------------------------------------------------------------------------
+
+/// Six mutually-disconnected call cycles, so clustering finds six communities
+/// no matter how the partition is seeded.
+fn write_six_community_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for g in 1..=6 {
+        std::fs::write(
+            dir.join(format!("g{g}.js")),
+            format!(
+                "export function g{g}a() {{ return g{g}b(); }}\n\
+                 export function g{g}b() {{ return g{g}c(); }}\n\
+                 export function g{g}c() {{ return g{g}a(); }}\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// The daemon branch of `Commands::Clusters` never put `limit`/`members` into
+/// the tool args and carried its own inline print loop with the bounding
+/// removed, so every `--limit` produced byte-identical output — measured at
+/// 7,967,385 bytes for four different combinations on the reporter's graph,
+/// while the direct path bounded correctly.
+#[test]
+fn clusters_text_honours_limit_on_the_daemon_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    write_six_community_repo(&repo);
+    let db = dir.path().join("clusters.lbug");
+
+    no_daemon_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    start_daemon(&db);
+    let _guard = DaemonGuard::new(&db);
+
+    let run = |limit: &str| -> String {
+        let out = daemon_cmd()
+            .args(["clusters", "--db"])
+            .arg(&db)
+            .args(["--limit", limit])
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clusters --limit {limit} failed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let two = run("2");
+    let five = run("5");
+
+    assert_ne!(
+        two, five,
+        "two different --limit values produced byte-identical output, so the \
+         flag reached nothing:\n{two}"
+    );
+    assert_eq!(
+        two.matches("cohesion=").count(),
+        2,
+        "--limit 2 must print two communities:\n{two}"
+    );
+    assert_eq!(
+        five.matches("cohesion=").count(),
+        5,
+        "--limit 5 must print five communities:\n{five}"
+    );
+    // The bound is only honest if it says what it dropped — the direct path
+    // already does, and the point of sharing one renderer is that both do.
+    assert!(
+        two.contains("4 more community(ies) not shown"),
+        "the truncation must be disclosed, not silent:\n{two}"
+    );
+    assert!(
+        two.contains("Clusters (6,"),
+        "and the PRE-cap total must survive the cap:\n{two}"
+    );
+}

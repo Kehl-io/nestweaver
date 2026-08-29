@@ -5865,7 +5865,9 @@ fn hubs_json_discloses_stale_rankings() {
         "no generation record means every repo predates the current resolver: {stale}"
     );
     assert!(
-        stale["stale_repos"].as_array().is_some_and(|a| !a.is_empty()),
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
         "and the payload must name which repos, so the caller can re-index them: {stale}"
     );
 }
@@ -5885,7 +5887,9 @@ fn bridges_json_discloses_stale_rankings() {
     let stale = ranking_json(&db, "bridges");
     assert_eq!(stale["rankings_stale"], true, "payload: {stale}");
     assert!(
-        stale["stale_repos"].as_array().is_some_and(|a| !a.is_empty()),
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
         "payload: {stale}"
     );
 }

@@ -11486,7 +11486,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                print_ranking_json("hubs", &hubs, &ResolverStaleness::from_store(&store, &db_path))?;
+                print_ranking_json(
+                    "hubs",
+                    &hubs,
+                    &ResolverStaleness::from_store(&store, &db_path),
+                )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
             } else {
@@ -11812,6 +11816,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // same pattern as `summary --json`. Text mode prints only
             // id/name/member_count/key_files, which the preview preserves.
             if use_daemon && !json {
+                // nw-299b, second half — NOT YET DONE, deliberately. `limit`
+                // and `members` are still not forwarded to the tool, so the
+                // daemon returns the whole population and the bound is applied
+                // here, by the printer. That is correct output but a larger
+                // payload than necessary.
+                //
+                // Forwarding them requires the `clusters` tool to DECLARE
+                // them: its input schema sets `additionalProperties: false`,
+                // so sending either key today fails the whole call with
+                // "invalid arguments for tool 'clusters'" and `clusters` stops
+                // working on the daemon route entirely. Add the two keys here
+                // once the tool declares them.
                 let mut args = serde_json::json!({});
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
@@ -11837,42 +11853,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if json {
-                        let output = nestweaver_engine::ClusteringOutput {
-                            resolution: value
-                                .get("resolution")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0),
-                            modularity: value
-                                .get("modularity")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0),
-                            communities,
-                        };
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else if communities.is_empty() {
-                        println!(
-                            "No communities detected (graph may be empty or fully disconnected)."
-                        );
-                    } else {
-                        println!(
-                            "Clusters ({}, modularity={:.4}):\n",
-                            communities.len(),
-                            value
-                                .get("modularity")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0)
-                        );
-                        for c in &communities {
-                            println!(
-                                "  [{:>3}] {} ({} members, cohesion={:.2})",
-                                c.id, c.name, c.member_count, c.cohesion
-                            );
-                            for f in &c.key_files {
-                                println!("        {f}");
-                            }
-                        }
-                    }
+                    // The `if json { … }` arm this replaces was unreachable:
+                    // the branch is guarded by `use_daemon && !json`, so `json`
+                    // is provably false here.
+                    //
+                    // Prefer the tool's own PRE-cap total when it reports one,
+                    // so the printer can disclose what the DAEMON dropped as
+                    // well as what it did. An older daemon omits the field, in
+                    // which case what arrived is the best total available.
+                    let total = value
+                        .get("total")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(communities.len());
+                    let output = nestweaver_engine::ClusteringOutput {
+                        resolution: value
+                            .get("resolution")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        modularity: value
+                            .get("modularity")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        communities,
+                    };
+                    // ONE renderer for both routes. The inline loop this
+                    // replaces was a copy of the text arm with the bounding
+                    // removed, which is exactly how the two routes came to
+                    // disagree about whether `--limit` means anything.
+                    print_clusters_output_with_total(&output, false, limit, members, total)?;
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22063,8 +22072,7 @@ fn run_brain(
                         // sample and cannot answer the question (nw-297). A
                         // pre-nw-297 daemon omits the fields — fall back to the
                         // page rather than printing nothing.
-                        let page_unresolved =
-                            links.iter().filter(|l| l.is_unresolved()).count();
+                        let page_unresolved = links.iter().filter(|l| l.is_unresolved()).count();
                         let unresolved = value
                             .get("unresolved")
                             .and_then(|v| v.as_u64())
@@ -22673,11 +22681,132 @@ fn bounded_clusters_payload(
     })
 }
 
+/// Render the text form of a clustering result, bounded to `limit`.
+///
+/// Returns a `String` rather than printing so the bound is assertable without
+/// capturing stdout, and so BOTH routes can share one renderer — the daemon
+/// branch of `Commands::Clusters` used to carry its own inline copy of this
+/// loop with the bounding removed, which is how `--limit` came to have no
+/// effect there at all (nw-299b).
+///
+/// `total` is passed in rather than read from `output.communities.len()`
+/// because on the daemon route the list has ALREADY been cut server-side, so a
+/// total taken from what arrived would report the cap as the population — the
+/// same lie F-DC-11 records for `summary --level cluster`.
+fn render_clusters_text(
+    output: &nestweaver_engine::ClusteringOutput,
+    limit: usize,
+    total: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    if output.communities.is_empty() {
+        return "No communities detected (graph may be empty or fully disconnected).\n".to_string();
+    }
+    let shown = output.communities.len();
+    let take = if limit == 0 { shown } else { limit.min(shown) };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Clusters ({total}, modularity={:.4}):\n",
+        output.modularity
+    );
+    for c in &output.communities[..take] {
+        let _ = writeln!(
+            out,
+            "  [{:>3}] {} ({} members, cohesion={:.2})",
+            c.id, c.name, c.member_count, c.cohesion
+        );
+        for f in &c.key_files {
+            let _ = writeln!(out, "        {f}");
+        }
+    }
+    if take < total {
+        let _ = writeln!(
+            out,
+            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
+            total - take
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod render_clusters_text_tests {
+    use nestweaver_engine::{ClusteringOutput, CommunityInfo};
+
+    fn community(id: u32) -> CommunityInfo {
+        CommunityInfo {
+            id,
+            name: format!("c{id}"),
+            cohesion: 1.0,
+            member_count: 3,
+            members: Vec::new(),
+            key_files: Vec::new(),
+        }
+    }
+
+    fn output(n: u32) -> ClusteringOutput {
+        ClusteringOutput {
+            resolution: 0.5,
+            modularity: 0.5,
+            communities: (0..n).map(community).collect(),
+        }
+    }
+
+    /// The bound is assertable without capturing stdout — which is the point of
+    /// the extraction: the daemon route's inline copy of this loop dropped the
+    /// bounding and nothing could see it (nw-299b).
+    #[test]
+    fn limit_bounds_the_listing_and_discloses_the_remainder() {
+        let text = super::render_clusters_text(&output(6), 2, 6);
+        assert_eq!(text.matches("cohesion=").count(), 2, "{text}");
+        assert!(text.contains("4 more community(ies) not shown"), "{text}");
+    }
+
+    /// `0` means "all", and there is then nothing to disclose.
+    #[test]
+    fn limit_zero_prints_every_community() {
+        let text = super::render_clusters_text(&output(6), 0, 6);
+        assert_eq!(text.matches("cohesion=").count(), 6, "{text}");
+        assert!(!text.contains("not shown"), "{text}");
+    }
+
+    /// The daemon may have already cut the list. A total taken from what
+    /// ARRIVED would report the cap as the population, which is the F-DC-11
+    /// defect one command over; the caller supplies the pre-cap total instead.
+    #[test]
+    fn a_server_side_cap_is_disclosed_from_the_supplied_total() {
+        // 50 arrived, 71_184 exist, the printer was asked for 10.
+        let text = super::render_clusters_text(&output(50), 10, 71_184);
+        assert!(text.contains("Clusters (71184,"), "{text}");
+        assert_eq!(text.matches("cohesion=").count(), 10, "{text}");
+        assert!(
+            text.contains("71174 more community(ies) not shown"),
+            "the remainder counts from the POPULATION, not from the page: {text}"
+        );
+    }
+}
+
 fn print_clusters_output(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
     limit: usize,
     members: usize,
+) -> anyhow::Result<()> {
+    // The direct path holds the whole population, so the total IS the length.
+    let total = output.communities.len();
+    print_clusters_output_with_total(output, json, limit, members, total)
+}
+
+/// [`print_clusters_output`] with the pre-cap total supplied by the caller, for
+/// the route that no longer has it (nw-299b).
+fn print_clusters_output_with_total(
+    output: &nestweaver_engine::ClusteringOutput,
+    json: bool,
+    limit: usize,
+    members: usize,
+    total: usize,
 ) -> anyhow::Result<()> {
     if json {
         println!(
@@ -22686,28 +22815,7 @@ fn print_clusters_output(
         );
         return Ok(());
     }
-    if output.communities.is_empty() {
-        println!("No communities detected (graph may be empty or fully disconnected).");
-        return Ok(());
-    }
-    let total = output.communities.len();
-    let take = if limit == 0 { total } else { limit.min(total) };
-    println!("Clusters ({total}, modularity={:.4}):\n", output.modularity);
-    for c in &output.communities[..take] {
-        println!(
-            "  [{:>3}] {} ({} members, cohesion={:.2})",
-            c.id, c.name, c.member_count, c.cohesion
-        );
-        for f in &c.key_files {
-            println!("        {f}");
-        }
-    }
-    if take < total {
-        println!(
-            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
-            total - take
-        );
-    }
+    print!("{}", render_clusters_text(output, limit, total));
     Ok(())
 }
 
