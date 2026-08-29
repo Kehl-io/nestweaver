@@ -4218,7 +4218,16 @@ fn budgeted_cut(
     (taken, used)
 }
 
-fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
+/// Estimated token cost of rendering one node, in the shape the renderer will
+/// actually emit.
+///
+/// `pub` because `src/main.rs` had a COPY of this — `render_cost_tokens` —
+/// which was the `concise == false` branch unconditionally, while
+/// `project-context` defaults to concise. It therefore charged roughly
+/// `(uid.len() + 40) / 4` tokens per node more than the renderer would spend
+/// and took fewer nodes for the same budget (nw-316). One function is the only
+/// arrangement in which the estimate and the renderer cannot disagree.
+pub fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
     if concise {
         // Concise renderers emit only {kind, title, location} (brain_context
         // omits location too, but one conservative model keeps this simple).

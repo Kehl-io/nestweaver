@@ -11028,7 +11028,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
                             let cut = match token_budget {
-                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                                // nw-316: `false` preserves TODAY's cost for this route. Its
+                                // renderer emits full nodes, so the detailed rate is the
+                                // correct one here — unlike `project-context`, which
+                                // renders concise and was charging this rate anyway.
+                                Some(budget) => {
+                                    token_budgeted_truncate(&result.connected, budget, false)
+                                }
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
@@ -15831,19 +15837,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // to the connected budget, not the seed overhead.
                     let connected_uids: std::collections::HashSet<&str> =
                         result.connected.iter().map(|n| n.uid.as_str()).collect();
+                    // nw-316: the SAME flag the renderer below is handed
+                    // (`!detailed`). Charging the detailed rate for a concise
+                    // response is what made this route return fewer items than
+                    // the daemon for an identical budget.
+                    let concise = !detailed;
                     let seed_tokens: usize = result
                         .seeds
                         .iter()
                         .filter(|n| !connected_uids.contains(n.uid.as_str()))
-                        .map(render_cost_tokens)
+                        .map(|n| render_cost_tokens(n, concise))
                         .sum();
                     let remaining_budget = token_budget.saturating_sub(seed_tokens);
-                    let cut = token_budgeted_truncate(&result.connected, remaining_budget);
+                    let cut = token_budgeted_truncate(&result.connected, remaining_budget, concise);
                     let connected_tokens: usize = result
                         .connected
                         .iter()
                         .take(cut)
-                        .map(render_cost_tokens)
+                        .map(|n| render_cost_tokens(n, concise))
                         .sum();
                     let used_tokens = seed_tokens + connected_tokens;
                     // Load external_refs from the extension sidecar so the
@@ -22030,7 +22041,11 @@ fn run_brain(
                     let result: nestweaver_engine::BrainContextResult =
                         serde_json::from_value(result_json)?;
                     let cut = match token_budget {
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        // nw-316: `false` preserves TODAY's cost for this route. Its
+                        // renderer emits full nodes, so the detailed rate is the
+                        // correct one here — unlike `project-context`, which
+                        // renders concise and was charging this rate anyway.
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
                         None => limit.min(result.connected.len()),
                     };
                     if json {
@@ -22320,7 +22335,11 @@ fn run_brain(
 
                     // token_budget takes precedence over the count-based limit.
                     let cut = match token_budget {
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        // nw-316: `false` preserves TODAY's cost for this route. Its
+                        // renderer emits full nodes, so the detailed rate is the
+                        // correct one here — unlike `project-context`, which
+                        // renders concise and was charging this rate anyway.
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
                         None => limit.min(result.connected.len()),
                     };
                     let node_count = result.seeds.len() + cut;
@@ -22849,11 +22868,15 @@ fn run_brain(
 /// Greedy token-budget selection: include nodes in PPR-rank order until the
 /// next one would exceed the budget. Returns the count of nodes to take.
 /// Token cost per node = (rendered length) / 4 — the standard cheap estimate.
-fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: usize) -> usize {
+fn token_budgeted_truncate(
+    connected: &[nestweaver_engine::BrainNode],
+    budget: usize,
+    concise: bool,
+) -> usize {
     let mut tokens = 0usize;
     let mut taken = 0usize;
     for n in connected {
-        let cost = render_cost_tokens(n);
+        let cost = render_cost_tokens(n, concise);
         if tokens + cost > budget {
             break;
         }
@@ -22948,9 +22971,20 @@ fn apply_recency_bias_cli(
 
 /// Rough token cost of rendering a single BrainNode line (chars / 4).
 /// Aligned with the MCP render_cost to avoid CLI vs MCP divergence.
-fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
-    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+/// Estimated token cost of one rendered node.
+///
+/// nw-316: this was a COPY of `nestweaver_mcp::tools::render_cost`'s
+/// `concise == false` branch, unconditionally — and `project-context` defaults
+/// to CONCISE, whose renderer emits only `{kind, title, location}`. So the
+/// budget charged roughly `(uid.len() + 40) / 4` tokens per node that the
+/// renderer never spent, and took fewer nodes than the budget allowed. That is
+/// the reported 14-items-vs-20.
+///
+/// It now delegates rather than mirroring both branches: a copy that agrees
+/// with the original is still a copy, and this one drifted from it precisely
+/// because it could.
+fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
+    nestweaver_mcp::tools::render_cost(n, concise)
 }
 
 /// Render a `clusters` result in either mode.
@@ -23249,7 +23283,9 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
             .connected
             .iter()
             .take(cut)
-            .map(render_cost_tokens)
+            // Text renderer: prints the full record, so the detailed rate is
+            // the right one. Unchanged from before nw-316.
+            .map(|n| render_cost_tokens(n, false))
             .sum();
         match token_budget {
             Some(budget) => println!(
@@ -33732,6 +33768,81 @@ mod include_components_tri_state_tests {
         assert!(
             flag_state(&[]).unwrap_or(true),
             "an absent flag must resolve to the documented default"
+        );
+    }
+}
+
+/// nw-316: the token budget must be spent at the rate the renderer charges.
+///
+/// `render_cost_tokens` was a COPY of `nestweaver_mcp::tools::render_cost`'s
+/// `concise == false` branch, unconditionally, while `project-context` renders
+/// CONCISE by default — `{kind, title, location}`, no `uid`, no `relevance`.
+/// The budget therefore paid for bytes the response never contained and
+/// admitted fewer nodes than it could afford, which is the reported
+/// 14-items-vs-20 against the daemon route for an identical request.
+#[cfg(test)]
+mod render_cost_parity_tests {
+    use super::*;
+
+    fn node(uid: &str) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol".to_string(),
+            title: "handleCheckout".to_string(),
+            location: "src/checkout/handler.ts:42".to_string(),
+            relevance: 0.5,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    /// There is now ONE implementation, so this asserts the delegation rather
+    /// than a numeric agreement between two copies. A copy that agrees is
+    /// still a copy — that is how this one drifted.
+    #[test]
+    fn the_cli_charges_exactly_what_the_tool_charges() {
+        for uid in ["sym:repo:short", &"sym:repo:".to_string().repeat(20)] {
+            let n = node(uid);
+            for concise in [true, false] {
+                assert_eq!(
+                    render_cost_tokens(&n, concise),
+                    nestweaver_mcp::tools::render_cost(&n, concise),
+                    "the CLI's estimate must BE the tool's, not match it"
+                );
+            }
+        }
+    }
+
+    /// The counterweight, and the one that would have caught the defect: the
+    /// two rates must actually DIFFER, and differ in the direction that
+    /// explains the symptom. If they were equal, threading the flag would be
+    /// pointless and the delegation test above would pass on the broken tree.
+    #[test]
+    fn the_concise_rate_is_cheaper_and_that_is_why_it_fits_more_nodes() {
+        let n = node("sym:repo:0123456789abcdef0123456789abcdef");
+        let concise = render_cost_tokens(&n, true);
+        let detailed = render_cost_tokens(&n, false);
+        assert!(
+            concise < detailed,
+            "a concise render omits uid and relevance, so it must cost less \
+             ({concise} vs {detailed}) — otherwise charging the wrong rate \
+             would be harmless and there would be no bug to fix"
+        );
+
+        // And the consequence, stated as the symptom rather than as arithmetic:
+        // for one budget, the correct rate admits strictly more nodes.
+        let nodes: Vec<_> = (0..40)
+            .map(|i| node(&format!("sym:repo:{i:032x}")))
+            .collect();
+        let budget = 400;
+        let at_concise_rate = token_budgeted_truncate(&nodes, budget, true);
+        let at_detailed_rate = token_budgeted_truncate(&nodes, budget, false);
+        assert!(
+            at_concise_rate > at_detailed_rate,
+            "charging the detailed rate for a concise response takes fewer \
+             nodes for the same budget ({at_detailed_rate} vs \
+             {at_concise_rate}) — that gap IS the reported item-count \
+             divergence between the two routes"
         );
     }
 }
