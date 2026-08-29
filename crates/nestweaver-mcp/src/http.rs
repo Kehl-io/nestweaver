@@ -211,6 +211,18 @@ pub struct McpHttpState {
     /// reads are atomic with readiness publication; standalone MCP retains the
     /// mutable lock above for backward compatibility.
     pub embed_model_provider: Option<Arc<dyn nestweaver_engine::EmbedModelProvider>>,
+    /// Supplies the CURRENT full-text index, overriding [`Self::tantivy`] when
+    /// set.
+    ///
+    /// `tantivy` is captured when this state is built, which for the daemon is
+    /// once, at boot. A daemon that could not open its Tantivy sidecar then —
+    /// locked by another process, or not yet created — froze `None` into this
+    /// field and served substring-fallback search over `/mcp` for the rest of
+    /// its life, even after the sidecar was repaired. The provider is the same
+    /// indirection `embed_model_provider` already uses, for the same reason.
+    /// `None` keeps the plain captured handle, which is right for callers
+    /// whose index genuinely cannot change.
+    pub search_index_provider: Option<Arc<dyn nestweaver_engine::SearchIndexProvider>>,
     /// Daemon-side federation coordinator, built once from the instance
     /// config's `[[upstream]]` entries. `None` for the common single-node case
     /// (no upstreams configured) — the `/mcp` boundary then stamps the honest
@@ -292,6 +304,7 @@ impl McpHttpState {
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             embed_model_provider: None,
+            search_index_provider: None,
             #[cfg(feature = "daemon")]
             federation: None,
         }
@@ -326,6 +339,7 @@ impl McpHttpState {
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             embed_model_provider: None,
+            search_index_provider: None,
             #[cfg(feature = "daemon")]
             federation: None,
         }
@@ -942,7 +956,10 @@ async fn handle_mcp(
             }
 
             let store = state.store.clone();
-            let tantivy = state.tantivy.clone();
+            let tantivy = match &state.search_index_provider {
+                Some(provider) => provider.search_index(),
+                None => state.tantivy.clone(),
+            };
             let db_path = state.db_path.clone();
             let instance_cfg = state.instance_cfg.clone();
             let lite = state.lite;

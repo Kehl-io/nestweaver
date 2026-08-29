@@ -356,7 +356,7 @@ mod tests {
                 worker_queue,
                 worker_workspace,
                 worker_store,
-                "test".to_string(),
+                crate::worker::fixed_instance_id("test"),
                 &mut worker_shutdown,
                 Some(worker_status),
                 Some(worker_drained),
