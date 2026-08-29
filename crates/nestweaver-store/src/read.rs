@@ -705,6 +705,32 @@ impl GraphStore {
         Ok(tested)
     }
 
+    /// The symbols a service owns, via `SERVICE_HAS_SYMBOL`.
+    ///
+    /// nw-311: `service-summary --help` says "Show a service summary with entry
+    /// points" and no code path anywhere ever looked for one — `Service` has six
+    /// fields and none of them is an entry point. The data was one query away
+    /// the whole time: the edge is written at `write.rs` and `Symbol` already
+    /// carries `is_entry_point`/`entry_point_kind`. Filtering happens in the
+    /// caller so this stays the general traversal.
+    pub fn symbols_in_service(&self, service_uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (svc:Service {{uid: $uid}})-[:SERVICE_HAS_SYMBOL]->(s:Symbol) RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", Value::String(service_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
     /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
     /// Returns `None` if no symbol has this canonical_id.
     pub fn symbol_by_canonical_id(&self, canonical_id: &str) -> Result<Option<Symbol>, StoreError> {

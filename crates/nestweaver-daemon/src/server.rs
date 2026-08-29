@@ -6991,13 +6991,26 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let instance = args.get("instance").and_then(|v| v.as_str());
-            let services = state
-                .store
-                .list_services(instance)
-                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
-            let service = services.iter().find(|s| s.name == name || s.uid == name);
-            match service {
-                Some(s) => serde_json::to_string(s)
+            let repo = args.get("repo").and_then(|v| v.as_str());
+            // nw-311: this used to be `services.iter().find(...)`, which
+            // returned the FIRST of however many matched and discarded the
+            // count, into a bare `Service` that had nowhere to put it. On a
+            // 44-repo graph the caller got a confident answer about a service
+            // they did not ask about, with no way to detect the substitution —
+            // while the CLI's direct path, unreachable whenever a daemon is up,
+            // already warned and listed every candidate.
+            //
+            // Both routes now call the same engine resolver. The payload
+            // FLATTENS the chosen service, so it stays a superset of what this
+            // RPC used to return: an older CLI still deserializes it as a
+            // `Service`, and every caller gains `matched` / `alternatives` /
+            // `entry_points` without a coordinated upgrade.
+            let summary = nestweaver_engine::query::service_summary(
+                &state.store, name, instance, repo,
+            )
+            .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+            match summary {
+                Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
                 None => Err(Status::not_found(format!("service not found: {name}"))),
             }

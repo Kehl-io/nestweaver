@@ -2347,6 +2347,148 @@ pub fn list_services(
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// One service that matched a `service-summary` name, enough to disambiguate by.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServiceCandidate {
+    pub uid: String,
+    pub name: String,
+    pub repo_uid: String,
+}
+
+/// An entry point of a service, as `service-summary --help` has always promised.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServiceEntryPoint {
+    pub uid: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point_kind: Option<String>,
+    pub file_path: String,
+    pub start_line: u32,
+}
+
+/// The ONE answer `service-summary` has, on every route.
+///
+/// nw-311. Two defects met here. (a) `--help` says "Show a service summary with
+/// entry points" and nothing anywhere ever queried one. (b) The direct CLI path
+/// warned on an ambiguous name and listed every candidate UID, while the daemon
+/// path — which runs first and `return`s on success, so the correct code below
+/// it is unreachable whenever a daemon is up, which is the default — resolved
+/// with `.find()` server-side and returned a bare `Service` that had nowhere to
+/// put "6 others matched". Same command, two answers, and the caller could not
+/// detect the substitution.
+///
+/// `service` is flattened so the payload stays a superset of the bare `Service`
+/// both routes used to emit: an existing consumer keeps working and gains the
+/// disclosure, rather than being broken into noticing it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServiceSummary {
+    #[serde(flatten)]
+    pub service: Service,
+    /// How many services the name matched. `> 1` means the answer below is ONE
+    /// of several and the caller asked a question with more than one answer.
+    pub matched: usize,
+    /// Every other candidate, so the caller can re-ask unambiguously.
+    #[serde(default)]
+    pub alternatives: Vec<ServiceCandidate>,
+    /// The entry points `--help` promises.
+    #[serde(default)]
+    pub entry_points: Vec<ServiceEntryPoint>,
+}
+
+impl ServiceSummary {
+    /// The human-facing ambiguity warning, written ONCE.
+    ///
+    /// Both CLI routes render this. The previous divergence was not a missing
+    /// feature but a warning that existed on one route and had no home on the
+    /// other; extracting it is what stops a third route from losing it again.
+    pub fn ambiguity_warning(&self, requested: &str) -> Option<String> {
+        if self.matched <= 1 {
+            return None;
+        }
+        let mut out = format!(
+            "warning: '{requested}' matches {} services; showing the first — \
+             pass the full UID to disambiguate:\n",
+            self.matched
+        );
+        out.push_str(&format!("  {} ({})\n", self.service.uid, self.service.name));
+        for candidate in &self.alternatives {
+            out.push_str(&format!("  {} ({})\n", candidate.uid, candidate.name));
+        }
+        Some(out)
+    }
+}
+
+/// Resolve a service by name or UID and describe it fully.
+///
+/// `repo` is the disambiguator 6.4.0 already shipped for `impact` ("apply
+/// `--repo` to uniquely-resolving names, not just ambiguous ones") and which
+/// this command was left without. It is resolved through
+/// [`crate::resolve_repo_selector`], the canonical resolver, so an unknown
+/// selector is an error rather than a silent empty match.
+///
+/// Returns `Ok(None)` when nothing matched — "not found" is not an error here,
+/// it is an answer with its own exit code.
+pub fn service_summary(
+    store: &GraphStore,
+    name: &str,
+    instance_id: Option<&str>,
+    repo: Option<&str>,
+) -> Result<Option<ServiceSummary>, anyhow::Error> {
+    let services = list_services(store, instance_id)?;
+
+    let repo_uid = match repo {
+        Some(selector) => {
+            let repos = store.list_repos(instance_id).map_err(|e| anyhow::anyhow!(e))?;
+            Some(crate::resolve_repo_selector(&repos, selector)?.uid.clone())
+        }
+        None => None,
+    };
+
+    let mut matches: Vec<&Service> = services
+        .iter()
+        .filter(|s| s.name == name || s.uid == name)
+        .filter(|s| repo_uid.as_deref().is_none_or(|uid| s.repo_uid == uid))
+        .collect();
+    // Deterministic: the store's row order is not a ranking, and "the first
+    // match" must not depend on it.
+    matches.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+    let Some(chosen) = matches.first().copied() else {
+        return Ok(None);
+    };
+
+    let entry_points = store
+        .symbols_in_service(&chosen.uid)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .into_iter()
+        .filter(|symbol| symbol.is_entry_point)
+        .map(|symbol| ServiceEntryPoint {
+            uid: symbol.uid,
+            name: symbol.name,
+            kind: symbol.kind.to_string(),
+            entry_point_kind: symbol.entry_point_kind.map(|kind| format!("{kind:?}")),
+            file_path: symbol.file_path,
+            start_line: symbol.start_line,
+        })
+        .collect();
+
+    Ok(Some(ServiceSummary {
+        service: chosen.clone(),
+        matched: matches.len(),
+        alternatives: matches
+            .iter()
+            .skip(1)
+            .map(|s| ServiceCandidate {
+                uid: s.uid.clone(),
+                name: s.name.clone(),
+                repo_uid: s.repo_uid.clone(),
+            })
+            .collect(),
+        entry_points,
+    }))
+}
+
 /// Estimate the number of tokens in `text` using the (len + 3) / 4 rule.
 fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
@@ -3792,5 +3934,170 @@ mod semantic_leg_tests {
         .expect_err("wrong-dimensional query vectors must not inject semantic seeds");
 
         assert!(format!("{err:#}").contains("No seeds resolved"));
+    }
+}
+
+#[cfg(test)]
+mod service_summary_tests {
+    use nestweaver_schema::{Repo, Service, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+
+    use super::service_summary;
+
+    fn symbol(uid: &str, name: &str, repo: &str, entry: bool) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: "src/index.js".to_string(),
+            start_line: 7,
+            end_line: 9,
+            signature: format!("function {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// `n` repos each holding a service with the SAME name, exactly the
+    /// 44-repo shape the report hit.
+    fn store_with_same_named_service_in_n_repos(name: &str, n: usize) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..n {
+            let repo_uid = format!("repo:test:{i:012x}");
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid.clone(),
+                    url: format!("https://github.com/example/r{i}"),
+                    indexed_sha: "abc123".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".to_string(),
+                    name: Some(format!("r{i}")),
+                    root_path: None,
+                })
+                .unwrap();
+            let svc_uid = format!("svc:{repo_uid}:{i:012x}");
+            store
+                .insert_service(&Service {
+                    uid: svc_uid.clone(),
+                    name: name.to_string(),
+                    repo_uid: repo_uid.clone(),
+                    summary: None,
+                    summary_hash: None,
+                    embedding: None,
+                })
+                .unwrap();
+            // One entry point and one ordinary symbol per service, so the
+            // filter has something to exclude.
+            let entry = symbol(&format!("sym:{repo_uid}:entry"), "handler", &repo_uid, true);
+            let plain = symbol(&format!("sym:{repo_uid}:plain"), "helper", &repo_uid, false);
+            store.insert_symbol(&entry).unwrap();
+            store.insert_symbol(&plain).unwrap();
+            store
+                .batch_insert_service_symbol_edges(&[
+                    (svc_uid.as_str(), entry.uid.as_str()),
+                    (svc_uid.as_str(), plain.uid.as_str()),
+                ])
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-311 / F-DC-14. `service-summary` silently picked 1 of 7 identically
+    /// named services: the daemon route resolved with `.find()` server-side and
+    /// returned a bare `Service` with nowhere to put "6 others matched", while
+    /// the direct route's warning sat below a `return` that a running daemon
+    /// always took first. The caller got a confident answer about a service
+    /// they did not ask about and no way to detect the substitution.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? Not "warn on the daemon
+    /// route too" — that is what created the divergence, twice. The resolution
+    /// AND the warning text now live in one function that both routes call, so
+    /// a third route inherits them instead of reimplementing them.
+    #[test]
+    fn service_summary_discloses_every_candidate_it_did_not_choose() {
+        let store = store_with_same_named_service_in_n_repos("src/services", 7);
+
+        let summary = service_summary(&store, "src/services", None, None)
+            .unwrap()
+            .expect("the service resolves");
+
+        assert_eq!(
+            summary.matched, 7,
+            "the count must survive resolution; discarding it is the defect"
+        );
+        assert_eq!(
+            summary.alternatives.len(),
+            6,
+            "every candidate the caller did NOT get must be named so they can \
+             re-ask unambiguously: {:?}",
+            summary.alternatives
+        );
+        let warning = summary
+            .ambiguity_warning("src/services")
+            .expect("an ambiguous match must warn");
+        assert!(warning.contains("matches 7 services"), "{warning}");
+        assert_eq!(
+            warning.matches("svc:").count(),
+            7,
+            "the warning must list every candidate uid, including the chosen \
+             one: {warning}"
+        );
+
+        // A unique name must NOT warn — a disclosure that always fires is noise.
+        let unique = store_with_same_named_service_in_n_repos("api", 1);
+        let only = service_summary(&unique, "api", None, None).unwrap().unwrap();
+        assert_eq!(only.matched, 1);
+        assert!(only.ambiguity_warning("api").is_none());
+    }
+
+    /// `--help` says "Show a service summary with entry points". `Service` has
+    /// six fields, none of them an entry point, and neither handler ever
+    /// queried `SERVICE_HAS_SYMBOL` — a command documented output it had no
+    /// route to produce.
+    #[test]
+    fn service_summary_returns_the_entry_points_its_help_promises() {
+        let store = store_with_same_named_service_in_n_repos("api", 1);
+        let summary = service_summary(&store, "api", None, None).unwrap().unwrap();
+
+        assert_eq!(
+            summary.entry_points.len(),
+            1,
+            "one of the two linked symbols is an entry point: {:?}",
+            summary.entry_points
+        );
+        assert_eq!(summary.entry_points[0].name, "handler");
+        assert_eq!(summary.entry_points[0].file_path, "src/index.js");
+    }
+
+    /// 6.4.0 already shipped this exact fix for `impact` ("apply `--repo` to
+    /// uniquely-resolving names, not just ambiguous ones") and two commands
+    /// were left behind. An unknown selector must ERROR rather than silently
+    /// matching nothing, which is the failure mode the canonical resolver
+    /// exists to prevent.
+    #[test]
+    fn a_repo_filter_disambiguates_and_an_unknown_one_is_an_error() {
+        let store = store_with_same_named_service_in_n_repos("src/services", 7);
+
+        let scoped = service_summary(&store, "src/services", None, Some("r3"))
+            .unwrap()
+            .expect("the r3 service resolves");
+        assert_eq!(scoped.matched, 1, "the repo filter must narrow the match");
+        assert!(scoped.alternatives.is_empty());
+        assert!(scoped.service.repo_uid.ends_with(&format!("{:012x}", 3)));
+
+        assert!(
+            service_summary(&store, "src/services", None, Some("no-such-repo")).is_err(),
+            "an unresolvable repo selector must fail loudly, not answer about \
+             whichever repo the store returned first"
+        );
     }
 }
