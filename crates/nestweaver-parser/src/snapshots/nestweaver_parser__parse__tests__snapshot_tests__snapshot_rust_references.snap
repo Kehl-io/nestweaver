@@ -82,6 +82,16 @@ expression: "parsed_references(\"simple.rs\", &source)"
   start_line: 29
   context: "{"
   receiver: ~
+- name: SensorManager
+  kind: TypeRef
+  start_line: 30
+  context: "{"
+  receiver: ~
+- name: HashMap
+  kind: TypeRef
+  start_line: 31
+  context: "HashMap::new()"
+  receiver: ~
 - name: new
   kind: Call
   start_line: 31
@@ -126,6 +136,11 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: TypeRef
   start_line: 40
   context: "config: &Settings"
+  receiver: ~
+- name: SensorManager
+  kind: TypeRef
+  start_line: 41
+  context: "SensorManager::new()"
   receiver: ~
 - name: new
   kind: Call

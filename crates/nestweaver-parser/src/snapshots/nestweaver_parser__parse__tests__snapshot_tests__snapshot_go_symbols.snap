@@ -119,8 +119,8 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   end_line: 33
   signature: "func main() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
+  is_entry_point: true
+  entry_point_kind: Main
   visibility: Private
   type_info: ~
   parent_name: ~

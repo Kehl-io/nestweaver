@@ -495,8 +495,21 @@ fn detect_go(
         return Some(EntryPointKind::HttpHandler);
     }
 
-    // Main function
-    if name == "main" && (file_path.contains("cmd/") || file_path.ends_with("main.go")) {
+    // Main function.
+    //
+    // Go's rule is `func main()` in `package main`, and the file may be named
+    // anything — `cmd/` and `main.go` are conventions, not the language. A
+    // `simple.go` holding `package main; func main()` is a program entry that
+    // this gate refused, and `infer_confidence` then scored the unreachable
+    // result HIGH on the Go lowercase-name convention: the most confident row
+    // in the list was the one symbol in the file that certainly is not dead.
+    //
+    // The package clause is not in scope here (this sees only name/path/kind/
+    // signature), so the test is widened to the name. A `func main` in a
+    // non-main package is legal but is a name Go style reserves; treating it
+    // as a root over-reports reachability slightly, which is the safe
+    // direction for a dead-code claim.
+    if name == "main" && file_path.ends_with(".go") {
         return Some(EntryPointKind::Main);
     }
 
@@ -1612,5 +1625,43 @@ mod tests {
     fn is_test_file_windows_separators() {
         assert!(is_test_file("src\\__tests__\\foo.ts"));
         assert!(is_test_file("pkg\\api\\users_test.go"));
+    }
+}
+
+/// nw-291 follow-up: a program entry that the path gate refused.
+#[cfg(test)]
+mod go_main_gate_tests {
+    use super::*;
+
+    /// Go's rule is `func main()` in `package main`; `cmd/` and `main.go` are
+    /// conventions, not the language. `testdata/go/simple.go` holds
+    /// `package main; func main()` and was refused by both halves of the old
+    /// gate — then scored HIGH-confidence dead code on the Go lowercase-name
+    /// convention, making the single most confident row in the list the one
+    /// symbol in the file that certainly is not dead.
+    #[test]
+    fn a_go_main_is_an_entry_point_whatever_the_file_is_called() {
+        for path in [
+            "testdata/go/simple.go",
+            "cmd/server/main.go",
+            "internal/app/run.go",
+        ] {
+            assert_eq!(
+                detect_entry_point("main", path, "function", None, "go"),
+                Some(EntryPointKind::Main),
+                "{path}"
+            );
+        }
+    }
+
+    /// WHERE ELSE: widening the gate must not widen it to another language's
+    /// `main`, each of which has its own rule.
+    #[test]
+    fn the_widened_gate_is_scoped_to_go_files() {
+        assert_eq!(
+            detect_entry_point("main", "src/helpers.py", "function", None, "go"),
+            None,
+            "a non-.go path must not be treated as a Go program entry"
+        );
     }
 }
