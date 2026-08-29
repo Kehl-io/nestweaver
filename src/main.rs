@@ -9472,6 +9472,78 @@ fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The coverage caveat every incomplete-impact disclosure ends with.
+///
+/// Named once so the daemon route can test for it rather than assume it is
+/// absent (nw-317).
+const IMPACT_FLOOR_CLAUSE: &str = "reported impact is a floor";
+
+/// Add the floor clause to a daemon-supplied `impact` note, unless the note
+/// already carries it.
+///
+/// The daemon and direct routes disclose the same truncation with two
+/// different strings: the direct one is parametrised (it names the depth, the
+/// threshold and the remedy) and ENDS with the floor clause, while the tool's
+/// is static and — for its depth case — omits it. Text mode papered over the
+/// gap by appending the clause unconditionally, which is correct only for as
+/// long as the tool's note lacks it.
+///
+/// That is a standing trap rather than a stable arrangement: the tool's OTHER
+/// note already contains the clause today (it is unreachable only because the
+/// tool hardcodes a 0.0 threshold, so `truncated_by_threshold` is never true),
+/// and moving the parametrised text down to the store — so both routes can
+/// share it — makes every note end with the clause. Under an unconditional
+/// append that prints it twice.
+///
+/// Testing for the clause is right in both arrangements and needs no follow-up
+/// edit when the note changes underneath it.
+fn impact_note_with_floor_clause(note: &str) -> String {
+    if note.contains(IMPACT_FLOOR_CLAUSE) {
+        note.to_string()
+    } else {
+        format!("{note} — {IMPACT_FLOOR_CLAUSE}")
+    }
+}
+
+#[cfg(test)]
+mod impact_floor_clause_tests {
+    use super::impact_note_with_floor_clause;
+
+    /// Today's daemon depth note omits the clause, so it must still be added.
+    #[test]
+    fn a_note_without_the_clause_gains_it() {
+        let note =
+            "frontier reached max depth — deeper dependents may exist beyond the returned set";
+        assert_eq!(
+            impact_note_with_floor_clause(note),
+            format!("{note} — reported impact is a floor")
+        );
+    }
+
+    /// The tool's threshold note already carries it mid-sentence.
+    #[test]
+    fn a_note_that_already_says_it_is_left_alone() {
+        let note = "paths pruned below the impact-score threshold — reported impact is a \
+                    floor, not the full set";
+        assert_eq!(impact_note_with_floor_clause(note), note);
+    }
+
+    /// And the parametrised form, which ends with the clause — the shape both
+    /// routes converge on once the note moves down to the store.
+    #[test]
+    fn the_parametrised_note_is_not_doubled() {
+        let note = "traversal hit the depth limit (3) — deeper dependents may exist; raise \
+                    --depth — reported impact is a floor";
+        let once = impact_note_with_floor_clause(note);
+        assert_eq!(once, note);
+        assert_eq!(
+            once.matches("reported impact is a floor").count(),
+            1,
+            "the clause must appear exactly once: {once}"
+        );
+    }
+}
+
 /// Human-readable caveat for an incomplete `impact` traversal, mirroring the
 /// pr-impact "reported impact is a floor" phrasing. Names the concrete cause
 /// (score pruning / depth cap) and the opt-out for each.
@@ -14930,7 +15002,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if let Some(note) = value.get("note").and_then(|v| v.as_str())
                             && !out.quiet
                         {
-                            println!("note: {note} — reported impact is a floor");
+                            println!("note: {}", impact_note_with_floor_clause(note));
                         }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
