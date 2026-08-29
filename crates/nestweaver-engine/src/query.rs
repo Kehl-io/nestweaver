@@ -4063,6 +4063,35 @@ mod service_summary_tests {
         assert!(only.ambiguity_warning("api").is_none());
     }
 
+    /// The daemon RPC used to return a bare `Service` and `src/main.rs` still
+    /// does `serde_json::from_value::<Service>(value)` on it. The envelope
+    /// FLATTENS the chosen service precisely so that call keeps working — an
+    /// older CLI against a newer daemon must not start reporting "not found".
+    /// Asserted, not assumed: a `#[serde(flatten)]` that stopped flattening
+    /// would break that caller silently and no test here would have noticed.
+    #[test]
+    fn the_envelope_is_still_readable_as_a_bare_service() {
+        let store = store_with_same_named_service_in_n_repos("api", 3);
+        let summary = service_summary(&store, "api", None, None).unwrap().unwrap();
+        let wire = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(
+            wire["uid"],
+            serde_json::json!(summary.service.uid),
+            "the service's own fields must be at the TOP level: {wire}"
+        );
+        let as_service: Service =
+            serde_json::from_value(wire.clone()).expect("still parses as a bare Service");
+        assert_eq!(as_service.uid, summary.service.uid);
+        assert_eq!(as_service.name, "api");
+
+        // And the envelope round-trips as itself, disclosure intact.
+        let back: super::ServiceSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.matched, 3);
+        assert_eq!(back.alternatives.len(), 2);
+        assert_eq!(back.entry_points.len(), summary.entry_points.len());
+    }
+
     /// `--help` says "Show a service summary with entry points". `Service` has
     /// six fields, none of them an entry point, and neither handler ever
     /// queried `SERVICE_HAS_SYMBOL` — a command documented output it had no
