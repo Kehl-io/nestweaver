@@ -2176,6 +2176,59 @@ pub fn remove_extension_uid_durable(db_path: &Path, uid: &str) -> Result<bool, a
     Ok(true)
 }
 
+/// Remove exactly ONE key from ONE uid in the extension sidecar and durably
+/// publish the replacement. Returns `true` when a key was removed; a missing
+/// sidecar, uid or key is a confirmed no-op.
+///
+/// [`remove_extension_uid_durable`] already existed but removes ALL of a uid's
+/// properties and is reachable only from daemon reindex / UID-remap /
+/// project-teardown paths — so the durable read-modify-write machinery was
+/// proven while no user or agent could unset a single property (nw-281b).
+/// `set_extension` requires `value`, so not even a null-set was expressible.
+///
+/// Strict on malformed input for the same reason as its sibling: a cleanup must
+/// never overwrite unrelated metadata with an empty map.
+pub fn remove_extension_key_durable(
+    db_path: &Path,
+    uid: &str,
+    key: &str,
+) -> Result<bool, anyhow::Error> {
+    let path = sidecar_path(db_path);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read extension sidecar {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut store: ExtensionStore = serde_json::from_str(&content)
+        .map_err(|error| anyhow::anyhow!("parse extension sidecar {}: {error}", path.display()))?;
+    let Some(properties) = store.get_mut(uid) else {
+        return Ok(false);
+    };
+    if properties.remove(key).is_none() {
+        return Ok(false);
+    }
+    // An empty property map is indistinguishable from an absent uid to every
+    // reader, so do not leave one behind for `query_extensions` to enumerate.
+    if properties.is_empty() {
+        store.remove(uid);
+    }
+
+    let json = serde_json::to_vec_pretty(&store)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&json))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably remove extension key {key} for {uid} from {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(true)
+}
+
 /// Set a single property on a node. Creates the node entry if absent.
 pub fn set_property(store: &mut ExtensionStore, uid: &str, key: &str, value: serde_json::Value) {
     store
@@ -2316,6 +2369,64 @@ mod tests {
     /// matching meant key+value mode returned 0 results for 100% of live data —
     /// the obvious question ("which nodes carry alias Widget") had no
     /// expressible form. Membership makes it answerable.
+
+    #[test]
+    fn remove_extension_key_drops_one_key_and_keeps_the_rest() {
+        // nw-281(b): `set_extension` requires `value`, so not even a null-set
+        // was expressible, and the only delete removed ALL of a uid's
+        // properties and was reachable solely from daemon reindex paths.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let mut store = ExtensionStore::new();
+        set_property(&mut store, "sym:a", "team_owner", serde_json::json!("core"));
+        set_property(&mut store, "sym:a", "deprecated", serde_json::json!(true));
+        set_property(&mut store, "sym:b", "team_owner", serde_json::json!("web"));
+        save_extensions(&db_path, &store).unwrap();
+
+        assert!(remove_extension_key_durable(&db_path, "sym:a", "deprecated").unwrap());
+
+        let after = load_extensions(&db_path);
+        assert_eq!(
+            after.get("sym:a").and_then(|p| p.get("team_owner")),
+            Some(&serde_json::json!("core")),
+            "the sibling key on the same uid must survive"
+        );
+        assert!(
+            after
+                .get("sym:a")
+                .is_none_or(|p| !p.contains_key("deprecated"))
+        );
+        assert_eq!(
+            after.get("sym:b").and_then(|p| p.get("team_owner")),
+            Some(&serde_json::json!("web")),
+            "an unrelated uid must be untouched"
+        );
+    }
+
+    #[test]
+    fn remove_extension_key_is_a_confirmed_no_op_and_leaves_no_empty_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        assert!(
+            !remove_extension_key_durable(&db_path, "sym:a", "k").unwrap(),
+            "no sidecar yet is a no-op, not an error"
+        );
+
+        let mut store = ExtensionStore::new();
+        set_property(&mut store, "sym:a", "only", serde_json::json!(1));
+        save_extensions(&db_path, &store).unwrap();
+
+        assert!(!remove_extension_key_durable(&db_path, "sym:a", "absent").unwrap());
+        assert!(!remove_extension_key_durable(&db_path, "sym:missing", "only").unwrap());
+
+        assert!(remove_extension_key_durable(&db_path, "sym:a", "only").unwrap());
+        assert!(
+            !load_extensions(&db_path).contains_key("sym:a"),
+            "an empty property map reads as a present uid to query_extensions; \
+             removing the last key must remove the entry"
+        );
+    }
+
     #[test]
     fn scalar_query_matches_a_member_of_an_array_valued_property() {
         let mut store: ExtensionStore = Default::default();

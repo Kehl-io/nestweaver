@@ -360,7 +360,8 @@ pub use extensions::{
     prepare_instance_extension_migration, prepare_instance_extension_migration_with_finalizers,
     prepare_instance_uid_migration_with_finalizers, query_by_property,
     reconcile_deleted_extension_uids, reconcile_extension_handoffs, reconcile_extension_liveness,
-    record_last_indexed_at, remove_extension_uid_durable, save_extensions, set_property,
+    record_last_indexed_at, remove_extension_key_durable, remove_extension_uid_durable,
+    save_extensions, set_property,
 };
 pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
@@ -389,8 +390,8 @@ pub use index_md::{
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
     clear_interaction_sidecar, compute_decayed_score, interaction_sidecar_path,
-    load_interaction_data, load_interaction_scores, load_node_score, save_interaction_store,
-    top_uids_by_kind,
+    load_interaction_data, load_interaction_scores, load_node_score, remove_node_score,
+    save_interaction_store, top_uids_by_kind,
 };
 pub use investigate::{
     Bundle, BundleEntry, BundleStore, Domain, ExpandResult, HydrateResult, InvestigateResult,
