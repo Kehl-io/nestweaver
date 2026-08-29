@@ -348,14 +348,14 @@ async fn dispatch_typed_brain_context(
     Ok(parsed)
 }
 
-/// Typed dispatch for `project_context` -> `GetProjectContext` RPC.
-/// Response is `ProjectContextResponse { result_json }`.
-async fn dispatch_typed_project_context(
-    client: &mut NestWeaverDaemonClient<Channel>,
-    params: &Value,
-    auth_token: Option<&str>,
-) -> Result<Value> {
-    let req = nestweaver_proto::ProjectContextRequest {
+/// Build the typed `project_context` request from JSON params.
+///
+/// Extracted so the argument contract can be asserted without a live daemon —
+/// the same idiom `src/main.rs` already uses for `bridge_nodes_rpc_args` and
+/// friends. nw-316 turned on exactly this boundary, and it had no test because
+/// the mapping was buried inside an `async fn` that needs a gRPC channel.
+fn project_context_request(params: &Value) -> nestweaver_proto::ProjectContextRequest {
+    nestweaver_proto::ProjectContextRequest {
         project: params
             .get("project")
             .and_then(|v| v.as_str())
@@ -366,7 +366,12 @@ async fn dispatch_typed_project_context(
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32,
         kinds: json_str_array(params, "kinds"),
-        include_components: bool_or(params, "include_components", true),
+        // nw-316: `Option`, not `bool_or(.., true)`. Defaulting here decided
+        // the value one hop before the layer that documents the default, so
+        // absence could never reach the tool.
+        include_components: params
+            .get("include_components")
+            .and_then(|value| value.as_bool()),
         intent: params
             .get("intent")
             .and_then(|v| v.as_str())
@@ -402,7 +407,17 @@ async fn dispatch_typed_project_context(
             .to_string(),
         tags: json_str_array(params, "tags"),
         exclude_tags: json_str_array(params, "exclude_tags"),
-    };
+    }
+}
+
+/// Typed dispatch for `project_context` -> `GetProjectContext` RPC.
+/// Response is `ProjectContextResponse { result_json }`.
+async fn dispatch_typed_project_context(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = project_context_request(params);
     let mut request = tonic::Request::new(req);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
@@ -415,21 +430,28 @@ async fn dispatch_typed_project_context(
     Ok(parsed)
 }
 
+/// Build the typed `note_get` request from JSON params. Extracted for the same
+/// reason as [`project_context_request`].
+fn note_get_request(params: &Value) -> nestweaver_proto::NoteGetRequest {
+    nestweaver_proto::NoteGetRequest {
+        uid: params.get("uid").and_then(|v| v.as_str()).map(String::from),
+        title: params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        // nw-316: preserve absence; see `project_context_request`.
+        include_body: params.get("include_body").and_then(|value| value.as_bool()),
+        sections: json_str_array(params, "sections"),
+    }
+}
+
 /// Typed dispatch for `note_get` -> `GetNote` RPC.
 async fn dispatch_typed_note_get(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
 ) -> Result<Value> {
-    let req = nestweaver_proto::NoteGetRequest {
-        uid: params.get("uid").and_then(|v| v.as_str()).map(String::from),
-        title: params
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        include_body: bool_or(params, "include_body", true),
-        sections: json_str_array(params, "sections"),
-    };
+    let req = note_get_request(params);
     let mut request = tonic::Request::new(req);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
@@ -514,17 +536,6 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Presence-aware bool extraction: proto3 scalar bools carry no
-/// presence, so an arg the caller left unset would forward as explicit
-/// `false`, and the daemon's typed handlers write that `false` back into the
-/// tool args — overriding tool defaults that are TRUE
-/// (`project_context.include_components`, `note_get.include_body`). Forward
-/// the tool's own default when the caller did not specify the flag; an
-/// explicit `false` is still honored.
-fn bool_or(params: &Value, key: &str, default: bool) -> bool {
-    params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,21 +606,39 @@ mod tests {
         );
     }
 
+    /// nw-316. `bool_or(params, "include_components", true)` guessed the tool's
+    /// default HERE, one hop before the layer that documents it, because the
+    /// proto3 `bool` it fed could not carry absence. The guess was right for an
+    /// absent argument and wrong in the only case that mattered: it made
+    /// "unset" and "explicitly false" indistinguishable at the daemon, so a CLI
+    /// flag whose clap default is `false` silently pinned the tool's documented
+    /// default of `true` to false, and `project-context X` seeded PPR from a
+    /// different member set than `project_context {"project":"X"}`.
+    ///
+    /// The field is `optional` now, so absence is representable and the
+    /// assertion is on ABSENCE surviving rather than on the guess being right.
+    ///
+    /// WHERE ELSE? `note_get.include_body` is the same shape and is fixed with
+    /// it — it is the other field the deleted helper's own doc comment named.
     #[test]
-    fn bool_or_forwards_default_true_when_arg_absent() {
-        // Absent include_components/include_body must NOT collapse to
-        // false (proto3 has no presence); the tool default is true.
+    fn absent_presence_tracked_bools_reach_the_tool_as_absent() {
         let empty = serde_json::json!({});
-        assert!(bool_or(&empty, "include_components", true));
-        assert!(bool_or(&empty, "include_body", true));
+        let project = project_context_request(&empty);
+        assert_eq!(
+            project.include_components, None,
+            "an absent flag must arrive absent, so the TOOL decides the default"
+        );
+        let note = note_get_request(&empty);
+        assert_eq!(note.include_body, None);
 
-        // Explicit values are honored in both directions.
+        // Explicit values are still carried, in both directions — presence
+        // tracking is what makes `false` distinguishable from silence.
         let explicit_false = serde_json::json!({ "include_components": false });
-        assert!(!bool_or(&explicit_false, "include_components", true));
+        assert_eq!(
+            project_context_request(&explicit_false).include_components,
+            Some(false)
+        );
         let explicit_true = serde_json::json!({ "include_body": true });
-        assert!(bool_or(&explicit_true, "include_body", true));
-
-        // Default-false bools keep their old behavior.
-        assert!(!bool_or(&empty, "prf", false));
+        assert_eq!(note_get_request(&explicit_true).include_body, Some(true));
     }
 }

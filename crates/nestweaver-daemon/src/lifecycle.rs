@@ -2581,7 +2581,29 @@ pub fn selected_slot_identity_daemon_pid(db_path: &Path) -> Option<i32> {
         .trim()
         .parse::<i32>()
         .ok()?;
-    (pid > 0 && unsafe { libc::kill(pid, 0) == 0 }).then_some(pid)
+    process_is_live(pid).then_some(pid)
+}
+
+/// Whether a process id names a process that is still running.
+///
+/// The one liveness predicate for the whole daemon, so a PID question is
+/// answered the same way wherever it is asked — daemon retirement
+/// ([`selected_slot_identity_daemon_pid`]) and, since nw-302, watcher
+/// ownership.
+///
+/// `EPERM` counts as ALIVE. `kill(pid, 0)` fails that way when the process
+/// EXISTS but belongs to another user; absence of permission is not absence of
+/// the process, and treating it as death is how a reclaim steals a watcher from
+/// a live owner. A recycled pid likewise reports live, which only ever makes a
+/// caller more conservative — never less.
+pub fn process_is_live(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Stop and clean up a daemon left behind under a superseded instance id.

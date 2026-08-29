@@ -177,6 +177,39 @@ pub struct ImpactResult {
     pub edge_types: Vec<EdgeType>,
 }
 
+impl ImpactResult {
+    /// Human-readable caveat for an incomplete traversal, naming the concrete
+    /// cause, the concrete opt-out for each, and the word "floor".
+    ///
+    /// nw-317 leg 1. This text lived in `src/main.rs` and was reachable only
+    /// from the CLI's DIRECT path. The daemon route — the DEFAULT route — got
+    /// a static string from `tool_brain_impact` that named neither the depth
+    /// value, nor the remedy, nor "floor", over byte-identical node data. It
+    /// was visible only under `--json`, because text mode appended the missing
+    /// clause; `--json` is where an agent reads it.
+    ///
+    /// It lives here, next to the two flags it interprets, so both routes call
+    /// the same function rather than one restating the other.
+    #[must_use]
+    pub fn truncation_note(&self, threshold: f64, depth: u32) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.truncated_by_threshold {
+            parts.push(format!(
+                "traversal pruned below the impact-score threshold ({threshold:.2}) — re-run with --min-score 0 for the full traversal"
+            ));
+        }
+        if self.truncated_by_depth {
+            parts.push(format!(
+                "traversal hit the depth limit ({depth}) — deeper dependents may exist; raise --depth"
+            ));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("{} — reported impact is a floor", parts.join("; ")))
+    }
+}
+
 /// A row representing caller + edge metadata returned from the BFS query.
 struct CallerRow {
     uid: String,

@@ -158,6 +158,27 @@ pub struct FilesystemReader {
     /// the walker would still descend the whole excluded tree — 8.3 GB in the
     /// case this feature was built for.
     dir_excludes: Option<GlobSet>,
+    /// Directory names from [`crate::index::SKIP_DIRS`] this repo opts back in
+    /// to. nw-325: the blocklist is a DEFAULT, not a law — a repo whose
+    /// `public/` or `build/` holds first-party source has to be able to say so.
+    unskip: std::collections::HashSet<String>,
+    /// Directories the last [`Self::list_files`] pruned, for disclosure.
+    ///
+    /// nw-325: the prune happens inside `WalkBuilder::filter_entry`, which cuts
+    /// the SUBTREE — the files below it are never enumerated, so they could
+    /// never reach the existing `SkippedFile` channel and the gap was
+    /// invisible. Recording the pruned directory itself is what turns a
+    /// silently wrong answer into a visible one.
+    skipped_dirs: std::sync::Arc<std::sync::Mutex<Vec<SkippedDir>>>,
+}
+
+/// A directory the walk pruned, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedDir {
+    /// Repo-relative path of the pruned directory.
+    pub path: String,
+    /// The `SKIP_DIRS` entry that matched, or the configured exclude pattern.
+    pub reason: String,
 }
 
 impl FilesystemReader {
@@ -167,6 +188,8 @@ impl FilesystemReader {
             limits: IndexLimits::default(),
             excludes: None,
             dir_excludes: None,
+            unskip: std::collections::HashSet::new(),
+            skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -176,7 +199,27 @@ impl FilesystemReader {
             limits,
             excludes: None,
             dir_excludes: None,
+            unskip: std::collections::HashSet::new(),
+            skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Opt this repo back in to directory names the default blocklist prunes.
+    ///
+    /// nw-325 (C.3): reuses the per-repo config surface that `excluding`
+    /// already occupies, in the opposite direction. `unskip = ["public"]` says
+    /// "in THIS repo that directory is source".
+    pub fn unskipping(mut self, names: &[String]) -> Self {
+        self.unskip = names.iter().map(|n| n.trim().to_string()).collect();
+        self
+    }
+
+    /// Directories the last [`Self::list_files`] pruned.
+    pub fn skipped_dirs(&self) -> Vec<SkippedDir> {
+        self.skipped_dirs
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Attach `[[repos]] exclude` globs. These are matched against
@@ -269,9 +312,39 @@ impl ContentReader for FilesystemReader {
     fn list_files(&self) -> Result<Vec<PathBuf>> {
         use ignore::WalkBuilder;
 
+        // Enumeration failure is not emptiness (nw-287).
+        //
+        // `WalkBuilder` surfaces an unreadable ROOT as a single `Err` item and
+        // no entries, and the per-entry arm below downgrades every walk error
+        // to a `tracing::warn!` — invisible at the CLI's default log level. So
+        // `list_files` returned `Ok(vec![])` for a vault it could not read at
+        // all. The markdown refresh treats its scan as the AUTHORITATIVE new
+        // state of the vault and `bulk_vault_reindex_write` deletes the old
+        // one first, which makes "not observed" and "deleted" the same input:
+        // a `chmod 000` vault directory silently emptied the graph and reported
+        // rc=0.
+        //
+        // Probing `read_dir` up front is deterministic and does not depend on
+        // how `ignore` chooses to surface the failure. A per-entry error BELOW
+        // the root keeps its `continue` — one unreadable child is a
+        // partial-coverage problem, not a failure to enumerate the tree.
+        std::fs::read_dir(&self.repo_path).with_context(|| {
+            format!(
+                "cannot enumerate {} — refusing to report an unreadable directory as empty",
+                self.repo_path.display()
+            )
+        })?;
+
         let mut files = Vec::new();
         let root = self.repo_path.clone();
         let dir_excludes = self.dir_excludes.clone();
+        let unskip = self.unskip.clone();
+        let recorded = std::sync::Arc::clone(&self.skipped_dirs);
+        if let Ok(mut pruned) = recorded.lock() {
+            pruned.clear();
+        }
+        let record = std::sync::Arc::clone(&recorded);
+        let record_root = self.repo_path.clone();
         let walker = WalkBuilder::new(&self.repo_path)
             .follow_links(false)
             .hidden(false)
@@ -280,15 +353,34 @@ impl ContentReader for FilesystemReader {
             .git_exclude(true)
             .filter_entry(move |e| {
                 if e.file_type().is_some_and(|ft| ft.is_dir()) {
+                    // nw-325: every prune is RECORDED. Where the default is
+                    // right (`dist`) the absence is now disclosed instead of
+                    // silent; where it is wrong the user can see it and reach
+                    // for `unskip`. The harm this closes is not the skip, it is
+                    // that `impact` stopped at a bridge and read as "nothing
+                    // further calls this".
+                    let note = |reason: &str| {
+                        if let Ok(rel) = e.path().strip_prefix(&record_root)
+                            && let Ok(mut pruned) = record.lock()
+                        {
+                            pruned.push(SkippedDir {
+                                path: rel.to_string_lossy().into_owned(),
+                                reason: reason.to_string(),
+                            });
+                        }
+                    };
                     if let Some(name) = e.file_name().to_str()
                         && crate::index::SKIP_DIRS.contains(&name)
+                        && !unskip.contains(name)
                     {
+                        note(name);
                         return false;
                     }
                     if let Ok(rel) = e.path().strip_prefix(&root)
                         && !rel.as_os_str().is_empty()
                         && dir_is_excluded(dir_excludes.as_ref(), rel)
                     {
+                        note("configured exclude");
                         return false;
                     }
                 }
@@ -910,6 +1002,116 @@ mod tests {
             .collect();
         assert!(names.contains(&"real.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    #[test]
+    fn skip_dirs_does_not_hide_a_nested_native_module() {
+        // nw-325 / F-CODE-5: `modules/<name>/ios/Foo.swift` is tracked and NOT
+        // gitignored (the real repo's .gitignore has a ROOT-ANCHORED `/ios`),
+        // yet SKIP_DIRS pruned any component named `ios` at any depth, so the
+        // native half of a React Native bridge was absent while its TS shim was
+        // present. There is no git repo in this TempDir, so nothing here is
+        // ignored by any mechanism other than SKIP_DIRS.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/media-writer/ios")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("modules/media-writer/ios/MediaWriterModule.swift"),
+            "public class MediaWriterModule {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/media-writer/android")).unwrap();
+        std::fs::write(
+            dir.path().join("modules/media-writer/android/Module.kt"),
+            "class Module\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/media-writer/src")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("modules/media-writer/src/MediaWriterModule.ts"),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+
+        let reader = FilesystemReader::new(dir.path());
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // Control: the TS shim was always indexed. Documents the asymmetry.
+        assert!(
+            names.contains(&"modules/media-writer/src/MediaWriterModule.ts".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"modules/media-writer/ios/MediaWriterModule.swift".to_string()),
+            "a nested, non-gitignored native module must be indexed: {names:?}"
+        );
+        // Where else does this property hold? `android` is the same case.
+        assert!(
+            names.contains(&"modules/media-writer/android/Module.kt".to_string()),
+            "the android half of the same bridge must be indexed too: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_directory_is_disclosed_rather_than_silently_dropped() {
+        // nw-325, the part that makes it dangerous. Even where the skip is the
+        // right default (`dist`), the absence must be REPORTED — the existing
+        // SkippedFile channel already carries the minified-bundle policy and
+        // carried nothing here, because the prune happens inside
+        // WalkBuilder::filter_entry before the file is ever enumerated.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("packages/app/dist")).unwrap();
+        std::fs::write(dir.path().join("packages/app/dist/bundle.js"), "").unwrap();
+        std::fs::write(dir.path().join("packages/app/index.ts"), "").unwrap();
+
+        let reader = FilesystemReader::new(dir.path());
+        let _ = reader.list_files().unwrap();
+        let skipped = reader.skipped_dirs();
+        assert!(
+            skipped
+                .iter()
+                .any(|d| d.path == "packages/app/dist" && d.reason == "dist"),
+            "pruned directories must be disclosed: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn a_configured_exclude_can_unskip_a_default_skip_dir() {
+        // nw-325 (C.3): the blocklist is a DEFAULT, not a law. A repo whose
+        // `public/` holds first-party source must be able to say so through the
+        // existing per-repo config plumbing.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public/site.js"), "export const a = 1;\n").unwrap();
+
+        let plain = FilesystemReader::new(dir.path());
+        let names: Vec<String> = plain
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !names.contains(&"public/site.js".to_string()),
+            "`public` is still a default skip: {names:?}"
+        );
+
+        let opted_in = FilesystemReader::new(dir.path()).unskipping(&["public".to_string()]);
+        let names: Vec<String> = opted_in
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"public/site.js".to_string()),
+            "an explicit unskip must re-admit the directory: {names:?}"
+        );
     }
 
     #[test]
@@ -1553,6 +1755,86 @@ mod tests {
         let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
         assert_eq!(oversized.observed_bytes, limit + 1);
         assert_eq!(oversized.limit_bytes, limit);
+    }
+
+    /// True when the current process bypasses filesystem permission bits.
+    /// A `0o000` directory is still readable by root, so the nw-287 tests have
+    /// nothing to observe there and skip rather than fail spuriously.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// nw-287: an unreadable vault ROOT must be an error, not an empty listing.
+    /// Returning `Ok(vec![])` is what lets the caller's stale-drop read
+    /// "I saw no files" as "every file was deleted".
+    #[cfg(unix)]
+    #[test]
+    fn list_files_errors_when_the_root_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A\n").unwrap();
+
+        let reader = FilesystemReader::new(&root);
+        assert_eq!(reader.list_files().unwrap().len(), 1, "precondition");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = reader.list_files();
+        // Restore BEFORE asserting so a failure still lets TempDir clean up.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = observed.expect_err(
+            "an unreadable vault root must surface as Err; Ok(vec![]) is \
+             indistinguishable from an empty vault and drives the nw-287 stale-drop",
+        );
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("permission")
+                || msg.contains("denied")
+                || msg.contains(&root.display().to_string().to_lowercase()),
+            "the error must name the cause or the path, got: {err:#}"
+        );
+    }
+
+    /// The contrast case that keeps the nw-287 fix from over-firing: a single
+    /// unreadable SUBDIRECTORY is a partial-coverage problem, not an
+    /// enumeration failure, so the files that were seen must still be returned.
+    #[cfg(unix)]
+    #[test]
+    fn list_files_tolerates_one_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::create_dir_all(root.join("closed")).unwrap();
+        std::fs::write(root.join("open/a.md"), "# A\n").unwrap();
+        std::fs::write(root.join("closed/b.md"), "# B\n").unwrap();
+
+        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let reader = FilesystemReader::new(&root);
+        let observed = reader.list_files();
+        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let files = observed.expect("one unreadable child must not fail the whole enumeration");
+        assert!(
+            files.iter().any(|p| p.ends_with("a.md")),
+            "the readable half must still be listed, got {files:?}"
+        );
     }
 }
 #[cfg(test)]

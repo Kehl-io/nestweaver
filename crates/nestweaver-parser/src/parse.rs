@@ -1049,6 +1049,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
                 let name = name_arena.to_string();
 
+                // nw-291 (M4): `_` is a DISCARD binding, not a name. Rust's
+                // `const _: () = assert!(..)`, Go's blank identifier and JS's
+                // `const _ = require('lodash')` all produced a graph symbol
+                // literally called `_`, which nothing can import, call or
+                // reference by name — and which `dead-code` then reported as a
+                // high-confidence unreachable symbol.
+                //
+                // The guard lives here, next to the dedup, rather than in
+                // `rust.scm` / `javascript.scm`, because the property is
+                // language-independent: it holds for every query pattern in
+                // every one of the 49 grammars at once. Only the exact name
+                // `_` is filtered — `_helper` is a real, addressable name that
+                // merely follows a private-by-convention spelling.
+                if name == "_" {
+                    continue;
+                }
+
                 if !seen_symbols.insert((name.clone(), start_line)) {
                     continue;
                 }
@@ -1253,6 +1270,36 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         .or(from_receiver_field)
                         .or(from_scoped_path)
                         .map(|s| s.to_string())
+                } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
+                    // nw-308: a FIELD ACCESS has a receiver too, and until this
+                    // existed it was thrown away — extraction was gated to
+                    // `Call`, so every ReadAccess/WriteAccess reference carried
+                    // `receiver: None` and the resolver's receiver gate waved
+                    // all of them through. Measured on this repo: with the gate
+                    // covering CALLS only, `impact collect` fell from 162 to 9
+                    // while `hubs` in-degree barely moved (771 -> 618), because
+                    // `hubs` counts ALL_SYMBOL_EDGE_TYPES — the residual was
+                    // ACCESSES and USES, the exact edges the gate could not see.
+                    //
+                    // Here the CAPTURED node is the member/field/selector node
+                    // itself rather than a call wrapping one, so the object is a
+                    // direct child rather than one level down under `function`.
+                    let k = node.kind();
+                    if k.contains("field")
+                        || k.contains("member")
+                        || k.contains("selector")
+                        || k.contains("attribute")
+                        || k.contains("navigation")
+                    {
+                        node.child_by_field_name("object")
+                            .or_else(|| node.child_by_field_name("value"))
+                            .or_else(|| node.child_by_field_name("operand"))
+                            .or_else(|| node.child_by_field_name("expression"))
+                            .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1272,6 +1319,28 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // nw-151: recover calls written inside Rust macro bodies.
     if lang == Language::Rust {
         collect_rust_macro_calls(tree.root_node(), source_bytes, &mut references);
+    }
+
+    // nw-291 follow-up: recover constant/static reads written as a bare name.
+    if let Some(rules) = constant_read_rules(lang) {
+        collect_constant_reads(tree.root_node(), source_bytes, &rules, &mut references);
+    }
+
+    // nw-291 follow-up: promote functions a Rust harness macro REGISTERS as
+    // roots. See RUST_ENTRY_POINT_REGISTRATION_MACROS.
+    if lang == Language::Rust {
+        let registered = collect_rust_registered_entry_points(tree.root_node(), source_bytes);
+        if !registered.is_empty() {
+            for symbol in &mut symbols {
+                if !symbol.is_entry_point
+                    && symbol.kind == SymbolKind::Function
+                    && registered.contains(symbol.name.as_str())
+                {
+                    symbol.is_entry_point = true;
+                    symbol.entry_point_kind = Some(EntryPointKind::Main);
+                }
+            }
+        }
     }
 
     // nw-155: promote symbols named in an `export { .. }` clause to Public.
@@ -1339,6 +1408,83 @@ fn collect_export_clause_names<'a>(
     names
 }
 
+/// Rust macros that REGISTER functions as harness entry points, whose argument
+/// list the parser otherwise cannot see.
+///
+/// `criterion_group!(benches, bench_a, bench_b);` plus `criterion_main!(benches);`
+/// is how every Criterion benchmark target names its roots. Criterion GENERATES
+/// the `main` that calls them, so `bench_a` has no caller anywhere in the source
+/// tree and `dead-code` reported every one of them: on a fresh index of this
+/// repo the entire top of the unreachable list was `benches/*.rs`, all of it
+/// registered and none of it dead.
+///
+/// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? Anywhere a function is invoked
+/// only from inside a token tree. `collect_rust_macro_calls` (nw-151) already
+/// recovers the `foo(..)` shape there and deliberately does NOT treat a BARE
+/// identifier as a call, because in `println!("{}", x)` it is a variable. That
+/// judgement is correct in general and wrong for exactly this family of macros,
+/// so the family is NAMED here rather than the general rule being loosened —
+/// adding a harness is a one-line data change, and no other call site moves.
+///
+/// A name is promoted only when the same file also defines a FUNCTION by that
+/// name, so a group label (`benches` names no function), a config key in the
+/// braced `criterion_group! { name = ..; targets = .. }` form, or a stray
+/// literal cannot invent an entry point out of nothing.
+const RUST_ENTRY_POINT_REGISTRATION_MACROS: &[&str] = &["criterion_group", "criterion_main"];
+
+/// Collect every bare identifier appearing inside a
+/// [`RUST_ENTRY_POINT_REGISTRATION_MACROS`] invocation.
+///
+/// Returns names, not symbols: the caller intersects them with the file's own
+/// function definitions, which is what keeps this from inventing entry points.
+fn collect_rust_registered_entry_points<'a>(
+    root: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+) -> std::collections::HashSet<&'a str> {
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "macro_invocation"
+            && let Some(macro_name) = current.child_by_field_name("macro")
+            && let Ok(text) = macro_name.utf8_text(source_bytes)
+            && RUST_ENTRY_POINT_REGISTRATION_MACROS.contains(&text)
+        {
+            let mut inner = current.walk();
+            for part in current.children(&mut inner) {
+                if part.kind() == "token_tree" {
+                    collect_identifiers_in_token_tree(part, source_bytes, &mut names);
+                }
+            }
+            continue;
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    names
+}
+
+/// Every `identifier` token anywhere under `node`, including nested token trees.
+fn collect_identifiers_in_token_tree<'a>(
+    node: tree_sitter::Node<'a>,
+    source_bytes: &'a [u8],
+    out: &mut std::collections::HashSet<&'a str>,
+) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier"
+            && let Ok(text) = current.utf8_text(source_bytes)
+        {
+            out.insert(text);
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
 /// Emit CALL references for calls written inside Rust macro bodies (nw-151).
 ///
 /// tree-sitter-rust parses macro arguments as an opaque `token_tree`, so
@@ -1402,6 +1548,139 @@ fn collect_calls_in_token_tree(
             collect_calls_in_token_tree(*child, source_bytes, references);
         }
     }
+}
+
+/// How to recognise a bare constant read in one language.
+struct ConstantReadRules {
+    /// Subtrees not to descend into. An import/use path is already expanded
+    /// into IMPORT references, and re-reading its segments here would emit a
+    /// second, weaker edge for the same syntax.
+    skip_subtrees: &'static [&'static str],
+    /// `(parent_kind, field_name)` pairs identifying an identifier that is the
+    /// DECLARATION's own name rather than a read of it. Without these the
+    /// declaration site reads as a reference to itself and every constant
+    /// acquires a self-edge.
+    definition_sites: &'static [(&'static str, &'static str)],
+}
+
+/// Emit ACCESSES references for constants read by BARE NAME (nw-291 follow-up).
+///
+/// # The gap
+///
+/// Every language's `.scm` spells `@reference.read_access` as `obj.field` — a
+/// field expression. Nothing anywhere captures a plain identifier standing on
+/// its own, so a constant read is invisible to the graph unless it happens to
+/// be called (`FOO()`) or type-referenced. Measured on a fresh index of this
+/// repo: 2,567 `Constant` symbols, 723 with any non-structural inbound edge. Of
+/// the top 1,000 `dead-code` candidates, 542 were `Constant`, and every sampled
+/// false positive — `SESSION_TTL_SECS`, `TS_QUERY`, `TOOL_VALIDATORS`,
+/// `NODE_ROUTE_RECEIVERS`, `CALL_EXCLUDE`, and Python's `DARK` / `REPO_ORDER` /
+/// `TOOL_LABELS` — is read by bare name IN ITS OWN FILE, which the resolver's
+/// Priority-1 same-file tier resolves the instant a reference exists to resolve.
+///
+/// # Why the name shape is the filter
+///
+/// Capturing every identifier would make a variable read indistinguishable from
+/// a constant read and hand the resolver a name for every local binding in the
+/// tree. `SCREAMING_SNAKE_CASE` is not merely a preference: `rustc`'s
+/// `non_upper_case_globals` warns on a const or static spelled otherwise and
+/// `non_snake_case` warns on a local spelled this way; PEP 8, the Google JS/TS
+/// style guide and the Java conventions say the same for module and `static
+/// final` constants. So the shape is an enforced discriminator, not a guess —
+/// 5,106 occurrences across this repo against 25,834 existing CALLS edges.
+///
+/// Like `collect_rust_macro_calls`, this is deliberately shallow: it recovers
+/// the NAME and leaves the normal resolver priority chain to decide what it
+/// points at. A name matching nothing resolves to nothing and yields no edge.
+///
+/// # WHERE ELSE DOES THIS PROPERTY NEED TO HOLD?
+///
+/// The `obj.field`-only spelling of `read_access` is identical in `go.scm`,
+/// `java.scm`, `javascript.scm`, `python.scm`, `rust.scm` and `typescript.scm`,
+/// so the gap is every one of them. [`constant_read_rules`] is the whole
+/// per-language surface: two node-kind lists per entry.
+///
+/// Deliberately absent:
+/// - **Go**, whose exported constants are `CamelCase` and therefore
+///   indistinguishable by shape from every other identifier. Go needs a
+///   different discriminator and does not get a guessed one here.
+/// - **Java** and the rest, which have the gap and would take the JS-shaped
+///   rule, but for which this branch has no indexed corpus to measure the
+///   before/after false-positive rate on. Every language listed below was
+///   measured; claiming the others without measuring is the exact thing this
+///   branch exists to stop doing.
+fn constant_read_rules(lang: Language) -> Option<ConstantReadRules> {
+    match lang {
+        Language::Rust => Some(ConstantReadRules {
+            skip_subtrees: &["use_declaration"],
+            definition_sites: &[("const_item", "name"), ("static_item", "name")],
+        }),
+        Language::Python => Some(ConstantReadRules {
+            skip_subtrees: &[
+                "import_statement",
+                "import_from_statement",
+                "future_import_statement",
+            ],
+            definition_sites: &[("assignment", "left"), ("augmented_assignment", "left")],
+        }),
+        Language::TypeScript | Language::JavaScript => Some(ConstantReadRules {
+            skip_subtrees: &["import_statement", "export_clause"],
+            definition_sites: &[("variable_declarator", "name")],
+        }),
+        _ => None,
+    }
+}
+
+fn collect_constant_reads(
+    root: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    rules: &ConstantReadRules,
+    references: &mut Vec<RawReference>,
+) {
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if rules.skip_subtrees.contains(&current.kind()) {
+            continue;
+        }
+        if current.kind() == "identifier"
+            && let Ok(name) = current.utf8_text(source_bytes)
+            && is_screaming_snake_case(name)
+            && !is_own_definition_name(current, rules.definition_sites)
+        {
+            references.push(RawReference {
+                name: name.to_string(),
+                kind: ReferenceKind::ReadAccess,
+                start_line: current.start_position().row as u32 + 1,
+                context: String::new(),
+                receiver: None,
+            });
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+/// `MAX`, `SESSION_TTL_SECS`, `HTTP2_MAX` — upper-case, digits and underscores
+/// only, starting with a letter, at least two characters so a single-letter
+/// generic parameter cannot qualify.
+fn is_screaming_snake_case(name: &str) -> bool {
+    name.len() >= 2
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// True when `node` is the name of the declaration that BINDS it, per the
+/// language's [`ConstantReadRules::definition_sites`].
+fn is_own_definition_name(node: tree_sitter::Node<'_>, sites: &[(&str, &str)]) -> bool {
+    node.parent().is_some_and(|parent| {
+        sites.iter().any(|(kind, field)| {
+            parent.kind() == *kind && parent.child_by_field_name(field) == Some(node)
+        })
+    })
 }
 
 // ── type extraction helpers ────────────────────────────────────────────────
@@ -2036,6 +2315,233 @@ mod tests {
             functions.iter().any(|s| s.name == "standalone_function"),
             "should find function 'standalone_function'"
         );
+    }
+
+    #[test]
+    fn python_module_level_variable_span_is_the_assignment_not_the_file() {
+        // nw-326 / F-CODE-4: queries/python.scm attached `@definition.variable`
+        // to the `(module)` node, so parse.rs recorded start_line=1 and
+        // end_line=EOF+1 for every module-level assignment. `read-symbols` then
+        // returned the whole file for a one-line variable — strictly worse than
+        // reading the file.
+        let source = "\
+import os
+
+
+def helper():
+    return 1
+
+
+LOGGER = os.getcwd()
+MAX_RETRIES = 3
+";
+        let parsed = parse_source(Path::new("mod_vars.py"), source).unwrap();
+
+        let logger = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "LOGGER" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable LOGGER must be extracted");
+
+        assert_eq!(logger.start_line, 8, "span must start at the assignment");
+        assert_eq!(
+            logger.end_line, 8,
+            "a one-line assignment is a one-line span"
+        );
+
+        let max_retries = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable MAX_RETRIES must be extracted");
+        assert_eq!(max_retries.start_line, 9);
+        assert_eq!(max_retries.end_line, 9);
+
+        // Two distinct one-line variables must not share a content hash — with
+        // the capture on `(module)` both hashed the whole file.
+        assert_ne!(
+            logger.content_hash, max_retries.content_hash,
+            "distinct variables must not share the file's content hash"
+        );
+        // The signature is the assignment, not the file's first line.
+        assert_eq!(logger.signature, "LOGGER = os.getcwd()");
+
+        // Regression guard: functions and classes were already exact and must
+        // stay exact.
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!((helper.start_line, helper.end_line), (4, 5));
+    }
+
+    #[test]
+    fn python_class_and_instance_attribute_spans_are_the_assignment_not_the_class() {
+        // nw-326, the "where else" half: queries/python.scm has the SAME
+        // container-as-capture shape for class attributes and for
+        // `self.x = ...` instance attributes, both anchored on
+        // `(class_definition)` — so every attribute got the whole class as its
+        // span, its content hash and its signature.
+        let source = "\
+class Config:
+    DEBUG = False
+    RETRIES = 3
+
+    def __init__(self):
+        self.name = \"config\"
+        self.size = 0
+";
+        let parsed = parse_source(Path::new("config.py"), source).unwrap();
+        let prop = |n: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == n && s.kind == SymbolKind::Property)
+                .unwrap_or_else(|| panic!("property {n} must be extracted"))
+        };
+
+        assert_eq!((prop("DEBUG").start_line, prop("DEBUG").end_line), (2, 2));
+        assert_eq!(
+            (prop("RETRIES").start_line, prop("RETRIES").end_line),
+            (3, 3)
+        );
+        assert_eq!((prop("name").start_line, prop("name").end_line), (6, 6));
+        assert_eq!((prop("size").start_line, prop("size").end_line), (7, 7));
+
+        assert_ne!(
+            prop("DEBUG").content_hash,
+            prop("RETRIES").content_hash,
+            "distinct attributes must not share the class's content hash"
+        );
+        // The class-body anchor must be preserved: the attribute still knows
+        // which class it belongs to.
+        assert_eq!(prop("DEBUG").parent_name.as_deref(), Some("Config"));
+        assert_eq!(prop("name").parent_name.as_deref(), Some("Config"));
+
+        // Regression guard: the class itself still spans the whole class.
+        let class = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .expect("class Config");
+        assert_eq!((class.start_line, class.end_line), (1, 7));
+    }
+
+    // ── nw-323 defects C and D: TS/JS reference coverage ───────────────────
+
+    #[test]
+    fn ts_export_from_is_captured_as_an_import_reference() {
+        // A barrel re-export is an import edge for graph purposes: it is how
+        // `NotFoundError` reaches its importers through
+        // common/errors.ts -> errors/index.ts -> http-errors.ts.
+        let source = "export * from './errors/index.js';\n\
+                      export { AppError, isAppError } from './app-error.js';\n\
+                      export type { ErrorDetails } from './app-error.js';\n";
+        let parsed = parse_source(Path::new("src/common/errors.ts"), source).unwrap();
+
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            imports.contains(&"./errors/index.js"),
+            "`export * from` must yield an Import reference; got: {imports:?}"
+        );
+        assert!(
+            imports.contains(&"./app-error.js"),
+            "`export {{ … }} from` must yield an Import reference; got: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn js_export_from_is_captured_as_an_import_reference() {
+        // Where else does this property hold? javascript.scm has the identical
+        // gap; a plain-JS barrel is just as common as a TS one.
+        let source = "export * from './a.js';\nexport { b } from './b.js';\n";
+        let parsed = parse_source(Path::new("src/index.js"), source).unwrap();
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(imports.contains(&"./a.js"), "got: {imports:?}");
+        assert!(imports.contains(&"./b.js"), "got: {imports:?}");
+    }
+
+    #[test]
+    fn ts_new_expression_is_captured_as_a_call_reference() {
+        // `NotFoundError` (56 files) and `NotificationService` (5 constructors)
+        // are consumed almost exclusively via `new`. With no capture they have
+        // ZERO inbound references before resolution even begins, which is why
+        // `impact --min-score 0 --depth 10` still returned 0.
+        let source = "import { NotFoundError } from '../../../common/errors.js';\n\
+                      export function get(id: string) {\n\
+                        throw new NotFoundError('Discrepancy');\n\
+                      }\n";
+        let parsed = parse_source(Path::new("src/modules/a/service.ts"), source).unwrap();
+
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotFoundError"),
+            "`new NotFoundError(..)` must yield a Call reference; got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn js_new_expression_is_captured_as_a_call_reference() {
+        // Where else does this property hold? javascript.scm has the same gap.
+        let source = "const s = new NotificationService(deps);\n";
+        let parsed = parse_source(Path::new("src/app.js"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotificationService"),
+            "got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── nw-291 M4: discard bindings must not become symbols ────────────────
+
+    #[test]
+    fn a_discard_binding_is_not_a_symbol() {
+        // nw-291 / F-DC-5: `const _: () = assert!(..)` and
+        // `const _ = require('lodash')` produced a graph symbol literally named
+        // `_`, which then ranked as high-confidence dead code.
+        let rust = "const _: () = assert!(true);\npub fn keep() {}\n";
+        let parsed = parse_source(Path::new("src/db.rs"), rust).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a Rust discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "keep"));
+
+        let js = "const _ = require('lodash');\nexport const KEEP = 1;\n";
+        let parsed = parse_source(Path::new("src/a.js"), js).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a JS discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "KEEP"));
     }
 
     // ── Hash test ──────────────────────────────────────────────────────────
@@ -3422,6 +3928,30 @@ use crate::config::{Settings, load as load_config};
             modules.iter().any(|s| s.name == "sub_module"),
             "should find module 'sub_module'; got: {:?}",
             modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sv_standalone_function_span_is_the_declaration_not_the_file() {
+        // nw-326, "where else does this property hold?": systemverilog.scm had
+        // the identical container-as-capture shape with the FILE ROOT as the
+        // container, so `compute_checksum` (simple.sv:62-68) was recorded as
+        // lines 1-78 with the file's leading `include as its signature. The
+        // checked-in snapshot had the defect baked in as expected output.
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let f = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute_checksum")
+            .expect("standalone function must be extracted");
+        assert_eq!((f.start_line, f.end_line), (62, 68));
+        assert!(
+            f.signature
+                .starts_with("function automatic int compute_checksum"),
+            "signature must be the declaration, not the file's first line: {:?}",
+            f.signature
         );
     }
 
@@ -6107,9 +6637,12 @@ mod export_clause_tests {
 
     /// nw-155: `export { .. }` is a separate statement from the declaration, so
     /// has_export_ancestor never saw it and the symbol stayed Private. Since
-    /// dead_code::infer_confidence returns High for anything private, a module's
-    /// DEFAULT EXPORT was reported as high-confidence dead code -- all 154
-    /// high-confidence results on the reference graph were of this shape.
+    /// dead_code::infer_confidence returned High for anything private, a
+    /// module's DEFAULT EXPORT was reported as high-confidence dead code --
+    /// all 154 high-confidence results on the reference graph were of this
+    /// shape. `private` no longer promotes to High, but Public is still what
+    /// makes this row LOW rather than merely Medium, so the property below is
+    /// still the one that matters.
     #[test]
     fn export_clause_names_become_public() {
         let src = concat!(
@@ -6148,5 +6681,140 @@ mod export_clause_tests {
         let parsed =
             parse_source(Path::new("src/w.js"), "function solo() { return 1; }\n").expect("parses");
         assert_eq!(parsed.symbols[0].visibility, Visibility::Private);
+    }
+}
+
+/// nw-291 follow-up. Three reachability gaps measured on a fresh Rust index,
+/// each of which made a live symbol look unreachable:
+/// registration macros, bare constant reads, and module-top-level invocation.
+#[cfg(test)]
+mod reachability_recovery_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(name: &str, src: &str) -> ParsedFile {
+        parse_source(Path::new(name), src).expect("parses")
+    }
+
+    fn entry_points(parsed: &ParsedFile) -> Vec<&str> {
+        let mut names: Vec<&str> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.is_entry_point)
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn reads(parsed: &ParsedFile) -> Vec<&str> {
+        let mut names: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::ReadAccess)
+            .map(|r| r.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Criterion GENERATES the `main` that calls these, so `bench_cold_index`
+    /// has no caller anywhere in the source tree. On a fresh index of this repo
+    /// the top 15 dead-code candidates were `benches/*.rs` and 15 of 15 were
+    /// registered, live benchmarks.
+    #[test]
+    fn criterion_registered_benches_are_entry_points() {
+        let src = concat!(
+            "fn bench_cold_index(c: &mut Criterion) { synth(); }\n",
+            "fn bench_warm_noop(c: &mut Criterion) {}\n",
+            "fn synth() {}\n",
+            "fn genuinely_unused() {}\n",
+            "criterion_group!(benches, bench_cold_index, bench_warm_noop);\n",
+            "criterion_main!(benches);\n",
+        );
+        let parsed = parse("benches/index_benchmarks.rs", src);
+        assert_eq!(
+            entry_points(&parsed),
+            vec!["bench_cold_index", "bench_warm_noop"]
+        );
+        // `benches` is the group LABEL — it names no function, so it must not
+        // conjure one, and `synth` is reached by a normal CALLS edge rather
+        // than promoted here.
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "benches"),
+            "a group label must not become a symbol"
+        );
+    }
+
+    /// The braced form carries config keys, none of which name a function.
+    #[test]
+    fn a_registration_macro_cannot_invent_an_entry_point() {
+        let src = concat!(
+            "fn bench_one(c: &mut Criterion) {}\n",
+            "criterion_group! {\n",
+            "    name = benches;\n",
+            "    config = Criterion::default();\n",
+            "    targets = bench_one\n",
+            "}\n",
+        );
+        let parsed = parse("benches/b.rs", src);
+        assert_eq!(entry_points(&parsed), vec!["bench_one"]);
+    }
+
+    /// `println!("{FOO}")`-style macros aside, every `.scm` spells
+    /// `read_access` as `obj.field`, so a bare constant read produced no
+    /// reference at all: 2,567 `Constant` symbols on a fresh index, 723 with
+    /// any inbound edge, and 542 of the top 1,000 dead-code candidates.
+    #[test]
+    fn a_rust_constant_read_by_bare_name_is_a_reference() {
+        let src = concat!(
+            "const SESSION_TTL_SECS: u64 = 60;\n",
+            "static MAX: usize = 4;\n",
+            "fn use_them() -> u64 {\n",
+            "    let n = MAX;\n",
+            "    SESSION_TTL_SECS + n as u64\n",
+            "}\n",
+        );
+        let parsed = parse("src/http.rs", src);
+        assert_eq!(reads(&parsed), vec!["MAX", "SESSION_TTL_SECS"]);
+    }
+
+    /// Without the definition-site guard every constant acquires a self-edge,
+    /// which is noise in PageRank and proves nothing about reachability.
+    #[test]
+    fn a_constants_own_declaration_is_not_a_read_of_it() {
+        let parsed = parse("src/only_decl.rs", "const ALONE: u8 = 1;\n");
+        assert!(
+            reads(&parsed).is_empty(),
+            "the declaration read as a reference to itself: {:?}",
+            reads(&parsed)
+        );
+    }
+
+    /// A `use` path is already expanded into IMPORT references; re-reading its
+    /// segments would emit a second, weaker edge for the same syntax.
+    #[test]
+    fn a_use_path_is_not_also_a_constant_read() {
+        let parsed = parse("src/u.rs", "use crate::limits::MAX_DEPTH;\nfn f() {}\n");
+        assert!(
+            reads(&parsed).is_empty(),
+            "the import path was double-counted as a read: {:?}",
+            reads(&parsed)
+        );
+    }
+
+    /// WHERE ELSE: the `obj.field`-only spelling is identical in every query
+    /// file. Python's module constants were the second-largest group in the
+    /// measured top 15 — `DARK`, `REPO_ORDER`, `TOOL_LABELS` in
+    /// `benchmarks/charts.py`, each read a dozen times in its own file.
+    #[test]
+    fn a_python_module_constant_read_is_a_reference() {
+        let src = concat!(
+            "REPO_ORDER = [\"a\", \"b\"]\n",
+            "def pick(data):\n",
+            "    return [r for r in REPO_ORDER if r in data]\n",
+        );
+        let parsed = parse("benchmarks/charts.py", src);
+        assert_eq!(reads(&parsed), vec!["REPO_ORDER"]);
     }
 }

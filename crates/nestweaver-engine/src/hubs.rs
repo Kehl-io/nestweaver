@@ -38,13 +38,36 @@ pub struct HubNode {
 /// Degree counts require the full edge set and cannot use the PageRank
 /// cache (which stores centrality, not in/out degree).
 pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> {
+    find_hub_nodes_bounded(store, top_n).map(|found| found.hubs)
+}
+
+/// The top-N hubs plus the size of the population they were selected FROM.
+pub struct HubNodes {
+    pub hubs: Vec<HubNode>,
+    /// How many symbols were CANDIDATES — i.e. had at least one code edge.
+    /// A symbol with no edges cannot be a hub at any `top_n`, so counting it
+    /// would overstate the population in the other direction.
+    pub candidate_total: usize,
+}
+
+/// [`find_hub_nodes`] with the candidate count retained.
+///
+/// `top_n` is honest when the CALLER chose it (`hubs --top 30` asked for 30).
+/// It is not honest when an internal constant chose it: `summary --level hub`
+/// hard-codes 30 and reported `{returned: 30, total: 30, truncated: false}` on
+/// a 180-candidate graph — the same shape as F-DC-11 one level up, and found
+/// by asking where else that property had to hold rather than by a report.
+pub fn find_hub_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<HubNodes> {
     let (symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to load graph data for hub detection")?;
 
     if symbols.is_empty() {
-        return Ok(vec![]);
+        return Ok(HubNodes {
+            hubs: vec![],
+            candidate_total: 0,
+        });
     }
 
     // Build UID -> index mapping.
@@ -87,8 +110,15 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
     // independent of what the caller asked for: `--top 10` and `--top 1000`
     // both took ~5s. Now only the survivors are materialized, so the work is
     // O(n log k) with k allocations rather than O(n log n) with n.
+    // Counted BEFORE the `top_n == 0` short-circuit and before the heap, so
+    // the population is reported even when nothing survives selection.
+    let candidate_total = (0..n).filter(|&i| in_degree[i] + out_degree[i] > 0).count();
+
     if top_n == 0 {
-        return Ok(vec![]);
+        return Ok(HubNodes {
+            hubs: vec![],
+            candidate_total,
+        });
     }
 
     /// Sort key for one candidate: degree first, PageRank as the tie-break,
@@ -165,7 +195,10 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
         })
         .collect();
 
-    Ok(hubs)
+    Ok(HubNodes {
+        hubs,
+        candidate_total,
+    })
 }
 
 /// Attach cluster IDs to hub nodes from a cached clustering result.

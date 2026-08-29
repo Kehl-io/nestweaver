@@ -24,6 +24,17 @@ use tracing::{info, warn};
 
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
+/// A cheap predicate polled by [`DaemonClient::wait_ready`] that can end the
+/// wait early.
+///
+/// Returns `Some(reason)` once the daemon being waited on is KNOWN never to
+/// become ready. A readiness wait can only ever observe absence — the socket is
+/// not there yet — which is the same observation for "booting" and for "died
+/// before it could bind". This is the channel that tells them apart, so the
+/// caller who spawned the process can report its failure in milliseconds
+/// instead of at the boot ceiling (nw-309).
+pub type ReadinessAbort<'a> = &'a mut dyn FnMut() -> Option<String>;
+
 /// Client for the NestWeaver daemon.
 ///
 /// Wraps a tonic gRPC channel connected over a Unix domain socket.
@@ -748,8 +759,22 @@ fn verify_requested_config_evidence(
             RestartConfig::Configured(path) => path.display().to_string(),
             RestartConfig::CompiledDefaults => "compiled defaults".to_string(),
         };
+        // nw-303: the REFUSAL is correct and stays. `--config` is a
+        // daemon-lifetime binding, not a per-command flag: one file carries
+        // `[authz]` policy, ranking priors, indexing limits, the repo list and
+        // server settings, and the daemon builds its permission source ONCE at
+        // startup. A running daemon cannot adopt another config's
+        // authorization policy per request, so honouring only the identity
+        // half while silently dropping the rest would be worse than saying no.
+        //
+        // What was missing is the other half of the sentence. A user who
+        // arrives here from `docs/guide/instance-id-migration.md` wants to put
+        // data under a named instance; they were told only the thing that does
+        // not work for a single command. `--instance` IS carried per-request
+        // (it is a field on the RPC, unlike a config), works against a running
+        // daemon, and needs no restart — so name it.
         anyhow::bail!(
-            "explicit --config {} does not match the running daemon's effective config ({effective_description}). {}",
+            "explicit --config {} does not match the running daemon's effective config              ({effective_description}).\n--config binds a daemon for its LIFETIME — it              also carries [authz], ranking priors, indexing limits and server settings,              which a running daemon built once at startup and cannot re-adopt per              request. {}\nTo place this ONE command's data under a different instance              without restarting anything, pass `--instance <id>` instead: it is carried              per-request and overrides the daemon's default.",
             requested.as_path().unwrap().display(),
             restart_with_requested_config_remedy(db_path, requested)
         );
@@ -1142,6 +1167,7 @@ impl DaemonClient {
         timeout: std::time::Duration,
         ignore_pid: Option<i32>,
         expected_config: &RestartConfig,
+        mut abort: Option<ReadinessAbort<'_>>,
     ) -> Result<nestweaver_proto::HealthCheckResponse> {
         let started = std::time::Instant::now();
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
@@ -1193,6 +1219,23 @@ impl DaemonClient {
                     tracing::debug!("wait_ready: daemon not connectable yet: {error:#}")
                 }
                 Err(_) => break,
+            }
+
+            // nw-309: the pidfile check below can only fire once a pidfile
+            // EXISTS. A daemon that dies before writing one — it cannot create
+            // its runtime directory, the config is rejected, the binary is
+            // wrong — leaves this loop nothing to observe, so "will never boot"
+            // is indistinguishable from "still booting" and the caller waits
+            // out the whole ceiling. `abort` is the other channel: the caller
+            // holding the spawned process can answer that question directly.
+            if let Some(abort) = abort.as_mut()
+                && let Some(reason) = abort()
+            {
+                anyhow::bail!(
+                    "daemon for {} will not become healthy: {reason}. Check the daemon logs: {}",
+                    db_path.display(),
+                    nestweaver_daemon::lifecycle::log_hint(&instance_id),
+                );
             }
 
             if let Some(pid) = autostart::read_pid(&pidfile)
@@ -1762,6 +1805,26 @@ credential_method = "gh"
         );
         assert!(message.contains("daemon --db"), "{message}");
         assert!(message.contains("restart --config"), "{message}");
+
+        // nw-303: the refusal must also name the thing that DOES work for a
+        // single command. Backlog filed this `high` and the black-box evidence
+        // graded it `low`, recommending documentation; the refusal itself is a
+        // deliberate safety property (a `--config` also carries [authz], which
+        // a running daemon built once at startup and cannot re-adopt per
+        // request — half-applying it silently would be worse than refusing).
+        // So the behaviour stays and the MESSAGE is the fix: a user who
+        // arrives from the instance-id migration runbook was told only the
+        // thing that cannot work.
+        assert!(
+            message.contains("--instance"),
+            "the refusal must name the per-command identity override, which \
+             unlike --config is carried on the RPC and reaches a running \
+             daemon: {message}"
+        );
+        assert!(
+            message.contains("LIFETIME"),
+            "and must say WHY --config cannot be adopted per-request: {message}"
+        );
 
         let defaults = verify_requested_config_evidence(
             &db,

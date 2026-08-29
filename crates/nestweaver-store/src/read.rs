@@ -30,6 +30,117 @@ pub type CodeEdge = (String, String, f64);
 /// Edge data with type and evidence: (source_uid, target_uid, edge_type, confidence, evidence_json).
 pub type TypedEdge = (String, String, String, f64, String);
 
+/// One vault relation, described exactly once.
+///
+/// nw-288 was two independent enumerations of "the vault's edges" in one
+/// codebase — [`crate::GraphScope::notes_only`] ranked the subgraph over nine
+/// relations while `export` ranked it over zero — and only one of them was
+/// complete. Both now read this list, so a vault relation added to ranking
+/// cannot be missed by export a second time.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultRelation {
+    /// The relationship table name as it appears in the graph.
+    pub rel: &'static str,
+    pub from: &'static str,
+    pub to: &'static str,
+    /// Whether the relation carries a `confidence` property to select.
+    pub scored: bool,
+    /// Whether the relation belongs to [`crate::GraphScope::notes_only`].
+    ///
+    /// `VAULT_HAS_NOTE` does not: that scope declares Note/Heading/Section/Tag
+    /// nodes and no Vault node, so including the edge would point PPR at a
+    /// node it never enumerated. Export DOES declare Vault nodes, which is
+    /// why the inventory carries the relation and the scope filters it out
+    /// rather than the inventory omitting it.
+    pub in_notes_scope: bool,
+}
+
+/// Every relation wholly inside the vault domain.
+pub const VAULT_RELATIONS: &[VaultRelation] = &[
+    VaultRelation {
+        rel: "VAULT_HAS_NOTE",
+        from: "Vault",
+        to: "Note",
+        scored: false,
+        in_notes_scope: false,
+    },
+    VaultRelation {
+        rel: "NOTE_HAS_HEADING",
+        from: "Note",
+        to: "Heading",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "NOTE_HAS_SECTION",
+        from: "Note",
+        to: "Section",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "HEADING_HAS_SECTION",
+        from: "Heading",
+        to: "Section",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "HEADING_PARENT",
+        from: "Heading",
+        to: "Heading",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "WIKILINK_TO_NOTE",
+        from: "Section",
+        to: "Note",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "WIKILINK_TO_HEADING",
+        from: "Section",
+        to: "Heading",
+        scored: true,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "NOTE_TAGGED_WITH",
+        from: "Note",
+        to: "Tag",
+        scored: false,
+        in_notes_scope: true,
+    },
+    VaultRelation {
+        rel: "SECTION_TAGGED_WITH",
+        from: "Section",
+        to: "Tag",
+        scored: false,
+        in_notes_scope: true,
+    },
+];
+
+/// The cross-domain bridges. Without these a "code + vault" export is two
+/// disconnected components rather than the unified graph the product claims.
+pub const VAULT_CODE_BRIDGE_RELATIONS: &[VaultRelation] = &[
+    VaultRelation {
+        rel: "REFERENCES_CODE_NOTE_TO_SYMBOL",
+        from: "Note",
+        to: "Symbol",
+        scored: true,
+        in_notes_scope: false,
+    },
+    VaultRelation {
+        rel: "REFERENCES_CODE_SECTION_TO_SYMBOL",
+        from: "Section",
+        to: "Symbol",
+        scored: true,
+        in_notes_scope: false,
+    },
+];
+
 /// Combined symbols and edges for clustering algorithms.
 pub type CodeGraph = (Vec<SymbolBasic>, Vec<CodeEdge>);
 
@@ -185,6 +296,22 @@ fn parse_symbol_kind(s: &str) -> SymbolKind {
     }
 }
 
+/// Parse the `visibility` column back into a [`Visibility`].
+///
+/// nw-291: an empty value is what a row written before the column existed reads
+/// back as, and what a symbol the parser could not classify writes. Both mean
+/// "not stated", which is exactly `Inferred` — so the pre-migration behaviour
+/// is preserved without pretending an unknown value is `Public`.
+fn parse_visibility(s: &str) -> Visibility {
+    match s {
+        "public" => Visibility::Public,
+        "internal" => Visibility::Internal,
+        "protected" => Visibility::Protected,
+        "private" => Visibility::Private,
+        _ => Visibility::Inferred,
+    }
+}
+
 fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
     match s {
         "main" => Some(EntryPointKind::Main),
@@ -228,6 +355,12 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         .get(14)
         .and_then(|_| extract_opt_string(row, 14).ok().flatten())
         .filter(|s| !s.is_empty());
+    // Column 15 (visibility) is optional: added by the nw-291 migration.
+    let visibility = row
+        .get(15)
+        .and_then(|_| extract_opt_string(row, 15).ok().flatten())
+        .map(|s| parse_visibility(&s))
+        .unwrap_or(Visibility::Inferred);
 
     Ok(Symbol {
         uid,
@@ -244,7 +377,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         pagerank_score: Some(pagerank_score),
         is_entry_point,
         entry_point_kind,
-        visibility: Visibility::Inferred,
+        visibility,
         type_info: None,
         framework_hint,
         canonical_id,
@@ -266,10 +399,11 @@ fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
 
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
-     s.framework_hint, s.canonical_id";
+     s.framework_hint, s.canonical_id, s.visibility";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
-     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
+     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score, \
+     n.frontmatter_raw";
 
 pub(crate) const HEADING_COLUMNS: &str = "h.uid, h.note_uid, h.level, h.text, h.slug, \
      h.start_line, h.end_line, h.content_hash";
@@ -339,7 +473,10 @@ fn parse_note_kind(s: &str) -> NoteKind {
 
 /// Build a Note from a query row with columns:
 /// uid, vault_uid, file_path, title, note_kind, word_count, content_hash,
-/// frontmatter, created_at, modified_at, pagerank_score
+/// frontmatter, created_at, modified_at, pagerank_score, frontmatter_raw
+///
+/// `frontmatter_raw` is APPENDED, not inserted next to `frontmatter`, so every
+/// existing positional index in this function stays valid.
 pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let uid = extract_string(row, 0)?;
     let vault_uid = extract_string(row, 1)?;
@@ -353,6 +490,12 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let created_at = extract_opt_string(row, 8)?;
     let modified_at = extract_opt_string(row, 9)?;
     let pagerank_score = extract_f64(row, 10)?;
+    // Absent on a database written before the column existed; `extract_opt_string`
+    // maps both a missing value and the `''` migration default to `None`.
+    let frontmatter_raw = row
+        .get(11)
+        .and_then(|_| extract_opt_string(row, 11).ok())
+        .flatten();
 
     Ok(Note {
         uid,
@@ -363,6 +506,7 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
         word_count,
         content_hash,
         frontmatter,
+        frontmatter_raw,
         created_at,
         modified_at,
         pagerank_score: Some(pagerank_score),
@@ -703,6 +847,32 @@ impl GraphStore {
             }
         }
         Ok(tested)
+    }
+
+    /// The symbols a service owns, via `SERVICE_HAS_SYMBOL`.
+    ///
+    /// nw-311: `service-summary --help` says "Show a service summary with entry
+    /// points" and no code path anywhere ever looked for one — `Service` has six
+    /// fields and none of them is an entry point. The data was one query away
+    /// the whole time: the edge is written at `write.rs` and `Symbol` already
+    /// carries `is_entry_point`/`entry_point_kind`. Filtering happens in the
+    /// caller so this stays the general traversal.
+    pub fn symbols_in_service(&self, service_uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (svc:Service {{uid: $uid}})-[:SERVICE_HAS_SYMBOL]->(s:Symbol) RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", Value::String(service_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
     }
 
     /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
@@ -2100,6 +2270,77 @@ impl GraphStore {
         Ok(edges)
     }
 
+    /// Returns every vault-domain edge with its type label, in the same shape
+    /// as [`load_typed_edges`](Self::load_typed_edges).
+    ///
+    /// nw-288. `load_typed_edges` was written for the code graph and every one
+    /// of its Cypher patterns is `(a:Symbol)-[...]->(b:Symbol)` or
+    /// `(f:File)-[...]->(s:Symbol)`, so it is structurally incapable of
+    /// returning a vault edge. When the vault subgraph was added to `export`
+    /// nothing extended it, and `--scope vault` emitted 28,254 nodes and ZERO
+    /// edges against a graph with ~1,800 demonstrable wikilinks — a node list,
+    /// not a subgraph.
+    ///
+    /// `include_code_bridges` adds the Note/Section → Symbol relations, which
+    /// only belong in a scope that also declares Symbol nodes. Under
+    /// `--scope vault` the caller's endpoint filter would drop them anyway;
+    /// passing `false` says so rather than relying on that.
+    pub fn load_vault_typed_edges(
+        &self,
+        include_code_bridges: bool,
+    ) -> Result<Vec<TypedEdge>, StoreError> {
+        let conn = self.conn()?;
+        let mut edges: Vec<TypedEdge> = Vec::new();
+        let relations = VAULT_RELATIONS.iter().chain(
+            VAULT_CODE_BRIDGE_RELATIONS
+                .iter()
+                .filter(|_| include_code_bridges),
+        );
+        for relation in relations {
+            let query = if relation.scored {
+                format!(
+                    "MATCH (a:{})-[r:{}]->(b:{}) RETURN a.uid, b.uid, r.confidence",
+                    relation.from, relation.rel, relation.to
+                )
+            } else {
+                format!(
+                    "MATCH (a:{})-[:{}]->(b:{}) RETURN a.uid, b.uid",
+                    relation.from, relation.rel, relation.to
+                )
+            };
+            let result = match conn.query(&query) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::trace!(
+                        "load_vault_typed_edges: {} skipped (table may not exist): {error}",
+                        relation.rel
+                    );
+                    continue;
+                }
+            };
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                // Structural containment carries no confidence column; a
+                // wikilink whose score failed to read is still a real edge, so
+                // fall back to 1.0 rather than dropping it.
+                let confidence = if relation.scored {
+                    extract_f64(&row, 2).unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                edges.push((
+                    src,
+                    dst,
+                    relation.rel.to_string(),
+                    confidence,
+                    String::new(),
+                ));
+            }
+        }
+        Ok(edges)
+    }
+
     /// Returns all Symbol nodes that `uid` calls or imports (outgoing edges).
     ///
     /// Follows CALLS, IMPORTS, and CROSS_REPO_LINK edges so that
@@ -2299,14 +2540,14 @@ impl GraphStore {
                 return Ok(std::collections::HashSet::new());
             }
         };
-        let result =
-            match conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))]) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::trace!("list_note_uids_modified_since: execute error: {e}");
-                    return Ok(std::collections::HashSet::new());
-                }
-            };
+        // nw-295. A failed query and "nothing has been modified since then"
+        // are different facts and used to be the same value — the execute
+        // error was swallowed into `Ok(HashSet::new())`, so a broken query
+        // presented as a confidently narrowed result and the caller lost
+        // every Note and Section without being told why. The `prepare`
+        // fallback above is different and stays: a Note table that does not
+        // exist means there genuinely are no notes.
+        let result = conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))])?;
         let mut uids = std::collections::HashSet::new();
         for row in result {
             if let Some(Value::String(uid)) = row.first() {
@@ -2340,14 +2581,9 @@ impl GraphStore {
                     return Ok(uids);
                 }
             };
-            let result =
-                match conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))]) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::trace!("list_section_uids_modified_since: execute error: {e}");
-                        continue;
-                    }
-                };
+            // Same argument one layer down: the `continue` this replaces
+            // silently dropped one note's sections from the answer.
+            let result = conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))])?;
             for row in result {
                 if let Some(Value::String(uid)) = row.first() {
                     uids.insert(uid.clone());
@@ -2884,7 +3120,33 @@ impl GraphStore {
             }
         }
 
-        Ok(order.into_iter().filter_map(|k| seen.remove(&k)).collect())
+        // nw-297: the two blocks above are appended in QUERY order — every
+        // low-confidence resolution before any genuinely-unresolved link — and
+        // every consumer head-truncates. On a real vault that made the default
+        // 50-row page a pure sample of the BENIGN category, so `broken-links`
+        // printed "0 unresolved (genuinely broken)" against 226 of them. The
+        // list is grouped by category, not ranked by severity, so any head
+        // slice smaller than the first group is a sample of that group alone.
+        //
+        // Order by severity here rather than in each of the three consumers:
+        // the insertion-order dedup above stays exactly as it was, and callers
+        // that page get a severity ranking instead of a query artefact.
+        let mut rows: Vec<BrokenWikilinkRow> =
+            order.into_iter().filter_map(|k| seen.remove(&k)).collect();
+        rows.sort_by(|a, b| {
+            let a_unresolved = a.current_target_uid.is_empty();
+            let b_unresolved = b.current_target_uid.is_empty();
+            b_unresolved
+                .cmp(&a_unresolved)
+                .then(
+                    a.confidence
+                        .partial_cmp(&b.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then_with(|| a.source_path.cmp(&b.source_path))
+                .then_with(|| a.wikilink_text.cmp(&b.wikilink_text))
+        });
+        Ok(rows)
     }
 
     /// Set of Note UIDs that have at least one OUTBOUND wikilink (to a note or
@@ -3253,6 +3515,7 @@ mod repo_has_content_tests {
                 word_count: 1,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

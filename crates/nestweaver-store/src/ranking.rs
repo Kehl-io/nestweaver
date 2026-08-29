@@ -447,25 +447,118 @@ impl fmt::Display for QueryIntent {
     }
 }
 
+impl QueryIntent {
+    /// Every spelling [`QueryIntent::from_str`] accepts, canonical first per
+    /// variant.
+    ///
+    /// nw-317 leg 2. This is the single authority for the accepted vocabulary,
+    /// and it exists because the vocabulary was previously RESTATED: two MCP
+    /// JSON-Schema `enum`s hand-listed four values while this parser accepted
+    /// fourteen, so `--intent blast-radius` — documented by `brain context
+    /// --help`, accepted on the direct route — was rejected through the daemon
+    /// with a raw schema error naming an internal tool. A third schema
+    /// (`code_context`) declared no enum at all, which made the same string
+    /// valid on one tool and invalid on its sibling.
+    ///
+    /// `from_str` matches against this table and the MCP schemas generate
+    /// their `enum` from it, so a schema can no longer reject a value the
+    /// engine accepts.
+    pub const SPELLINGS: &'static [(&'static str, QueryIntent)] = &[
+        ("find-definition", QueryIntent::FindDefinition),
+        ("definition", QueryIntent::FindDefinition),
+        ("find", QueryIntent::FindDefinition),
+        (
+            "understand-architecture",
+            QueryIntent::UnderstandArchitecture,
+        ),
+        ("architecture", QueryIntent::UnderstandArchitecture),
+        ("arch", QueryIntent::UnderstandArchitecture),
+        ("analyze-impact", QueryIntent::AnalyzeImpact),
+        ("impact", QueryIntent::AnalyzeImpact),
+        ("blast-radius", QueryIntent::AnalyzeImpact),
+        ("general-context", QueryIntent::GeneralContext),
+        ("general", QueryIntent::GeneralContext),
+        ("context", QueryIntent::GeneralContext),
+        ("project-context", QueryIntent::ProjectContext),
+        ("project", QueryIntent::ProjectContext),
+    ];
+
+    /// The accepted spellings as a flat list, for callers that must DECLARE
+    /// the vocabulary (JSON Schema `enum`s, `--help` text) rather than parse
+    /// it.
+    #[must_use]
+    pub fn accepted_spellings() -> &'static [&'static str] {
+        const SPELLINGS: [&str; QueryIntent::SPELLINGS.len()] = {
+            let mut out = [""; QueryIntent::SPELLINGS.len()];
+            let mut i = 0;
+            while i < QueryIntent::SPELLINGS.len() {
+                out[i] = QueryIntent::SPELLINGS[i].0;
+                i += 1;
+            }
+            out
+        };
+        &SPELLINGS
+    }
+}
+
 impl std::str::FromStr for QueryIntent {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "find-definition" | "definition" | "find" => Ok(QueryIntent::FindDefinition),
-            "understand-architecture" | "architecture" | "arch" => {
-                Ok(QueryIntent::UnderstandArchitecture)
-            }
-            "analyze-impact" | "impact" | "blast-radius" => Ok(QueryIntent::AnalyzeImpact),
-            "general-context" | "general" | "context" => Ok(QueryIntent::GeneralContext),
-            "project-context" | "project" => Ok(QueryIntent::ProjectContext),
-            other => Err(format!(
-                "unknown intent '{}': expected one of find-definition, \
-                 understand-architecture, analyze-impact, blast-radius, \
-                 general-context, project-context",
-                other
-            )),
+        let lowered = s.to_lowercase();
+        QueryIntent::SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == lowered)
+            .map(|(_, intent)| *intent)
+            .ok_or_else(|| {
+                format!(
+                    "unknown intent '{}': expected one of {}",
+                    s,
+                    QueryIntent::accepted_spellings().join(", ")
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod query_intent_spelling_tests {
+    use super::QueryIntent;
+
+    /// The table and the parser must agree in both directions, so the declared
+    /// vocabulary can be generated from it without a second list.
+    #[test]
+    fn every_declared_spelling_parses_to_its_own_variant() {
+        for (spelling, intent) in QueryIntent::SPELLINGS {
+            assert_eq!(
+                spelling.parse::<QueryIntent>().as_ref(),
+                Ok(intent),
+                "{spelling} does not parse to the variant it is listed under"
+            );
         }
+        assert_eq!(
+            QueryIntent::accepted_spellings().len(),
+            QueryIntent::SPELLINGS.len()
+        );
+    }
+
+    /// The value that caused nw-317: documented by `--help`, accepted direct,
+    /// rejected through the daemon by a schema that restated this parser.
+    #[test]
+    fn blast_radius_is_an_accepted_spelling() {
+        assert_eq!(
+            "blast-radius".parse::<QueryIntent>(),
+            Ok(QueryIntent::AnalyzeImpact)
+        );
+        assert!(QueryIntent::accepted_spellings().contains(&"blast-radius"));
+    }
+
+    /// The error must enumerate what IS accepted, since that list is now the
+    /// same one the schemas declare.
+    #[test]
+    fn an_unknown_intent_names_the_accepted_vocabulary() {
+        let error = "nonsense".parse::<QueryIntent>().unwrap_err();
+        assert!(error.contains("blast-radius"), "{error}");
+        assert!(error.contains("project-context"), "{error}");
     }
 }
 
@@ -604,19 +697,31 @@ impl GraphScope {
                 "MATCH (s:Section) RETURN s.uid".to_string(),
                 "MATCH (t:Tag) RETURN t.uid".to_string(),
             ],
-            edge_queries: vec![
-                // Structural containment edges: no confidence property → defaults to 1.0.
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_HEADING]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_PARENT]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                // Wikilinks carry confidence — query the property explicitly.
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_NOTE]->(b:Note) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_HEADING]->(b:Heading) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
-                // Tag edges: no confidence property → defaults to 1.0.
-                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
-                ScopedEdgeQuery { query: "MATCH (a:Section)-[:SECTION_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
-            ],
+            // nw-288: built from the ONE shared vault-relation inventory
+            // (`crate::read::VAULT_RELATIONS`) rather than hand-written here,
+            // so a relation added for ranking cannot go missing from export —
+            // which is exactly how a 28,254-node / 0-edge vault export shipped.
+            edge_queries: crate::read::VAULT_RELATIONS
+                .iter()
+                .filter(|relation| relation.in_notes_scope)
+                .map(|relation| ScopedEdgeQuery {
+                    query: if relation.scored {
+                        // Wikilinks carry confidence — query it explicitly.
+                        format!(
+                            "MATCH (a:{})-[r:{}]->(b:{}) RETURN a.uid, b.uid, r.confidence",
+                            relation.from, relation.rel, relation.to
+                        )
+                    } else {
+                        // Structural containment: no confidence property, so
+                        // `load_ppr_graph` fills the null column with 1.0.
+                        format!(
+                            "MATCH (a:{})-[:{}]->(b:{}) RETURN a.uid, b.uid",
+                            relation.from, relation.rel, relation.to
+                        )
+                    },
+                    edge_type: None,
+                })
+                .collect(),
         }
     }
 
@@ -2357,6 +2462,7 @@ mod tests {
                     word_count: 1,
                     content_hash: "h".to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -2429,6 +2535,7 @@ mod tests {
                     word_count: 10,
                     content_hash: "h".to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -2538,6 +2645,7 @@ mod tests {
                     word_count: 1,
                     content_hash: "h".to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -3122,6 +3230,7 @@ mod tests {
             word_count: 50,
             content_hash: "ha".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -3136,6 +3245,7 @@ mod tests {
             word_count: 50,
             content_hash: "hb".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -3154,6 +3264,7 @@ mod tests {
             word_count: 200,
             content_hash: "hx".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -3168,6 +3279,7 @@ mod tests {
             word_count: 200,
             content_hash: "hy".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -3190,6 +3302,7 @@ mod tests {
                 word_count: 30,
                 content_hash: format!("hf{i}"),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

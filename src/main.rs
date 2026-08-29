@@ -311,17 +311,27 @@ enum CliDiagnostic {
     )]
     RepoPathNotADirectory { path: String },
 
-    #[error("No symbols found in the database")]
-    #[diagnostic(
-        code(nestweaver::empty_graph),
-        help("Try indexing first with `nestweaver index --repo .`")
-    )]
-    NoSymbolsFound,
-
+    /// nw-329. The audience for "I found nothing" is by definition someone
+    /// whose targeting is already wrong, and a query that returned no rows has
+    /// NOT established that the database is empty — so it must not send them
+    /// to the one command that writes. The help this replaces was
+    /// `nestweaver index --repo <path>`; its sibling `NoSymbolsFound` said
+    /// `nestweaver index --repo .`, which is verbatim the invocation that
+    /// indexed a home directory into the live knowledge graph during the
+    /// 8.0.0 hunt (nw-284). That sibling existed only to serve the substring
+    /// rewrite deleted in `into_diagnostic`, so it is gone rather than fixed.
+    ///
+    /// Report what is true and point at a read that confirms it. Which
+    /// repository to index, and where, is a decision this error has no
+    /// information about. `read_path_diagnostics_never_prescribe_a_write`
+    /// keeps it that way.
     #[error("Database is empty")]
     #[diagnostic(
         code(nestweaver::empty_db),
-        help("Index a repository first: `nestweaver index --repo <path>`")
+        help(
+            "Confirm with `nestweaver brain status`, which reports the repos, \
+             symbols and vaults this database holds."
+        )
     )]
     EmptyDatabase,
 
@@ -344,14 +354,36 @@ enum CliDiagnostic {
     /// A crashed daemon leaves an unreplayed write-ahead log. Replay needs
     /// read-write access, so the read-only path can never perform it and the
     /// generic "could not open" message sends the user nowhere (nw-126).
+    ///
+    /// nw-285. The second clause used to read: *"If that also fails, move {wal}
+    /// aside and retry — it is replayed or discarded on the next read-write
+    /// open, and the database itself is intact."* Three things were wrong with
+    /// it, and `no_permanent_diagnostic_advises_waiting_it_out` is what found
+    /// them:
+    ///
+    /// 1. "and retry" is not a remedy. Nothing about the database changes
+    ///    between the two attempts, so the second one fails identically.
+    /// 2. "the database itself is intact" is asserted, never tested. This
+    ///    diagnostic is reached by a TEXT match on the engine's "shadow pages"
+    ///    sentence, which a truncated or scribbled file produces just as
+    ///    readily as a genuinely unreplayed log.
+    /// 3. Moving a WAL aside is destructive, and the sentence framed it as
+    ///    free. The writes in it are gone once the database opens without it.
+    ///
+    /// Corruption is now classified BEFORE this arm (`db_corrupt`), so what
+    /// reaches here is far more likely to be a real unreplayed log — but "more
+    /// likely" is not "known", so the text no longer claims to know.
     #[error("Database has an unreplayed write-ahead log: {path}")]
     #[diagnostic(
         code(nestweaver::db_wal_unreplayed),
         help(
             "{cause}\nThis usually follows a daemon crash. Replay requires read-write \
-             access:\n  nestweaver daemon --db {path} start\n\
-             If that also fails, move {wal} aside and retry — it is replayed or \
-             discarded on the next read-write open, and the database itself is intact."
+             access, which the read path cannot take:\n  nestweaver daemon --db {path} start\n\
+             If that fails too, the log cannot be replayed. Moving {wal} aside \
+             DISCARDS the writes it holds, so take a copy of both files first; a \
+             read that still fails afterwards means the database file itself is \
+             damaged, and the remedy is `nestweaver backup restore <archive>` or \
+             a re-index."
         )
     )]
     DatabaseWalUnreplayed {
@@ -360,17 +392,227 @@ enum CliDiagnostic {
         cause: String,
     },
 
+    /// nw-285. The file is present and its header is intact, but its CONTENTS
+    /// do not describe a database the engine can read. Distinct from
+    /// `db_unavailable` (something else holds it — wait or stop that process)
+    /// and from `db_wal_unreplayed` (the data is fine, a replay is owed):
+    /// nothing that runs later fixes this file, so a remedy that says "retry"
+    /// is a remedy nobody can run.
+    ///
+    /// The wording deliberately matches `open_crash_guard`'s SIGSEGV message
+    /// verbatim in its recovery clause. Corruption reaches the user two ways —
+    /// as a signal the guard catches, and as an ordinary error that unwinds —
+    /// and the two are the same event to the person holding the file, so they
+    /// must not offer two different sets of instructions.
+    #[error("Database file is corrupt: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_corrupt),
+        help(
+            "{cause}\nThe file exists and its header is intact, but its contents \
+             do not describe a readable database.\n\
+             Recover it: restore the most recent backup with `nestweaver backup \
+             restore <archive>`, or delete this database and re-index the \
+             repositories it held.\n\
+             Do not keep retrying: this is deterministic, not transient."
+        )
+    )]
+    DatabaseCorrupt { path: String, cause: String },
+
+    /// nw-285. A zero-length `.lbug`, or one that was created but never
+    /// indexed. `require_openable_db` passes a zero-byte file on purpose (it
+    /// is what the store itself initialises), and a read-only open does not
+    /// run `init_schema`, so the first query fails in the engine's binder with
+    /// `Table <X> does not exist` — an internal sentence with no remedy, for a
+    /// condition whose remedy is obvious and safe to name.
+    ///
+    /// This is the one database-shaped diagnostic that MAY prescribe a write:
+    /// `read_path_diagnostics_never_prescribe_a_write` bars a write when the
+    /// database might hold data, and a file with no schema demonstrably holds
+    /// none, so `index` cannot destroy anything here. The size is reported
+    /// rather than asserted, because "0 bytes" and "never indexed" want
+    /// different next steps from the operator.
+    #[error("Database has no graph schema: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_no_schema),
+        help(
+            "{detail}\nThis database has never been indexed, so the tables a \
+             query needs do not exist yet.\n\
+             Create them by indexing a repository into it:\n  \
+             nestweaver index --repo <path> --db {path}"
+        )
+    )]
+    DatabaseNoSchema { path: String, detail: String },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
+}
+
+/// Replace any absolute path into a Rust build tree with the crate it points
+/// at, so a message the storage engine wrote with `__FILE__` cannot ship a
+/// developer's home directory to a user.
+///
+/// nw-285: a mid-file corruption surfaced as
+/// `Assertion failed in file "/Users/<name>/.cargo/registry/src/index.crates.io-<hash>/lbug-0.19.1/lbug-src/src/storage/table/column.cpp" on line 289: ...`.
+/// lbug is built from source in the cargo registry and `ASSERT` interpolates
+/// `__FILE__`, so the absolute build path is baked into the binary and printed
+/// verbatim. The username in it is the part that must never leave the machine.
+///
+/// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every message, not on the
+/// corruption arm — which is why this runs at the TOP of `into_diagnostic`, on
+/// the message every arm below then classifies, rather than inside the arm that
+/// happened to be reported. Any error text that ever embeds a `__FILE__`, a
+/// `panic::Location`, or a registry path is covered by construction. The same
+/// reasoning already governs the committed `.wasm` artifact, which is built
+/// with `--remap-path-prefix` for exactly this leak.
+fn redact_build_paths(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find("/.cargo/registry/") {
+        // Walk back to the start of the absolute path so the home prefix goes
+        // with it, not just the registry tail.
+        let head = &rest[..at];
+        let start = head
+            .rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .map_or(0, |i| i + 1);
+        out.push_str(&head[..start]);
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '"')
+            .unwrap_or(tail.len());
+        // Keep the crate-relative remainder: it is the only diagnostic part.
+        let path = &tail[..end];
+        let short = path
+            .split("/index.crates.io-")
+            .nth(1)
+            .and_then(|s| s.split_once('/'))
+            .map_or("<dependency source>", |(_, rel)| rel);
+        out.push_str("<dep>/");
+        out.push_str(short);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove the storage engine's own guess at a transient cause from a message
+/// we have already classified as permanent.
+///
+/// nw-285. lbug appends "The database may be checkpointing; please retry
+/// later." to its truncation error — a guess, not a test: nothing in that code
+/// path asks whether a checkpoint is in progress or whether any writer exists.
+/// Quoting it under a diagnostic that ends "Do not keep retrying: this is
+/// deterministic, not transient" would hand the operator two instructions and
+/// let them pick, which is how the nw-318/nw-328 class survives. The engine's
+/// FACTS ("catalog page range ... outside the database file with 1696 pages")
+/// are the load-bearing part and are kept verbatim; only the advice goes.
+fn drop_engine_retry_advice(message: &str) -> String {
+    const GUESSES: &[&str] = &[
+        " The database may be checkpointing; please retry later.",
+        "The database may be checkpointing; please retry later.",
+    ];
+    let mut out = message.to_string();
+    for guess in GUESSES {
+        out = out.replace(guess, "");
+    }
+    out.trim_end().to_string()
+}
+
+/// The database this process last attempted to open on the read path.
+///
+/// Set by `open_store`, read only by `into_diagnostic`. A `Mutex<Option<..>>`
+/// rather than a `OnceLock` because a single invocation can open more than one
+/// database (federation, `instance merge`) and the interesting one is the last.
+static LAST_OPENED_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn record_opened_db_path(path: &Path) {
+    if let Ok(mut slot) = LAST_OPENED_DB.lock() {
+        *slot = Some(path.display().to_string());
+    }
+}
+
+/// Name the database an error is about.
+///
+/// Prefers a path the message itself carries ("failed to open database at
+/// <path>: ..."), because that one is certainly the subject. Falls back to the
+/// last database `open_store` opened, which is what the binder and assertion
+/// failures need — they carry no path at all.
+fn extract_db_path(message: &str) -> String {
+    if let Some(path) = message
+        .split("database at ")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        return path;
+    }
+    LAST_OPENED_DB
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| default_db_path().display().to_string())
 }
 
 /// Inspect an `anyhow::Error` and, when it matches a known pattern, convert it
 /// into a `miette::Report` with rich diagnostic information (help text, error
 /// code). Falls back to a plain `miette::Report` for unrecognised errors.
 fn into_diagnostic(err: anyhow::Error) -> miette::Report {
-    let message = format!("{err:#}");
+    let message = redact_build_paths(&format!("{err:#}"));
     let lower = message.to_lowercase();
+
+    // nw-285. Corruption must be classified BEFORE the WAL and not-found arms,
+    // because a corrupt file produces text those arms recognise while their
+    // remedies cannot help it. All three signals below were reproduced against
+    // a real 20 MB index; each previously fell through to `nestweaver::error`,
+    // which has no `help` at all.
+    //
+    // 1. TRUNCATION. The engine says, in its own words, that the file is too
+    //    short: "catalog page range starts at 3567 and spans 5 pages, outside
+    //    the database file with 1696 pages" — and then appends "The database
+    //    may be checkpointing; please retry later." That trailer is the engine
+    //    guessing at a transient cause it did not test for. Retrying never
+    //    lengthens a truncated file, and the same sentence is what nw-318 and
+    //    nw-328 were about: a remedy nobody ran.
+    // 2. A C++ ASSERTION. `Assertion failed in file "..." on line 289: ...`
+    //    escapes as an ordinary unwinding error, so `open_crash_guard` — which
+    //    handles SIGSEGV/SIGBUS only — never sees it.
+    // 3. `basic_string`. A bare C++ exception `what()` with no sentence in it,
+    //    produced by a different corruption offset.
+    //
+    // Matched on the storage engine's phrasing rather than on a `StoreError`
+    // variant because there is no variant for it: `From<lbug::Error>` collapses
+    // every engine failure into `StoreError::Database(String)`. That is the
+    // deeper fix and it is a store-crate change, noted here so the next reader
+    // knows this arm is the workaround and not the design.
+    let engine_corruption = lower.contains("outside the database file")
+        || lower.contains("assertion failed in file")
+        || lower.contains("database error: basic_string")
+        || lower.contains("corrupted wal");
+    if engine_corruption {
+        let path = extract_db_path(&message);
+        return CliDiagnostic::DatabaseCorrupt {
+            path,
+            cause: drop_engine_retry_advice(&message),
+        }
+        .into();
+    }
+
+    // nw-285. A zero-length `.lbug` passes `require_openable_db` by design, and
+    // `open_read_only` does not run `init_schema`, so the first query dies in
+    // the binder. `Table Symbol does not exist` / `Table Vault does not exist`
+    // is an internal sentence for a condition with an obvious remedy.
+    if lower.contains("does not exist")
+        && (lower.contains("binder exception") || lower.contains("table "))
+    {
+        let path = extract_db_path(&message);
+        let detail = match std::fs::metadata(&path).map(|m| m.len()) {
+            Ok(0) => format!("{path} is 0 bytes — an interrupted create leaves exactly this."),
+            Ok(bytes) => format!("{path} is {bytes} bytes, but holds no graph tables."),
+            Err(_) => message.clone(),
+        };
+        return CliDiagnostic::DatabaseNoSchema { path, detail }.into();
+    }
 
     // Only genuine "the DB file is absent" failures map here. A create-path
     // error (`index` / `brain add`) like "open/create store at <path>.lbug:
@@ -484,15 +726,274 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         return CliDiagnostic::RepoPathNotFound { path }.into();
     }
 
-    if lower.contains("no symbols found") || lower.contains("no matching symbols") {
-        return CliDiagnostic::NoSymbolsFound.into();
-    }
+    // nw-329: NO "no symbols found" ARM HERE, deliberately.
+    //
+    // The engine's own message is `No symbols found in file(s): bot.py. The
+    // file may contain only re-exports or unsupported syntax.`
+    // (`query.rs`, `build_context_with_intent`). `"no symbols found"` is a
+    // PREFIX of it, so a substring rewrite fired on exactly the errors it
+    // should have left alone and turned a true statement about ONE FILE into
+    // a false statement about a 126,000-symbol database — then attached
+    // `nestweaver index --repo .` as the remedy. A classifier that sits above
+    // the point where scope is known cannot recover it; it can only
+    // generalise, and it generalised to the worst available advice. The
+    // engine's message is better than the replacement in every case, so it
+    // falls through to `General` and is printed verbatim.
 
     if lower.contains("database is empty") || (lower.contains("empty") && lower.contains("graph")) {
         return CliDiagnostic::EmptyDatabase.into();
     }
 
     CliDiagnostic::General { message }.into()
+}
+
+/// nw-329: one classification of a `context` lookup failure, shared by the
+/// daemon and direct routes so they cannot disagree about what went wrong.
+///
+/// The engine's message is printed VERBATIM. It already names the scope it
+/// actually searched, which is the thing no layer above it can reconstruct.
+fn report_context_lookup_failure(error: &anyhow::Error) -> i32 {
+    let message = format!("{error:#}");
+    if message.contains("No matching symbols") || message.contains("No symbols found") {
+        eprintln!("{message}");
+        EXIT_NOT_FOUND
+    } else if message.contains("Ambiguous") {
+        eprintln!("{message}");
+        EXIT_AMBIGUOUS
+    } else {
+        eprintln!("Error: {message}");
+        EXIT_ERROR
+    }
+}
+
+// ── Environment-variable registry (S1/T2) ────────────────────────────────────
+
+/// What a `NESTWEAVER_*` variable DOES, which is the property an error message
+/// has to get right when it offers one as a remedy.
+///
+/// nw-318 (defect B) is the reason this carries a role rather than just a
+/// name. Three messages told the user a bypass "requires `NESTWEAVER_NO_DAEMON=1`".
+/// That variable is real, and the binary really reads it — so a check that
+/// only asked "does this name exist?" would have passed on every one of them.
+/// It is a second way to REQUEST the bypass; the thing that PERMITS it is
+/// `NESTWEAVER_ALLOW_NO_DAEMON`. Setting the named variable therefore does not
+/// resolve the error, which is the whole defect class.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvRole {
+    /// Asks for a behaviour. Setting it is NOT sufficient — something else
+    /// decides whether the request is honoured. Never a valid remedy.
+    Requests,
+    /// Permits a behaviour. A valid remedy.
+    Grants,
+    /// Selects or tunes something. A valid remedy.
+    Configures,
+    /// Exists for the test harness or for internal process handoff. Never
+    /// offered to a user.
+    Internal,
+}
+
+#[cfg(test)]
+struct EnvVar {
+    name: &'static str,
+    role: EnvRole,
+}
+
+/// Every `NESTWEAVER_*` variable this workspace reads or names, with its role.
+///
+/// Written in the explicit-inventory idiom this module already uses for the
+/// `--db`/`--config` matrix: sorted, one entry per name, and a failing test
+/// that tells you to come here. It is also the documentation nobody had — 40+
+/// environment variables with no single list is its own defect.
+#[cfg(test)]
+const ENV_REGISTRY: &[EnvVar] = &[
+    EnvVar {
+        name: "NESTWEAVER_ADMIN_TOKEN",
+        role: EnvRole::Configures,
+    },
+    // The gate for `--no-daemon`. THIS is the one a bypass remedy may name.
+    EnvVar {
+        name: "NESTWEAVER_ALLOW_NO_DAEMON",
+        role: EnvRole::Grants,
+    },
+    EnvVar {
+        name: "NESTWEAVER_AUTH_TOKEN",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_BIND",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_CRASH_REPORT_DIRS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_FORK",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DB",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DRAIN_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_API_KEY",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_CACHE_ISOLATION_CHILD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_EMPTY_CACHE_PATH",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_POPULATED_CACHE_PATH",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_CLONE_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_CMD_TEST_UNSET_XYZ",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_NET_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_HOOK_MARKER",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_CPU_PERCENT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_PUBLICATION_WAIT_MS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_BUFFER_POOL_BYTES",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_MAX_DB_SIZE",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_MAX_THREADS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_SOURCE_MANIFEST",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_MANAGED_START",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_CACHE_DIR",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_DB",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_MODEL_ID",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR",
+        role: EnvRole::Internal,
+    },
+    // REQUESTS the daemon bypass. `NESTWEAVER_ALLOW_NO_DAEMON` permits it.
+    // Offering this one as a remedy is nw-318 defect B.
+    EnvVar {
+        name: "NESTWEAVER_NO_DAEMON",
+        role: EnvRole::Requests,
+    },
+    EnvVar {
+        name: "NESTWEAVER_PARENT_SPAWN_LOCK_FD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_RPC_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_RTS_NO_RECORD",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_SOCK_FALLBACK_DIR",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_STOP_GRACE_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_XDG_DEFAULT_CHILD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TOKEN",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_UPSTREAM",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_WEBHOOK_SECRET",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_WEBHOOK_SECRET_OLD",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_XDG_DEFAULT_CHILD_OK",
+        role: EnvRole::Internal,
+    },
+];
+
+#[cfg(test)]
+fn env_role(name: &str) -> Option<EnvRole> {
+    ENV_REGISTRY
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.role)
 }
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -930,11 +1431,17 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
 /// Summarise how many entries are genuinely broken versus merely resolved at a
 /// lower tier, so the headline count cannot be read as "all of these are
 /// broken".
-fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
-    let unresolved = links.iter().filter(|l| l.is_unresolved()).count();
-    let resolved = links.len() - unresolved;
+///
+/// The counts are over the whole POPULATION, never the returned page. Computing
+/// them from the page printed "0 unresolved (genuinely broken)" on a vault with
+/// 226 of them (nw-297): the store groups low-confidence rows ahead of
+/// unresolved ones, so a head-slice shorter than that group is a pure sample of
+/// the benign category. Ordering is being fixed in `broken_wikilinks`, but a
+/// page is still a sample — only the population can answer "does this vault
+/// have broken links".
+fn print_link_classification(total_unresolved: usize, total_low_confidence: usize) {
     println!(
-        "  {unresolved} unresolved (genuinely broken), {resolved} resolved at a lower \
+        "  {total_unresolved} unresolved (genuinely broken), {total_low_confidence} resolved at a lower \
          confidence tier (same-folder or filename-stem match — not broken)"
     );
 }
@@ -1065,16 +1572,124 @@ fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
     );
 }
 
+/// The ranking-staleness disclosure, as fields on a `--json` payload.
+///
+/// nw-308: [`warn_stale_resolver_rankings`] carries exactly these facts, but
+/// sends them to STDERR only — deliberately, so `--json` could keep emitting a
+/// bare array. That contract is what makes the disclosure unreachable: an agent
+/// reading `--json` parses stdout, so the consumer most likely to ACT on a
+/// stale ranking is the one that cannot see it. Bumping `RESOLVER_GENERATION`
+/// marks every already-indexed repo stale at a stroke, which turns "an agent
+/// might miss the warning" into "every repo in the graph returns pre-fix
+/// rankings and nothing on stdout says so".
+struct ResolverStaleness {
+    /// True when at least one repo's edges are known to predate the current
+    /// resolver, or when no generation record exists at all.
+    rankings_stale: bool,
+    /// The repos that can be PROVEN stale, so the caller knows what to
+    /// re-index. May be empty while `rankings_stale` is true — see
+    /// [`ResolverStaleness::from_sidecar`].
+    stale_repos: Vec<String>,
+}
+
+impl ResolverStaleness {
+    /// Exact answer: enumerate the repos and compare each recorded generation.
+    /// Available only where we hold the store, i.e. the direct path.
+    fn from_store(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) -> Self {
+        let uids: Vec<String> = store
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.uid)
+            .collect();
+        let stale_repos = nestweaver_engine::resolver_generation::load(db_path)
+            .stale_repos(uids.iter().map(String::as_str));
+        Self {
+            rankings_stale: !stale_repos.is_empty(),
+            stale_repos,
+        }
+    }
+
+    /// Sidecar-only answer, for the daemon path — which has no store handle and
+    /// must not open one, since the daemon owns the write lock.
+    ///
+    /// This is an UNDER-approximation and deliberately so. It catches the two
+    /// cases the sidecar can prove: no record at all (every repo predates the
+    /// record, the common upgrade case), and a recorded repo whose generation
+    /// is behind. A repo that is in the graph but absent from a non-empty
+    /// sidecar is stale and invisible here — the same blind spot
+    /// [`warn_stale_resolver_rankings_no_store`] already has on this route.
+    /// Reporting what can be proven beats reporting nothing, and it is never
+    /// a FALSE alarm.
+    fn from_sidecar(db_path: &std::path::Path) -> Self {
+        let sidecar = nestweaver_engine::sidecar_path(
+            db_path,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        let generations = nestweaver_engine::resolver_generation::load(db_path);
+        let recorded: Vec<String> = generations.repos.keys().cloned().collect();
+        let stale_repos = generations.stale_repos(recorded.iter().map(String::as_str));
+        Self {
+            rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
+            stale_repos,
+        }
+    }
+}
+
+/// Print a ranking payload as an OBJECT carrying its own staleness, rather than
+/// the bare array that had nowhere to put it (nw-308).
+fn print_ranking_json<T: serde::Serialize>(
+    key: &str,
+    rows: &T,
+    staleness: &ResolverStaleness,
+) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            key: rows,
+            "rankings_stale": staleness.rankings_stale,
+            "stale_repos": staleness.stale_repos,
+        }))?
+    );
+    Ok(())
+}
+
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
 /// mistaken for a result set.
-fn impact_json_ambiguous(symbol: &str, candidates: serde_json::Value) -> serde_json::Value {
+///
+/// nw-328: `repo_filter` is a parameter because the remedy is a FUNCTION of
+/// the state that produced the error, not a constant. `resolve_uid_with_repo_filter`
+/// returns `Ambiguous` only when MORE THAN ONE candidate SURVIVES the filter,
+/// so reaching this with `--repo` already set is a proof that `--repo` cannot
+/// separate these two symbols. Advising it anyway sends the caller round a
+/// loop; an agent following the remedy verbatim never terminates.
+fn impact_json_ambiguous(
+    symbol: &str,
+    repo_filter: Option<&str>,
+    candidates: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "ambiguous",
         "symbol": symbol,
         "candidates": candidates,
-        "note": "the symbol name matched multiple symbols; no impact was computed. \
-                 Disambiguate with --repo <name> or pass a full UID",
+        "note": impact_ambiguity_remedy(repo_filter),
     })
+}
+
+/// The one sentence both the JSON and the text renderings of an ambiguous
+/// `impact` use, so they cannot drift.
+fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
+    match repo_filter {
+        Some(repo) => format!(
+            "the symbol name matched multiple symbols; no impact was computed. \
+             --repo {repo} is already set and every match is inside it, so it \
+             cannot separate them. Pass a full UID instead — each candidate \
+             below carries one."
+        ),
+        None => "the symbol name matched multiple symbols; no impact was computed. \
+                 Disambiguate with --repo <name> or pass a full UID"
+            .to_string(),
+    }
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
@@ -1579,11 +2194,26 @@ fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
                     }
                 }
             } else {
+                // nw-310, third site in the same family: the fallback for an
+                // older daemon that sends no remediation commands. `entries`
+                // carries every `instance_id`, so the consolidation half is
+                // rendered from the values rather than from placeholders.
+                let observed: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| e["instance_id"].as_str())
+                    .map(str::to_string)
+                    .collect();
+                let consolidation =
+                    nestweaver_engine::instance_remedy::instance_consolidation_remedy(
+                        &observed, None,
+                    );
                 out.push_str(&format!(
                     "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
-                     Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>\n"
+                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n"
                 ));
+                if !consolidation.is_empty() {
+                    out.push_str(&format!("  Or {consolidation}\n"));
+                }
             }
         } else {
             // Generic forwarding: a warning kind this binary does not know —
@@ -2192,6 +2822,15 @@ enum Commands {
         name: String,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
+        /// nw-311: 6.4.0 shipped `--repo` for `impact` ("apply it to
+        /// uniquely-resolving names, not just ambiguous ones") and left
+        /// `service-summary` without it, so the one command that most often
+        /// hits a same-named service in several repos had no way to say which.
+        #[arg(
+            long,
+            help = "Restrict to one repository (uid, name, url or local root)"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2821,9 +3460,6 @@ enum Commands {
         /// In daemon mode, the daemon's own --config takes precedence.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// CI/testing only — bypass the daemon. Requires NESTWEAVER_NO_DAEMON=1.
-        #[arg(long, hide = true)]
-        no_daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -2845,6 +3481,20 @@ enum Commands {
         /// Enable live re-indexing watchers (file system watching)
         #[arg(long)]
         watch: bool,
+
+        /// Repository to watch under `--watch`. Defaults to the repository
+        /// root detected from the current directory.
+        ///
+        /// nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
+        /// mutates the graph continuously and previously had no way to state
+        /// its source at all, so a guard that refuses a wholly-inferred write
+        /// would have left `ui --watch` unusable rather than correctable.
+        /// Additive and non-breaking.
+        #[arg(
+            long,
+            help = "Repository to watch (with --watch); defaults to the detected repo root"
+        )]
+        repo: Option<PathBuf>,
     },
     /// Manage interaction memory
     Interactions {
@@ -3121,8 +3771,22 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
-        #[arg(long, help = "Also include notes/symbols from component sub-projects")]
-        include_components: bool,
+        /// nw-316: `Option<bool>`, because a bare clap `bool` cannot express
+        /// "unset" and the tool's documented default is TRUE. Sending clap's
+        /// `false` unconditionally made that default UNREACHABLE on this
+        /// route, and `component_uids` feeds both the PPR seed set and the x5
+        /// membership boost — so the daemon and direct routes ranked the same
+        /// request differently, and neither said so.
+        ///
+        /// `--include-components` bare still means true; `--include-components
+        /// false` is how you opt out.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            help = "Also include notes/symbols from component sub-projects (default: true)"
+        )]
+        include_components: Option<bool>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -3134,9 +3798,20 @@ enum Commands {
         config: Option<PathBuf>,
         /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
         /// Symbol nodes are always kept.
+        ///
+        /// nw-295: validated AND normalised at the clap boundary, not at the
+        /// filter. `modified_at` is a String column, so the downstream
+        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        /// `'2'` (0x32), which made an unparseable value byte-identical to
+        /// `2099-12-31`: it matched no note and silently dropped every Note and
+        /// Section from the answer while exiting 0. Parsing here is the only
+        /// layer that runs before BOTH the daemon and direct routes, so neither
+        /// can be reached with a value the other would have rejected.
         #[arg(
             long = "since",
-            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+            value_parser = |s: &str| nestweaver_engine::parse_since(s),
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp (2026-01-31 or 2026-01-31T00:00:00Z)"
         )]
         since: Option<String>,
         /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
@@ -3332,10 +4007,13 @@ enum Commands {
     /// are reported as potentially dead, with confidence scoring based
     /// on visibility.
     ///
-    /// Known limitation: symbol visibility is not persisted (reads rebuild it
-    /// as Inferred), so confidence scoring cannot distinguish a public API
-    /// from a private helper — treat Low-confidence results as review
-    /// candidates, not proof of deadness.
+    /// Known limitation: a symbol is reported when no entry point REACHES it,
+    /// which is not the same as "nothing references it" — a reference the
+    /// parser does not capture is indistinguishable from no reference at all.
+    /// Treat EVERY confidence tier as review candidates, not proof of
+    /// deadness: the caveat is not scoped to Low. Confidence ranks how
+    /// unaddressable a symbol is from outside its file, never how sure the
+    /// reachability walk is.
     #[command(
         after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
     )]
@@ -4208,6 +4886,24 @@ enum ExtensionCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
+    /// Remove one extension property from one node.
+    ///
+    /// `set_extension` requires `value`, so not even a null-set was
+    /// expressible, and the only existing delete removes ALL of a uid's
+    /// properties and is reachable solely from daemon reindex paths (nw-281b).
+    Unset {
+        /// Node UID.
+        uid: String,
+        /// Property key to remove.
+        key: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4528,9 +5224,20 @@ enum BrainCommands {
         weight_semantic: Option<f64>,
         /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
         /// Symbol nodes are always kept.
+        ///
+        /// nw-295: validated AND normalised at the clap boundary, not at the
+        /// filter. `modified_at` is a String column, so the downstream
+        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        /// `'2'` (0x32), which made an unparseable value byte-identical to
+        /// `2099-12-31`: it matched no note and silently dropped every Note and
+        /// Section from the answer while exiting 0. Parsing here is the only
+        /// layer that runs before BOTH the daemon and direct routes, so neither
+        /// can be reached with a value the other would have rejected.
         #[arg(
             long = "since",
-            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+            value_parser = |s: &str| nestweaver_engine::parse_since(s),
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp (2026-01-31 or 2026-01-31T00:00:00Z)"
         )]
         since: Option<String>,
         /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
@@ -5214,6 +5921,22 @@ enum InteractionCommands {
         )]
         db: Option<PathBuf>,
     },
+    /// Forget one node's interaction memory, leaving the rest intact.
+    ///
+    /// `clear` is all-or-nothing. A single poisoned entry — a phantom key from
+    /// a pre-nw-296 binary, or an oversized caller-supplied seed — could only
+    /// be removed by destroying every accumulated ranking signal (nw-313).
+    Forget {
+        /// Node UID to forget.
+        uid: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
     /// Show recorded interaction events / decayed score for a UID, or the
     /// top UIDs by a given event kind.
     Show {
@@ -5366,11 +6089,125 @@ fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u
     ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
 }
 
+/// Which link in a database-resolution chain actually produced the path.
+///
+/// nw-284/S2. Every resolver in this file ends in a `.unwrap_or_else(...)`
+/// chain and returns a bare `PathBuf`, so the answer to "did the user name
+/// this database?" is computed and then thrown away one line later. A
+/// mutating command needs that answer, so the resolvers now return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbSource {
+    /// An explicit `--db` on the command line.
+    Flag,
+    /// The `db` field of an explicit `--config`.
+    Config,
+    /// The `NESTWEAVER_DB` environment variable — ambient, and the only
+    /// source S2 treats as "not stated".
+    Env,
+    /// `<repo>/nestweaver.lbug`. Ambient, but DERIVED FROM THE SOURCE: it
+    /// follows wherever the repo is, creates a local file, and is the
+    /// documented quick-start path. Refusing it would break `nestweaver
+    /// index` in a fresh clone, which is the UX S2 exists to protect.
+    RepoLocal,
+    /// `./nestweaver.lbug`, the compiled-in default for commands with no repo
+    /// argument. Same reasoning as [`DbSource::RepoLocal`]: cwd-local, not
+    /// somebody else's graph.
+    CwdLocal,
+}
+
+/// nw-284 / structural fix S2: **a mutating command may infer its SOURCE or
+/// its TARGET from the environment, never both.**
+///
+/// The defect this closes: `nestweaver index` with no `--repo` and no
+/// `--db`/`--config` takes its source from the current directory and its
+/// target from `NESTWEAVER_DB`, writes to the graph, and exits 0. Neither end
+/// of the operation was named by the user, and the command reported success.
+/// During the 8.0.0 post-release hunt this indexed `~/brain` into the live
+/// knowledge graph (102 files, 2329 symbols, repos 43 -> 44).
+///
+/// Two independent implicit defaults compose here, and neither is
+/// individually unreasonable — cwd detection is documented ergonomics and
+/// `NESTWEAVER_DB` is a documented first-class selector. So the guard is
+/// scoped to the INFERRED case in the shape nw-246 established for instance
+/// identity (see [`resolve_instance_id_for_db`]): stating EITHER end is a
+/// deliberate act and passes through untouched. `--repo` is not made
+/// required, `detect_repo_root` is not changed, and a repo-local or cwd-local
+/// target is not refused — that target is derived from the source rather than
+/// from the ambient environment.
+///
+/// Returns the refusal text, or `None` when the caller may proceed.
+fn wholly_inferred_write_refusal(
+    action: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    wholly_inferred_write_message(
+        &format!("Error: refusing to {action}"),
+        repo_stated,
+        db_source,
+        repo_path,
+        db_path,
+    )
+}
+
+/// The same property as [`wholly_inferred_write_refusal`], reported rather
+/// than enforced.
+///
+/// The `investigate*` commands share the shape exactly — source from
+/// `detect_repo_root()`, target from `NESTWEAVER_DB` — but what they write is
+/// `<db>.bundles.json`, a rebuildable bundle cache beside the database, not
+/// the graph. The blast radius does not justify refusing a working read-ish
+/// workflow, so they say what they are about to do instead. This asymmetry is
+/// deliberate and is the only place S2 is applied at warn level.
+fn wholly_inferred_write_warning(
+    action: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    wholly_inferred_write_message(
+        &format!("Warning: {action}"),
+        repo_stated,
+        db_source,
+        repo_path,
+        db_path,
+    )
+}
+
+fn wholly_inferred_write_message(
+    lead: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    if repo_stated || db_source != DbSource::Env {
+        return None;
+    }
+    Some(format!(
+        "{lead}: neither the source nor the target was stated.\n  \
+         source: {} (detected from the current directory)\n  \
+         target: {} (from the NESTWEAVER_DB environment variable)\n\
+         State either end: `--repo <path>` to confirm the source, \
+         or `--db <path>` / `--config <file>` to confirm the target.",
+        repo_path.display(),
+        db_path.display(),
+    ))
+}
+
 fn default_db_path() -> PathBuf {
+    default_db_path_with_source().0
+}
+
+/// [`default_db_path`] with the nw-284/S2 provenance retained.
+fn default_db_path_with_source() -> (PathBuf, DbSource) {
     if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        PathBuf::from(env_db)
+        (PathBuf::from(env_db), DbSource::Env)
     } else {
-        PathBuf::from("./nestweaver.lbug")
+        (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
     }
 }
 
@@ -5381,12 +6218,21 @@ fn default_db_path() -> PathBuf {
 /// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
 /// select a DB instead of being silently ignored (Bug #19).
 fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let (resolved, cfg) = resolve_base_db_with_config(db, config)?;
+    resolve_db_with_config_source(db, config).map(|(path, _)| path)
+}
+
+/// [`resolve_db_with_config`] with the nw-284/S2 provenance retained, for the
+/// mutating commands that must not infer both ends of their operation.
+fn resolve_db_with_config_source(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<(PathBuf, DbSource)> {
+    let (resolved, cfg, source) = resolve_base_db_with_config_source(db, config)?;
     let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
     if let Some(config) = cfg.as_ref() {
         assert_config_expected_brain(config, &selected)?;
     }
-    Ok(selected)
+    Ok((selected, source))
 }
 
 /// Resolve the stable database anchor without following publication
@@ -5396,16 +6242,28 @@ fn resolve_base_db_with_config(
     db: Option<PathBuf>,
     config: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>)> {
+    resolve_base_db_with_config_source(db, config).map(|(path, cfg, _)| (path, cfg))
+}
+
+/// [`resolve_base_db_with_config`] with the nw-284/S2 provenance retained.
+fn resolve_base_db_with_config_source(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>, DbSource)> {
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
                 .with_context(|| format!("loading --config {}", cfg_path.display()))
         })
         .transpose()?;
-    let resolved = db
-        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
-        .unwrap_or_else(default_db_path);
-    Ok((resolved, cfg))
+    let (resolved, source) = match db {
+        Some(path) => (path, DbSource::Flag),
+        None => match cfg.as_ref().and_then(|config| config.db_path()) {
+            Some(path) => (path, DbSource::Config),
+            None => default_db_path_with_source(),
+        },
+    };
+    Ok((resolved, cfg, source))
 }
 
 /// Enforce a config's data binding before a command can route to a daemon or
@@ -5611,13 +6469,15 @@ fn resolve_instance_id_for_db(
         // is how the fork would deepen, so refuse and name them. Stating an
         // instance resolves it, which is why this is unreachable when the
         // caller named one.
+        // nw-310: the consolidation half of this remedy used to read
+        // `--from <one> --to <keep>` with `ids` bound on the line below it.
         anyhow::bail!(
             "this database holds data under {} instances ({}), and no instance was \
              specified, so there is no safe default.\n\
-             Name one with `--instance <id>` or a `--config`, or consolidate them with \
-             `nestweaver instance merge --from <one> --to <keep>`.",
+             Name one with `--instance <id>` or a `--config`, or {}",
             ids.len(),
-            ids.join(", ")
+            ids.join(", "),
+            nestweaver_engine::instance_remedy::instance_consolidation_remedy(ids, None)
         );
     }
 
@@ -6077,26 +6937,37 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
 /// Precedence intentionally matches [`resolve_db_with_config`]: an explicit
 /// `--db`, then the explicit config's `db`, then `NESTWEAVER_DB`, and finally
 /// `<repo>/nestweaver.lbug`.
+///
+/// nw-284/S2: the returned [`DbSource`] says WHICH of those four fired. A
+/// caller that only receives the `PathBuf` cannot tell "the database you
+/// named" from "the database your shell profile named", and that is exactly
+/// the distinction a mutating command has to make before it writes.
 fn resolve_index_db_path(
     db: Option<PathBuf>,
     config: Option<&Path>,
     repo_root: &Path,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, DbSource)> {
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
                 .with_context(|| format!("loading --config {}", cfg_path.display()))
         })
         .transpose()?;
-    let resolved = db
-        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
-        .or_else(|| std::env::var("NESTWEAVER_DB").ok().map(PathBuf::from))
-        .unwrap_or_else(|| repo_root.join("nestweaver.lbug"));
+    let (resolved, source) = match db {
+        Some(path) => (path, DbSource::Flag),
+        None => match cfg.as_ref().and_then(|config| config.db_path()) {
+            Some(path) => (path, DbSource::Config),
+            None => match std::env::var("NESTWEAVER_DB").ok() {
+                Some(value) => (PathBuf::from(value), DbSource::Env),
+                None => (repo_root.join("nestweaver.lbug"), DbSource::RepoLocal),
+            },
+        },
+    };
     let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
     if let Some(config) = cfg.as_ref() {
         assert_config_expected_brain(config, &selected)?;
     }
-    Ok(selected)
+    Ok((selected, source))
 }
 
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
@@ -6125,6 +6996,56 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
     }
 }
 
+/// nw-318 (defect A). Classify a read-only open failure against a store the
+/// daemon holds, and say something the caller has not already tried.
+///
+/// The message this replaces read: *"This command should route through the
+/// daemon automatically. If you see this error, please report it as a bug.
+/// Workaround: pass --no-daemon to open the database directly."* Every clause
+/// of it was wrong for the caller who actually reaches here. This function is
+/// only ever entered on the DIRECT open path — i.e. by someone who already
+/// bypassed the daemon — so:
+///
+///   * offering `--no-daemon` prescribes the flag they just passed: a closed
+///     loop, and the defect class this release exists to remove;
+///   * "should route through the daemon automatically" is false for a caller
+///     who explicitly opted out;
+///   * "report it as a bug" mislabels a state the user deliberately asked for.
+///
+/// The two matched substrings are also NOT the same condition, and were being
+/// given one answer. `Could not set lock` is live contention — stopping the
+/// daemon resolves it. `Corrupted wal` is a non-replayable write-ahead log,
+/// which a READ-ONLY open can never replay however many times it is retried
+/// (the same nw-126 hazard the `db_wal_unreplayed` diagnostic documents), so
+/// the only way through is a read-write open, i.e. the daemon.
+///
+/// Extracted from a closure so the message is testable at all; see
+/// `no_daemon_refusal_never_prescribes_the_flag_already_passed`.
+fn daemon_held_store_error(path: &Path, upstream: &str) -> anyhow::Error {
+    if upstream.contains("Corrupted wal") {
+        anyhow::anyhow!(
+            "The database at {} has write-ahead log state that a read-only open \
+             cannot replay.\n\
+             Replay needs read-write access, which is why opening it directly \
+             cannot succeed here however often it is retried.\n\
+             Let this command route through the daemon, which holds the \
+             database read-write: `nestweaver daemon --db {} start`.",
+            path.display(),
+            path.display()
+        )
+    } else if upstream.contains("Could not set lock") {
+        anyhow::anyhow!(
+            "The NestWeaver daemon holds the write lock on the database at {}.\n\
+             Either let this command route through the daemon, or stop the \
+             daemon first: `nestweaver daemon --db {} stop`.",
+            path.display(),
+            path.display()
+        )
+    } else {
+        anyhow::anyhow!("failed to open database at {}: {upstream}", path.display())
+    }
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
@@ -6142,22 +7063,19 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // Guarding here fixes every read path at once instead of repeating the
     // check at each call site. The explicit `require_existing_db` calls stay:
     // they run BEFORE a daemon can be autostarted, which this cannot.
-    require_existing_db(path)?;
-    let store = GraphStore::open_read_only(path).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("Corrupted wal") || msg.contains("Could not set lock") {
-            anyhow::anyhow!(
-                "The NestWeaver daemon already has the database open at {}.\n\
-                 This command should route through the daemon automatically. \
-                 If you see this error, please report it as a bug.\n\
-                 Workaround: pass --no-daemon to open the database directly \
-                 (only safe when the daemon is stopped).",
-                path.display()
-            )
-        } else {
-            anyhow::anyhow!("failed to open database at {}: {e}", path.display())
-        }
-    })?;
+    //
+    // nw-309: the same check the daemon-dial funnel applies, so the two routes
+    // report an unopenable `--db` identically instead of one erroring at once
+    // and the other after a 30s boot ceiling.
+    require_openable_db(path)?;
+    // nw-285: remember what we tried to open. The engine's binder and assertion
+    // failures ("Table Vault does not exist", "Assertion failed in file ...")
+    // name no path at all, so a diagnostic derived from the message alone
+    // cannot tell the operator WHICH database is broken — and with several
+    // scratch databases open that is the only fact that matters.
+    record_opened_db_path(path);
+    let store = GraphStore::open_read_only(path)
+        .map_err(|e| daemon_held_store_error(path, &e.to_string()))?;
 
     // nw-029: load the PageRank sidecar from the canonical path. Every writer
     // and `migrate_sidecar` produce `<db>.lbug.pagerank.json` via
@@ -8153,6 +9071,63 @@ fn require_existing_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The four bytes every LadybugDB file starts with.
+const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
+
+/// Reject a `--db` that exists but is demonstrably not a database, BEFORE
+/// anything decides to dial or autostart a daemon for it.
+///
+/// nw-309. `require_existing_db` and the daemon-dial short-circuit in
+/// `try_hybrid_json_rpc_checked` both tested only `.exists()`, which admits a
+/// text file, a directory and an unreadable file to the route whose entire
+/// purpose is to open the store. The measured cost was the full 30s daemon
+/// boot ceiling (`NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS`) before the direct path
+/// produced the correct exit 1 — while a genuinely NONEXISTENT path was fast,
+/// because it had a guard. "Missing" and "present but not a database" are the
+/// same answer to the caller and were being given wildly different service.
+///
+/// Deliberately a cheap header probe and NOT an open: an open is what costs,
+/// and this runs before every daemon-routed read. It is also deliberately
+/// conservative — an empty file passes, because a zero-byte `.lbug` is what
+/// the store itself initialises.
+///
+/// This does NOT claim to detect corruption. A `.lbug` whose header is intact
+/// and whose index region is not still passes here, by construction; see
+/// `nestweaver-store`'s `open_crash_guard` (nw-285) for why a header check
+/// cannot be that guard and must not be mistaken for one.
+fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
+    require_existing_db(db_path)?;
+    if db_path.is_dir() {
+        anyhow::bail!(
+            "{} is a directory, not a NestWeaver database",
+            db_path.display()
+        );
+    }
+    let mut header = [0u8; 4];
+    let read = (|| -> std::io::Result<usize> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(db_path)?;
+        file.read(&mut header)
+    })();
+    match read {
+        Err(error) => anyhow::bail!(
+            "{} cannot be read: {error}. Check its permissions, or point --db \
+             at a database you can read.",
+            db_path.display()
+        ),
+        // A zero-byte file is what an interrupted create leaves; the store
+        // initialises it. Not this guard's business.
+        Ok(0) => Ok(()),
+        Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "{} is not a NestWeaver database (its header is not `LBUG`). \
+             Point --db at a `.lbug` file, or run `nestweaver index --repo <path> \
+             --db <new path>` to create one.",
+            db_path.display()
+        ),
+    }
+}
+
 /// Stable machine name for a recovery outcome, for `--json` consumers.
 fn repair_outcome_name(
     outcome: &nestweaver_engine::index::IndexPublicationRecovery,
@@ -8387,6 +9362,9 @@ fn wait_for_started_daemon_with_timeout(
         timeout,
         ignore_pid,
         expected_config,
+        // This waiter did not spawn the daemon, so it holds no process whose
+        // exit could end the wait early (nw-309).
+        None,
     ))
 }
 
@@ -8814,26 +9792,117 @@ fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Human-readable caveat for an incomplete `impact` traversal, mirroring the
-/// pr-impact "reported impact is a floor" phrasing. Names the concrete cause
-/// (score pruning / depth cap) and the opt-out for each.
-fn impact_truncation_note(
-    result: &nestweaver_store::ImpactResult,
-    threshold: f64,
-    depth: u32,
-) -> String {
-    let mut parts = Vec::new();
-    if result.truncated_by_threshold {
-        parts.push(format!(
-            "traversal pruned below the impact-score threshold ({threshold:.2}) — re-run with --min-score 0 for the full traversal"
-        ));
+/// The coverage caveat every incomplete-impact disclosure ends with.
+///
+/// Named once so the daemon route can test for it rather than assume it is
+/// absent (nw-317).
+const IMPACT_FLOOR_CLAUSE: &str = "reported impact is a floor";
+
+/// Add the floor clause to a daemon-supplied `impact` note, unless the note
+/// already carries it.
+///
+/// The daemon and direct routes disclose the same truncation with two
+/// different strings: the direct one is parametrised (it names the depth, the
+/// threshold and the remedy) and ENDS with the floor clause, while the tool's
+/// is static and — for its depth case — omits it. Text mode papered over the
+/// gap by appending the clause unconditionally, which is correct only for as
+/// long as the tool's note lacks it.
+///
+/// That is a standing trap rather than a stable arrangement: the tool's OTHER
+/// note already contains the clause today (it is unreachable only because the
+/// tool hardcodes a 0.0 threshold, so `truncated_by_threshold` is never true),
+/// and moving the parametrised text down to the store — so both routes can
+/// share it — makes every note end with the clause. Under an unconditional
+/// append that prints it twice.
+///
+/// Testing for the clause is right in both arrangements and needs no follow-up
+/// edit when the note changes underneath it.
+fn impact_note_with_floor_clause(note: &str) -> String {
+    if note.contains(IMPACT_FLOOR_CLAUSE) {
+        note.to_string()
+    } else {
+        format!("{note} — {IMPACT_FLOOR_CLAUSE}")
     }
-    if result.truncated_by_depth {
-        parts.push(format!(
-            "traversal hit the depth limit ({depth}) — deeper dependents may exist; raise --depth"
-        ));
+}
+
+#[cfg(test)]
+mod impact_floor_clause_tests {
+    use super::impact_note_with_floor_clause;
+
+    /// Today's daemon depth note omits the clause, so it must still be added.
+    #[test]
+    fn a_note_without_the_clause_gains_it() {
+        let note =
+            "frontier reached max depth — deeper dependents may exist beyond the returned set";
+        assert_eq!(
+            impact_note_with_floor_clause(note),
+            format!("{note} — reported impact is a floor")
+        );
     }
-    format!("{} — reported impact is a floor", parts.join("; "))
+
+    /// The tool's threshold note already carries it mid-sentence.
+    #[test]
+    fn a_note_that_already_says_it_is_left_alone() {
+        let note = "paths pruned below the impact-score threshold — reported impact is a \
+                    floor, not the full set";
+        assert_eq!(impact_note_with_floor_clause(note), note);
+    }
+
+    /// And the parametrised form, which ends with the clause — the shape both
+    /// routes converged on when the note moved down to the store.
+    ///
+    /// Asserted against the REAL producer rather than a transcribed string.
+    /// nw-317 leg 1 made this load-bearing: the daemon now returns
+    /// `ImpactResult::truncation_note`, so if the append were not idempotent
+    /// every truncated `impact` would print the clause twice. A hand-written
+    /// fixture would keep passing while the producer drifted away from it —
+    /// which is the exact failure this whole finding is about.
+    #[test]
+    fn no_note_the_shared_producer_can_emit_is_ever_doubled() {
+        let mut seen = 0;
+        for by_threshold in [false, true] {
+            for by_depth in [false, true] {
+                let result = nestweaver_store::ImpactResult {
+                    nodes: vec![],
+                    truncated_by_threshold: by_threshold,
+                    truncated_by_depth: by_depth,
+                    edge_types: vec![],
+                };
+                let Some(note) = result.truncation_note(0.25, 3) else {
+                    // Neither flag set: there is no truncation to disclose, and
+                    // the routes agree by emitting nothing at all.
+                    assert!(
+                        !by_threshold && !by_depth,
+                        "a truncated result must produce a note"
+                    );
+                    continue;
+                };
+                seen += 1;
+                let once = impact_note_with_floor_clause(&note);
+                assert_eq!(
+                    once, note,
+                    "the append must be a no-op for a note that already ends \
+                     with the clause"
+                );
+                assert_eq!(
+                    once.matches(super::IMPACT_FLOOR_CLAUSE).count(),
+                    1,
+                    "the clause must appear exactly once: {once}"
+                );
+                // The disclosure is only useful if it names what to change.
+                assert!(
+                    (!by_depth || note.contains("--depth"))
+                        && (!by_threshold || note.contains("--min-score")),
+                    "the note must name the remedy for each cause it reports: {note}"
+                );
+            }
+        }
+        assert_eq!(
+            seen, 3,
+            "all three truncation combinations must produce a note; if the \
+             producer stops emitting one, this test must not silently shrink"
+        );
+    }
 }
 
 /// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
@@ -9269,6 +10338,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
+        // nw-281(b): the only delete that existed removed ALL of a uid's
+        // properties and was reachable solely from daemon reindex paths, so
+        // no user or agent could retract a single annotation they had set.
+        //
+        // NOT guarded by `wholly_inferred_write_refusal` (nw-284/S2): that
+        // guard exists for commands whose SOURCE and TARGET both default and
+        // compose. Here the source is the required `<uid> <key>` positional
+        // pair, so the caller has necessarily stated one end — the same
+        // reasoning that excluded `backup`/`snapshot`/`instance` from it.
+        Commands::Extensions {
+            command:
+                ExtensionCommands::Unset {
+                    uid,
+                    key,
+                    db,
+                    config,
+                },
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // Same precedent as `extensions list`: a typo'd `--db` is not an
+            // empty store, and this one would otherwise report a confident
+            // "no such property" about a database that does not exist.
+            require_existing_db(&db_path)?;
+            if nestweaver_engine::remove_extension_key_durable(&db_path, &uid, &key)? {
+                println!("Removed extension property '{key}' from {uid}");
+                Ok((EXIT_SUCCESS, None))
+            } else {
+                println!("No extension property '{key}' on {uid}");
+                Ok((EXIT_NOT_FOUND, None))
+            }
+        }
+
         Commands::ListRepos {
             instance,
             json,
@@ -9653,80 +10754,90 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::ServiceSummary {
             name,
             instance,
+            repo,
             json,
             db,
         } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
+            // nw-311. ONE shape for both routes.
+            //
+            // The previous divergence was not a missing feature — it was a
+            // warning that existed on one route and had nowhere to live on the
+            // other. The daemon branch deserialized the envelope back down to
+            // a bare `Service`, which SUCCEEDS because the service is
+            // flattened, so the disclosure was dropped without anything
+            // looking broken; and the direct branch re-implemented the
+            // resolution with its own `list_services` filter and its own copy
+            // of the warning text. Both now call
+            // `nestweaver_engine::query::service_summary`, which is the single
+            // resolver, and render its envelope.
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+
+            let summary: Option<nestweaver_engine::query::ServiceSummary> = {
                 let mut args = serde_json::json!({ "name": name });
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)?
-                {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                        return Ok((EXIT_SUCCESS, None));
-                    }
-                    // A real service deserializes with a non-empty uid. Do NOT fabricate an
-                    // empty Service on a not-found/error response — that would print a fake
-                    // "Service: <name>" header and exit 0. Report not found with the right code.
-                    match serde_json::from_value::<nestweaver_schema::Service>(value) {
-                        Ok(s) if !s.uid.is_empty() => {
-                            println!("Service: {}", s.name);
-                            if let Some(ref summary) = s.summary {
-                                println!("Summary: {summary}");
-                            }
-                            return Ok((EXIT_SUCCESS, None));
-                        }
-                        _ => {
-                            if !out.quiet {
-                                println!("Service not found: {name}");
-                            }
-                            return Ok((EXIT_NOT_FOUND, None));
-                        }
+                if let Some(ref r) = repo {
+                    args["repo"] = serde_json::json!(r);
+                }
+                match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args)? {
+                    // A not-found/error response does not deserialize into a
+                    // summary with a non-empty uid, so it falls through to the
+                    // NOT_FOUND arm below rather than fabricating an empty
+                    // service and printing a header for it.
+                    Some(value) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
+                    None => {
+                        let store = open_store(db.as_deref())?;
+                        nestweaver_engine::query::service_summary(
+                            &store,
+                            &name,
+                            instance.as_deref(),
+                            repo.as_deref(),
+                        )?
                     }
                 }
+            };
+
+            let Some(summary) = summary.filter(|s| !s.service.uid.is_empty()) else {
+                if !out.quiet {
+                    println!("Service not found: {name}");
+                }
+                return Ok((EXIT_NOT_FOUND, None));
+            };
+
+            // Rendered by whichever route ran, from the resolver's own text.
+            //
+            // Exit code deliberately left at 0 for an ambiguous match, on both
+            // routes, exactly as before. `EXIT_AMBIGUOUS` exists and `impact`
+            // uses it, but adopting it here is a product decision and not one
+            // to make inside a bug fix. Because it stays 0, this warning is
+            // the ONLY signal, which is precisely why it must not be dropped.
+            if let Some(warning) = summary.ambiguity_warning(&name) {
+                eprint!("{warning}");
             }
 
-            let store = open_store(db.as_deref())?;
-            let services = list_services(&store, instance.as_deref())?;
-            let matches: Vec<&nestweaver_schema::Service> = services
-                .iter()
-                .filter(|s| s.name == name || s.uid == name)
-                .collect();
-            // An ambiguous name silently picked the first match — at
-            // least warn so the user knows to disambiguate by UID.
-            if matches.len() > 1 {
-                eprintln!(
-                    "warning: '{name}' matches {} services; showing the first — \
-                     pass the full UID to disambiguate:",
-                    matches.len()
-                );
-                for s in &matches {
-                    eprintln!("  {} ({})", s.uid, s.name);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Service: {}", summary.service.name);
+                if let Some(ref s) = summary.service.summary {
+                    println!("Summary: {s}");
                 }
-            }
-            let service = matches.first().copied();
-            match service {
-                Some(s) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(s)?);
-                    } else {
-                        println!("Service: {}", s.name);
-                        if let Some(ref summary) = s.summary {
-                            println!("Summary: {summary}");
-                        }
+                // `--help` has said "with entry points" since this command
+                // shipped, and neither route printed any.
+                if summary.entry_points.is_empty() {
+                    println!("Entry points: none indexed");
+                } else {
+                    println!("Entry points ({}):", summary.entry_points.len());
+                    for ep in &summary.entry_points {
+                        println!(
+                            "  {} ({}) {}:{}",
+                            ep.name, ep.kind, ep.file_path, ep.start_line
+                        );
                     }
-                    Ok((EXIT_SUCCESS, None))
-                }
-                None => {
-                    eprintln!("Service not found: {name}");
-                    Ok((EXIT_NOT_FOUND, None))
                 }
             }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::RepoMap {
@@ -10158,7 +11269,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
                             let cut = match token_budget {
-                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                                // nw-316: `false` preserves TODAY's cost for this route. Its
+                                // renderer emits full nodes, so the detailed rate is the
+                                // correct one here — unlike `project-context`, which
+                                // renders concise and was charging this rate anyway.
+                                Some(budget) => {
+                                    token_budgeted_truncate(&result.connected, budget, false)
+                                }
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
@@ -10252,15 +11369,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(intent) = intent.as_deref().filter(|value| !value.is_empty()) {
                     code_args["intent"] = serde_json::json!(intent);
                 }
-                if let Some(result_json) = try_hybrid_json_rpc_checked(
+                // nw-329: a bare `?` here let the engine's lookup error escape
+                // `run()` unhandled, so the same failure produced a DIFFERENT
+                // message, a different exit code and a different remedy
+                // depending on whether a daemon happened to be running. Both
+                // routes now classify it the same way.
+                match try_hybrid_json_rpc_checked(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
                     "code_context",
                     code_args,
-                )? {
-                    context_result = Some(serde_json::from_value(result_json)?);
-                    routed_via_daemon = true;
+                ) {
+                    Ok(Some(result_json)) => {
+                        context_result = Some(serde_json::from_value(result_json)?);
+                        routed_via_daemon = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Ok((report_context_lookup_failure(&error), None)),
                 }
             }
 
@@ -10334,19 +11460,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("No matching symbols") || msg.contains("No symbols found") {
-                        eprintln!("{msg}");
-                        Ok((EXIT_NOT_FOUND, None))
-                    } else if msg.contains("Ambiguous") {
-                        eprintln!("{msg}");
-                        Ok((EXIT_AMBIGUOUS, None))
-                    } else {
-                        eprintln!("Error: {msg}");
-                        Ok((EXIT_ERROR, None))
-                    }
-                }
+                Err(e) => Ok((report_context_lookup_failure(&e), None)),
             }
         }
 
@@ -10777,7 +11891,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None => Vec::new(),
                 };
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&hubs)?);
+                    // nw-308: the daemon route is the DEFAULT route, so the
+                    // payload disclosure has to be here as well as on the
+                    // direct path below.
+                    print_ranking_json("hubs", &hubs, &ResolverStaleness::from_sidecar(&db_path))?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
@@ -10825,12 +11942,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // this machine the FIXED binary still returned the bug report's
             // exact ranking until the repo was re-indexed. Say so rather than
             // presenting stale numbers as current. Written to stderr so it
-            // reaches the user in --json mode too, without altering the
-            // documented bare-array payload.
+            // reaches the user in --json mode too. nw-308: stderr alone was
+            // not enough — the bare-array payload had nowhere to put this, so
+            // the `--json` consumer never saw it. The payload now carries it.
             warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&hubs)?);
+                print_ranking_json(
+                    "hubs",
+                    &hubs,
+                    &ResolverStaleness::from_store(&store, &db_path),
+                )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
             } else {
@@ -10886,7 +12008,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .context("decode bridge nodes from the daemon")?,
                         };
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&bridges)?);
+                        // nw-308: same disclosure as `hubs`; bridges are
+                        // downstream of the same edges.
+                        print_ranking_json(
+                            "bridges",
+                            &bridges,
+                            &ResolverStaleness::from_sidecar(&db_path),
+                        )?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
                     } else {
@@ -10937,7 +12065,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&bridges)?);
+                print_ranking_json(
+                    "bridges",
+                    &bridges,
+                    &ResolverStaleness::from_store(&store, &db_path),
+                )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
             } else {
@@ -11046,6 +12178,57 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
                 }
                 out.summaries
+            } else if parsed_level == SummaryLevel::Cluster {
+                // F-DC-11. Cluster level has the identical shape to Symbol —
+                // an unconditional cap upstream — and had none of the
+                // disclosure. `generate_cluster_summaries` truncated to 50 and
+                // returned a bare `Vec`, which has nowhere to say it dropped
+                // anything, so `total` was taken from the capped vector and a
+                // 71,184-community graph answered
+                // `{returned: 50, total: 50, truncated: false}`.
+                //
+                // The `else` branch below is deliberately not widened to cover
+                // this: File and Hub levels are NOT capped, and folding a
+                // no-op cap into their path would make the disclosure
+                // unfalsifiable for them.
+                let out = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
+                    &store,
+                    nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+                )?;
+                if out.capped {
+                    cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
+                }
+                // Persisted exactly as before: `generate_summaries` saved this
+                // same capped set, and changing WHAT the sidecar holds is a
+                // different decision from reporting the count honestly.
+                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                if let Some(ref t) = target {
+                    filter_by_target(&out.summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    out.summaries
+                }
+            } else if parsed_level == SummaryLevel::Hub {
+                // The third offender, found by sweeping all four levels rather
+                // than by a report: `HUB_COUNT` is an internal 30 the caller
+                // never stated, so `total: 30` was a claim that the graph has
+                // thirty hubs. Measured on a 180-candidate fixture:
+                // `{returned: 30, total: 30, truncated: false}`.
+                let out = nestweaver_engine::summaries::generate_hub_summaries_bounded(&store)?;
+                if out.capped {
+                    cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
+                }
+                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                if let Some(ref t) = target {
+                    filter_by_target(&out.summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    out.summaries
+                }
             } else {
                 let summaries = generate_summaries(&store, parsed_level)?;
                 // Save to sidecar for later use.
@@ -11146,10 +12329,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // same pattern as `summary --json`. Text mode prints only
             // id/name/member_count/key_files, which the preview preserves.
             if use_daemon && !json {
-                let mut args = serde_json::json!({});
-                if let Some(r) = resolution {
-                    args["resolution"] = serde_json::json!(r);
-                }
+                // nw-299b, second half. The bound is now applied at the
+                // SOURCE as well as by the printer, so the daemon stops
+                // serialising a population the caller asked it not to send —
+                // measured at 7,967,385 bytes for a listing the caller had
+                // bounded to a few dozen entries.
+                //
+                // This was deliberately left out until the `clusters` tool
+                // DECLARED the two keys. Its input schema sets
+                // `additionalProperties: false`, so an undeclared key does not
+                // get ignored — it fails the whole call with "invalid
+                // arguments for tool 'clusters'" and `clusters` stops working
+                // on the daemon route entirely. The precondition is a property
+                // of the tool's schema, so it is asserted THERE
+                // (`cluster_flag_forwarding_precondition_tests`) rather than
+                // trusted from here: a comment cannot notice when it stops
+                // being true, and this one would have had to notice twice.
+                let args = clusters_tool_args(limit, members, resolution);
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -11171,42 +12367,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if json {
-                        let output = nestweaver_engine::ClusteringOutput {
-                            resolution: value
-                                .get("resolution")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0),
-                            modularity: value
-                                .get("modularity")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0),
-                            communities,
-                        };
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else if communities.is_empty() {
-                        println!(
-                            "No communities detected (graph may be empty or fully disconnected)."
-                        );
-                    } else {
-                        println!(
-                            "Clusters ({}, modularity={:.4}):\n",
-                            communities.len(),
-                            value
-                                .get("modularity")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0)
-                        );
-                        for c in &communities {
-                            println!(
-                                "  [{:>3}] {} ({} members, cohesion={:.2})",
-                                c.id, c.name, c.member_count, c.cohesion
-                            );
-                            for f in &c.key_files {
-                                println!("        {f}");
-                            }
-                        }
-                    }
+                    // The `if json { … }` arm this replaces was unreachable:
+                    // the branch is guarded by `use_daemon && !json`, so `json`
+                    // is provably false here.
+                    //
+                    // Prefer the tool's own PRE-cap total when it reports one,
+                    // so the printer can disclose what the DAEMON dropped as
+                    // well as what it did. An older daemon omits the field, in
+                    // which case what arrived is the best total available.
+                    let total = value
+                        .get("total")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(communities.len());
+                    let output = nestweaver_engine::ClusteringOutput {
+                        resolution: value
+                            .get("resolution")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        modularity: value
+                            .get("modularity")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        communities,
+                    };
+                    // ONE renderer for both routes. The inline loop this
+                    // replaces was a copy of the text arm with the bounding
+                    // removed, which is exactly how the two routes came to
+                    // disagree about whether `--limit` means anything.
+                    print_clusters_output_with_total(&output, false, limit, members, total)?;
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -11241,12 +12430,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(requested) => requested,
                 None => {
                     let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-                    // Adaptive resolution: pick a sensible default based on
-                    // graph size. Large graphs (>10 K symbols) benefit from
-                    // lower resolution to avoid the explosion of tiny
-                    // communities that resolution=1.0 produces.
+                    // F-DC-7: ONE rule, shared with the `clusters` tool and
+                    // `generate_cluster_summaries`. Community IDs are
+                    // ASSIGNMENT-dependent, so two runs at different
+                    // resolutions are two different ID SPACES, not two
+                    // orderings of one. Four copies of this 0.3/0.5 rule
+                    // existed and a fifth (`generate_cluster_summaries`, hard
+                    // coded to 1.0) drifted — which is why 26 of 50 IDs from
+                    // `summary --level cluster` did not resolve through
+                    // `cluster <id>`.
                     let count = store.count_symbols().unwrap_or(0);
-                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };
+                    let adaptive = nestweaver_engine::default_cluster_resolution(&store);
                     symbol_count = Some(count);
                     opened = Some(store);
                     adaptive
@@ -11326,8 +12520,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => {
                     out.status("No cached clusters found; computing with default resolution...");
                     let store = open_store(Some(&db_path))?;
-                    let sym_count = store.count_symbols().unwrap_or(0);
-                    let default_res = if sym_count > 10_000 { 0.3 } else { 0.5 };
+                    // F-DC-7: the same single authority `clusters` uses. This
+                    // is the command that RESOLVES the IDs the others emit, so
+                    // a private copy of the rule here is the one that decides
+                    // whether their output is addressable at all.
+                    let default_res = nestweaver_engine::default_cluster_resolution(&store);
                     let computed = compute_clusters(&store, default_res)?;
                     save_clusters(&db_path, &computed)?;
                     computed
@@ -11426,6 +12623,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!("No interaction data to clear.");
                 }
                 Ok((EXIT_SUCCESS, None))
+            }
+            // nw-313: the selective counterpart to `clear`. One poisoned entry
+            // — a phantom key from a pre-nw-296 binary, or an oversized
+            // caller-supplied seed — previously cost every accumulated ranking
+            // signal in the sidecar to remove.
+            //
+            // Takes `--config` where its three siblings take only `--db`,
+            // because unlike them it MUTATES: `resolve_db_with_config` is the
+            // resolver that also runs `assert_config_expected_brain`, so a
+            // pinned config cannot delete out of a different instance's graph.
+            InteractionCommands::Forget { uid, db, config } => {
+                let db_path = resolve_db_with_config(db, config.as_deref())?;
+                if nestweaver_engine::remove_node_score(&db_path, &uid)? {
+                    println!("Forgot interaction memory for {uid}");
+                    Ok((EXIT_SUCCESS, None))
+                } else {
+                    // Not an error: "there was nothing to forget" is a
+                    // successful outcome for an idempotent verb, but the caller
+                    // should be able to tell the two apart — otherwise a typo'd
+                    // UID reports the same success as a real deletion.
+                    println!("No interaction memory recorded for {uid}");
+                    Ok((EXIT_NOT_FOUND, None))
+                }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
                 let db_path = db.unwrap_or_else(default_db_path);
@@ -12391,6 +13611,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 eprintln!("Error: --refresh-wiki-hours requires --config");
                 return Ok((EXIT_USAGE, None));
             }
+            // nw-284/S2. `watch` is byte-for-byte the same both-defaults-
+            // compose shape as `index` and strictly worse in consequence: it
+            // keeps writing for as long as it runs.
+            let repo_stated = repo.is_some();
             let repo_path = match repo {
                 Some(p) => p,
                 None => detect_repo_root(),
@@ -12402,7 +13626,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
                 return Ok((EXIT_ERROR, None));
             }
-            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let (db_path, db_source) = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            if let Some(message) =
+                wholly_inferred_write_refusal("watch", repo_stated, db_source, &repo_path, &db_path)
+            {
+                eprintln!("{message}");
+                return Ok((EXIT_USAGE, None));
+            }
             let index_limits = match config.as_deref() {
                 Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
                     .with_context(|| format!("failed to load config from {}", path.display()))?
@@ -12646,7 +13876,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             track_interactions,
             no_track_interactions,
             config,
-            no_daemon,
         } => {
             if allow_mcp_add_sources {
                 eprintln!(
@@ -12672,7 +13901,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             // warn=false: run() already emitted the escape-hatch warning once
             // for this invocation — warning again here double-prints it.
-            let use_daemon_mcp = resolve_use_daemon(no_daemon, false);
+            //
+            // nw-318 (defect B) / nw-217: this used to read a `Commands::Mcp`-
+            // LOCAL `--no-daemon` that shadowed the global flag, and the two
+            // help strings drifted — the global was corrected to name the
+            // granting variable and the twin still named the requesting one.
+            // The twin is deleted rather than synchronised, so there is one
+            // definition to keep right.
+            let use_daemon_mcp = resolve_use_daemon(cli.no_daemon, false);
             nestweaver_mcp::tools::validate_tool_selection(
                 tool_allowlist.as_deref(),
                 lite,
@@ -12729,8 +13965,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
             no_open,
             watch,
+            repo,
         } => {
-            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-284/S2. `ui --watch` re-indexes continuously through the
+            // daemon, so it is a mutating command with the same
+            // both-defaults-compose shape as `index` and `watch`. The guard
+            // only applies under `--watch`: a read-only `ui` writes nothing.
+            let repo_stated = repo.is_some();
+            let (db_path, db_source) = resolve_db_with_config_source(db, config.as_deref())?;
+            let watch_repo_path = if watch {
+                repo.clone().unwrap_or_else(detect_repo_root)
+            } else {
+                PathBuf::new()
+            };
+            if watch
+                && let Some(message) = wholly_inferred_write_refusal(
+                    "watch from the UI",
+                    repo_stated,
+                    db_source,
+                    &watch_repo_path,
+                    &db_path,
+                )
+            {
+                eprintln!("{message}");
+                return Ok((EXIT_USAGE, None));
+            }
 
             let daemon_connection = if use_daemon {
                 match tokio::runtime::Runtime::new() {
@@ -12768,11 +14027,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let mut daemon_ok = false;
             if let Some((rt, mut client)) = daemon_connection {
-                let watch_repo_path = if watch {
-                    detect_repo_root().display().to_string()
-                } else {
-                    String::new()
-                };
+                let watch_repo_path = watch_repo_path.display().to_string();
 
                 match rt.block_on(client.serve_ui(
                     port,
@@ -14045,6 +15300,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     "{}",
                                     serde_json::to_string_pretty(&impact_json_ambiguous(
                                         &name_or_uid,
+                                        // Always `None` here: `--repo` forces
+                                        // the direct path (see the routing
+                                        // condition on this arm). Passing it
+                                        // makes that explicit rather than
+                                        // implicit.
+                                        repo_filter.as_deref(),
                                         cands
                                     ))?
                                 );
@@ -14064,10 +15325,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             .get("start_line")
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
-                                        println!("  {cname} ({fp}:{ln})");
+                                        let uid =
+                                            c.get("uid").and_then(|v| v.as_str()).unwrap_or("");
+                                        // nw-328: the UID was NOT printed here,
+                                        // so "pass a full UID" was unfollowable
+                                        // from text output. The direct route
+                                        // already prints it.
+                                        println!("  {uid} {cname} ({fp}:{ln})");
                                     }
                                 }
-                                println!("Disambiguate with --repo <name> or pass a full UID.");
+                                println!("{}", impact_ambiguity_remedy(repo_filter.as_deref()));
                             }
                             return Ok((EXIT_AMBIGUOUS, None));
                         }
@@ -14205,7 +15472,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if let Some(note) = value.get("note").and_then(|v| v.as_str())
                             && !out.quiet
                         {
-                            println!("note: {note} — reported impact is a floor");
+                            println!("note: {}", impact_note_with_floor_clause(note));
                         }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
@@ -14224,7 +15491,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     )?;
                     let nodes = &result.nodes;
                     let count = nodes.len();
-                    let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
                     if json {
                         // One envelope whether or not the walk was pruned. The
@@ -14260,10 +15526,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 impact_score: n.impact_score,
                             })
                             .collect();
-                        let note = truncated.then(|| {
-                            let note = impact_truncation_note(&result, threshold, depth);
+                        // nw-317 leg 1. The note now comes from `ImpactResult`
+                        // itself, beside the two flags it interprets, so this
+                        // route and `tool_brain_impact` emit the SAME string
+                        // rather than one restating the other. They did not:
+                        // the daemon route's static text named neither the
+                        // depth value, nor the remedy, nor "floor", over
+                        // byte-identical node data.
+                        //
+                        // `truncation_note` returns `None` exactly when
+                        // neither flag is set, which is the same condition
+                        // `truncated` tests — so the guard is now expressed
+                        // once instead of by two predicates that had to agree.
+                        let note = result.truncation_note(threshold, depth).inspect(|note| {
                             eprintln!("note: {note}");
-                            note
                         });
                         println!(
                             "{}",
@@ -14297,11 +15573,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if !out.quiet {
                             println!("No impact found for '{name_or_uid}'.");
                         }
-                        if truncated {
-                            println!(
-                                "  note: {}",
-                                impact_truncation_note(&result, threshold, depth)
-                            );
+                        if let Some(note) = result.truncation_note(threshold, depth) {
+                            println!("  note: {note}");
                         }
                     } else {
                         if !out.quiet {
@@ -14331,11 +15604,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 );
                             }
                         }
-                        if truncated {
-                            println!(
-                                "  note: {}",
-                                impact_truncation_note(&result, threshold, depth)
-                            );
+                        if let Some(note) = result.truncation_note(threshold, depth) {
+                            println!("  note: {note}");
                         }
                     }
                     let stats = format!(
@@ -14367,6 +15637,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ambiguous(
                                 &name_or_uid,
+                                repo_filter.as_deref(),
                                 serde_json::to_value(&candidates)?
                             ))?
                         );
@@ -14517,20 +15788,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
+            let mut project_args = serde_json::json!({
+                    "project": name,
+                    "token_budget": token_budget,
+                    "response_format": response_format,
+                    // nw-316: omitted when unset, so the TOOL's documented
+                    // default of `true` governs. Sending clap's `false` here
+                    // was what pinned this route to the opposite of the
+                    // documented behaviour.
+                    // nw-295: absent `since` sends `""`, not the key omitted.
+                    // The daemon strips empty strings at `server.rs`, so this is
+                    // benign THERE — but it is benign by the receiver's grace,
+                    // and any caller reaching `tools::dispatch` directly with
+                    // `since: ""` gets a spurious filter. Omit the key instead,
+                    // so the request does not depend on who reads it.
+                    "recency_weight": recency_weight,
+                    "recency_half_life_days": recency_half_life_days,
+            });
+            if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
+                project_args["since"] = serde_json::json!(since);
+            }
+            if let Some(include_components) = include_components {
+                project_args["include_components"] = serde_json::json!(include_components);
+            }
             let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "project_context",
-                serde_json::json!({
-                    "project": name,
-                    "token_budget": token_budget,
-                    "response_format": response_format,
-                    "include_components": include_components,
-                    "since": since.clone().unwrap_or_default(),
-                    "recency_weight": recency_weight,
-                    "recency_half_life_days": recency_half_life_days,
-                }),
+                project_args,
             );
             // A project that does not exist is NOT FOUND, not a generic
             // failure. The direct path returns `EXIT_NOT_FOUND` with an
@@ -14622,7 +15908,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             member_uids.extend(sym_uids);
 
-            let comp_uids = if include_components {
+            // nw-316: the same documented default the tool applies
+            // (`unwrap_or(true)` in `tool_project_context`). Both routes now
+            // land on the schema's `default: true` rather than one of them on
+            // clap's.
+            let comp_uids = if include_components.unwrap_or(true) {
                 store
                     .list_project_component_uids(&project.uid)
                     .map_err(|e| anyhow::anyhow!(e))?
@@ -14788,19 +16078,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // to the connected budget, not the seed overhead.
                     let connected_uids: std::collections::HashSet<&str> =
                         result.connected.iter().map(|n| n.uid.as_str()).collect();
+                    // nw-316: the SAME flag the renderer below is handed
+                    // (`!detailed`). Charging the detailed rate for a concise
+                    // response is what made this route return fewer items than
+                    // the daemon for an identical budget.
+                    let concise = !detailed;
                     let seed_tokens: usize = result
                         .seeds
                         .iter()
                         .filter(|n| !connected_uids.contains(n.uid.as_str()))
-                        .map(render_cost_tokens)
+                        .map(|n| render_cost_tokens(n, concise))
                         .sum();
                     let remaining_budget = token_budget.saturating_sub(seed_tokens);
-                    let cut = token_budgeted_truncate(&result.connected, remaining_budget);
+                    let cut = token_budgeted_truncate(&result.connected, remaining_budget, concise);
                     let connected_tokens: usize = result
                         .connected
                         .iter()
                         .take(cut)
-                        .map(render_cost_tokens)
+                        .map(|n| render_cost_tokens(n, concise))
                         .sum();
                     let used_tokens = seed_tokens + connected_tokens;
                     // Load external_refs from the extension sidecar so the
@@ -14848,7 +16143,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -14923,7 +16231,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .into_iter()
                 .filter(|t| seen.insert(t.clone()))
                 .collect();
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate-expand is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -14981,7 +16302,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate-hydrate is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -15082,6 +16416,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 eprintln!("Error: vault path is not a directory: {}", vault.display());
                 return Ok((EXIT_ERROR, None));
             }
+            // Same `stat(2)`-only guard as `brain refresh` / `brain watch`, and
+            // this command enumerates the vault too (nw-287). Not named in the
+            // report — found by asking where else the property has to hold.
+            if let Err(err) = std::fs::read_dir(&vault) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    vault.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
 
             // ── daemon guard ──────────────────────────────────────
             // nw-161: NOT taken for --dry-run. The daemon RPC has no dry-run
@@ -15171,6 +16515,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             fail_on_skip,
             setup,
         } => {
+            // nw-284/S2: capture the provenance BEFORE `repo` is shadowed.
+            // Both fallbacks resolve in the next four lines, and this is the
+            // last instant at which "did the user name a source?" is still
+            // answerable. It is also before the daemon/direct fork below, so
+            // one guard covers both routes — the reported incident fired on
+            // the daemon route.
+            let repo_stated = repo.is_some();
             let repo_path = match repo {
                 Some(p) => p,
                 None => detect_repo_root(),
@@ -15181,7 +16532,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Failing fast here also turns a typo'd/nonexistent path into a clear error
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
-            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let (db_path, db_source) = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            if let Some(message) =
+                wholly_inferred_write_refusal("index", repo_stated, db_source, &repo_path, &db_path)
+            {
+                eprintln!("{message}");
+                // EXIT_USAGE (64, EX_USAGE): the invocation was wrong, not the
+                // operation — same code as the `--refresh-wiki-hours requires
+                // --config` refusal on `watch`.
+                return Ok((EXIT_USAGE, None));
+            }
             let loaded_config = match config.as_deref() {
                 Some(path) => Some(
                     nestweaver_engine::InstanceConfig::from_file(path).with_context(|| {
@@ -18008,7 +19368,22 @@ fn run_memory(
                 println!("  stale notes:           {}", report.stale.len());
                 println!("  contradictions:        {}", report.contradictions.len());
                 println!("  orphans:               {}", report.orphans.len());
-                println!("  broken wikilinks:      {}", report.broken_wikilinks.len());
+                // Same population split as `broken-links` (nw-297). Printing
+                // the bare length reported 1328 where 226 are genuinely broken
+                // and 1102 are lower-tier resolutions that are not broken at
+                // all — and it is the same `broken_links` call, so the two
+                // surfaces agreed only because they shared the defect.
+                let lint_unresolved = report
+                    .broken_wikilinks
+                    .iter()
+                    .filter(|l| l.is_unresolved())
+                    .count();
+                println!(
+                    "  broken wikilinks:      {} ({} genuinely broken, {} lower-tier resolutions)",
+                    report.broken_wikilinks.len(),
+                    lint_unresolved,
+                    report.broken_wikilinks.len() - lint_unresolved
+                );
                 println!(
                     "  supersession chains:   {}",
                     report.supersession_chains.len()
@@ -18339,6 +19714,20 @@ fn try_hybrid_json_rpc_checked(
     // (federated read), else return None so the caller's direct path reports
     // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
     // through here, so it is unaffected.
+    // nw-309: refuse an exists-but-not-a-database `--db` HERE, before the
+    // dial. This is the one funnel every daemon-routed read passes through, so
+    // one check turns a 30s boot-ceiling stall into an immediate, accurate
+    // error for the whole read surface rather than for the one command that
+    // was reported.
+    require_openable_db(db_path).or_else(|error| {
+        if db_path.exists() {
+            Err(error)
+        } else {
+            // Absent is handled by the arm below, which still routes to
+            // configured upstreams (federated read) rather than failing.
+            Ok(())
+        }
+    })?;
     if !db_path.exists() {
         if let Some(config_path) = config {
             nestweaver_engine::InstanceConfig::from_file(config_path).with_context(|| {
@@ -19785,6 +21174,18 @@ fn run_brain(
                 eprintln!("Error: vault path is not a directory: {}", path.display());
                 return Ok((EXIT_ERROR, None));
             }
+            // `is_dir()` only needs `stat(2)`, which succeeds on a `chmod 000`
+            // directory — that needs `+x` on the PARENT, not on the directory
+            // itself — so the guard above passes on a vault that cannot be
+            // ENUMERATED. Probing `read_dir` is the cheapest predicate that
+            // actually tests the operation the refresh depends on (nw-287).
+            if let Err(err) = std::fs::read_dir(&path) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    path.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
@@ -20039,6 +21440,18 @@ fn run_brain(
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
+                return Ok((EXIT_ERROR, None));
+            }
+            // `is_dir()` only needs `stat(2)`, which succeeds on a `chmod 000`
+            // directory — that needs `+x` on the PARENT, not on the directory
+            // itself — so the guard above passes on a vault that cannot be
+            // ENUMERATED. Probing `read_dir` is the cheapest predicate that
+            // actually tests the operation the refresh depends on (nw-287).
+            if let Err(err) = std::fs::read_dir(&path) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    path.display()
+                );
                 return Ok((EXIT_ERROR, None));
             }
             let vault_name = name.unwrap_or_else(|| {
@@ -20848,10 +22261,15 @@ fn run_brain(
                         "prf": prf,
                         "rerank": rerank,
                         "weight_semantic": if no_embed { 0.0 } else { weight_semantic.unwrap_or(0.0) },
-                        "since": since.as_deref().unwrap_or(""),
+                        // nw-295: see the twin in `project-context` — an
+                        // absent filter is omitted rather than sent as `""`.
                         "recency_weight": recency_weight,
                         "recency_half_life_days": recency_half_life_days,
                 });
+                let mut context_params = context_params;
+                if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
+                    context_params["since"] = serde_json::json!(since);
+                }
 
                 if let Some(result_json) = try_hybrid_json_rpc_checked(
                     true,
@@ -20864,7 +22282,11 @@ fn run_brain(
                     let result: nestweaver_engine::BrainContextResult =
                         serde_json::from_value(result_json)?;
                     let cut = match token_budget {
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        // nw-316: `false` preserves TODAY's cost for this route. Its
+                        // renderer emits full nodes, so the detailed rate is the
+                        // correct one here — unlike `project-context`, which
+                        // renders concise and was charging this rate anyway.
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
                         None => limit.min(result.connected.len()),
                     };
                     if json {
@@ -21154,7 +22576,11 @@ fn run_brain(
 
                     // token_budget takes precedence over the count-based limit.
                     let cut = match token_budget {
-                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        // nw-316: `false` preserves TODAY's cost for this route. Its
+                        // renderer emits full nodes, so the detailed rate is the
+                        // correct one here — unlike `project-context`, which
+                        // renders concise and was charging this rate anyway.
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget, false),
                         None => limit.min(result.connected.len()),
                     };
                     let node_count = result.seeds.len() + cut;
@@ -21227,7 +22653,22 @@ fn run_brain(
                             }
                             _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
                         }
-                        print_link_classification(&links);
+                        // Population counts from the envelope; the page is a
+                        // sample and cannot answer the question (nw-297). A
+                        // pre-nw-297 daemon omits the fields — fall back to the
+                        // page rather than printing nothing.
+                        let page_unresolved = links.iter().filter(|l| l.is_unresolved()).count();
+                        let unresolved = value
+                            .get("unresolved")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(page_unresolved);
+                        let low_confidence = value
+                            .get("low_confidence")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(links.len() - page_unresolved);
+                        print_link_classification(unresolved, low_confidence);
                         for l in &links {
                             println!(
                                 "  [[{}]] in {} (confidence {:.2}) — {}",
@@ -21248,6 +22689,10 @@ fn run_brain(
             let store = open_store(Some(&db_path))?;
             let all_links = nestweaver_engine::broken_links(&store, max_suggestions)?;
             let total = all_links.len();
+            // Classify BEFORE truncating — the page is a sample of a list that
+            // is grouped by category, not ranked by severity (nw-297).
+            let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
+            let low_confidence = total - unresolved;
             let links: Vec<_> = all_links.into_iter().take(limit).collect();
             if json {
                 println!(
@@ -21256,13 +22701,15 @@ fn run_brain(
                         "broken_links": links,
                         "total": total,
                         "returned": links.len(),
+                        "unresolved": unresolved,
+                        "low_confidence": low_confidence,
                     }))?
                 );
             } else if links.is_empty() {
                 println!("No broken or ambiguous wikilinks found.");
             } else {
                 println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
-                print_link_classification(&links);
+                print_link_classification(unresolved, low_confidence);
                 for l in &links {
                     println!(
                         "  [[{}]] in {} (confidence {:.2}) — {}",
@@ -21662,11 +23109,15 @@ fn run_brain(
 /// Greedy token-budget selection: include nodes in PPR-rank order until the
 /// next one would exceed the budget. Returns the count of nodes to take.
 /// Token cost per node = (rendered length) / 4 — the standard cheap estimate.
-fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: usize) -> usize {
+fn token_budgeted_truncate(
+    connected: &[nestweaver_engine::BrainNode],
+    budget: usize,
+    concise: bool,
+) -> usize {
     let mut tokens = 0usize;
     let mut taken = 0usize;
     for n in connected {
-        let cost = render_cost_tokens(n);
+        let cost = render_cost_tokens(n, concise);
         if tokens + cost > budget {
             break;
         }
@@ -21761,9 +23212,20 @@ fn apply_recency_bias_cli(
 
 /// Rough token cost of rendering a single BrainNode line (chars / 4).
 /// Aligned with the MCP render_cost to avoid CLI vs MCP divergence.
-fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
-    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+/// Estimated token cost of one rendered node.
+///
+/// nw-316: this was a COPY of `nestweaver_mcp::tools::render_cost`'s
+/// `concise == false` branch, unconditionally — and `project-context` defaults
+/// to CONCISE, whose renderer emits only `{kind, title, location}`. So the
+/// budget charged roughly `(uid.len() + 40) / 4` tokens per node that the
+/// renderer never spent, and took fewer nodes than the budget allowed. That is
+/// the reported 14-items-vs-20.
+///
+/// It now delegates rather than mirroring both branches: a copy that agrees
+/// with the original is still a copy, and this one drifted from it precisely
+/// because it could.
+fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
+    nestweaver_mcp::tools::render_cost(n, concise)
 }
 
 /// Render a `clusters` result in either mode.
@@ -21819,11 +23281,168 @@ fn bounded_clusters_payload(
     })
 }
 
+/// Render the text form of a clustering result, bounded to `limit`.
+///
+/// Returns a `String` rather than printing so the bound is assertable without
+/// capturing stdout, and so BOTH routes can share one renderer — the daemon
+/// branch of `Commands::Clusters` used to carry its own inline copy of this
+/// loop with the bounding removed, which is how `--limit` came to have no
+/// effect there at all (nw-299b).
+///
+/// `total` is passed in rather than read from `output.communities.len()`
+/// because on the daemon route the list has ALREADY been cut server-side, so a
+/// total taken from what arrived would report the cap as the population — the
+/// same lie F-DC-11 records for `summary --level cluster`.
+fn render_clusters_text(
+    output: &nestweaver_engine::ClusteringOutput,
+    limit: usize,
+    total: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    if output.communities.is_empty() {
+        return "No communities detected (graph may be empty or fully disconnected).\n".to_string();
+    }
+    let shown = output.communities.len();
+    let take = if limit == 0 { shown } else { limit.min(shown) };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Clusters ({total}, modularity={:.4}):\n",
+        output.modularity
+    );
+    for c in &output.communities[..take] {
+        let _ = writeln!(
+            out,
+            "  [{:>3}] {} ({} members, cohesion={:.2})",
+            c.id, c.name, c.member_count, c.cohesion
+        );
+        for f in &c.key_files {
+            let _ = writeln!(out, "        {f}");
+        }
+    }
+    if take < total {
+        let _ = writeln!(
+            out,
+            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
+            total - take
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod render_clusters_text_tests {
+    use nestweaver_engine::{ClusteringOutput, CommunityInfo};
+
+    fn community(id: u32) -> CommunityInfo {
+        CommunityInfo {
+            id,
+            name: format!("c{id}"),
+            cohesion: 1.0,
+            member_count: 3,
+            members: Vec::new(),
+            key_files: Vec::new(),
+        }
+    }
+
+    fn output(n: u32) -> ClusteringOutput {
+        ClusteringOutput {
+            resolution: 0.5,
+            modularity: 0.5,
+            communities: (0..n).map(community).collect(),
+        }
+    }
+
+    /// The bound is assertable without capturing stdout — which is the point of
+    /// the extraction: the daemon route's inline copy of this loop dropped the
+    /// bounding and nothing could see it (nw-299b).
+    #[test]
+    fn limit_bounds_the_listing_and_discloses_the_remainder() {
+        let text = super::render_clusters_text(&output(6), 2, 6);
+        assert_eq!(text.matches("cohesion=").count(), 2, "{text}");
+        assert!(text.contains("4 more community(ies) not shown"), "{text}");
+    }
+
+    /// `0` means "all", and there is then nothing to disclose.
+    #[test]
+    fn limit_zero_prints_every_community() {
+        let text = super::render_clusters_text(&output(6), 0, 6);
+        assert_eq!(text.matches("cohesion=").count(), 6, "{text}");
+        assert!(!text.contains("not shown"), "{text}");
+    }
+
+    /// The daemon may have already cut the list. A total taken from what
+    /// ARRIVED would report the cap as the population, which is the F-DC-11
+    /// defect one command over; the caller supplies the pre-cap total instead.
+    #[test]
+    fn a_server_side_cap_is_disclosed_from_the_supplied_total() {
+        // 50 arrived, 71_184 exist, the printer was asked for 10.
+        let text = super::render_clusters_text(&output(50), 10, 71_184);
+        assert!(text.contains("Clusters (71184,"), "{text}");
+        assert_eq!(text.matches("cohesion=").count(), 10, "{text}");
+        assert!(
+            text.contains("71174 more community(ies) not shown"),
+            "the remainder counts from the POPULATION, not from the page: {text}"
+        );
+    }
+}
+
 fn print_clusters_output(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
     limit: usize,
     members: usize,
+) -> anyhow::Result<()> {
+    // The direct path holds the whole population, so the total IS the length.
+    let total = output.communities.len();
+    print_clusters_output_with_total(output, json, limit, members, total)
+}
+
+/// [`print_clusters_output`] with the pre-cap total supplied by the caller, for
+/// the route that no longer has it (nw-299b).
+/// Build the `clusters` tool arguments for the daemon route.
+///
+/// CLAMPED, not forwarded verbatim. `--limit` and `--members` are unbounded
+/// `usize` in clap, while the tool caps limit at 1000 and members at 200 — two
+/// DIFFERENT ceilings — and under `additionalProperties: false` an
+/// out-of-range value fails the WHOLE call rather than being clamped
+/// server-side, so `clusters` would stop working on the daemon route for
+/// anyone who passed a large bound.
+///
+/// Clamping is strictly better than not forwarding at all, in every case. An
+/// OMITTED key is not "unbounded" — `read_limit` applies the tool's default of
+/// 50 — so declining to forward `--limit 200` was already substituting a
+/// SMALLER bound than the caller asked for, and the printer could not restore
+/// the 150 communities that never arrived.
+///
+/// `0` is the spelling of "all" on both sides and survives the clamp untouched.
+/// The ceilings are imported rather than restated: a second copy of a bound
+/// that has already drifted once is how these routes diverge.
+fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> serde_json::Value {
+    fn clamp(requested: usize, ceiling: usize) -> usize {
+        if requested == 0 {
+            0
+        } else {
+            requested.min(ceiling)
+        }
+    }
+    let mut args = serde_json::json!({
+        "limit": clamp(limit, nestweaver_mcp::tools::CLUSTERS_LIMIT_MAX),
+        "members": clamp(members, nestweaver_mcp::tools::CLUSTERS_MEMBERS_MAX),
+    });
+    if let Some(r) = resolution {
+        args["resolution"] = serde_json::json!(r);
+    }
+    args
+}
+
+fn print_clusters_output_with_total(
+    output: &nestweaver_engine::ClusteringOutput,
+    json: bool,
+    limit: usize,
+    members: usize,
+    total: usize,
 ) -> anyhow::Result<()> {
     if json {
         println!(
@@ -21832,28 +23451,7 @@ fn print_clusters_output(
         );
         return Ok(());
     }
-    if output.communities.is_empty() {
-        println!("No communities detected (graph may be empty or fully disconnected).");
-        return Ok(());
-    }
-    let total = output.communities.len();
-    let take = if limit == 0 { total } else { limit.min(total) };
-    println!("Clusters ({total}, modularity={:.4}):\n", output.modularity);
-    for c in &output.communities[..take] {
-        println!(
-            "  [{:>3}] {} ({} members, cohesion={:.2})",
-            c.id, c.name, c.member_count, c.cohesion
-        );
-        for f in &c.key_files {
-            println!("        {f}");
-        }
-    }
-    if take < total {
-        println!(
-            "\n  … {} more community(ies) not shown — raise --limit (0 = all)",
-            total - take
-        );
-    }
+    print!("{}", render_clusters_text(output, limit, total));
     Ok(())
 }
 
@@ -21926,7 +23524,9 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
             .connected
             .iter()
             .take(cut)
-            .map(render_cost_tokens)
+            // Text renderer: prints the full record, so the detailed rate is
+            // the right one. Unchanged from before nw-316.
+            .map(|n| render_cost_tokens(n, false))
             .sum();
         match token_budget {
             Some(budget) => println!(
@@ -22285,11 +23885,29 @@ mod cli_help_contract_tests {
             // beside the database, so it resolves the pair through the same
             // `resolve_db_with_config` helper every other entry here uses.
             "nestweaver extensions list",
+            // nw-281(b): added deliberately, and it is the first MUTATING
+            // entry in this inventory that writes a sidecar rather than the
+            // graph. It resolves the pair through `resolve_db_with_config` —
+            // the same helper `extensions list` beside it uses — which is the
+            // resolver that also runs `assert_config_expected_brain`, so a
+            // pinned config cannot delete out of a different instance's graph.
+            // That is the decision this inventory exists to force: a delete
+            // verb inheriting a READ command's resolution would be the wrong
+            // answer even though it is the neighbouring one.
+            "nestweaver extensions unset",
             "nestweaver flow-trace",
             "nestweaver generate-guide",
             "nestweaver hubs",
             "nestweaver impact",
             "nestweaver index",
+            // nw-313: added deliberately, and deliberately UNLIKE its three
+            // siblings. `interactions status`/`clear`/`show` take only `--db`
+            // and resolve it with `db.unwrap_or_else(default_db_path)`; they
+            // read. This one mutates, so it takes `--config` and resolves
+            // through `resolve_db_with_config`, which additionally asserts the
+            // config's expected brain. Matching the siblings would have been
+            // the consistent choice and the wrong one.
+            "nestweaver interactions forget",
             "nestweaver list-links",
             "nestweaver list-projects",
             "nestweaver list-repos",
@@ -22318,6 +23936,663 @@ mod cli_help_contract_tests {
         assert_eq!(
             paths, expected,
             "the --db + --config command inventory changed; update the config-DB behavior matrix"
+        );
+    }
+
+    // ── S1: a pasteable remedy is an assertion, so test it like one ───────
+    //
+    // Three tiers, in descending order of value:
+    //
+    //   T2  — the env-var ROLE registry. Catches nw-318 defect B by
+    //         construction. The naive "does this name exist?" form of this
+    //         check PASSES on nw-318, because `NESTWEAVER_NO_DAEMON` is a real
+    //         variable the binary really reads. The role tag is load-bearing.
+    //   T3b — no read-path diagnostic may prescribe a write. Catches nw-329.
+    //   T1  — a parse sweep over command strings. It is the cheap FLOOR and
+    //         nothing more: it answers "does this flag exist?", while every
+    //         defect in this class answers "does running this resolve the
+    //         error?". It catches none of the four findings and is justified
+    //         only as insurance against a future rename. Labelled as such so
+    //         nobody mistakes a green T1 for evidence.
+    //
+    // Deliberately NOT implemented: a blanket "no `<placeholder>` in a
+    // message" rule. 32 sites use placeholders and most are legitimate —
+    // `Run `nestweaver index --repo <path>`` has no path to substitute.
+    // Placeholders are only checkable at the point of emission, with the
+    // values in scope, which is a runtime concern (see
+    // `tests/error_remedy_test.rs`).
+
+    /// The source files S1's static sweeps read.
+    ///
+    /// The WHOLE file, deliberately. The first version of this cut each file
+    /// at its first `#[cfg(test)]`, on the theory that test modules live at
+    /// the bottom. In `src/main.rs` the first one is at line 548 of 29,000 —
+    /// so the sweeps saw 2% of the file and passed while both known nw-318
+    /// offenders (at 22,921 and 22,936) sat untouched. That is exactly the
+    /// failure this workstream exists to stop: a check that looks like it
+    /// works, passes its own regression test, and inspects nothing. Verified
+    /// by running the check against a tree with the offenders restored: it
+    /// passed.
+    ///
+    /// Scanning test code too costs a small, LOUD risk — a future fixture that
+    /// quotes an offending shape trips the sweep and someone has to look — in
+    /// exchange for removing a large, SILENT one. `//` lines are still skipped,
+    /// because prose is not a remedy.
+    fn sweep_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("src").join("main.rs")];
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip build output and vendored frontend trees.
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let sources: Vec<(String, String)> = files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path.display().to_string(), text))
+            })
+            .collect();
+        // Coverage self-check. Over-skipping is the silent failure mode, so
+        // prove the sweep reaches the END of the largest file rather than
+        // trusting that it does.
+        let main_rs = sources
+            .iter()
+            .find(|(path, _)| path.ends_with("src/main.rs"))
+            .expect("the sweep must include src/main.rs");
+        assert!(
+            main_rs.1.contains("mod cli_help_contract_tests"),
+            "the sweep is not reaching the end of src/main.rs, so every check \
+             built on it is inspecting less than it claims"
+        );
+        assert!(
+            sources.len() > 100,
+            "the sweep found only {} source files; it is not walking the \
+             workspace",
+            sources.len()
+        );
+        sources
+    }
+
+    /// Prose is not a remedy. `//`-prefixed lines are skipped by every sweep
+    /// here: a doc comment that writes `NESTWEAVER_*` to mean "the family", or
+    /// spells `nestweaver stale-chekc` to illustrate a typo (see `EXIT_USAGE`),
+    /// is documentation, not something a user pastes.
+    fn is_comment(line: &str) -> bool {
+        line.trim_start().starts_with("//")
+    }
+
+    fn env_tokens(line: &str) -> Vec<String> {
+        let bytes = line.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while let Some(found) = line[at..].find("NESTWEAVER_") {
+            let start = at + found;
+            let mut end = start + "NESTWEAVER_".len();
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            // `NESTWEAVER_` with nothing after it is the family, not a
+            // variable (`the NESTWEAVER_* vars`), so it is not a lookup.
+            if end > start + "NESTWEAVER_".len() {
+                out.push(line[start..end].to_string());
+            }
+            at = end.max(start + 1);
+        }
+        out
+    }
+
+    /// S1/T2, half one: the registry is the inventory, so it cannot silently
+    /// fall behind the code.
+    #[test]
+    fn every_environment_variable_the_workspace_names_is_in_the_registry() {
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for token in env_tokens(line) {
+                    if env_role(&token).is_none() {
+                        unknown.push(format!("{file}:{}: {token}", index + 1));
+                    }
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these NESTWEAVER_* variables are used or named but carry no role in \
+             ENV_REGISTRY. Add them there — the role is what tells a reviewer \
+             whether a message may offer the variable as a remedy: {unknown:#?}"
+        );
+    }
+
+    /// S1/T2, half two — THE CHECK THAT CATCHES nw-318 DEFECT B.
+    ///
+    /// A message that says "requires/set/export `NESTWEAVER_X`" is asserting
+    /// that setting `NESTWEAVER_X` resolves the error. That is false for a
+    /// variable whose role is `Requests`: it asks for the behaviour, and
+    /// something else decides. Three messages made exactly that claim about
+    /// `NESTWEAVER_NO_DAEMON`, and a user who followed them got the identical
+    /// refusal back.
+    #[test]
+    fn a_remedy_never_offers_a_variable_that_only_requests() {
+        const OFFERS: &[&str] = &["requires ", "Requires ", "set ", "Set ", "export "];
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for offer in OFFERS {
+                    let Some(at) = line.find(offer) else { continue };
+                    let rest = &line[at + offer.len()..];
+                    let Some(token) = env_tokens(rest).into_iter().next() else {
+                        continue;
+                    };
+                    // Only when the variable IMMEDIATELY follows the verb —
+                    // otherwise "set the path and see NESTWEAVER_DB" matches.
+                    if !rest.trim_start().starts_with(&token) {
+                        continue;
+                    }
+                    if env_role(&token) == Some(EnvRole::Requests) {
+                        offenders.push(format!("{file}:{}: {offer}{token}", index + 1));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "these messages offer a variable that only REQUESTS a behaviour as \
+             though setting it PERMITTED one. Name the `Grants` variable \
+             instead (for the daemon bypass that is NESTWEAVER_ALLOW_NO_DAEMON, \
+             which `no_daemon_allowed()` actually reads): {offenders:#?}"
+        );
+    }
+
+    /// S1/T3b — THE CHECK THAT CATCHES nw-329.
+    ///
+    /// The audience for an "I found nothing" error is by definition someone
+    /// whose targeting is already wrong. Sending them to `index` — the one
+    /// command that writes — is how a lookup miss becomes a production write,
+    /// and `nestweaver index --repo .` is verbatim the invocation that indexed
+    /// a home directory into the live graph during the 8.0.0 hunt.
+    ///
+    /// The codebase already knew this hazard for a neighbouring case: see
+    /// `CliDiagnostic::DatabaseUnavailable`, whose own doc says suggesting
+    /// `index --repo` at a path that already holds a database invites the user
+    /// to write over their own data (nw-126). This applies the same rule to
+    /// the diagnostics that were still breaking it.
+    #[test]
+    fn read_path_diagnostics_never_prescribe_a_write() {
+        use miette::Diagnostic;
+
+        const WRITE_COMMANDS: &[&str] = &[
+            "index",
+            "brain add",
+            "brain remove",
+            "brain refresh",
+            "instance merge",
+            "instance purge",
+            "repair",
+            "publication rollback",
+        ];
+
+        // Explicit inventory, not a scan: a new diagnostic must be classified
+        // by a human, and the classification is the point.
+        let read_diagnostics = [CliDiagnostic::EmptyDatabase];
+
+        for diagnostic in read_diagnostics {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            for command in WRITE_COMMANDS {
+                assert!(
+                    !help.contains(&format!("nestweaver {command}")),
+                    "`{code}` is a read-path diagnostic but its help prescribes \
+                     `nestweaver {command}`. A query that returned no rows has not \
+                     established that the database is empty, so it cannot know that \
+                     writing is safe. Help: {help}"
+                );
+            }
+            assert!(
+                !help.is_empty(),
+                "`{code}` must still offer something followable — the rule is \
+                 'no writes', not 'no help'"
+            );
+        }
+    }
+
+    /// S1/T3c — nw-285. THE FORM THE HARNESS DID NOT HAVE.
+    ///
+    /// `read_path_diagnostics_never_prescribe_a_write` above asks "is this
+    /// remedy dangerous?" and `tests/error_remedy_test.rs` asks "does this
+    /// command exist?". Neither asks "can running this change the outcome?",
+    /// and that is the question every defect in this class turns on. A
+    /// truncated database was answered with "The database may be checkpointing;
+    /// please retry later." — a remedy nobody ran, on a file that no amount of
+    /// waiting lengthens.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every `CliDiagnostic`,
+    /// which is why the inventory below is EXHAUSTIVE and destructured rather
+    /// than sampled: adding a variant fails to compile until it is classified,
+    /// and the classification is a human deciding whether the condition can
+    /// clear on its own. `read_path_diagnostics_never_prescribe_a_write`'s own
+    /// inventory holds ONE variant and calls itself explicit; this one holds
+    /// all of them.
+    #[test]
+    fn no_permanent_diagnostic_advises_waiting_it_out() {
+        use miette::Diagnostic;
+
+        /// Can this condition clear without the operator doing anything?
+        #[derive(PartialEq, Debug)]
+        enum Clears {
+            /// Another process is doing something that will finish.
+            OnItsOwn,
+            /// Nothing that runs later changes this file or this fact.
+            Never,
+        }
+
+        let sample = |name: &str| name.to_string();
+        let inventory: Vec<(CliDiagnostic, Clears)> = vec![
+            (
+                CliDiagnostic::DatabaseNotFound { path: sample("d") },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::RepoPathNotFound { path: sample("r") },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
+                Clears::Never,
+            ),
+            (CliDiagnostic::EmptyDatabase, Clears::Never),
+            // The one genuinely transient case: a live holder of the write lock
+            // releases it. Its help says to stop that process rather than to
+            // wait, which is stronger, but waiting is not a lie here.
+            (
+                CliDiagnostic::DatabaseUnavailable {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::OnItsOwn,
+            ),
+            (
+                CliDiagnostic::DatabaseWalUnreplayed {
+                    path: sample("d"),
+                    wal: sample("w"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::DatabaseCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::DatabaseNoSchema {
+                    path: sample("d"),
+                    detail: sample("0 bytes"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::General {
+                    message: sample("m"),
+                },
+                Clears::Never,
+            ),
+        ];
+
+        // Compile-time completeness: destructuring every variant means a new
+        // one cannot be added without touching this match, and the arm count
+        // must equal the inventory length.
+        fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
+            match diagnostic {
+                CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
+                CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
+                CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
+                CliDiagnostic::EmptyDatabase => "empty_db",
+                CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
+                CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
+                CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+                CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
+                CliDiagnostic::General { .. } => "error",
+            }
+        }
+        let covered: std::collections::HashSet<&str> = inventory
+            .iter()
+            .map(|(diagnostic, _)| classify_is_total(diagnostic))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            inventory.len(),
+            "the inventory must name every variant exactly once"
+        );
+
+        for (diagnostic, clears) in &inventory {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            if *clears == Clears::OnItsOwn {
+                continue;
+            }
+            for phrase in [
+                "retry later",
+                "please retry",
+                "try again later",
+                "and retry",
+            ] {
+                assert!(
+                    !help.to_lowercase().contains(phrase),
+                    "`{code}` is classified as never clearing on its own, yet its \
+                     help says {phrase:?}. That is a remedy nobody can run — the \
+                     nw-318/nw-328 class. Help: {help}"
+                );
+            }
+        }
+    }
+
+    /// nw-285. lbug is built from source in the cargo registry and its `ASSERT`
+    /// macro interpolates `__FILE__`, so a mid-file corruption printed the
+    /// build machine's home directory to the user, verbatim, with no remedy.
+    ///
+    /// The input below is the message reproduced against a real 20 MB index,
+    /// character for character. Asserted here rather than only end to end
+    /// because which corruption OFFSET produces an unwinding C++ exception
+    /// (this) versus a SIGSEGV (`open_crash_guard`, already correct) versus a
+    /// clean read of garbage is not stable across fixture sizes — a test that
+    /// depended on hitting this path would pass for the wrong reason on a small
+    /// database, which is exactly what the first draft of the end-to-end row
+    /// did.
+    #[test]
+    fn a_raw_engine_assertion_is_redacted_and_named_as_corruption() {
+        let raw = "list_all_symbols: query error: Query execution failed: \
+                   Assertion failed in file \
+                   \"/Users/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
+lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
+                   startOffsetInSegment + length <= state.metadata.numValues";
+
+        let redacted = redact_build_paths(raw);
+        assert!(
+            !redacted.contains(".cargo/registry"),
+            "the registry path survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("/Users/someone"),
+            "the username survived, which is the part that must never leave the \
+             machine: {redacted}"
+        );
+        assert!(
+            redacted.contains("lbug-0.19.1"),
+            "the crate and version are the diagnostic part and must survive: \
+             {redacted}"
+        );
+
+        let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+        let code = report
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            code, "nestweaver::db_corrupt",
+            "a C++ assertion escaping the engine is corruption, not a generic \
+             error with no help"
+        );
+        let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("backup restore") && help.contains("re-index"),
+            "corruption must name a recovery: {help}"
+        );
+        assert!(
+            !help.contains(".cargo/registry"),
+            "the redaction must survive classification: {help}"
+        );
+    }
+
+    /// nw-285. The engine appends its own untested guess at a transient cause —
+    /// "The database may be checkpointing; please retry later." — to a
+    /// truncation error whose own facts prove the opposite. Quoting the guess
+    /// under a diagnostic that ends "Do not keep retrying" hands the operator
+    /// two instructions and lets them pick.
+    #[test]
+    fn the_engines_own_retry_guess_is_dropped_but_its_facts_are_kept() {
+        let raw = "failed to open database at /tmp/x.lbug: database error: Runtime \
+                   exception: Cannot read checkpoint: catalog page range starts at \
+                   3567 and spans 5 pages, outside the database file with 1696 \
+                   pages. The database may be checkpointing; please retry later.";
+
+        let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+        assert_eq!(
+            report.code().map(|c| c.to_string()).unwrap_or_default(),
+            "nestweaver::db_corrupt",
+            "a file shorter than its own catalog is truncated, not checkpointing"
+        );
+        let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            !help.to_lowercase().contains("retry later"),
+            "the engine's guess reached the user through the quoted cause: {help}"
+        );
+        assert!(
+            help.contains("outside the database file with 1696 pages"),
+            "the engine's FACTS are the load-bearing part and must survive: {help}"
+        );
+    }
+
+    /// nw-318 (defect A). `open_store`'s daemon-held refusal is reached ONLY
+    /// by a caller who already bypassed the daemon, so prescribing
+    /// `--no-daemon` to that caller is a closed loop — and "report it as a bug"
+    /// mislabels a state they deliberately asked for.
+    #[test]
+    fn no_daemon_refusal_never_prescribes_the_flag_already_passed() {
+        for upstream in ["Could not set lock on file", "Corrupted wal detected"] {
+            let rendered =
+                daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), upstream).to_string();
+
+            assert!(
+                !rendered.contains("--no-daemon"),
+                "this refusal is only reachable WITH --no-daemon, so offering it \
+                 is a closed loop. Got: {rendered}"
+            );
+            assert!(
+                !rendered.to_lowercase().contains("report it as a bug"),
+                "a user-requested bypass against a daemon-held store is not a \
+                 product defect. Got: {rendered}"
+            );
+            assert!(
+                rendered.contains("nestweaver daemon"),
+                "the refusal must name an action the caller has NOT already \
+                 taken. Got: {rendered}"
+            );
+            assert!(
+                rendered.contains("/tmp/x.lbug"),
+                "and it must name the database. Got: {rendered}"
+            );
+        }
+
+        // The two conditions are NOT the same and must not get one answer: a
+        // read-only open can never replay a WAL however many times the caller
+        // stops and restarts things, so `stop` is the wrong advice for it.
+        let wal = daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Corrupted wal")
+            .to_string();
+        assert!(wal.contains("start"), "{wal}");
+        let lock =
+            daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Could not set lock")
+                .to_string();
+        assert!(lock.contains("stop"), "{lock}");
+    }
+
+    /// nw-328 / F-CODE-7. When `--repo` is already set the collision is
+    /// intra-repo BY CONSTRUCTION — `resolve_uid_with_repo_filter` returns
+    /// `Ambiguous` only when more than one candidate SURVIVES the filter — so
+    /// advising `--repo` sends the caller round a loop. An agent following the
+    /// remedy verbatim never terminates.
+    #[test]
+    fn impact_ambiguity_does_not_advise_a_flag_that_is_already_set() {
+        let candidates = serde_json::json!([
+            {"uid": "sym:repo:coyote-server:aaa:6", "name": "formatNumber",
+             "file_path": "src/common/number-format.ts", "start_line": 6},
+            {"uid": "sym:repo:coyote-server:bbb:116", "name": "formatNumber",
+             "file_path": "src/modules/reports/generators/base-report-generator.ts",
+             "start_line": 116},
+        ]);
+
+        let scoped =
+            impact_json_ambiguous("formatNumber", Some("coyote-server"), candidates.clone());
+        let note = scoped["note"].as_str().unwrap();
+        assert!(
+            !note.contains("--repo <name>"),
+            "the remedy repeats the flag that is already set: {note}"
+        );
+        assert!(
+            note.contains("UID") || note.contains("uid"),
+            "the remedy must offer a disambiguator that can discriminate: {note}"
+        );
+        // …and the candidates must actually carry the UID the remedy names.
+        assert!(
+            scoped["candidates"][0]["uid"]
+                .as_str()
+                .unwrap()
+                .starts_with("sym:")
+        );
+
+        // Unscoped: `--repo` IS a valid remedy and must be preserved.
+        let unscoped = impact_json_ambiguous("formatNumber", None, candidates);
+        assert!(unscoped["note"].as_str().unwrap().contains("--repo"));
+    }
+
+    /// nw-309. The predicate itself: "present" and "usable" are different
+    /// questions, and only the first was being asked before a decision to
+    /// spend 30 seconds on a daemon boot.
+    #[test]
+    fn require_openable_db_separates_present_from_usable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("nope.lbug");
+        let error = require_openable_db(&missing).unwrap_err().to_string();
+        assert!(error.contains("not found"), "{error}");
+
+        let text = dir.path().join("fake.lbug");
+        std::fs::write(&text, b"hello not a db").unwrap();
+        let error = require_openable_db(&text).unwrap_err().to_string();
+        assert!(error.contains("not a NestWeaver database"), "{error}");
+        assert!(error.contains("fake.lbug"), "{error}");
+
+        let directory = dir.path().join("adir.lbug");
+        std::fs::create_dir(&directory).unwrap();
+        let error = require_openable_db(&directory).unwrap_err().to_string();
+        assert!(error.contains("is a directory"), "{error}");
+
+        // A zero-byte file is what an interrupted create leaves and what the
+        // store itself initialises. Refusing it would break creation.
+        let empty = dir.path().join("empty.lbug");
+        std::fs::write(&empty, b"").unwrap();
+        require_openable_db(&empty).expect("an empty file is the store's business");
+
+        // And a real header passes, so the guard cannot be satisfied by
+        // rejecting everything.
+        let real = dir.path().join("real.lbug");
+        std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
+        require_openable_db(&real).expect("a real LadybugDB header must pass");
+    }
+
+    /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
+    ///
+    /// It answers "does this subcommand still exist?", which catches a future
+    /// rename and catches NONE of nw-310/318/328/329. Scoped to backtick-
+    /// quoted commands because that is the convention this codebase already
+    /// uses for pasteable text, which keeps prose out of the sweep.
+    #[test]
+    fn backtick_quoted_remedies_still_name_a_real_subcommand() {
+        let subcommands = on_big_stack(|| {
+            let root = Cli::command();
+            root.get_subcommands()
+                .map(|sub| sub.get_name().to_string())
+                .collect::<std::collections::HashSet<String>>()
+        });
+
+        // Deliberate exceptions, in the explicit-inventory idiom this module
+        // already uses: one entry, one justification, sorted.
+        const NOT_A_SUBCOMMAND: &[&str] = &[
+            // A fixture for "a warning kind this binary predates". Its whole
+            // subject is that the command comes from a NEWER daemon and this
+            // CLI does not know it, so being unknown is the assertion rather
+            // than a defect.
+            "synthetic-repair",
+        ];
+
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                let mut at = 0usize;
+                while let Some(found) = line[at..].find("`nestweaver ") {
+                    let start = at + found + "`nestweaver ".len();
+                    let rest = &line[start..];
+                    let word: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect();
+                    at = start.max(at + 1);
+                    if word.is_empty() {
+                        continue;
+                    }
+                    if !subcommands.contains(&word) && !NOT_A_SUBCOMMAND.contains(&word.as_str()) {
+                        unknown.push(format!("{file}:{}: `nestweaver {word}`", index + 1));
+                    }
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these backtick-quoted remedies name a subcommand the CLI does not \
+             have, so a user who pastes them gets a clap parse error instead of \
+             a fix: {unknown:#?}"
         );
     }
 }
@@ -22918,7 +25193,7 @@ where
                     format!(
                         "failed to connect to daemon for {}; start it with \
                          'nestweaver daemon --db {} start' or use --no-daemon \
-                         (requires NESTWEAVER_NO_DAEMON=1)",
+                         (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
                         path.display(),
                         path.display()
                     )
@@ -22933,7 +25208,7 @@ where
     if use_daemon && endpoint.is_none() && !local {
         anyhow::bail!(
             "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
-             or use --no-daemon (requires NESTWEAVER_NO_DAEMON=1)",
+             or use --no-daemon (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
             path.display()
         );
     }
@@ -27585,6 +29860,67 @@ credential_method = "gh"
         assert!(!missing.exists());
     }
 
+    /// nw-284/S2. The refusal is a function of PROVENANCE, not of paths, so it
+    /// is tested as one: only "source inferred AND target from the ambient
+    /// environment" refuses. Every other combination is a stated intent and
+    /// must pass through untouched — including the repo-local fallback, which
+    /// is what `nestweaver index` in a fresh clone relies on.
+    #[test]
+    fn only_a_wholly_inferred_write_is_refused() {
+        let repo = std::path::Path::new("/tmp/checkout");
+        let db = std::path::Path::new("/tmp/ambient.lbug");
+
+        let refused = wholly_inferred_write_refusal("index", false, DbSource::Env, repo, db)
+            .expect("neither end stated must refuse");
+        // The message must name the inferred SOURCE, the inferred TARGET, and
+        // where the target came from — a refusal the reader cannot act on is
+        // the defect class this release exists to close.
+        assert!(refused.contains("/tmp/checkout"), "{refused}");
+        assert!(refused.contains("/tmp/ambient.lbug"), "{refused}");
+        assert!(refused.contains("NESTWEAVER_DB"), "{refused}");
+        // …and a remedy that discriminates: either end will do.
+        assert!(refused.contains("--repo"), "{refused}");
+        assert!(refused.contains("--db"), "{refused}");
+        assert!(refused.contains("--config"), "{refused}");
+
+        // Stating the source is intent.
+        assert!(wholly_inferred_write_refusal("index", true, DbSource::Env, repo, db).is_none());
+        // Stating the target is intent.
+        for stated_target in [DbSource::Flag, DbSource::Config] {
+            assert!(
+                wholly_inferred_write_refusal("index", false, stated_target, repo, db).is_none(),
+                "{stated_target:?} is a stated target"
+            );
+        }
+        // A target DERIVED from the source is not an ambient target: refusing
+        // it would break `nestweaver index` in a fresh clone.
+        for derived in [DbSource::RepoLocal, DbSource::CwdLocal] {
+            assert!(
+                wholly_inferred_write_refusal("index", false, derived, repo, db).is_none(),
+                "{derived:?} follows the source and must stay allowed"
+            );
+        }
+    }
+
+    /// nw-284/S2. The resolver must report WHICH of its four sources fired: a
+    /// caller cannot otherwise tell "the database you named" from "the
+    /// database your shell profile named".
+    #[test]
+    fn resolve_index_db_path_reports_which_source_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let flagged = dir.path().join("flagged.lbug");
+
+        let (path, source) = resolve_index_db_path(Some(flagged.clone()), None, &repo).unwrap();
+        assert_eq!(path, flagged);
+        assert_eq!(source, DbSource::Flag);
+
+        // The env and repo-local arms depend on process environment, which the
+        // parallel test harness owns; `tests/cli_test.rs` covers them out of
+        // process where the environment can be set safely.
+    }
+
     /// The CLI must send the exact arg names the MCP tools read —
     /// `top_n` for bridge_nodes, `changed_files` (array) for affected_tests.
     #[test]
@@ -31559,9 +33895,17 @@ mod vault_command_config_parity_tests {
         let Commands::Extensions { command } = cli.command else {
             panic!("expected `extensions`");
         };
+        // Was an irrefutable `let`, which compiled only while `List` was the
+        // sole variant of `ExtensionCommands`. nw-281(b)'s `unset` added a
+        // second one and broke it — correctly: this test's subject is that
+        // bare `extensions list` still routes to `List`, and that is now a
+        // claim with a way to be false.
         let ExtensionCommands::List {
             uid, key, value, ..
-        } = command;
+        } = command
+        else {
+            panic!("`extensions list` must still route to `List`");
+        };
         assert!(
             uid.is_none() && key.is_none() && value.is_none(),
             "an unfiltered list must be the default — auditing starts with 'show me everything'"
@@ -31660,6 +34004,311 @@ mod optional_count_rendering_tests {
         assert!(
             unknown.contains("unavailable") && unknown.contains("NOT zero"),
             "and it must say so in words a reader cannot mistake: {unknown}"
+        );
+    }
+}
+
+/// nw-295: `--since` is validated AND normalised by clap, so every route
+/// downstream sees one shape.
+///
+/// The normalisation is the half that is easy to drop: an offset timestamp
+/// compared bytewise against a `Z`-suffixed column is wrong BY THE OFFSET, and
+/// wrong quietly — it still returns rows, just the wrong ones. A validator that
+/// only said yes/no would leave that intact.
+#[cfg(test)]
+mod since_boundary_tests {
+    use super::*;
+
+    fn parse(args: Vec<String>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn since_of(command: Commands) -> Option<String> {
+        match command {
+            Commands::ProjectContext { since, .. } => since,
+            Commands::Brain { command } => match *command {
+                BrainCommands::Context { since, .. } => since,
+                _ => panic!("expected `brain context`"),
+            },
+            _ => panic!("expected `project-context` or `brain context`"),
+        }
+    }
+
+    /// Both flags, one table, because the defect was that two commands
+    /// declaring the same flag treated it two different ways.
+    fn both_since_flags(value: &str) -> Vec<Result<Cli, clap::Error>> {
+        vec![
+            parse(vec![
+                "nestweaver".into(),
+                "project-context".into(),
+                "p".into(),
+                "--since".into(),
+                value.into(),
+            ]),
+            parse(vec![
+                "nestweaver".into(),
+                "brain".into(),
+                "context".into(),
+                "q".into(),
+                "--since".into(),
+                value.into(),
+            ]),
+        ]
+    }
+
+    #[test]
+    fn every_accepted_since_reaches_the_command_normalised_to_utc() {
+        // `modified_at` is stored as `YYYY-MM-DDTHH:MM:SSZ`. All three inputs
+        // denote the same instant and must arrive as the same bytes, because
+        // the comparison downstream is lexicographic.
+        for value in [
+            "2026-01-31",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T02:00:00+02:00",
+        ] {
+            for parsed in both_since_flags(value) {
+                let cli = parsed.unwrap_or_else(|e| panic!("`--since {value}` must parse: {e}"));
+                assert_eq!(
+                    since_of(cli.command).as_deref(),
+                    Some("2026-01-31T00:00:00Z"),
+                    "`--since {value}` must arrive normalised: a +02:00 offset \
+                     compared bytewise against a Z-suffixed column is wrong by \
+                     the offset, and wrong QUIETLY — it returns rows, just the \
+                     wrong ones"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unparseable_since_cannot_reach_either_command() {
+        for value in ["garbage", "2026-13-01", "", "2099"] {
+            for parsed in both_since_flags(value) {
+                assert!(
+                    parsed.is_err(),
+                    "`--since {value:?}` must be rejected at the boundary. It \
+                     cannot be rejected downstream: `modified_at >= $since` is a \
+                     byte comparison that never fails, so a bad value does not \
+                     error — it matches nothing and reports success"
+                );
+            }
+        }
+    }
+}
+
+/// nw-299(b): the CLI must never construct `clusters` arguments the tool will
+/// reject. Under `additionalProperties: false` plus declared bounds, a bad
+/// value is not ignored — it fails the whole call, so the daemon route would
+/// break for exactly the callers who bound their output most aggressively.
+#[cfg(test)]
+mod clusters_forwarding_tests {
+    use super::*;
+
+    #[test]
+    fn every_cli_reachable_bound_produces_arguments_the_tool_accepts() {
+        // `--limit`/`--members` are unbounded `usize` in clap, so the domain
+        // here is "anything a user can type", not "anything reasonable".
+        for limit in [0usize, 1, 20, 50, 200, 1000, 1001, 5000, usize::MAX] {
+            for members in [0usize, 1, 20, 200, 201, 500, usize::MAX] {
+                for resolution in [None, Some(0.3), Some(2.0)] {
+                    let args = clusters_tool_args(limit, members, resolution);
+                    nestweaver_mcp::tools::validate_tool_arguments("clusters", &args)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "`clusters --limit {limit} --members {members}` produced \
+                                 arguments the tool rejects ({e}). An out-of-range value \
+                                 fails the ENTIRE call, so this is not a degraded \
+                                 result — it is `clusters` not working at all on the \
+                                 route that is taken by default."
+                            )
+                        });
+                }
+            }
+        }
+    }
+
+    /// The counterweight: clamping must not quietly become "always send the
+    /// ceiling", which would make the test above pass while discarding the
+    /// caller's bound.
+    #[test]
+    fn a_bound_within_the_tools_range_is_forwarded_exactly() {
+        let args = clusters_tool_args(7, 3, None);
+        assert_eq!(args["limit"], 7);
+        assert_eq!(args["members"], 3);
+
+        // And 0 keeps meaning "all" rather than being clamped to a ceiling.
+        let all = clusters_tool_args(0, 0, None);
+        assert_eq!(all["limit"], 0, "`--limit 0` means all, on both sides");
+        assert_eq!(all["members"], 0);
+    }
+}
+
+/// nw-316: `--include-components` must be able to be UNSET, so the tool's
+/// documented default governs both routes.
+///
+/// The tool's schema says `"default": true` and its handler applies
+/// `unwrap_or(true)`. A bare clap `bool` has no third state, so the CLI sent
+/// `false` unconditionally and pinned Route A to the opposite of the
+/// documented behaviour. `component_uids` feeds both the PPR seed set and the
+/// x5 membership boost, so the two routes ranked the same request differently
+/// and neither disclosed it.
+#[cfg(test)]
+mod include_components_tri_state_tests {
+    use super::*;
+
+    fn parse(args: Vec<String>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn flag_state(extra: &[&str]) -> Option<bool> {
+        let mut argv: Vec<String> = ["nestweaver", "project-context", "p"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        argv.extend(extra.iter().map(|s| (*s).to_string()));
+        match parse(argv).expect("must parse").command {
+            Commands::ProjectContext {
+                include_components, ..
+            } => include_components,
+            _ => panic!("expected `project-context`"),
+        }
+    }
+
+    #[test]
+    fn an_absent_flag_stays_absent_rather_than_becoming_false() {
+        assert_eq!(
+            flag_state(&[]),
+            None,
+            "`None` is the whole point: it is what lets the request omit the \
+             key so the tool's documented `default: true` decides. A bare \
+             clap bool collapses this to `false` and makes the documented \
+             default unreachable on this route."
+        );
+    }
+
+    #[test]
+    fn the_flag_can_still_be_stated_either_way() {
+        assert_eq!(
+            flag_state(&["--include-components"]),
+            Some(true),
+            "the bare flag must keep meaning 'yes' — it did before this change"
+        );
+        assert_eq!(
+            flag_state(&["--include-components", "false"]),
+            Some(false),
+            "and opting OUT must remain expressible, or the tri-state has just \
+             moved the unreachable value rather than removed it"
+        );
+        assert_eq!(flag_state(&["--include-components", "true"]), Some(true));
+    }
+
+    /// The CLI's direct path must resolve an absent flag to the same value the
+    /// tool does. Restating `true` in two places is how these routes diverged.
+    #[test]
+    fn the_direct_path_default_matches_the_tools_documented_default() {
+        let schema = nestweaver_mcp::tools::tool_list(false);
+        let tool = schema["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .find(|t| t["name"] == "project_context")
+            .expect("project_context must be in the catalogue");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["include_components"]["default"],
+            serde_json::json!(true),
+            "the CLI's `unwrap_or(true)` is only correct while the tool \
+             documents `true`; if the documented default ever changes, this \
+             test is the thing that says the CLI has to change with it"
+        );
+        // And the value the CLI actually applies for an absent flag.
+        assert!(
+            flag_state(&[]).unwrap_or(true),
+            "an absent flag must resolve to the documented default"
+        );
+    }
+}
+
+/// nw-316: the token budget must be spent at the rate the renderer charges.
+///
+/// `render_cost_tokens` was a COPY of `nestweaver_mcp::tools::render_cost`'s
+/// `concise == false` branch, unconditionally, while `project-context` renders
+/// CONCISE by default — `{kind, title, location}`, no `uid`, no `relevance`.
+/// The budget therefore paid for bytes the response never contained and
+/// admitted fewer nodes than it could afford, which is the reported
+/// 14-items-vs-20 against the daemon route for an identical request.
+#[cfg(test)]
+mod render_cost_parity_tests {
+    use super::*;
+
+    fn node(uid: &str) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol".to_string(),
+            title: "handleCheckout".to_string(),
+            location: "src/checkout/handler.ts:42".to_string(),
+            relevance: 0.5,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    /// There is now ONE implementation, so this asserts the delegation rather
+    /// than a numeric agreement between two copies. A copy that agrees is
+    /// still a copy — that is how this one drifted.
+    #[test]
+    fn the_cli_charges_exactly_what_the_tool_charges() {
+        for uid in ["sym:repo:short", &"sym:repo:".to_string().repeat(20)] {
+            let n = node(uid);
+            for concise in [true, false] {
+                assert_eq!(
+                    render_cost_tokens(&n, concise),
+                    nestweaver_mcp::tools::render_cost(&n, concise),
+                    "the CLI's estimate must BE the tool's, not match it"
+                );
+            }
+        }
+    }
+
+    /// The counterweight, and the one that would have caught the defect: the
+    /// two rates must actually DIFFER, and differ in the direction that
+    /// explains the symptom. If they were equal, threading the flag would be
+    /// pointless and the delegation test above would pass on the broken tree.
+    #[test]
+    fn the_concise_rate_is_cheaper_and_that_is_why_it_fits_more_nodes() {
+        let n = node("sym:repo:0123456789abcdef0123456789abcdef");
+        let concise = render_cost_tokens(&n, true);
+        let detailed = render_cost_tokens(&n, false);
+        assert!(
+            concise < detailed,
+            "a concise render omits uid and relevance, so it must cost less \
+             ({concise} vs {detailed}) — otherwise charging the wrong rate \
+             would be harmless and there would be no bug to fix"
+        );
+
+        // And the consequence, stated as the symptom rather than as arithmetic:
+        // for one budget, the correct rate admits strictly more nodes.
+        let nodes: Vec<_> = (0..40)
+            .map(|i| node(&format!("sym:repo:{i:032x}")))
+            .collect();
+        let budget = 400;
+        let at_concise_rate = token_budgeted_truncate(&nodes, budget, true);
+        let at_detailed_rate = token_budgeted_truncate(&nodes, budget, false);
+        assert!(
+            at_concise_rate > at_detailed_rate,
+            "charging the detailed rate for a concise response takes fewer \
+             nodes for the same budget ({at_detailed_rate} vs \
+             {at_concise_rate}) — that gap IS the reported item-count \
+             divergence between the two routes"
         );
     }
 }

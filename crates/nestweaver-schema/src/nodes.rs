@@ -260,6 +260,19 @@ pub struct Note {
     pub word_count: u32,
     pub content_hash: String,
     pub frontmatter: Option<String>,
+    /// The frontmatter's ORIGINAL YAML text, as written between the `---`
+    /// fences. `frontmatter` above is the parsed map serialized as JSON, which
+    /// is why both exist: the JSON answers "what fields does this note declare"
+    /// and cannot answer "does this file contain this string, and on what
+    /// line". Frontmatter is split off before sectioning, so it reaches no
+    /// Section either — which is what made 1.36 MB of it unreachable from
+    /// `regex_search` / `count_patterns` while `brain_search` found it by
+    /// reading the file off disk (nw-298).
+    ///
+    /// `#[serde(default)]` so notes serialized before this field still
+    /// deserialize.
+    #[serde(default)]
+    pub frontmatter_raw: Option<String>,
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
     pub pagerank_score: Option<f64>,

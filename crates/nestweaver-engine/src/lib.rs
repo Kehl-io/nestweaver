@@ -16,6 +16,142 @@ pub fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Failure while validating a user-supplied `since` filter value.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid 'since' value '{input}': expected an ISO 8601 timestamp \
+     (2026-01-31 or 2026-01-31T00:00:00Z)"
+)]
+pub struct ParseSinceError {
+    /// The value the caller supplied, quoted back so the error is actionable.
+    pub input: String,
+}
+
+/// Validate a user-supplied `since` filter and normalise it to the exact shape
+/// `modified_at` is stored in: `YYYY-MM-DDTHH:MM:SSZ`, UTC.
+///
+/// nw-295. `since` used to be handed straight to
+/// `WHERE n.modified_at >= $since`, and `modified_at` is a String column, so
+/// that predicate is a LEXICOGRAPHIC byte comparison, not a temporal one. It
+/// can never fail, so an unparseable value had nowhere to surface: `'g'`
+/// (0x67) sorts above every stored timestamp's leading `'2'` (0x32), which
+/// made `since: "garbage"` byte-identical to `since: "2099-12-31"` — both
+/// matched no note and silently deleted every Note and Section from the
+/// answer. The failure direction is the harmful one: it does not no-op, it
+/// narrows the result toward emptiness while reporting success.
+///
+/// Two shapes are accepted, and BOTH must keep working:
+///
+/// - a bare `YYYY-MM-DD` date, which is not RFC 3339 but works correctly today
+///   and is the natural thing for an agent to send. It is widened to
+///   `T00:00:00Z`. An RFC-3339-only validator would reject a currently-working
+///   input, which would be a regression dressed as a fix.
+/// - a full RFC 3339 timestamp, including one with a non-UTC offset. That last
+///   case is why this returns a NORMALISED string rather than validating in
+///   place: `2026-01-01T00:00:00+02:00` compared bytewise against a `Z`-suffixed
+///   column is wrong by the offset, so converting to UTC here makes the
+///   downstream lexicographic comparison temporally correct.
+///
+/// # Errors
+/// Returns [`ParseSinceError`] when `input` is not one of those two shapes, or
+/// is not a real calendar date.
+pub fn parse_since(input: &str) -> Result<String, ParseSinceError> {
+    use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+
+    let fail = || ParseSinceError {
+        input: input.to_string(),
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(fail());
+    }
+
+    // A bare date is widened rather than special-cased downstream, so exactly
+    // one shape reaches the comparison.
+    let candidate = if trimmed.len() == 10 && trimmed.as_bytes()[4] == b'-' {
+        format!("{trimmed}T00:00:00Z")
+    } else {
+        trimmed.to_string()
+    };
+
+    let parsed = OffsetDateTime::parse(&candidate, &Rfc3339).map_err(|_| fail())?;
+    let utc = parsed.to_offset(UtcOffset::UTC);
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+    ))
+}
+
+#[cfg(test)]
+mod parse_since_tests {
+    use super::parse_since;
+
+    /// The values the QA hit. Each of these used to be silently HONOURED and
+    /// each emptied the Note/Section half of the result set.
+    #[test]
+    fn an_unparseable_since_is_rejected_rather_than_honoured() {
+        for bad in [
+            "garbage",
+            "",
+            "   ",
+            "yesterday",
+            "2026-13-45",
+            "not-a-date",
+            "31/01/2026",
+            "2099",
+            "2026-01",
+        ] {
+            let error = parse_since(bad)
+                .expect_err("an unparseable `since` must be an error, not a filter");
+            let message = error.to_string();
+            assert!(
+                message.contains("since"),
+                "the error must name the offending parameter: {message}"
+            );
+            assert!(
+                message.contains("ISO 8601"),
+                "the error must state the expected format, as `kinds` and `scope` do: {message}"
+            );
+        }
+    }
+
+    /// A bare date is not RFC 3339 but works today, so rejecting it would be a
+    /// regression. It must widen to the stored shape.
+    #[test]
+    fn a_bare_date_is_accepted_and_widened() {
+        assert_eq!(parse_since("2026-01-31").unwrap(), "2026-01-31T00:00:00Z");
+    }
+
+    /// Normalisation is the point, not a side effect: `modified_at` is stored
+    /// as `...Z` and compared BYTEWISE, so an offset timestamp left as-is is
+    /// wrong by the offset.
+    #[test]
+    fn an_offset_timestamp_is_normalised_to_utc() {
+        assert_eq!(
+            parse_since("2026-01-31T02:00:00+02:00").unwrap(),
+            "2026-01-31T00:00:00Z"
+        );
+        assert_eq!(
+            parse_since("2026-01-31T00:00:00Z").unwrap(),
+            "2026-01-31T00:00:00Z"
+        );
+    }
+
+    /// The normalised output must sort the same way the stored column does,
+    /// which is the property the whole filter rests on.
+    #[test]
+    fn the_normalised_shape_sorts_like_the_stored_column() {
+        let stored = "2026-08-27T22:58:58Z";
+        assert!(parse_since("2026-01-01").unwrap().as_str() < stored);
+        assert!(parse_since("2099-12-31").unwrap().as_str() > stored);
+    }
+}
+
 /// Failure while resolving a user-supplied path.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveUserPathError {
@@ -243,6 +379,7 @@ pub mod index;
 pub mod index_limits;
 pub mod index_md;
 pub mod index_publication;
+pub mod instance_remedy;
 pub mod interactions;
 pub mod investigate;
 pub mod jobs;
@@ -317,7 +454,9 @@ pub use brain_memory::{
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
-    ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
+    ClusterMember, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
+    LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, compute_clusters,
+    default_cluster_resolution, load_clusters, save_clusters,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
@@ -360,7 +499,8 @@ pub use extensions::{
     prepare_instance_extension_migration, prepare_instance_extension_migration_with_finalizers,
     prepare_instance_uid_migration_with_finalizers, query_by_property,
     reconcile_deleted_extension_uids, reconcile_extension_handoffs, reconcile_extension_liveness,
-    record_last_indexed_at, remove_extension_uid_durable, save_extensions, set_property,
+    record_last_indexed_at, remove_extension_key_durable, remove_extension_uid_durable,
+    save_extensions, set_property,
 };
 pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
@@ -389,8 +529,8 @@ pub use index_md::{
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
     clear_interaction_sidecar, compute_decayed_score, interaction_sidecar_path,
-    load_interaction_data, load_interaction_scores, load_node_score, save_interaction_store,
-    top_uids_by_kind,
+    load_interaction_data, load_interaction_scores, load_node_score, remove_node_score,
+    save_interaction_store, top_uids_by_kind,
 };
 pub use investigate::{
     Bundle, BundleEntry, BundleStore, Domain, ExpandResult, HydrateResult, InvestigateResult,
@@ -415,7 +555,7 @@ pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, CODE_CONTEXT_DEFAULT_LIMIT, ContextNode, ContextResult,
     CrossRepoLink, EmbedModelProvider, EmbedQueryFn, FeatureContextResult, FeatureInfo,
-    HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
+    HybridSearchConfig, LinkInfo, LookupResult, SearchIndexProvider, SymbolCandidate, SymbolDetail,
     apply_ranking_priors, build_brain_context, build_brain_context_hybrid,
     build_brain_context_hybrid_with_aliases, build_context, build_context_with_intent,
     build_feature_context, dedup_heading_section_pairs, expand_query_with_aliases,

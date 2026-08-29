@@ -83,6 +83,29 @@
 (import_statement
   source: (string) @name) @reference.import
 
+; Re-export source: `export * from './x'` / `export { A } from './x'`.
+;
+; nw-323 (defect C): `export_statement` was captured only inside
+; `@definition.*` patterns for export-wrapped declarations, so the re-export
+; SOURCE was never captured as an import. A barrel file therefore had zero
+; imports, `ImportGraph::imports_of` returned empty for it, and the re-export
+; tier in resolve.rs had nothing to walk. Rust does not have this hole because
+; `use_declaration` covers `pub use` and is captured whole.
+(export_statement
+  source: (string) @name) @reference.import
+
+; Object construction: `new Foo(...)`.
+;
+; nw-323 (defect D): `new_expression` appeared in NEITHER typescript.scm nor
+; javascript.scm -- only in the *_types.scm files, which feed the type
+; environment and NOT the edge set (`resolve_references_with_context` takes that
+; argument as `_type_envs`). `NotFoundError` and `NotificationService` are
+; consumed almost exclusively via `new`, so they had ZERO inbound references
+; before resolution even began -- which is why `impact --min-score 0 --depth 10`
+; still returned 0 for them. The edges were ABSENT, not pruned.
+(new_expression
+  constructor: (identifier) @name) @reference.call
+
 ; require() calls
 (call_expression
   function: (identifier)

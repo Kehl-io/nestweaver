@@ -35,16 +35,22 @@
   (class_constructor_declaration)) @definition.constructor
 
 ; Standalone function declarations (not inside class)
+;
+; nw-326: the `(source_file)` anchor scopes the pattern to "not inside a
+; class", but the capture must sit on the DECLARATION. Anchoring and capturing
+; on the file root gave every standalone function the WHOLE FILE as its span,
+; content hash and signature -- `compute_checksum` was recorded as lines 1-78
+; of simple.sv with the leading `include directive as its signature.
 (source_file
   (function_declaration
     (function_body_declaration
-      name: (simple_identifier) @name))) @definition.function
+      name: (simple_identifier) @name)) @definition.function)
 
 ; Standalone task declarations (not inside class)
 (source_file
   (task_declaration
     (task_body_declaration
-      name: (simple_identifier) @name))) @definition.function
+      name: (simple_identifier) @name)) @definition.function)
 
 ; Module-level function declarations
 (module_declaration

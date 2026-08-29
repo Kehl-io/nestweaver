@@ -533,6 +533,176 @@ enum SearchIndexReconciliation {
     Unavailable(String),
 }
 
+/// How long to wait before retrying a search-index open that failed.
+///
+/// The thing being waited out is another process holding the Tantivy writer
+/// lock, or a sidecar that has not been created yet. Both are resolved by
+/// someone else finishing, on a human timescale — so retrying per query would
+/// pay a failed open on the hot path for nothing, and retrying never is the
+/// bug. A minute is short enough that a repaired sidecar is picked up without
+/// a restart and long enough to be invisible.
+const SEARCH_REOPEN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The daemon's full-text search capability, re-establishable.
+///
+/// This is the `tantivy` + `search_reconciliation` pair that used to sit
+/// frozen on [`DaemonState`]. They were opened once from the filesystem during
+/// `serve()` and had no re-open path, so a daemon that booted while the
+/// Tantivy sidecar was locked by another process — or before it existed —
+/// served substring-fallback search for its ENTIRE life and disclosed that in
+/// exactly one boot-time log line. Repairing or creating the sidecar
+/// externally changed nothing until the daemon was restarted.
+///
+/// Same lifetime error as nw-286: a field whose lifetime is the process,
+/// holding a fact whose lifetime is shorter. `embedding_runtime` on the same
+/// struct was deliberately given interior mutability so embedding readiness
+/// could be re-established; this is that pattern, applied to the field that
+/// did not get it.
+///
+/// Re-opening is attempted only when the current state is not fully healthy,
+/// and at most once per [`SEARCH_REOPEN_RETRY_INTERVAL`]. A daemon with a
+/// working writer never pays anything.
+pub struct SearchRuntime {
+    tantivy_path: PathBuf,
+    read_only: bool,
+    retry_interval: Duration,
+    inner: std::sync::RwLock<SearchRuntimeSnapshot>,
+    /// Guards the re-open attempt itself, so a burst of concurrent queries
+    /// against a broken sidecar performs ONE open, not one per query.
+    next_attempt: std::sync::Mutex<Instant>,
+}
+
+/// Readiness and the exact usable handle as one value, so a caller can never
+/// observe a reconciliation verdict that disagrees with the index it holds.
+#[derive(Clone)]
+struct SearchRuntimeSnapshot {
+    tantivy: Option<Arc<TantivyIndex>>,
+    reconciliation: SearchIndexReconciliation,
+}
+
+impl SearchRuntimeSnapshot {
+    /// Whether this state is as good as it can get. A writer-backed index is;
+    /// a reader-only fallback is NOT, because the writer lock it lost may have
+    /// since been released, and without a writer no index or vault mutation
+    /// reaches BM25.
+    fn is_healthy(&self) -> bool {
+        match &self.reconciliation {
+            // A read-only replica legitimately has no writer: that is the
+            // configured shape, not a degraded one, and retrying would open
+            // the sidecar for writing against a snapshot it must not touch.
+            SearchIndexReconciliation::Disabled => true,
+            SearchIndexReconciliation::Available(_) => true,
+            SearchIndexReconciliation::Unavailable(_) => false,
+        }
+    }
+}
+
+impl SearchRuntime {
+    fn open(tantivy_path: PathBuf, read_only: bool) -> Self {
+        Self::with_retry_interval(tantivy_path, read_only, SEARCH_REOPEN_RETRY_INTERVAL)
+    }
+
+    fn with_retry_interval(
+        tantivy_path: PathBuf,
+        read_only: bool,
+        retry_interval: Duration,
+    ) -> Self {
+        let (tantivy, reconciliation) = open_search_index(&tantivy_path, read_only);
+        Self::from_parts(
+            tantivy_path,
+            read_only,
+            retry_interval,
+            SearchRuntimeSnapshot {
+                tantivy,
+                reconciliation,
+            },
+        )
+    }
+
+    fn from_parts(
+        tantivy_path: PathBuf,
+        read_only: bool,
+        retry_interval: Duration,
+        snapshot: SearchRuntimeSnapshot,
+    ) -> Self {
+        Self {
+            tantivy_path,
+            read_only,
+            retry_interval,
+            inner: std::sync::RwLock::new(snapshot),
+            next_attempt: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// The current search state, re-establishing it first if it is degraded
+    /// and the retry window has elapsed.
+    fn snapshot(&self) -> SearchRuntimeSnapshot {
+        {
+            let current = self
+                .inner
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current.is_healthy() {
+                return current.clone();
+            }
+        }
+        self.try_reopen();
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn try_reopen(&self) {
+        let now = Instant::now();
+        {
+            let mut next = self
+                .next_attempt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if now < *next {
+                return;
+            }
+            *next = now + self.retry_interval;
+        }
+        let (tantivy, reconciliation) = open_search_index(&self.tantivy_path, self.read_only);
+        let candidate = SearchRuntimeSnapshot {
+            tantivy,
+            reconciliation,
+        };
+        if !candidate.is_healthy() {
+            // Still broken. Keep whatever we already had — a reader-only
+            // fallback is strictly better than dropping to None because a
+            // later open failed harder.
+            return;
+        }
+        tracing::info!(
+            path = %self.tantivy_path.display(),
+            "search index re-opened after a degraded start — BM25 search is live again"
+        );
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+    }
+
+    /// Replace the reconciliation verdict. Used by the deletion-reconciliation
+    /// tests to install a failing or disabled index.
+    #[cfg(test)]
+    fn set_reconciliation(&self, reconciliation: SearchIndexReconciliation) {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reconciliation = reconciliation;
+    }
+}
+
+impl nestweaver_engine::SearchIndexProvider for SearchRuntime {
+    fn search_index(&self) -> Option<Arc<TantivyIndex>> {
+        self.snapshot().tantivy
+    }
+}
+
 /// A registered daemon-side file watcher and its shutdown handle.
 ///
 /// The `id` lets the watcher thread clear only ITS OWN registration on exit:
@@ -541,6 +711,25 @@ enum SearchIndexReconciliation {
 pub struct WatcherRegistration {
     id: u64,
     handle: nestweaver_engine::ShutdownHandle,
+    /// nw-302: the process that ASKED for this watcher.
+    ///
+    /// The registration models a daemon-side resource but stands for a
+    /// client-side session, and `WatchVault`/`WatchCode` are UNARY: the daemon
+    /// returns immediately and holds no connection to the client afterwards,
+    /// so a `kill -9`'d `brain watch` produces no observable event — no stream
+    /// close, no RST. Without an owner recorded here there is nothing to
+    /// observe, and the slot stayed occupied for the daemon's lifetime, which
+    /// is the whole of nw-302.
+    ///
+    /// Read from the KERNEL, not from the request: the unix socket's peer
+    /// credentials (`SO_PEERCRED` / `LOCAL_PEEREPID`) via [`peer_owner_pid`].
+    /// A caller cannot claim to be another process, and clients shipped before
+    /// this change are covered without a protocol change.
+    ///
+    /// `None` means "no owner could be established" — a TCP (server-mode)
+    /// connection, or an in-process call — and is deliberately NOT treated as
+    /// orphaned. Absence of evidence of death is not evidence of death.
+    owner_pid: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -917,8 +1106,11 @@ impl Drop for EffectiveConfigBindingCleanup {
 
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
-    pub tantivy: Option<Arc<TantivyIndex>>,
-    search_reconciliation: SearchIndexReconciliation,
+    /// Full-text search, held behind interior mutability so a daemon that
+    /// booted without its Tantivy sidecar can pick it up later instead of
+    /// serving substring fallback for the rest of its life. See
+    /// [`SearchRuntime`]; read it through [`DaemonState::tantivy`].
+    search: Arc<SearchRuntime>,
     pub db_path: PathBuf,
     /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
     /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
@@ -1079,6 +1271,79 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// The daemon's full-text search index, **as of now**.
+    ///
+    /// Not a field. It used to be one, opened from the filesystem at boot with
+    /// no re-open path, which meant a daemon that started while the Tantivy
+    /// sidecar was locked answered every search from the substring fallback
+    /// for its whole life. Every reader goes through here so the recovery is
+    /// available to all of them, and so a future reader cannot reintroduce the
+    /// freeze by capturing the handle.
+    pub fn tantivy(&self) -> Option<Arc<TantivyIndex>> {
+        self.search.snapshot().tantivy
+    }
+
+    /// The current search-index reconciliation verdict, paired atomically with
+    /// the handle [`Self::tantivy`] returns.
+    fn search_reconciliation(&self) -> SearchIndexReconciliation {
+        self.search.snapshot().reconciliation
+    }
+
+    /// The logical instance this database's data belongs to, **as of now**.
+    ///
+    /// nw-286: [`Self::data_instance_id`] is a BOOT SNAPSHOT of a mutable
+    /// database fact. The database's recorded identity is minted lazily, by the
+    /// first index (`ensure_data_instance_id`, via `record_data_instance`) —
+    /// and autostart guarantees the daemon that will serve that index booted
+    /// first, read `None`, and snapshotted the ambient `"default"`. A later
+    /// config-less write that stamped the snapshot forked the graph:
+    /// `repo:alpha:<hash>` AND `repo:default:<hash>` for one path.
+    ///
+    /// nw-275 made the AMBIGUITY CHECK live and left the RESOLUTION frozen —
+    /// one half of a twin pair. This accessor is the single reader, so the pair
+    /// cannot be split again: every consumer of the daemon's data identity goes
+    /// through here (the write choke point, the backup manifest, the
+    /// config-repo enqueue, the worker stamp, the poll scheduler, the repo
+    /// gauge).
+    ///
+    /// The `--config`-stated path is deliberately NOT re-read: an explicitly
+    /// stated instance is intent, is genuinely immutable for the process
+    /// (`instance_stated_by_config` — "a fact about how the daemon was
+    /// started"), and config-driven instance switching is a supported
+    /// operation. It also means a server-mode daemon, which is almost always
+    /// `--config`-driven, pays no store read at all.
+    pub fn effective_data_instance_id(&self) -> String {
+        if self.instance_stated_by_config {
+            return self.data_instance_id.clone();
+        }
+        let observed = self.store.observed_instance_ids().unwrap_or_default();
+        self.effective_data_instance_id_with_observed(&observed)
+    }
+
+    /// [`Self::effective_data_instance_id`] for a caller that has ALREADY paid
+    /// for `observed_instance_ids()` — the write choke point queries it for the
+    /// ambiguity refusal, and re-querying would double the cost of every
+    /// config-less write for no new information.
+    ///
+    /// Precedence mirrors the boot computation in `serve()` and the CLI's
+    /// `resolve_instance_id_for_db`, in that order and for the same reason:
+    /// several observed instances is a damage state with no answer, so it
+    /// yields to the ambient default (the write funnel refuses separately);
+    /// otherwise the database's own record wins; otherwise the single observed
+    /// id backfills a legacy database that predates the record.
+    fn effective_data_instance_id_with_observed(&self, observed: &[String]) -> String {
+        if self.instance_stated_by_config || observed.len() > 1 {
+            return self.data_instance_id.clone();
+        }
+        match self.store.data_instance_id() {
+            Ok(Some(recorded)) => recorded,
+            _ => observed
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.data_instance_id.clone()),
+        }
+    }
+
     /// Resolve the caller's per-repo visibility (R9/R9b — Blast Radius scoping)
     /// from a request's tonic extensions.
     ///
@@ -1174,7 +1439,6 @@ fn pick_effective_instance_id(requested: &str, configured: &str) -> Result<Strin
 }
 
 fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result<String, Status> {
-    let configured = state.data_instance_id.as_str();
     // nw-246: a request that states no instance, against a database holding
     // several and having stated none itself, has no safe default. Adopting one
     // is how the fork deepens.
@@ -1210,18 +1474,38 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
             // `--instance` IS carried per-request, so it works. Restarting the
             // daemon under a config also works, and is named as the second
             // option because it is the one a `--config` user actually wants.
+            //
+            // nw-310: the consolidation half used to emit
+            // `--from <one> --to <keep>` with `ambiguous` bound on the line
+            // below. Same renderer as the direct route, so the two routes
+            // cannot drift the way this pair already had.
             "this database holds data under {} instances ({}), and neither this \
              request nor the daemon's configuration named one, so there is no safe \
              default.\nName one per-request with `--instance <id>`; or restart the \
              daemon under a config that names one (`nestweaver daemon --db <path> \
              stop`, then `start --config <path>`) — a `--config` on this command \
-             cannot reach a daemon that is already running; or consolidate them \
-             with `nestweaver instance merge --from <one> --to <keep>`.",
+             cannot reach a daemon that is already running; or {}",
             ambiguous.len(),
-            ambiguous.join(", ")
+            ambiguous.join(", "),
+            nestweaver_engine::instance_remedy::instance_consolidation_remedy(&ambiguous, None)
         )));
     }
-    pick_effective_instance_id(requested, configured)
+    // nw-286: the RESOLUTION is as live as the ambiguity check above. This
+    // used to read the boot snapshot `state.data_instance_id`, so nw-275's
+    // live guard decided whether to refuse using the database as it is while
+    // the value it then returned described the database as it was at startup.
+    // With one instance present the ambiguity arm is inert, so the half that
+    // was fixed could never cover for the half that was not.
+    //
+    // `ambiguous` is reused rather than re-queried: it is already exactly
+    // `observed_instance_ids()` on the branch that needs it, and empty on the
+    // branches that do not read it.
+    let configured = if requested.is_empty() && !state.instance_stated_by_config {
+        state.effective_data_instance_id_with_observed(&ambiguous)
+    } else {
+        state.data_instance_id.clone()
+    };
+    pick_effective_instance_id(requested, &configured)
 }
 
 /// Build the terminal `Phase::Done` message for `IndexRepo`. When
@@ -1776,26 +2060,76 @@ fn register_watcher(
     state: &DaemonState,
     handle: nestweaver_engine::ShutdownHandle,
     force: bool,
+    owner_pid: Option<i32>,
 ) -> Result<u64, Status> {
     let mut guard = state
         .watcher_stop
         .lock()
         .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
     if let Some(existing) = guard.as_ref() {
-        if !force {
+        // nw-302: an incumbent whose OWNER IS GONE is reclaimed automatically.
+        //
+        // 8.0.0's changelog says "reclaim an orphaned watcher". What shipped
+        // was `force` on `WatchVaultRequest` — an operator override, not a
+        // reclaim, because the daemon could not tell an orphan from a live
+        // watcher: the registration recorded no owner, and the log line below
+        // could only say "possibly orphaned". A vault watcher under launchd
+        // that is OOM-killed left the vault silently unwatched AND blocked its
+        // own automatic restart until someone typed `--force` by hand — which
+        // is exactly what an unattended supervisor cannot do.
+        //
+        // Narrow by construction: only a KNOWN owner that is provably dead
+        // reclaims. An unknown owner (`None`) and a live owner both still
+        // refuse, so this cannot become "any watch request steals the slot".
+        let orphaned = existing
+            .owner_pid
+            .is_some_and(|pid| !lifecycle::process_is_live(pid));
+        if !force && !orphaned {
             return Err(Status::already_exists(
                 "a watcher is already running; stop it first (StopWatch) or retry with force",
             ));
         }
-        tracing::info!(
-            watcher_id = existing.id,
-            "force-stopping existing watcher (possibly orphaned)"
-        );
+        if orphaned && !force {
+            tracing::info!(
+                watcher_id = existing.id,
+                owner_pid = existing.owner_pid.unwrap_or_default(),
+                "reclaiming orphaned watcher — its owning client process is gone"
+            );
+        } else {
+            tracing::info!(
+                watcher_id = existing.id,
+                "force-stopping existing watcher (possibly orphaned)"
+            );
+        }
         existing.handle.stop();
     }
     let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
-    *guard = Some(WatcherRegistration { id, handle });
+    *guard = Some(WatcherRegistration {
+        id,
+        handle,
+        owner_pid,
+    });
     Ok(id)
+}
+
+/// The pid of the process on the other end of the unix socket a request
+/// arrived on, as reported by the kernel.
+///
+/// nw-302. `SO_PEERCRED` on Linux, `LOCAL_PEEREPID` on macOS, surfaced by
+/// tonic as [`UdsConnectInfo`](tonic::transport::server::UdsConnectInfo). This
+/// is deliberately not a request field: a self-reported pid could be wrong or
+/// forged, would need a protocol change, and would leave every already-shipped
+/// client (and the MCP proxy) unowned.
+///
+/// `None` for a TCP connection (server mode has no local watch sessions) and
+/// for direct in-process calls in tests — both correctly meaning "unknown
+/// owner", which preserves the pre-nw-302 refusal exactly.
+fn peer_owner_pid<T>(request: &Request<T>) -> Option<i32> {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred)
+        .and_then(|cred| cred.pid())
 }
 
 /// Clear a watcher registration on watcher-thread exit — but only when the
@@ -1978,9 +2312,10 @@ impl DaemonService {
             );
 
             let t_dispatch = std::time::Instant::now();
+            let dispatch_tantivy = state.tantivy();
             let mut value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
-                state.tantivy.as_deref(),
+                dispatch_tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
@@ -2115,9 +2450,10 @@ impl DaemonService {
             let embed_ref = embed_arc.as_deref();
 
             let t_dispatch = std::time::Instant::now();
+            let dispatch_tantivy = state.tantivy();
             let value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
-                state.tantivy.as_deref(),
+                dispatch_tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
@@ -2821,7 +3157,7 @@ where
 fn indexed_search_rows_before(
     state: &DaemonState,
 ) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>> {
-    indexed_search_rows_before_with(&state.search_reconciliation, || {
+    indexed_search_rows_before_with(&state.search_reconciliation(), || {
         indexed_search_rows(&state.store)
     })
 }
@@ -3200,7 +3536,7 @@ fn rebuild_tantivy_after_mutation(
     operation: &str,
 ) -> Result<(), anyhow::Error> {
     reconcile_search_index(
-        &state.search_reconciliation,
+        &state.search_reconciliation(),
         &state.store,
         mutation,
         operation,
@@ -3958,7 +4294,10 @@ impl NestWeaverDaemon for DaemonService {
             // contents, so stamp the logical instance (config name when set, else the
             // runtime hash) — not the runtime hash unconditionally. Restore keys
             // nothing on this field (checksum + schema-compat only), so it is safe.
-            instance_id: self.state.data_instance_id.clone(),
+            // nw-286: read live. The frozen field made this a claim about the
+            // instance the daemon BOOTED under, not the one whose data is in
+            // the archive.
+            instance_id: self.state.effective_data_instance_id(),
             workspace_path: if req.include_clones {
                 self.state.db_path.parent().map(|p| p.join("workspace"))
             } else {
@@ -4020,6 +4359,9 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
+        // nw-302: read the owner BEFORE `into_inner()` consumes the request's
+        // extensions — that is where the transport puts the peer credentials.
+        let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -4062,10 +4404,10 @@ impl NestWeaverDaemon for DaemonService {
         // so live edits update BM25 in place. Opening a separate handle
         // (reader-only or read-write) would either silently no-op writes
         // or collide on the writer lock.
-        if let Some(ref tantivy) = self.state.tantivy
+        if let Some(tantivy) = self.state.tantivy()
             && tantivy.has_writer()
         {
-            watcher = watcher.with_external_tantivy(Arc::clone(tantivy));
+            watcher = watcher.with_external_tantivy(tantivy);
         } else {
             watcher = watcher.with_tantivy_index(&tantivy_path);
         }
@@ -4082,11 +4424,13 @@ impl NestWeaverDaemon for DaemonService {
         let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // `force` now reaches here, as it always has for `watch_code`: the
-        // watcher slot is global and has no client-liveness check, so an
-        // orphaned registration otherwise blocks every later vault watch until
-        // the daemon restarts.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+        // `force` reaches here, as it always has for `watch_code`. nw-302: the
+        // slot is still global, but it is no longer ownerless — the incumbent
+        // records the pid of the client that asked for it, so a registration
+        // orphaned by a killed CLI is reclaimed automatically instead of
+        // blocking every later vault watch until the daemon restarts. `force`
+        // remains the override for an incumbent whose owner is ALIVE.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
             Ok(id) => id,
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchVaultResponse {
@@ -4157,6 +4501,9 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
+        // nw-302: read the owner BEFORE `into_inner()` consumes the request's
+        // extensions — that is where the transport puts the peer credentials.
+        let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let force = req.force;
@@ -4204,10 +4551,11 @@ impl NestWeaverDaemon for DaemonService {
         let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // With `force`, an already-running watcher (e.g. orphaned by a
-        // kill -9'd `watch` CLI) is stopped and replaced instead of
-        // failing every new watch session.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+        // With `force`, an already-running watcher whose owner is ALIVE is
+        // stopped and replaced. nw-302: one orphaned by a kill -9'd `watch`
+        // CLI no longer needs `force` — its owner pid is recorded, so the
+        // reclaim is automatic.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
             Ok(id) => id,
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
@@ -4442,7 +4790,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
-            state.tantivy.clone(),
+            // Per-RPC construction, so this is already as live as the runtime
+            // — but through the accessor, so it stays that way.
+            state.tantivy(),
             state.db_path.clone(),
         );
 
@@ -5126,10 +5476,8 @@ impl NestWeaverDaemon for DaemonService {
                     // error: a read-only replica legitimately has no writer.
                     // So it is disclosed rather than failed, and the phrasing
                     // says which of the two happened.
-                    let search_index_rebuilt = state
-                        .tantivy
-                        .as_ref()
-                        .is_some_and(|tantivy| tantivy.has_writer());
+                    let search_index_rebuilt =
+                        state.tantivy().is_some_and(|tantivy| tantivy.has_writer());
                     if !search_index_rebuilt {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "note: the graph was updated but the BM25 search index \
@@ -5140,7 +5488,7 @@ impl NestWeaverDaemon for DaemonService {
                             ..Default::default()
                         }));
                     }
-                    if let Some(ref tantivy) = state.tantivy
+                    if let Some(tantivy) = state.tantivy()
                         && tantivy.has_writer()
                     {
                         match tantivy.reindex_from_store(&state.store) {
@@ -5258,7 +5606,7 @@ impl NestWeaverDaemon for DaemonService {
                 &extra_patterns,
             ) {
                 Ok(result) => {
-                    if let Some(ref tantivy) = state.tantivy
+                    if let Some(tantivy) = state.tantivy()
                         && tantivy.has_writer()
                         && let Err(error) = tantivy.reindex_from_store(&state.store)
                     {
@@ -5830,13 +6178,9 @@ impl NestWeaverDaemon for DaemonService {
         let state = self.state.clone();
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let tantivy = state
-                .tantivy
-                .as_ref()
-                .filter(|t| t.has_writer())
-                .ok_or_else(|| {
-                    Status::failed_precondition("daemon has no writer-mode Tantivy index")
-                })?;
+            let tantivy = state.tantivy().filter(|t| t.has_writer()).ok_or_else(|| {
+                Status::failed_precondition("daemon has no writer-mode Tantivy index")
+            })?;
             let count = tantivy
                 .reindex_from_store(&state.store)
                 .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
@@ -6108,9 +6452,14 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "project": req.project,
-            "include_components": req.include_components,
             "include_seeds": req.include_seeds,
         });
+        // nw-316: only when the caller actually said so. Injecting it
+        // unconditionally re-erased the absence the `optional` field exists to
+        // carry, so the tool's documented default of `true` stayed unreachable.
+        if let Some(include_components) = req.include_components {
+            args["include_components"] = serde_json::json!(include_components);
+        }
         if req.token_budget > 0 {
             args["token_budget"] = serde_json::json!(req.token_budget);
         }
@@ -6164,9 +6513,12 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<NoteGetRequest>,
     ) -> Result<Response<NoteGetResponse>, Status> {
         let req = r.into_inner();
-        let mut args = serde_json::json!({
-            "include_body": req.include_body,
-        });
+        let mut args = serde_json::json!({});
+        // nw-316: omit when the caller did not say, so the tool's documented
+        // default governs instead of proto3's zero value.
+        if let Some(include_body) = req.include_body {
+            args["include_body"] = serde_json::json!(include_body);
+        }
         if let Some(ref uid) = req.uid {
             args["uid"] = serde_json::json!(uid);
         }
@@ -6991,13 +7343,25 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let instance = args.get("instance").and_then(|v| v.as_str());
-            let services = state
-                .store
-                .list_services(instance)
-                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
-            let service = services.iter().find(|s| s.name == name || s.uid == name);
-            match service {
-                Some(s) => serde_json::to_string(s)
+            let repo = args.get("repo").and_then(|v| v.as_str());
+            // nw-311: this used to be `services.iter().find(...)`, which
+            // returned the FIRST of however many matched and discarded the
+            // count, into a bare `Service` that had nowhere to put it. On a
+            // 44-repo graph the caller got a confident answer about a service
+            // they did not ask about, with no way to detect the substitution —
+            // while the CLI's direct path, unreachable whenever a daemon is up,
+            // already warned and listed every candidate.
+            //
+            // Both routes now call the same engine resolver. The payload
+            // FLATTENS the chosen service, so it stays a superset of what this
+            // RPC used to return: an older CLI still deserializes it as a
+            // `Service`, and every caller gains `matched` / `alternatives` /
+            // `entry_points` without a coordinated upgrade.
+            let summary =
+                nestweaver_engine::query::service_summary(&state.store, name, instance, repo)
+                    .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+            match summary {
+                Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
                 None => Err(Status::not_found(format!("service not found: {name}"))),
             }
@@ -10092,7 +10456,7 @@ pub async fn run_server(
     // the configured-index failure.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
     let tantivy_started = std::time::Instant::now();
-    let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
+    let search = Arc::new(SearchRuntime::open(tantivy_path.clone(), read_only));
     let tantivy_open_ms = tantivy_started.elapsed().as_millis() as u64;
 
     let idle_notify = Arc::new(Notify::new());
@@ -10311,12 +10675,11 @@ pub async fn run_server(
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
-        tantivy,
-        search_reconciliation,
+        search: Arc::clone(&search),
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
-        data_instance_id: data_instance_id.clone(),
+        data_instance_id,
         instance_stated_by_config: instance_cfg.is_some(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
@@ -10596,7 +10959,7 @@ pub async fn run_server(
                 nestweaver_mcp::http::McpHttpState::with_auth(
                     false,
                     state.store.clone(),
-                    state.tantivy.clone(),
+                    state.tantivy(),
                     state.db_path.clone(),
                     state.instance_cfg.clone(),
                     state.server_mode,
@@ -10607,7 +10970,7 @@ pub async fn run_server(
                 nestweaver_mcp::http::McpHttpState::new(
                     false,
                     state.store.clone(),
-                    state.tantivy.clone(),
+                    state.tantivy(),
                     state.db_path.clone(),
                     state.instance_cfg.clone(),
                     state.server_mode,
@@ -10618,6 +10981,13 @@ pub async fn run_server(
             s.embed_model_provider =
                 Some(state.embedding_runtime.clone()
                     as Arc<dyn nestweaver_engine::EmbedModelProvider>);
+            // Class B: and the search index for the same reason. This state is
+            // built ONCE, at boot, in server mode — so the `Option<Arc<..>>`
+            // above is a snapshot of the worst possible moment. The provider
+            // is what lets `/mcp` observe a sidecar that was repaired or
+            // created after this daemon started.
+            s.search_index_provider =
+                Some(Arc::clone(&search) as Arc<dyn nestweaver_engine::SearchIndexProvider>);
             // A read-only replica must reject mutating MCP tools before dispatch,
             // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
             s.read_only = read_only;
@@ -10692,7 +11062,12 @@ pub async fn run_server(
                 // nw-019: look up under the same logical instance the worker
                 // stamps on the repo, or the "already indexed?" check never
                 // matches and we re-enqueue on every boot.
-                let repo_uid = nestweaver_schema::repo_uid(&data_instance_id, &repo_cfg.url);
+                // nw-286: through the one accessor. This branch only runs
+                // under `state.instance_cfg`, so the accessor returns the
+                // stated instance and costs nothing — but it must not be the
+                // one site that still reads the frozen field.
+                let repo_uid =
+                    nestweaver_schema::repo_uid(&state.effective_data_instance_id(), &repo_cfg.url);
                 let needs_initial_index = state
                     .store
                     .lookup_repo(&repo_uid)
@@ -10799,7 +11174,7 @@ pub async fn run_server(
                     std::collections::HashMap::new(),
                 )),
                 daemon_store: state.store.clone(),
-                tantivy: state.tantivy.clone(),
+                tantivy: state.tantivy(),
                 instance_id: state.instance_id.clone(),
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
@@ -11277,7 +11652,12 @@ pub async fn run_server(
             let worker_store = Arc::clone(&state.store);
             let worker_db = db_path.clone();
             // nw-019: the worker stamps this on every repo it indexes.
-            let worker_instance = data_instance_id.clone();
+            // nw-286: a RESOLVER, not a boot-frozen clone — the worker asks
+            // once per job, so a database whose identity was minted after this
+            // daemon booted is stamped correctly rather than forked.
+            let worker_state = Arc::clone(&state);
+            let worker_instance: nestweaver_engine::worker::InstanceIdResolver =
+                Arc::new(move || worker_state.effective_data_instance_id());
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
             let worker_write_gate = state.write_gate.clone();
@@ -11419,7 +11799,9 @@ pub async fn run_server(
         let poll_store = Arc::clone(&state.store);
         // nw-019: must match the worker's stamp, or list_repos/repo_uid
         // lookups here find nothing and the scheduler never polls the repos.
-        let poll_instance = data_instance_id.clone();
+        // nw-286: which is why it reads through the same accessor the worker's
+        // resolver does, at the point of use, instead of freezing a copy here.
+        let poll_state = Arc::clone(&state);
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
@@ -11461,7 +11843,8 @@ pub async fn run_server(
             }
 
             // Also seed any already-indexed repos not in the config (legacy).
-            if let Ok(repos) = poll_store.list_repos(Some(&poll_instance)) {
+            if let Ok(repos) = poll_store.list_repos(Some(&poll_state.effective_data_instance_id()))
+            {
                 for repo in repos {
                     if seeded_urls.contains(&repo.url) {
                         continue;
@@ -11550,7 +11933,10 @@ pub async fn run_server(
                             };
                             // A completed ls-remote probe.
                             nestweaver_web::routes::metrics::POLL_CHECKS.inc();
-                            let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
+                            let r_uid = nestweaver_schema::repo_uid(
+                                &poll_state.effective_data_instance_id(),
+                                &url,
+                            );
                             let indexed_sha = poll_store.lookup_repo(&r_uid)
                                 .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
                             if remote_sha != indexed_sha {
@@ -11597,7 +11983,10 @@ pub async fn run_server(
         let metrics_job_queue = shared_job_queue_opt.clone();
         // nw-019: must match the worker's stamp, or the repo-count gauge
         // filters on the wrong instance and always reads zero.
-        let metrics_instance = data_instance_id.clone();
+        // nw-286: re-read each tick. This task outlives every identity change
+        // a running daemon can see, so a frozen copy meant the gauge silently
+        // reported zero for the daemon's whole life after the first mint.
+        let metrics_state = Arc::clone(&state);
         let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -11605,7 +11994,9 @@ pub async fn run_server(
             let mut last_metric_completed_at = 0_i64;
             loop {
                 // Update repo gauge.
-                if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
+                if let Ok(repos) =
+                    metrics_store.list_repos(Some(&metrics_state.effective_data_instance_id()))
+                {
                     metrics::REPOS_TOTAL
                         .with_label_values(&["indexed"])
                         .set(repos.len() as i64);
@@ -12460,6 +12851,7 @@ mod startup_helper_tests {
                 word_count: 3,
                 content_hash: format!("hash:{note_uid}"),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -12552,6 +12944,7 @@ mod startup_helper_tests {
                 word_count: 1,
                 content_hash: "dead".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -12589,7 +12982,7 @@ mod startup_helper_tests {
     #[test]
     fn nonexistent_vault_skips_all_reconciliation_after_unknown_preflight() {
         let state = test_state_with_writer();
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:nonexistent-vault-noop",
@@ -12639,11 +13032,12 @@ mod startup_helper_tests {
             "confirmed no-op must not rebuild available search"
         );
 
-        let mut unavailable = test_state_with_writer();
-        Arc::get_mut(&mut unavailable)
-            .unwrap()
-            .search_reconciliation =
-            SearchIndexReconciliation::Unavailable("configured search unavailable".to_string());
+        let unavailable = test_state_with_writer();
+        unavailable
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "configured search unavailable".to_string(),
+            ));
         let generation_before = unavailable.store.graph_generation();
         let response = run_remove_vault_with_projection(
             &unavailable,
@@ -12669,7 +13063,7 @@ mod startup_helper_tests {
         let embedding_path = state.store.embedding_sidecar_path().unwrap();
         std::fs::remove_file(&embedding_path).unwrap();
         std::fs::create_dir(&embedding_path).unwrap();
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:stale-vault-reconciliation",
@@ -13389,7 +13783,7 @@ mod startup_helper_tests {
         let (source_note_uid, _) =
             seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
         reconcile_search_index(
-            &state.search_reconciliation,
+            &state.search_reconciliation(),
             &state.store,
             IndexedSearchMutation::Changed,
             "seed_crash_recovery_vault",
@@ -13414,7 +13808,7 @@ mod startup_helper_tests {
         )
         .unwrap();
         let destination_vault_uid = state.store.list_vaults(Some("new")).unwrap()[0].uid.clone();
-        let stale_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        let stale_hits = state.tantivy().unwrap().search("Note", 10).unwrap();
         assert!(
             stale_hits
                 .iter()
@@ -13428,7 +13822,7 @@ mod startup_helper_tests {
 
         recover_pending_instance_extension_migration(&state).unwrap();
 
-        let recovered_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        let recovered_hits = state.tantivy().unwrap().search("Note", 10).unwrap();
         assert!(
             !recovered_hits
                 .iter()
@@ -13592,12 +13986,15 @@ mod startup_helper_tests {
     fn unavailable_search_finalizer_keeps_graph_applied_journal_until_restart_retry() {
         use nestweaver_schema::uid::vault_uid;
 
-        let mut state = test_state_with_writer();
+        let state = test_state_with_writer();
         let root = "/missing/unavailable-search-retry";
         let source_vault_uid = vault_uid("old", root);
         seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
-        Arc::get_mut(&mut state).unwrap().search_reconciliation =
-            SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "injected writer outage".to_string(),
+            ));
 
         run_merge_instance_with(
             &state,
@@ -13619,9 +14016,10 @@ mod startup_helper_tests {
         assert!(!pending.reconciled());
         assert!(pending.search_reconciliation_required());
 
-        let tantivy = Arc::clone(state.tantivy.as_ref().unwrap());
-        Arc::get_mut(&mut state).unwrap().search_reconciliation =
-            SearchIndexReconciliation::Available(tantivy);
+        let tantivy = state.tantivy().unwrap();
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Available(tantivy));
         recover_pending_instance_extension_migration(&state).unwrap();
         assert!(
             !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
@@ -14512,6 +14910,7 @@ mod startup_helper_tests {
             word_count: 1,
             content_hash: "old-hash".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -14555,6 +14954,110 @@ mod startup_helper_tests {
             }
             _ => panic!("writer lock must remain explicit unavailable mutation state"),
         }
+    }
+
+    /// Class B (the same lifetime error as nw-286, in the field beside it):
+    /// a daemon that could not open its search index at BOOT must be able to
+    /// pick it up later.
+    ///
+    /// `tantivy` and `search_reconciliation` were opened once from the
+    /// filesystem during `serve()` and had no re-open path, so a daemon that
+    /// started while the sidecar was locked — or before it existed — answered
+    /// every search from the substring fallback for its ENTIRE life, and said
+    /// so in exactly one boot-time log line. Repairing the sidecar externally
+    /// changed nothing until the process was restarted.
+    ///
+    /// The failure is induced with a plain FILE where the index directory
+    /// belongs: `open_or_create` cannot `create_dir_all` over it and
+    /// `open_reader_only` cannot read it, which is exactly the (None,
+    /// Unavailable) boot state the defect describes.
+    #[test]
+    fn a_search_index_that_could_not_be_opened_at_boot_is_reopened_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        // A file, not a directory: the index cannot be opened over it.
+        std::fs::write(&tantivy_path, b"not an index").unwrap();
+
+        let runtime = SearchRuntime::with_retry_interval(
+            tantivy_path.clone(),
+            false,
+            std::time::Duration::ZERO,
+        );
+        let booted = runtime.snapshot();
+        assert!(
+            booted.tantivy.is_none(),
+            "precondition: the daemon boots with no search index — this is the \
+             state the defect is about"
+        );
+        assert!(!booted.is_healthy());
+
+        // The obstruction clears — an operator repaired the sidecar, or the
+        // process that held it exited. Nothing restarts the daemon.
+        std::fs::remove_file(&tantivy_path).unwrap();
+
+        let recovered = runtime.snapshot();
+        assert!(
+            recovered.tantivy.is_some(),
+            "a repaired sidecar must be picked up without a daemon restart; \
+             holding None here is the Class B freeze — substring-fallback \
+             search for the whole life of the process"
+        );
+        assert!(matches!(
+            recovered.reconciliation,
+            SearchIndexReconciliation::Available(_)
+        ));
+        assert!(
+            recovered.tantivy.as_ref().unwrap().has_writer(),
+            "and it must be the WRITER, or index and vault mutations still \
+             never reach BM25"
+        );
+    }
+
+    /// The retry must be throttled and must never DOWNGRADE what it already
+    /// has. A burst of queries against a still-broken sidecar would otherwise
+    /// pay a failed open each, and a harder failure on a later attempt must
+    /// not turn a working reader-only fallback into nothing.
+    #[test]
+    fn a_still_broken_search_index_is_retried_at_most_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        std::fs::write(&tantivy_path, b"not an index").unwrap();
+
+        let runtime = SearchRuntime::with_retry_interval(
+            tantivy_path.clone(),
+            false,
+            std::time::Duration::from_secs(3600),
+        );
+        assert!(runtime.snapshot().tantivy.is_none());
+
+        // Repair it, but stay inside the retry window: still no index.
+        std::fs::remove_file(&tantivy_path).unwrap();
+        assert!(
+            runtime.snapshot().tantivy.is_none(),
+            "the retry window must actually bound the reopen attempts, or a \
+             broken sidecar costs a failed open on every query"
+        );
+    }
+
+    /// A healthy runtime must never re-open. This is the fence that keeps the
+    /// recovery free for the overwhelmingly common case.
+    #[test]
+    fn a_healthy_search_index_is_never_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        let runtime =
+            SearchRuntime::with_retry_interval(tantivy_path, false, std::time::Duration::ZERO);
+        let first = runtime.snapshot();
+        assert!(matches!(
+            first.reconciliation,
+            SearchIndexReconciliation::Available(_)
+        ));
+        let first_handle = first.tantivy.unwrap();
+        let second_handle = runtime.snapshot().tantivy.unwrap();
+        assert!(
+            Arc::ptr_eq(&first_handle, &second_handle),
+            "a healthy runtime must hand back the SAME handle, not re-open"
+        );
     }
 
     #[test]
@@ -14923,6 +15426,7 @@ mod startup_helper_tests {
                 word_count: 3,
                 content_hash: "null-name-durable-remove-hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -15563,7 +16067,7 @@ mod startup_helper_tests {
         deps.save(&deps_path).unwrap();
 
         let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:late-remove",
@@ -15724,6 +16228,124 @@ mod startup_helper_tests {
         // An invalid instance is still rejected at this trust boundary rather
         // than silently producing an ambiguous uid.
         assert!(pick_effective_instance_id("a:b", "default").is_err());
+    }
+
+    /// nw-286: the daemon's RESOLUTION must be as live as its ambiguity check.
+    ///
+    /// `test_state_with_writer` builds the exact F-INST-1 boot condition: a
+    /// config-less daemon that snapshotted `data_instance_id = "default"` from
+    /// a database that was still empty. That is not a contrived state — it is
+    /// the universal one, because the first `nestweaver index` both CREATES the
+    /// database and autostarts the daemon that will serve it, so the daemon
+    /// reads the identity at the one moment the database has nothing to say.
+    /// The database then mints `alpha` (what `index --instance alpha` does, via
+    /// `record_data_instance`). A later config-less write must ADOPT `alpha` —
+    /// the changelog's word — not stamp the boot snapshot and fork the graph.
+    ///
+    /// nw-275 made only the AMBIGUITY check live. With one instance present the
+    /// ambiguity arm is inert, so it cannot cover for a frozen resolution.
+    #[test]
+    fn a_configless_write_adopts_the_recorded_instance_minted_after_boot() {
+        let state = test_state_with_writer();
+
+        // Precondition: this is the boot snapshot F-INST-1 starts from.
+        assert_eq!(state.data_instance_id, "default");
+        assert!(!state.instance_stated_by_config);
+        assert_eq!(
+            state.store.data_instance_id().unwrap(),
+            None,
+            "the database is empty at daemon boot — that is the whole setup"
+        );
+
+        // STEP 1 equivalent: an explicitly instanced write mints the identity.
+        assert_eq!(
+            state.store.ensure_data_instance_id("alpha").unwrap(),
+            "alpha"
+        );
+
+        // STEP 2: a BARE write — empty `requested` is the protocol's
+        // "you decide" sentinel.
+        let effective = resolve_effective_instance_id("", &state)
+            .expect("a single-instance database must not refuse a config-less write");
+
+        assert_eq!(
+            effective, "alpha",
+            "a config-less write must adopt the identity the database records, \
+             not the boot snapshot; returning \"default\" here is the nw-246 fork \
+             (repo:alpha:<hash> AND repo:default:<hash> for one path)"
+        );
+    }
+
+    /// nw-286, the "where else" half: the choke point is one of SIX readers of
+    /// the daemon's data identity. The other five are off-struct — the backup
+    /// manifest, the config-repo enqueue, the worker stamp, the poll scheduler
+    /// and the repo gauge — and three of them carry comments requiring them to
+    /// MATCH the worker's stamp. Fixing only the choke point would make
+    /// resolution live while those stayed frozen, splitting the twin pair a
+    /// third time in the fix for a bug about splitting twin pairs.
+    ///
+    /// They therefore all read through this one accessor. Asserting on the
+    /// accessor is what makes "all six" checkable rather than asserted.
+    #[test]
+    fn the_shared_accessor_is_live_for_every_reader_of_the_data_identity() {
+        let state = test_state_with_writer();
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "default",
+            "an empty database has nothing to say; the ambient default stands"
+        );
+
+        state.store.ensure_data_instance_id("alpha").unwrap();
+
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "alpha",
+            "every consumer — backup manifest, config-repo enqueue, worker \
+             stamp, poll scheduler, repo gauge — reads through here, so a \
+             single assertion covers all of them"
+        );
+    }
+
+    /// The `--config`-stated path must NOT start paying for a store read, and
+    /// must keep returning the stated instance even when the database records
+    /// another — that is supported `--config`-driven instance switching, not a
+    /// fork. This is the regression fence for the half of nw-286 that must NOT
+    /// change.
+    #[test]
+    fn a_config_stated_instance_still_wins_over_the_recorded_one() {
+        let mut state = test_state_with_writer();
+        {
+            let state = Arc::get_mut(&mut state).expect("sole owner in test");
+            state.data_instance_id = "kory-brain".to_string();
+            state.instance_stated_by_config = true;
+        }
+        state.store.ensure_data_instance_id("alpha").unwrap();
+
+        assert_eq!(
+            resolve_effective_instance_id("", &state).unwrap(),
+            "kory-brain",
+            "a stated instance is intent and passes through untouched"
+        );
+        assert_eq!(
+            state.effective_data_instance_id(),
+            "kory-brain",
+            "and the shared accessor agrees, so the worker stamp cannot \
+             diverge from the choke point"
+        );
+    }
+
+    /// A per-request `--instance` still beats the recorded identity: the
+    /// request is the most explicit statement of intent there is, and
+    /// `instance merge --from/--to` (the documented remedy for an already
+    /// forked database) depends on it being obeyed.
+    #[test]
+    fn a_requested_instance_still_beats_the_recorded_one() {
+        let state = test_state_with_writer();
+        state.store.ensure_data_instance_id("alpha").unwrap();
+        assert_eq!(
+            resolve_effective_instance_id("beta", &state).unwrap(),
+            "beta"
+        );
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
@@ -16539,6 +17161,7 @@ mod startup_helper_tests {
                 word_count: 1,
                 content_hash: format!("note-hash-{suffix}"),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -16793,14 +17416,22 @@ mod startup_helper_tests {
             std::fs::write(generation_path, generation.to_string()).unwrap();
         }
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
-        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        let dir_path = dir.path().to_path_buf();
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir_path.join("tantivy")).unwrap());
         // Keep the temp dir alive for the duration of the test process.
         std::mem::forget(dir);
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: Some(Arc::clone(&tantivy)),
-            search_reconciliation: SearchIndexReconciliation::Available(tantivy),
+            search: Arc::new(SearchRuntime::from_parts(
+                dir_path.join("tantivy"),
+                false,
+                SEARCH_REOPEN_RETRY_INTERVAL,
+                SearchRuntimeSnapshot {
+                    tantivy: Some(Arc::clone(&tantivy)),
+                    reconciliation: SearchIndexReconciliation::Available(tantivy),
+                },
+            )),
             db_path,
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
@@ -16884,8 +17515,15 @@ credential_method = "gh"
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: None,
-            search_reconciliation: SearchIndexReconciliation::Disabled,
+            search: Arc::new(SearchRuntime::from_parts(
+                std::path::PathBuf::from(":memory:.tantivy"),
+                false,
+                SEARCH_REOPEN_RETRY_INTERVAL,
+                SearchRuntimeSnapshot {
+                    tantivy: None,
+                    reconciliation: SearchIndexReconciliation::Disabled,
+                },
+            )),
             db_path: std::path::PathBuf::from(":memory:"),
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
@@ -18536,7 +19174,7 @@ external_model = "unavailable-test-model"
         // that `--force` would otherwise tear down.
         let incumbent =
             nestweaver_engine::CodeWatcher::new(&state.db_path, repo_dir.path(), "test-instance");
-        register_watcher(&state, incumbent.shutdown_handle(), false)
+        register_watcher(&state, incumbent.shutdown_handle(), false, None)
             .expect("the incumbent registers before shutdown");
 
         state.active_writes.store(1, Ordering::Relaxed);
@@ -19076,6 +19714,10 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_a.clone()),
             false,
+            // nw-302: a LIVE owner, so this test still exercises the `force`
+            // override it is named for rather than silently becoming a test of
+            // automatic reclaim.
+            Some(std::process::id() as i32),
         )
         .expect("first registration");
 
@@ -19084,6 +19726,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
             false,
+            Some(std::process::id() as i32),
         )
         .expect_err("second registration without force must fail");
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
@@ -19097,6 +19740,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
             true,
+            Some(std::process::id() as i32),
         )
         .expect("force registration");
         assert!(
@@ -19116,6 +19760,148 @@ external_model = "unavailable-test-model"
         assert!(state.watcher_stop.lock().unwrap().is_none());
     }
 
+    /// Spawn a process, wait for it, and return its pid — a pid that is
+    /// provably not live by the time this returns, without guessing at a
+    /// number. Reaping matters: a zombie is still `kill(pid, 0)`-visible, so an
+    /// unwaited child would report LIVE and the test would pass for the wrong
+    /// reason.
+    fn spawn_and_reap_a_short_lived_process() -> i32 {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn a trivially short-lived process");
+        let pid = child.id() as i32;
+        child.wait().expect("reap it");
+        pid
+    }
+
+    /// nw-302: an incumbent whose owning client is GONE must be reclaimed
+    /// automatically, not left blocking every later watch for the daemon's
+    /// lifetime.
+    ///
+    /// 8.0.0 claims "reclaim an orphaned watcher". What shipped was `force` on
+    /// `WatchVaultRequest` — an operator override, not a reclaim: the daemon
+    /// could not tell an orphan from a live watcher, because
+    /// `WatcherRegistration` recorded no owner. `WatchVault` is unary, so the
+    /// client's death produces no observable event; without an owner there was
+    /// nothing to observe.
+    ///
+    /// The operational shape this is actually about: a vault watcher under
+    /// launchd. An OOM kill leaves the vault silently unwatched AND blocks the
+    /// automatic restart, and an unattended supervisor cannot type `--force`.
+    #[test]
+    fn a_watcher_whose_owner_process_is_gone_is_reclaimed_without_force() {
+        let state = test_state_with_writer();
+        let orphan = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+
+        let dead_pid = spawn_and_reap_a_short_lived_process();
+        assert!(
+            !lifecycle::process_is_live(dead_pid),
+            "the fixture must actually be dead or the test proves nothing"
+        );
+
+        let orphan_id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(orphan.clone()),
+            false,
+            Some(dead_pid),
+        )
+        .expect("first registration");
+
+        // The client is gone. A plain (non-force) watch must now SUCCEED.
+        let new_id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(replacement.clone()),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .expect(
+            "an incumbent whose owner is dead must be reclaimed automatically; \
+             refusing here is the nw-302 wedge — every later watcher is refused \
+             until the daemon restarts",
+        );
+
+        assert_ne!(orphan_id, new_id);
+        assert!(
+            orphan.load(Ordering::Relaxed),
+            "reclaiming must stop the orphaned watcher, not merely overwrite its slot"
+        );
+        assert!(!replacement.load(Ordering::Relaxed));
+    }
+
+    /// The reclaim must be narrow: a LIVE owner is still protected, and the
+    /// operator override still works. This is the fence that stops the nw-302
+    /// fix from becoming "any watch request steals the slot".
+    #[test]
+    fn a_watcher_with_a_live_owner_is_still_refused_without_force() {
+        let state = test_state_with_writer();
+        let incumbent = Arc::new(AtomicBool::new(false));
+
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(incumbent.clone()),
+            false,
+            Some(std::process::id() as i32), // alive, by construction
+        )
+        .expect("first registration");
+
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .expect_err("a live owner must still be protected");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !incumbent.load(Ordering::Relaxed),
+            "a refused registration must not stop the incumbent"
+        );
+    }
+
+    /// An UNKNOWN owner (`None` — a TCP caller, or an in-process call) must
+    /// behave exactly as before nw-302: refuse without force. Absence of
+    /// evidence of death is not evidence of death, and treating it as such
+    /// would let one watch request evict another for no reason.
+    #[test]
+    fn an_unknown_owner_is_refused_without_force_exactly_as_today() {
+        let state = test_state_with_writer();
+        let incumbent = Arc::new(AtomicBool::new(false));
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(incumbent.clone()),
+            false,
+            None,
+        )
+        .expect("first registration");
+
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            None,
+        )
+        .expect_err("unknown ownership must not be treated as orphaned");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !incumbent.load(Ordering::Relaxed),
+            "a refused registration must not stop the incumbent"
+        );
+    }
+
+    /// nw-302's liveness predicate must not read a permission failure as
+    /// death. `kill(pid, 0)` returns EPERM for a process owned by another
+    /// user — pid 1 (launchd/init) is the portable example — and treating that
+    /// as "gone" would let any user's watch request reclaim a slot from a
+    /// process it merely cannot signal.
+    #[test]
+    fn process_liveness_does_not_read_a_permission_failure_as_death() {
+        assert!(lifecycle::process_is_live(std::process::id() as i32));
+        assert!(lifecycle::process_is_live(1), "pid 1 is always running");
+        assert!(!lifecycle::process_is_live(0));
+        assert!(!lifecycle::process_is_live(-1));
+    }
+
     /// The shutdown RPC stops any active watcher up front, so an
     /// orphaned watcher's blocking thread can't pin the drain until the
     /// client's SIGKILL.
@@ -19127,6 +19913,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
             false,
+            None,
         )
         .unwrap();
 

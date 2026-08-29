@@ -326,7 +326,21 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
     let mut schema_drift = Vec::new();
     if !templates.is_empty() {
         for n in &notes {
-            let kind_key = n.note_kind.to_string().to_lowercase();
+            // A template defines the schema; it cannot drift from it. The
+            // templates are themselves notes, so without this every template
+            // was linted against the merged bucket and reported as drifting
+            // from every other template (nw-307).
+            if n.file_path
+                .to_lowercase()
+                .replace('\\', "/")
+                .contains("_templates/")
+            {
+                continue;
+            }
+            let kind_key = note_template_key(n);
+            // A note whose declared kind has no template is untemplated, not
+            // drifting. This is what keeps the fix from over-flagging in the
+            // other direction.
             let Some(required) = templates.get(&kind_key) else {
                 continue;
             };
@@ -541,10 +555,22 @@ fn dfs_cycles<'a>(
     color.insert(node, 2);
 }
 
-/// Load template frontmatter keys from `_templates/<kind>.md` notes in the
-/// vault. Returns `note_kind_lowercased → {required keys}`. Empty when no
+/// Load template frontmatter keys from `_templates/<name>.md` notes in the
+/// vault. Returns `template_stem_lowercased → {required keys}`. Empty when no
 /// template notes exist. A template note's path is matched against
-/// `_templates/` (case-insensitive) and its stem is the note-kind hint.
+/// `_templates/` (case-insensitive).
+///
+/// The key is the template's own STEM, not `NoteKind::from_hint(stem)`.
+/// `NoteKind` is a six-variant retrieval hint with a `General` catch-all, so it
+/// is not injective over template names: `Log`, `Architecture`, `Decision`,
+/// `Backlog Item`, `Project` and `Person` all mapped to `general`, and
+/// `HashSet::extend` then UNIONED their key sets into one bucket. Every note
+/// that also landed on `General` was checked against that union, so a daily log
+/// matching `_templates/Log.md` exactly was reported missing twelve keys that
+/// belong to other templates — 96% of the vault flagged (nw-307).
+///
+/// The collision was lossy in the worst direction: additive, so each new
+/// unrecognised template made the bucket stricter for every note in it.
 fn load_templates(store: &GraphStore) -> HashMap<String, HashSet<String>> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     let Ok(notes) = store.list_notes(None) else {
@@ -561,17 +587,61 @@ fn load_templates(store: &GraphStore) -> HashMap<String, HashSet<String>> {
         else {
             continue;
         };
-        // Map the template stem through the same kind-hint logic the parser
-        // uses, so `_templates/meeting.md` governs Meeting notes.
-        let kind = nestweaver_schema::NoteKind::from_hint(stem)
-            .to_string()
-            .to_lowercase();
         let keys = note_frontmatter_keys(n);
         if !keys.is_empty() {
-            out.entry(kind).or_default().extend(keys);
+            out.entry(normalize_template_key(stem))
+                .or_default()
+                .extend(keys);
         }
     }
     out
+}
+
+/// Collapse a template name or a note's declared kind to one comparable key.
+///
+/// Lowercased, with every run of non-alphanumeric characters reduced to a
+/// single space, so `_templates/Backlog Item.md`, `type: backlog-item` and
+/// `category: Backlog_Item` all name the same template.
+fn normalize_template_key(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+/// The template key a note declares for ITSELF: frontmatter `type:`, then
+/// `category:`, then its `note_kind` display name.
+///
+/// The note's own declared identity is what the schema check needs; routing it
+/// through `NoteKind` is what made six distinct template names indistinguishable
+/// (nw-307).
+fn note_template_key(note: &nestweaver_schema::Note) -> String {
+    for field in ["type", "category"] {
+        if let Some(value) = note_frontmatter_string(note, field) {
+            let key = normalize_template_key(&value);
+            if !key.is_empty() {
+                return key;
+            }
+        }
+    }
+    normalize_template_key(&note.note_kind.to_string())
+}
+
+/// Read one string-valued frontmatter field from a note's stored JSON.
+fn note_frontmatter_string(note: &nestweaver_schema::Note, key: &str) -> Option<String> {
+    let fm = note.frontmatter.as_deref()?;
+    let json = serde_json::from_str::<serde_json::Value>(fm).ok()?;
+    json.get(key)?.as_str().map(|s| s.to_string())
 }
 
 // ── memory_consolidate ───────────────────────────────────────────────────────
@@ -1200,6 +1270,110 @@ mod tests {
         assert!(
             report.stale.iter().any(|s| s.title == "Active"),
             "active note older than 90 days must be flagged stale"
+        );
+    }
+
+    #[test]
+    fn lint_does_not_union_unrelated_templates_into_one_kind() {
+        // nw-307 / F-HEALTH-2: `NoteKind::from_hint` collapses every
+        // unrecognised template stem to `General`, and `load_templates` then
+        // UNIONS their key sets into the single "general" bucket. A daily log
+        // that matches `_templates/Log.md` EXACTLY is flagged for missing
+        // Backlog-Item keys it was never supposed to have.
+        let (_dir, root) = make_vault(&[
+            (
+                "_templates/Log.md",
+                "---\nPeople:\ntags: [type/daily-log]\n---\n# Log Template\n",
+            ),
+            (
+                "_templates/Backlog Item.md",
+                "---\nid:\npriority:\nstatus:\npromoted:\n---\n# Backlog Item Template\n",
+            ),
+            (
+                "_logs/2024-03-26.md",
+                "---\ntype: log\nPeople:\ntags: [type/daily-log]\n---\n# 2024-03-26\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let report = memory_lint(&store, 1_900_000_000.0).unwrap();
+
+        let drift = report
+            .schema_drift
+            .iter()
+            .find(|d| d.file_path.ends_with("2024-03-26.md"));
+        assert!(
+            drift.is_none(),
+            "a note matching its own template exactly must not drift; \
+             it was flagged for {:?} — keys belonging to Backlog Item",
+            drift.map(|d| &d.missing_keys)
+        );
+    }
+
+    /// nw-307, the other half of the same bucket bug: the templates themselves
+    /// are notes, so they lint against the merged bucket and every template is
+    /// reported as drifting from every other template.
+    #[test]
+    fn lint_does_not_flag_the_template_notes_themselves() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_templates/Log.md",
+                "---\nPeople:\ntags: [type/daily-log]\n---\n# Log Template\n",
+            ),
+            (
+                "_templates/Backlog Item.md",
+                "---\nid:\npriority:\nstatus:\npromoted:\n---\n# Backlog Item Template\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let report = memory_lint(&store, 1_900_000_000.0).unwrap();
+        let flagged: Vec<&str> = report
+            .schema_drift
+            .iter()
+            .filter(|d| d.file_path.to_lowercase().contains("_templates/"))
+            .map(|d| d.file_path.as_str())
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "a template defines the schema; it cannot drift from it — got {flagged:?}"
+        );
+    }
+
+    /// nw-307's guard against over-correcting: a note whose declared kind DOES
+    /// have a template must still be checked against exactly that template.
+    #[test]
+    fn lint_still_flags_drift_against_the_notes_own_template() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_templates/Log.md",
+                "---\nPeople:\ntags: [type/daily-log]\n---\n# Log Template\n",
+            ),
+            (
+                "_templates/Backlog Item.md",
+                "---\nid:\npriority:\nstatus:\npromoted:\n---\n# Backlog Item Template\n",
+            ),
+            // Declares `type: backlog item` but carries only `id`.
+            (
+                "items/one.md",
+                "---\ntype: backlog item\nid: nw-1\n---\n# One\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let report = memory_lint(&store, 1_900_000_000.0).unwrap();
+        let drift = report
+            .schema_drift
+            .iter()
+            .find(|d| d.file_path.ends_with("items/one.md"))
+            .expect("a backlog item missing priority/status/promoted must drift");
+        let mut missing = drift.missing_keys.clone();
+        missing.sort();
+        assert_eq!(
+            missing,
+            vec![
+                "priority".to_string(),
+                "promoted".to_string(),
+                "status".to_string()
+            ],
+            "only its OWN template's keys — never the Log template's"
         );
     }
 

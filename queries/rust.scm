@@ -102,6 +102,24 @@
 (reference_type
   type: (type_identifier) @name) @reference.type_ref
 
+; Struct literal: `MyType { .. }` CONSTRUCTS the type, which is the strongest
+; possible use of it, yet every rule above matches only a type ANNOTATION. A
+; struct that is only ever built and never annotated therefore had no inbound
+; edge at all -- `MaintenanceHandle`, `ChildGuard`, `RuntimeDirFixture` and
+; `PreparedRestart` were all reported as unreachable while being constructed in
+; their own file (nw-291 follow-up).
+(struct_expression
+  name: (type_identifier) @name) @reference.type_ref
+
+; Associated-item path: `MyType::new()`, `MyType::CONST`. The .scm already
+; captures the trailing `name:` as a call; the leading `path:` is a use of the
+; TYPE and was captured nowhere. Gated on an upper-case initial so a module
+; path -- `std::fs`, `tools::dispatch` -- is not turned into a type reference
+; and cannot bind to a same-named symbol somewhere else in the graph.
+((scoped_identifier
+   path: (identifier) @name) @reference.type_ref
+ (#match? @name "^[A-Z]"))
+
 ; ── Field access (ACCESSES edges) ───────────────────────────────────
 ; Field expression: obj.field
 (field_expression

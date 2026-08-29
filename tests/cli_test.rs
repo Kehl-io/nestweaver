@@ -5161,3 +5161,1414 @@ credential_method = "gh"
         );
     }
 }
+
+// ── nw-284 / S2: a mutating command may infer its source OR its target ────
+
+/// nw-284 / S2. A bare `nestweaver index` — neither source nor target stated —
+/// must refuse, because it would otherwise index the current directory into
+/// whatever `NESTWEAVER_DB` happens to name. This fired against the production
+/// graph during the 8.0.0 post-release hunt (102 files, 2329 symbols, repos
+/// 43 -> 44) and exited 0.
+///
+/// The test owns its environment end to end: cwd is a temp dir, NESTWEAVER_DB
+/// is set to a path inside that same temp dir, and no assertion depends on any
+/// inherited variable.
+#[test]
+fn index_refuses_when_neither_repo_nor_db_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.py"), "def f():\n    return 1\n").unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .arg("index")
+        .assert()
+        .code(64)
+        // names the inferred SOURCE
+        .stderr(contains(cwd.display().to_string()))
+        // names the inferred TARGET and where it came from
+        .stderr(contains(ambient_db.display().to_string()))
+        .stderr(contains("NESTWEAVER_DB"))
+        // offers a remedy that actually discriminates
+        .stderr(contains("--repo").and(contains("--db")));
+
+    // The refusal must be total: nothing was written to the ambient target.
+    assert!(
+        !ambient_db.exists(),
+        "a refused index must not create or touch the ambient database"
+    );
+}
+
+/// The companion half of S2, and the reason the guard is not "make --repo
+/// required": stating EITHER end is intent, and must still work.
+#[test]
+fn index_still_runs_when_only_one_end_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.py"), "def f():\n    return 1\n").unwrap();
+    let stated_db = dir.path().join("stated.lbug");
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Source inferred from cwd, target stated -> allowed.
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["index", "--db"])
+        .arg(&stated_db)
+        .assert()
+        .success();
+    assert!(stated_db.exists());
+    assert!(!ambient_db.exists());
+
+    // Target inferred from the environment, source stated -> also allowed.
+    let second = dir.path().join("second.lbug");
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .env("NESTWEAVER_DB", &second)
+        .args(["index", "--repo"])
+        .arg(&cwd)
+        .assert()
+        .success();
+    assert!(second.exists());
+}
+
+/// S2 is a property, not a fix to `index`. `watch` shares the shape
+/// byte-for-byte and is strictly worse — it writes for as long as it runs — so
+/// it must refuse identically.
+#[test]
+fn watch_refuses_when_neither_repo_nor_db_was_stated() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Bounded on purpose. Without the guard `watch` does not exit — it starts
+    // watching and writes to the ambient database for as long as it runs,
+    // which is precisely why this arm is a refusal and not a warning. An
+    // unbounded assert here would hang the suite on a regression instead of
+    // reporting one.
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .arg("watch")
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .code(64)
+        .stderr(contains("NESTWEAVER_DB"));
+    assert!(!ambient_db.exists());
+}
+
+/// `ui --watch` re-indexes continuously and had NO `--repo` flag at all, so
+/// its source was not even statable. The flag added by this fix is what makes
+/// the guard satisfiable rather than a dead end.
+#[test]
+fn ui_watch_refuses_a_wholly_inferred_write_and_can_be_corrected() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["ui", "--watch"])
+        .assert()
+        .code(64)
+        .stderr(contains("NESTWEAVER_DB"));
+
+    // The remedy the refusal names must exist on this command.
+    nestweaver_cmd()
+        .args(["ui", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--repo"));
+}
+
+/// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
+/// later widening of the guard cannot quietly break plain `nestweaver ui`.
+#[test]
+fn ui_without_watch_is_not_subject_to_the_s2_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("some-checkout");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ambient_db = dir.path().join("ambient.lbug");
+
+    // Port 0 is refused by the server, so this cannot bind and hang; what
+    // matters is only that it is NOT the usage refusal.
+    let output = nestweaver_cmd()
+        .current_dir(&cwd)
+        .env("NESTWEAVER_DB", &ambient_db)
+        .args(["ui", "--no-open", "--port", "0"])
+        .timeout(std::time::Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(64),
+        "plain `ui` reads; S2 must not refuse it: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── nw-285: a corrupt database must fail closed, not die on a signal ─────
+
+/// nw-285 / F-CLI-3. Opening a corrupted `.lbug` killed the process with
+/// SIGSEGV (exit 139) and printed nothing at all — indistinguishable from
+/// being killed by something else. The fault is in the vendored lbug C++
+/// (`StorageManager::recover` -> `PrimaryKeyIndex::load`), a pinned crates.io
+/// dependency, so this pins OUR half of the contract: whatever the engine does
+/// internally, the process terminates NORMALLY with a diagnosable message.
+///
+/// Corruption starts well PAST the header on purpose. A header/magic-byte
+/// check would pass the real reproduction — which overwrote 40%-60% of a
+/// 5.6 GB file — and would therefore pass its own regression test while
+/// missing the fault. That is the exact failure class this release exists to
+/// remove, so the fixture is built to rule it out.
+///
+/// Several ranges are exercised because WHICH range faults is a function of
+/// where this fixture's index pages happen to land: some return an ordinary
+/// `Err`, some take the process down. Both are acceptable outcomes; dying on a
+/// signal is not. Asserting the invariant over the set is what keeps this test
+/// honest at fixture scale instead of pinning one lucky offset.
+#[test]
+#[cfg(unix)]
+fn opening_a_corrupted_database_never_dies_on_a_signal() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Enough symbols that the on-disk index has real structure to corrupt: a
+    // near-empty database keeps all its data in the WAL, where this recipe
+    // would touch nothing and the test would pass vacuously.
+    for i in 0..120 {
+        let mut body = String::new();
+        for j in 0..20 {
+            body.push_str(&format!(
+                "def f{i}_{j}(x):\n    return x + {j}\n\nclass C{i}_{j}:\n    def g(self):\n        return f{i}_{j}(1)\n\n"
+            ));
+        }
+        std::fs::write(repo.join(format!("m{i}.py")), body).unwrap();
+    }
+    let pristine = dir.path().join("pristine.lbug");
+    nestweaver_cmd()
+        .args(["index", "--db"])
+        .arg(&pristine)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+
+    let size = std::fs::metadata(&pristine).unwrap().len();
+    assert!(
+        size > 1024 * 1024,
+        "the fixture database is {size} bytes — too small for the corruption to \
+         land on real on-disk index structures, which would make this test pass \
+         for the wrong reason"
+    );
+
+    let mut crashed_at_least_once = false;
+    for (index, (from, to)) in [(0.005, 0.2), (0.05, 0.95), (0.4, 0.6)].iter().enumerate() {
+        let db = dir.path().join(format!("corrupt{index}.lbug"));
+        std::fs::copy(&pristine, &db).unwrap();
+        let start = (size as f64 * from) as u64;
+        let end = (size as f64 * to) as u64;
+        assert!(
+            start > 8192,
+            "corruption must begin past any header, or a header check could \
+             satisfy this test without touching the fault"
+        );
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+            file.seek(SeekFrom::Start(start)).unwrap();
+            file.write_all(&vec![0xFFu8; (end - start) as usize])
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let output = nestweaver_cmd()
+            .args(["brain", "status", "--db"])
+            .arg(&db)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // THE PRIMARY ASSERTION.
+        assert!(
+            output.status.signal().is_none(),
+            "corrupting {from}-{to} of the database killed the process with \
+             signal {:?} (139 == SIGSEGV); it must fail closed instead. \
+             stderr: {stderr}",
+            output.status.signal()
+        );
+
+        if output.status.code() == Some(0) {
+            // This range did not disturb anything the open reads. Not a
+            // failure — just a range that proves nothing.
+            continue;
+        }
+
+        // Whatever the engine did, the user must be able to act on it.
+        // Matched on the FILE NAME, not the full path: miette hard-wraps the
+        // rendered diagnostic at the terminal width, so a long temp path is
+        // split across lines and a whole-path `contains` would fail on a
+        // message that does name it.
+        let file_name = db.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            stderr.contains(&file_name),
+            "the error must name the database it could not open: {stderr}"
+        );
+        if stderr.contains("the storage engine crashed while reading it") {
+            crashed_at_least_once = true;
+            assert!(
+                stderr.contains("restore") || stderr.contains("re-index"),
+                "a crash attribution must offer a way out: {stderr}"
+            );
+        }
+    }
+
+    // If NO range faulted, this fixture never exercised the guard and the test
+    // would be green while proving nothing — say so rather than pass.
+    assert!(
+        crashed_at_least_once,
+        "no corruption range reached the crashing code path, so this run did \
+         not exercise the crash-attribution guard at all"
+    );
+}
+
+// ── nw-309: an exists-but-unopenable --db must fail on the store ─────────
+
+/// nw-309 / F-CLI-1. A `--db` path that EXISTS but is not a database was
+/// admitted to the daemon-autostart route, and the client's boot-readiness
+/// wait has no failure channel for a daemon that never gets far enough to
+/// publish a live PID — so the caller paid the full 30s boot ceiling before
+/// the direct path produced the correct exit 1. A genuinely NONEXISTENT path
+/// was fast, because that case had a guard.
+///
+/// Pinned to the DAEMON route (`env_remove`) because the stall only existed on
+/// the route that dials. The ceiling is left at its default and the budget is
+/// far under it, so this test cannot be satisfied by shortening the timeout —
+/// only by giving the decision a failure channel.
+#[test]
+fn a_db_that_is_not_a_database_fails_fast_without_paying_the_boot_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake.lbug");
+    std::fs::write(&fake, b"hello not a db").unwrap();
+
+    let start = std::time::Instant::now();
+    let output = Command::cargo_bin("nestweaver")
+        .unwrap()
+        .args(["stale-check", "--db"])
+        .arg(&fake)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_DB")
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_ne!(output.status.code(), Some(0), "a broken DB must not exit 0");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?} against a 30s ceiling — an unopenable database is \
+         still being handed to the daemon route, where 'will never boot' is \
+         indistinguishable from 'still booting'. stderr: {stderr}"
+    );
+    // And the failure must say what is wrong, not just that something is.
+    assert!(
+        stderr.contains("fake.lbug"),
+        "the error must name the path: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a NestWeaver database"),
+        "the error must say WHY it is unusable: {stderr}"
+    );
+}
+
+/// The companion: a genuinely missing `--db` keeps its existing, different
+/// answer. nw-309 is about closing the gap between "missing" and "present but
+/// broken", not about collapsing them into one message.
+#[test]
+fn a_missing_db_still_reports_db_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.lbug");
+
+    nestweaver_cmd()
+        .args(["stale-check", "--db"])
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(contains("nope.lbug"));
+    assert!(
+        !missing.exists(),
+        "a failed lookup must not create a database"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-297 — a summary printed beside a truncated list must describe the
+// POPULATION, not the page.
+// ---------------------------------------------------------------------------
+
+/// Build a vault with a known, unequal split: six links that resolve at a lower
+/// confidence tier (unique global filename-stem match, 0.90) and three that
+/// resolve to nothing at all.
+///
+/// The store emits the low-confidence group first, so any page shorter than six
+/// is a pure sample of the benign category — which is exactly the shape that
+/// made a 226-unresolved vault print `0 unresolved (genuinely broken)`.
+fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
+    let vault = root.join("vault");
+    std::fs::create_dir_all(vault.join("targets")).unwrap();
+    std::fs::create_dir_all(vault.join("sources")).unwrap();
+    for i in 1..=6 {
+        // Title deliberately unlike the stem, so the link misses the 1.0
+        // unique-title tier and lands on the 0.90 global-stem tier.
+        std::fs::write(
+            vault.join(format!("targets/stemkey-{i}.md")),
+            format!("---\ntitle: Utterly Different Title {i}\n---\n\nbody\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join(format!("sources/src{i}.md")),
+            format!("---\ntitle: Source {i}\n---\n\nSee [[stemkey-{i}]]\n"),
+        )
+        .unwrap();
+    }
+    for i in 1..=3 {
+        std::fs::write(
+            vault.join(format!("sources/miss{i}.md")),
+            format!("---\ntitle: Miss {i}\n---\n\nSee [[Nonexistent Note {i}]]\n"),
+        )
+        .unwrap();
+    }
+    vault
+}
+
+fn indexed_broken_links_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let vault = broken_links_vault(dir.path());
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+/// The headline classification must not move when `--limit` moves. A page of
+/// four said `0 unresolved (genuinely broken)` on a vault holding three.
+#[test]
+fn broken_links_classification_counts_the_population_not_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let full = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "100", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let full = String::from_utf8(full.get_output().stdout.clone()).unwrap();
+    assert!(
+        full.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the whole population is 3 unresolved / 6 lower-tier: {full}"
+    );
+
+    let page = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let page = String::from_utf8(page.get_output().stdout.clone()).unwrap();
+    assert!(
+        page.contains("Broken / ambiguous wikilinks (4 of 9)"),
+        "the page itself is still bounded by --limit: {page}"
+    );
+    assert!(
+        page.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the classification describes the population, not the page: {page}"
+    );
+}
+
+/// `--json` must carry the same split, so an agent does not have to re-derive
+/// it from a page that cannot answer the question.
+#[test]
+fn broken_links_json_carries_the_population_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--json", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+    assert_eq!(value["total"], 9, "payload: {out}");
+    assert_eq!(value["returned"], 4, "payload: {out}");
+    assert_eq!(
+        value["unresolved"], 3,
+        "the genuinely-broken count is a property of the vault: {out}"
+    );
+    assert_eq!(
+        value["low_confidence"], 6,
+        "and so is the benign count: {out}"
+    );
+}
+
+/// `memory lint` is the second surface onto the same `broken_links` call, so it
+/// corroborated the first only because it shared the defect.
+#[test]
+fn memory_lint_splits_the_broken_wikilink_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["memory", "lint", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("broken wikilinks:      9 (3 genuinely broken, 6 lower-tier resolutions)"),
+        "the bare length conflates two categories: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-287 — a precondition must test the operation the caller will perform.
+// ---------------------------------------------------------------------------
+
+/// `chmod 000` on a directory leaves `stat(2)` working — that needs `+x` on the
+/// PARENT, not on the directory itself — so `exists()` and `is_dir()` both pass
+/// on a vault that cannot be ENUMERATED. Only `read_dir` fails, two layers down,
+/// where the empty scan was indistinguishable from "the user deleted every
+/// note": `brain refresh` reported rc=0 and dropped the whole vault.
+fn unreadable_vault(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("keep.md"),
+        "---\ntitle: Keep Me\n---\n\nimportant content\n",
+    )
+    .unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    (vault, db)
+}
+
+fn make_readable_again(vault: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(vault, std::fs::Permissions::from_mode(0o755));
+}
+
+fn note_count(db: &std::path::Path) -> String {
+    let out = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn brain_refresh_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error, not an empty vault: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must say the directory could not be READ, not that it is not a \
+         directory — it is one: {stderr}"
+    );
+
+    let status = note_count(&db);
+    assert!(
+        status.contains("Notes:     1"),
+        "the indexed note must survive a refresh that could not see it: {status}"
+    );
+}
+
+#[test]
+fn brain_watch_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "watch"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "watch must refuse before it starts a watcher on a directory it cannot \
+         enumerate: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}
+
+/// The same `!exists() || !is_dir()` shape guards `detect-implicit-projects`,
+/// which enumerates the vault too. Not named in the nw-287 report — found by
+/// asking where else the property has to hold.
+#[test]
+fn detect_implicit_projects_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["detect-implicit-projects", "--vault"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error here too: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-308 / F-DC-13 — `hubs` / `bridges` must disclose stale rankings on the
+// JSON payload, not only on stderr.
+// ---------------------------------------------------------------------------
+
+/// Index a small repo and return its database path.
+fn indexed_ranking_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("a.js"),
+        "import { b } from './b.js';\nexport function a() { return b(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("b.js"),
+        "export function b() { return 1; }\nexport function c() { return b(); }\n",
+    )
+    .unwrap();
+    let db = dir.path().join("graph.lbug");
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+fn ranking_json(db: &std::path::Path, command: &str) -> serde_json::Value {
+    let out = nestweaver_cmd()
+        .args([command, "--json", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{command} --json: {e}\n{stdout}"))
+}
+
+/// A database whose resolver-generation record is absent is exactly the
+/// upgrade case: every repo's edges predate the current resolver, so every
+/// ranking is stale. `warn_stale_resolver_rankings` already says so — on
+/// stderr, where the `--json` consumer most likely to act on it cannot see it.
+fn forget_resolver_generation(db: &std::path::Path) {
+    let sidecar = sidecar_path(db, ".resolver_generation.json");
+    std::fs::remove_file(&sidecar).unwrap();
+}
+
+#[test]
+fn hubs_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    // Freshly indexed: current by construction, and the disclosure must not
+    // cry wolf.
+    let fresh = ranking_json(&db, "hubs");
+    assert_eq!(
+        fresh["rankings_stale"], false,
+        "a repo indexed by this binary is not stale: {fresh}"
+    );
+    assert!(
+        fresh["hubs"].is_array(),
+        "the rows keep their own key: {fresh}"
+    );
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "hubs");
+    assert_eq!(
+        stale["rankings_stale"], true,
+        "no generation record means every repo predates the current resolver: {stale}"
+    );
+    assert!(
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "and the payload must name which repos, so the caller can re-index them: {stale}"
+    );
+}
+
+/// `bridges` is the same shape one screen away. Fixing only `hubs` would be
+/// the same scoping error this remediation is about.
+#[test]
+fn bridges_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    let fresh = ranking_json(&db, "bridges");
+    assert_eq!(fresh["rankings_stale"], false, "payload: {fresh}");
+    assert!(fresh["bridges"].is_array(), "payload: {fresh}");
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "bridges");
+    assert_eq!(stale["rankings_stale"], true, "payload: {stale}");
+    assert!(
+        stale["stale_repos"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "payload: {stale}"
+    );
+}
+
+// ── nw-313 + nw-281(b): the selective delete verbs ─────────────────────────
+//
+// `interactions clear` and the extension teardown are both all-or-nothing, so
+// one poisoned entry could only be removed by destroying every accumulated
+// signal beside it. The engine primitives (`remove_node_score`,
+// `remove_extension_key_durable`) landed with the sidecar work; these are the
+// user-facing verbs, and the property they must hold is SELECTIVITY — the
+// neighbouring entries have to survive, which is the whole reason the verbs
+// exist and the one thing `clear` cannot do.
+
+/// Seed a two-node interaction sidecar so "the other node survived" is
+/// assertable rather than assumed.
+fn seed_interaction_sidecar(db_path: &std::path::Path) {
+    std::fs::write(
+        sidecar_path(db_path, ".interactions.json"),
+        r#"{"version":1,"last_compacted":0.0,"node_scores":{
+             "sym:repo:keep":  {"access_count":3,"query_seed_count":1,
+                                "result_used_count":1,"result_shown_count":2,
+                                "last_accessed":1.0,"content_hash_at_access":null,
+                                "distinct_sessions":1,"computed_score":0.5},
+             "sym:repo:forget":{"access_count":9,"query_seed_count":4,
+                                "result_used_count":0,"result_shown_count":9,
+                                "last_accessed":2.0,"content_hash_at_access":null,
+                                "distinct_sessions":2,"computed_score":0.9}}}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn interactions_forget_removes_one_node_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    seed_interaction_sidecar(&db_path);
+
+    nestweaver_cmd()
+        .args([
+            "interactions",
+            "forget",
+            "sym:repo:forget",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("sym:repo:forget"));
+
+    let after = std::fs::read_to_string(sidecar_path(&db_path, ".interactions.json")).unwrap();
+    assert!(
+        !after.contains("sym:repo:forget"),
+        "the named node's interaction memory must be gone:\n{after}"
+    );
+    assert!(
+        after.contains("sym:repo:keep"),
+        "SELECTIVITY is the entire point of this verb — `clear` already removes \
+         everything, and a forget that took the neighbours with it would be \
+         `clear` with a longer name:\n{after}"
+    );
+}
+
+#[test]
+fn interactions_forget_separates_nothing_to_forget_from_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    seed_interaction_sidecar(&db_path);
+
+    // Idempotent verbs are not errors, but the caller must still be able to
+    // tell "I removed it" from "there was nothing there" — otherwise a typo'd
+    // UID reports the same success as a real deletion.
+    let output = nestweaver_cmd()
+        .args([
+            "interactions",
+            "forget",
+            "sym:repo:never-recorded",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a uid with no recorded memory must exit NOT_FOUND, not SUCCESS: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn extensions_unset_removes_one_key_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"owner": "platform", "tier": "gold"},
+            "sym:repo:other":  {"owner": "search"}}"#,
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "extensions",
+            "unset",
+            "sym:repo:widget",
+            "owner",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(sidecar_path(&db_path, ".extensions.json")).unwrap();
+    let store: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert!(
+        store["sym:repo:widget"]["owner"].is_null(),
+        "the named key must be gone:\n{after}"
+    );
+    assert_eq!(
+        store["sym:repo:widget"]["tier"], "gold",
+        "the node's OTHER properties must survive — the only delete that \
+         existed removed all of them:\n{after}"
+    );
+    assert_eq!(
+        store["sym:repo:other"]["owner"], "search",
+        "and so must the same key on a DIFFERENT node:\n{after}"
+    );
+}
+
+#[test]
+fn extensions_unset_separates_nothing_to_remove_from_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"owner": "platform"}}"#,
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args([
+            "extensions",
+            "unset",
+            "sym:repo:widget",
+            "tier",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a key that was never set must exit NOT_FOUND: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+// ── nw-295: `--since` was never parsed ────────────────────────────────────
+//
+// `since` went straight into `WHERE n.modified_at >= $since`. `modified_at` is
+// a String column, so that is a LEXICOGRAPHIC comparison which cannot fail:
+// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with `'2'`
+// (0x32), so an unparseable value matched no note and silently dropped every
+// Note and Section from the answer — byte-identical to `--since 2099-12-31`.
+//
+// The failure direction is the harmful one. It does not no-op; it narrows the
+// result toward emptiness while reporting success, so the caller reads "this
+// project has no notes" off a typo.
+
+/// Every `--since` that reaches a lexicographic comparison, with the command
+/// name and the flag's own value. `brain refresh` is deliberately in the list:
+/// it already validated (via `parse_iso8601_to_system_time`) before nw-295, and
+/// its presence here is what makes this a sweep over the flag rather than a
+/// re-statement of the two sites that were broken.
+const SINCE_ACCEPTING_COMMANDS: &[&[&str]] = &[
+    &["project-context", "anything"],
+    &["brain", "context", "anything"],
+];
+
+#[test]
+fn an_unparseable_since_is_refused_rather_than_silently_matching_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    for command in SINCE_ACCEPTING_COMMANDS {
+        let output = nestweaver_cmd()
+            .args(*command)
+            .args(["--db", &db_path.display().to_string()])
+            .args(["--since", "garbage"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "`{}` --since garbage must FAIL. Exiting 0 with a filtered answer is \
+             how a typo reads as 'this project has no recent notes'.\nstdout={}\nstderr={stderr}",
+            command.join(" "),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("since") || stderr.contains("garbage"),
+            "the refusal must name the flag or the value it rejected, or the \
+             caller cannot tell it apart from any other failure:\n{stderr}"
+        );
+    }
+}
+
+/// The counterweight, and the one that matters most: a validator that rejects
+/// a currently-working input is a regression dressed as a fix. A bare
+/// `YYYY-MM-DD` is not RFC 3339, is the natural thing to type, and works
+/// today — an Rfc3339-only parser would break it.
+#[test]
+fn a_bare_calendar_date_is_still_accepted_by_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    for command in SINCE_ACCEPTING_COMMANDS {
+        for value in [
+            "2026-01-31",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T02:00:00+02:00",
+        ] {
+            let output = nestweaver_cmd()
+                .args(*command)
+                .args(["--db", &db_path.display().to_string()])
+                .args(["--since", value])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The command may still fail for its OWN reasons (no such project
+            // in an empty graph); what it may not do is reject the timestamp.
+            assert!(
+                !stderr.contains("--since") && !stderr.contains(&format!("'{value}'")),
+                "`{}` --since {value} must be accepted:\n{stderr}",
+                command.join(" ")
+            );
+        }
+    }
+}
+
+// ── F-DC-11: `summary --level cluster` computed `total` AFTER the cap ──────
+//
+// `generate_cluster_summaries` truncated to 50 and returned a bare `Vec`,
+// which has nowhere to say "I dropped some". The CLI then took `total` from
+// the already-capped vector, so a 71,184-community graph reported
+// `{returned: 50, total: 50, truncated: false}` — the cap made invisible in
+// exactly the two fields that exist to disclose it.
+//
+// The honesty machinery already existed for `SummaryLevel::Symbol`
+// (`generate_symbol_summaries_bounded` -> `cap_dropped`) and was wired for
+// that level only.
+
+/// 60 modules with three functions each, calling only within their own module.
+/// That is 60 disjoint components of size 3 — comfortably over the cap of 50,
+/// and with no cross-module edge that could let the clusterer merge them.
+fn write_sixty_disjoint_communities(root: &std::path::Path) {
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 1..=60 {
+        std::fs::write(
+            src.join(format!("m{i}.js")),
+            format!(
+                "export function alpha{i}() {{ return beta{i}() + gamma{i}(); }}\n\
+                 export function beta{i}() {{ return gamma{i}(); }}\n\
+                 export function gamma{i}() {{ return {i}; }}\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn summary_at_cluster_level_reports_the_pre_cap_match_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    write_sixty_disjoint_communities(dir.path());
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["summary", "--level", "cluster", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .args(["--token-budget", "0"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("summary --json must emit JSON ({e}):\n{stdout}"));
+
+    let returned = value["returned"].as_u64().unwrap();
+    let total = value["total"].as_u64().unwrap();
+    let truncated = value["truncated"].as_bool().unwrap();
+
+    // The counterweight first: if the cap did not bite, this test proves
+    // nothing and must say so rather than passing vacuously.
+    assert_eq!(
+        returned, 50,
+        "this fixture exists to exercise the 50-cluster cap; if it did not \
+         bite, the assertions below are vacuous:\n{stdout}"
+    );
+    assert!(
+        total > returned,
+        "`total` must count what MATCHED, not what survived the cap. Reporting \
+         `total == returned` beside a capped list is not merely imprecise — it \
+         is the one number a caller would use to decide whether to look \
+         further, saying there is nothing further to look at. \
+         got total={total}, returned={returned}"
+    );
+    assert!(
+        truncated,
+        "`returned == total` and `truncated: false` together are a claim that \
+         the answer is complete. It was not."
+    );
+}
+
+/// The third offender, and the reason this file sweeps all four levels rather
+/// than fixing the one that was reported. `HUB_COUNT` is an internal 30 that
+/// the caller never stated, so `total: 30` is not a truncation notice — it is
+/// a claim that the graph HAS thirty hubs.
+///
+/// `File` is uncapped and `Symbol`'s cap is 500, so on this fixture only
+/// `Cluster` (50) and `Hub` (30) can bite; measured before the fix, both
+/// reported `total == returned` and `truncated: false`.
+#[test]
+fn summary_at_hub_level_reports_the_candidate_population() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    write_sixty_disjoint_communities(dir.path());
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["summary", "--level", "hub", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .args(["--token-budget", "0"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("summary --json must emit JSON ({e}):\n{stdout}"));
+
+    let returned = value["returned"].as_u64().unwrap();
+    let total = value["total"].as_u64().unwrap();
+    assert_eq!(
+        returned, 30,
+        "this fixture exists to exercise the internal 30-hub bound; if it did \
+         not bite the assertion below is vacuous:\n{stdout}"
+    );
+    assert!(
+        total > returned,
+        "180 symbols carry code edges in this fixture, so 30 is a selection \
+         from a much larger candidate set, not the size of it. \
+         got total={total}, returned={returned}"
+    );
+    assert!(
+        value["truncated"].as_bool().unwrap(),
+        "a bound the caller never asked for and cannot see must at minimum be \
+         disclosed:\n{stdout}"
+    );
+}
+
+// ── nw-289 (deeper property): a generation advance orphans its artifacts ───
+//
+// `.manifests.json` is an identity- AND generation-bound artifact: its
+// envelope records `source_graph_generation`, and `load_manifest_cache_for_db`
+// refuses to decode it when that no longer matches the live graph. The
+// deletion path already handles this — it reads the manifest payload at
+// generation N, advances to N+1, and republishes at N+1. The index/watcher
+// path advances the generation and does not.
+//
+// A markdown/vault index cannot change any code manifest, so the payload stays
+// correct while its BINDING goes stale. The graph then has no manifests for as
+// long as nobody runs a code index, and every CLI consumer loads them with
+// `.unwrap_or_default()` — so the failure is not an error, it is
+// `dead-code` losing its manifest-driven entry points and `suggest-links`
+// losing its cross-repo signal, both silently.
+
+#[test]
+fn a_vault_index_does_not_orphan_the_code_manifest_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"demo-pkg","version":"1.2.3","dependencies":{"left-pad":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/a.js"),
+        "export function hello(){return 1;}\n",
+    )
+    .unwrap();
+    std::fs::write(vault.join("n.md"), "# Note\n").unwrap();
+
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Baseline: the code index leaves the cache readable. If it did not, the
+    // assertion after the vault index would prove nothing about the vault.
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let manifests = nestweaver_engine::load_manifest_cache_for_db(&store, &db_path)
+            .expect("a code index must leave its own manifest cache readable");
+        assert!(
+            !manifests.is_empty(),
+            "the fixture must actually produce manifests, or the test below is \
+             vacuous"
+        );
+    }
+
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    let manifests = nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).expect(
+        "indexing a VAULT advanced the graph generation and left the code \
+         manifest cache bound to the previous one. A markdown index cannot \
+         change a code manifest, so the payload is still correct — only its \
+         binding went stale, and every CLI consumer swallows that with \
+         `.unwrap_or_default()`",
+    );
+    assert!(
+        !manifests.is_empty(),
+        "and it must still carry the manifests, not merely decode to an empty \
+         map — an invalidation that silently becomes 'this repo has no \
+         manifests' is the same outcome with a different spelling"
+    );
+}
+
+// ── F-DC-7: the adaptive cluster resolution has exactly one definition ─────
+//
+// Community IDs are ASSIGNMENT-dependent, so two runs at different
+// resolutions produce two different ID SPACES rather than two orderings of
+// one. Five copies of the 0.3/0.5 rule existed; the fifth
+// (`generate_cluster_summaries`) was hard-coded to 1.0, which is how
+// `summary --level cluster` came to emit IDs that `cluster <id>` could not
+// resolve — 26 of 50.
+//
+// A behavioural test cannot catch the recurrence: every surviving copy agreed
+// with the authority, so an end-to-end assertion passes on a tree with all of
+// them restored. The defect appears only when one copy is edited and the
+// others are not. What IS checkable is that no second copy exists.
+//
+// This lives in the integration suite, not beside the code, because a sweep
+// that scans `src/main.rs` from within `src/main.rs` matches its own predicate
+// and its own fixture. The alternative — teaching it to skip its own module —
+// is the over-skipping that once let a `src/main.rs` check pass against a tree
+// with the known bugs restored, by cutting the file at line 548 of 29,000.
+
+fn cli_source() -> String {
+    std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+        .expect("src/main.rs must be readable")
+}
+
+#[test]
+fn the_adaptive_cluster_resolution_is_not_open_coded_in_the_cli() {
+    let source = cli_source();
+    // Matched as a PAIR: either literal alone appears legitimately — 0.5 is a
+    // common default and 10_000 a common bound — so either alone would be a
+    // sweep that cries wolf and gets deleted.
+    let offenders: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("10_000") && line.contains("0.3"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the adaptive cluster resolution must come from \
+         `nestweaver_engine::default_cluster_resolution`, not be restated in \
+         the CLI — a private copy silently re-partitions the graph and makes \
+         the IDs every other command emits unaddressable. Found:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The counterweight. A sweep's silence means nothing unless it can be shown
+/// to SEE the shape it forbids, and to be reading the whole file.
+#[test]
+fn the_cluster_resolution_sweep_can_detect_what_it_forbids() {
+    let restored = "                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };";
+    assert!(
+        restored.trim().contains("10_000") && restored.trim().contains("0.3"),
+        "the predicate must match the literal form the removed copies had"
+    );
+
+    let source = cli_source();
+    assert!(
+        source.lines().count() > 30_000,
+        "the sweep reads {} lines of src/main.rs; if that ever collapses to a \
+         prefix, the test above passes by not looking",
+        source.lines().count()
+    );
+}
+
+// ── nw-311 / D2-E4: `service-summary` renders the pre-resolver shape ───────
+//
+// `nestweaver_engine::query::service_summary` is the single resolver: it
+// returns the chosen service FLATTENED alongside `matched`, `alternatives` and
+// `entry_points`, and carries the ambiguity text as
+// `ServiceSummary::ambiguity_warning`. The CLI calls neither. Its daemon
+// branch deserializes the envelope back down to a bare `Service` — which still
+// succeeds, because the service is flattened, so nothing looks broken — and
+// its direct branch re-implements the resolution with its own
+// `list_services` + filter and its own copy of the warning.
+//
+// Two consequences. The daemon route drops the ambiguity disclosure entirely,
+// which is the divergence nw-311 is about. And BOTH routes drop the entry
+// points, which `--help` has always promised: "Show a service summary with
+// entry points".
+
+/// Two services with the same name, in two repos, each with one entry-point
+/// symbol and one ordinary symbol so the entry-point filter has something to
+/// exclude. Persistent (not in-memory) because the CLI opens by path.
+fn seed_ambiguous_services(db_path: &std::path::Path) {
+    use nestweaver_schema::{Repo, Service, Symbol, SymbolKind, Visibility};
+
+    let store = nestweaver_store::GraphStore::open_or_create(db_path).unwrap();
+    for i in 0..2 {
+        let repo_uid = format!("repo:test:{i:012x}");
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.clone(),
+                url: format!("https://github.com/example/r{i}"),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: Some(format!("r{i}")),
+                root_path: None,
+            })
+            .unwrap();
+        let svc_uid = format!("svc:{repo_uid}:{i:012x}");
+        store
+            .insert_service(&Service {
+                uid: svc_uid.clone(),
+                name: "checkout".to_string(),
+                repo_uid: repo_uid.clone(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            })
+            .unwrap();
+        let mk = |suffix: &str, name: &str, entry: bool| Symbol {
+            uid: format!("sym:{repo_uid}:{suffix}"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.clone(),
+            file_path: format!("src/{suffix}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("{repo_uid}:{suffix}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let entry = mk("entry", "handler", true);
+        let plain = mk("plain", "helper", false);
+        store.insert_symbol(&entry).unwrap();
+        store.insert_symbol(&plain).unwrap();
+        store
+            .batch_insert_service_symbol_edges(&[
+                (svc_uid.as_str(), entry.uid.as_str()),
+                (svc_uid.as_str(), plain.uid.as_str()),
+            ])
+            .unwrap();
+    }
+    drop(store);
+}
+
+#[test]
+fn service_summary_json_carries_the_resolvers_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    seed_ambiguous_services(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["service-summary", "checkout", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--json must emit JSON ({e}):\n{stdout}"));
+
+    // The flattened `Service` must still be there — the envelope is a
+    // SUPERSET, so an existing consumer keeps working.
+    assert!(
+        value.get("uid").is_some() && value["name"] == "checkout",
+        "the payload must stay a superset of the bare Service it replaced:\n{stdout}"
+    );
+    assert_eq!(
+        value["matched"], 2,
+        "two services carry this name; a payload that cannot say so is how \
+         `service-summary` silently answered one of several questions:\n{stdout}"
+    );
+    assert_eq!(
+        value["alternatives"].as_array().map(Vec::len),
+        Some(1),
+        "the candidate it did NOT choose must be listed, or the caller cannot \
+         re-ask unambiguously:\n{stdout}"
+    );
+    assert_eq!(
+        value["entry_points"].as_array().map(Vec::len),
+        Some(1),
+        "`--help` says 'Show a service summary with entry points'; the one \
+         entry-point symbol must be there and the ordinary symbol must \
+         not:\n{stdout}"
+    );
+}
+
+#[test]
+fn service_summary_text_warns_about_ambiguity_and_lists_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    seed_ambiguous_services(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["service-summary", "checkout"])
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("matches 2 services"),
+        "an ambiguous name must warn, on stderr, naming the count:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("handler"),
+        "the entry point `--help` promises must actually be printed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("helper"),
+        "and only ENTRY POINTS — listing every symbol in the service would be \
+         a different command:\n{stdout}"
+    );
+}

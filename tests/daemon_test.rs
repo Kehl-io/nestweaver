@@ -3983,6 +3983,7 @@ fn daemon_merge_rejects_self_merge_without_mutation() {
             word_count: 42,
             content_hash: "authored-hash".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -5621,5 +5622,216 @@ fn ambiguity_arising_after_boot_is_still_refused() {
         !stderr.contains("or a `--config`"),
         "the refusal must not offer a bare `--config` as the fix; this request \
          cannot carry one:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-299(b) — `clusters` text mode must honour `--limit` on BOTH routes.
+// ---------------------------------------------------------------------------
+
+/// Six mutually-disconnected call cycles, so clustering finds six communities
+/// no matter how the partition is seeded.
+fn write_six_community_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for g in 1..=6 {
+        std::fs::write(
+            dir.join(format!("g{g}.js")),
+            format!(
+                "export function g{g}a() {{ return g{g}b(); }}\n\
+                 export function g{g}b() {{ return g{g}c(); }}\n\
+                 export function g{g}c() {{ return g{g}a(); }}\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// The daemon branch of `Commands::Clusters` never put `limit`/`members` into
+/// the tool args and carried its own inline print loop with the bounding
+/// removed, so every `--limit` produced byte-identical output — measured at
+/// 7,967,385 bytes for four different combinations on the reporter's graph,
+/// while the direct path bounded correctly.
+#[test]
+fn clusters_text_honours_limit_on_the_daemon_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    write_six_community_repo(&repo);
+    let db = dir.path().join("clusters.lbug");
+
+    no_daemon_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    start_daemon(&db);
+    let _guard = DaemonGuard::new(&db);
+
+    let run = |limit: &str| -> String {
+        let out = daemon_cmd()
+            .args(["clusters", "--db"])
+            .arg(&db)
+            .args(["--limit", limit])
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clusters --limit {limit} failed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let two = run("2");
+    let five = run("5");
+
+    assert_ne!(
+        two, five,
+        "two different --limit values produced byte-identical output, so the \
+         flag reached nothing:\n{two}"
+    );
+    assert_eq!(
+        two.matches("cohesion=").count(),
+        2,
+        "--limit 2 must print two communities:\n{two}"
+    );
+    assert_eq!(
+        five.matches("cohesion=").count(),
+        5,
+        "--limit 5 must print five communities:\n{five}"
+    );
+    // The bound is only honest if it says what it dropped — the direct path
+    // already does, and the point of sharing one renderer is that both do.
+    assert!(
+        two.contains("4 more community(ies) not shown"),
+        "the truncation must be disclosed, not silent:\n{two}"
+    );
+    assert!(
+        two.contains("Clusters (6,"),
+        "and the PRE-cap total must survive the cap:\n{two}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// nw-309 (client half) — a daemon that will never boot must be reported at
+// once, not at the boot ceiling.
+// ---------------------------------------------------------------------------
+
+/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
+/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
+/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
+/// nothing to observe: "will never boot" and "still booting" are the same
+/// observation, and the caller waits out the whole ceiling.
+///
+/// Staged with an unwritable state directory, so the daemon cannot create its
+/// Flatten a miette-rendered diagnostic so a phrase assertion cannot be broken
+/// by line wrapping.
+///
+/// miette wraps to the terminal width and prefixes continuation lines with its
+/// box-drawing gutter, so a two-word phrase can arrive as `Permission\n  │
+/// denied`. That is exactly how this test failed on CI while passing on a
+/// developer machine: the wrap point moved with the tempdir path length, so the
+/// assertion was width-dependent rather than behaviour-dependent.
+///
+/// Only assertions against text that is rendered *inside* a diagnostic block
+/// need this. A phrase from a plain `eprintln!` warning cannot wrap.
+fn flatten_diagnostic(stderr: &str) -> String {
+    stderr
+        .replace(
+            ['\u{2502}', '\u{256d}', '\u{2570}', '\u{2500}', '\u{00d7}'],
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// runtime directory and exits in milliseconds without ever writing a pidfile.
+/// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
+/// this without touching the operator's real state tree.
+/// The wrapped form this helper exists for, captured verbatim from the CI run
+/// that failed on 2026-08-29 while the same test passed locally. Asserting on
+/// the raw string here would fail, which is what makes this test non-vacuous:
+/// it pins the actual defect rather than the fixed rendering.
+#[test]
+fn flatten_diagnostic_recovers_a_phrase_miette_wrapped() {
+    let as_ci_rendered = "  \u{00d7} create log dir: /tmp/.tmph9AjEh/state/nestweaver/982eefe7: Permission\n  \u{2502} denied (os error 13). Check the daemon logs:";
+
+    assert!(
+        !as_ci_rendered.contains("Permission denied"),
+        "fixture must reproduce the wrap, or this test proves nothing"
+    );
+    assert!(flatten_diagnostic(as_ci_rendered).contains("Permission denied"));
+    assert!(flatten_diagnostic(as_ci_rendered).contains("create log dir"));
+}
+
+#[test]
+fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("a.js"), "export function f() {}\n").unwrap();
+    let db = dir.path().join("graph.lbug");
+
+    no_daemon_cmd()
+        .env("XDG_STATE_HOME", &state)
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Read+execute but not write: the daemon can traverse it and cannot create
+    // its instance directory under it.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let boot_ceiling = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let output = daemon_cmd()
+        .env("XDG_STATE_HOME", &state)
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .args(["search", "f", "--db"])
+        .arg(&db)
+        .timeout(boot_ceiling + Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // The launcher's own verdict arrives in milliseconds. Half the ceiling is a
+    // deliberately loose bound — the point is that the wait is not the ceiling.
+    assert!(
+        elapsed < boot_ceiling / 2,
+        "a daemon known to be dead was waited on for {elapsed:?} against a 30s \
+         boot ceiling; the failure channel is not connected.\nstderr:\n{stderr}"
+    );
+
+    // And the report must say what actually happened, not merely that time ran
+    // out — the launcher's stderr was going to /dev/null.
+    assert!(
+        stderr.contains("will not become healthy"),
+        "the failure must be attributed to the launcher exiting, not to a \
+         timeout:\n{stderr}"
+    );
+    assert!(
+        flatten_diagnostic(&stderr).contains("Permission denied"),
+        "and it must carry the launcher's own reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("did not become healthy and attest"),
+        "the ceiling message must not be what the user sees when the answer \
+         was knowable immediately:\n{stderr}"
     );
 }

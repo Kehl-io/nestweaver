@@ -658,6 +658,70 @@ mod tests {
         );
     }
 
+    /// nw-297: genuinely-broken links must sort BEFORE lower-tier resolutions.
+    /// `broken_wikilinks` emits the `WHERE r.confidence < 1.0` block first and
+    /// the `UnresolvedWikilink` block second, preserving insertion order — so on
+    /// the real vault all 226 real breakages sort after all 1102 benign ones and
+    /// the default `--limit 50` page contains zero of them.
+    #[test]
+    fn genuinely_broken_links_sort_before_lower_tier_resolutions() {
+        let (_dir, root) = make_vault(&[
+            (
+                "folder/a.md",
+                "# A\n\nSee [[Sibling]], [[Second]], [[Third]] and [[Nowhere At All]].\n",
+            ),
+            ("folder/Sibling.md", "# Different Title Entirely\n"),
+            ("folder/Second.md", "# Another Title\n"),
+            ("folder/Third.md", "# Yet Another Title\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let links = broken_links(&store, 0).unwrap();
+        let first_broken = links.iter().position(|l| l.is_unresolved());
+        let first_resolved = links.iter().position(|l| !l.is_unresolved());
+        assert!(
+            first_broken.is_some(),
+            "precondition: one dangling link exists"
+        );
+        assert!(
+            first_resolved.is_some(),
+            "precondition: lower-tier resolutions exist"
+        );
+        assert!(
+            first_broken < first_resolved,
+            "nw-297: an unresolved link must not sort after ANY resolved one — \
+             genuinely broken at index {first_broken:?}, first resolved at \
+             {first_resolved:?}. This ordering is what makes the default \
+             `broken-links` page report '0 genuinely broken' on a vault with 226."
+        );
+
+        // The default page must never claim zero when the total is nonzero.
+        const DEFAULT_LIMIT: usize = 50;
+        let page: Vec<_> = links.iter().take(DEFAULT_LIMIT).collect();
+        let total_broken = links.iter().filter(|l| l.is_unresolved()).count();
+        let page_broken = page.iter().filter(|l| l.is_unresolved()).count();
+        assert!(
+            total_broken == 0 || page_broken > 0,
+            "the first page must surface at least one genuinely broken link when any exist"
+        );
+    }
+
+    /// nw-297, the secondary key: within the unresolved block and within the
+    /// resolved block, rows must be ordered by ASCENDING confidence so the page
+    /// is a severity ranking rather than an arbitrary slice.
+    #[test]
+    fn broken_links_are_ordered_by_ascending_confidence() {
+        let (_dir, store) = f9_vault();
+        let links = broken_links(&store, 0).unwrap();
+        let confidences: Vec<f32> = links.iter().map(|l| l.confidence).collect();
+        let mut sorted = confidences.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(
+            confidences, sorted,
+            "broken_wikilinks must return rows in ascending-confidence order"
+        );
+    }
+
     /// nw-100: a link that resolved at a lower tier is NOT broken.
     ///
     /// `[[Sibling]]` in `folder/a.md` resolves to `folder/Sibling.md` by

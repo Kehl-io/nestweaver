@@ -152,6 +152,19 @@ to the logical name.
   and `prune-stale` unable to clean it because nothing is actually orphaned.
   The database records its instance on first write and reports it in
   `list-repos`.
+- **`--config` binds a daemon; `--instance` binds a command.** A `--config`
+  supplied on an ordinary command (`index`, `brain add`, …) applies when it
+  STARTS the daemon — cold, or after a version-mismatch restart. Against a
+  daemon that is already running under a *different* config, the command is
+  refused rather than half-applied, and the error names
+  `nestweaver daemon --db <path> restart --config <path>`. That is deliberate:
+  the same file also carries `[authz]`, ranking priors, indexing limits and
+  server settings, which the running process built once at startup and cannot
+  re-adopt per request — honouring only its `instance_id` while silently
+  dropping its authorization policy would be worse than refusing. When you want
+  a different instance for one command and nothing else, use `--instance <id>`:
+  it travels on the RPC, reaches a running daemon, and needs no restart
+  (nw-303).
 - Naming an instance explicitly is still honoured, and a database may hold
   several. That is a supported configuration — a daemon restarted under a
   different `--config` writes new rows under the new instance, and

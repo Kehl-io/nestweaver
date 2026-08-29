@@ -77,6 +77,12 @@ pub struct BundleEntry {
     /// Whether the entry has been expanded (full body + neighbors fetched).
     #[serde(default)]
     pub expanded: bool,
+    /// Why this entry carries no body, when it carries none. nw-301: an entry
+    /// with no body and no reason is read as "this node has no content"; the
+    /// truth was usually "this kind was never implemented" or "the source was
+    /// not readable from the root you passed". Absent when a body is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     /// `true` when this entry was one of the query's resolved seed nodes
     /// (a direct hit), as opposed to a node surfaced by graph proximity.
     /// Skipped from JSON when `false` so existing consumers see unchanged
@@ -208,6 +214,19 @@ pub struct HydrateResult {
     /// `hydrated: 0` is distinguishable from a failure. `hydrated + already_hydrated`
     /// is the count of entries with a body after this call.
     pub already_hydrated: usize,
+    /// Entries this call could NOT fill. nw-301: without this,
+    /// `hydrated + already_hydrated` silently under-counted the bundle and the
+    /// caller had no way to tell an entry it had skipped from one it had
+    /// filled. `hydrated + already_hydrated + skipped == entries.len()` is now
+    /// an invariant.
+    #[serde(default)]
+    pub skipped: usize,
+    /// Why they were skipped, counted by reason — so "Tag entries have no body"
+    /// (a fact) is distinguishable from "source not readable from the supplied
+    /// root" (a fixable mistake) and from "token budget exhausted" (retry with
+    /// more budget).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub skipped_reasons: std::collections::BTreeMap<String, usize>,
     pub entries: Vec<BundleEntry>,
 }
 
@@ -567,6 +586,7 @@ pub fn investigate(
             inline_body: node.inline_body.clone(),
             body_complete: node.body_complete,
             expanded: false,
+            unavailable_reason: None,
             is_seed: seed_uids.contains(&node.uid),
             relevance: node.relevance,
         };
@@ -666,19 +686,39 @@ pub fn investigate_expand(
             // Guard against an unreadable root / empty source span: storing an
             // empty body marked `body_complete` would poison the entry and
             // prevent a later hydrate from retrying it.
-            if let Some(body) = fetch_full_body(store, &uid, root).filter(|b| !b.is_empty()) {
-                // Bug H: `investigate_expand` stores the full body without
-                // truncation, so the entry is unconditionally body-complete.
-                if bundle.entries[idx].summary.is_none() {
-                    let s = summarize(&body);
-                    if !s.is_empty() {
-                        bundle.entries[idx].summary = Some(s);
+            //
+            // nw-301: `expanded = true` used to sit OUTSIDE this branch, so it
+            // was set whether or not a body was found. `expanded: true` on an
+            // entry with no body reads to an agent as "this symbol has no
+            // body", not "this route failed" — the honest-failure antipattern
+            // this release was closing elsewhere, in the one field whose job is
+            // to say whether the operation worked.
+            match fetch_full_body(store, &uid, root) {
+                Ok(body) => {
+                    // Bug H: `investigate_expand` stores the full body without
+                    // truncation, so the entry is unconditionally body-complete.
+                    if bundle.entries[idx].summary.is_none() {
+                        let s = summarize(&body);
+                        if !s.is_empty() {
+                            bundle.entries[idx].summary = Some(s);
+                        }
                     }
+                    bundle.entries[idx].inline_body = Some(body);
+                    bundle.entries[idx].body_complete = true;
+                    bundle.entries[idx].expanded = true;
+                    bundle.entries[idx].unavailable_reason = None;
                 }
-                bundle.entries[idx].inline_body = Some(body);
-                bundle.entries[idx].body_complete = true;
+                // An entry that already carries a body stays expanded — the
+                // fetch is a refresh there, not the thing that made it usable.
+                Err(_) if bundle.entries[idx].inline_body.is_some() => {
+                    bundle.entries[idx].expanded = true;
+                    bundle.entries[idx].unavailable_reason = None;
+                }
+                Err(reason) => {
+                    bundle.entries[idx].expanded = false;
+                    bundle.entries[idx].unavailable_reason = Some(reason.reason());
+                }
             }
-            bundle.entries[idx].expanded = true;
             neighbors.extend(fetch_neighbors(store, &uid, &asset_id));
             expanded.push(bundle.entries[idx].clone());
         }
@@ -707,59 +747,95 @@ pub fn investigate_hydrate(
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
         .min(MAX_TOKEN_BUDGET);
 
-    let (hydrated, already_hydrated, entries) = update_bundle_store(db_path, |bundle_store| {
-        let bundle = bundle_store
-            .bundles
-            .get_mut(bundle_id)
-            .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
+    let (hydrated, already_hydrated, skipped, skipped_reasons, entries) =
+        update_bundle_store(db_path, |bundle_store| {
+            let bundle = bundle_store
+                .bundles
+                .get_mut(bundle_id)
+                .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
 
-        let mut used_tokens = 0usize;
-        let mut hydrated = 0usize;
-        let mut already_hydrated = 0usize;
-        for entry in bundle.entries.iter_mut() {
-            if entry.inline_body.is_some() {
-                already_hydrated += 1;
-                continue;
-            }
-            let Some(body) = fetch_full_body(store, &entry.uid, root) else {
-                continue;
-            };
-            if body.is_empty() {
-                continue;
-            }
-            let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
-            // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
-            // `complete` flag is propagated to BundleEntry.body_complete so
-            // consumers can decide whether to fall back to `read_symbols` for the
-            // full source.
-            let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
-            let cost = body.len().div_ceil(4);
-            if hydrated > 0 && used_tokens + cost > budget {
-                // Over budget: skip THIS body and keep going — a later, smaller
-                // body may still fit. (Previously a `break` aborted every
-                // remaining entry.)
-                continue;
-            }
-            used_tokens += cost;
-            if entry.summary.is_none() {
-                let s = summarize(&body);
-                if !s.is_empty() {
-                    entry.summary = Some(s);
+            let mut used_tokens = 0usize;
+            let mut hydrated = 0usize;
+            let mut already_hydrated = 0usize;
+            // nw-301: both `continue`s below used to exit without touching EITHER
+            // counter, which is why the reported `hydrated: 7, already_hydrated: 5`
+            // summed to 12 — the Note count — on a 30-entry bundle, and the other
+            // 18 entries appeared nowhere. A command whose entire job is filling
+            // bodies did not account for the entries it failed to fill.
+            let mut skipped_reasons: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let skip =
+                |reason: String,
+                 entry: &mut BundleEntry,
+                 reasons: &mut std::collections::BTreeMap<String, usize>| {
+                    *reasons.entry(reason.clone()).or_insert(0) += 1;
+                    entry.unavailable_reason = Some(reason);
+                };
+            for entry in bundle.entries.iter_mut() {
+                if entry.inline_body.is_some() {
+                    already_hydrated += 1;
+                    entry.unavailable_reason = None;
+                    continue;
                 }
+                let body = match fetch_full_body(store, &entry.uid, root) {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        skip(reason.reason(), entry, &mut skipped_reasons);
+                        continue;
+                    }
+                };
+                if body.is_empty() {
+                    skip(BodyUnavailable::Empty.reason(), entry, &mut skipped_reasons);
+                    continue;
+                }
+                let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
+                // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
+                // `complete` flag is propagated to BundleEntry.body_complete so
+                // consumers can decide whether to fall back to `read_symbols` for the
+                // full source.
+                let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
+                let cost = body.len().div_ceil(4);
+                if hydrated > 0 && used_tokens + cost > budget {
+                    // Over budget: skip THIS body and keep going — a later, smaller
+                    // body may still fit. (Previously a `break` aborted every
+                    // remaining entry.)
+                    skip(
+                        format!("token budget of {budget} exhausted"),
+                        entry,
+                        &mut skipped_reasons,
+                    );
+                    continue;
+                }
+                used_tokens += cost;
+                if entry.summary.is_none() {
+                    let s = summarize(&body);
+                    if !s.is_empty() {
+                        entry.summary = Some(s);
+                    }
+                }
+                entry.inline_body = Some(body);
+                entry.body_complete = complete;
+                entry.unavailable_reason = None;
+                hydrated += 1;
             }
-            entry.inline_body = Some(body);
-            entry.body_complete = complete;
-            hydrated += 1;
-        }
 
-        let entries = bundle.entries.clone();
-        Ok((hydrated, already_hydrated, entries))
-    })?;
+            let skipped: usize = skipped_reasons.values().sum();
+            let entries = bundle.entries.clone();
+            Ok((
+                hydrated,
+                already_hydrated,
+                skipped,
+                skipped_reasons,
+                entries,
+            ))
+        })?;
 
     Ok(HydrateResult {
         bundle_id: bundle_id.to_string(),
         hydrated,
         already_hydrated,
+        skipped,
+        skipped_reasons,
         entries,
     })
 }
@@ -996,34 +1072,144 @@ fn domain_label(e: &BundleEntry) -> String {
 
 /// Fetch the full body for a node UID. Symbols → source span; sections →
 /// section text; notes → concatenated section text.
-fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Option<String> {
-    if uid.starts_with("sym:") {
-        let reader = crate::content_reader::FilesystemReader::new(root);
-        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
-        return res.symbols.into_iter().next().map(|w| w.body);
-    }
-    if uid.starts_with("sec:") {
-        return store.lookup_section(uid).ok().map(|s| s.text_content);
-    }
-    if uid.starts_with("note:") {
-        let sections = store.sections_in_note(uid).ok()?;
-        if sections.is_empty() {
-            return None;
+/// Why an entry has no body — the four outcomes `Option::None` used to conflate.
+///
+/// nw-301: `fetch_full_body` returned `Option<String>`, so *this kind has no
+/// body route*, *the source was not readable from this root*, *the node has no
+/// content* and *the node was not found* were one silence. Every caller then
+/// treated that silence as "nothing to do", which is why `expand` reported
+/// `expanded: true` on entries it had failed to fill and `hydrate` counted them
+/// in neither of its counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyUnavailable {
+    /// The kind has no body by nature — a Tag is a name, not a document. This
+    /// is a FACT, and stating it is different from the bug below it.
+    NoBodyForKind(&'static str),
+    /// The kind has a body route but the source could not be read from the
+    /// caller-supplied root. Symbol file paths are stored repo-relative and
+    /// resolved by joining onto ONE root, so in a multi-repo graph at most one
+    /// repo's symbols can be read per call.
+    SourceUnreadable { path: String },
+    /// The node exists and its body is genuinely empty.
+    Empty,
+    /// No such node in the graph (a stale bundle, or a UID from another graph).
+    NotFound,
+    /// The UID belongs to no domain this schema mints.
+    UnknownUid,
+}
+
+impl BodyUnavailable {
+    /// A short, stable reason string for the wire.
+    pub fn reason(&self) -> String {
+        match self {
+            BodyUnavailable::NoBodyForKind(kind) => {
+                format!("{kind} entries have no body")
+            }
+            BodyUnavailable::SourceUnreadable { path } => {
+                format!("source not readable from the supplied root: {path}")
+            }
+            BodyUnavailable::Empty => "the node's body is empty".to_string(),
+            BodyUnavailable::NotFound => "not found in this graph".to_string(),
+            BodyUnavailable::UnknownUid => "unrecognised uid".to_string(),
         }
+    }
+}
+
+/// Fetch the full body behind a bundle entry, or say why there is none.
+///
+/// The match is over [`UidKind`], which enumerates every domain
+/// `nestweaver-schema` mints, so a twelfth kind is a compile error here rather
+/// than a silent dead end. Before nw-301 this was an `if` chain over three of
+/// the five kinds a bundle can contain: `head:` and `tag:` fell off the end into
+/// `None` and were unhydratable forever — no `--root`, no token budget and no
+/// retry could ever have filled them.
+fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Result<String, BodyUnavailable> {
+    use nestweaver_schema::UidKind;
+
+    let non_empty = |text: String| {
+        if text.is_empty() {
+            Err(BodyUnavailable::Empty)
+        } else {
+            Ok(text)
+        }
+    };
+    // Sections in document order, joined — the shape `note:` already produced.
+    let join_sections = |sections: Vec<nestweaver_schema::Section>| {
         let mut combined: Vec<(u32, String)> = sections
             .into_iter()
             .map(|s| (s.start_line, s.text_content))
             .collect();
         combined.sort_by_key(|(line, _)| *line);
-        return Some(
-            combined
-                .into_iter()
-                .map(|(_, t)| t)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        );
+        combined
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    match UidKind::of(uid) {
+        Some(UidKind::Symbol) => {
+            let reader = crate::content_reader::FilesystemReader::new(root);
+            let res =
+                crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
+            match res.symbols.into_iter().next() {
+                // `body_available` is the signal `read_symbols` already
+                // computes and this function used to throw away by reading
+                // `.body` alone — an unreadable span became an empty string,
+                // indistinguishable from a symbol with no source.
+                Some(window) if !window.body_available => {
+                    Err(BodyUnavailable::SourceUnreadable { path: window.path })
+                }
+                Some(window) => non_empty(window.body),
+                None => Err(BodyUnavailable::NotFound),
+            }
+        }
+        Some(UidKind::Section) => match store.lookup_section(uid) {
+            Ok(section) => non_empty(section.text_content),
+            Err(_) => Err(BodyUnavailable::NotFound),
+        },
+        Some(UidKind::Note) => match store.sections_in_note(uid) {
+            Ok(sections) if sections.is_empty() => Err(BodyUnavailable::Empty),
+            Ok(sections) => non_empty(join_sections(sections)),
+            Err(_) => Err(BodyUnavailable::NotFound),
+        },
+        // A heading's body is the text under it, which is exactly the sections
+        // that point back at it. The note is recoverable from the heading UID
+        // itself (`head:{note_uid}:{slug_hash}:{line}`), so this needs no extra
+        // lookup and no schema change — the arm was simply never written.
+        Some(UidKind::Heading) => {
+            let Some(note) = nestweaver_schema::note_uid_of_heading(uid) else {
+                return Err(BodyUnavailable::UnknownUid);
+            };
+            match store.sections_in_note(note) {
+                Ok(sections) => {
+                    let own: Vec<nestweaver_schema::Section> = sections
+                        .into_iter()
+                        .filter(|section| section.heading_uid.as_deref() == Some(uid))
+                        .collect();
+                    if own.is_empty() {
+                        Err(BodyUnavailable::Empty)
+                    } else {
+                        non_empty(join_sections(own))
+                    }
+                }
+                Err(_) => Err(BodyUnavailable::NotFound),
+            }
+        }
+        // Stated, not fallen through. "Tags have no body" is a fact the caller
+        // can act on; "no body" with no reason reads as "this failed" and
+        // invites an infinite retry.
+        Some(
+            kind @ (UidKind::Tag
+            | UidKind::Repo
+            | UidKind::File
+            | UidKind::Service
+            | UidKind::Vault
+            | UidKind::Project
+            | UidKind::Contract),
+        ) => Err(BodyUnavailable::NoBodyForKind(kind.label())),
+        None => Err(BodyUnavailable::UnknownUid),
     }
-    None
 }
 
 /// Fetch immediate neighbors for a node: callers + callees for symbols,
@@ -1279,6 +1465,187 @@ mod tests {
         assert!(
             expanded.unresolved.is_empty(),
             "no unresolved targets expected"
+        );
+    }
+
+    /// A vault with a heading, a section under it and a tag — the three note
+    /// kinds a bundle can contain besides `note:` itself.
+    fn make_vault_store() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("deploy.md"),
+            "# Deployment\n\nThe service deploys through CI on every merge. #ops\n\n\
+             ## Rollback\n\nRun the rollback script and page the on-call.\n",
+        )
+        .unwrap();
+        let (_result, store) =
+            crate::index_md::index_markdown_directory_in_memory(&vault, "test", "testvault")
+                .unwrap();
+        (dir, vault, store)
+    }
+
+    fn bundle_of(db_path: &Path, entries: Vec<BundleEntry>) -> String {
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_301".to_string(),
+            Bundle {
+                bundle_id: "bndl_301".to_string(),
+                created_at: now_epoch(),
+                query: "deployment".to_string(),
+                scope: "vault".to_string(),
+                entries,
+            },
+        );
+        save_bundle_store(db_path, &bundle_store).unwrap();
+        "bndl_301".to_string()
+    }
+
+    fn entry_for(uid: &str, kind: &str) -> BundleEntry {
+        BundleEntry {
+            asset_id: format!("a_{}", &uid[..uid.len().min(12)]),
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: kind.to_string(),
+            location: "deploy.md".to_string(),
+            summary: None,
+            inline_body: None,
+            body_complete: true,
+            expanded: false,
+            unavailable_reason: None,
+            is_seed: false,
+            relevance: 1.0,
+        }
+    }
+
+    /// nw-301. `fetch_full_body` had arms for `sym:`/`sec:`/`note:` and fell off
+    /// the end for the other two members of the UID space, so `head:` and
+    /// `tag:` entries were a PERMANENT dead end: `expand` marked them
+    /// `expanded: true` with no body and `hydrate` — the command whose entire
+    /// job is filling bodies — counted them in NEITHER of its counters. That is
+    /// why a 30-entry bundle reported `hydrated: 7, already_hydrated: 5`: 7+5
+    /// is 12, exactly the Note count, and the other 18 entries appeared nowhere.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? Not "add two arms" — an `if`
+    /// chain cannot be exhaustive, so a sixth kind would fall off the end the
+    /// same way. `fetch_full_body` now matches `nestweaver_schema::UidKind`,
+    /// which enumerates every domain the schema mints in ONE place, and the
+    /// accounting invariant below is asserted over the whole bundle rather than
+    /// over the kinds this test happens to include.
+    #[test]
+    fn hydrate_accounts_for_every_entry_it_was_given() {
+        let (dir, vault, store) = make_vault_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let headings = store.list_all_headings().unwrap();
+        assert!(
+            !headings.is_empty(),
+            "fixture must contain a Heading or this test proves nothing"
+        );
+        let tags = store.list_tags(None).unwrap();
+        assert!(
+            !tags.is_empty(),
+            "fixture must contain a Tag or this test proves nothing"
+        );
+
+        let mut entries: Vec<BundleEntry> = headings
+            .iter()
+            .map(|h| entry_for(&h.uid, "Heading"))
+            .collect();
+        entries.push(entry_for(&tags[0].uid, "Tag"));
+        let total = entries.len();
+        let bundle_id = bundle_of(&db_path, entries);
+
+        let result =
+            investigate_hydrate(&store, &db_path, &vault, &bundle_id, Some(16000)).unwrap();
+
+        assert_eq!(
+            result.hydrated + result.already_hydrated + result.skipped,
+            total,
+            "every entry must land in exactly one counter; got hydrated={} \
+             already={} skipped={} of {total}",
+            result.hydrated,
+            result.already_hydrated,
+            result.skipped
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .filter(|e| e.uid.starts_with("head:"))
+                .all(|e| e.inline_body.is_some()),
+            "Heading entries must receive a body — `head:` had no arm at all: {:?}",
+            result.entries
+        );
+        let tag_entry = result
+            .entries
+            .iter()
+            .find(|e| e.uid.starts_with("tag:"))
+            .expect("the tag entry survives");
+        assert!(
+            tag_entry
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Tag")),
+            "a Tag has no body BY NATURE, and saying so is different from the \
+             silence that reads as 'this failed, retry': {tag_entry:?}"
+        );
+    }
+
+    /// `expanded: true` on an entry with no body is the honest-failure
+    /// antipattern this release was closing elsewhere: `expanded = true` sat
+    /// OUTSIDE the `if let Some(body)`, so it claimed success on every failure.
+    /// An agent reads that as "this symbol has no body", not "this route
+    /// failed", and has no signal that more exists.
+    #[test]
+    fn expand_does_not_claim_success_when_no_body_was_obtained() {
+        let (dir, _src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        let entry = entry_for(&greet_uid, "Symbol");
+        let asset_id = entry.asset_id.clone();
+        let bundle_id = bundle_of(&db_path, vec![entry]);
+
+        // A root that does not contain the symbol's file — the 43-repo case,
+        // where symbol paths are repo-relative and one root can serve one repo.
+        let bogus_root = dir.path().join("not-the-repo");
+        fs::create_dir_all(&bogus_root).unwrap();
+        let out = investigate_expand(
+            &store,
+            &db_path,
+            &bogus_root,
+            &bundle_id,
+            std::slice::from_ref(&asset_id),
+        )
+        .unwrap();
+
+        let expanded = out
+            .expanded
+            .iter()
+            .find(|e| e.asset_id == asset_id)
+            .expect("the target was expanded");
+        assert!(
+            expanded.inline_body.is_none(),
+            "precondition: no body was readable from a root that lacks the file"
+        );
+        assert!(
+            !expanded.expanded,
+            "an entry with no body must not report expanded: true: {expanded:?}"
+        );
+        assert!(
+            expanded
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not readable")),
+            "the failure must be NAMED — 'source not readable from the supplied \
+             root' is actionable, silence is not: {expanded:?}"
         );
     }
 
@@ -2116,6 +2483,7 @@ mod tests {
                     inline_body: None,
                     body_complete: true,
                     expanded: false,
+                    unavailable_reason: None,
                     is_seed: false,
                     relevance: 1.0,
                 }],
@@ -2193,6 +2561,7 @@ mod tests {
             inline_body: None,
             body_complete: true,
             expanded: false,
+            unavailable_reason: None,
             is_seed: false,
             relevance: 1.0,
         };

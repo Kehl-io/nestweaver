@@ -579,6 +579,20 @@ fn index_markdown_since_with_reader(
         });
     }
 
+    // nw-287: the incremental path deletes just as totally as the full one.
+    // With an empty scan every indexed note falls into `removed_uids` below, so
+    // an unreadable or unmounted vault empties the graph here too. Same guard,
+    // same reason: a deletion must be observed, never inferred from silence.
+    if eligible_note_uids.is_empty() && vault_existed && !existing_notes.is_empty() {
+        anyhow::bail!(
+            "refusing to refresh vault '{vault_name}': the scan found no note files, but {} \
+             note(s) are indexed. Committing this would delete every one of them. Check that \
+             the vault directory is readable and mounted; if it really is empty, drop it with \
+             `nestweaver brain remove`.",
+            existing_notes.len()
+        );
+    }
+
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
         .filter(|note| !eligible_note_uids.contains(&note.uid))
@@ -1016,7 +1030,14 @@ fn index_markdown_since_with_reader(
     // candidate-node count unchanged — the generation bump is the only signal
     // that stales the trigram posting table (mirrors `index.rs` and the full
     // vault index above).
-    store.bump_and_persist_generation();
+    //
+    // nw-289: wrapped so the code manifest cache is carried across the
+    // boundary. A VAULT index advances the generation that `.manifests.json`
+    // is bound to, while being incapable of changing anything the manifest
+    // describes.
+    crate::manifest::advancing_generation_rebinding_manifests(store, || {
+        store.bump_and_persist_generation();
+    });
 
     // Best-effort and AFTER the commit, like the symbol epilogue: a
     // tombstoning failure must not fail a refresh that already succeeded.
@@ -1236,6 +1257,7 @@ fn prepare_single_note(
         note_kind: parsed.note_kind,
         word_count: parsed.word_count,
         content_hash: parsed.content_hash.clone(),
+        frontmatter_raw: parsed.frontmatter_raw.clone(),
         frontmatter: frontmatter_json,
         created_at,
         modified_at,
@@ -1606,6 +1628,7 @@ where
             word_count: parsed.word_count,
             content_hash: parsed.content_hash.clone(),
             frontmatter: frontmatter_json,
+            frontmatter_raw: parsed.frontmatter_raw.clone(),
             created_at,
             modified_at,
             pagerank_score: None,
@@ -1838,6 +1861,32 @@ where
     // gate, before the write.
     let vault_existed = store.lookup_vault(&v_uid).is_ok();
 
+    // nw-287: refuse a whole-vault deletion that was INFERRED rather than
+    // observed. `bulk_vault_reindex_write` is a total replacement — it
+    // cascade-deletes the old vault and inserts the scan's result — so an empty
+    // scan over a vault that HELD notes commits as "every note was deleted".
+    //
+    // `FilesystemReader::list_files` now refuses an unreadable root, which
+    // closes the reported case. This guard is the belt: an unmounted volume
+    // presents as an empty-but-READABLE directory, which no enumeration check
+    // can distinguish from a genuinely emptied vault. The destructive reading
+    // must not be the default one, and the watcher route has no human reading
+    // the exit code.
+    if all_notes.is_empty() && vault_existed {
+        let existing = store
+            .list_notes(Some(&v_uid))
+            .context("count indexed notes before the stale-drop")?;
+        if !existing.is_empty() {
+            anyhow::bail!(
+                "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
+                 note files, but {} note(s) are indexed. Committing this would delete every \
+                 one of them. Check that the vault directory is readable and mounted; if it \
+                 really is empty, drop it with `nestweaver brain remove`.",
+                existing.len()
+            );
+        }
+    }
+
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
 
@@ -2026,7 +2075,12 @@ where
     // note content. `bump_and_persist_generation` persists to the
     // `<db>.generation` sidecar for persistent stores and just bumps for
     // in-memory ones.
-    store.bump_and_persist_generation();
+    //
+    // nw-289: wrapped for the same reason as the incremental path — see
+    // `advancing_generation_rebinding_manifests`.
+    crate::manifest::advancing_generation_rebinding_manifests(store, || {
+        store.bump_and_persist_generation();
+    });
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -2118,6 +2172,20 @@ fn normalize_relative(source_folder: &str, key: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Split a vault-relative folder into lowercased path components.
+///
+/// Empty components are dropped so `""`, `"/"` and `"a//b"` normalise the way
+/// callers expect, and the vault root becomes the empty prefix that is an
+/// ancestor of every folder.
+fn folder_components(folder: &str) -> Vec<String> {
+    folder
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_lowercase())
+        .collect()
+}
+
 struct WikilinkLookup<'a> {
     /// Path key → note_uid. Path keys are lowercased, with optional ".md"
     /// stripped, normalised to forward slashes.
@@ -2133,11 +2201,14 @@ struct WikilinkLookup<'a> {
     folder_by_note: HashMap<&'a str, &'a str>,
     /// note_uid → heading slug → heading_uid. For anchor resolution.
     headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>>,
-    /// (folder, lowercased title OR filename stem) → list of note_uids in
-    /// that folder. Drives priority-3 same-folder resolution: lets a
-    /// wikilink target match a sibling note by title OR by `note-name`
-    /// even when no global title match exists.
-    by_folder_name: HashMap<(String, String), Vec<&'a str>>,
+    /// (folder, lowercased filename stem) → note_uids in that folder.
+    ///
+    /// Stems ONLY. This map used to hold titles as well, under the same key
+    /// space, which broke its own `len() == 1` uniqueness test two ways: a note
+    /// whose title equalled its own stem pushed itself twice, and a folder
+    /// holding one title-match plus one stem-match looked ambiguous when those
+    /// are two different tiers by design (nw-290).
+    by_folder_stem: HashMap<(String, String), Vec<&'a str>>,
     /// All known note UIDs (F11: lets frontmatter reference a canonical UID).
     known_uids: HashSet<&'a str>,
 }
@@ -2150,7 +2221,7 @@ impl<'a> WikilinkLookup<'a> {
         let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
-        let mut by_folder_name: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
+        let mut by_folder_stem: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
         let mut known_uids: HashSet<&'a str> = HashSet::new();
 
         for note in notes {
@@ -2182,17 +2253,12 @@ impl<'a> WikilinkLookup<'a> {
             // filename stem. Lets `[[my-note]]` resolve to `folder/my-note.md`
             // even when no other note shares that title globally.
             let folder = note.folder.to_string();
-            let title_lc = note.title.to_lowercase();
-            by_folder_name
-                .entry((folder.clone(), title_lc))
-                .or_default()
-                .push(note.note_uid.as_str());
             if let Some(stem) = std::path::Path::new(&note.rel_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
             {
                 let stem_lc = stem.to_lowercase();
-                by_folder_name
+                by_folder_stem
                     .entry((folder, stem_lc.clone()))
                     .or_default()
                     .push(note.note_uid.as_str());
@@ -2216,7 +2282,7 @@ impl<'a> WikilinkLookup<'a> {
             by_stem,
             folder_by_note,
             headings_by_note,
-            by_folder_name,
+            by_folder_stem,
             known_uids,
         }
     }
@@ -2226,16 +2292,47 @@ impl<'a> WikilinkLookup<'a> {
     /// must never score below a later one, so downstream consumers can
     /// threshold on confidence without inverting the resolver's own ordering.
     ///
+    /// **FILENAME BEFORE TITLE; DIRECTORY PROXIMITY BEFORE GLOBALITY.**
+    ///
     /// - Priority 1: path match — target contains `/` and matches a known
-    ///   path (lowercased, with/without `.md`) → confidence 1.0.
-    /// - Priority 2: unique title match → confidence 1.0.
-    /// - Priority 3: same-folder match (filename stem or title scoped to the
-    ///   source's folder) → confidence 0.95.
-    /// - Priority 3b: unique global filename-stem match (Obsidian
-    ///   shortest-path) → confidence 0.9.
-    /// - Priority 4: alias match → unique 0.7, ambiguous split.
-    /// - Priority 5: ambiguous title match → same-folder narrowing 0.5,
+    ///   path (lowercased, with/without `.md`) → 1.0.
+    /// - Priority 2: same-folder filename stem → 0.95.
+    /// - Priority 3: NEAREST-ANCESTOR filename stem → 0.92.
+    /// - Priority 4: unique global filename stem (Obsidian shortest-path) → 0.90.
+    /// - Priority 5: unique global title → 1.0 when NO file in the vault
+    ///   carries that stem, otherwise 0.80.
+    /// - Priority 6: alias match → unique 0.7, ambiguous split.
+    /// - Priority 7: path-qualified fallback to the last segment → 0.85.
+    /// - Priority 8: ambiguous title match → same-folder narrowing 0.5,
     ///   otherwise split across all candidates.
+    ///
+    /// There is deliberately NO same-folder TITLE tier. Placed above priority 5
+    /// it made proximity DECREASE confidence — a title link to a sibling scored
+    /// 0.85 while the identical link written from another folder scored 1.0 —
+    /// and its only unique job, preferring a co-located note when a title is
+    /// ambiguous vault-wide, is already priority 8's narrowing. Adding it would
+    /// also push every same-folder title link into `broken_wikilinks`, which is
+    /// the surface nw-297 exists to keep readable.
+    ///
+    /// The title tier used to sit at priority 2, ABOVE every filename tier, and
+    /// return 1.0. One note that lost its `# ` heading therefore fell back to
+    /// its bare stem as a title, became the unique global title match, and
+    /// captured every unqualified `[[Name]]` in the vault — 12 of them across
+    /// five unrelated workspaces — at exactly the confidence
+    /// `GraphStore::broken_wikilinks` is defined to ignore (`WHERE r.confidence
+    /// < 1.0`). The wrong edge was unreportable by construction (nw-290).
+    ///
+    /// Priority 6's conditional is the precise statement of that: reaching the
+    /// title tier at all means NO filename tier matched. If the vault holds no
+    /// file with that stem, the title is the only evidence and 1.0 is honest.
+    /// If it does, the title match is a guess made AGAINST filename evidence
+    /// and must not claim certainty.
+    ///
+    /// Priority 3 is new (nw-306). Directory scoping used to be exact-folder
+    /// equality only, so `**Up:** [[_Overview]]` written one directory below
+    /// its hub matched nothing: the same-folder tier saw the wrong folder and
+    /// the global-stem tier required vault-wide uniqueness among 21 files named
+    /// `_Overview.md`. 38 real hub links were reported broken.
     fn resolve(&self, target: &str, source_folder: &str) -> ResolveOutcome {
         let key = target.trim().replace('\\', "/").to_lowercase();
         // nw-166: markdown links keep their extension (`[x](codebase-recon.md)`),
@@ -2292,37 +2389,37 @@ impl<'a> WikilinkLookup<'a> {
             }
         }
 
-        // Priority 2: unique title match.
-        if let Some(uids) = self.by_title.get(&key)
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 1.0,
-            }]);
-        }
-
-        // Priority 3: same-folder match.
-        // A wikilink `[[target]]` in note F/x.md resolves to F/y.md when
-        // F/y.md has either a title or a filename stem equal to `target`.
-        // This is the priority that lets sibling-relative links work
-        // without forcing the user to add aliases or write the full path.
-        // Also acts as ambiguity-breaker when multiple notes share a
-        // title and the source is co-located with one of them.
+        // Priority 2: same-folder filename stem.
+        // A wikilink `[[target]]` in note F/x.md resolves to F/target.md.
+        // This is the tier that lets sibling-relative links work without
+        // forcing the user to add aliases or write the full path, and it now
+        // runs ABOVE the title tiers — a filename is a stronger claim on a bare
+        // `[[Name]]` than a heading is (nw-290).
+        //
+        // It must stay at 0.95, not 1.0: `broken_wikilinks` selects
+        // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
+        // depends on a same-folder match remaining visible there as a
+        // resolved-but-lower-tier row.
         if let Some(uids) = self
-            .by_folder_name
+            .by_folder_stem
             .get(&(source_folder.to_string(), key.clone()))
             && uids.len() == 1
         {
             return ResolveOutcome::Resolved(vec![ResolveCandidate {
                 note_uid: uids[0].to_string(),
-                // Must stay above priority 3b's 0.9: this tier outranks the
-                // global-stem match, and confidence must not invert priority.
                 confidence: 0.95,
             }]);
         }
 
-        // Priority 3b: global filename-stem match (Obsidian shortest-path).
+        // Priority 3: nearest-ancestor filename stem (nw-306).
+        if let Some(uid) = self.nearest_ancestor_stem(&key, source_folder) {
+            return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: uid,
+                confidence: 0.92,
+            }]);
+        }
+
+        // Priority 4: global filename-stem match (Obsidian shortest-path).
         if let Some(uids) = self.by_stem.get(&key)
             && uids.len() == 1
         {
@@ -2332,7 +2429,23 @@ impl<'a> WikilinkLookup<'a> {
             }]);
         }
 
-        // Priority 4: alias match (unique → 0.7, ambiguous → split).
+        // Priority 5: unique global title. Full confidence ONLY when no file in
+        // the vault carries this stem — see the tier table above for why.
+        if let Some(uids) = self.by_title.get(&key)
+            && uids.len() == 1
+        {
+            let confidence = if self.by_stem.contains_key(&key) {
+                0.80
+            } else {
+                1.0
+            };
+            return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence,
+            }]);
+        }
+
+        // Priority 6: alias match (unique → 0.7, ambiguous → split).
         if let Some(uids) = self.by_alias.get(&key) {
             if uids.len() == 1 {
                 return ResolveOutcome::Resolved(vec![ResolveCandidate {
@@ -2380,9 +2493,14 @@ impl<'a> WikilinkLookup<'a> {
             }
         }
 
-        // Priority 5: ambiguous title match (was bundled inside priority
-        // 2; now it's the last-resort tier so we always try alias / same-
-        // folder first when the global title is non-unique).
+        // Priority 8: ambiguous title match (was bundled inside the unique
+        // title tier; now it's the last-resort tier so we always try alias /
+        // same-folder first when the global title is non-unique).
+        //
+        // Deliberately NOT extended to ambiguous STEMS. Two same-named files in
+        // unrelated folders are exactly the case the resolver should decline
+        // rather than guess at — the ancestor tier above already narrows the
+        // cases where the directory tree carries a real signal.
         if let Some(uids) = self.by_title.get(&key) {
             // Try same-folder narrowing inside the title-multiple case.
             let same_folder: Vec<&&str> = uids
@@ -2407,6 +2525,51 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         ResolveOutcome::Unresolved
+    }
+
+    /// Of the notes whose filename stem is `key`, return the one living in the
+    /// DEEPEST folder that is an ancestor of `source_folder`. `None` when no
+    /// candidate is an ancestor, or when two candidates tie at that depth.
+    ///
+    /// This is the vault's strongest structural signal — "the one nearest in
+    /// the directory tree" — and nothing consulted it: the only directory tier
+    /// was exact-folder string equality, and the global-stem tier required
+    /// vault-wide uniqueness (nw-306).
+    ///
+    /// Comparison is COMPONENT-WISE, not `str::starts_with`: the latter would
+    /// accept `Workspaces/Cortina` as an ancestor of
+    /// `Workspaces/Cortina Precision/plans`. Both sides are lowercased and
+    /// forward-slashed the way priority 1 already normalises paths.
+    fn nearest_ancestor_stem(&self, key: &str, source_folder: &str) -> Option<String> {
+        let uids = self.by_stem.get(key)?;
+        let source = folder_components(source_folder);
+
+        let mut best_depth: Option<usize> = None;
+        let mut best: Option<&str> = None;
+        let mut tied = false;
+        for uid in uids {
+            let folder = self.folder_by_note.get(uid).copied().unwrap_or("");
+            let candidate = folder_components(folder);
+            // The vault root (no components) is an ancestor of everything.
+            if candidate.len() > source.len() || candidate[..] != source[..candidate.len()] {
+                continue;
+            }
+            match best_depth {
+                Some(depth) if candidate.len() < depth => {}
+                Some(depth) if candidate.len() == depth => tied = true,
+                _ => {
+                    best_depth = Some(candidate.len());
+                    best = Some(uid);
+                    tied = false;
+                }
+            }
+        }
+        // Two notes with the same stem at the same ancestor depth carry equal
+        // evidence. Declining is the honest answer; guessing is nw-290.
+        if tied {
+            return None;
+        }
+        best.map(|uid| uid.to_string())
     }
 
     fn find_heading(&self, note_uid: &str, slug: &str) -> Option<String> {
@@ -2771,6 +2934,360 @@ mod tests {
             fs::write(&path, content).unwrap();
         }
         (dir, root)
+    }
+
+    /// True when the current process bypasses filesystem permission bits.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// nw-287 (CRITICAL, data loss): a full refresh whose scan could not read
+    /// the vault DIRECTORY must fail. It must not commit the stale-drop, and
+    /// it must not report success. Confirmed 3x black-box: rc=0,
+    /// "dropped 2 stale note(s), reindexed 0", and `brain search` then empty.
+    #[cfg(unix)]
+    #[test]
+    fn refresh_of_an_unreadable_vault_directory_refuses_the_stale_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let (_dir, root) = make_vault(&[
+            ("f1.md", "# F1\n\ncontent one\n"),
+            ("f2.md", "# F2\n\ncontent two\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+
+        let first = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            first.index.notes_count, 2,
+            "precondition: two notes indexed"
+        );
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        // Restore BEFORE asserting so a failure still lets TempDir clean up.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match observed {
+            Err(_) => {}
+            Ok(result) => panic!(
+                "refresh reported SUCCESS on an unreadable vault directory: \
+                 dropped {} stale note(s), reindexed {}. This is nw-287: the \
+                 EACCES is swallowed in FilesystemReader::list_files and the \
+                 empty scan is committed as a whole-vault deletion.",
+                result.notes_deleted, result.index.notes_count
+            ),
+        }
+
+        // The graph must be intact whether the refresh errored or not.
+        assert_eq!(
+            store.list_notes(None).unwrap().len(),
+            2,
+            "an unreadable vault directory must never delete indexed notes"
+        );
+    }
+
+    /// nw-287, the case `list_files` alone cannot catch: an UNMOUNTED volume
+    /// presents as an empty-but-readable directory. A total-replacement
+    /// refresh must not read "I saw no files" as "every file was deleted".
+    #[test]
+    fn refresh_that_scans_zero_notes_refuses_to_empty_a_populated_vault() {
+        let (_dir, root) = make_vault(&[
+            ("f1.md", "# F1\n\ncontent one\n"),
+            ("f2.md", "# F2\n\ncontent two\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+
+        // Simulate the mount going away: the directory is readable and empty.
+        std::fs::remove_file(root.join("f1.md")).unwrap();
+        std::fs::remove_file(root.join("f2.md")).unwrap();
+
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        assert!(
+            observed.is_err(),
+            "an empty scan over a vault that held notes must fail closed, not \
+             commit a whole-vault deletion (nw-287)"
+        );
+        assert_eq!(
+            store.list_notes(None).unwrap().len(),
+            2,
+            "the previously indexed notes must survive the refusal"
+        );
+    }
+
+    /// The counterpart that keeps the empty-scan guard from becoming a wall: a
+    /// vault that was ALREADY empty must still refresh cleanly, and so must a
+    /// vault being indexed for the first time.
+    #[test]
+    fn refresh_of_a_genuinely_empty_vault_still_succeeds() {
+        let (_dir, root) = make_vault(&[]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+
+        let first = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .expect("first index of an empty vault is not a deletion");
+        assert_eq!(first.index.notes_count, 0);
+
+        let second = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .expect("re-refreshing an already-empty vault deletes nothing");
+        assert_eq!(second.index.notes_count, 0);
+        assert_eq!(second.notes_deleted, 0);
+    }
+
+    /// nw-290: a note that falls back to a BARE title must not capture another
+    /// workspace's unqualified basename link. `Workspaces/NW/Backlog.md` has no
+    /// `# ` heading, so its title is the bare word "Backlog" and it is the
+    /// unique global title match — which today short-circuits above every
+    /// filename tier, at confidence 1.0.
+    #[test]
+    fn a_bare_title_does_not_steal_a_sibling_filename_link() {
+        let (_dir, root) = make_vault(&[
+            (
+                "Workspaces/Cortina/_Overview.md",
+                "# Cortina — Overview\n\n- [[Backlog]] — execution backlog\n",
+            ),
+            (
+                "Workspaces/Cortina/Backlog.md",
+                "# Cortina — Backlog\n\nbody\n",
+            ),
+            // No `# ` heading: title falls back to the bare stem "Backlog".
+            ("Workspaces/NW/Backlog.md", "some body, no heading\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let uid_of = |frag: &str| {
+            notes
+                .iter()
+                .find(|n| n.file_path.contains(frag))
+                .map(|n| n.uid.clone())
+                .unwrap()
+        };
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, uid_of("Workspaces/Cortina/_Overview.md"));
+        assert_eq!(
+            edges[0].1,
+            uid_of("Workspaces/Cortina/Backlog.md"),
+            "nw-290: the sibling FILENAME must win; a bare title in another \
+             workspace must not capture the link"
+        );
+    }
+
+    /// nw-290, second half: when a title match is the surviving evidence AND
+    /// files with that stem exist, it must not claim confidence 1.0 — that is
+    /// the band `broken_wikilinks` is defined to ignore (read.rs `WHERE
+    /// r.confidence < 1.0`), so a wrong-but-confident edge is unreportable.
+    #[test]
+    fn a_title_match_competing_with_filenames_never_scores_full_confidence() {
+        let (_dir, root) = make_vault(&[
+            ("logs/day.md", "# Day\n\nSee [[Backlog]].\n"),
+            ("Workspaces/NW/Backlog.md", "no heading here\n"),
+            ("Workspaces/Orbit/Backlog.md", "# Orbit — Backlog\n"),
+        ]);
+        let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let suspect = store.broken_wikilinks().unwrap();
+        let row = suspect
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("Backlog"))
+            .expect(
+                "nw-290: a 1-of-2 filename guess must be visible to broken-links; \
+                 today it resolves at 1.0 and never appears here",
+            );
+        assert!(row.confidence < 1.0, "got {}", row.confidence);
+    }
+
+    /// nw-306: `**Up:** [[_Overview]]` from a subfolder must resolve to the
+    /// nearest ancestor's `_Overview.md`. Today the only directory tier is
+    /// exact-folder equality, and the global-stem tier requires vault-wide
+    /// uniqueness, so 38 real hub links are reported broken.
+    #[test]
+    fn an_unqualified_basename_resolves_to_the_nearest_ancestor() {
+        let (_dir, root) = make_vault(&[
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            ("Workspaces/Orbit/_Overview.md", "# Orbit — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro-homepage.md",
+                "# Astro Homepage\n\n**Up:** [[_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.wikilinks_unresolved, 0,
+            "nw-306: a hub `Up:` link one directory down must not read as broken"
+        );
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let uid_of = |frag: &str| {
+            notes
+                .iter()
+                .find(|n| n.file_path.contains(frag))
+                .map(|n| n.uid.clone())
+                .unwrap()
+        };
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1,
+            uid_of("Workspaces/Cortina/_Overview.md"),
+            "the NEAREST ancestor wins; Orbit's identically-named hub must not"
+        );
+    }
+
+    /// The guard that keeps the nw-306 tier from becoming nw-290: an ancestor
+    /// tier must not fire when NO candidate is an ancestor. Companion to the
+    /// existing `ambiguous_global_stem_stays_unresolved`.
+    #[test]
+    fn the_ancestor_tier_does_not_fire_for_unrelated_directories() {
+        let (_dir, root) = make_vault(&[
+            ("logs/daily.md", "# Daily\n\nSee [[target]].\n"),
+            ("f/target.md", "# Alpha\n"),
+            ("g/target.md", "# Beta\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(
+            result.wikilinks_unresolved, 1,
+            "no candidate is an ancestor of logs/, so the resolver must still decline"
+        );
+    }
+
+    /// nw-306, the depth tie-break: two ancestors both carry the stem, so the
+    /// DEEPEST must win. A prefix comparison that stopped at "is an ancestor"
+    /// would be ambiguous here and decline.
+    #[test]
+    fn the_nearest_ancestor_wins_over_a_shallower_one() {
+        let (_dir, root) = make_vault(&[
+            ("_Overview.md", "# Vault Root Overview\n"),
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro.md",
+                "# Astro\n\n**Up:** [[_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.wikilinks_unresolved, 0);
+
+        let notes = store.list_notes(None).unwrap();
+        let cortina = notes
+            .iter()
+            .find(|n| n.file_path.contains("Workspaces/Cortina/_Overview.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1, cortina,
+            "the nearest ancestor must beat the vault-root one"
+        );
+    }
+
+    /// nw-298 / F-VAULT-5: a string present ONLY in YAML frontmatter is
+    /// invisible to `regex_search` / `count_patterns` while `brain_search`
+    /// finds it. Two query surfaces over one database must not disagree about
+    /// whether a string exists.
+    #[test]
+    fn regex_search_sees_frontmatter_only_text() {
+        let (_dir, root) = make_vault(&[(
+            "Backlog.md",
+            "---\nitems:\n  - id: nw-231\n    note: 'saves-and-exits on device'\n---\n             # Backlog\n\nBody text only.\n",
+        )]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let hits = store
+            .regex_search("saves-and-exits", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "frontmatter text must be reachable from the exact-match surface; \
+             brain_search finds it and regex_search reports posting_hits: 0"
+        );
+
+        let counts = store
+            .count_patterns(&["nw-231".to_string()], None, None)
+            .unwrap();
+        assert_eq!(
+            counts[0].files_matched, 1,
+            "count_patterns must not report a confident zero for text that is present"
+        );
+    }
+
+    /// nw-298, the half that makes the visibility UNSTABLE rather than merely
+    /// asymmetric: a YAML-shaped pattern must match too. Indexing the stored
+    /// `Note.frontmatter` JSON column would satisfy the bare-token test above
+    /// and still fail this one.
+    #[test]
+    fn regex_search_matches_yaml_shaped_frontmatter_patterns() {
+        let (_dir, root) = make_vault(&[(
+            "Backlog.md",
+            "---\nid: nw-231\nstatus: ready\n---\n# Backlog\n\nBody.\n",
+        )]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let hits = store
+            .regex_search(r"(?m)^status: ready$", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "the RAW frontmatter text must be indexed, not the JSON re-encoding \
+             — a YAML-shaped regex is exactly what the vault's own backlog \
+             queries look like (nw-298)"
+        );
     }
 
     #[test]
@@ -3979,11 +4496,21 @@ sub b body
 
     #[test]
     fn since_refresh_preserves_project_membership_for_replacements_only() {
-        let (_dir, root) = make_vault(&[("a.md", "# A\n\nold\n")]);
+        // Two notes on purpose. With one, removing it also EMPTIES the vault,
+        // which the nw-287 guard refuses — and the subject here is "a removed
+        // file drops its project membership", not "a vault may be emptied by a
+        // refresh". The second note keeps those two variables apart.
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nold\n"), ("keep.md", "# Keep\n")]);
         let store = GraphStore::in_memory().unwrap();
         let db_path = root.join("unused.lbug");
         index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
-        let note_uid = store.list_notes(None).unwrap()[0].uid.clone();
+        let note_uid = store
+            .list_notes(None)
+            .unwrap()
+            .iter()
+            .find(|n| n.file_path.ends_with("a.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
         let project_uid = "proj:test:incremental-membership";
         store
             .insert_project(&nestweaver_schema::Project {
@@ -4272,6 +4799,7 @@ sub b body
             word_count: 3,
             content_hash: format!("hash{i}"),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,

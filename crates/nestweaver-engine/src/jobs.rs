@@ -163,6 +163,27 @@ pub struct JobQueue {
     conn: Connection,
 }
 
+/// Apply one additive SQLite column migration, reporting anything that is not
+/// "the column is already there".
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so a re-run on an already-migrated
+/// queue always errors with `duplicate column name`. That one message is
+/// benign and expected on every daemon start; everything else means the queue
+/// is missing a column and the next query against it will fail somewhere far
+/// from here. The `let _ =` this replaces could not tell those apart — the same
+/// defect that let `ALTER TABLE Note ADD frontmatter_raw` in the graph schema
+/// run against a table that did not exist yet, on every open, unnoticed.
+fn add_column(conn: &Connection, column: &str, ddl: &str) {
+    match conn.execute_batch(ddl) {
+        Ok(()) => {}
+        Err(error) if error.to_string().contains("duplicate column name") => {}
+        Err(error) => tracing::warn!(
+            "job queue migration for index_jobs.{column} failed: {error}; \
+             queue operations that need that column will fail"
+        ),
+    }
+}
+
 impl JobQueue {
     /// Open (or create) the job queue database at `path`.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
@@ -195,8 +216,14 @@ impl JobQueue {
             );",
         )?;
         // Migrations: add columns to existing databases.
-        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN branch TEXT;");
-        let _ = conn.execute_batch(
+        add_column(
+            &conn,
+            "branch",
+            "ALTER TABLE index_jobs ADD COLUMN branch TEXT;",
+        );
+        add_column(
+            &conn,
+            "requeue_needed",
             "ALTER TABLE index_jobs ADD COLUMN requeue_needed INTEGER NOT NULL DEFAULT 0;",
         );
         // T4.1/T4.2: per-claim fencing token + lease visibility timeout. Both
@@ -204,8 +231,16 @@ impl JobQueue {
         // legacy `running` rows simply have NULL lease/owner and are handled by
         // the `recover_stale` fallback (run at startup AND on every reaper tick)
         // until re-claimed with a lease.
-        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN claimed_by TEXT;");
-        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN lease_expires_at INTEGER;");
+        add_column(
+            &conn,
+            "claimed_by",
+            "ALTER TABLE index_jobs ADD COLUMN claimed_by TEXT;",
+        );
+        add_column(
+            &conn,
+            "lease_expires_at",
+            "ALTER TABLE index_jobs ADD COLUMN lease_expires_at INTEGER;",
+        );
         // Persisted periodic-full reindex state (one row per repo). Lives in
         // the same DB as the job queue so it shares the daemon's lifecycle and
         // survives restarts — the in-memory `ReindexTracker` is only a cache.

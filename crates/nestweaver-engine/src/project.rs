@@ -382,6 +382,9 @@ pub fn materialize_projects_with_lease(
                     word_count: content.split_whitespace().count() as u32,
                     content_hash: truncated_hash(&content),
                     frontmatter: None,
+                    // Synthesised from wiki content, not parsed from a file
+                    // with a `---` block.
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -751,6 +754,7 @@ args = { page = "123" }
                 word_count: 1,
                 content_hash: "last-good".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

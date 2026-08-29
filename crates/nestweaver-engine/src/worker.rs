@@ -24,6 +24,23 @@ impl std::fmt::Display for JobCancelled {
 
 impl std::error::Error for JobCancelled {}
 
+/// How a worker learns which logical instance to stamp on the repos it indexes.
+///
+/// nw-286: resolved PER JOB, not captured once at spawn. The database's
+/// recorded data identity is minted lazily by the first index — i.e. possibly
+/// *after* the daemon that spawned this pool booted and read `None`. A `String`
+/// captured at spawn time is a boot snapshot, and a boot snapshot of a mutable
+/// database fact is exactly what forked the graph in nw-286. Callers whose
+/// instance genuinely cannot change (a `--config`-stated daemon, tests) use
+/// [`fixed_instance_id`] and pay nothing.
+pub type InstanceIdResolver = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// An [`InstanceIdResolver`] over a value that cannot change.
+pub fn fixed_instance_id(id: impl Into<String>) -> InstanceIdResolver {
+    let id = id.into();
+    Arc::new(move || id.clone())
+}
+
 /// Shared indexing status that can be observed by other components (e.g. the
 /// daemon's `brain_status` handler) to report whether indexing is in progress.
 #[derive(Clone)]
@@ -136,7 +153,7 @@ impl WorkerPool {
         queue: Arc<Mutex<JobQueue>>,
         workspace: Arc<BareCloneWorkspace>,
         store: Arc<nestweaver_store::GraphStore>,
-        instance_id: String,
+        instance_id: InstanceIdResolver,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
     ) {
@@ -171,7 +188,7 @@ impl WorkerPool {
         queue: Arc<Mutex<JobQueue>>,
         workspace: Arc<BareCloneWorkspace>,
         store: Arc<nestweaver_store::GraphStore>,
-        instance_id: String,
+        instance_id: InstanceIdResolver,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
         drained: Option<Arc<AtomicBool>>,
@@ -306,6 +323,11 @@ impl WorkerPool {
                         .cloned()
                         .unwrap_or(RepoType::Code);
                     tokio::task::spawn_blocking(move || {
+                        // nw-286: resolve the instance HERE, once per job, on
+                        // the blocking pool — the resolver consults the store,
+                        // and the answer can differ from the one that was true
+                        // when this pool was spawned.
+                        let instance_id = instance_id();
                         let prepared = prepare_job(
                             &job_clone,
                             &workspace,
@@ -1855,8 +1877,15 @@ mod tests {
 
         // Run the worker loop in a background task.
         let handle = tokio::spawn(async move {
-            pool.run(q, workspace, s, "test".to_string(), shutdown_rx, None)
-                .await;
+            pool.run(
+                q,
+                workspace,
+                s,
+                fixed_instance_id("test"),
+                shutdown_rx,
+                None,
+            )
+            .await;
         });
 
         // Wait for the job to be processed (poll queue depth).
@@ -1918,7 +1947,7 @@ mod tests {
                 q,
                 workspace,
                 s,
-                "test".to_string(),
+                fixed_instance_id("test"),
                 &mut shutdown_rx,
                 None,
                 None,
@@ -1984,7 +2013,7 @@ mod tests {
                 q,
                 workspace,
                 s,
-                "test".to_string(),
+                fixed_instance_id("test"),
                 shutdown_rx,
                 Some(status),
             )

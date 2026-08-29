@@ -6,6 +6,24 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+/// Marks a generation-staleness refusal inside a [`StoreError`] message.
+///
+/// nw-289. Callers must be able to tell "this artifact describes an OLDER
+/// generation of THIS graph" — rebuildable derived data, which a backup can
+/// exclude and carry on — from "this artifact belongs to a DIFFERENT graph",
+/// which is a corruption signal that must abort. Both arrive as
+/// `StoreError::Query`, so the distinction lives in one constant both the
+/// producer and every classifier read, rather than in a literal each side
+/// spells for itself.
+pub const STALE_ARTIFACT_MARKER: &str = "stale artifact generation";
+
+/// Whether an error message is the generation-staleness refusal above.
+#[must_use]
+pub fn is_stale_artifact_generation(message: &str) -> bool {
+    message.contains(STALE_ARTIFACT_MARKER)
+}
+
 use serde_json::Value;
 
 use crate::{PublicationIdentity, StoreError};
@@ -136,9 +154,21 @@ impl ArtifactEnvelope {
             )));
         }
         if self.source_graph_generation != expectation.source_graph_generation {
+            // nw-289: the message this replaces was
+            // `stale artifact generation 93, expected 95` — two numbers, no
+            // artifact, no file, no remedy. `backup save` failed 100% against
+            // a 5.6 GB production graph and printed exactly that. The
+            // neighbouring PageRank guard already meets the in-repo standard
+            // ("...declares damping 0.5 but this build computes with 0.85 —
+            // re-index"); this one did not. `self.artifact_kind` was known
+            // thirty lines above.
             return Err(StoreError::Query(format!(
-                "stale artifact generation {}, expected {}",
-                self.source_graph_generation, expectation.source_graph_generation
+                "{STALE_ARTIFACT_MARKER}: the {} artifact describes graph generation {}, \
+                 but the graph is at {}. It is derived data — re-index the repository \
+                 (`nestweaver index --repo <path> --force`) to regenerate it.",
+                self.artifact_kind,
+                self.source_graph_generation,
+                expectation.source_graph_generation
             )));
         }
         let observed_digest = payload_digest(&canonical_value(self.payload.clone()))?;

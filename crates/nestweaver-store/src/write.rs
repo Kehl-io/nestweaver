@@ -510,7 +510,7 @@ fn encode_framework_hint(symbol: &Symbol) -> String {
 /// Write Symbol rows to a CSV file (no header row).
 /// Column order: uid, name, kind, repo_uid, file_path, start_line, end_line,
 /// signature, summary, content_hash, pagerank_score, is_entry_point,
-/// entry_point_kind, framework_hint
+/// entry_point_kind, framework_hint, canonical_id, visibility
 fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> {
     let f = std::fs::File::create(path)
         .map_err(|e| StoreError::Query(format!("create symbols csv: {e}")))?;
@@ -528,6 +528,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             .unwrap_or_default();
         let fh = encode_framework_hint(s);
         let canonical = s.canonical_id.clone().unwrap_or_default();
+        let visibility = s.visibility.to_string();
         wtr.write_record([
             &s.uid,
             &s.name,
@@ -544,6 +545,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             &epk,
             &fh,
             &canonical,
+            &visibility,
         ])
         .map_err(|e| StoreError::Query(format!("write symbol row: {e}")))?;
     }
@@ -841,7 +843,7 @@ impl GraphStore {
              repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
              pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
-             framework_hint: $fh, canonical_id: $cid})",
+             framework_hint: $fh, canonical_id: $cid, visibility: $vis})",
             vec![
                 ("uid", lbug::Value::String(symbol.uid.clone())),
                 ("name", lbug::Value::String(symbol.name.clone())),
@@ -885,6 +887,11 @@ impl GraphStore {
                     "cid",
                     lbug::Value::String(symbol.canonical_id.clone().unwrap_or_default()),
                 ),
+                // nw-291: visibility is persisted rather than recomputed on
+                // read. Without it every symbol read back as `Inferred` and the
+                // nw-155 "an explicit export outranks the underscore" guard was
+                // dead code.
+                ("vis", lbug::Value::String(symbol.visibility.to_string())),
             ],
         )
     }
@@ -2096,7 +2103,7 @@ impl GraphStore {
                 &conn,
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
              note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
-             created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
+             frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
                 vec![
                     ("uid", lbug::Value::String(note.uid.clone())),
                     ("vid", lbug::Value::String(note.vault_uid.clone())),
@@ -2108,6 +2115,10 @@ impl GraphStore {
                     (
                         "fm",
                         lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "fmr",
+                        lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
                     ),
                     (
                         "ca",
@@ -2149,7 +2160,7 @@ impl GraphStore {
             .prepare(
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
                  note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
-                 created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
+                 frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for note in notes {
@@ -2166,6 +2177,10 @@ impl GraphStore {
                     (
                         "fm",
                         lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "fmr",
+                        lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
                     ),
                     (
                         "ca",
@@ -7749,14 +7764,14 @@ mod copy_from_tests {
                 f,
                 "uid,name,kind,repo_uid,file_path,start_line,end_line,\
                  signature,summary,content_hash,pagerank_score,is_entry_point,\
-                 entry_point_kind,framework_hint,canonical_id"
+                 entry_point_kind,framework_hint,canonical_id,visibility"
             )
             .unwrap();
             for i in 0..100 {
                 writeln!(
                     f,
                     "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
+                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,,",
                 )
                 .unwrap();
             }
@@ -7803,7 +7818,7 @@ mod copy_from_tests {
                     writeln!(
                         f,
                         "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
+                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,,",
                     )
                     .unwrap();
                 }
@@ -8303,6 +8318,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "one".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -8443,6 +8459,7 @@ mod tests {
                     word_count: 1,
                     content_hash: n.to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -8517,6 +8534,7 @@ mod tests {
             word_count: 1,
             content_hash: "old".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -9369,6 +9387,7 @@ mod tests {
                     word_count: 1,
                     content_hash: "one".to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -9768,6 +9787,7 @@ mod tests {
                 word_count: 3,
                 content_hash: "null-project-delete-hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -9947,6 +9967,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "note-hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10045,6 +10066,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "stable".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10061,6 +10083,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "new".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10153,6 +10176,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "stable".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10322,6 +10346,7 @@ mod tests {
             word_count: 1,
             content_hash: "old".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,

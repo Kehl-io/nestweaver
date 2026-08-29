@@ -1054,11 +1054,19 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
     // dirty (fail-closed) rather than treating it as a clean commit.
     let mut publication_clean = false;
     if publish_clean {
-        let generation_advanced = if db_path.is_some() {
-            lease.clean_generation()
-        } else {
-            store.try_bump_graph_generation()
-        };
+        // nw-289: the code-index path advances the same generation
+        // `.manifests.json` is bound to. It usually rewrites that cache from
+        // source afterwards, so this is normally a no-op — but "usually" is
+        // not a property, and a scope that indexes no manifest-bearing repo
+        // would otherwise orphan the cache exactly as the vault path did.
+        let generation_advanced =
+            crate::manifest::advancing_generation_rebinding_manifests(store, || {
+                if db_path.is_some() {
+                    lease.clean_generation()
+                } else {
+                    store.try_bump_graph_generation()
+                }
+            });
         let generation_durable = match generation_advanced {
             Err(error) => {
                 push_reconciliation_failure(
@@ -1934,6 +1942,27 @@ fn tiered_change_check(
 }
 
 /// Directory names to skip when walking the repository tree.
+///
+/// This is a DEFAULT, not a definition of coverage. Three properties hold:
+///
+///  1. Every prune is DISCLOSED (`FilesystemReader::skipped_dirs`, surfaced as
+///     `IndexResult::skipped_files`). nw-325: the prune runs inside
+///     `WalkBuilder::filter_entry`, which cuts the subtree before enumeration,
+///     so nothing below it could ever reach the `SkippedFile` channel and a
+///     wrong answer was indistinguishable from a complete one.
+///  2. A repo can opt any entry back in (`FilesystemReader::unskipping`).
+///  3. `ios` and `android` are NOT here. In an Expo / React Native / Capacitor
+///     layout they are first-party source by default — a nested
+///     `modules/<name>/ios/Foo.swift` is tracked and not gitignored, and this
+///     list pruned it at any depth, so the native half of a bridge was absent
+///     while its TypeScript shim was present. The genuinely-generated case is
+///     already covered: repos that generate them gitignore them, and the walker
+///     honours gitignore.
+///
+/// The remaining ambiguous entries (`build`, `dist`, `out`, `public`, `env`,
+/// `vendor`, `target`) are kept because removing them trades a false-negative
+/// class for a false-positive one — a JS monorepo's `dist/` is genuinely
+/// megabytes of minified output. They are now visible and overridable instead.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -1962,8 +1991,6 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".env",
     ".pio",
     "Pods",
-    "ios",
-    "android",
     ".gradle",
     "public",
     "out",
@@ -3231,10 +3258,23 @@ where
                                 // The signature-based hint cannot see a route
                                 // registered inside a function BODY, so recover
                                 // it from the retained source.
-                                source
-                                    .as_deref()
-                                    .and_then(crate::contracts::detect_node_route_framework)
+                                //
+                                // nw-292 (F-CT-4): this recovery is LANGUAGE
+                                // GATED. The `framework_language_str(lang)`
+                                // check above guards `detect_frameworks` only,
+                                // so this `or_else` used to run on every file of
+                                // every language — which is why NestWeaver
+                                // minted `GET /a` out of a Rust `assert_eq!`
+                                // and `POST /oauth/token` out of its own test
+                                // fixture in `contracts.rs`.
+                                source.as_deref().and_then(|src| {
+                                    crate::contracts::detect_node_route_framework_for_language(
+                                        src,
+                                        crate::contracts::framework_language_str(lang)
+                                            .unwrap_or(""),
+                                    )
                                     .map(str::to_string)
+                                })
                             })
                     });
                 let mut handler_file = controller_framework.map(|framework| {
@@ -6951,6 +6991,7 @@ mod tests {
                     word_count: 10,
                     content_hash: format!("hash-{publisher}-{n}"),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,

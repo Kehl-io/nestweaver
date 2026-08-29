@@ -325,18 +325,12 @@ pub fn count_results(value: &Value) -> usize {
 
 /// Set (or replace) the `_meta.stale_repos` provenance on a response, creating
 /// the `_meta` object if absent. No-op for non-object responses.
+///
+/// nw-315: the body moved to `nestweaver_schema::provenance`, which is the one
+/// place the key spelling is written down. This stays as the federation-facing
+/// name so callers do not have to know that.
 pub fn set_stale_repos(result: &mut Value, stale: &[String]) {
-    if let Some(obj) = result.as_object_mut() {
-        let meta = obj
-            .entry("_meta")
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if let Some(meta_obj) = meta.as_object_mut() {
-            meta_obj.insert(
-                "stale_repos".to_string(),
-                serde_json::to_value(stale).unwrap_or(Value::Null),
-            );
-        }
-    }
+    nestweaver_schema::provenance::set_stale_repos(result, stale);
 }
 
 /// Extract the result items array from a JSON response.
@@ -659,6 +653,31 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         if local.get("connected_count").is_some() || server.get("connected_count").is_some() {
             let connected_len = result["connected"].as_array().map_or(0, Vec::len);
             result["connected_count"] = Value::from(connected_len);
+            result["returned"] = Value::from(connected_len);
+        }
+        // nw-320. This envelope is rebuilt key by key, so a field not re-added
+        // here is silently dropped — which is exactly how a federated
+        // `code_context` would have lost the pre-cap total the tool now
+        // reports. `total` SUMS across tiers (each tier counts its own
+        // matches) rather than being recomputed from the merged array, because
+        // recomputing it from what survived is the defect itself.
+        if local.get("total").is_some() || server.get("total").is_some() {
+            let tier_total = |tier: &Value| {
+                tier.get("total")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        tier.get("connected")
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.len() as u64)
+                    })
+                    .unwrap_or(0)
+            };
+            let total = tier_total(local).saturating_add(tier_total(server));
+            let connected_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
+            result["total"] = Value::from(total.max(connected_len));
+            if total > connected_len {
+                result["truncated"] = Value::from(true);
+            }
         }
         // This envelope is rebuilt key by key above, so anything not re-added
         // here is silently dropped. `semantic_applied` / `degraded_components`
@@ -689,19 +708,14 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
 
 /// Wrap merged results into a response envelope with provenance metadata.
 pub fn wrap_merged_response(results: Vec<Value>, sources: &[&str]) -> Value {
-    let scope = if sources.len() > 1 {
-        "hybrid"
-    } else {
-        sources.first().copied().unwrap_or("local")
-    };
-    serde_json::json!({
-        "results": results,
-        "_meta": {
-            "sources": sources,
-            "stale_repos": [],
-            "scope": scope,
-        },
-    })
+    let mut response = serde_json::json!({ "results": results });
+    nestweaver_schema::provenance::set(
+        &mut response,
+        nestweaver_schema::provenance::derived_scope(sources),
+        sources,
+        &[],
+    );
+    response
 }
 
 /// Inject `_meta` provenance into an existing JSON object response.
@@ -709,21 +723,12 @@ pub fn wrap_merged_response(results: Vec<Value>, sources: &[&str]) -> Value {
 /// This is the inner helper; prefer [`inject_or_wrap_provenance`] which
 /// also handles bare-array responses.
 pub fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String]) {
-    let scope = if sources.len() > 1 {
-        "hybrid"
-    } else {
-        sources.first().copied().unwrap_or("local")
-    };
-    if let Some(obj) = result.as_object_mut() {
-        obj.insert(
-            "_meta".to_string(),
-            serde_json::json!({
-                "sources": sources,
-                "stale_repos": stale_repos,
-                "scope": scope,
-            }),
-        );
-    }
+    nestweaver_schema::provenance::set(
+        result,
+        nestweaver_schema::provenance::derived_scope(sources),
+        sources,
+        stale_repos,
+    );
 }
 
 /// Add provenance to a response, wrapping bare result arrays when needed.
@@ -733,23 +738,12 @@ pub fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[St
 /// bare array. In the upstream-only fallback path callers still need to know
 /// that the data came from the server, so preserve the array under `results`.
 pub fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String]) {
-    if result.is_array() {
-        let items = result.take();
-        *result = serde_json::json!({
-            "results": items,
-            "_meta": {
-                "sources": sources,
-                "stale_repos": stale_repos,
-                "scope": if sources.len() > 1 {
-                    "hybrid"
-                } else {
-                    sources.first().copied().unwrap_or("local")
-                },
-            },
-        });
-    } else {
-        inject_provenance(result, sources, stale_repos);
-    }
+    nestweaver_schema::provenance::set_or_wrap(
+        result,
+        nestweaver_schema::provenance::derived_scope(sources),
+        sources,
+        stale_repos,
+    );
 }
 
 // ---------------------------------------------------------------------------
