@@ -601,12 +601,27 @@ fn resolve_single_reference(
         }
     }
 
+    // nw-308 / nw-327: the receiver gate. See `receiver_denotes` -- the nw-150
+    // fix put exactly this test in, but only on Priority 4, the WEAKEST tier.
+    // Priorities 2 and 3 return first and were ungated, so importing ANY symbol
+    // from a file donated every bare method name in it: `.collect()` in
+    // `tools.rs` bound to a private `SegmentCollector::collect` in
+    // `tantivy_index.rs` purely because `tools.rs:30` imports `SearchTotal`
+    // from that file. The comment at the Priority 4 tier below is a verbatim
+    // description of this bug at a different tier.
+    let value_receiver = reference
+        .receiver
+        .as_deref()
+        .filter(|receiver| !receiver.contains("::"));
+
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
     for (_, imported_file) in &imports {
         if let Some(syms) = &candidates
-            && let Some((_, sym)) = syms.iter().find(|(f, _)| f == imported_file)
+            && let Some((_, sym)) = syms
+                .iter()
+                .find(|(f, sym)| f == imported_file && receiver_denotes(f, sym, value_receiver))
         {
             let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
             let confidence = confidence_score(MatchType::ImportResolved, language);
@@ -631,7 +646,9 @@ fn resolve_single_reference(
         transitive_imports.sort_by(|(_, a), (_, b)| a.cmp(b));
         for (_, transitive_file) in &transitive_imports {
             if let Some(syms) = &candidates
-                && let Some((_, sym)) = syms.iter().find(|(f, _)| f == transitive_file)
+                && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
+                    f == transitive_file && receiver_denotes(f, sym, value_receiver)
+                })
             {
                 let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
                 let confidence = confidence_score(MatchType::ReExportResolved, language);
@@ -665,10 +682,6 @@ fn resolve_single_reference(
     // it, so require the candidate's file stem to match the receiver. A path
     // receiver (containing `::`) is already handled by the qualified tier
     // above, and a receiver-less plain call keeps the original behaviour.
-    let value_receiver = reference
-        .receiver
-        .as_deref()
-        .filter(|receiver| !receiver.contains("::"));
     let same_dir = parent_dir(file_path);
     if let Some(syms) = &candidates {
         let mut same_pkg: Vec<_> = syms
@@ -676,26 +689,7 @@ fn resolve_single_reference(
             .filter(|(candidate_file, _)| {
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
             })
-            .filter(|(candidate_file, _)| match value_receiver {
-                // Compare against the receiver's LAST segment so a chained
-                // receiver still matches: `self.store.query()` -> `store` ->
-                // store.rs. `knex.where()` -> `knex`, which does not match the
-                // unrelated file that happened to declare a local `where`.
-                Some(receiver) => {
-                    let denoted = receiver
-                        .rsplit(['.', ':'])
-                        .find(|segment| !segment.is_empty());
-                    let stem = candidate_file
-                        .rsplit('/')
-                        .next()
-                        .and_then(|base| base.split('.').next());
-                    match (denoted, stem) {
-                        (Some(denoted), Some(stem)) => stem == denoted,
-                        _ => false,
-                    }
-                }
-                None => true,
-            })
+            .filter(|(candidate_file, sym)| receiver_denotes(candidate_file, sym, value_receiver))
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
         if let Some((candidate_file, sym)) = same_pkg.into_iter().next() {
@@ -729,6 +723,57 @@ fn resolve_single_reference(
             note: None,
         }],
     })
+}
+
+/// How many re-export hops the Priority 3 tier walks.
+///
+/// nw-323: one hop was not enough for a real TypeScript barrel
+/// (`common/errors.ts -> errors/index.ts -> http-errors.ts` is two), and an
+/// unbounded walk would reinstate exactly the fan-out that nw-103 and nw-153
+/// exist to prevent. Three covers the observed chains with headroom.
+const REEXPORT_MAX_HOPS: usize = 3;
+
+/// Whether `receiver` could plausibly denote a symbol declared in
+/// `candidate_file`.
+///
+/// nw-150 established this test and nw-308/nw-327 established that it has to
+/// hold at EVERY name-only tier, not just the weakest one. The original
+/// comment, still below at Priority 4, says why: `knex.where(..)` is captured
+/// as a call to the bare name `where`, and binding that to whatever same-named
+/// symbol happens to be in scope made a block-scoped `const where = {..}` the
+/// most-depended-on symbol in a 193k-symbol graph. The identical failure at the
+/// import tier made `collect`, `contains`, `is_empty`, `len` and `path` the
+/// "architectural core" of a 44-repo graph — a measure of import fan-in over
+/// generic vocabulary, not of architecture.
+///
+/// A reference with NO receiver (a plain function call, `find_hub_nodes()`) is
+/// waved through unchanged: an import is the only evidence available for those,
+/// they are the majority of real edges, and gating them would be a large
+/// recall regression for no precision gain.
+///
+/// A receiver is accepted when its last segment names either the candidate's
+/// FILE (`self.store.query()` -> `store` -> `store.rs`) or the candidate's
+/// DECLARING TYPE (`Logger.write()` -> a method whose `parent_name` is
+/// `Logger`). A path receiver containing `::` is excluded here because the
+/// path-qualified tier above already handles it.
+fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str>) -> bool {
+    let Some(receiver) = receiver else {
+        return true;
+    };
+    let Some(denoted) = receiver
+        .rsplit(['.', ':'])
+        .find(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+    let stem = candidate_file
+        .rsplit('/')
+        .next()
+        .and_then(|base| base.split('.').next());
+    if stem == Some(denoted) {
+        return true;
+    }
+    sym.parent_name.as_deref() == Some(denoted)
 }
 
 /// Find the enclosing symbol: the innermost symbol whose span contains the
@@ -959,6 +1004,150 @@ mod tests {
                 .iter()
                 .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
             "database.connect() should still resolve to database.js"
+        );
+    }
+
+    /// nw-327 / nw-308: the nw-150 receiver gate was applied to the
+    /// same-package fallback ONLY. Priority 2 (direct imports) returns first
+    /// and had no gate, so importing ANY symbol from a file donated every bare
+    /// method name in it.
+    ///
+    /// Real case: `crates/nestweaver-mcp/src/tools.rs:30` imports `SearchTotal`
+    /// from `tantivy_index.rs`; `.collect()` at :9431 then bound to the private
+    /// `SegmentCollector::collect` at `tantivy_index.rs:202` at ImportResolved
+    /// confidence, giving a function with zero real callers 498 in-edges.
+    #[test]
+    fn an_imported_file_does_not_donate_its_method_names_to_bare_calls() {
+        let mut caller = make_symbol("tool_hub_nodes", 10);
+        caller.end_line = 60;
+        let mut call = make_ref("collect", ReferenceKind::Call, 40);
+        // The receiver of a chained `.collect()` is the whole preceding chain.
+        call.receiver = Some("hubs.iter().map(|h| render(h))".to_string());
+
+        let files = vec![
+            (
+                "src/tools.js".to_string(),
+                vec![caller],
+                vec![
+                    // The file is imported for an UNRELATED symbol.
+                    make_ref("./tantivy_index", ReferenceKind::Import, 1),
+                    call,
+                ],
+            ),
+            (
+                "src/tantivy_index.js".to_string(),
+                vec![make_symbol("SearchTotal", 5), make_symbol("collect", 202)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let phantom = symbol_uid("repo:test:abc", "src/tantivy_index.js", "collect", 202);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == phantom),
+            "a chained .collect() must not bind to an unrelated `collect` merely \
+             because the file was imported for something else: {edges:?}"
+        );
+    }
+
+    /// Where else does this property hold? Priority 3 (re-exports) has the
+    /// identical shape and the identical omission — one hop further out.
+    #[test]
+    fn a_reexported_file_does_not_donate_its_method_names_to_bare_calls() {
+        let mut caller = make_symbol("tool_hub_nodes", 10);
+        caller.end_line = 60;
+        let mut call = make_ref("collect", ReferenceKind::Call, 40);
+        call.receiver = Some("hubs.iter()".to_string());
+
+        let files = vec![
+            (
+                "src/tools.js".to_string(),
+                vec![caller],
+                vec![make_ref("./barrel", ReferenceKind::Import, 1), call],
+            ),
+            (
+                "src/barrel.js".to_string(),
+                vec![],
+                vec![make_ref("./tantivy_index", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/tantivy_index.js".to_string(),
+                vec![make_symbol("collect", 202)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let phantom = symbol_uid("repo:test:abc", "src/tantivy_index.js", "collect", 202);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == phantom),
+            "the re-export tier must carry the same receiver gate: {edges:?}"
+        );
+    }
+
+    /// The Priority-2 gate must not touch plain function calls: those carry no
+    /// receiver and an import is the only evidence available for them.
+    #[test]
+    fn a_receiverless_call_still_resolves_through_a_direct_import() {
+        let mut caller = make_symbol("main", 5);
+        caller.end_line = 20;
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![caller],
+                vec![
+                    make_ref("./helper", ReferenceKind::Import, 1),
+                    make_ref("helperFn", ReferenceKind::Call, 10), // receiver: None
+                ],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/helper.js", "helperFn", 1);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "receiver-less import-resolved calls must keep resolving"
+        );
+    }
+
+    /// A receiver that genuinely denotes the imported file must still bind
+    /// through Priority 2 — the gate is a discriminator, not a ban.
+    #[test]
+    fn a_denoting_receiver_still_resolves_through_a_direct_import() {
+        let mut caller = make_symbol("handler", 10);
+        caller.end_line = 40;
+        let mut call = make_ref("query", ReferenceKind::Call, 20);
+        call.receiver = Some("store".to_string());
+
+        let files = vec![
+            (
+                "src/handler.js".to_string(),
+                vec![caller],
+                vec![make_ref("./store", ReferenceKind::Import, 1), call],
+            ),
+            (
+                "src/store.js".to_string(),
+                vec![make_symbol("query", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/store.js", "query", 5);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "store.query() must still resolve to the imported store.js: {edges:?}"
         );
     }
 
