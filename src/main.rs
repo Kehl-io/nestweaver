@@ -1199,11 +1199,17 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
 /// Summarise how many entries are genuinely broken versus merely resolved at a
 /// lower tier, so the headline count cannot be read as "all of these are
 /// broken".
-fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
-    let unresolved = links.iter().filter(|l| l.is_unresolved()).count();
-    let resolved = links.len() - unresolved;
+///
+/// The counts are over the whole POPULATION, never the returned page. Computing
+/// them from the page printed "0 unresolved (genuinely broken)" on a vault with
+/// 226 of them (nw-297): the store groups low-confidence rows ahead of
+/// unresolved ones, so a head-slice shorter than that group is a pure sample of
+/// the benign category. Ordering is being fixed in `broken_wikilinks`, but a
+/// page is still a sample — only the population can answer "does this vault
+/// have broken links".
+fn print_link_classification(total_unresolved: usize, total_low_confidence: usize) {
     println!(
-        "  {unresolved} unresolved (genuinely broken), {resolved} resolved at a lower \
+        "  {total_unresolved} unresolved (genuinely broken), {total_low_confidence} resolved at a lower \
          confidence tier (same-folder or filename-stem match — not broken)"
     );
 }
@@ -18675,7 +18681,22 @@ fn run_memory(
                 println!("  stale notes:           {}", report.stale.len());
                 println!("  contradictions:        {}", report.contradictions.len());
                 println!("  orphans:               {}", report.orphans.len());
-                println!("  broken wikilinks:      {}", report.broken_wikilinks.len());
+                // Same population split as `broken-links` (nw-297). Printing
+                // the bare length reported 1328 where 226 are genuinely broken
+                // and 1102 are lower-tier resolutions that are not broken at
+                // all — and it is the same `broken_links` call, so the two
+                // surfaces agreed only because they shared the defect.
+                let lint_unresolved = report
+                    .broken_wikilinks
+                    .iter()
+                    .filter(|l| l.is_unresolved())
+                    .count();
+                println!(
+                    "  broken wikilinks:      {} ({} genuinely broken, {} lower-tier resolutions)",
+                    report.broken_wikilinks.len(),
+                    lint_unresolved,
+                    report.broken_wikilinks.len() - lint_unresolved
+                );
                 println!(
                     "  supersession chains:   {}",
                     report.supersession_chains.len()
@@ -21908,7 +21929,23 @@ fn run_brain(
                             }
                             _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
                         }
-                        print_link_classification(&links);
+                        // Population counts from the envelope; the page is a
+                        // sample and cannot answer the question (nw-297). A
+                        // pre-nw-297 daemon omits the fields — fall back to the
+                        // page rather than printing nothing.
+                        let page_unresolved =
+                            links.iter().filter(|l| l.is_unresolved()).count();
+                        let unresolved = value
+                            .get("unresolved")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(page_unresolved);
+                        let low_confidence = value
+                            .get("low_confidence")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(links.len() - page_unresolved);
+                        print_link_classification(unresolved, low_confidence);
                         for l in &links {
                             println!(
                                 "  [[{}]] in {} (confidence {:.2}) — {}",
@@ -21929,6 +21966,10 @@ fn run_brain(
             let store = open_store(Some(&db_path))?;
             let all_links = nestweaver_engine::broken_links(&store, max_suggestions)?;
             let total = all_links.len();
+            // Classify BEFORE truncating — the page is a sample of a list that
+            // is grouped by category, not ranked by severity (nw-297).
+            let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
+            let low_confidence = total - unresolved;
             let links: Vec<_> = all_links.into_iter().take(limit).collect();
             if json {
                 println!(
@@ -21937,13 +21978,15 @@ fn run_brain(
                         "broken_links": links,
                         "total": total,
                         "returned": links.len(),
+                        "unresolved": unresolved,
+                        "low_confidence": low_confidence,
                     }))?
                 );
             } else if links.is_empty() {
                 println!("No broken or ambiguous wikilinks found.");
             } else {
                 println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
-                print_link_classification(&links);
+                print_link_classification(unresolved, low_confidence);
                 for l in &links {
                     println!(
                         "  [[{}]] in {} (confidence {:.2}) — {}",

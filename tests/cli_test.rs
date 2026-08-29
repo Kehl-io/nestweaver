@@ -5513,3 +5513,136 @@ fn a_missing_db_still_reports_db_not_found() {
         "a failed lookup must not create a database"
     );
 }
+
+// ---------------------------------------------------------------------------
+// nw-297 — a summary printed beside a truncated list must describe the
+// POPULATION, not the page.
+// ---------------------------------------------------------------------------
+
+/// Build a vault with a known, unequal split: six links that resolve at a lower
+/// confidence tier (unique global filename-stem match, 0.90) and three that
+/// resolve to nothing at all.
+///
+/// The store emits the low-confidence group first, so any page shorter than six
+/// is a pure sample of the benign category — which is exactly the shape that
+/// made a 226-unresolved vault print `0 unresolved (genuinely broken)`.
+fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
+    let vault = root.join("vault");
+    std::fs::create_dir_all(vault.join("targets")).unwrap();
+    std::fs::create_dir_all(vault.join("sources")).unwrap();
+    for i in 1..=6 {
+        // Title deliberately unlike the stem, so the link misses the 1.0
+        // unique-title tier and lands on the 0.90 global-stem tier.
+        std::fs::write(
+            vault.join(format!("targets/stemkey-{i}.md")),
+            format!("---\ntitle: Utterly Different Title {i}\n---\n\nbody\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join(format!("sources/src{i}.md")),
+            format!("---\ntitle: Source {i}\n---\n\nSee [[stemkey-{i}]]\n"),
+        )
+        .unwrap();
+    }
+    for i in 1..=3 {
+        std::fs::write(
+            vault.join(format!("sources/miss{i}.md")),
+            format!("---\ntitle: Miss {i}\n---\n\nSee [[Nonexistent Note {i}]]\n"),
+        )
+        .unwrap();
+    }
+    vault
+}
+
+fn indexed_broken_links_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let vault = broken_links_vault(dir.path());
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+/// The headline classification must not move when `--limit` moves. A page of
+/// four said `0 unresolved (genuinely broken)` on a vault holding three.
+#[test]
+fn broken_links_classification_counts_the_population_not_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let full = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "100", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let full = String::from_utf8(full.get_output().stdout.clone()).unwrap();
+    assert!(
+        full.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the whole population is 3 unresolved / 6 lower-tier: {full}"
+    );
+
+    let page = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let page = String::from_utf8(page.get_output().stdout.clone()).unwrap();
+    assert!(
+        page.contains("Broken / ambiguous wikilinks (4 of 9)"),
+        "the page itself is still bounded by --limit: {page}"
+    );
+    assert!(
+        page.contains("3 unresolved (genuinely broken), 6 resolved"),
+        "the classification describes the population, not the page: {page}"
+    );
+}
+
+/// `--json` must carry the same split, so an agent does not have to re-derive
+/// it from a page that cannot answer the question.
+#[test]
+fn broken_links_json_carries_the_population_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["brain", "broken-links", "--limit", "4", "--json", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+    assert_eq!(value["total"], 9, "payload: {out}");
+    assert_eq!(value["returned"], 4, "payload: {out}");
+    assert_eq!(
+        value["unresolved"], 3,
+        "the genuinely-broken count is a property of the vault: {out}"
+    );
+    assert_eq!(
+        value["low_confidence"], 6,
+        "and so is the benign count: {out}"
+    );
+}
+
+/// `memory lint` is the second surface onto the same `broken_links` call, so it
+/// corroborated the first only because it shared the defect.
+#[test]
+fn memory_lint_splits_the_broken_wikilink_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_broken_links_db(&dir);
+
+    let out = nestweaver_cmd()
+        .args(["memory", "lint", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("broken wikilinks:      9 (3 genuinely broken, 6 lower-tier resolutions)"),
+        "the bare length conflates two categories: {out}"
+    );
+}
