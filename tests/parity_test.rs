@@ -261,6 +261,76 @@ fn run_direct(db_path: &Path, args: &[&str]) -> Output {
     cmd.output().expect("failed to run nestweaver (direct)")
 }
 
+/// Run a tool over MCP stdio and return its `structuredContent` payload.
+///
+/// **This is the third route, and until now this harness had no leg for it.**
+/// `run_direct` and `run_via_daemon` compare A against B; the MCP server calls
+/// `nestweaver_mcp::tools::dispatch` directly, so every response-shape decision
+/// the CLI makes ABOVE that call — provenance, pre-cap counts, truncation
+/// disclosure, summary lists, budget accounting — was invisible to this file by
+/// construction. That is why a batch of route-parity findings survived a
+/// release that spent six commits on route parity, and why a doc comment
+/// further down asserts an equivalence it never tested.
+///
+/// Modelled on `tests/daemon_test.rs:301` (`mcp_tool_call_in_mode`); each
+/// `tests/*.rs` is its own crate, so duplicating the minimal harness is this
+/// file's stated convention.
+fn run_via_mcp(db_path: &Path, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }),
+    ];
+    let input = frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    let mut child = StdCommand::new(bin_path())
+        .args(["mcp", "--db", &db_path.display().to_string()])
+        // Direct, like `run_direct`: any difference is then layer-shaped rather
+        // than transport-shaped.
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("failed to read mcp output");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    let frame: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("{tool}: no tools/call frame in MCP stdout:\n{stdout}"));
+    assert!(
+        frame["result"]["isError"] != serde_json::json!(true),
+        "{tool}: MCP returned an error: {}",
+        frame["result"]
+    );
+    frame["result"]["structuredContent"].clone()
+}
+
 /// Run the CLI in DAEMON mode (daemon must already be running for `db_path`).
 fn run_via_daemon(db_path: &Path, args: &[&str]) -> Output {
     let mut cmd = StdCommand::new(bin_path());
@@ -1453,4 +1523,301 @@ fn a_direct_watcher_is_refused_while_the_daemon_holds_the_lease() {
              generic I/O error:\n{stderr}"
         );
     }
+}
+
+// ─── C. The MCP leg ──────────────────────────────────────────────────────────
+//
+// Routes A (CLI→daemon) and B (CLI direct) were the only two this file ever
+// compared. These tests add route C (MCP over stdio) for the fields the
+// bounds/disclosure pass changed, so a future refactor cannot quietly reopen
+// them.
+
+/// Every path down which a JSON key can be reached, so a missing field fails
+/// as a missing field rather than as "just ordering".
+fn json_key_paths(value: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, prefix: &str, into: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let path = format!("{prefix}.{key}");
+                    into.push(path.clone());
+                    walk(child, &path, into);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, &format!("{prefix}[]"), into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn parse_stdout(command: &str, output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{command}: expected JSON on stdout ({error})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// nw-320. A capped `code_context` used to report only what it RETURNED, so
+/// the count agreed with the item list by construction and a truncated answer
+/// was indistinguishable from a complete one. Asserted on the MCP route
+/// because that is the route with no CLI enrichment layer above it: whatever
+/// the tool does not say, an agent never learns.
+#[test]
+fn mcp_code_context_discloses_the_pre_cap_total() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let capped = run_via_mcp(
+        db,
+        "code_context",
+        serde_json::json!({ "seeds": ["mainA"], "limit": 1 }),
+    );
+
+    let returned = capped["connected"]
+        .as_array()
+        .expect("connected is an array")
+        .len();
+    assert_eq!(returned, 1, "the cap must bite or this test proves nothing");
+    for field in ["total", "returned", "truncated", "limit"] {
+        assert!(
+            capped.get(field).is_some(),
+            "code_context (MCP) omits `{field}` — the agent cannot tell a capped \
+             answer from a complete one: {capped}"
+        );
+    }
+    let total = capped["total"].as_u64().expect("total is a number");
+    assert!(
+        total > returned as u64,
+        "`total` is {total} for {returned} returned rows — it is counting what SURVIVED \
+         the cap: {capped}"
+    );
+    assert_eq!(capped["truncated"], serde_json::json!(true));
+}
+
+/// nw-299(a). `clusters` declared no bounding parameter and applied none, and
+/// `additionalProperties: false` meant a caller-supplied `limit` was actively
+/// REJECTED — 98.7 MB from a default call with no way for a client to prevent
+/// it. The bound must be accepted, applied, and disclosed.
+#[test]
+fn mcp_clusters_accepts_applies_and_discloses_its_bound() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let unbounded = run_via_mcp(db, "clusters", serde_json::json!({}));
+    let all = unbounded["clusters"]
+        .as_array()
+        .expect("clusters is an array")
+        .len();
+    assert_eq!(
+        unbounded["total"].as_u64().map(|n| n as usize),
+        Some(all),
+        "an unbounded call must report a total equal to what it returned: {unbounded}"
+    );
+    assert_eq!(unbounded["truncated"], serde_json::json!(false));
+
+    // `limit: 1` used to be a hard validation error, not a bound.
+    let bounded = run_via_mcp(db, "clusters", serde_json::json!({ "limit": 1 }));
+    let returned = bounded["clusters"].as_array().unwrap().len();
+    assert!(
+        returned <= 1,
+        "the declared bound was not applied: {bounded}"
+    );
+    assert_eq!(
+        bounded["total"].as_u64().map(|n| n as usize),
+        Some(all),
+        "`total` must count what MATCHED, not what survived the cut: {bounded}"
+    );
+    assert_eq!(bounded["truncated"], serde_json::json!(all > returned));
+}
+
+/// nw-304. A present-but-out-of-range value is a caller bug and must surface
+/// as one. `as_u64()` returns None for a negative, so `-1` used to fall
+/// through to `unwrap_or_else(configured_result_limit)` and become 50 — the
+/// caller was told nothing and got a confident answer to a request they never
+/// made.
+#[test]
+fn mcp_rejects_a_negative_limit_rather_than_defaulting_it() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let baseline = run_via_mcp(db, "brain_tag_graph", serde_json::json!({}));
+
+    // Deliberately not `run_via_mcp`, which asserts success: the point is that
+    // this call must FAIL.
+    let raw = mcp_raw_frame(db, "brain_tag_graph", serde_json::json!({ "limit": -1 }));
+    assert_eq!(
+        raw["result"]["isError"],
+        serde_json::json!(true),
+        "`limit: -1` was accepted. It does not mean 'use the default' — it means the \
+         caller made a mistake.\nbaseline for comparison: {baseline}\ngot: {raw}"
+    );
+}
+
+/// Like `run_via_mcp` but returns the whole frame and does not assert success,
+/// for the cases where the correct behaviour IS an error.
+fn mcp_raw_frame(db_path: &Path, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }),
+    ];
+    let input = frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut child = StdCommand::new(bin_path())
+        .args(["mcp", "--db", &db_path.display().to_string()])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("failed to read mcp output");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("{tool}: no tools/call frame in MCP stdout:\n{stdout}"))
+}
+
+/// nw-317 leg 2. `--intent blast-radius` is documented by `brain context
+/// --help`, accepted by `QueryIntent::from_str`, accepted on the CLI's direct
+/// route — and was rejected through the daemon and on MCP by a JSON-Schema
+/// `enum` that restated the parser and disagreed with it. One vocabulary,
+/// three routes.
+#[test]
+fn intent_vocabulary_agrees_across_all_three_routes() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let args = &[
+        "brain",
+        "context",
+        "mainA",
+        "--limit",
+        "3",
+        "--intent",
+        "blast-radius",
+        "--json",
+    ];
+    let direct = run_direct(db, args);
+    assert!(
+        direct.status.success(),
+        "direct route rejected a documented --intent value:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    let mcp = mcp_raw_frame(
+        db,
+        "brain_context",
+        // `brain_context` takes no `limit` — `token_budget` is its bound.
+        // Sending an undeclared key would fail on `additionalProperties`
+        // rather than on the enum, which would pass this test for the wrong
+        // reason.
+        serde_json::json!({ "seeds": ["mainA"], "token_budget": 500, "intent": "blast-radius" }),
+    );
+    assert!(
+        mcp["result"]["isError"] != serde_json::json!(true),
+        "MCP rejected `intent: \"blast-radius\"`, which the engine's own parser accepts \
+         and the CLI's --help documents. A schema that restates a parser is how the same \
+         string came to be valid on `code_context` and invalid on `brain_context`: {mcp}"
+    );
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "`--intent blast-radius` diverges by route.\ndaemon stderr:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    let stderr = flatten_miette(&daemon.stderr);
+    assert!(
+        !stderr.contains("schema keyword"),
+        "a CLI user who never invoked MCP was shown a raw JSON-Schema error: {stderr}"
+    );
+}
+
+/// The structural guard: for a tool with a CLI twin, any key the CLI emits and
+/// MCP does not is a field an agent cannot see. The known gaps are listed
+/// explicitly with the finding that owns them, and the assertion is
+/// CONTAINMENT — closing one shrinks the set safely, opening a new one fails.
+#[test]
+fn the_mcp_route_does_not_grow_new_disclosure_gaps() {
+    /// Owned by nw-315: `_meta` (scope/sources/stale_repos) is authored in the
+    /// CLI/client layer, and `stale_check`'s two summary lists are derived in
+    /// `src/main.rs`, so the MCP route — which calls `tools::dispatch`
+    /// directly — never sees either. Not fixed here; pinned so it cannot grow.
+    const KNOWN_GAPS: &[&str] = &[
+        ".needs_reindex_repos",
+        ".needs_reindex_repos[]",
+        ".stale_repos",
+        ".stale_repos[]",
+        "._meta",
+        "._meta.scope",
+        "._meta.sources",
+        "._meta.sources[]",
+        "._meta.stale_repos",
+        "._meta.stale_repos[]",
+    ];
+
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(db, &["stale-check", "--json"]);
+    assert!(
+        cli.status.success(),
+        "stale-check (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("stale-check", &cli);
+    let mcp_json = run_via_mcp(db, "stale_check", serde_json::json!({}));
+
+    let mcp_keys = json_key_paths(&mcp_json);
+    let missing: Vec<String> = json_key_paths(&cli_json)
+        .into_iter()
+        .filter(|key| !mcp_keys.contains(key))
+        .filter(|key| !KNOWN_GAPS.contains(&key.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "stale_check: these fields reach a CLI caller and not an MCP one, and they are \
+         not in the list of gaps this batch knowingly left open: {missing:?}\n\
+         CLI: {cli_json}\nMCP: {mcp_json}"
+    );
 }
