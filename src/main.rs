@@ -9585,41 +9585,60 @@ mod impact_floor_clause_tests {
     }
 
     /// And the parametrised form, which ends with the clause — the shape both
-    /// routes converge on once the note moves down to the store.
+    /// routes converged on when the note moved down to the store.
+    ///
+    /// Asserted against the REAL producer rather than a transcribed string.
+    /// nw-317 leg 1 made this load-bearing: the daemon now returns
+    /// `ImpactResult::truncation_note`, so if the append were not idempotent
+    /// every truncated `impact` would print the clause twice. A hand-written
+    /// fixture would keep passing while the producer drifted away from it —
+    /// which is the exact failure this whole finding is about.
     #[test]
-    fn the_parametrised_note_is_not_doubled() {
-        let note = "traversal hit the depth limit (3) — deeper dependents may exist; raise \
-                    --depth — reported impact is a floor";
-        let once = impact_note_with_floor_clause(note);
-        assert_eq!(once, note);
+    fn no_note_the_shared_producer_can_emit_is_ever_doubled() {
+        let mut seen = 0;
+        for by_threshold in [false, true] {
+            for by_depth in [false, true] {
+                let result = nestweaver_store::ImpactResult {
+                    nodes: vec![],
+                    truncated_by_threshold: by_threshold,
+                    truncated_by_depth: by_depth,
+                    edge_types: vec![],
+                };
+                let Some(note) = result.truncation_note(0.25, 3) else {
+                    // Neither flag set: there is no truncation to disclose, and
+                    // the routes agree by emitting nothing at all.
+                    assert!(
+                        !by_threshold && !by_depth,
+                        "a truncated result must produce a note"
+                    );
+                    continue;
+                };
+                seen += 1;
+                let once = impact_note_with_floor_clause(&note);
+                assert_eq!(
+                    once, note,
+                    "the append must be a no-op for a note that already ends \
+                     with the clause"
+                );
+                assert_eq!(
+                    once.matches(super::IMPACT_FLOOR_CLAUSE).count(),
+                    1,
+                    "the clause must appear exactly once: {once}"
+                );
+                // The disclosure is only useful if it names what to change.
+                assert!(
+                    (!by_depth || note.contains("--depth"))
+                        && (!by_threshold || note.contains("--min-score")),
+                    "the note must name the remedy for each cause it reports: {note}"
+                );
+            }
+        }
         assert_eq!(
-            once.matches("reported impact is a floor").count(),
-            1,
-            "the clause must appear exactly once: {once}"
+            seen, 3,
+            "all three truncation combinations must produce a note; if the \
+             producer stops emitting one, this test must not silently shrink"
         );
     }
-}
-
-/// Human-readable caveat for an incomplete `impact` traversal, mirroring the
-/// pr-impact "reported impact is a floor" phrasing. Names the concrete cause
-/// (score pruning / depth cap) and the opt-out for each.
-fn impact_truncation_note(
-    result: &nestweaver_store::ImpactResult,
-    threshold: f64,
-    depth: u32,
-) -> String {
-    let mut parts = Vec::new();
-    if result.truncated_by_threshold {
-        parts.push(format!(
-            "traversal pruned below the impact-score threshold ({threshold:.2}) — re-run with --min-score 0 for the full traversal"
-        ));
-    }
-    if result.truncated_by_depth {
-        parts.push(format!(
-            "traversal hit the depth limit ({depth}) — deeper dependents may exist; raise --depth"
-        ));
-    }
-    format!("{} — reported impact is a floor", parts.join("; "))
 }
 
 /// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
@@ -15184,7 +15203,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     )?;
                     let nodes = &result.nodes;
                     let count = nodes.len();
-                    let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
                     if json {
                         // One envelope whether or not the walk was pruned. The
@@ -15220,10 +15238,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 impact_score: n.impact_score,
                             })
                             .collect();
-                        let note = truncated.then(|| {
-                            let note = impact_truncation_note(&result, threshold, depth);
+                        // nw-317 leg 1. The note now comes from `ImpactResult`
+                        // itself, beside the two flags it interprets, so this
+                        // route and `tool_brain_impact` emit the SAME string
+                        // rather than one restating the other. They did not:
+                        // the daemon route's static text named neither the
+                        // depth value, nor the remedy, nor "floor", over
+                        // byte-identical node data.
+                        //
+                        // `truncation_note` returns `None` exactly when
+                        // neither flag is set, which is the same condition
+                        // `truncated` tests — so the guard is now expressed
+                        // once instead of by two predicates that had to agree.
+                        let note = result.truncation_note(threshold, depth).inspect(|note| {
                             eprintln!("note: {note}");
-                            note
                         });
                         println!(
                             "{}",
@@ -15257,11 +15285,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if !out.quiet {
                             println!("No impact found for '{name_or_uid}'.");
                         }
-                        if truncated {
-                            println!(
-                                "  note: {}",
-                                impact_truncation_note(&result, threshold, depth)
-                            );
+                        if let Some(note) = result.truncation_note(threshold, depth) {
+                            println!("  note: {note}");
                         }
                     } else {
                         if !out.quiet {
@@ -15291,11 +15316,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 );
                             }
                         }
-                        if truncated {
-                            println!(
-                                "  note: {}",
-                                impact_truncation_note(&result, threshold, depth)
-                            );
+                        if let Some(note) = result.truncation_note(threshold, depth) {
+                            println!("  note: {note}");
                         }
                     }
                     let stats = format!(
