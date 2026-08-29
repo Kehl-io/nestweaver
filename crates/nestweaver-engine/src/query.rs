@@ -469,6 +469,19 @@ pub struct ContextResult {
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// How many connected symbols MATCHED, before the cap.
+    ///
+    /// nw-320: the traversal knows this number and used to throw it away — it
+    /// stopped pushing once `connected` reached the cap, discarding the row
+    /// and the knowledge that it existed in the same expression. The only
+    /// count a caller ever saw was the count of what SURVIVED, which agrees
+    /// with the returned list by construction, so a capped answer was
+    /// indistinguishable from a complete one.
+    ///
+    /// Serialized as `total`, the spelling `brain_impact` and `brain_search`
+    /// were standardised on, so the CLI parses the daemon's reply into it.
+    #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
+    pub connected_total: Option<usize>,
 }
 
 /// Detect whether an input string looks like a file path.
@@ -596,6 +609,9 @@ pub fn build_context_with_intent(
 
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
+    // Counted for EVERY resolved non-seed node, whether or not the cap let it
+    // through. This is the whole of nw-320.
+    let mut connected_total: usize = 0;
     let effective_limit = limit.unwrap_or(usize::MAX);
 
     // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
@@ -622,8 +638,11 @@ pub fn build_context_with_intent(
 
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
-        } else if connected.len() < effective_limit {
-            connected.push(node);
+        } else {
+            connected_total += 1;
+            if connected.len() < effective_limit {
+                connected.push(node);
+            }
         }
     }
 
@@ -652,6 +671,10 @@ pub fn build_context_with_intent(
         // these after deciding whether the extra row they asked for arrived.
         limit: None,
         truncated: None,
+        // `connected_total` is different from the two above: it is not a
+        // policy the caller chose, it is a fact only this traversal can
+        // observe, so the engine is the only layer that CAN report it.
+        connected_total: Some(connected_total),
     })
 }
 
@@ -934,6 +957,14 @@ pub struct FeatureContextResult {
     pub seeds: Vec<ContextNode>,
     pub connected: Vec<ContextNode>,
     pub unmatched_entry_points: Vec<String>,
+    /// How many connected symbols MATCHED, before the cap.
+    ///
+    /// Where else does nw-320's property need to hold? Here: this builder caps
+    /// `connected` with the same `else if connected.len() < effective_limit`
+    /// and reported no total at all, so `feature-context --limit N` had the
+    /// identical defect one screen away from the one that was reported.
+    #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
+    pub connected_total: Option<usize>,
 }
 
 /// Build a task-focused context for a declared feature bundle.
@@ -1029,6 +1060,7 @@ pub fn build_feature_context(
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
+    let mut connected_total: usize = 0;
 
     // Apply limit to PPR results (seeds are always included).
     let effective_limit = limit.unwrap_or(usize::MAX);
@@ -1053,8 +1085,11 @@ pub fn build_feature_context(
         };
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
-        } else if connected.len() < effective_limit {
-            connected.push(node);
+        } else {
+            connected_total += 1;
+            if connected.len() < effective_limit {
+                connected.push(node);
+            }
         }
     }
 
@@ -1080,6 +1115,7 @@ pub fn build_feature_context(
         seeds,
         connected,
         unmatched_entry_points,
+        connected_total: Some(connected_total),
     })
 }
 

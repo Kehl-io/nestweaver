@@ -3590,15 +3590,29 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             "relevance": node.relevance,
         })
     };
-    Ok(json!({
+    // nw-320. `connected_count` reports what was RETURNED, so it agrees with
+    // the item list by construction and a capped answer looked complete. The
+    // engine knows how many MATCHED — it stopped pushing at the cap and threw
+    // the number away — and now reports it. `total`/`returned` are the
+    // spellings 8.0.0 corrected `brain_impact` and `brain_search` to; a `total`
+    // that counts survivors is not a total of anything.
+    let returned = result.connected.len();
+    let total = result.connected_total.unwrap_or(returned).max(returned);
+    let payload = json!({
         "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
         "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
         "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
         "seeds_resolved": result.seeds.len(),
-        "connected_count": result.connected.len(),
+        // Retained as the returned count, which is what it has always meant
+        // and what `merge_json_results` recomputes after a federated cap.
+        // `total` is the field that was missing.
+        "connected_count": returned,
+        "returned": returned,
+        "total": total,
         "limit": limit,
-        "truncated": truncated,
-    }))
+        "truncated": truncated || total > returned,
+    });
+    Ok(payload)
 }
 
 fn tool_brain_context(
@@ -12368,6 +12382,65 @@ mod cache_dispatch_tests {
 
         let mut empty: Vec<u8> = Vec::new();
         assert!(!truncate_reporting(&mut empty, 0));
+    }
+
+    /// The other half: when everything fits, `truncated` must be false. Without
+    /// this, a field hardcoded to `true` would pass the test above.
+    /// nw-320. `code_context` shipped in 8.0.0 with the defect its own
+    /// contract claims to prevent: `connected_count` reports what was
+    /// RETURNED, so it agrees with the item list by construction and a capped
+    /// answer is indistinguishable from a complete one. The engine HAS the
+    /// pre-cap number — its traversal stopped pushing once the cap was reached
+    /// and discarded the knowledge in the same expression.
+    ///
+    /// The convention 8.0.0 corrected `brain_impact` and `brain_search` to is
+    /// `returned: N, total: M, truncated: true`.
+    #[test]
+    fn code_context_reports_the_pre_cap_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        // One seed reaching five distinct callees, so a cap of 2 provably
+        // drops rows the caller must be told about.
+        fs::write(
+            src.join("main.js"),
+            "function greet(n){return a(n)+b(n)+c(n)+d(n)+e(n);}\n\
+             function a(n){return n;}\nfunction b(n){return n;}\n\
+             function c(n){return n;}\nfunction d(n){return n;}\n\
+             function e(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let capped = dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["greet"], "limit": 2 }),
+            None,
+        )
+        .unwrap();
+
+        let returned = capped["connected"].as_array().unwrap().len();
+        assert_eq!(returned, 2, "the cap must bite or this test proves nothing");
+        assert_eq!(capped["truncated"], json!(true));
+        let total = capped["total"]
+            .as_u64()
+            .expect("a capped answer must report the PRE-CAP total") as usize;
+        assert!(
+            total > returned,
+            "`total` reports {total} for {returned} returned rows — it is counting what \
+             SURVIVED the cap, so a capped answer looks complete"
+        );
+        assert_eq!(
+            capped["returned"].as_u64().unwrap() as usize,
+            returned,
+            "`returned` must spell the returned count the same way every sibling tool does"
+        );
     }
 
     #[test]

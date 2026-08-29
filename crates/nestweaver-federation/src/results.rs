@@ -659,6 +659,31 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         if local.get("connected_count").is_some() || server.get("connected_count").is_some() {
             let connected_len = result["connected"].as_array().map_or(0, Vec::len);
             result["connected_count"] = Value::from(connected_len);
+            result["returned"] = Value::from(connected_len);
+        }
+        // nw-320. This envelope is rebuilt key by key, so a field not re-added
+        // here is silently dropped — which is exactly how a federated
+        // `code_context` would have lost the pre-cap total the tool now
+        // reports. `total` SUMS across tiers (each tier counts its own
+        // matches) rather than being recomputed from the merged array, because
+        // recomputing it from what survived is the defect itself.
+        if local.get("total").is_some() || server.get("total").is_some() {
+            let tier_total = |tier: &Value| {
+                tier.get("total")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        tier.get("connected")
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.len() as u64)
+                    })
+                    .unwrap_or(0)
+            };
+            let total = tier_total(local).saturating_add(tier_total(server));
+            let connected_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
+            result["total"] = Value::from(total.max(connected_len));
+            if total > connected_len {
+                result["truncated"] = Value::from(true);
+            }
         }
         // This envelope is rebuilt key by key above, so anything not re-added
         // here is silently dropped. `semantic_applied` / `degraded_components`
