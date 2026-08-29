@@ -3891,12 +3891,25 @@ fn tool_brain_context(
     }
 
     // since filter: hard filter Note/Section nodes by modified_at.
-    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+    // nw-295. Validated and NORMALISED at the boundary, once. The value used
+    // to go straight into `WHERE n.modified_at >= $since`, which is a
+    // LEXICOGRAPHIC comparison against a String column and therefore can never
+    // fail — so `since: "garbage"` was byte-identical to `since: "2099-12-31"`:
+    // both matched no note and silently dropped every Note and Section from
+    // the answer. The `.filter(|s| !s.is_empty())` matters too: the CLI's
+    // daemon route sends `""` for an absent `--since`, and it survives today
+    // only because the daemon strips empty strings before dispatch.
+    if let Some(since) = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        let since = nestweaver_engine::parse_since(since).map_err(|e| anyhow!("{e}"))?;
         let recent_notes = store
-            .list_note_uids_modified_since(since)
+            .list_note_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
         let recent_sections = store
-            .list_section_uids_modified_since(since)
+            .list_section_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
         let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
             nodes.retain(|item| {
@@ -9208,12 +9221,25 @@ fn tool_project_context(
     }
 
     // 6a. since filter: hard filter Note/Section nodes by modified_at.
-    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+    // nw-295. Validated and NORMALISED at the boundary, once. The value used
+    // to go straight into `WHERE n.modified_at >= $since`, which is a
+    // LEXICOGRAPHIC comparison against a String column and therefore can never
+    // fail — so `since: "garbage"` was byte-identical to `since: "2099-12-31"`:
+    // both matched no note and silently dropped every Note and Section from
+    // the answer. The `.filter(|s| !s.is_empty())` matters too: the CLI's
+    // daemon route sends `""` for an absent `--since`, and it survives today
+    // only because the daemon strips empty strings before dispatch.
+    if let Some(since) = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        let since = nestweaver_engine::parse_since(since).map_err(|e| anyhow!("{e}"))?;
         let recent_notes = store
-            .list_note_uids_modified_since(since)
+            .list_note_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
         let recent_sections = store
-            .list_section_uids_modified_since(since)
+            .list_section_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
         let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
             nodes.retain(|item| {
