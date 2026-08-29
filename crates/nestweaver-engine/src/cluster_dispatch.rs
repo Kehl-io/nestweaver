@@ -37,6 +37,38 @@ pub struct ClusterMember {
     pub kind: String,
 }
 
+/// Symbol count above which the adaptive default drops to
+/// [`LARGE_GRAPH_CLUSTER_RESOLUTION`].
+pub const LARGE_GRAPH_SYMBOL_THRESHOLD: usize = 10_000;
+
+/// Resolution used on graphs above [`LARGE_GRAPH_SYMBOL_THRESHOLD`]. Lower
+/// resolution merges communities more aggressively, avoiding the explosion of
+/// near-singleton communities that a high resolution produces at scale.
+pub const LARGE_GRAPH_CLUSTER_RESOLUTION: f64 = 0.3;
+
+/// Resolution used on graphs at or below [`LARGE_GRAPH_SYMBOL_THRESHOLD`].
+pub const SMALL_GRAPH_CLUSTER_RESOLUTION: f64 = 0.5;
+
+/// The resolution to use when the caller named none.
+///
+/// F-DC-7 (folded into nw-299). Community IDs are assignment-dependent, so two
+/// runs at different resolutions produce two different ID SPACES. The `clusters`
+/// tool and the `clusters`/`cluster` CLI commands each open-coded this same
+/// 0.3/0.5 rule, while `generate_cluster_summaries` hard-coded **1.0** — so
+/// `summary --level cluster` emitted IDs from a partition that `cluster <id>`
+/// could not resolve, and 26 of 50 IDs came back wrong. That is what two
+/// independent partitions of one graph look like.
+///
+/// Every default now comes from here, so the ID spaces cannot diverge again.
+/// A caller that passes an explicit resolution still gets exactly that.
+pub fn default_cluster_resolution(store: &GraphStore) -> f64 {
+    if store.count_symbols().unwrap_or(0) > LARGE_GRAPH_SYMBOL_THRESHOLD {
+        LARGE_GRAPH_CLUSTER_RESOLUTION
+    } else {
+        SMALL_GRAPH_CLUSTER_RESOLUTION
+    }
+}
+
 /// Run Louvain-style local-moving community detection on the code graph.
 ///
 /// Loads all Symbol nodes and code-level edges (CALLS, IMPORTS, EXTENDS_SYM,

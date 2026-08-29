@@ -79,6 +79,113 @@ pub fn tag_uid(vault_uid: &str, name: &str) -> String {
     format!("tag:{}:{}", vault_uid, truncated_hash(&name.to_lowercase()))
 }
 
+/// Every UID domain this module mints, enumerated ONCE.
+///
+/// nw-301: `investigate`'s `fetch_full_body` matched `sym:`/`sec:`/`note:` with
+/// an `if` chain and returned `None` off the end, so `head:` and `tag:` entries
+/// were a permanent dead end — no error, no retry that could ever work, and
+/// `expanded: true` on an entry with no body. An `if` chain cannot be
+/// exhaustive, so nothing in the compiler or the test suite could notice the
+/// two missing arms.
+///
+/// This enum is the fix for the CLASS rather than the two cases: match on it
+/// and adding a twelfth domain below without handling it is a compile error at
+/// every call site, not a silent `None` at runtime. `classify_uid_domain_is_total`
+/// pins that every constructor here mints something this recognises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UidKind {
+    Repo,
+    File,
+    Service,
+    Symbol,
+    Vault,
+    Note,
+    Heading,
+    Section,
+    Tag,
+    Project,
+    Contract,
+}
+
+impl UidKind {
+    /// Every variant, so a caller can assert over the domain instead of over
+    /// the cases it happens to have seen.
+    pub const ALL: &'static [UidKind] = &[
+        UidKind::Repo,
+        UidKind::File,
+        UidKind::Service,
+        UidKind::Symbol,
+        UidKind::Vault,
+        UidKind::Note,
+        UidKind::Heading,
+        UidKind::Section,
+        UidKind::Tag,
+        UidKind::Project,
+        UidKind::Contract,
+    ];
+
+    /// The `prefix:` each domain's UIDs start with.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            UidKind::Repo => "repo:",
+            UidKind::File => "file:",
+            UidKind::Service => "svc:",
+            UidKind::Symbol => "sym:",
+            UidKind::Vault => "vlt:",
+            UidKind::Note => "note:",
+            UidKind::Heading => "head:",
+            UidKind::Section => "sec:",
+            UidKind::Tag => "tag:",
+            UidKind::Project => "proj:",
+            UidKind::Contract => "contract:",
+        }
+    }
+
+    /// The human-facing node label, for messages that name a kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            UidKind::Repo => "Repo",
+            UidKind::File => "File",
+            UidKind::Service => "Service",
+            UidKind::Symbol => "Symbol",
+            UidKind::Vault => "Vault",
+            UidKind::Note => "Note",
+            UidKind::Heading => "Heading",
+            UidKind::Section => "Section",
+            UidKind::Tag => "Tag",
+            UidKind::Project => "Project",
+            UidKind::Contract => "Contract",
+        }
+    }
+
+    /// Classify a UID by its domain prefix.
+    ///
+    /// `note:` and `head:`/`sec:` share no prefix and `repo:` is not a prefix of
+    /// any other domain, so a plain longest-match is unambiguous.
+    pub fn of(uid: &str) -> Option<UidKind> {
+        UidKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| uid.starts_with(kind.prefix()))
+    }
+}
+
+/// The note a heading belongs to, recovered from the heading UID itself.
+///
+/// `heading_uid` is `head:{note_uid}:{slug_hash}:{line}` and `note_uid` contains
+/// colons of its own, so the split has to come off the RIGHT. Written here,
+/// beside the constructor it inverts, so the two cannot drift.
+pub fn note_uid_of_heading(heading_uid: &str) -> Option<&str> {
+    let rest = heading_uid.strip_prefix("head:")?;
+    // `{note_uid}:{slug_hash}:{line}` — drop the last two components.
+    let (without_line, _line) = rest.rsplit_once(':')?;
+    let (note_uid, _slug_hash) = without_line.rsplit_once(':')?;
+    if note_uid.is_empty() {
+        return None;
+    }
+    Some(note_uid)
+}
+
 /// Canonical UID domains that can identify a top-level `brain_search` row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchEntityUidKind {
@@ -355,6 +462,62 @@ pub fn scoped_contract_uid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-301. The point of `UidKind` is that it is TOTAL — every UID this
+    /// module can mint must classify, or a `match` over it silently stops being
+    /// exhaustive in practice while still compiling. Adding a constructor
+    /// without adding a variant fails here.
+    #[test]
+    fn classify_uid_domain_is_total() {
+        let repo = repo_uid("local", "https://github.com/acme/api.git");
+        let vault = vault_uid("local", "/vault");
+        let note = note_uid(&vault, "a/b.md");
+        let minted = [
+            (UidKind::Repo, repo.clone()),
+            (UidKind::File, file_uid(&repo, "src/a.rs")),
+            (UidKind::Service, service_uid(&repo, "api")),
+            (UidKind::Symbol, symbol_uid(&repo, "src/a.rs", "main", 3)),
+            (UidKind::Vault, vault.clone()),
+            (UidKind::Note, note.clone()),
+            (UidKind::Heading, heading_uid(&note, "intro", 4)),
+            (UidKind::Section, section_uid(&note, 4, "abc123")),
+            (UidKind::Tag, tag_uid(&vault, "Ops")),
+            (UidKind::Project, project_uid("local", "nestweaver")),
+            (
+                UidKind::Contract,
+                scoped_contract_uid(&repo, "http", Some("get"), Some("/widgets"), None),
+            ),
+        ];
+
+        for (expected, uid) in &minted {
+            assert_eq!(
+                UidKind::of(uid),
+                Some(*expected),
+                "`{uid}` did not classify as {expected:?}"
+            );
+        }
+        let covered: std::collections::BTreeSet<UidKind> =
+            minted.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            covered.len(),
+            UidKind::ALL.len(),
+            "a UidKind variant has no minted example here, so nothing proves its \
+             prefix matches what the constructor writes"
+        );
+    }
+
+    /// The heading UID embeds its note UID, which itself contains colons — so
+    /// the split must come off the right. Getting this wrong is invisible: it
+    /// returns a truncated-but-plausible note UID that simply looks up nothing.
+    #[test]
+    fn a_heading_names_the_note_it_belongs_to() {
+        let vault = vault_uid("local", "/vault");
+        let note = note_uid(&vault, "a/b.md");
+        let heading = heading_uid(&note, "intro", 12);
+        assert_eq!(note_uid_of_heading(&heading), Some(note.as_str()));
+        assert_eq!(note_uid_of_heading(&note), None);
+        assert_eq!(note_uid_of_heading("head:"), None);
+    }
 
     #[test]
     fn truncated_hash_is_12_hex_chars() {

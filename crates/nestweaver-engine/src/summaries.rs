@@ -350,7 +350,7 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
 /// Maximum number of clusters to summarize. On large graphs, local moving can
 /// produce thousands of tiny communities; summarizing all of them yields
 /// noise rather than signal. We keep only the top-N largest clusters.
-const MAX_CLUSTER_SUMMARIES: usize = 50;
+pub const MAX_CLUSTER_SUMMARIES: usize = 50;
 
 /// Lower resolution parameter used when the default (1.0) produces too
 /// many small clusters. A lower resolution merges communities more
@@ -369,7 +369,38 @@ const FALLBACK_CLUSTER_RESOLUTION: f64 = 0.5;
 ///    with a lower resolution to force larger communities.
 /// 3. Limits output to the top-N largest clusters by member count.
 fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
-    let mut output = crate::cluster_dispatch::compute_clusters(store, 1.0)?;
+    generate_cluster_summaries_bounded(store, MAX_CLUSTER_SUMMARIES).map(|out| out.summaries)
+}
+
+/// Cluster summaries plus the two facts a caller needs to know it is looking
+/// at a capped view.
+pub struct ClusterSummaries {
+    pub summaries: Vec<Summary>,
+    /// How many non-singleton communities MATCHED, before the cap.
+    pub matched_total: usize,
+    /// Whether the cap dropped any.
+    pub capped: bool,
+}
+
+/// F-DC-11 (folded into nw-299). `generate_cluster_summaries` truncated to 50
+/// and returned a bare `Vec`, which has nowhere to say "I dropped some". The
+/// caller then computed `total` from the already-capped vector, so
+/// `summary --level cluster` reported `{returned: 50, total: 50,
+/// truncated: false}` against a 71,184-community graph. The honesty machinery
+/// existed — `generate_symbol_summaries_bounded` returns exactly this pair —
+/// and was wired for `SummaryLevel::Symbol` only.
+pub fn generate_cluster_summaries_bounded(
+    store: &GraphStore,
+    cap: usize,
+) -> Result<ClusterSummaries> {
+    // F-DC-7: the SAME adaptive default the `clusters` tool and the
+    // `clusters`/`cluster` CLI commands use. This used to be a hard-coded 1.0,
+    // which put the IDs in this summary into a different partition from the
+    // one `cluster <id>` resolves against.
+    let mut output = crate::cluster_dispatch::compute_clusters(
+        store,
+        crate::cluster_dispatch::default_cluster_resolution(store),
+    )?;
 
     // Filter out singleton clusters — they carry no architectural signal.
     output.communities.retain(|c| c.member_count > 1);
@@ -382,12 +413,20 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     }
 
     if output.communities.is_empty() {
-        return Ok(vec![]);
+        return Ok(ClusterSummaries {
+            summaries: vec![],
+            matched_total: 0,
+            capped: false,
+        });
     }
+
+    // Captured BEFORE the cap. Computing it after is the whole of F-DC-11.
+    let matched_total = output.communities.len();
+    let capped = matched_total > cap;
 
     // Communities are already sorted by size descending from compute_clusters.
     // Keep only the top-N largest for summarization.
-    output.communities.truncate(MAX_CLUSTER_SUMMARIES);
+    output.communities.truncate(cap);
 
     // Build symbol UID -> cluster ID mapping for cross-cluster dependency detection.
     let mut uid_to_cluster: HashMap<String, u32> = HashMap::new();
@@ -469,7 +508,11 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
         });
     }
 
-    Ok(summaries)
+    Ok(ClusterSummaries {
+        summaries,
+        matched_total,
+        capped,
+    })
 }
 
 // ── Sidecar persistence ──────────────────────────────────────────────────────

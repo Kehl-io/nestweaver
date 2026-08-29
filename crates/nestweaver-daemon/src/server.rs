@@ -6447,9 +6447,14 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "project": req.project,
-            "include_components": req.include_components,
             "include_seeds": req.include_seeds,
         });
+        // nw-316: only when the caller actually said so. Injecting it
+        // unconditionally re-erased the absence the `optional` field exists to
+        // carry, so the tool's documented default of `true` stayed unreachable.
+        if let Some(include_components) = req.include_components {
+            args["include_components"] = serde_json::json!(include_components);
+        }
         if req.token_budget > 0 {
             args["token_budget"] = serde_json::json!(req.token_budget);
         }
@@ -6503,9 +6508,12 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<NoteGetRequest>,
     ) -> Result<Response<NoteGetResponse>, Status> {
         let req = r.into_inner();
-        let mut args = serde_json::json!({
-            "include_body": req.include_body,
-        });
+        let mut args = serde_json::json!({});
+        // nw-316: omit when the caller did not say, so the tool's documented
+        // default governs instead of proto3's zero value.
+        if let Some(include_body) = req.include_body {
+            args["include_body"] = serde_json::json!(include_body);
+        }
         if let Some(ref uid) = req.uid {
             args["uid"] = serde_json::json!(uid);
         }
@@ -7330,13 +7338,25 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let instance = args.get("instance").and_then(|v| v.as_str());
-            let services = state
-                .store
-                .list_services(instance)
-                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
-            let service = services.iter().find(|s| s.name == name || s.uid == name);
-            match service {
-                Some(s) => serde_json::to_string(s)
+            let repo = args.get("repo").and_then(|v| v.as_str());
+            // nw-311: this used to be `services.iter().find(...)`, which
+            // returned the FIRST of however many matched and discarded the
+            // count, into a bare `Service` that had nowhere to put it. On a
+            // 44-repo graph the caller got a confident answer about a service
+            // they did not ask about, with no way to detect the substitution —
+            // while the CLI's direct path, unreachable whenever a daemon is up,
+            // already warned and listed every candidate.
+            //
+            // Both routes now call the same engine resolver. The payload
+            // FLATTENS the chosen service, so it stays a superset of what this
+            // RPC used to return: an older CLI still deserializes it as a
+            // `Service`, and every caller gains `matched` / `alternatives` /
+            // `entry_points` without a coordinated upgrade.
+            let summary =
+                nestweaver_engine::query::service_summary(&state.store, name, instance, repo)
+                    .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+            match summary {
+                Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
                 None => Err(Status::not_found(format!("service not found: {name}"))),
             }

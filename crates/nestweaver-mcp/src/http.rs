@@ -28,24 +28,80 @@ use uuid::Uuid;
 use crate::protocol::{PROTOCOL_VERSION, error_code};
 use crate::tools;
 
-/// Tools that mutate server state and therefore require admin-level auth.
-/// Query tokens may only invoke read-only tools; mutating operations require
-/// the admin token when auth is configured.
+/// Declares the mutating-tool table once and projects it into the two shapes
+/// the codebase needs: the flat name list every gate already consults, and the
+/// per-tool MCP annotation classification the `tools/list` catalogue derives
+/// `destructiveHint`/`idempotentHint` from.
 ///
-/// This is the SINGLE canonical list of mutating MCP tool names. Both the
-/// HTTP/MCP gate (this module) and the daemon's gRPC gate
-/// (`nestweaver-daemon`) reference this const, so a new mutating tool cannot be
-/// added to one surface's gate while silently leaving the other open.
-pub const MUTATING_TOOLS: &[&str] = &[
-    "brain_add_source",
-    "brain_remove_source",
-    "brain_memory_consolidate",
-    "set_extension",
-    "prune_stale",
+/// A macro rather than two consts because nw-293 was caused by exactly this
+/// shape of restatement: `MUTATING_TOOLS` existed and was authoritative, but
+/// nothing projected it, so the wire had no idea which tools mutate. A second
+/// hand-written classification list would have re-opened the same gap the
+/// moment a seventh mutator arrived. Here it cannot: adding a name to this
+/// invocation requires classifying it in the same line.
+macro_rules! mutating_tools {
+    ($($(#[$meta:meta])* ($name:literal, $destructive:literal, $idempotent:literal)),* $(,)?) => {
+        /// Tools that mutate server state and therefore require admin-level auth.
+        /// Query tokens may only invoke read-only tools; mutating operations require
+        /// the admin token when auth is configured.
+        ///
+        /// This is the SINGLE canonical list of mutating MCP tool names. Both the
+        /// HTTP/MCP gate (this module) and the daemon's gRPC gate
+        /// (`nestweaver-daemon`) reference this const, so a new mutating tool cannot be
+        /// added to one surface's gate while silently leaving the other open.
+        pub const MUTATING_TOOLS: &[&str] = &[$($name),*];
+
+        /// `(name, destructiveHint, idempotentHint)` for every mutating tool,
+        /// in MCP `ToolAnnotations` terms. Projected from the same invocation
+        /// as [`MUTATING_TOOLS`], so the two can never disagree about
+        /// membership.
+        pub const MUTATING_TOOL_HINTS: &[(&str, bool, bool)] =
+            &[$(($name, $destructive, $idempotent)),*];
+    };
+}
+
+mutating_tools![
+    // Additive: it indexes content that was not in the graph. Idempotent by
+    // its own description — "re-indexing an existing source overwrites the
+    // previous index", so a repeat lands on the same state.
+    ("brain_add_source", false, true),
+    // "Removal is permanent." Idempotent because the tool documents re-running
+    // as the recovery path: "re-run only to retry the bookkeeping" — a second
+    // call against an already-removed target reports `committed: false` and
+    // changes nothing further.
+    ("brain_remove_source", true, true),
+    // Destructive because `apply: true` MOVES files the CALLER did not name,
+    // out of the paths they were at. Annotations are per-tool and cannot vary
+    // by argument, so the hint must describe the worst case, not the dry-run
+    // default. Non-idempotent because promotion follows a tier path
+    // (log -> idea -> project): re-running after an apply can promote the same
+    // note again.
+    ("brain_memory_consolidate", true, false),
+    // Writes exactly the one `(uid, key)` the caller named, to the value the
+    // caller supplied. Nothing the caller did not name is touched, and the
+    // same call twice leaves the same value.
+    ("set_extension", false, true),
+    // "Cannot undo — removed sources must be re-indexed." Idempotent for the
+    // same documented reason as `brain_remove_source`: a second run finds
+    // nothing further to prune.
+    ("prune_stale", true, true),
     // Rewrites the embedding artifact through the daemon's write gate. A
-    // read-only endpoint must neither advertise nor dispatch it.
-    "compact_embeddings",
+    // read-only endpoint must neither advertise nor dispatch it. NOT
+    // destructive: it reclaims only vectors that are already unreachable, so
+    // no live data is lost; a second run reclaims zero.
+    ("compact_embeddings", false, true),
 ];
+
+/// `(destructiveHint, idempotentHint)` for `name`, or `None` when the tool is
+/// not a mutator. The single lookup both the catalogue decorator and its test
+/// use, so neither can restate the table.
+#[must_use]
+pub fn mutating_tool_hints(name: &str) -> Option<(bool, bool)> {
+    MUTATING_TOOL_HINTS
+        .iter()
+        .find(|(tool, _, _)| *tool == name)
+        .map(|(_, destructive, idempotent)| (*destructive, *idempotent))
+}
 
 const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -489,27 +545,31 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
 /// federated ones — a caller can always read which repos the local index is
 /// behind an upstream on.
 fn add_provenance_metadata(
-    mut result: Value,
+    payload: &mut Value,
     upstream_source: Option<&str>,
     stale_repos: &[String],
-) -> Value {
-    if let Some(obj) = result.as_object_mut() {
-        let meta = obj.entry("_meta").or_insert_with(|| json!({}));
-        if let Some(meta_obj) = meta.as_object_mut() {
-            match upstream_source {
-                Some(name) => {
-                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon", name]));
-                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("federated"));
-                }
-                None => {
-                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon"]));
-                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("single-node"));
-                }
-            }
-            meta_obj.insert("nestweaver.io/stale_repos".to_string(), json!(stale_repos));
+) {
+    // nw-315. This used to write `nestweaver.io/sources` / `nestweaver.io/scope`
+    // / `nestweaver.io/stale_repos` onto the OUTER `tools/call` envelope — a
+    // THIRD spelling of the same three facts, in a different place, so an HTTP
+    // MCP client and a CLI user learned the provenance of the same answer under
+    // different key names and a stdio client learned it not at all. There is
+    // now one author (`nestweaver_schema::provenance`), one spelling, and one
+    // location: the payload, which is where both CLI routes have always put it
+    // and what `SERVER_INSTRUCTIONS` promises.
+    //
+    // `set`, not `ensure`: `tools::dispatch` has already stamped the honest but
+    // narrow local verdict, and this boundary knows strictly more — it can name
+    // the contributing upstream and carry the federation health check's
+    // staleness verdict, neither of which the tool layer can compute.
+    match upstream_source {
+        Some(name) => {
+            nestweaver_schema::provenance::set(payload, "federated", &["daemon", name], stale_repos)
+        }
+        None => {
+            nestweaver_schema::provenance::set(payload, "single-node", &["daemon"], stale_repos)
         }
     }
-    result
 }
 
 /// Check per-session rate limit. Returns `true` if the request is allowed.
@@ -1120,11 +1180,13 @@ async fn handle_mcp(
                         Vec<String>,
                     ) = (value, None, Vec::new());
 
-                    let result = add_provenance_metadata(
-                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits),
-                        upstream_source.as_deref(),
-                        &stale_repos,
-                    );
+                    // Provenance goes on the PAYLOAD, before wrapping, so the
+                    // key an HTTP client reads is the key a stdio client and a
+                    // CLI user read (nw-315).
+                    let mut value = value;
+                    add_provenance_metadata(&mut value, upstream_source.as_deref(), &stale_repos);
+                    let result =
+                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits);
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -1194,36 +1256,37 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// nw-315. The HTTP boundary used to stamp `nestweaver.io/*` keys on the
+    /// outer envelope while the CLI stamped bare `scope`/`sources`/`stale_repos`
+    /// on the payload and stdio stamped nothing — three spellings of one fact,
+    /// which is why nobody noticed the third route had none. One author now, so
+    /// this test asserts the SPELLING as well as the values.
     #[test]
-    fn provenance_metadata_injects_namespaced_single_node_scope() {
-        // A raw /mcp client must get in-band provenance so the schema (which mentions _meta)
-        // is honest: a standalone daemon reports itself as the sole source + single-node scope.
-        let out = add_provenance_metadata(json!({ "content": [], "isError": false }), None, &[]);
+    fn provenance_metadata_uses_the_one_spelling_on_the_payload() {
+        let mut out = json!({ "repos": [] });
+        add_provenance_metadata(&mut out, None, &[]);
         let meta = &out["_meta"];
-        assert_eq!(meta["nestweaver.io/scope"], json!("single-node"));
-        assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+        assert_eq!(meta["scope"], json!("single-node"));
+        assert_eq!(meta["sources"], json!(["daemon"]));
         // Staleness is stamped uniformly — empty when no upstream is configured.
-        assert_eq!(meta["nestweaver.io/stale_repos"], json!([]));
+        assert_eq!(meta["stale_repos"], json!([]));
+        assert!(
+            meta.get("nestweaver.io/sources").is_none(),
+            "the namespaced spelling is gone, not duplicated: {out}"
+        );
 
-        // Merges with pre-existing _meta (e.g. limits) rather than clobbering it.
-        let with_limits = json!({ "content": [], "_meta": { "limits": [{"param": "depth"}] } });
-        let out = add_provenance_metadata(with_limits, None, &[]);
-        assert_eq!(out["_meta"]["nestweaver.io/scope"], json!("single-node"));
-        assert!(out["_meta"]["limits"].is_array());
-
-        // A federated result names the contributing upstream and flips scope.
-        let fed = add_provenance_metadata(
-            json!({ "content": [] }),
+        // A federated result names the contributing upstream and flips scope,
+        // overriding the tool layer's narrower local stamp.
+        let mut fed = json!({ "repos": [], "_meta": { "scope": "local", "sources": ["local"], "stale_repos": [] } });
+        add_provenance_metadata(
+            &mut fed,
             Some("acme"),
             &["https://github.com/acme/api.git".to_string()],
         );
-        assert_eq!(fed["_meta"]["nestweaver.io/scope"], json!("federated"));
+        assert_eq!(fed["_meta"]["scope"], json!("federated"));
+        assert_eq!(fed["_meta"]["sources"], json!(["daemon", "acme"]));
         assert_eq!(
-            fed["_meta"]["nestweaver.io/sources"],
-            json!(["daemon", "acme"])
-        );
-        assert_eq!(
-            fed["_meta"]["nestweaver.io/stale_repos"],
+            fed["_meta"]["stale_repos"],
             json!(["https://github.com/acme/api.git"])
         );
     }

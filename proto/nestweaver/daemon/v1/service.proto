@@ -484,7 +484,10 @@ message RepoStatesResponse {
 message NoteGetRequest {
   optional string uid = 1;
   optional string title = 2;
-  bool include_body = 3;
+  // nw-316 (same defect as `ProjectContextRequest.include_components`): a
+  // proto3 non-optional `bool` decodes an absent field to `false`, so the
+  // tool's documented default of `true` could not survive this hop.
+  optional bool include_body = 3;
   repeated string sections = 4;
 }
 message NoteGetResponse {
@@ -544,7 +547,14 @@ message ProjectContextRequest {
   string project = 1;
   int32 token_budget = 2;
   repeated string kinds = 3;
-  bool include_components = 4;
+  // nw-316: `optional` so ABSENCE survives the RPC. A proto3 non-optional
+  // `bool` cannot express "unset" — it decodes to `false` — so the tool's
+  // documented default of `true` was unreachable through this hop no matter
+  // what the caller sent, and `project-context X` seeded PPR from a different
+  // member set than `project_context {"project":"X"}`. Wire-compatible: the
+  // field number and type are unchanged; proto3 `optional` only adds presence
+  // tracking.
+  optional bool include_components = 4;
   string intent = 5;
   bool include_seeds = 6;
   // RFC3339 timestamp; when set, hard-filters Note/Section nodes by

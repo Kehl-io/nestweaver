@@ -186,6 +186,45 @@ fn all_tool_schemas() -> Vec<Value> {
             })
         });
     }
+    // nw-293. Every tool must declare MCP `annotations`, DERIVED from
+    // `MUTATING_TOOLS` for exactly the reason the cache decoration above is
+    // derived from `CACHEABLE_TOOLS`: the classification already exists and is
+    // already authoritative (it is the gate both the HTTP surface and the
+    // daemon's gRPC surface enforce), so hand-annotating 42 schemas would
+    // create a second list that drifts the moment a seventh mutator lands.
+    // Zero of the 42 declared any annotation, which made `prune_stale`
+    // indistinguishable from `brain_status` on the wire.
+    //
+    // `annotations` is a SIBLING of `inputSchema` on the MCP `Tool` object, so
+    // it is inert for `tool_validators()` (which builds from
+    // `tool["inputSchema"]` only) and cannot affect `additionalProperties`.
+    for tool in &mut schemas {
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        // Not in the canonical mutating list => read-only, and a read-only
+        // tool is trivially non-destructive and idempotent.
+        let (read_only, destructive, idempotent) = match crate::http::mutating_tool_hints(name) {
+            Some((destructive, idempotent)) => (false, destructive, idempotent),
+            None => (true, false, true),
+        };
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "annotations".to_string(),
+            serde_json::json!({
+                "readOnlyHint": read_only,
+                "destructiveHint": destructive,
+                "idempotentHint": idempotent,
+                // Every tool here reads the LOCAL graph and local filesystem.
+                // `brain_add_source` is the only candidate for an open world
+                // and its own description rules it out: "Cannot index remote
+                // URLs directly — only local filesystem paths".
+                "openWorldHint": false,
+            }),
+        );
+    }
     schemas
 }
 
@@ -896,6 +935,126 @@ mod tool_schema_validation_tests {
         );
     }
 
+    /// nw-293. Every registered tool must declare MCP `annotations`, and
+    /// `readOnlyHint` must be DERIVED from `MUTATING_TOOLS` rather than
+    /// restated by hand.
+    ///
+    /// Zero of 42 tools declared any annotation, so `prune_stale` and
+    /// `brain_status` were indistinguishable on the wire and no client could
+    /// build an auto-approve policy without hard-coding our tool names.
+    ///
+    /// Asserted over the REGISTRY, not a hand-listed set, so tool 43 cannot be
+    /// added without classifying it — the same rule
+    /// `every_registered_schema_rejects_unknown_arguments` enforces for
+    /// `additionalProperties`.
+    #[test]
+    fn every_registered_tool_declares_annotations_matching_the_mutating_list() {
+        const HINTS: &[&str] = &[
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ];
+
+        let payload = tool_list(false);
+        let tools = payload["tools"]
+            .as_array()
+            .expect("tool_list returns a tools array");
+
+        let mut missing = Vec::new();
+        let mut mislabelled = Vec::new();
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("registered tool has a name");
+            let Some(annotations) = tool.get("annotations").and_then(Value::as_object) else {
+                missing.push(name.to_string());
+                continue;
+            };
+            for hint in HINTS {
+                assert!(
+                    annotations.get(*hint).and_then(Value::as_bool).is_some(),
+                    "{name}.annotations.{hint} is absent or not a boolean; a client \
+                     cannot build an auto-approve policy from a partial annotation"
+                );
+            }
+            let declared_read_only = annotations["readOnlyHint"]
+                .as_bool()
+                .expect("checked above");
+            let actually_mutates = crate::http::MUTATING_TOOLS.contains(&name);
+            if declared_read_only == actually_mutates {
+                mislabelled.push(format!(
+                    "{name}: readOnlyHint={declared_read_only} but \
+                     MUTATING_TOOLS membership={actually_mutates}"
+                ));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these tools declare no `annotations`, so a mutating tool is \
+             indistinguishable from a read-only one on the wire: {missing:?}"
+        );
+        assert!(
+            mislabelled.is_empty(),
+            "`readOnlyHint` contradicts the authoritative MUTATING_TOOLS gate: {mislabelled:?}"
+        );
+
+        // The six mutators must additionally be recoverable as a SET from the
+        // annotations alone — that is the property an agent harness consumes.
+        let declared_mutators: BTreeSet<&str> = tools
+            .iter()
+            .filter(|t| t["annotations"]["readOnlyHint"] == json!(false))
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        let expected: BTreeSet<&str> = crate::http::MUTATING_TOOLS.iter().copied().collect();
+        assert_eq!(declared_mutators, expected);
+    }
+
+    /// A read-only tool must not claim it may destroy anything, and a mutator's
+    /// `destructiveHint`/`idempotentHint` must come from the single classified
+    /// table rather than a second hand-list.
+    #[test]
+    fn mutating_tool_hints_come_from_the_canonical_classification() {
+        let payload = tool_list(false);
+        let tools = payload["tools"].as_array().unwrap();
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = &tool["annotations"];
+            match crate::http::mutating_tool_hints(name) {
+                Some((destructive, idempotent)) => {
+                    assert_eq!(
+                        annotations["destructiveHint"],
+                        json!(destructive),
+                        "{name}: destructiveHint diverged from MUTATING_TOOL_HINTS"
+                    );
+                    assert_eq!(
+                        annotations["idempotentHint"],
+                        json!(idempotent),
+                        "{name}: idempotentHint diverged from MUTATING_TOOL_HINTS"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        annotations["destructiveHint"],
+                        json!(false),
+                        "{name} is read-only but advertises that it may destroy data"
+                    );
+                    assert_eq!(annotations["idempotentHint"], json!(true), "{name}");
+                }
+            }
+            // Every tool in this binary reads the LOCAL graph and local
+            // filesystem. `brain_add_source`, the only candidate for an open
+            // world, states in its own description that it "cannot index remote
+            // URLs directly — only local filesystem paths".
+            assert_eq!(
+                annotations["openWorldHint"],
+                json!(false),
+                "{name}: no tool in this server reaches an open world"
+            );
+        }
+    }
+
     #[test]
     fn bounded_tools_reject_unknown_arguments() {
         // Mistyped arg names must fail loudly instead of being
@@ -1150,27 +1309,35 @@ mod tool_schema_validation_tests {
         assert_eq!(high["truncated"], false);
     }
 
+    /// nw-316. `forwarded_bool(&args, "include_components", true)` guessed the
+    /// tool's default at the FORWARDING layer because the proto3 `bool` it fed
+    /// could not carry absence — and its own doc comment recorded the real fix
+    /// (`optional` proto fields) as blocked "because `nestweaver-federation`
+    /// constructs these request messages with exhaustive struct literals". That
+    /// is not a blocker, it is a second file to change; both are in one commit
+    /// now. The tool is the layer that DOCUMENTS the default, so it must be the
+    /// layer that applies it.
     #[cfg(feature = "daemon")]
     #[test]
-    fn forwarded_bool_preserves_default_true_when_arg_absent() {
-        // Proto3 bools have no presence — an absent arg must forward as
-        // the tool's default (true for these two), not as explicit false.
-        assert!(forwarded_bool(&json!({}), "include_components", true));
-        assert!(forwarded_bool(&json!({}), "include_body", true));
-        // Explicit values still honored, including explicit false.
-        assert!(!forwarded_bool(
-            &json!({ "include_components": false }),
-            "include_components",
-            true
-        ));
-        assert!(forwarded_bool(
-            &json!({ "include_body": true }),
-            "include_body",
-            true
-        ));
-        // Default-false bools are unaffected.
-        assert!(!forwarded_bool(&json!({}), "prf", false));
-        assert!(forwarded_bool(&json!({ "prf": true }), "prf", false));
+    fn absent_presence_tracked_bools_forward_as_absent() {
+        for (key, args) in [
+            ("include_components", json!({})),
+            ("include_body", json!({})),
+        ] {
+            assert_eq!(
+                args.get(key).and_then(|value| value.as_bool()),
+                None,
+                "an absent `{key}` must arrive absent, so the TOOL decides"
+            );
+        }
+        // Explicit values are still carried, in both directions — presence
+        // tracking is what makes `false` distinguishable from silence.
+        assert_eq!(
+            json!({ "include_components": false })
+                .get("include_components")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 
     #[cfg(feature = "daemon")]
@@ -1611,6 +1778,36 @@ pub fn dispatch_cancellable(
     } else {
         dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
     };
+
+    // nw-315: THE tool layer is the author of provenance, because it is the
+    // only layer every route passes through.
+    //
+    // `_meta` (scope/sources/stale_repos) used to be written by the CLI
+    // presentation layer — `attach_local_meta` on the direct route, the
+    // federation client on the daemon route — and MCP over stdio has no
+    // presentation layer, so it never received the field at all. Not dropped:
+    // never added. Meanwhile `SERVER_INSTRUCTIONS` (lib.rs) promises the agent
+    // "Results include `_meta.sources` indicating which data sources
+    // contributed", so the server documented a field it did not send.
+    //
+    // Stamped here rather than in the stdio server so that the property holds
+    // for EVERY route through `dispatch` — stdio, HTTP, and the daemon's
+    // `dispatch_tool_json` — instead of for the one route that was reported.
+    //
+    // `ensure` and not `set`: a federating caller knows strictly more than this
+    // layer does (it can name upstreams and a background staleness verdict this
+    // process cannot compute without I/O), so its richer stamp wins. What this
+    // layer can say honestly is that the answer came from the local graph, and
+    // saying that is what makes the absence of a richer verdict legible.
+    let result = result.map(|mut value| {
+        nestweaver_schema::provenance::ensure(
+            &mut value,
+            nestweaver_schema::provenance::SCOPE_LOCAL,
+            &[nestweaver_schema::provenance::SOURCE_LOCAL],
+            &[],
+        );
+        value
+    });
 
     // Tools that do not consult PageRank still succeed during a dirty
     // publication, so the classification is applied to the ERROR rather than
@@ -2792,16 +2989,14 @@ fn tool_schema_count_patterns() -> Value {
 // ── F9: document-graph tools ──────────────────────────────────────────────
 
 fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let max_suggestions = args
-        .get("max_suggestions")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(5);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let max_suggestions = read_limit(&args, "max_suggestions", 5, 1, 50)?;
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
@@ -2818,16 +3013,15 @@ fn tool_schema_brain_broken_links() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "max_suggestions": {
-                    "type": "integer",
-                    "description": "Max suggested target UIDs per broken link (default 5).",
-                    "default": 5
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max broken links to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                // `maximum: 50`, not 1000: suggestions multiply PER broken
+                // link, so a 1000-suggestion cap across 1328 links is a cross
+                // product. 10x the default is the same ratio `clusters.members`
+                // uses against its own preview.
+                "max_suggestions": limit_schema(
+                    "Max suggested target UIDs per broken link (1-50, default 5).", 5, 1, 50),
+                "limit": limit_schema(
+                    "Max broken links to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -2837,11 +3031,13 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
     let vault = args.get("vault").and_then(|v| v.as_str());
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
     let total = all_orphans.len();
     let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
@@ -2865,11 +3061,9 @@ fn tool_schema_brain_orphan_documents() -> Value {
                     "items": { "type": "string" },
                     "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max orphan documents to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max orphan documents to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -2880,11 +3074,13 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
         .get("resolution")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.5);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let all_clusters = topic_clusters(store, resolution)?;
     let total = all_clusters.len();
     let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
@@ -2906,22 +3102,22 @@ fn tool_schema_brain_topic_clusters() -> Value {
                     "description": "Community-detection resolution — higher yields more, smaller clusters (default 0.5).",
                     "default": 0.5
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max clusters to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max clusters to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
 }
 
 fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
     match args.get("tag") {
@@ -2950,22 +3146,16 @@ fn tool_schema_brain_tag_graph() -> Value {
             "additionalProperties": false,
             "properties": {
                 "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max tags to return in the all-tags listing (default 50). Ignored when a specific tag is queried.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max tags to return in the all-tags listing (1-1000, default 50). Ignored when a specific tag is queried.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
 }
 
 fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let top_tags_limit = args
-        .get("top_tags_limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(10);
+    let top_tags_limit = read_limit(&args, "top_tags_limit", 10, 1, RESULT_LIMIT_MAX)?;
     let stats = doc_stats(store, top_tags_limit)?;
     Ok(serde_json::to_value(&stats)?)
 }
@@ -2978,11 +3168,8 @@ fn tool_schema_brain_doc_stats() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "top_tags_limit": {
-                    "type": "integer",
-                    "description": "Max entries in top_tags (default 10).",
-                    "default": 10
-                }
+                "top_tags_limit": limit_schema(
+                    "Max entries in top_tags (1-1000, default 10).", 10, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3000,11 +3187,13 @@ fn now_epoch_secs() -> f64 {
 }
 
 fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let mut report = serde_json::to_value(memory_lint(store, now_epoch_secs())?)?;
     // Truncate each lint category to `limit` and report totals.
     if let Some(obj) = report.as_object_mut() {
@@ -3032,11 +3221,9 @@ fn tool_schema_brain_memory_lint() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results per lint category (default 50). Totals are always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max results per lint category (1-1000, default 50). Totals are always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3044,11 +3231,13 @@ fn tool_schema_brain_memory_lint() -> Value {
 
 fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
     // Truncate proposals to limit and report total.
     if let Some(obj) = manifest.as_object_mut() {
@@ -3079,11 +3268,13 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                     "description": "Opt into write-mode: move files to their promoted destinations (default false = safe dry-run).",
                     "default": false
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max proposals to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                // The ONE parameter on the entire mutating surface with
+                // unverified bounds (the other five mutators declare no numeric
+                // parameter at all). Fixed schema-side, so no write path had to
+                // be exercised to close it.
+                "limit": limit_schema(
+                    "Max proposals to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3217,10 +3408,9 @@ fn tool_schema_code_context() -> Value {
                     "maximum": 5000,
                     "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count` and `truncated` so an omitted limit is never silently lossy."
                 },
-                "intent": {
-                    "type": "string",
-                    "description": "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
-                }
+                "intent": intent_schema(
+                    "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
+                )
             },
             "required": ["seeds"],
             "additionalProperties": false
@@ -3309,11 +3499,9 @@ fn tool_schema_brain_context() -> Value {
                     "default": 30.0,
                     "description": "Half-life for age-decay in days."
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
-                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
-                },
+                "intent": intent_schema(
+                    "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' (alias 'blast-radius') follows dependency edges; 'general-context' uses balanced defaults."
+                ),
                 "include_seeds": {
                     "type": "boolean",
                     "default": false,
@@ -3437,15 +3625,29 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             "relevance": node.relevance,
         })
     };
-    Ok(json!({
+    // nw-320. `connected_count` reports what was RETURNED, so it agrees with
+    // the item list by construction and a capped answer looked complete. The
+    // engine knows how many MATCHED — it stopped pushing at the cap and threw
+    // the number away — and now reports it. `total`/`returned` are the
+    // spellings 8.0.0 corrected `brain_impact` and `brain_search` to; a `total`
+    // that counts survivors is not a total of anything.
+    let returned = result.connected.len();
+    let total = result.connected_total.unwrap_or(returned).max(returned);
+    let payload = json!({
         "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
         "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
         "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
         "seeds_resolved": result.seeds.len(),
-        "connected_count": result.connected.len(),
+        // Retained as the returned count, which is what it has always meant
+        // and what `merge_json_results` recomputes after a federated cap.
+        // `total` is the field that was missing.
+        "connected_count": returned,
+        "returned": returned,
+        "total": total,
         "limit": limit,
-        "truncated": truncated,
-    }))
+        "truncated": truncated || total > returned,
+    });
+    Ok(payload)
 }
 
 fn tool_brain_context(
@@ -3724,12 +3926,25 @@ fn tool_brain_context(
     }
 
     // since filter: hard filter Note/Section nodes by modified_at.
-    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+    // nw-295. Validated and NORMALISED at the boundary, once. The value used
+    // to go straight into `WHERE n.modified_at >= $since`, which is a
+    // LEXICOGRAPHIC comparison against a String column and therefore can never
+    // fail — so `since: "garbage"` was byte-identical to `since: "2099-12-31"`:
+    // both matched no note and silently dropped every Note and Section from
+    // the answer. The `.filter(|s| !s.is_empty())` matters too: the CLI's
+    // daemon route sends `""` for an absent `--since`, and it survives today
+    // only because the daemon strips empty strings before dispatch.
+    if let Some(since) = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        let since = nestweaver_engine::parse_since(since).map_err(|e| anyhow!("{e}"))?;
         let recent_notes = store
-            .list_note_uids_modified_since(since)
+            .list_note_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
         let recent_sections = store
-            .list_section_uids_modified_since(since)
+            .list_section_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
         let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
             nodes.retain(|item| {
@@ -6285,15 +6500,17 @@ pub fn mark_brain_status_daemon_bypassed(value: &mut Value, cause: &str) {
         "degraded_components".to_string(),
         json!([DAEMON_RUNTIME_DEGRADED]),
     );
-    obj.insert(
-        "_meta".to_string(),
-        json!({
-            "sources": ["direct"],
-            "stale_repos": [],
-            "scope": "direct",
-            "degraded_components": [DAEMON_RUNTIME_DEGRADED],
-        }),
-    );
+    // nw-315: built through the one provenance author so this cannot become a
+    // sixth spelling of the same three keys; the `degraded_components` leg is
+    // this path's own addition and is merged on top.
+    let mut meta = nestweaver_schema::provenance::provenance("direct", &["direct"], &[]);
+    if let Some(meta_obj) = meta.as_object_mut() {
+        meta_obj.insert(
+            "degraded_components".to_string(),
+            json!([DAEMON_RUNTIME_DEGRADED]),
+        );
+    }
+    obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
     if let Some(warnings) = obj
         .entry("warnings".to_string())
         .or_insert_with(|| json!([]))
@@ -7075,11 +7292,9 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
                 "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max contract links to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max contract links to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -7093,11 +7308,13 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
     };
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     let refs = store
         .cross_repo_links(&uid)
@@ -7175,11 +7392,9 @@ fn tool_schema_contract_drift() -> Value {
             "additionalProperties": false,
             "properties": {
                 "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results per drift bucket (default 50). Totals are always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max results per drift bucket (1-1000, default 50). Totals are always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -7187,11 +7402,13 @@ fn tool_schema_contract_drift() -> Value {
 
 fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let repo = args.get("repo").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
     // Shared with the CLI's local path so the two serializations cannot drift
@@ -7244,11 +7461,13 @@ fn tool_brain_impact(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'symbol' is required"))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
     let concise = is_concise(&args);
     let owners = restricted_symbol_owners(store, visible)?;
     let uid_is_visible = |uid: &str| {
@@ -7329,6 +7548,11 @@ fn tool_brain_impact(
     };
     let truncated_by_threshold = result.truncated_by_threshold;
     let truncated_by_depth = result.truncated_by_depth;
+    // nw-317 leg 1. Built by the SAME function the CLI's direct path calls,
+    // so the default (daemon) route can no longer be the weaker disclosure.
+    // `impact_with_flags` prunes at `DEFAULT_IMPACT_THRESHOLD`, so that is the
+    // threshold this note reports.
+    let note = result.truncation_note(nestweaver_store::DEFAULT_IMPACT_THRESHOLD, depth);
     let mut nodes = result.nodes;
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
@@ -7368,15 +7592,11 @@ fn tool_brain_impact(
         // the reported impact set is a FLOOR, not the full reverse-closure.
         "truncated_by_threshold": truncated_by_threshold,
         "truncated_by_depth": truncated_by_depth,
-        "note": if truncated_by_threshold {
-            (truncated_by_threshold || truncated_by_depth).then_some(
-                "paths pruned below the impact-score threshold — reported impact is a floor, not the full set",
-            )
-        } else {
-            truncated_by_depth.then_some(
-                "frontier reached max depth — deeper dependents may exist beyond the returned set",
-            )
-        },
+        // F-PARITY-11: the CLI emits `truncated` and MCP did not, so an MCP
+        // caller could not detect truncation here at all. Same "confident
+        // answer to a partial read" family as nw-320, one field over.
+        "truncated": truncated_by_threshold || truncated_by_depth || rows.len() < total,
+        "note": note,
     }))
 }
 
@@ -8064,14 +8284,44 @@ fn tool_schema_clusters() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                // F-MCP-6: no `default` key. The applied resolution depends
+                // on the corpus (0.3 above 10K symbols, 0.5 at or below), which
+                // JSON Schema cannot express — so the schema advertised 0.5
+                // while the handler applied 0.3 on every graph this tool exists
+                // to serve. Same precedent as `project_context.token_budget`:
+                // state the truth in the description rather than a different
+                // wrong number in the key.
                 "resolution": {
                     "type": "number",
-                    "description": "Community-detection resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
-                    "default": 0.5
+                    "exclusiveMinimum": 0.0,
+                    "description": "Community-detection resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. When omitted the applied value depends on graph size: 0.3 for large graphs (>10K symbols), 0.5 at or below. Try 2.0 for fine-grained modules."
                 },
+                // nw-299(a). This was the only list-returning tool in the
+                // catalogue with no bounding parameter, and
+                // `additionalProperties: false` meant a caller-supplied `limit`
+                // was actively REJECTED — 98.7 MB on the wire from a default
+                // call, with no way for a client to prevent it. 50/20 are the
+                // CLI twin's existing defaults, not new numbers; any others
+                // would be a THIRD set for one concept.
+                "limit": limit_schema(
+                    "Max clusters to return (0 = all, default 50). `total`/`returned`/`truncated` always report what was dropped.",
+                    50,
+                    0,
+                    RESULT_LIMIT_MAX,
+                ),
+                // Maximum 200, not 2000: `limit` and `members` multiply, and
+                // 1000 clusters x 2000 members is the original failure with
+                // extra steps. The documented way to page INTO one cluster is
+                // `cluster_id`, which this bound does not touch.
+                "members": limit_schema(
+                    "Max members previewed per cluster in the multi-cluster listing (0 = all, default 20). Ignored when `cluster_id` is set — that path returns the cluster's full member list, capped at 2000.",
+                    20,
+                    0,
+                    200,
+                ),
                 "cluster_id": {
                     "type": "integer",
-                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the 20-member preview. Use the same resolution as the call that produced the id."
+                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the preview. Use the same resolution as the call that produced the id."
                 }
             }
         }
@@ -8079,11 +8329,17 @@ fn tool_schema_clusters() -> Value {
 }
 
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let user_resolution = args.get("resolution").and_then(|v| v.as_f64());
-    let resolution = user_resolution.unwrap_or_else(|| {
-        let sym_count = store.count_symbols().unwrap_or(0);
-        if sym_count > 10_000 { 0.3 } else { 0.5 }
-    });
+    // F-DC-7: the adaptive default now comes from the engine, so this tool,
+    // the `clusters`/`cluster` CLI commands and `summary --level cluster` all
+    // partition the graph the same way. They did not: summaries hard-coded
+    // resolution 1.0, which put its cluster IDs in a different ID SPACE from
+    // the one `cluster <id>` resolves against — 26 of 50 IDs did not resolve.
+    let resolution = args
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
+    let limit = read_limit(&args, "limit", 50, 0, RESULT_LIMIT_MAX)?;
+    let preview_members = read_limit(&args, "members", 20, 0, 200)?;
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -8103,18 +8359,23 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     // count), which made large clusters' membership unretrievable from the tool.
     let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
     // Full membership when a specific cluster is requested (bounded so a giant
-    // cluster can't blow the context window), a small preview otherwise.
+    // cluster can't blow the context window), a caller-sized preview otherwise.
     const FULL_MEMBER_CAP: usize = 2000;
-    const PREVIEW_MEMBER_CAP: usize = 20;
-    let clusters_json: Vec<Value> = output
+    let matching: Vec<&nestweaver_engine::CommunityInfo> = output
         .communities
         .iter()
         .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
-        .map(|c| {
+        .collect();
+    // Cut BEFORE rendering, and capture the pre-cut total. Rendering the whole
+    // corpus for a bounded answer is the other half of this defect class.
+    let bounded = Bounded::take(matching, limit).map(|c| {
+        {
             let member_cap = if requested_id.is_some() {
                 FULL_MEMBER_CAP
+            } else if preview_members == 0 {
+                c.members.len()
             } else {
-                PREVIEW_MEMBER_CAP
+                preview_members
             };
             let members: Vec<Value> = c
                 .members
@@ -8131,6 +8392,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                     })
                 })
                 .collect();
+            let members_returned = members.len();
             json!({
                 "id": c.id,
                 "name": c.name,
@@ -8138,20 +8400,26 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 "cohesion": c.cohesion,
                 "key_files": c.key_files,
                 "members": members,
+                "returned_members": members_returned,
                 "members_truncated": c.members.len() > member_cap,
             })
-        })
-        .collect();
+        }
+    });
 
     let symbol_count: usize = output.communities.iter().map(|c| c.member_count).sum();
 
-    Ok(json!({
+    let mut payload = json!({
         "resolution": resolution,
+        // The graph-wide community count, unchanged. `total` below is the
+        // number that MATCHED this call's filter; with no `cluster_id` the two
+        // agree, and with one they must not.
         "cluster_count": output.communities.len(),
         "symbol_count": symbol_count,
         "modularity": output.modularity,
-        "clusters": clusters_json,
-    }))
+        "limit": limit,
+    });
+    bounded.merge_into(&mut payload, "clusters");
+    Ok(payload)
 }
 
 // ── 13. stale_check ────────────────────────────────────────────────────────
@@ -8269,12 +8537,38 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         }));
     }
 
+    // nw-315: the two PRE-SUMMARISED lists, authored here rather than in the
+    // CLI. Both routes of `stale-check --json` derived them from `repos`
+    // themselves — Route A by post-processing the daemon's payload
+    // (`src/main.rs`), Route B by a complete second implementation of this
+    // whole loop — so an MCP caller was told "at least one repo needs
+    // re-indexing" and had to linearly scan a 43-entry array to learn which.
+    // `needs_reindex_repos` is the field 8.0.0 added as a documented breaking
+    // change and it had never reached the MCP surface at all.
+    //
+    // Deriving them from `results` (not from a parallel pass) is what keeps
+    // them from drifting from `is_stale`/`needs_reindex` the way they drifted
+    // three times before.
+    let urls_where = |field: &str| -> Vec<Value> {
+        results
+            .iter()
+            .filter(|repo| repo[field].as_bool().unwrap_or(false))
+            .filter_map(|repo| repo["url"].as_str().map(Value::from))
+            .collect()
+    };
+    let stale_repos = urls_where("is_stale");
+    let needs_reindex_repos = urls_where("needs_reindex");
+
     Ok(json!({
         "repo_count": repos.len(),
         // Behind HEAD only. Kept because it is what the word means; a CI gate
         // wanting "is my graph usable" should read `any_needs_reindex`.
         "any_stale": any_stale,
         "any_needs_reindex": any_needs_reindex,
+        // Behind HEAD only, matching `any_stale`/`is_stale`.
+        "stale_repos": stale_repos,
+        // The ACTIONABLE set, matching `any_needs_reindex`/`needs_reindex`.
+        "needs_reindex_repos": needs_reindex_repos,
         "repos": results,
     }))
 }
@@ -8469,11 +8763,9 @@ fn tool_schema_brain_diff() -> Value {
                     "type": "string",
                     "description": "Git SHA to compare against. Defaults to the repo's indexed_sha. Use a specific SHA to diff against an older baseline."
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max affected symbols to return (default 50). The total count is always reported.",
-                    "default": DEFAULT_RESULT_LIMIT
-                }
+                "limit": limit_schema(
+                    "Max affected symbols to return (1-1000, default 50). The total count is always reported.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             },
             "required": ["repo"]
         }
@@ -8492,11 +8784,13 @@ fn tool_brain_diff(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'repo' must be a string"))?;
     let since_sha_arg = args.get("since_sha").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     // Find the repo in the graph using the shared deterministic selector. The
     // caller supplies the already-visible repository set in authenticated
@@ -8651,11 +8945,9 @@ fn tool_schema_project_context() -> Value {
                     "default": false,
                     "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
-                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
-                },
+                "intent": intent_schema(
+                    "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' (alias 'blast-radius') follows dependency edges; 'general-context' uses balanced defaults."
+                ),
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
@@ -9039,12 +9331,25 @@ fn tool_project_context(
     }
 
     // 6a. since filter: hard filter Note/Section nodes by modified_at.
-    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+    // nw-295. Validated and NORMALISED at the boundary, once. The value used
+    // to go straight into `WHERE n.modified_at >= $since`, which is a
+    // LEXICOGRAPHIC comparison against a String column and therefore can never
+    // fail — so `since: "garbage"` was byte-identical to `since: "2099-12-31"`:
+    // both matched no note and silently dropped every Note and Section from
+    // the answer. The `.filter(|s| !s.is_empty())` matters too: the CLI's
+    // daemon route sends `""` for an absent `--since`, and it survives today
+    // only because the daemon strips empty strings before dispatch.
+    if let Some(since) = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        let since = nestweaver_engine::parse_since(since).map_err(|e| anyhow!("{e}"))?;
         let recent_notes = store
-            .list_note_uids_modified_since(since)
+            .list_note_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
         let recent_sections = store
-            .list_section_uids_modified_since(since)
+            .list_section_uids_modified_since(&since)
             .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
         let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
             nodes.retain(|item| {
@@ -9299,11 +9604,13 @@ fn tool_dead_code(
     // with `total_symbols`/`reachable_symbols`/`dead_percentage`, which are
     // also unfiltered); `matching_count` is the post-`min_confidence` count;
     // `returned`/`truncated` disclose the cap.
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(configured_result_limit);
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
 
     let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
@@ -9566,11 +9873,16 @@ fn tool_schema_blast_radius() -> Value {
                     "description": "Also follow data-dependence edges (type refs & field access). Higher recall, noisier; default false.",
                     "default": false
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Cap on returned affected_symbols (most-impactful first). Omit for the full set; a truncation note reports the true total.",
-                    "minimum": 1
-                },
+                // Found by asserting the bound over the REGISTRY rather than
+                // the ten sites the report named: this one declared `minimum`
+                // and no `maximum`. Omission still means "the full set" — the
+                // ceiling bounds an EXPLICIT request, so there is nothing to
+                // gain by asking for more than it.
+                "limit": bounded_integer_schema(
+                    "Cap on returned affected_symbols (most-impactful first, 1-1000). Omit for the full set; a truncation note reports the true total.",
+                    1,
+                    RESULT_LIMIT_MAX,
+                ),
                 "format": {
                     "type": "string",
                     "enum": ["json", "sarif"],
@@ -9807,6 +10119,29 @@ fn tool_schema_get_summary() -> Value {
     })
 }
 
+/// `generate_summaries`, plus the count its return type cannot express.
+///
+/// Only `SummaryLevel::Cluster` caps inside the generator today, so only that
+/// arm has anything to report — but the shape is per-level on purpose, so a
+/// second capped level cannot be added without deciding what it reports.
+fn generate_summaries_reporting_cap(
+    store: &GraphStore,
+    level: nestweaver_engine::SummaryLevel,
+    cap_dropped: &mut usize,
+) -> Result<Vec<nestweaver_engine::Summary>, anyhow::Error> {
+    if matches!(level, nestweaver_engine::SummaryLevel::Cluster) {
+        let bounded = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
+            store,
+            nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+        )?;
+        *cap_dropped = bounded
+            .matched_total
+            .saturating_sub(bounded.summaries.len());
+        return Ok(bounded.summaries);
+    }
+    generate_summaries(store, level)
+}
+
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     use nestweaver_engine::{load_summaries, merge_and_save_summaries};
 
@@ -9875,6 +10210,16 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         return Ok(json!({
             "level": level_str,
             "target": target,
+            // nw-321: `returned`/`total` is the one pair of count names, and
+            // `summaries` is STRUCTURED. The CLI twin returned a list with
+            // `returned`/`total` while this returned a "\n"-joined string with
+            // `count`/`total_available`, so the human got structure and the
+            // agent got prose to re-parse — the inverse of who benefits from
+            // it — and no caller could be written against both. `count` /
+            // `total_available` are kept as aliases of the SAME values for one
+            // release; they are not a second contract.
+            "returned": display.len(),
+            "total": matched_total,
             "count": display.len(),
             "total_available": matched_total,
             "tokens_used": total_tokens,
@@ -9883,7 +10228,8 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "partial": capped,
             "cached": false,
             "note": note,
-            "summaries": render_text(&display),
+            "summaries": display,
+            "summaries_text": render_text(&display),
         }));
     }
 
@@ -9900,6 +10246,11 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // the F16 response cache — otherwise a caller asking for fresh data got
     // `cached: true` served from the sidecar, which reads as contradictory.
     let bypass = cache_bypassed(&args);
+    // F-DC-11. `generate_cluster_summaries` truncates to 50 INSIDE the
+    // generator, so a total taken from what it returned reports 50 against a
+    // 71,184-community graph and `truncated` computes to false. The honesty
+    // machinery existed and was wired for `SummaryLevel::Symbol` only.
+    let mut cap_dropped: usize = 0;
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && !bypass
         && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
@@ -9911,13 +10262,13 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
                 level = level_str,
                 "sidecar has summaries but none at requested level; regenerating"
             );
-            let fresh = generate_summaries(store, level)?;
+            let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
             (fresh, false)
         } else {
             (level_filtered, true)
         }
     } else {
-        let fresh = generate_summaries(store, level)?;
+        let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
         (fresh, false)
     };
 
@@ -9926,8 +10277,6 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     if !from_cache && let Some(ref db) = db_path {
         merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
     }
-
-    let total_available = summaries.len();
 
     // Build the display list: filter by target, then truncate by budget.
     let after_filter: Vec<nestweaver_engine::Summary> = if let Some(t) = target {
@@ -9940,6 +10289,17 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
 
     let after_filter_len = after_filter.len();
+    // nw-321. This was `summaries.len() + cap_dropped`, computed BEFORE
+    // `filter_by_target`, while the CLI twin's `total` is computed AFTER it.
+    // The two coincide only when no `target` is passed — which is how the QA
+    // saw both report 9657 and concluded the names were a pure rename. Pass a
+    // `target` and they are different quantities under different names.
+    //
+    // Reconciled on the AFTER-filter side, matching the CLI: a total that
+    // ignores the filter the caller asked for is not a total of anything the
+    // caller can see. `cap_dropped` is still added because those rows matched
+    // and were dropped by the generator's cap, not by the caller's filter.
+    let total_available = after_filter_len + cap_dropped;
     let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
         truncate_to_budget(&after_filter, budget)
             .into_iter()
@@ -9955,13 +10315,22 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     Ok(json!({
         "level": level_str,
         "target": target,
+        // See the symbol-level payload above: `returned`/`total` is the one
+        // pair of names, `summaries` is the structured list the CLI twin
+        // returns, and `count`/`total_available` are aliases of the same
+        // values for one release.
+        "returned": display.len(),
+        "total": total_available,
         "count": display.len(),
         "total_available": total_available,
         "tokens_used": total_tokens,
         "token_budget": token_budget,
-        "truncated": display.len() < after_filter_len,
+        // Either cause: the generator's cap upstream, or the budget here.
+        // Reporting only the second made the first vanish (F-DC-11).
+        "truncated": display.len() < after_filter_len || cap_dropped > 0,
         "cached": from_cache,
-        "summaries": text,
+        "summaries": display,
+        "summaries_text": text,
     }))
 }
 
@@ -10084,6 +10453,264 @@ fn configured_result_limit_or(builtin: usize) -> usize {
     current_instance_config()
         .and_then(|cfg| cfg.limits.default_result_limit)
         .unwrap_or(builtin)
+}
+
+// ── The (bound, total, truncated) seam ──────────────────────────────────────
+//
+// `configured_result_limit_or` above governs the DEFAULT and nothing else —
+// not the clamp, not the reported total, not the truncation disclosure. So
+// the `(bound, total, truncated)` triple was reimplemented independently in
+// sixteen-plus places across this file and `src/main.rs`, under five key
+// spellings (`total`, `total_available`, `more_available`, `connected_count`,
+// `proposals_total`), ABSENT in two commands, and computed AFTER the cap in a
+// third — which is how `summary --level cluster` came to report
+// `{returned: 50, total: 50, truncated: false}` against 71,184 communities.
+//
+// The three items below are the seam that was missing. `limit_schema` emits
+// the declaration, `read_limit` parses the argument against the SAME bounds,
+// and `Bounded` captures `total` BEFORE the cut so a capped answer structurally
+// cannot report itself complete. New bounded tools call these rather than
+// writing a seventeenth copy.
+
+/// JSON Schema fragment for an `intent` parameter, with the `enum` GENERATED
+/// from `QueryIntent::from_str` rather than restated beside it.
+///
+/// nw-317 leg 2. Two schemas hand-listed four values while the parser accepted
+/// fourteen, and a third (`code_context`) declared no enum at all — so
+/// `--intent blast-radius`, which `brain context --help` documents and the
+/// direct route accepts, was rejected through the daemon with a raw
+/// JSON-Schema error naming an internal MCP tool, while the same string was
+/// valid on a sibling tool. Restating an enumeration is the same anti-pattern
+/// the `CACHEABLE_TOOLS` decoration loop was invented to prevent.
+fn intent_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": nestweaver_store::ranking::QueryIntent::accepted_spellings(),
+        "description": description,
+    })
+}
+
+/// The upper bound every list-returning tool in this catalogue declares.
+///
+/// Not a new number: `brain_impact`, `detect_changes`, `dead_code`,
+/// `hub_nodes` and `bridge_nodes` already declare exactly this. A second
+/// ceiling for the params that lacked one would be the drift this seam exists
+/// to stop.
+pub(crate) const RESULT_LIMIT_MAX: usize = 1000;
+
+/// JSON Schema fragment for a limit-shaped integer parameter.
+///
+/// `minimum` is what turns a negative into a REJECTION. Without it
+/// `as_u64()` returns `None` for `-1`, `unwrap_or_else` fires, and the
+/// caller's explicit `-1` silently becomes the default — the caller is told
+/// nothing and gets a confident answer to a request they did not make.
+fn limit_schema(description: &str, default: usize, min: usize, max: usize) -> Value {
+    let mut schema = bounded_integer_schema(description, min, max);
+    schema["default"] = json!(default);
+    schema
+}
+
+/// The same bounds WITHOUT a `default` key, for a parameter whose omitted
+/// behaviour is not a number.
+///
+/// `blast_radius.limit` is the case: omitting it means "the full set", so
+/// advertising any default would be a claim the handler does not honour — the
+/// same dishonesty `clusters.resolution` and `project_context.token_budget`
+/// were corrected for.
+fn bounded_integer_schema(description: &str, min: usize, max: usize) -> Value {
+    json!({
+        "type": "integer",
+        "minimum": min,
+        "maximum": max,
+        "description": description,
+    })
+}
+
+/// Read a limit-shaped argument, REJECTING an out-of-range value rather than
+/// silently substituting the default.
+///
+/// Parses with `as_i64`, not `as_u64`: `as_u64` collapses "absent",
+/// "negative" and "not an integer" into one `None`, which the caller then
+/// converts into a confident default. The value the caller actually sent is
+/// examined here.
+///
+/// Schema validation already rejects out-of-range values on the MCP path, but
+/// `dispatch` is also reached from routes that never validate against the
+/// schema, so the bound is enforced in both places on purpose.
+fn read_limit(
+    args: &Value,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, anyhow::Error> {
+    let Some(raw) = args.get(key) else {
+        return Ok(default);
+    };
+    if raw.is_null() {
+        return Ok(default);
+    }
+    let value = raw
+        .as_i64()
+        .ok_or_else(|| anyhow!("invalid '{key}': expected an integer, got {raw}"))?;
+    let min_i64 = i64::try_from(min).unwrap_or(i64::MAX);
+    let max_i64 = i64::try_from(max).unwrap_or(i64::MAX);
+    if value < min_i64 || value > max_i64 {
+        anyhow::bail!("invalid '{key}': {value} is out of range (expected {min}..={max})");
+    }
+    Ok(usize::try_from(value).unwrap_or(default))
+}
+
+/// A list plus the two facts that make it honest: how many matched, and
+/// whether the caller is looking at all of them.
+///
+/// `total` is captured at construction, BEFORE the cut. That ordering is the
+/// whole point — every instance of this defect class in the codebase came
+/// from computing `total` on an already-truncated vector.
+pub(crate) struct Bounded<T> {
+    items: Vec<T>,
+    total: usize,
+}
+
+impl<T> Bounded<T> {
+    /// Cut `items` to `limit`, capturing the pre-cap total.
+    ///
+    /// `limit == 0` means unlimited, matching the CLI's documented
+    /// `--limit 0 = all` convention. A tool that does not offer that escape
+    /// hatch declares `minimum: 1` and never passes 0 here.
+    fn take(mut items: Vec<T>, limit: usize) -> Self {
+        let total = items.len();
+        if limit != 0 && total > limit {
+            items.truncate(limit);
+        }
+        Self { items, total }
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+
+    fn returned(&self) -> usize {
+        self.items.len()
+    }
+
+    fn truncated(&self) -> bool {
+        self.items.len() < self.total
+    }
+
+    /// Render only what survived the cut. Rendering before the cut is the
+    /// other half of this defect class: work proportional to the corpus for
+    /// an answer bounded to the limit.
+    fn map<U>(self, f: impl FnMut(T) -> U) -> Bounded<U> {
+        Bounded {
+            items: self.items.into_iter().map(f).collect(),
+            total: self.total,
+        }
+    }
+}
+
+impl Bounded<Value> {
+    /// Merge the canonical disclosure triple into an object payload:
+    /// `{<key>: [...], returned, total, truncated}`.
+    ///
+    /// `returned`/`total` are the spellings 8.0.0 standardised `brain_impact`
+    /// and `brain_search` on; every new bounded list uses them so an agent
+    /// parses one shape rather than five. Merging rather than constructing,
+    /// because every tool in this catalogue carries additional top-level keys
+    /// beside its list.
+    fn merge_into(self, target: &mut Value, key: &str) {
+        let (returned, total, truncated) = (self.returned(), self.total(), self.truncated());
+        let Some(object) = target.as_object_mut() else {
+            return;
+        };
+        object.insert(key.to_string(), Value::Array(self.items));
+        object.insert("returned".to_string(), json!(returned));
+        object.insert("total".to_string(), json!(total));
+        object.insert("truncated".to_string(), json!(truncated));
+    }
+}
+
+#[cfg(test)]
+mod bounds_seam_tests {
+    use super::*;
+
+    #[test]
+    fn total_is_captured_before_the_cut() {
+        let bounded = Bounded::take((0..120).collect::<Vec<i32>>(), 5);
+        assert_eq!(bounded.returned(), 5);
+        assert_eq!(bounded.total(), 120, "total must count what MATCHED");
+        assert!(bounded.truncated());
+    }
+
+    #[test]
+    fn a_zero_limit_means_unlimited() {
+        let bounded = Bounded::take((0..7).collect::<Vec<i32>>(), 0);
+        assert_eq!(bounded.returned(), 7);
+        assert!(!bounded.truncated());
+    }
+
+    #[test]
+    fn merge_into_emits_one_canonical_shape() {
+        let mut payload = json!({ "unrelated": true });
+        Bounded::take(vec![json!("a"), json!("b"), json!("c")], 2).merge_into(&mut payload, "rows");
+        assert_eq!(payload["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["returned"], json!(2));
+        assert_eq!(payload["total"], json!(3));
+        assert_eq!(payload["truncated"], json!(true));
+    }
+
+    #[test]
+    fn a_negative_limit_is_rejected_rather_than_silently_defaulted() {
+        let error = read_limit(&json!({ "limit": -1 }), "limit", 50, 1, RESULT_LIMIT_MAX)
+            .expect_err("-1 must not become 50");
+        assert!(
+            format!("{error}").contains("out of range"),
+            "the rejection must name the violated bound: {error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_limit_takes_the_documented_default() {
+        assert_eq!(
+            read_limit(&json!({}), "limit", 50, 1, RESULT_LIMIT_MAX).unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn an_over_ceiling_limit_is_rejected() {
+        assert!(
+            read_limit(
+                &json!({ "limit": 999_999_999 }),
+                "limit",
+                50,
+                1,
+                RESULT_LIMIT_MAX
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_schema_fragment_and_the_parser_share_their_bounds() {
+        let schema = limit_schema("Max rows", 50, 1, RESULT_LIMIT_MAX);
+        let min = schema["minimum"].as_i64().unwrap();
+        let max = schema["maximum"].as_i64().unwrap();
+        // Whatever the declaration rejects, the parser must reject too.
+        for out_of_range in [min - 1, max + 1] {
+            assert!(
+                read_limit(
+                    &json!({ "limit": out_of_range }),
+                    "limit",
+                    50,
+                    1,
+                    RESULT_LIMIT_MAX
+                )
+                .is_err(),
+                "{out_of_range} is outside the declared bounds but the parser accepted it"
+            );
+        }
+    }
 }
 
 fn configured_index_limits() -> nestweaver_engine::index_limits::IndexLimits {
@@ -10267,21 +10894,6 @@ fn grpc_status_err(status: tonic::Status) -> anyhow::Error {
     } else {
         anyhow::anyhow!("gRPC error: {message}")
     }
-}
-
-/// Proto3 scalar bools carry no presence. An MCP arg the caller left
-/// unset would forward as explicit `false`, and the daemon's typed handlers
-/// write that `false` back into the tool args — overriding tool defaults that
-/// are TRUE (`project_context.include_components`, `note_get.include_body`).
-/// Forward the tool's own default when the caller did not specify the flag;
-/// an explicit `false` is still honored.
-///
-/// (The alternative — proto `optional` fields — is blocked because
-/// `nestweaver-federation` constructs these request messages with exhaustive
-/// struct literals; any proto field change would break that crate.)
-#[cfg(feature = "daemon")]
-fn forwarded_bool(args: &serde_json::Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 /// Dispatch an MCP tool call through the daemon gRPC service instead of
@@ -10522,7 +11134,11 @@ pub fn dispatch_via_daemon(
                     project: str_field("project"),
                     token_budget: i32_field("token_budget"),
                     kinds: str_array("kinds"),
-                    include_components: forwarded_bool(&args, "include_components", true),
+                    // nw-316: absence must survive to the tool, which is the
+                    // one place the default is documented.
+                    include_components: args
+                        .get("include_components")
+                        .and_then(|value| value.as_bool()),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
                     since: str_field("since"),
@@ -10545,7 +11161,8 @@ pub fn dispatch_via_daemon(
                 let req = tonic::Request::new(NoteGetRequest {
                     uid: opt_str_field("uid"),
                     title: opt_str_field("title"),
-                    include_body: forwarded_bool(&args, "include_body", true),
+                    // nw-316: preserve absence; see `include_components`.
+                    include_body: args.get("include_body").and_then(|value| value.as_bool()),
                     sections: str_array("sections"),
                 });
                 let resp = client.get_note(req).await.map_err(grpc_status_err)?;
@@ -11674,6 +12291,155 @@ mod cache_dispatch_tests {
         FLUSH_COUNTER.with(|c| c.set(0));
     }
 
+    /// The smallest argument object a schema accepts, so the only thing under
+    /// test is what the dispatch seam adds.
+    fn smallest_valid_args(schema: &Value) -> Value {
+        let mut args = serde_json::Map::new();
+        let properties = schema["properties"].as_object();
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let Some(field) = required.as_str() else {
+                continue;
+            };
+            let declared = properties.and_then(|properties| properties.get(field));
+            let kind = declared
+                .and_then(|value| value["type"].as_str())
+                .unwrap_or("string");
+            let value = match kind {
+                "array" => json!(["greet"]),
+                "integer" | "number" => json!(1),
+                "boolean" => json!(true),
+                "object" => json!({}),
+                _ => declared
+                    .and_then(|value| value["enum"].as_array())
+                    .and_then(|values| values.first().cloned())
+                    .unwrap_or_else(|| json!("greet")),
+            };
+            args.insert(field.to_string(), value);
+        }
+        Value::Object(args)
+    }
+
+    /// nw-315. `_meta` (scope/sources/stale_repos) was never added on the MCP
+    /// route — not dropped, never added. Four provenance authors existed and
+    /// the stdio server was not one of them: `src/main.rs` for the CLI direct
+    /// route, the federation client for the CLI daemon route, `http.rs` under a
+    /// third, namespaced spelling, and stdio nothing — while
+    /// `SERVER_INSTRUCTIONS` promises the agent that "Results include
+    /// `_meta.sources` indicating which data sources contributed". The server
+    /// documented a field it did not send.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? The report named ten tools.
+    /// Asserting on those ten would have re-created the defect the moment an
+    /// eleventh tool was registered, because the real problem is that
+    /// provenance was authored per-command instead of at the seam every route
+    /// passes through. So this asserts over the REGISTRY: every registered
+    /// read-only tool that answers at all must carry provenance.
+    #[test]
+    fn every_tool_that_answers_stamps_its_provenance() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let schemas = all_tool_schemas();
+        let mut answered: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for tool in &schemas {
+            let Some(name) = tool["name"].as_str() else {
+                continue;
+            };
+            // Mutating tools are excluded because exercising them here would
+            // write to the fixture, not because provenance is optional for
+            // them: they reach the same seam and inherit the same stamp.
+            if crate::http::MUTATING_TOOLS.contains(&name) {
+                continue;
+            }
+            let args = smallest_valid_args(&tool["inputSchema"]);
+            let Ok(value) = dispatch(&store, None, name, args, None) else {
+                // A tool that cannot answer on this two-symbol fixture proves
+                // nothing either way; the ones that DO answer are the sample.
+                continue;
+            };
+            // A bare array has nowhere to put a key. Those exist (legacy JSON
+            // RPCs) and are a separate shape defect, not this one.
+            if !value.is_object() {
+                continue;
+            }
+            answered.push(name.to_string());
+            if value["_meta"]["sources"].as_array().is_none() {
+                missing.push(name.to_string());
+            }
+        }
+
+        assert!(
+            answered.len() >= 10,
+            "only {} tools answered on the fixture — too small a sample to \
+             prove anything: {answered:?}",
+            answered.len()
+        );
+        assert!(
+            missing.is_empty(),
+            "these tools returned an object with no `_meta.sources`, while the \
+             server's own `initialize` instructions tell the agent \"Results \
+             include _meta.sources indicating which data sources contributed\": \
+             {missing:?}"
+        );
+    }
+
+    /// The `stale_check` half of nw-315: both CLI routes derived
+    /// `stale_repos` / `needs_reindex_repos` from `repos` themselves — Route A
+    /// by post-processing the daemon payload, Route B in a complete second
+    /// implementation of the whole loop — so the agent was told "at least one
+    /// repo needs re-indexing" and had to scan a 43-entry array to learn which.
+    /// `needs_reindex_repos` is the field 8.0.0 added as a documented breaking
+    /// change and it had never reached the MCP surface.
+    #[test]
+    fn stale_check_reports_the_two_summary_lists_itself() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let value = tool_stale_check(&store).unwrap();
+        for field in ["stale_repos", "needs_reindex_repos"] {
+            assert!(
+                value[field].is_array(),
+                "stale_check must author `{field}` itself; deriving it above the \
+                 tool is what made it invisible to MCP: {value}"
+            );
+        }
+
+        // And they must agree with the per-repo flags they summarise — the
+        // three prior drifts in this pair were all disagreements of exactly
+        // this kind.
+        let names = |field: &str, flag: &str| {
+            let summary: Vec<&str> = value[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            let derived: Vec<&str> = value["repos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|repo| repo[flag].as_bool().unwrap_or(false))
+                .filter_map(|repo| repo["url"].as_str())
+                .collect();
+            (summary, derived)
+        };
+        for (field, flag) in [
+            ("stale_repos", "is_stale"),
+            ("needs_reindex_repos", "needs_reindex"),
+        ] {
+            let (summary, derived) = names(field, flag);
+            assert_eq!(
+                summary, derived,
+                "`{field}` disagrees with the `{flag}` flags it summarises: {value}"
+            );
+        }
+    }
+
     /// H1: an upgrade must not serve a pre-upgrade response shape.
     ///
     /// Before the fix this test failed: the entry below satisfies the persisted
@@ -11947,6 +12713,63 @@ mod cache_dispatch_tests {
 
     /// The other half: when everything fits, `truncated` must be false. Without
     /// this, a field hardcoded to `true` would pass the test above.
+    /// nw-320. `code_context` shipped in 8.0.0 with the defect its own
+    /// contract claims to prevent: `connected_count` reports what was
+    /// RETURNED, so it agrees with the item list by construction and a capped
+    /// answer is indistinguishable from a complete one. The engine HAS the
+    /// pre-cap number — its traversal stopped pushing once the cap was reached
+    /// and discarded the knowledge in the same expression.
+    ///
+    /// The convention 8.0.0 corrected `brain_impact` and `brain_search` to is
+    /// `returned: N, total: M, truncated: true`.
+    #[test]
+    fn code_context_reports_the_pre_cap_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        // One seed reaching five distinct callees, so a cap of 2 provably
+        // drops rows the caller must be told about.
+        fs::write(
+            src.join("main.js"),
+            "function greet(n){return a(n)+b(n)+c(n)+d(n)+e(n);}\n\
+             function a(n){return n;}\nfunction b(n){return n;}\n\
+             function c(n){return n;}\nfunction d(n){return n;}\n\
+             function e(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let capped = dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["greet"], "limit": 2 }),
+            None,
+        )
+        .unwrap();
+
+        let returned = capped["connected"].as_array().unwrap().len();
+        assert_eq!(returned, 2, "the cap must bite or this test proves nothing");
+        assert_eq!(capped["truncated"], json!(true));
+        let total = capped["total"]
+            .as_u64()
+            .expect("a capped answer must report the PRE-CAP total") as usize;
+        assert!(
+            total > returned,
+            "`total` reports {total} for {returned} returned rows — it is counting what \
+             SURVIVED the cap, so a capped answer looks complete"
+        );
+        assert_eq!(
+            capped["returned"].as_u64().unwrap() as usize,
+            returned,
+            "`returned` must spell the returned count the same way every sibling tool does"
+        );
+    }
+
     #[test]
     fn a_result_that_fits_is_not_reported_as_truncated() {
         let (_dir, db_path) = index_on_disk();
@@ -13233,6 +14056,100 @@ mod cache_dispatch_tests {
             "flight entry must be removed after the leader finishes"
         );
     }
+
+    /// Two files, so a `target` filter can be seen to change the answer.
+    fn index_two_files_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("alpha.js"),
+            "function alphaOne(n){return alphaTwo(n);}\nfunction alphaTwo(n){return n;}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("beta.js"),
+            "function betaOne(n){return betaTwo(n);}\nfunction betaTwo(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        (dir, db_path)
+    }
+
+    /// nw-321. `summary` handed the HUMAN a structured list with
+    /// `returned`/`total` and the AGENT a single "\n"-joined string with
+    /// `count`/`total_available` — the inverse of who benefits from structure,
+    /// and no caller could be written against both.
+    ///
+    /// The fourth divergence, which the report missed: the CLI's `total` is
+    /// computed AFTER `filter_by_target` and the tool's `total_available` was
+    /// captured BEFORE it. They coincide only when no `target` is passed, which
+    /// is why both routes read 9657 in the evidence and the rename looked pure.
+    /// Pass a `target` and they were different quantities under different names.
+    #[test]
+    fn get_summary_hands_the_agent_structure_and_a_total_that_respects_the_filter() {
+        reset_session();
+        let (_dir, db_path) = index_two_files_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let all = dispatch(
+            &store,
+            None,
+            "get_summary",
+            json!({ "level": "file", "no_cache": true }),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            all["summaries"].is_array(),
+            "the agent must get records, not prose it has to re-parse: {all}"
+        );
+        assert!(
+            all["summaries_text"].is_string(),
+            "the rendered form stays available under its own key: {all}"
+        );
+        assert_eq!(all["returned"], all["count"], "aliases must agree: {all}");
+        assert_eq!(
+            all["total"], all["total_available"],
+            "aliases must agree: {all}"
+        );
+        let total_all = all["total"].as_u64().expect("total is a number");
+        assert!(
+            total_all >= 2,
+            "the fixture must summarise both files or the filter below proves \
+             nothing: {all}"
+        );
+
+        let targeted = dispatch(
+            &store,
+            None,
+            "get_summary",
+            json!({ "level": "file", "target": "alpha", "no_cache": true }),
+            None,
+        )
+        .unwrap();
+        let returned = targeted["returned"].as_u64().expect("returned is a number");
+        let total = targeted["total"].as_u64().expect("total is a number");
+        assert!(
+            returned >= 1 && returned < total_all,
+            "precondition: the target filter must actually bite: {targeted}"
+        );
+        assert_eq!(
+            total, returned,
+            "`total` must count what matched the filter the caller ASKED for; \
+             counting the whole corpus under the same name makes `returned` vs \
+             `total` read as truncation that never happened: {targeted}"
+        );
+        assert_eq!(
+            targeted["truncated"],
+            json!(false),
+            "nothing was dropped, so nothing may be reported as dropped: {targeted}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13402,10 +14319,25 @@ mod arg_alias_tests {
         assert_eq!(via_name["count"], json!(1));
         assert_eq!(via_name["total_available"], json!(1));
         assert_eq!(via_name["partial"], json!(false));
+        // nw-321: `summaries` is the STRUCTURED list on both routes now, with
+        // the rendered prose under `summaries_text`. The agent used to get the
+        // string and the human the records, which is backwards.
+        assert_eq!(
+            via_name["summaries"]
+                .as_array()
+                .expect("summaries is a list")
+                .len(),
+            1
+        );
         assert!(
-            via_name["summaries"].as_str().unwrap().contains("greet"),
+            via_name["summaries_text"]
+                .as_str()
+                .unwrap()
+                .contains("greet"),
             "summary should describe the targeted symbol"
         );
+        assert_eq!(via_name["returned"], json!(1), "the canonical count name");
+        assert_eq!(via_name["total"], json!(1), "the canonical total name");
         // `target` works identically.
         let via_target =
             tool_get_summary(&store, json!({ "level": "symbol", "target": "hello" })).unwrap();
@@ -14842,6 +15774,163 @@ merged = {merged}"
 #[cfg(test)]
 mod schema_default_honesty_tests {
     use super::*;
+
+    /// nw-299(a). `clusters` was the only list-returning tool in the catalogue
+    /// with no bounding parameter, and `additionalProperties: false` meant a
+    /// caller-supplied `limit` was actively REJECTED — 98.7 MB on the wire with
+    /// no way for an MCP client to prevent it.
+    #[test]
+    fn clusters_declares_a_bound_like_every_other_list_tool() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "clusters")
+            .expect("clusters must be registered");
+        let props = &tool["inputSchema"]["properties"];
+
+        assert_eq!(
+            props["limit"]["default"],
+            json!(50),
+            "must match the CLI twin's documented default"
+        );
+        assert_eq!(
+            props["limit"]["maximum"],
+            json!(RESULT_LIMIT_MAX),
+            "1000 is the ceiling every comparable list tool already uses"
+        );
+        assert_eq!(props["members"]["default"], json!(20));
+        assert_eq!(props["members"]["maximum"], json!(200));
+    }
+
+    /// F-MCP-6. `clusters.resolution` advertised 0.5 while the handler applies
+    /// 0.3 on any graph over 10K symbols — i.e. on every graph this tool exists
+    /// to serve. A conditional default is not expressible in JSON Schema, so
+    /// the correct fix is to omit the key (the precedent
+    /// `project_context.token_budget` already set), not to state a different
+    /// wrong one.
+    #[test]
+    fn clusters_does_not_advertise_a_resolution_it_may_not_apply() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "clusters")
+            .expect("clusters must be registered");
+        let resolution = &tool["inputSchema"]["properties"]["resolution"];
+        assert!(
+            resolution.get("default").is_none(),
+            "the applied resolution depends on symbol count (0.3 above 10K, 0.5 below), \
+             so a fixed `default` here is a claim the handler does not honour"
+        );
+        let description = resolution["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("0.3") && description.contains("0.5"),
+            "the description must state BOTH, since the schema cannot: {description}"
+        );
+    }
+
+    /// nw-317 leg 2. Every `intent` enum in the registry must accept exactly
+    /// what `QueryIntent::from_str` accepts. Restating a parser in a schema is
+    /// how `blast-radius` came to be documented by `--help`, accepted on the
+    /// direct route, and rejected through the daemon with a raw JSON-Schema
+    /// error naming an internal MCP tool.
+    #[test]
+    fn declared_intent_enums_match_the_query_intent_parser() {
+        let accepted = nestweaver_store::ranking::QueryIntent::accepted_spellings();
+        assert!(
+            accepted.contains(&"blast-radius"),
+            "fixture drifted from the parser"
+        );
+
+        let mut rejected = Vec::new();
+        let mut undeclared = Vec::new();
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>").to_string();
+            let Some(intent) = tool["inputSchema"]["properties"].get("intent") else {
+                continue;
+            };
+            let Some(values) = intent["enum"].as_array() else {
+                undeclared.push(name);
+                continue;
+            };
+            let declared: std::collections::BTreeSet<&str> =
+                values.iter().filter_map(Value::as_str).collect();
+            for spelling in accepted {
+                if !declared.contains(spelling) {
+                    rejected.push(format!("{name} rejects `{spelling}`"));
+                }
+            }
+            for spelling in &declared {
+                assert!(
+                    spelling
+                        .parse::<nestweaver_store::ranking::QueryIntent>()
+                        .is_ok(),
+                    "{name} declares `{spelling}`, which the engine's parser rejects"
+                );
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "these schemas reject an intent the engine accepts and the CLI `--help` \
+             documents: {rejected:?}"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "these tools take an `intent` but declare no enum, so the same string is \
+             valid on one tool and invalid on its sibling: {undeclared:?}"
+        );
+    }
+
+    /// nw-304. Where a schema declares `minimum`/`maximum` the validator
+    /// enforces it perfectly. The gap is the ten params that declare a
+    /// `default` and NO bounds: `as_u64()` returns `None` for a negative, so
+    /// `limit: -1` silently became 50 — the caller's explicit request was
+    /// discarded and they were told nothing — and `limit: 999999999` returned
+    /// the whole dataset.
+    ///
+    /// Asserted over the REGISTRY so an eleventh unbounded param cannot be
+    /// added without failing here.
+    #[test]
+    fn every_limit_style_param_declares_both_bounds() {
+        const LIMIT_KEYS: &[&str] = &["limit", "top_n", "max_suggestions", "top_tags_limit"];
+        let mut offenders: Vec<String> = Vec::new();
+
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("?").to_string();
+            let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (field, spec) in props {
+                if !LIMIT_KEYS.contains(&field.as_str()) {
+                    continue;
+                }
+                if spec.get("minimum").is_none() {
+                    offenders.push(format!(
+                        "{name}.{field}: no `minimum` — a negative silently becomes the \
+                         default instead of being rejected"
+                    ));
+                }
+                if spec.get("maximum").is_none() {
+                    offenders.push(format!(
+                        "{name}.{field}: no `maximum` — the tool has no upper bound at all"
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unbounded limit params: {offenders:#?}"
+        );
+    }
+
+    /// The bound must be ENFORCED, not merely declared. A present-but-negative
+    /// value is a caller bug and must surface as one.
+    #[test]
+    fn a_negative_limit_is_rejected_rather_than_silently_defaulted() {
+        let error = validate_tool_arguments("brain_tag_graph", &json!({ "limit": -1 }))
+            .expect_err("limit: -1 must not validate");
+        assert!(
+            format!("{error}").contains("minimum"),
+            "the rejection must name the violated bound, not just fail: {error}"
+        );
+    }
 
     /// Every advertised default must be a value the schema itself would accept.
     /// A default outside its own `minimum`/`maximum`, or off an `enum`, is
