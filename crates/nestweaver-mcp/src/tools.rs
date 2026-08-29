@@ -10202,6 +10202,16 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         return Ok(json!({
             "level": level_str,
             "target": target,
+            // nw-321: `returned`/`total` is the one pair of count names, and
+            // `summaries` is STRUCTURED. The CLI twin returned a list with
+            // `returned`/`total` while this returned a "\n"-joined string with
+            // `count`/`total_available`, so the human got structure and the
+            // agent got prose to re-parse — the inverse of who benefits from
+            // it — and no caller could be written against both. `count` /
+            // `total_available` are kept as aliases of the SAME values for one
+            // release; they are not a second contract.
+            "returned": display.len(),
+            "total": matched_total,
             "count": display.len(),
             "total_available": matched_total,
             "tokens_used": total_tokens,
@@ -10210,7 +10220,8 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "partial": capped,
             "cached": false,
             "note": note,
-            "summaries": render_text(&display),
+            "summaries": display,
+            "summaries_text": render_text(&display),
         }));
     }
 
@@ -10259,9 +10270,6 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
     }
 
-    // Counts what MATCHED, not what survived the generator's cap.
-    let total_available = summaries.len() + cap_dropped;
-
     // Build the display list: filter by target, then truncate by budget.
     let after_filter: Vec<nestweaver_engine::Summary> = if let Some(t) = target {
         filter_by_target(&summaries, t)
@@ -10273,6 +10281,17 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
 
     let after_filter_len = after_filter.len();
+    // nw-321. This was `summaries.len() + cap_dropped`, computed BEFORE
+    // `filter_by_target`, while the CLI twin's `total` is computed AFTER it.
+    // The two coincide only when no `target` is passed — which is how the QA
+    // saw both report 9657 and concluded the names were a pure rename. Pass a
+    // `target` and they are different quantities under different names.
+    //
+    // Reconciled on the AFTER-filter side, matching the CLI: a total that
+    // ignores the filter the caller asked for is not a total of anything the
+    // caller can see. `cap_dropped` is still added because those rows matched
+    // and were dropped by the generator's cap, not by the caller's filter.
+    let total_available = after_filter_len + cap_dropped;
     let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
         truncate_to_budget(&after_filter, budget)
             .into_iter()
@@ -10288,13 +10307,22 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     Ok(json!({
         "level": level_str,
         "target": target,
+        // See the symbol-level payload above: `returned`/`total` is the one
+        // pair of names, `summaries` is the structured list the CLI twin
+        // returns, and `count`/`total_available` are aliases of the same
+        // values for one release.
+        "returned": display.len(),
+        "total": total_available,
         "count": display.len(),
         "total_available": total_available,
         "tokens_used": total_tokens,
         "token_budget": token_budget,
-        "truncated": display.len() < after_filter_len,
+        // Either cause: the generator's cap upstream, or the budget here.
+        // Reporting only the second made the first vanish (F-DC-11).
+        "truncated": display.len() < after_filter_len || cap_dropped > 0,
         "cached": from_cache,
-        "summaries": text,
+        "summaries": display,
+        "summaries_text": text,
     }))
 }
 
@@ -14028,6 +14056,100 @@ mod cache_dispatch_tests {
         assert!(
             entry_gone,
             "flight entry must be removed after the leader finishes"
+        );
+    }
+
+    /// Two files, so a `target` filter can be seen to change the answer.
+    fn index_two_files_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("alpha.js"),
+            "function alphaOne(n){return alphaTwo(n);}\nfunction alphaTwo(n){return n;}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("beta.js"),
+            "function betaOne(n){return betaTwo(n);}\nfunction betaTwo(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        (dir, db_path)
+    }
+
+    /// nw-321. `summary` handed the HUMAN a structured list with
+    /// `returned`/`total` and the AGENT a single "\n"-joined string with
+    /// `count`/`total_available` — the inverse of who benefits from structure,
+    /// and no caller could be written against both.
+    ///
+    /// The fourth divergence, which the report missed: the CLI's `total` is
+    /// computed AFTER `filter_by_target` and the tool's `total_available` was
+    /// captured BEFORE it. They coincide only when no `target` is passed, which
+    /// is why both routes read 9657 in the evidence and the rename looked pure.
+    /// Pass a `target` and they were different quantities under different names.
+    #[test]
+    fn get_summary_hands_the_agent_structure_and_a_total_that_respects_the_filter() {
+        reset_session();
+        let (_dir, db_path) = index_two_files_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let all = dispatch(
+            &store,
+            None,
+            "get_summary",
+            json!({ "level": "file", "no_cache": true }),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            all["summaries"].is_array(),
+            "the agent must get records, not prose it has to re-parse: {all}"
+        );
+        assert!(
+            all["summaries_text"].is_string(),
+            "the rendered form stays available under its own key: {all}"
+        );
+        assert_eq!(all["returned"], all["count"], "aliases must agree: {all}");
+        assert_eq!(
+            all["total"], all["total_available"],
+            "aliases must agree: {all}"
+        );
+        let total_all = all["total"].as_u64().expect("total is a number");
+        assert!(
+            total_all >= 2,
+            "the fixture must summarise both files or the filter below proves \
+             nothing: {all}"
+        );
+
+        let targeted = dispatch(
+            &store,
+            None,
+            "get_summary",
+            json!({ "level": "file", "target": "alpha", "no_cache": true }),
+            None,
+        )
+        .unwrap();
+        let returned = targeted["returned"].as_u64().expect("returned is a number");
+        let total = targeted["total"].as_u64().expect("total is a number");
+        assert!(
+            returned >= 1 && returned < total_all,
+            "precondition: the target filter must actually bite: {targeted}"
+        );
+        assert_eq!(
+            total, returned,
+            "`total` must count what matched the filter the caller ASKED for; \
+             counting the whole corpus under the same name makes `returned` vs \
+             `total` read as truncation that never happened: {targeted}"
+        );
+        assert_eq!(
+            targeted["truncated"],
+            json!(false),
+            "nothing was dropped, so nothing may be reported as dropped: {targeted}"
         );
     }
 }
