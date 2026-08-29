@@ -3775,10 +3775,13 @@ enum Commands {
     /// are reported as potentially dead, with confidence scoring based
     /// on visibility.
     ///
-    /// Known limitation: symbol visibility is not persisted (reads rebuild it
-    /// as Inferred), so confidence scoring cannot distinguish a public API
-    /// from a private helper — treat Low-confidence results as review
-    /// candidates, not proof of deadness.
+    /// Known limitation: a symbol is reported when no entry point REACHES it,
+    /// which is not the same as "nothing references it" — a reference the
+    /// parser does not capture is indistinguishable from no reference at all.
+    /// Treat EVERY confidence tier as review candidates, not proof of
+    /// deadness: the caveat is not scoped to Low. Confidence ranks how
+    /// unaddressable a symbol is from outside its file, never how sure the
+    /// reachability walk is.
     #[command(
         after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
     )]

@@ -25,12 +25,17 @@ use crate::manifest::ManifestInfo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeadCodeConfidence {
-    /// Public symbol in a potentially library crate — could be used externally.
+    /// Explicitly public symbol — could be consumed by code this graph does
+    /// not contain (a library API, a re-export, a plugin surface).
     Low,
-    /// Public symbol in a non-library crate, or internal symbol with some
-    /// ambiguity (e.g. `Inferred` visibility).
+    /// The default tier. An unreachable symbol with no naming signal, whatever
+    /// its visibility. Explicitly `private` lands HERE, not in [`Self::High`] —
+    /// see [`infer_confidence`] for why.
     Medium,
-    /// Private/internal unreachable symbol — cannot be called externally.
+    /// Unreachable AND spelled private-by-convention (leading `_`, or a
+    /// lowercase-initial name in a Go file, which is unexported at the
+    /// language level). This is the only signal that has ever discriminated
+    /// on a real index.
     High,
 }
 
@@ -101,6 +106,74 @@ fn is_excluded_from_dead_code(sym: &nestweaver_schema::Symbol) -> bool {
     ) || sym.file_path.ends_with(".d.ts")
 }
 
+/// UIDs of `Constant`/`Variable` symbols whose source span lies inside a
+/// `Function` or `Method` in the same file — i.e. local bindings, not
+/// declarations.
+///
+/// A local binding is not dead code and cannot be: it has no name anything
+/// outside its enclosing body could use, so "is it reachable from an entry
+/// point" is not a question that has an answer about it. Reporting one invites
+/// a caller to go delete a line that a function two lines down is reading.
+///
+/// This is the `.tsx` half of nw-291's real-index evidence. React's
+/// `const [activeView, setActiveView] = useState(..)` is captured as
+/// `definition.const` by `typescript.scm`, so 173 of the first measured 1,000
+/// candidates were component-local `const`s — `selected`, `badge`, `busy`,
+/// `isZen`, `hideDetail`. Once the Rust false positives were fixed they floated
+/// to 470 of 1,000, i.e. fixing everything else made this the dominant defect.
+///
+/// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? Everywhere, which is why the
+/// test is on the SPAN rather than on the language: a `let` in a Go function, a
+/// `const` in a Rust `fn` body, a module-level name assigned inside a Python
+/// `def` — all have the same shape, and a per-language rule would have to be
+/// written 32 times and would still miss the 33rd. The containing kind is
+/// restricted to `Function`/`Method` on purpose: a `Class`, `Extension` or Rust
+/// `impl` block also contains its members' spans, and an associated constant
+/// IS externally addressable, so it stays in the analysis.
+///
+/// The fix deliberately lives here and not in `typescript.scm`. Dropping the
+/// symbol at parse time would also drop it from search, `repo-map`, PageRank
+/// and every UID that references it — a far larger blast radius than the one
+/// defect being fixed, and those consumers WANT a local binding to be findable.
+fn function_local_bindings(symbols: &[nestweaver_schema::Symbol]) -> HashSet<&str> {
+    let mut by_file: HashMap<&str, Vec<&nestweaver_schema::Symbol>> = HashMap::new();
+    for sym in symbols {
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+            || matches!(sym.kind, SymbolKind::Constant | SymbolKind::Variable)
+        {
+            by_file.entry(sym.file_path.as_str()).or_default().push(sym);
+        }
+    }
+
+    let mut local = HashSet::new();
+    for candidates in by_file.values() {
+        let bodies: Vec<&nestweaver_schema::Symbol> = candidates
+            .iter()
+            .copied()
+            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+            .collect();
+        if bodies.is_empty() {
+            continue;
+        }
+        for sym in candidates {
+            if !matches!(sym.kind, SymbolKind::Constant | SymbolKind::Variable) {
+                continue;
+            }
+            // A zero-width or inverted span cannot be reasoned about; leave it in.
+            if sym.end_line < sym.start_line {
+                continue;
+            }
+            if bodies
+                .iter()
+                .any(|body| body.start_line < sym.start_line && sym.end_line <= body.end_line)
+            {
+                local.insert(sym.uid.as_str());
+            }
+        }
+    }
+    local
+}
+
 /// Default minimum edge confidence for BFS traversal.
 const DEFAULT_MIN_EDGE_CONFIDENCE: f32 = 0.3;
 
@@ -125,14 +198,17 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 /// or `exports` entries in a package.json manifest are treated as additional
 /// entry points.
 ///
-/// **Known limitation — visibility is not persisted.** Symbol reads rebuild
-/// `visibility` as `Visibility::Inferred` for every row (see
-/// `nestweaver-store/src/read.rs`), so the confidence scoring below cannot
-/// tell a crate-public API function from a private helper: everything scores
-/// off the inferred-visibility heuristic, and genuinely public (externally
-/// consumed) symbols may be reported as Low-confidence dead code. Treat Low
-/// results as review candidates, not proof. Persisting visibility is a
-/// schema change and is deliberately NOT attempted here.
+/// **Known limitation — reachability is only as complete as the edge set.**
+/// A symbol is reported when no entry point reaches it, which is not the same
+/// as "nothing references it". Two gaps are known and measured on a real Rust
+/// index: references to a constant or static by bare name are only captured
+/// for languages whose query file has a bare-identifier read rule, and a
+/// symbol registered by a macro the parser treats as an opaque token tree is
+/// reachable only if that macro is on the registration list in
+/// `nestweaver-parser`. Treat EVERY tier as review candidates, not proof —
+/// the caveat is not scoped to Low. Visibility IS persisted (it round-trips
+/// through the store), but it deliberately does not promote a row to High;
+/// see [`infer_confidence`].
 ///
 /// **Performance note**: The BFS itself is O(V+E) and fast. On large graphs
 /// (80K+ symbols, 100K+ edges), the dominant cost is loading all symbols and
@@ -210,13 +286,17 @@ fn detect_dead_code_inner(
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
 
+    let function_local: HashSet<String> = function_local_bindings(&raw_symbols)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let excluded_count = raw_symbols
         .iter()
-        .filter(|s| is_excluded_from_dead_code(s))
+        .filter(|s| is_excluded_from_dead_code(s) || function_local.contains(&s.uid))
         .count();
     let all_symbols: Vec<_> = raw_symbols
         .into_iter()
-        .filter(|s| !is_excluded_from_dead_code(s))
+        .filter(|s| !is_excluded_from_dead_code(s) && !function_local.contains(&s.uid))
         .collect();
 
     if all_symbols.is_empty() {
@@ -451,25 +531,45 @@ fn detect_dead_code_inner(
 
 /// Infer dead-code confidence from visibility and naming conventions.
 ///
-/// - Names starting with `_` or lowercase in Go/Rust-like files -> High
-///   (private by convention).
-/// - `Inferred` visibility with no private signal -> Medium.
-/// - Explicitly public symbols -> Low (could be library API).
+/// - Explicitly public -> Low (could be library API); this wins over every
+///   naming convention below (nw-155).
+/// - Names starting with `_`, or lowercase-initial in Go files -> High
+///   (private by convention AND unaddressable from outside the file/package).
+/// - Everything else, INCLUDING an explicitly private/internal/protected
+///   symbol -> Medium.
+///
+/// # Why `private` alone does not reach High (nw-291 follow-up)
+///
+/// Before visibility was persisted, symbol reads rebuilt every row as
+/// `Inferred`, so the `visibility == "private"` guard here was unreachable and
+/// this population scored Medium. Persisting the column made the guard live —
+/// and promoted the same rows to High without anything having validated that
+/// the rows were right. On a fresh Rust index the resulting High tier was
+/// 1000/1000 `private`, and its top 15 contained zero true positives: all were
+/// `criterion_group!`-registered benchmark functions or file-local constants
+/// whose references the graph does not yet carry.
+///
+/// The command's own help scopes its caveats to LOW-confidence results, so
+/// promoting that population to High would present the least trustworthy list
+/// as the most trustworthy one — strictly worse for a caller than the Medium
+/// it used to get. `private` is a NECESSARY condition for "cannot be called
+/// from outside", not a SUFFICIENT one for "is dead": it says nothing about
+/// whether the in-file references were captured at all.
+///
+/// So visibility keeps demoting (public -> Low, which is safe: it moves rows
+/// AWAY from the trustworthy tier) and no longer promotes. High is reserved
+/// for the naming conventions that were the live discriminator before this
+/// column existed, so this branch is not worse-calibrated than the tier it
+/// replaces. Re-couple `private` to High only with a measured precision number
+/// on a real index behind it.
 fn infer_confidence(name: &str, visibility: &str, file_path: &str) -> DeadCodeConfidence {
-    // Explicitly private or internal symbols: high confidence.
-    if visibility == "private" || visibility == "internal" || visibility == "protected" {
-        return DeadCodeConfidence::High;
-    }
-
     // Explicitly public wins over every naming convention below (nw-155).
     //
     // A leading underscore means "private by convention", but an explicit
     // export overrides the convention: `export { __wbg_init as default }`
     // makes that symbol a module's PUBLIC entry point no matter how it is
     // spelled. Reporting it as high-confidence dead code invites a user to
-    // delete live, exported API -- and the command's own help scopes the
-    // visibility caveat to LOW-confidence results, so the tier presented as
-    // trustworthy was the one driven purely by spelling.
+    // delete live, exported API.
     if visibility == "public" {
         return DeadCodeConfidence::Low;
     }
@@ -477,7 +577,6 @@ fn infer_confidence(name: &str, visibility: &str, file_path: &str) -> DeadCodeCo
     // Naming-convention heuristics for private scope:
     //   - Leading underscore (Python, JS/TS, Dart, Ruby)
     //   - Lowercase first char in Go files (unexported)
-    //   - Lowercase first char in Kotlin files (typically local)
     if name.starts_with('_') {
         return DeadCodeConfidence::High;
     }
@@ -486,12 +585,8 @@ fn infer_confidence(name: &str, visibility: &str, file_path: &str) -> DeadCodeCo
         return DeadCodeConfidence::High;
     }
 
-    // Explicitly public: low confidence (could be library API).
-    if visibility == "public" {
-        return DeadCodeConfidence::Low;
-    }
-
-    // Inferred visibility with no strong private signal: medium.
+    // Everything else — including an explicitly private/internal/protected
+    // symbol with no naming signal — is Medium. See the note above.
     DeadCodeConfidence::Medium
 }
 
@@ -911,8 +1006,16 @@ mod tests {
     }
 
     /// Where else does this property hold? The private/internal/protected guard
-    /// is the same unreachable branch in the other direction — it must promote
-    /// an explicitly private symbol that no naming convention would catch.
+    /// is the same branch in the other direction. The column must still survive
+    /// the round trip — other work depends on it — but it must NOT carry the
+    /// row into the tier the command presents as trustworthy.
+    ///
+    /// nw-291 follow-up: this assertion used to demand `High`. On a fresh Rust
+    /// index that promotion produced a top-1000 that was 1000/1000 `private`
+    /// and 0/15 true positives at the top, i.e. a ~0%-precision list served as
+    /// the HIGH tier while the command's help scopes its caveats to LOW. Before
+    /// visibility was persisted this same population came out `Medium`, so the
+    /// promotion was a regression against `main`, not merely an unfixed bug.
     #[test]
     fn explicit_private_visibility_survives_the_store_round_trip() {
         let store = GraphStore::in_memory().unwrap();
@@ -927,8 +1030,150 @@ mod tests {
             .iter()
             .find(|s| s.name == "Helper")
             .expect("Helper must be reported");
-        assert_eq!(row.visibility, "private");
-        assert_eq!(row.confidence, DeadCodeConfidence::High);
+        assert_eq!(
+            row.visibility, "private",
+            "the column is correct and must keep round-tripping"
+        );
+        assert_eq!(
+            row.confidence,
+            DeadCodeConfidence::Medium,
+            "`private` alone must not reach the tier the help calls trustworthy"
+        );
+    }
+
+    /// nw-291 follow-up, the load-bearing guard: whatever else changes about
+    /// the tiers, an unreachable row must never be promoted to `High` on the
+    /// strength of `visibility` alone. Asserted over the whole `Visibility`
+    /// enum so a variant added later cannot quietly re-open the promotion —
+    /// the name carries no private-by-convention signal, so the ONLY thing
+    /// that could lift it is visibility.
+    #[test]
+    fn no_visibility_alone_promotes_a_row_to_high() {
+        for visibility in [
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Protected,
+            Visibility::Internal,
+            Visibility::Inferred,
+        ] {
+            let store = GraphStore::in_memory().unwrap();
+            let mut sym =
+                make_symbol_with_kind("v", "Helper", SymbolKind::Function, "src/lib.ts", false);
+            sym.visibility = visibility;
+            store.insert_symbol(&sym).unwrap();
+
+            let result = detect_dead_code(&store).unwrap();
+            let row = result
+                .unreachable_symbols
+                .iter()
+                .find(|s| s.name == "Helper")
+                .expect("Helper must be reported");
+            assert_ne!(
+                row.confidence,
+                DeadCodeConfidence::High,
+                "visibility={visibility:?} must not reach High on its own"
+            );
+        }
+    }
+
+    /// nw-291 follow-up / F-DC evidence. `typescript.scm` captures
+    /// `const [activeView, setActiveView] = useState(..)` as `definition.const`,
+    /// so React component-local bindings became dead-code candidates: 173 of the
+    /// first measured 1,000, and 470 of 1,000 once the Rust false positives were
+    /// fixed and they floated up. A local binding has no name anything outside
+    /// its enclosing body could use, so "is it reachable from an entry point" is
+    /// not a question that has an answer about it.
+    #[test]
+    fn a_binding_inside_a_function_body_is_not_a_dead_code_candidate() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut component = make_symbol_with_kind(
+            "c",
+            "AppContent",
+            SymbolKind::Function,
+            "src/App.tsx",
+            false,
+        );
+        component.start_line = 10;
+        component.end_line = 90;
+        let mut local = make_symbol_with_kind(
+            "l",
+            "activeView",
+            SymbolKind::Constant,
+            "src/App.tsx",
+            false,
+        );
+        local.start_line = 20;
+        local.end_line = 20;
+        let mut module_level = make_symbol_with_kind(
+            "m",
+            "DEFAULT_VIEW",
+            SymbolKind::Constant,
+            "src/App.tsx",
+            false,
+        );
+        module_level.start_line = 3;
+        module_level.end_line = 3;
+        for sym in [&component, &local, &module_level] {
+            store.insert_symbol(sym).unwrap();
+        }
+
+        let result = detect_dead_code(&store).unwrap();
+        let reported: Vec<&str> = result
+            .unreachable_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !reported.contains(&"activeView"),
+            "a component-local binding was reported as dead code: {reported:?}"
+        );
+        assert!(
+            reported.contains(&"DEFAULT_VIEW"),
+            "a MODULE-level constant is externally addressable and must stay in \
+             the analysis: {reported:?}"
+        );
+        assert!(
+            reported.contains(&"AppContent"),
+            "the enclosing function is itself a candidate: {reported:?}"
+        );
+        assert_eq!(
+            result.excluded_count, 1,
+            "the excluded binding must be counted as excluded, not silently \
+             dropped from the totals"
+        );
+    }
+
+    /// WHERE ELSE: the rule is keyed on SPANS, not on a language, so it must
+    /// NOT fire for a member container. A Rust `impl` block and a TS class both
+    /// contain their members' spans, and an associated constant IS externally
+    /// addressable.
+    #[test]
+    fn an_associated_constant_inside_a_class_stays_in_the_analysis() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut class =
+            make_symbol_with_kind("k", "Config", SymbolKind::Class, "src/config.rs", false);
+        class.start_line = 1;
+        class.end_line = 40;
+        let mut assoc = make_symbol_with_kind(
+            "a",
+            "MAX_DEPTH",
+            SymbolKind::Constant,
+            "src/config.rs",
+            false,
+        );
+        assoc.start_line = 5;
+        assoc.end_line = 5;
+        store.insert_symbol(&class).unwrap();
+        store.insert_symbol(&assoc).unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert!(
+            result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "MAX_DEPTH"),
+            "an associated constant was excluded as if it were a local binding"
+        );
     }
 
     /// nw-291 / F-DC-6: `--limit N` took the first N of a
@@ -978,10 +1223,26 @@ mod tests {
             infer_confidence("Helper", "inferred", "src/lib.rs"),
             DeadCodeConfidence::Medium
         );
-        // Explicit private -> High
+        // Explicit private with no naming signal -> Medium, NOT High. See
+        // `infer_confidence`: the promotion this used to assert was measured
+        // at 0/15 true positives on a real Rust index.
         assert_eq!(
             infer_confidence("Helper", "private", "src/lib.rs"),
-            DeadCodeConfidence::High
+            DeadCodeConfidence::Medium
+        );
+        assert_eq!(
+            infer_confidence("Helper", "internal", "src/lib.cs"),
+            DeadCodeConfidence::Medium
+        );
+        assert_eq!(
+            infer_confidence("Helper", "protected", "src/lib.java"),
+            DeadCodeConfidence::Medium
+        );
+        // Public still outranks the underscore convention (nw-155): the
+        // demotion direction is unchanged.
+        assert_eq!(
+            infer_confidence("__wbg_init", "public", "src/wasm/glue.js"),
+            DeadCodeConfidence::Low
         );
     }
 
