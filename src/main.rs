@@ -9042,6 +9042,9 @@ fn wait_for_started_daemon_with_timeout(
         timeout,
         ignore_pid,
         expected_config,
+        // This waiter did not spawn the daemon, so it holds no process whose
+        // exit could end the wait early (nw-309).
+        None,
     ))
 }
 

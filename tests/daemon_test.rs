@@ -5709,3 +5709,90 @@ fn clusters_text_honours_limit_on_the_daemon_route() {
         "and the PRE-cap total must survive the cap:\n{two}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// nw-309 (client half) — a daemon that will never boot must be reported at
+// once, not at the boot ceiling.
+// ---------------------------------------------------------------------------
+
+/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
+/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
+/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
+/// nothing to observe: "will never boot" and "still booting" are the same
+/// observation, and the caller waits out the whole ceiling.
+///
+/// Staged with an unwritable state directory, so the daemon cannot create its
+/// runtime directory and exits in milliseconds without ever writing a pidfile.
+/// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
+/// this without touching the operator's real state tree.
+#[test]
+fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("a.js"), "export function f() {}\n").unwrap();
+    let db = dir.path().join("graph.lbug");
+
+    no_daemon_cmd()
+        .env("XDG_STATE_HOME", &state)
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Read+execute but not write: the daemon can traverse it and cannot create
+    // its instance directory under it.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let boot_ceiling = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let output = daemon_cmd()
+        .env("XDG_STATE_HOME", &state)
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .args(["search", "f", "--db"])
+        .arg(&db)
+        .timeout(boot_ceiling + Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // The launcher's own verdict arrives in milliseconds. Half the ceiling is a
+    // deliberately loose bound — the point is that the wait is not the ceiling.
+    assert!(
+        elapsed < boot_ceiling / 2,
+        "a daemon known to be dead was waited on for {elapsed:?} against a 30s \
+         boot ceiling; the failure channel is not connected.\nstderr:\n{stderr}"
+    );
+
+    // And the report must say what actually happened, not merely that time ran
+    // out — the launcher's stderr was going to /dev/null.
+    assert!(
+        stderr.contains("will not become healthy"),
+        "the failure must be attributed to the launcher exiting, not to a \
+         timeout:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Permission denied"),
+        "and it must carry the launcher's own reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("did not become healthy and attest"),
+        "the ceiling message must not be what the user sees when the answer \
+         was knowable immediately:\n{stderr}"
+    );
+}
