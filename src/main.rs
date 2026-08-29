@@ -311,17 +311,27 @@ enum CliDiagnostic {
     )]
     RepoPathNotADirectory { path: String },
 
-    #[error("No symbols found in the database")]
-    #[diagnostic(
-        code(nestweaver::empty_graph),
-        help("Try indexing first with `nestweaver index --repo .`")
-    )]
-    NoSymbolsFound,
-
+    /// nw-329. The audience for "I found nothing" is by definition someone
+    /// whose targeting is already wrong, and a query that returned no rows has
+    /// NOT established that the database is empty — so it must not send them
+    /// to the one command that writes. The help this replaces was
+    /// `nestweaver index --repo <path>`; its sibling `NoSymbolsFound` said
+    /// `nestweaver index --repo .`, which is verbatim the invocation that
+    /// indexed a home directory into the live knowledge graph during the
+    /// 8.0.0 hunt (nw-284). That sibling existed only to serve the substring
+    /// rewrite deleted in `into_diagnostic`, so it is gone rather than fixed.
+    ///
+    /// Report what is true and point at a read that confirms it. Which
+    /// repository to index, and where, is a decision this error has no
+    /// information about. `read_path_diagnostics_never_prescribe_a_write`
+    /// keeps it that way.
     #[error("Database is empty")]
     #[diagnostic(
         code(nestweaver::empty_db),
-        help("Index a repository first: `nestweaver index --repo <path>`")
+        help(
+            "Confirm with `nestweaver brain status`, which reports the repos, \
+             symbols and vaults this database holds."
+        )
     )]
     EmptyDatabase,
 
@@ -484,15 +494,274 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         return CliDiagnostic::RepoPathNotFound { path }.into();
     }
 
-    if lower.contains("no symbols found") || lower.contains("no matching symbols") {
-        return CliDiagnostic::NoSymbolsFound.into();
-    }
+    // nw-329: NO "no symbols found" ARM HERE, deliberately.
+    //
+    // The engine's own message is `No symbols found in file(s): bot.py. The
+    // file may contain only re-exports or unsupported syntax.`
+    // (`query.rs`, `build_context_with_intent`). `"no symbols found"` is a
+    // PREFIX of it, so a substring rewrite fired on exactly the errors it
+    // should have left alone and turned a true statement about ONE FILE into
+    // a false statement about a 126,000-symbol database — then attached
+    // `nestweaver index --repo .` as the remedy. A classifier that sits above
+    // the point where scope is known cannot recover it; it can only
+    // generalise, and it generalised to the worst available advice. The
+    // engine's message is better than the replacement in every case, so it
+    // falls through to `General` and is printed verbatim.
 
     if lower.contains("database is empty") || (lower.contains("empty") && lower.contains("graph")) {
         return CliDiagnostic::EmptyDatabase.into();
     }
 
     CliDiagnostic::General { message }.into()
+}
+
+/// nw-329: one classification of a `context` lookup failure, shared by the
+/// daemon and direct routes so they cannot disagree about what went wrong.
+///
+/// The engine's message is printed VERBATIM. It already names the scope it
+/// actually searched, which is the thing no layer above it can reconstruct.
+fn report_context_lookup_failure(error: &anyhow::Error) -> i32 {
+    let message = format!("{error:#}");
+    if message.contains("No matching symbols") || message.contains("No symbols found") {
+        eprintln!("{message}");
+        EXIT_NOT_FOUND
+    } else if message.contains("Ambiguous") {
+        eprintln!("{message}");
+        EXIT_AMBIGUOUS
+    } else {
+        eprintln!("Error: {message}");
+        EXIT_ERROR
+    }
+}
+
+// ── Environment-variable registry (S1/T2) ────────────────────────────────────
+
+/// What a `NESTWEAVER_*` variable DOES, which is the property an error message
+/// has to get right when it offers one as a remedy.
+///
+/// nw-318 (defect B) is the reason this carries a role rather than just a
+/// name. Three messages told the user a bypass "requires `NESTWEAVER_NO_DAEMON=1`".
+/// That variable is real, and the binary really reads it — so a check that
+/// only asked "does this name exist?" would have passed on every one of them.
+/// It is a second way to REQUEST the bypass; the thing that PERMITS it is
+/// `NESTWEAVER_ALLOW_NO_DAEMON`. Setting the named variable therefore does not
+/// resolve the error, which is the whole defect class.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvRole {
+    /// Asks for a behaviour. Setting it is NOT sufficient — something else
+    /// decides whether the request is honoured. Never a valid remedy.
+    Requests,
+    /// Permits a behaviour. A valid remedy.
+    Grants,
+    /// Selects or tunes something. A valid remedy.
+    Configures,
+    /// Exists for the test harness or for internal process handoff. Never
+    /// offered to a user.
+    Internal,
+}
+
+#[cfg(test)]
+struct EnvVar {
+    name: &'static str,
+    role: EnvRole,
+}
+
+/// Every `NESTWEAVER_*` variable this workspace reads or names, with its role.
+///
+/// Written in the explicit-inventory idiom this module already uses for the
+/// `--db`/`--config` matrix: sorted, one entry per name, and a failing test
+/// that tells you to come here. It is also the documentation nobody had — 40+
+/// environment variables with no single list is its own defect.
+#[cfg(test)]
+const ENV_REGISTRY: &[EnvVar] = &[
+    EnvVar {
+        name: "NESTWEAVER_ADMIN_TOKEN",
+        role: EnvRole::Configures,
+    },
+    // The gate for `--no-daemon`. THIS is the one a bypass remedy may name.
+    EnvVar {
+        name: "NESTWEAVER_ALLOW_NO_DAEMON",
+        role: EnvRole::Grants,
+    },
+    EnvVar {
+        name: "NESTWEAVER_AUTH_TOKEN",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_BIND",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_CRASH_REPORT_DIRS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_FORK",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DB",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_DRAIN_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_API_KEY",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_CACHE_ISOLATION_CHILD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_EMPTY_CACHE_PATH",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_EMBED_POPULATED_CACHE_PATH",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_CLONE_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_CMD_TEST_UNSET_XYZ",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_GIT_NET_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_HOOK_MARKER",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_CPU_PERCENT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_PUBLICATION_WAIT_MS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_INDEX_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_BUFFER_POOL_BYTES",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_MAX_DB_SIZE",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_MAX_THREADS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_LBUG_SOURCE_MANIFEST",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_MANAGED_START",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_CACHE_DIR",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_DB",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_MODEL_ID",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR",
+        role: EnvRole::Internal,
+    },
+    // REQUESTS the daemon bypass. `NESTWEAVER_ALLOW_NO_DAEMON` permits it.
+    // Offering this one as a remedy is nw-318 defect B.
+    EnvVar {
+        name: "NESTWEAVER_NO_DAEMON",
+        role: EnvRole::Requests,
+    },
+    EnvVar {
+        name: "NESTWEAVER_PARENT_SPAWN_LOCK_FD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_RPC_TIMEOUT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_RTS_NO_RECORD",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_SOCK_FALLBACK_DIR",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_STOP_GRACE_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TEST_XDG_DEFAULT_CHILD",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_TOKEN",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_UPSTREAM",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_WEBHOOK_SECRET",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_WEBHOOK_SECRET_OLD",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
+        name: "NESTWEAVER_XDG_DEFAULT_CHILD_OK",
+        role: EnvRole::Internal,
+    },
+];
+
+#[cfg(test)]
+fn env_role(name: &str) -> Option<EnvRole> {
+    ENV_REGISTRY
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.role)
 }
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -1067,14 +1336,40 @@ fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
 
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
 /// mistaken for a result set.
-fn impact_json_ambiguous(symbol: &str, candidates: serde_json::Value) -> serde_json::Value {
+///
+/// nw-328: `repo_filter` is a parameter because the remedy is a FUNCTION of
+/// the state that produced the error, not a constant. `resolve_uid_with_repo_filter`
+/// returns `Ambiguous` only when MORE THAN ONE candidate SURVIVES the filter,
+/// so reaching this with `--repo` already set is a proof that `--repo` cannot
+/// separate these two symbols. Advising it anyway sends the caller round a
+/// loop; an agent following the remedy verbatim never terminates.
+fn impact_json_ambiguous(
+    symbol: &str,
+    repo_filter: Option<&str>,
+    candidates: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "ambiguous",
         "symbol": symbol,
         "candidates": candidates,
-        "note": "the symbol name matched multiple symbols; no impact was computed. \
-                 Disambiguate with --repo <name> or pass a full UID",
+        "note": impact_ambiguity_remedy(repo_filter),
     })
+}
+
+/// The one sentence both the JSON and the text renderings of an ambiguous
+/// `impact` use, so they cannot drift.
+fn impact_ambiguity_remedy(repo_filter: Option<&str>) -> String {
+    match repo_filter {
+        Some(repo) => format!(
+            "the symbol name matched multiple symbols; no impact was computed. \
+             --repo {repo} is already set and every match is inside it, so it \
+             cannot separate them. Pass a full UID instead — each candidate \
+             below carries one."
+        ),
+        None => "the symbol name matched multiple symbols; no impact was computed. \
+                 Disambiguate with --repo <name> or pass a full UID"
+            .to_string(),
+    }
 }
 
 fn impact_json_not_found(symbol: &str) -> serde_json::Value {
@@ -1579,11 +1874,26 @@ fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
                     }
                 }
             } else {
+                // nw-310, third site in the same family: the fallback for an
+                // older daemon that sends no remediation commands. `entries`
+                // carries every `instance_id`, so the consolidation half is
+                // rendered from the values rather than from placeholders.
+                let observed: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| e["instance_id"].as_str())
+                    .map(str::to_string)
+                    .collect();
+                let consolidation =
+                    nestweaver_engine::instance_remedy::instance_consolidation_remedy(
+                        &observed, None,
+                    );
                 out.push_str(&format!(
                     "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
-                     Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>\n"
+                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n"
                 ));
+                if !consolidation.is_empty() {
+                    out.push_str(&format!("  Or {consolidation}\n"));
+                }
             }
         } else {
             // Generic forwarding: a warning kind this binary does not know —
@@ -2821,9 +3131,6 @@ enum Commands {
         /// In daemon mode, the daemon's own --config takes precedence.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// CI/testing only — bypass the daemon. Requires NESTWEAVER_NO_DAEMON=1.
-        #[arg(long, hide = true)]
-        no_daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -2845,6 +3152,20 @@ enum Commands {
         /// Enable live re-indexing watchers (file system watching)
         #[arg(long)]
         watch: bool,
+
+        /// Repository to watch under `--watch`. Defaults to the repository
+        /// root detected from the current directory.
+        ///
+        /// nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
+        /// mutates the graph continuously and previously had no way to state
+        /// its source at all, so a guard that refuses a wholly-inferred write
+        /// would have left `ui --watch` unusable rather than correctable.
+        /// Additive and non-breaking.
+        #[arg(
+            long,
+            help = "Repository to watch (with --watch); defaults to the detected repo root"
+        )]
+        repo: Option<PathBuf>,
     },
     /// Manage interaction memory
     Interactions {
@@ -5366,11 +5687,125 @@ fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u
     ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
 }
 
+/// Which link in a database-resolution chain actually produced the path.
+///
+/// nw-284/S2. Every resolver in this file ends in a `.unwrap_or_else(...)`
+/// chain and returns a bare `PathBuf`, so the answer to "did the user name
+/// this database?" is computed and then thrown away one line later. A
+/// mutating command needs that answer, so the resolvers now return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbSource {
+    /// An explicit `--db` on the command line.
+    Flag,
+    /// The `db` field of an explicit `--config`.
+    Config,
+    /// The `NESTWEAVER_DB` environment variable — ambient, and the only
+    /// source S2 treats as "not stated".
+    Env,
+    /// `<repo>/nestweaver.lbug`. Ambient, but DERIVED FROM THE SOURCE: it
+    /// follows wherever the repo is, creates a local file, and is the
+    /// documented quick-start path. Refusing it would break `nestweaver
+    /// index` in a fresh clone, which is the UX S2 exists to protect.
+    RepoLocal,
+    /// `./nestweaver.lbug`, the compiled-in default for commands with no repo
+    /// argument. Same reasoning as [`DbSource::RepoLocal`]: cwd-local, not
+    /// somebody else's graph.
+    CwdLocal,
+}
+
+/// nw-284 / structural fix S2: **a mutating command may infer its SOURCE or
+/// its TARGET from the environment, never both.**
+///
+/// The defect this closes: `nestweaver index` with no `--repo` and no
+/// `--db`/`--config` takes its source from the current directory and its
+/// target from `NESTWEAVER_DB`, writes to the graph, and exits 0. Neither end
+/// of the operation was named by the user, and the command reported success.
+/// During the 8.0.0 post-release hunt this indexed `~/brain` into the live
+/// knowledge graph (102 files, 2329 symbols, repos 43 -> 44).
+///
+/// Two independent implicit defaults compose here, and neither is
+/// individually unreasonable — cwd detection is documented ergonomics and
+/// `NESTWEAVER_DB` is a documented first-class selector. So the guard is
+/// scoped to the INFERRED case in the shape nw-246 established for instance
+/// identity (see [`resolve_instance_id_for_db`]): stating EITHER end is a
+/// deliberate act and passes through untouched. `--repo` is not made
+/// required, `detect_repo_root` is not changed, and a repo-local or cwd-local
+/// target is not refused — that target is derived from the source rather than
+/// from the ambient environment.
+///
+/// Returns the refusal text, or `None` when the caller may proceed.
+fn wholly_inferred_write_refusal(
+    action: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    wholly_inferred_write_message(
+        &format!("Error: refusing to {action}"),
+        repo_stated,
+        db_source,
+        repo_path,
+        db_path,
+    )
+}
+
+/// The same property as [`wholly_inferred_write_refusal`], reported rather
+/// than enforced.
+///
+/// The `investigate*` commands share the shape exactly — source from
+/// `detect_repo_root()`, target from `NESTWEAVER_DB` — but what they write is
+/// `<db>.bundles.json`, a rebuildable bundle cache beside the database, not
+/// the graph. The blast radius does not justify refusing a working read-ish
+/// workflow, so they say what they are about to do instead. This asymmetry is
+/// deliberate and is the only place S2 is applied at warn level.
+fn wholly_inferred_write_warning(
+    action: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    wholly_inferred_write_message(
+        &format!("Warning: {action}"),
+        repo_stated,
+        db_source,
+        repo_path,
+        db_path,
+    )
+}
+
+fn wholly_inferred_write_message(
+    lead: &str,
+    repo_stated: bool,
+    db_source: DbSource,
+    repo_path: &Path,
+    db_path: &Path,
+) -> Option<String> {
+    if repo_stated || db_source != DbSource::Env {
+        return None;
+    }
+    Some(format!(
+        "{lead}: neither the source nor the target was stated.\n  \
+         source: {} (detected from the current directory)\n  \
+         target: {} (from the NESTWEAVER_DB environment variable)\n\
+         State either end: `--repo <path>` to confirm the source, \
+         or `--db <path>` / `--config <file>` to confirm the target.",
+        repo_path.display(),
+        db_path.display(),
+    ))
+}
+
 fn default_db_path() -> PathBuf {
+    default_db_path_with_source().0
+}
+
+/// [`default_db_path`] with the nw-284/S2 provenance retained.
+fn default_db_path_with_source() -> (PathBuf, DbSource) {
     if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        PathBuf::from(env_db)
+        (PathBuf::from(env_db), DbSource::Env)
     } else {
-        PathBuf::from("./nestweaver.lbug")
+        (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
     }
 }
 
@@ -5381,12 +5816,21 @@ fn default_db_path() -> PathBuf {
 /// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
 /// select a DB instead of being silently ignored (Bug #19).
 fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let (resolved, cfg) = resolve_base_db_with_config(db, config)?;
+    resolve_db_with_config_source(db, config).map(|(path, _)| path)
+}
+
+/// [`resolve_db_with_config`] with the nw-284/S2 provenance retained, for the
+/// mutating commands that must not infer both ends of their operation.
+fn resolve_db_with_config_source(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<(PathBuf, DbSource)> {
+    let (resolved, cfg, source) = resolve_base_db_with_config_source(db, config)?;
     let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
     if let Some(config) = cfg.as_ref() {
         assert_config_expected_brain(config, &selected)?;
     }
-    Ok(selected)
+    Ok((selected, source))
 }
 
 /// Resolve the stable database anchor without following publication
@@ -5396,16 +5840,28 @@ fn resolve_base_db_with_config(
     db: Option<PathBuf>,
     config: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>)> {
+    resolve_base_db_with_config_source(db, config).map(|(path, cfg, _)| (path, cfg))
+}
+
+/// [`resolve_base_db_with_config`] with the nw-284/S2 provenance retained.
+fn resolve_base_db_with_config_source(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>, DbSource)> {
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
                 .with_context(|| format!("loading --config {}", cfg_path.display()))
         })
         .transpose()?;
-    let resolved = db
-        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
-        .unwrap_or_else(default_db_path);
-    Ok((resolved, cfg))
+    let (resolved, source) = match db {
+        Some(path) => (path, DbSource::Flag),
+        None => match cfg.as_ref().and_then(|config| config.db_path()) {
+            Some(path) => (path, DbSource::Config),
+            None => default_db_path_with_source(),
+        },
+    };
+    Ok((resolved, cfg, source))
 }
 
 /// Enforce a config's data binding before a command can route to a daemon or
@@ -5611,13 +6067,15 @@ fn resolve_instance_id_for_db(
         // is how the fork would deepen, so refuse and name them. Stating an
         // instance resolves it, which is why this is unreachable when the
         // caller named one.
+        // nw-310: the consolidation half of this remedy used to read
+        // `--from <one> --to <keep>` with `ids` bound on the line below it.
         anyhow::bail!(
             "this database holds data under {} instances ({}), and no instance was \
              specified, so there is no safe default.\n\
-             Name one with `--instance <id>` or a `--config`, or consolidate them with \
-             `nestweaver instance merge --from <one> --to <keep>`.",
+             Name one with `--instance <id>` or a `--config`, or {}",
             ids.len(),
-            ids.join(", ")
+            ids.join(", "),
+            nestweaver_engine::instance_remedy::instance_consolidation_remedy(ids, None)
         );
     }
 
@@ -6077,26 +6535,37 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
 /// Precedence intentionally matches [`resolve_db_with_config`]: an explicit
 /// `--db`, then the explicit config's `db`, then `NESTWEAVER_DB`, and finally
 /// `<repo>/nestweaver.lbug`.
+///
+/// nw-284/S2: the returned [`DbSource`] says WHICH of those four fired. A
+/// caller that only receives the `PathBuf` cannot tell "the database you
+/// named" from "the database your shell profile named", and that is exactly
+/// the distinction a mutating command has to make before it writes.
 fn resolve_index_db_path(
     db: Option<PathBuf>,
     config: Option<&Path>,
     repo_root: &Path,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, DbSource)> {
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
                 .with_context(|| format!("loading --config {}", cfg_path.display()))
         })
         .transpose()?;
-    let resolved = db
-        .or_else(|| cfg.as_ref().and_then(|config| config.db_path()))
-        .or_else(|| std::env::var("NESTWEAVER_DB").ok().map(PathBuf::from))
-        .unwrap_or_else(|| repo_root.join("nestweaver.lbug"));
+    let (resolved, source) = match db {
+        Some(path) => (path, DbSource::Flag),
+        None => match cfg.as_ref().and_then(|config| config.db_path()) {
+            Some(path) => (path, DbSource::Config),
+            None => match std::env::var("NESTWEAVER_DB").ok() {
+                Some(value) => (PathBuf::from(value), DbSource::Env),
+                None => (repo_root.join("nestweaver.lbug"), DbSource::RepoLocal),
+            },
+        },
+    };
     let selected = nestweaver_engine::publication::resolve_selected_database(&resolved)?;
     if let Some(config) = cfg.as_ref() {
         assert_config_expected_brain(config, &selected)?;
     }
-    Ok(selected)
+    Ok((selected, source))
 }
 
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
@@ -6125,6 +6594,56 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
     }
 }
 
+/// nw-318 (defect A). Classify a read-only open failure against a store the
+/// daemon holds, and say something the caller has not already tried.
+///
+/// The message this replaces read: *"This command should route through the
+/// daemon automatically. If you see this error, please report it as a bug.
+/// Workaround: pass --no-daemon to open the database directly."* Every clause
+/// of it was wrong for the caller who actually reaches here. This function is
+/// only ever entered on the DIRECT open path — i.e. by someone who already
+/// bypassed the daemon — so:
+///
+///   * offering `--no-daemon` prescribes the flag they just passed: a closed
+///     loop, and the defect class this release exists to remove;
+///   * "should route through the daemon automatically" is false for a caller
+///     who explicitly opted out;
+///   * "report it as a bug" mislabels a state the user deliberately asked for.
+///
+/// The two matched substrings are also NOT the same condition, and were being
+/// given one answer. `Could not set lock` is live contention — stopping the
+/// daemon resolves it. `Corrupted wal` is a non-replayable write-ahead log,
+/// which a READ-ONLY open can never replay however many times it is retried
+/// (the same nw-126 hazard the `db_wal_unreplayed` diagnostic documents), so
+/// the only way through is a read-write open, i.e. the daemon.
+///
+/// Extracted from a closure so the message is testable at all; see
+/// `no_daemon_refusal_never_prescribes_the_flag_already_passed`.
+fn daemon_held_store_error(path: &Path, upstream: &str) -> anyhow::Error {
+    if upstream.contains("Corrupted wal") {
+        anyhow::anyhow!(
+            "The database at {} has write-ahead log state that a read-only open \
+             cannot replay.\n\
+             Replay needs read-write access, which is why opening it directly \
+             cannot succeed here however often it is retried.\n\
+             Let this command route through the daemon, which holds the \
+             database read-write: `nestweaver daemon --db {} start`.",
+            path.display(),
+            path.display()
+        )
+    } else if upstream.contains("Could not set lock") {
+        anyhow::anyhow!(
+            "The NestWeaver daemon holds the write lock on the database at {}.\n\
+             Either let this command route through the daemon, or stop the \
+             daemon first: `nestweaver daemon --db {} stop`.",
+            path.display(),
+            path.display()
+        )
+    } else {
+        anyhow::anyhow!("failed to open database at {}: {upstream}", path.display())
+    }
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
@@ -6142,22 +6661,13 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // Guarding here fixes every read path at once instead of repeating the
     // check at each call site. The explicit `require_existing_db` calls stay:
     // they run BEFORE a daemon can be autostarted, which this cannot.
-    require_existing_db(path)?;
-    let store = GraphStore::open_read_only(path).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("Corrupted wal") || msg.contains("Could not set lock") {
-            anyhow::anyhow!(
-                "The NestWeaver daemon already has the database open at {}.\n\
-                 This command should route through the daemon automatically. \
-                 If you see this error, please report it as a bug.\n\
-                 Workaround: pass --no-daemon to open the database directly \
-                 (only safe when the daemon is stopped).",
-                path.display()
-            )
-        } else {
-            anyhow::anyhow!("failed to open database at {}: {e}", path.display())
-        }
-    })?;
+    //
+    // nw-309: the same check the daemon-dial funnel applies, so the two routes
+    // report an unopenable `--db` identically instead of one erroring at once
+    // and the other after a 30s boot ceiling.
+    require_openable_db(path)?;
+    let store = GraphStore::open_read_only(path)
+        .map_err(|e| daemon_held_store_error(path, &e.to_string()))?;
 
     // nw-029: load the PageRank sidecar from the canonical path. Every writer
     // and `migrate_sidecar` produce `<db>.lbug.pagerank.json` via
@@ -8151,6 +8661,63 @@ fn require_existing_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         anyhow::bail!("database not found at {}", db_path.display());
     }
     Ok(())
+}
+
+/// The four bytes every LadybugDB file starts with.
+const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
+
+/// Reject a `--db` that exists but is demonstrably not a database, BEFORE
+/// anything decides to dial or autostart a daemon for it.
+///
+/// nw-309. `require_existing_db` and the daemon-dial short-circuit in
+/// `try_hybrid_json_rpc_checked` both tested only `.exists()`, which admits a
+/// text file, a directory and an unreadable file to the route whose entire
+/// purpose is to open the store. The measured cost was the full 30s daemon
+/// boot ceiling (`NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS`) before the direct path
+/// produced the correct exit 1 — while a genuinely NONEXISTENT path was fast,
+/// because it had a guard. "Missing" and "present but not a database" are the
+/// same answer to the caller and were being given wildly different service.
+///
+/// Deliberately a cheap header probe and NOT an open: an open is what costs,
+/// and this runs before every daemon-routed read. It is also deliberately
+/// conservative — an empty file passes, because a zero-byte `.lbug` is what
+/// the store itself initialises.
+///
+/// This does NOT claim to detect corruption. A `.lbug` whose header is intact
+/// and whose index region is not still passes here, by construction; see
+/// `nestweaver-store`'s `open_crash_guard` (nw-285) for why a header check
+/// cannot be that guard and must not be mistaken for one.
+fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
+    require_existing_db(db_path)?;
+    if db_path.is_dir() {
+        anyhow::bail!(
+            "{} is a directory, not a NestWeaver database",
+            db_path.display()
+        );
+    }
+    let mut header = [0u8; 4];
+    let read = (|| -> std::io::Result<usize> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(db_path)?;
+        file.read(&mut header)
+    })();
+    match read {
+        Err(error) => anyhow::bail!(
+            "{} cannot be read: {error}. Check its permissions, or point --db \
+             at a database you can read.",
+            db_path.display()
+        ),
+        // A zero-byte file is what an interrupted create leaves; the store
+        // initialises it. Not this guard's business.
+        Ok(0) => Ok(()),
+        Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "{} is not a NestWeaver database (its header is not `LBUG`). \
+             Point --db at a `.lbug` file, or run `nestweaver index --repo <path> \
+             --db <new path>` to create one.",
+            db_path.display()
+        ),
+    }
 }
 
 /// Stable machine name for a recovery outcome, for `--json` consumers.
@@ -10252,15 +10819,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(intent) = intent.as_deref().filter(|value| !value.is_empty()) {
                     code_args["intent"] = serde_json::json!(intent);
                 }
-                if let Some(result_json) = try_hybrid_json_rpc_checked(
+                // nw-329: a bare `?` here let the engine's lookup error escape
+                // `run()` unhandled, so the same failure produced a DIFFERENT
+                // message, a different exit code and a different remedy
+                // depending on whether a daemon happened to be running. Both
+                // routes now classify it the same way.
+                match try_hybrid_json_rpc_checked(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
                     "code_context",
                     code_args,
-                )? {
-                    context_result = Some(serde_json::from_value(result_json)?);
-                    routed_via_daemon = true;
+                ) {
+                    Ok(Some(result_json)) => {
+                        context_result = Some(serde_json::from_value(result_json)?);
+                        routed_via_daemon = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Ok((report_context_lookup_failure(&error), None)),
                 }
             }
 
@@ -10334,19 +10910,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("No matching symbols") || msg.contains("No symbols found") {
-                        eprintln!("{msg}");
-                        Ok((EXIT_NOT_FOUND, None))
-                    } else if msg.contains("Ambiguous") {
-                        eprintln!("{msg}");
-                        Ok((EXIT_AMBIGUOUS, None))
-                    } else {
-                        eprintln!("Error: {msg}");
-                        Ok((EXIT_ERROR, None))
-                    }
-                }
+                Err(e) => Ok((report_context_lookup_failure(&e), None)),
             }
         }
 
@@ -12391,6 +12955,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 eprintln!("Error: --refresh-wiki-hours requires --config");
                 return Ok((EXIT_USAGE, None));
             }
+            // nw-284/S2. `watch` is byte-for-byte the same both-defaults-
+            // compose shape as `index` and strictly worse in consequence: it
+            // keeps writing for as long as it runs.
+            let repo_stated = repo.is_some();
             let repo_path = match repo {
                 Some(p) => p,
                 None => detect_repo_root(),
@@ -12402,7 +12970,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
                 return Ok((EXIT_ERROR, None));
             }
-            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let (db_path, db_source) = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            if let Some(message) =
+                wholly_inferred_write_refusal("watch", repo_stated, db_source, &repo_path, &db_path)
+            {
+                eprintln!("{message}");
+                return Ok((EXIT_USAGE, None));
+            }
             let index_limits = match config.as_deref() {
                 Some(path) => nestweaver_engine::InstanceConfig::from_file(path)
                     .with_context(|| format!("failed to load config from {}", path.display()))?
@@ -12646,7 +13220,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             track_interactions,
             no_track_interactions,
             config,
-            no_daemon,
         } => {
             if allow_mcp_add_sources {
                 eprintln!(
@@ -12672,7 +13245,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             // warn=false: run() already emitted the escape-hatch warning once
             // for this invocation — warning again here double-prints it.
-            let use_daemon_mcp = resolve_use_daemon(no_daemon, false);
+            //
+            // nw-318 (defect B) / nw-217: this used to read a `Commands::Mcp`-
+            // LOCAL `--no-daemon` that shadowed the global flag, and the two
+            // help strings drifted — the global was corrected to name the
+            // granting variable and the twin still named the requesting one.
+            // The twin is deleted rather than synchronised, so there is one
+            // definition to keep right.
+            let use_daemon_mcp = resolve_use_daemon(cli.no_daemon, false);
             nestweaver_mcp::tools::validate_tool_selection(
                 tool_allowlist.as_deref(),
                 lite,
@@ -12729,8 +13309,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
             no_open,
             watch,
+            repo,
         } => {
-            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-284/S2. `ui --watch` re-indexes continuously through the
+            // daemon, so it is a mutating command with the same
+            // both-defaults-compose shape as `index` and `watch`. The guard
+            // only applies under `--watch`: a read-only `ui` writes nothing.
+            let repo_stated = repo.is_some();
+            let (db_path, db_source) = resolve_db_with_config_source(db, config.as_deref())?;
+            let watch_repo_path = if watch {
+                repo.clone().unwrap_or_else(detect_repo_root)
+            } else {
+                PathBuf::new()
+            };
+            if watch
+                && let Some(message) = wholly_inferred_write_refusal(
+                    "watch from the UI",
+                    repo_stated,
+                    db_source,
+                    &watch_repo_path,
+                    &db_path,
+                )
+            {
+                eprintln!("{message}");
+                return Ok((EXIT_USAGE, None));
+            }
 
             let daemon_connection = if use_daemon {
                 match tokio::runtime::Runtime::new() {
@@ -12768,11 +13371,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let mut daemon_ok = false;
             if let Some((rt, mut client)) = daemon_connection {
-                let watch_repo_path = if watch {
-                    detect_repo_root().display().to_string()
-                } else {
-                    String::new()
-                };
+                let watch_repo_path = watch_repo_path.display().to_string();
 
                 match rt.block_on(client.serve_ui(
                     port,
@@ -14045,6 +14644,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     "{}",
                                     serde_json::to_string_pretty(&impact_json_ambiguous(
                                         &name_or_uid,
+                                        // Always `None` here: `--repo` forces
+                                        // the direct path (see the routing
+                                        // condition on this arm). Passing it
+                                        // makes that explicit rather than
+                                        // implicit.
+                                        repo_filter.as_deref(),
                                         cands
                                     ))?
                                 );
@@ -14064,10 +14669,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             .get("start_line")
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
-                                        println!("  {cname} ({fp}:{ln})");
+                                        let uid =
+                                            c.get("uid").and_then(|v| v.as_str()).unwrap_or("");
+                                        // nw-328: the UID was NOT printed here,
+                                        // so "pass a full UID" was unfollowable
+                                        // from text output. The direct route
+                                        // already prints it.
+                                        println!("  {uid} {cname} ({fp}:{ln})");
                                     }
                                 }
-                                println!("Disambiguate with --repo <name> or pass a full UID.");
+                                println!("{}", impact_ambiguity_remedy(repo_filter.as_deref()));
                             }
                             return Ok((EXIT_AMBIGUOUS, None));
                         }
@@ -14367,6 +14978,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "{}",
                             serde_json::to_string_pretty(&impact_json_ambiguous(
                                 &name_or_uid,
+                                repo_filter.as_deref(),
                                 serde_json::to_value(&candidates)?
                             ))?
                         );
@@ -14848,7 +15460,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -14923,7 +15548,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .into_iter()
                 .filter(|t| seen.insert(t.clone()))
                 .collect();
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate-expand is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -14981,7 +15619,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-284/S2 (warn level — see `wholly_inferred_write_warning`).
+            let (db_path, db_source) = match db {
+                Some(path) => (path, DbSource::Flag),
+                None => default_db_path_with_source(),
+            };
+            if let Some(message) = wholly_inferred_write_warning(
+                "investigate-hydrate is writing its bundle cache beside a database nobody named",
+                root.is_some(),
+                db_source,
+                &detect_repo_root(),
+                &db_path,
+            ) {
+                eprintln!("{message}");
+            }
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -15171,6 +15822,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             fail_on_skip,
             setup,
         } => {
+            // nw-284/S2: capture the provenance BEFORE `repo` is shadowed.
+            // Both fallbacks resolve in the next four lines, and this is the
+            // last instant at which "did the user name a source?" is still
+            // answerable. It is also before the daemon/direct fork below, so
+            // one guard covers both routes — the reported incident fired on
+            // the daemon route.
+            let repo_stated = repo.is_some();
             let repo_path = match repo {
                 Some(p) => p,
                 None => detect_repo_root(),
@@ -15181,7 +15839,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Failing fast here also turns a typo'd/nonexistent path into a clear error
             // instead of a confusing no-op.
             let repo_path = canonical_repo_dir(&repo_path)?;
-            let db_path = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            let (db_path, db_source) = resolve_index_db_path(db, config.as_deref(), &repo_path)?;
+            if let Some(message) =
+                wholly_inferred_write_refusal("index", repo_stated, db_source, &repo_path, &db_path)
+            {
+                eprintln!("{message}");
+                // EXIT_USAGE (64, EX_USAGE): the invocation was wrong, not the
+                // operation — same code as the `--refresh-wiki-hours requires
+                // --config` refusal on `watch`.
+                return Ok((EXIT_USAGE, None));
+            }
             let loaded_config = match config.as_deref() {
                 Some(path) => Some(
                     nestweaver_engine::InstanceConfig::from_file(path).with_context(|| {
@@ -18339,6 +19006,20 @@ fn try_hybrid_json_rpc_checked(
     // (federated read), else return None so the caller's direct path reports
     // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
     // through here, so it is unaffected.
+    // nw-309: refuse an exists-but-not-a-database `--db` HERE, before the
+    // dial. This is the one funnel every daemon-routed read passes through, so
+    // one check turns a 30s boot-ceiling stall into an immediate, accurate
+    // error for the whole read surface rather than for the one command that
+    // was reported.
+    require_openable_db(db_path).or_else(|error| {
+        if db_path.exists() {
+            Err(error)
+        } else {
+            // Absent is handled by the arm below, which still routes to
+            // configured upstreams (federated read) rather than failing.
+            Ok(())
+        }
+    })?;
     if !db_path.exists() {
         if let Some(config_path) = config {
             nestweaver_engine::InstanceConfig::from_file(config_path).with_context(|| {
@@ -22320,6 +23001,438 @@ mod cli_help_contract_tests {
             "the --db + --config command inventory changed; update the config-DB behavior matrix"
         );
     }
+
+    // ── S1: a pasteable remedy is an assertion, so test it like one ───────
+    //
+    // Three tiers, in descending order of value:
+    //
+    //   T2  — the env-var ROLE registry. Catches nw-318 defect B by
+    //         construction. The naive "does this name exist?" form of this
+    //         check PASSES on nw-318, because `NESTWEAVER_NO_DAEMON` is a real
+    //         variable the binary really reads. The role tag is load-bearing.
+    //   T3b — no read-path diagnostic may prescribe a write. Catches nw-329.
+    //   T1  — a parse sweep over command strings. It is the cheap FLOOR and
+    //         nothing more: it answers "does this flag exist?", while every
+    //         defect in this class answers "does running this resolve the
+    //         error?". It catches none of the four findings and is justified
+    //         only as insurance against a future rename. Labelled as such so
+    //         nobody mistakes a green T1 for evidence.
+    //
+    // Deliberately NOT implemented: a blanket "no `<placeholder>` in a
+    // message" rule. 32 sites use placeholders and most are legitimate —
+    // `Run `nestweaver index --repo <path>`` has no path to substitute.
+    // Placeholders are only checkable at the point of emission, with the
+    // values in scope, which is a runtime concern (see
+    // `tests/error_remedy_test.rs`).
+
+    /// The source files S1's static sweeps read.
+    ///
+    /// The WHOLE file, deliberately. The first version of this cut each file
+    /// at its first `#[cfg(test)]`, on the theory that test modules live at
+    /// the bottom. In `src/main.rs` the first one is at line 548 of 29,000 —
+    /// so the sweeps saw 2% of the file and passed while both known nw-318
+    /// offenders (at 22,921 and 22,936) sat untouched. That is exactly the
+    /// failure this workstream exists to stop: a check that looks like it
+    /// works, passes its own regression test, and inspects nothing. Verified
+    /// by running the check against a tree with the offenders restored: it
+    /// passed.
+    ///
+    /// Scanning test code too costs a small, LOUD risk — a future fixture that
+    /// quotes an offending shape trips the sweep and someone has to look — in
+    /// exchange for removing a large, SILENT one. `//` lines are still skipped,
+    /// because prose is not a remedy.
+    fn sweep_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("src").join("main.rs")];
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip build output and vendored frontend trees.
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let sources: Vec<(String, String)> = files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path.display().to_string(), text))
+            })
+            .collect();
+        // Coverage self-check. Over-skipping is the silent failure mode, so
+        // prove the sweep reaches the END of the largest file rather than
+        // trusting that it does.
+        let main_rs = sources
+            .iter()
+            .find(|(path, _)| path.ends_with("src/main.rs"))
+            .expect("the sweep must include src/main.rs");
+        assert!(
+            main_rs.1.contains("mod cli_help_contract_tests"),
+            "the sweep is not reaching the end of src/main.rs, so every check \
+             built on it is inspecting less than it claims"
+        );
+        assert!(
+            sources.len() > 100,
+            "the sweep found only {} source files; it is not walking the \
+             workspace",
+            sources.len()
+        );
+        sources
+    }
+
+    /// Prose is not a remedy. `//`-prefixed lines are skipped by every sweep
+    /// here: a doc comment that writes `NESTWEAVER_*` to mean "the family", or
+    /// spells `nestweaver stale-chekc` to illustrate a typo (see `EXIT_USAGE`),
+    /// is documentation, not something a user pastes.
+    fn is_comment(line: &str) -> bool {
+        line.trim_start().starts_with("//")
+    }
+
+    fn env_tokens(line: &str) -> Vec<String> {
+        let bytes = line.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while let Some(found) = line[at..].find("NESTWEAVER_") {
+            let start = at + found;
+            let mut end = start + "NESTWEAVER_".len();
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            // `NESTWEAVER_` with nothing after it is the family, not a
+            // variable (`the NESTWEAVER_* vars`), so it is not a lookup.
+            if end > start + "NESTWEAVER_".len() {
+                out.push(line[start..end].to_string());
+            }
+            at = end.max(start + 1);
+        }
+        out
+    }
+
+    /// S1/T2, half one: the registry is the inventory, so it cannot silently
+    /// fall behind the code.
+    #[test]
+    fn every_environment_variable_the_workspace_names_is_in_the_registry() {
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for token in env_tokens(line) {
+                    if env_role(&token).is_none() {
+                        unknown.push(format!("{file}:{}: {token}", index + 1));
+                    }
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these NESTWEAVER_* variables are used or named but carry no role in \
+             ENV_REGISTRY. Add them there — the role is what tells a reviewer \
+             whether a message may offer the variable as a remedy: {unknown:#?}"
+        );
+    }
+
+    /// S1/T2, half two — THE CHECK THAT CATCHES nw-318 DEFECT B.
+    ///
+    /// A message that says "requires/set/export `NESTWEAVER_X`" is asserting
+    /// that setting `NESTWEAVER_X` resolves the error. That is false for a
+    /// variable whose role is `Requests`: it asks for the behaviour, and
+    /// something else decides. Three messages made exactly that claim about
+    /// `NESTWEAVER_NO_DAEMON`, and a user who followed them got the identical
+    /// refusal back.
+    #[test]
+    fn a_remedy_never_offers_a_variable_that_only_requests() {
+        const OFFERS: &[&str] = &["requires ", "Requires ", "set ", "Set ", "export "];
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for offer in OFFERS {
+                    let Some(at) = line.find(offer) else { continue };
+                    let rest = &line[at + offer.len()..];
+                    let Some(token) = env_tokens(rest).into_iter().next() else {
+                        continue;
+                    };
+                    // Only when the variable IMMEDIATELY follows the verb —
+                    // otherwise "set the path and see NESTWEAVER_DB" matches.
+                    if !rest.trim_start().starts_with(&token) {
+                        continue;
+                    }
+                    if env_role(&token) == Some(EnvRole::Requests) {
+                        offenders.push(format!("{file}:{}: {offer}{token}", index + 1));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "these messages offer a variable that only REQUESTS a behaviour as \
+             though setting it PERMITTED one. Name the `Grants` variable \
+             instead (for the daemon bypass that is NESTWEAVER_ALLOW_NO_DAEMON, \
+             which `no_daemon_allowed()` actually reads): {offenders:#?}"
+        );
+    }
+
+    /// S1/T3b — THE CHECK THAT CATCHES nw-329.
+    ///
+    /// The audience for an "I found nothing" error is by definition someone
+    /// whose targeting is already wrong. Sending them to `index` — the one
+    /// command that writes — is how a lookup miss becomes a production write,
+    /// and `nestweaver index --repo .` is verbatim the invocation that indexed
+    /// a home directory into the live graph during the 8.0.0 hunt.
+    ///
+    /// The codebase already knew this hazard for a neighbouring case: see
+    /// `CliDiagnostic::DatabaseUnavailable`, whose own doc says suggesting
+    /// `index --repo` at a path that already holds a database invites the user
+    /// to write over their own data (nw-126). This applies the same rule to
+    /// the diagnostics that were still breaking it.
+    #[test]
+    fn read_path_diagnostics_never_prescribe_a_write() {
+        use miette::Diagnostic;
+
+        const WRITE_COMMANDS: &[&str] = &[
+            "index",
+            "brain add",
+            "brain remove",
+            "brain refresh",
+            "instance merge",
+            "instance purge",
+            "repair",
+            "publication rollback",
+        ];
+
+        // Explicit inventory, not a scan: a new diagnostic must be classified
+        // by a human, and the classification is the point.
+        let read_diagnostics = [CliDiagnostic::EmptyDatabase];
+
+        for diagnostic in read_diagnostics {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            for command in WRITE_COMMANDS {
+                assert!(
+                    !help.contains(&format!("nestweaver {command}")),
+                    "`{code}` is a read-path diagnostic but its help prescribes \
+                     `nestweaver {command}`. A query that returned no rows has not \
+                     established that the database is empty, so it cannot know that \
+                     writing is safe. Help: {help}"
+                );
+            }
+            assert!(
+                !help.is_empty(),
+                "`{code}` must still offer something followable — the rule is \
+                 'no writes', not 'no help'"
+            );
+        }
+    }
+
+    /// nw-318 (defect A). `open_store`'s daemon-held refusal is reached ONLY
+    /// by a caller who already bypassed the daemon, so prescribing
+    /// `--no-daemon` to that caller is a closed loop — and "report it as a bug"
+    /// mislabels a state they deliberately asked for.
+    #[test]
+    fn no_daemon_refusal_never_prescribes_the_flag_already_passed() {
+        for upstream in ["Could not set lock on file", "Corrupted wal detected"] {
+            let rendered =
+                daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), upstream).to_string();
+
+            assert!(
+                !rendered.contains("--no-daemon"),
+                "this refusal is only reachable WITH --no-daemon, so offering it \
+                 is a closed loop. Got: {rendered}"
+            );
+            assert!(
+                !rendered.to_lowercase().contains("report it as a bug"),
+                "a user-requested bypass against a daemon-held store is not a \
+                 product defect. Got: {rendered}"
+            );
+            assert!(
+                rendered.contains("nestweaver daemon"),
+                "the refusal must name an action the caller has NOT already \
+                 taken. Got: {rendered}"
+            );
+            assert!(
+                rendered.contains("/tmp/x.lbug"),
+                "and it must name the database. Got: {rendered}"
+            );
+        }
+
+        // The two conditions are NOT the same and must not get one answer: a
+        // read-only open can never replay a WAL however many times the caller
+        // stops and restarts things, so `stop` is the wrong advice for it.
+        let wal = daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Corrupted wal")
+            .to_string();
+        assert!(wal.contains("start"), "{wal}");
+        let lock =
+            daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Could not set lock")
+                .to_string();
+        assert!(lock.contains("stop"), "{lock}");
+    }
+
+    /// nw-328 / F-CODE-7. When `--repo` is already set the collision is
+    /// intra-repo BY CONSTRUCTION — `resolve_uid_with_repo_filter` returns
+    /// `Ambiguous` only when more than one candidate SURVIVES the filter — so
+    /// advising `--repo` sends the caller round a loop. An agent following the
+    /// remedy verbatim never terminates.
+    #[test]
+    fn impact_ambiguity_does_not_advise_a_flag_that_is_already_set() {
+        let candidates = serde_json::json!([
+            {"uid": "sym:repo:coyote-server:aaa:6", "name": "formatNumber",
+             "file_path": "src/common/number-format.ts", "start_line": 6},
+            {"uid": "sym:repo:coyote-server:bbb:116", "name": "formatNumber",
+             "file_path": "src/modules/reports/generators/base-report-generator.ts",
+             "start_line": 116},
+        ]);
+
+        let scoped =
+            impact_json_ambiguous("formatNumber", Some("coyote-server"), candidates.clone());
+        let note = scoped["note"].as_str().unwrap();
+        assert!(
+            !note.contains("--repo <name>"),
+            "the remedy repeats the flag that is already set: {note}"
+        );
+        assert!(
+            note.contains("UID") || note.contains("uid"),
+            "the remedy must offer a disambiguator that can discriminate: {note}"
+        );
+        // …and the candidates must actually carry the UID the remedy names.
+        assert!(
+            scoped["candidates"][0]["uid"]
+                .as_str()
+                .unwrap()
+                .starts_with("sym:")
+        );
+
+        // Unscoped: `--repo` IS a valid remedy and must be preserved.
+        let unscoped = impact_json_ambiguous("formatNumber", None, candidates);
+        assert!(unscoped["note"].as_str().unwrap().contains("--repo"));
+    }
+
+    /// nw-309. The predicate itself: "present" and "usable" are different
+    /// questions, and only the first was being asked before a decision to
+    /// spend 30 seconds on a daemon boot.
+    #[test]
+    fn require_openable_db_separates_present_from_usable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("nope.lbug");
+        let error = require_openable_db(&missing).unwrap_err().to_string();
+        assert!(error.contains("not found"), "{error}");
+
+        let text = dir.path().join("fake.lbug");
+        std::fs::write(&text, b"hello not a db").unwrap();
+        let error = require_openable_db(&text).unwrap_err().to_string();
+        assert!(error.contains("not a NestWeaver database"), "{error}");
+        assert!(error.contains("fake.lbug"), "{error}");
+
+        let directory = dir.path().join("adir.lbug");
+        std::fs::create_dir(&directory).unwrap();
+        let error = require_openable_db(&directory).unwrap_err().to_string();
+        assert!(error.contains("is a directory"), "{error}");
+
+        // A zero-byte file is what an interrupted create leaves and what the
+        // store itself initialises. Refusing it would break creation.
+        let empty = dir.path().join("empty.lbug");
+        std::fs::write(&empty, b"").unwrap();
+        require_openable_db(&empty).expect("an empty file is the store's business");
+
+        // And a real header passes, so the guard cannot be satisfied by
+        // rejecting everything.
+        let real = dir.path().join("real.lbug");
+        std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
+        require_openable_db(&real).expect("a real LadybugDB header must pass");
+    }
+
+    /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
+    ///
+    /// It answers "does this subcommand still exist?", which catches a future
+    /// rename and catches NONE of nw-310/318/328/329. Scoped to backtick-
+    /// quoted commands because that is the convention this codebase already
+    /// uses for pasteable text, which keeps prose out of the sweep.
+    #[test]
+    fn backtick_quoted_remedies_still_name_a_real_subcommand() {
+        let subcommands = on_big_stack(|| {
+            let root = Cli::command();
+            root.get_subcommands()
+                .map(|sub| sub.get_name().to_string())
+                .collect::<std::collections::HashSet<String>>()
+        });
+
+        // Deliberate exceptions, in the explicit-inventory idiom this module
+        // already uses: one entry, one justification, sorted.
+        const NOT_A_SUBCOMMAND: &[&str] = &[
+            // A fixture for "a warning kind this binary predates". Its whole
+            // subject is that the command comes from a NEWER daemon and this
+            // CLI does not know it, so being unknown is the assertion rather
+            // than a defect.
+            "synthetic-repair",
+        ];
+
+        let mut unknown: Vec<String> = Vec::new();
+        for (file, body) in sweep_sources() {
+            for (index, line) in body.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                let mut at = 0usize;
+                while let Some(found) = line[at..].find("`nestweaver ") {
+                    let start = at + found + "`nestweaver ".len();
+                    let rest = &line[start..];
+                    let word: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect();
+                    at = start.max(at + 1);
+                    if word.is_empty() {
+                        continue;
+                    }
+                    if !subcommands.contains(&word) && !NOT_A_SUBCOMMAND.contains(&word.as_str()) {
+                        unknown.push(format!("{file}:{}: `nestweaver {word}`", index + 1));
+                    }
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "these backtick-quoted remedies name a subcommand the CLI does not \
+             have, so a user who pastes them gets a clap parse error instead of \
+             a fix: {unknown:#?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -22918,7 +24031,7 @@ where
                     format!(
                         "failed to connect to daemon for {}; start it with \
                          'nestweaver daemon --db {} start' or use --no-daemon \
-                         (requires NESTWEAVER_NO_DAEMON=1)",
+                         (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
                         path.display(),
                         path.display()
                     )
@@ -22933,7 +24046,7 @@ where
     if use_daemon && endpoint.is_none() && !local {
         anyhow::bail!(
             "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
-             or use --no-daemon (requires NESTWEAVER_NO_DAEMON=1)",
+             or use --no-daemon (permitted only when NESTWEAVER_ALLOW_NO_DAEMON is set)",
             path.display()
         );
     }
@@ -27583,6 +28696,67 @@ credential_method = "gh"
             .to_string();
         assert!(error.contains("no database exists"), "{error}");
         assert!(!missing.exists());
+    }
+
+    /// nw-284/S2. The refusal is a function of PROVENANCE, not of paths, so it
+    /// is tested as one: only "source inferred AND target from the ambient
+    /// environment" refuses. Every other combination is a stated intent and
+    /// must pass through untouched — including the repo-local fallback, which
+    /// is what `nestweaver index` in a fresh clone relies on.
+    #[test]
+    fn only_a_wholly_inferred_write_is_refused() {
+        let repo = std::path::Path::new("/tmp/checkout");
+        let db = std::path::Path::new("/tmp/ambient.lbug");
+
+        let refused = wholly_inferred_write_refusal("index", false, DbSource::Env, repo, db)
+            .expect("neither end stated must refuse");
+        // The message must name the inferred SOURCE, the inferred TARGET, and
+        // where the target came from — a refusal the reader cannot act on is
+        // the defect class this release exists to close.
+        assert!(refused.contains("/tmp/checkout"), "{refused}");
+        assert!(refused.contains("/tmp/ambient.lbug"), "{refused}");
+        assert!(refused.contains("NESTWEAVER_DB"), "{refused}");
+        // …and a remedy that discriminates: either end will do.
+        assert!(refused.contains("--repo"), "{refused}");
+        assert!(refused.contains("--db"), "{refused}");
+        assert!(refused.contains("--config"), "{refused}");
+
+        // Stating the source is intent.
+        assert!(wholly_inferred_write_refusal("index", true, DbSource::Env, repo, db).is_none());
+        // Stating the target is intent.
+        for stated_target in [DbSource::Flag, DbSource::Config] {
+            assert!(
+                wholly_inferred_write_refusal("index", false, stated_target, repo, db).is_none(),
+                "{stated_target:?} is a stated target"
+            );
+        }
+        // A target DERIVED from the source is not an ambient target: refusing
+        // it would break `nestweaver index` in a fresh clone.
+        for derived in [DbSource::RepoLocal, DbSource::CwdLocal] {
+            assert!(
+                wholly_inferred_write_refusal("index", false, derived, repo, db).is_none(),
+                "{derived:?} follows the source and must stay allowed"
+            );
+        }
+    }
+
+    /// nw-284/S2. The resolver must report WHICH of its four sources fired: a
+    /// caller cannot otherwise tell "the database you named" from "the
+    /// database your shell profile named".
+    #[test]
+    fn resolve_index_db_path_reports_which_source_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let flagged = dir.path().join("flagged.lbug");
+
+        let (path, source) = resolve_index_db_path(Some(flagged.clone()), None, &repo).unwrap();
+        assert_eq!(path, flagged);
+        assert_eq!(source, DbSource::Flag);
+
+        // The env and repo-local arms depend on process environment, which the
+        // parallel test harness owns; `tests/cli_test.rs` covers them out of
+        // process where the environment can be set safely.
     }
 
     /// The CLI must send the exact arg names the MCP tools read —
