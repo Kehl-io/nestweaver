@@ -6108,9 +6108,14 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "project": req.project,
-            "include_components": req.include_components,
             "include_seeds": req.include_seeds,
         });
+        // nw-316: only when the caller actually said so. Injecting it
+        // unconditionally re-erased the absence the `optional` field exists to
+        // carry, so the tool's documented default of `true` stayed unreachable.
+        if let Some(include_components) = req.include_components {
+            args["include_components"] = serde_json::json!(include_components);
+        }
         if req.token_budget > 0 {
             args["token_budget"] = serde_json::json!(req.token_budget);
         }
@@ -6164,9 +6169,12 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<NoteGetRequest>,
     ) -> Result<Response<NoteGetResponse>, Status> {
         let req = r.into_inner();
-        let mut args = serde_json::json!({
-            "include_body": req.include_body,
-        });
+        let mut args = serde_json::json!({});
+        // nw-316: omit when the caller did not say, so the tool's documented
+        // default governs instead of proto3's zero value.
+        if let Some(include_body) = req.include_body {
+            args["include_body"] = serde_json::json!(include_body);
+        }
         if let Some(ref uid) = req.uid {
             args["uid"] = serde_json::json!(uid);
         }

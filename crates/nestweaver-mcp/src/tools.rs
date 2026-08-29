@@ -1309,27 +1309,35 @@ mod tool_schema_validation_tests {
         assert_eq!(high["truncated"], false);
     }
 
+    /// nw-316. `forwarded_bool(&args, "include_components", true)` guessed the
+    /// tool's default at the FORWARDING layer because the proto3 `bool` it fed
+    /// could not carry absence — and its own doc comment recorded the real fix
+    /// (`optional` proto fields) as blocked "because `nestweaver-federation`
+    /// constructs these request messages with exhaustive struct literals". That
+    /// is not a blocker, it is a second file to change; both are in one commit
+    /// now. The tool is the layer that DOCUMENTS the default, so it must be the
+    /// layer that applies it.
     #[cfg(feature = "daemon")]
     #[test]
-    fn forwarded_bool_preserves_default_true_when_arg_absent() {
-        // Proto3 bools have no presence — an absent arg must forward as
-        // the tool's default (true for these two), not as explicit false.
-        assert!(forwarded_bool(&json!({}), "include_components", true));
-        assert!(forwarded_bool(&json!({}), "include_body", true));
-        // Explicit values still honored, including explicit false.
-        assert!(!forwarded_bool(
-            &json!({ "include_components": false }),
-            "include_components",
-            true
-        ));
-        assert!(forwarded_bool(
-            &json!({ "include_body": true }),
-            "include_body",
-            true
-        ));
-        // Default-false bools are unaffected.
-        assert!(!forwarded_bool(&json!({}), "prf", false));
-        assert!(forwarded_bool(&json!({ "prf": true }), "prf", false));
+    fn absent_presence_tracked_bools_forward_as_absent() {
+        for (key, args) in [
+            ("include_components", json!({})),
+            ("include_body", json!({})),
+        ] {
+            assert_eq!(
+                args.get(key).and_then(|value| value.as_bool()),
+                None,
+                "an absent `{key}` must arrive absent, so the TOOL decides"
+            );
+        }
+        // Explicit values are still carried, in both directions — presence
+        // tracking is what makes `false` distinguishable from silence.
+        assert_eq!(
+            json!({ "include_components": false })
+                .get("include_components")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 
     #[cfg(feature = "daemon")]
@@ -10888,21 +10896,6 @@ fn grpc_status_err(status: tonic::Status) -> anyhow::Error {
     }
 }
 
-/// Proto3 scalar bools carry no presence. An MCP arg the caller left
-/// unset would forward as explicit `false`, and the daemon's typed handlers
-/// write that `false` back into the tool args — overriding tool defaults that
-/// are TRUE (`project_context.include_components`, `note_get.include_body`).
-/// Forward the tool's own default when the caller did not specify the flag;
-/// an explicit `false` is still honored.
-///
-/// (The alternative — proto `optional` fields — is blocked because
-/// `nestweaver-federation` constructs these request messages with exhaustive
-/// struct literals; any proto field change would break that crate.)
-#[cfg(feature = "daemon")]
-fn forwarded_bool(args: &serde_json::Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
-}
-
 /// Dispatch an MCP tool call through the daemon gRPC service instead of
 /// opening the DB directly. Maps each MCP tool name to the corresponding
 /// gRPC RPC on the `NestWeaverDaemon` service.
@@ -11141,7 +11134,11 @@ pub fn dispatch_via_daemon(
                     project: str_field("project"),
                     token_budget: i32_field("token_budget"),
                     kinds: str_array("kinds"),
-                    include_components: forwarded_bool(&args, "include_components", true),
+                    // nw-316: absence must survive to the tool, which is the
+                    // one place the default is documented.
+                    include_components: args
+                        .get("include_components")
+                        .and_then(|value| value.as_bool()),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
                     since: str_field("since"),
@@ -11164,7 +11161,8 @@ pub fn dispatch_via_daemon(
                 let req = tonic::Request::new(NoteGetRequest {
                     uid: opt_str_field("uid"),
                     title: opt_str_field("title"),
-                    include_body: forwarded_bool(&args, "include_body", true),
+                    // nw-316: preserve absence; see `include_components`.
+                    include_body: args.get("include_body").and_then(|value| value.as_bool()),
                     sections: str_array("sections"),
                 });
                 let resp = client.get_note(req).await.map_err(grpc_status_err)?;
