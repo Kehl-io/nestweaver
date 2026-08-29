@@ -3370,10 +3370,9 @@ fn tool_schema_code_context() -> Value {
                     "maximum": 5000,
                     "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count` and `truncated` so an omitted limit is never silently lossy."
                 },
-                "intent": {
-                    "type": "string",
-                    "description": "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
-                }
+                "intent": intent_schema(
+                    "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
+                )
             },
             "required": ["seeds"],
             "additionalProperties": false
@@ -3462,11 +3461,9 @@ fn tool_schema_brain_context() -> Value {
                     "default": 30.0,
                     "description": "Half-life for age-decay in days."
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
-                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
-                },
+                "intent": intent_schema(
+                    "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' (alias 'blast-radius') follows dependency edges; 'general-context' uses balanced defaults."
+                ),
                 "include_seeds": {
                     "type": "boolean",
                     "default": false,
@@ -7511,6 +7508,11 @@ fn tool_brain_impact(
     };
     let truncated_by_threshold = result.truncated_by_threshold;
     let truncated_by_depth = result.truncated_by_depth;
+    // nw-317 leg 1. Built by the SAME function the CLI's direct path calls,
+    // so the default (daemon) route can no longer be the weaker disclosure.
+    // `impact_with_flags` prunes at `DEFAULT_IMPACT_THRESHOLD`, so that is the
+    // threshold this note reports.
+    let note = result.truncation_note(nestweaver_store::DEFAULT_IMPACT_THRESHOLD, depth);
     let mut nodes = result.nodes;
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
@@ -7550,15 +7552,11 @@ fn tool_brain_impact(
         // the reported impact set is a FLOOR, not the full reverse-closure.
         "truncated_by_threshold": truncated_by_threshold,
         "truncated_by_depth": truncated_by_depth,
-        "note": if truncated_by_threshold {
-            (truncated_by_threshold || truncated_by_depth).then_some(
-                "paths pruned below the impact-score threshold — reported impact is a floor, not the full set",
-            )
-        } else {
-            truncated_by_depth.then_some(
-                "frontier reached max depth — deeper dependents may exist beyond the returned set",
-            )
-        },
+        // F-PARITY-11: the CLI emits `truncated` and MCP did not, so an MCP
+        // caller could not detect truncation here at all. Same "confident
+        // answer to a partial read" family as nw-320, one field over.
+        "truncated": truncated_by_threshold || truncated_by_depth || rows.len() < total,
+        "note": note,
     }))
 }
 
@@ -8833,11 +8831,9 @@ fn tool_schema_project_context() -> Value {
                     "default": false,
                     "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
-                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
-                },
+                "intent": intent_schema(
+                    "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' (alias 'blast-radius') follows dependency edges; 'general-context' uses balanced defaults."
+                ),
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
@@ -10304,6 +10300,24 @@ fn configured_result_limit_or(builtin: usize) -> usize {
 // and `Bounded` captures `total` BEFORE the cut so a capped answer structurally
 // cannot report itself complete. New bounded tools call these rather than
 // writing a seventeenth copy.
+
+/// JSON Schema fragment for an `intent` parameter, with the `enum` GENERATED
+/// from `QueryIntent::from_str` rather than restated beside it.
+///
+/// nw-317 leg 2. Two schemas hand-listed four values while the parser accepted
+/// fourteen, and a third (`code_context`) declared no enum at all — so
+/// `--intent blast-radius`, which `brain context --help` documents and the
+/// direct route accepts, was rejected through the daemon with a raw
+/// JSON-Schema error naming an internal MCP tool, while the same string was
+/// valid on a sibling tool. Restating an enumeration is the same anti-pattern
+/// the `CACHEABLE_TOOLS` decoration loop was invented to prevent.
+fn intent_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": nestweaver_store::ranking::QueryIntent::accepted_spellings(),
+        "description": description,
+    })
+}
 
 /// The upper bound every list-returning tool in this catalogue declares.
 ///
