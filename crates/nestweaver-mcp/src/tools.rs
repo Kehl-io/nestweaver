@@ -8287,6 +8287,19 @@ fn scoped_local_repo_path(
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
 
+/// Ceiling on `clusters.limit`. Public because the CLI must CLAMP to it before
+/// forwarding `--limit`: clap's `--limit` is an unbounded `usize`, and under
+/// `additionalProperties: false` an out-of-range value fails the entire call
+/// rather than being clamped for us. Restating `1000` on the CLI side would be
+/// a second copy of a bound that has already drifted once.
+pub const CLUSTERS_LIMIT_MAX: usize = RESULT_LIMIT_MAX;
+
+/// Ceiling on `clusters.members` — 200, NOT [`CLUSTERS_LIMIT_MAX`]. `limit` and
+/// `members` multiply, and 1000 clusters x 2000 members is the original
+/// 98.7 MB failure with extra steps. The asymmetry is the point, and is why the
+/// CLI clamps against two named constants rather than one.
+pub const CLUSTERS_MEMBERS_MAX: usize = 200;
+
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
@@ -8318,7 +8331,7 @@ fn tool_schema_clusters() -> Value {
                     "Max clusters to return (0 = all, default 50). `total`/`returned`/`truncated` always report what was dropped.",
                     50,
                     0,
-                    RESULT_LIMIT_MAX,
+                    CLUSTERS_LIMIT_MAX,
                 ),
                 // Maximum 200, not 2000: `limit` and `members` multiply, and
                 // 1000 clusters x 2000 members is the original failure with
@@ -8328,7 +8341,7 @@ fn tool_schema_clusters() -> Value {
                     "Max members previewed per cluster in the multi-cluster listing (0 = all, default 20). Ignored when `cluster_id` is set — that path returns the cluster's full member list, capped at 2000.",
                     20,
                     0,
-                    200,
+                    CLUSTERS_MEMBERS_MAX,
                 ),
                 "cluster_id": {
                     "type": "integer",
@@ -8349,8 +8362,8 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         .get("resolution")
         .and_then(|v| v.as_f64())
         .unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
-    let limit = read_limit(&args, "limit", 50, 0, RESULT_LIMIT_MAX)?;
-    let preview_members = read_limit(&args, "members", 20, 0, 200)?;
+    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
+    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -16282,6 +16295,88 @@ mod mutating_tool_routing_invariant_tests {
              be sent upstream, or fall to LocalFirst and fail in dispatch_json_rpc with \
              'unsupported tool for JSON dispatch' while still being advertised. Add them \
              to the Admin/mutation arm in nestweaver-federation's routing.rs"
+        );
+    }
+}
+
+/// nw-299(b), the forwarding half. The CLI declined to send `limit`/`members`
+/// to the `clusters` tool because the schema set `additionalProperties: false`
+/// and declared neither, so sending either failed the WHOLE call and `clusters`
+/// stopped working on the daemon route. That precondition is a property of this
+/// crate's schema, so it is asserted here rather than described in a comment in
+/// `src/main.rs` — a comment cannot notice when it stops being true.
+#[cfg(test)]
+mod cluster_flag_forwarding_precondition_tests {
+    use super::*;
+
+    #[test]
+    fn the_clusters_tool_accepts_the_two_flags_the_cli_needs_to_forward() {
+        for args in [
+            json!({ "limit": 2 }),
+            json!({ "members": 3 }),
+            json!({ "limit": 2, "members": 3 }),
+            json!({ "limit": 0, "members": 0 }),
+            json!({ "limit": 2, "members": 3, "resolution": 0.5 }),
+        ] {
+            validate_tool_arguments("clusters", &args).unwrap_or_else(|e| {
+                panic!(
+                    "`clusters` must accept {args}: the CLI forwards exactly these \
+                     keys, and under `additionalProperties: false` an undeclared \
+                     one fails the entire call rather than being ignored — {e}"
+                )
+            });
+        }
+    }
+
+    /// The counterweight. If `additionalProperties` were relaxed instead of the
+    /// keys being declared, the test above would pass for the wrong reason and
+    /// would keep passing if the tool later ignored both flags.
+    #[test]
+    fn an_undeclared_key_is_still_rejected_by_the_clusters_tool() {
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "not_a_real_key": 1 })).is_err(),
+            "the schema must still be closed — otherwise the test above proves \
+             only that nothing is checked"
+        );
+    }
+
+    /// Why NOT forwarding was never the neutral option it looked like.
+    ///
+    /// An omitted `limit` does not mean "unbounded" — it means the tool's own
+    /// default of 50. So the pre-forwarding daemon route answered
+    /// `clusters --limit 200` with fifty communities, and the CLI-side printer
+    /// could not restore the other 150 because they never arrived.
+    #[test]
+    fn an_omitted_limit_is_the_tools_default_not_the_whole_population() {
+        assert_eq!(
+            read_limit(&json!({}), "limit", 50, 0, RESULT_LIMIT_MAX).unwrap(),
+            50,
+            "omitting the key applies 50 — declining to forward a caller's \
+             larger --limit therefore SUBSTITUTES a smaller bound rather than \
+             leaving the payload unbounded"
+        );
+        assert_eq!(
+            read_limit(&json!({ "limit": 0 }), "limit", 50, 0, RESULT_LIMIT_MAX).unwrap(),
+            0,
+            "and 0 is the spelling of `all`, which the CLI's `--limit 0` must \
+             be able to reach"
+        );
+    }
+
+    /// The bound the CLI must clamp to. `--limit` is an unbounded `usize` in
+    /// clap; these are the tool's ceilings, and forwarding a value above them
+    /// fails the whole call rather than being clamped for us.
+    #[test]
+    fn the_tool_rejects_values_above_its_declared_ceilings() {
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "limit": 5000 })).is_err(),
+            "limit is capped at {RESULT_LIMIT_MAX}; a CLI that forwards \
+             `--limit 5000` verbatim breaks the daemon route entirely"
+        );
+        assert!(
+            validate_tool_arguments("clusters", &json!({ "members": 500 })).is_err(),
+            "members is capped at 200 — a DIFFERENT ceiling from limit, which \
+             is exactly the kind of asymmetry a single clamp constant would miss"
         );
     }
 }

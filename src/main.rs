@@ -12030,22 +12030,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // same pattern as `summary --json`. Text mode prints only
             // id/name/member_count/key_files, which the preview preserves.
             if use_daemon && !json {
-                // nw-299b, second half — NOT YET DONE, deliberately. `limit`
-                // and `members` are still not forwarded to the tool, so the
-                // daemon returns the whole population and the bound is applied
-                // here, by the printer. That is correct output but a larger
-                // payload than necessary.
+                // nw-299b, second half. The bound is now applied at the
+                // SOURCE as well as by the printer, so the daemon stops
+                // serialising a population the caller asked it not to send —
+                // measured at 7,967,385 bytes for a listing the caller had
+                // bounded to a few dozen entries.
                 //
-                // Forwarding them requires the `clusters` tool to DECLARE
-                // them: its input schema sets `additionalProperties: false`,
-                // so sending either key today fails the whole call with
-                // "invalid arguments for tool 'clusters'" and `clusters` stops
-                // working on the daemon route entirely. Add the two keys here
-                // once the tool declares them.
-                let mut args = serde_json::json!({});
-                if let Some(r) = resolution {
-                    args["resolution"] = serde_json::json!(r);
-                }
+                // This was deliberately left out until the `clusters` tool
+                // DECLARED the two keys. Its input schema sets
+                // `additionalProperties: false`, so an undeclared key does not
+                // get ignored — it fails the whole call with "invalid
+                // arguments for tool 'clusters'" and `clusters` stops working
+                // on the daemon route entirely. The precondition is a property
+                // of the tool's schema, so it is asserted THERE
+                // (`cluster_flag_forwarding_precondition_tests`) rather than
+                // trusted from here: a comment cannot notice when it stops
+                // being true, and this one would have had to notice twice.
+                let args = clusters_tool_args(limit, members, resolution);
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -23052,6 +23053,42 @@ fn print_clusters_output(
 
 /// [`print_clusters_output`] with the pre-cap total supplied by the caller, for
 /// the route that no longer has it (nw-299b).
+/// Build the `clusters` tool arguments for the daemon route.
+///
+/// CLAMPED, not forwarded verbatim. `--limit` and `--members` are unbounded
+/// `usize` in clap, while the tool caps limit at 1000 and members at 200 — two
+/// DIFFERENT ceilings — and under `additionalProperties: false` an
+/// out-of-range value fails the WHOLE call rather than being clamped
+/// server-side, so `clusters` would stop working on the daemon route for
+/// anyone who passed a large bound.
+///
+/// Clamping is strictly better than not forwarding at all, in every case. An
+/// OMITTED key is not "unbounded" — `read_limit` applies the tool's default of
+/// 50 — so declining to forward `--limit 200` was already substituting a
+/// SMALLER bound than the caller asked for, and the printer could not restore
+/// the 150 communities that never arrived.
+///
+/// `0` is the spelling of "all" on both sides and survives the clamp untouched.
+/// The ceilings are imported rather than restated: a second copy of a bound
+/// that has already drifted once is how these routes diverge.
+fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> serde_json::Value {
+    fn clamp(requested: usize, ceiling: usize) -> usize {
+        if requested == 0 {
+            0
+        } else {
+            requested.min(ceiling)
+        }
+    }
+    let mut args = serde_json::json!({
+        "limit": clamp(limit, nestweaver_mcp::tools::CLUSTERS_LIMIT_MAX),
+        "members": clamp(members, nestweaver_mcp::tools::CLUSTERS_MEMBERS_MAX),
+    });
+    if let Some(r) = resolution {
+        args["resolution"] = serde_json::json!(r);
+    }
+    args
+}
+
 fn print_clusters_output_with_total(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
@@ -33468,5 +33505,52 @@ mod since_boundary_tests {
                 );
             }
         }
+    }
+}
+
+/// nw-299(b): the CLI must never construct `clusters` arguments the tool will
+/// reject. Under `additionalProperties: false` plus declared bounds, a bad
+/// value is not ignored — it fails the whole call, so the daemon route would
+/// break for exactly the callers who bound their output most aggressively.
+#[cfg(test)]
+mod clusters_forwarding_tests {
+    use super::*;
+
+    #[test]
+    fn every_cli_reachable_bound_produces_arguments_the_tool_accepts() {
+        // `--limit`/`--members` are unbounded `usize` in clap, so the domain
+        // here is "anything a user can type", not "anything reasonable".
+        for limit in [0usize, 1, 20, 50, 200, 1000, 1001, 5000, usize::MAX] {
+            for members in [0usize, 1, 20, 200, 201, 500, usize::MAX] {
+                for resolution in [None, Some(0.3), Some(2.0)] {
+                    let args = clusters_tool_args(limit, members, resolution);
+                    nestweaver_mcp::tools::validate_tool_arguments("clusters", &args)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "`clusters --limit {limit} --members {members}` produced \
+                                 arguments the tool rejects ({e}). An out-of-range value \
+                                 fails the ENTIRE call, so this is not a degraded \
+                                 result — it is `clusters` not working at all on the \
+                                 route that is taken by default."
+                            )
+                        });
+                }
+            }
+        }
+    }
+
+    /// The counterweight: clamping must not quietly become "always send the
+    /// ceiling", which would make the test above pass while discarding the
+    /// caller's bound.
+    #[test]
+    fn a_bound_within_the_tools_range_is_forwarded_exactly() {
+        let args = clusters_tool_args(7, 3, None);
+        assert_eq!(args["limit"], 7);
+        assert_eq!(args["members"], 3);
+
+        // And 0 keeps meaning "all" rather than being clamped to a ceiling.
+        let all = clusters_tool_args(0, 0, None);
+        assert_eq!(all["limit"], 0, "`--limit 0` means all, on both sides");
+        assert_eq!(all["members"], 0);
     }
 }
