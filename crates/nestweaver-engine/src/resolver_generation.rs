@@ -31,7 +31,13 @@ use std::path::Path;
 ///
 /// 1 — nw-103: import edges attributed to the importing file instead of being
 ///     fanned out to every symbol in the imported file.
-pub const RESOLVER_GENERATION: u32 = 1;
+/// 2 — nw-308/nw-327: the nw-150 receiver gate reached only the same-package
+///     fallback, so the direct-import and re-export tiers bound every bare
+///     method name (`collect`, `contains`, `len`) to any same-named symbol in
+///     an imported file. nw-323/nw-324: TS/JS `.js`-to-`.ts` specifiers,
+///     `"./src/*"` tsconfig targets, `export … from` re-exports and
+///     `new X()` all produced no edge at all. Both change edge SHAPE.
+pub const RESOLVER_GENERATION: u32 = 2;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

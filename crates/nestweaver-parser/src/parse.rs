@@ -1049,6 +1049,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
                 let name = name_arena.to_string();
 
+                // nw-291 (M4): `_` is a DISCARD binding, not a name. Rust's
+                // `const _: () = assert!(..)`, Go's blank identifier and JS's
+                // `const _ = require('lodash')` all produced a graph symbol
+                // literally called `_`, which nothing can import, call or
+                // reference by name — and which `dead-code` then reported as a
+                // high-confidence unreachable symbol.
+                //
+                // The guard lives here, next to the dedup, rather than in
+                // `rust.scm` / `javascript.scm`, because the property is
+                // language-independent: it holds for every query pattern in
+                // every one of the 49 grammars at once. Only the exact name
+                // `_` is filtered — `_helper` is a real, addressable name that
+                // merely follows a private-by-convention spelling.
+                if name == "_" {
+                    continue;
+                }
+
                 if !seen_symbols.insert((name.clone(), start_line)) {
                     continue;
                 }
@@ -1253,6 +1270,36 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         .or(from_receiver_field)
                         .or(from_scoped_path)
                         .map(|s| s.to_string())
+                } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
+                    // nw-308: a FIELD ACCESS has a receiver too, and until this
+                    // existed it was thrown away — extraction was gated to
+                    // `Call`, so every ReadAccess/WriteAccess reference carried
+                    // `receiver: None` and the resolver's receiver gate waved
+                    // all of them through. Measured on this repo: with the gate
+                    // covering CALLS only, `impact collect` fell from 162 to 9
+                    // while `hubs` in-degree barely moved (771 -> 618), because
+                    // `hubs` counts ALL_SYMBOL_EDGE_TYPES — the residual was
+                    // ACCESSES and USES, the exact edges the gate could not see.
+                    //
+                    // Here the CAPTURED node is the member/field/selector node
+                    // itself rather than a call wrapping one, so the object is a
+                    // direct child rather than one level down under `function`.
+                    let k = node.kind();
+                    if k.contains("field")
+                        || k.contains("member")
+                        || k.contains("selector")
+                        || k.contains("attribute")
+                        || k.contains("navigation")
+                    {
+                        node.child_by_field_name("object")
+                            .or_else(|| node.child_by_field_name("value"))
+                            .or_else(|| node.child_by_field_name("operand"))
+                            .or_else(|| node.child_by_field_name("expression"))
+                            .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2036,6 +2083,233 @@ mod tests {
             functions.iter().any(|s| s.name == "standalone_function"),
             "should find function 'standalone_function'"
         );
+    }
+
+    #[test]
+    fn python_module_level_variable_span_is_the_assignment_not_the_file() {
+        // nw-326 / F-CODE-4: queries/python.scm attached `@definition.variable`
+        // to the `(module)` node, so parse.rs recorded start_line=1 and
+        // end_line=EOF+1 for every module-level assignment. `read-symbols` then
+        // returned the whole file for a one-line variable — strictly worse than
+        // reading the file.
+        let source = "\
+import os
+
+
+def helper():
+    return 1
+
+
+LOGGER = os.getcwd()
+MAX_RETRIES = 3
+";
+        let parsed = parse_source(Path::new("mod_vars.py"), source).unwrap();
+
+        let logger = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "LOGGER" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable LOGGER must be extracted");
+
+        assert_eq!(logger.start_line, 8, "span must start at the assignment");
+        assert_eq!(
+            logger.end_line, 8,
+            "a one-line assignment is a one-line span"
+        );
+
+        let max_retries = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Variable)
+            .expect("module-level variable MAX_RETRIES must be extracted");
+        assert_eq!(max_retries.start_line, 9);
+        assert_eq!(max_retries.end_line, 9);
+
+        // Two distinct one-line variables must not share a content hash — with
+        // the capture on `(module)` both hashed the whole file.
+        assert_ne!(
+            logger.content_hash, max_retries.content_hash,
+            "distinct variables must not share the file's content hash"
+        );
+        // The signature is the assignment, not the file's first line.
+        assert_eq!(logger.signature, "LOGGER = os.getcwd()");
+
+        // Regression guard: functions and classes were already exact and must
+        // stay exact.
+        let helper = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!((helper.start_line, helper.end_line), (4, 5));
+    }
+
+    #[test]
+    fn python_class_and_instance_attribute_spans_are_the_assignment_not_the_class() {
+        // nw-326, the "where else" half: queries/python.scm has the SAME
+        // container-as-capture shape for class attributes and for
+        // `self.x = ...` instance attributes, both anchored on
+        // `(class_definition)` — so every attribute got the whole class as its
+        // span, its content hash and its signature.
+        let source = "\
+class Config:
+    DEBUG = False
+    RETRIES = 3
+
+    def __init__(self):
+        self.name = \"config\"
+        self.size = 0
+";
+        let parsed = parse_source(Path::new("config.py"), source).unwrap();
+        let prop = |n: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == n && s.kind == SymbolKind::Property)
+                .unwrap_or_else(|| panic!("property {n} must be extracted"))
+        };
+
+        assert_eq!((prop("DEBUG").start_line, prop("DEBUG").end_line), (2, 2));
+        assert_eq!(
+            (prop("RETRIES").start_line, prop("RETRIES").end_line),
+            (3, 3)
+        );
+        assert_eq!((prop("name").start_line, prop("name").end_line), (6, 6));
+        assert_eq!((prop("size").start_line, prop("size").end_line), (7, 7));
+
+        assert_ne!(
+            prop("DEBUG").content_hash,
+            prop("RETRIES").content_hash,
+            "distinct attributes must not share the class's content hash"
+        );
+        // The class-body anchor must be preserved: the attribute still knows
+        // which class it belongs to.
+        assert_eq!(prop("DEBUG").parent_name.as_deref(), Some("Config"));
+        assert_eq!(prop("name").parent_name.as_deref(), Some("Config"));
+
+        // Regression guard: the class itself still spans the whole class.
+        let class = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .expect("class Config");
+        assert_eq!((class.start_line, class.end_line), (1, 7));
+    }
+
+    // ── nw-323 defects C and D: TS/JS reference coverage ───────────────────
+
+    #[test]
+    fn ts_export_from_is_captured_as_an_import_reference() {
+        // A barrel re-export is an import edge for graph purposes: it is how
+        // `NotFoundError` reaches its importers through
+        // common/errors.ts -> errors/index.ts -> http-errors.ts.
+        let source = "export * from './errors/index.js';\n\
+                      export { AppError, isAppError } from './app-error.js';\n\
+                      export type { ErrorDetails } from './app-error.js';\n";
+        let parsed = parse_source(Path::new("src/common/errors.ts"), source).unwrap();
+
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            imports.contains(&"./errors/index.js"),
+            "`export * from` must yield an Import reference; got: {imports:?}"
+        );
+        assert!(
+            imports.contains(&"./app-error.js"),
+            "`export {{ … }} from` must yield an Import reference; got: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn js_export_from_is_captured_as_an_import_reference() {
+        // Where else does this property hold? javascript.scm has the identical
+        // gap; a plain-JS barrel is just as common as a TS one.
+        let source = "export * from './a.js';\nexport { b } from './b.js';\n";
+        let parsed = parse_source(Path::new("src/index.js"), source).unwrap();
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(imports.contains(&"./a.js"), "got: {imports:?}");
+        assert!(imports.contains(&"./b.js"), "got: {imports:?}");
+    }
+
+    #[test]
+    fn ts_new_expression_is_captured_as_a_call_reference() {
+        // `NotFoundError` (56 files) and `NotificationService` (5 constructors)
+        // are consumed almost exclusively via `new`. With no capture they have
+        // ZERO inbound references before resolution even begins, which is why
+        // `impact --min-score 0 --depth 10` still returned 0.
+        let source = "import { NotFoundError } from '../../../common/errors.js';\n\
+                      export function get(id: string) {\n\
+                        throw new NotFoundError('Discrepancy');\n\
+                      }\n";
+        let parsed = parse_source(Path::new("src/modules/a/service.ts"), source).unwrap();
+
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotFoundError"),
+            "`new NotFoundError(..)` must yield a Call reference; got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn js_new_expression_is_captured_as_a_call_reference() {
+        // Where else does this property hold? javascript.scm has the same gap.
+        let source = "const s = new NotificationService(deps);\n";
+        let parsed = parse_source(Path::new("src/app.js"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "NotificationService"),
+            "got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.kind, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── nw-291 M4: discard bindings must not become symbols ────────────────
+
+    #[test]
+    fn a_discard_binding_is_not_a_symbol() {
+        // nw-291 / F-DC-5: `const _: () = assert!(..)` and
+        // `const _ = require('lodash')` produced a graph symbol literally named
+        // `_`, which then ranked as high-confidence dead code.
+        let rust = "const _: () = assert!(true);\npub fn keep() {}\n";
+        let parsed = parse_source(Path::new("src/db.rs"), rust).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a Rust discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "keep"));
+
+        let js = "const _ = require('lodash');\nexport const KEEP = 1;\n";
+        let parsed = parse_source(Path::new("src/a.js"), js).unwrap();
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "_"),
+            "a JS discard const must not be a symbol: {:?}",
+            parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(parsed.symbols.iter().any(|s| s.name == "KEEP"));
     }
 
     // ── Hash test ──────────────────────────────────────────────────────────
@@ -3422,6 +3696,30 @@ use crate::config::{Settings, load as load_config};
             modules.iter().any(|s| s.name == "sub_module"),
             "should find module 'sub_module'; got: {:?}",
             modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sv_standalone_function_span_is_the_declaration_not_the_file() {
+        // nw-326, "where else does this property hold?": systemverilog.scm had
+        // the identical container-as-capture shape with the FILE ROOT as the
+        // container, so `compute_checksum` (simple.sv:62-68) was recorded as
+        // lines 1-78 with the file's leading `include as its signature. The
+        // checked-in snapshot had the defect baked in as expected output.
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let f = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute_checksum")
+            .expect("standalone function must be extracted");
+        assert_eq!((f.start_line, f.end_line), (62, 68));
+        assert!(
+            f.signature
+                .starts_with("function automatic int compute_checksum"),
+            "signature must be the declaration, not the file's first line: {:?}",
+            f.signature
         );
     }
 

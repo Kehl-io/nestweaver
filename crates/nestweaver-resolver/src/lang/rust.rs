@@ -112,9 +112,24 @@ pub fn resolve_import(
                 && let Some(root) = crate_root_file("src", known_files)
             {
                 let base = parent_dir(&root).to_string();
-                return resolve_module_path(&base, rest, known_files);
+                if let Some(resolved) = resolve_module_path(&base, rest, known_files) {
+                    return Some(resolved);
+                }
             }
-            None
+            // nw-327 (M2): Rust-2018 UNIFORM PATHS. A `use` whose first segment
+            // names a module of the CURRENT module is legal, and it is the form
+            // a crate root's own re-exports take — `pub use hubs::find_hub_nodes;`
+            // in `lib.rs`. `resolve_import` never tried it, so the re-export
+            // chain `tools.rs -> nestweaver_engine (lib.rs) -> hubs.rs` broke at
+            // lib.rs and `flow_trace` lost its edges to `find_hub_nodes`,
+            // `load_clusters` and `attach_cluster_ids`.
+            //
+            // `resolve_module_path` requires the FIRST segment to name a real
+            // module file next to the importer, which is what keeps external
+            // crates unresolved: `serde::de` from `src/main.rs` only binds if
+            // `src/serde.rs` actually exists. Tried LAST, so a genuine
+            // workspace crate always wins over a same-named local module.
+            resolve_module_path(&self_module_dir(from_file), &segments, known_files)
         }
     }
 }
@@ -503,5 +518,74 @@ mod tests {
         ]);
         let result = resolve_import("tests/it.rs", "serde::de", &known);
         assert_eq!(result, None);
+    }
+    /// nw-327: `pub use hubs::find_hub_nodes;` inside a crate root is a
+    /// Rust-2018 uniform path whose first segment names a LOCAL MODULE — a form
+    /// `resolve_import` never tried. Without it the re-export chain broke at
+    /// lib.rs and `tools.rs` lost its edges to find_hub_nodes / load_clusters /
+    /// attach_cluster_ids.
+    #[test]
+    fn a_crate_root_reexport_resolves_through_a_local_module() {
+        let known = set(&[
+            "crates/nestweaver-engine/src/lib.rs",
+            "crates/nestweaver-engine/src/hubs.rs",
+            "crates/nestweaver-mcp/src/lib.rs",
+            "crates/nestweaver-mcp/src/tools.rs",
+        ]);
+        assert_eq!(
+            resolve_import(
+                "crates/nestweaver-engine/src/lib.rs",
+                "hubs::find_hub_nodes",
+                &known
+            ),
+            Some("crates/nestweaver-engine/src/hubs.rs".to_string())
+        );
+    }
+
+    /// Where else does this property hold? A uniform path is legal from ANY
+    /// module, not just the crate root — the first segment names a module of
+    /// the IMPORTING module, which for `bridges.rs` is `bridges/`.
+    #[test]
+    fn a_uniform_path_resolves_a_submodule_of_the_importing_module() {
+        let known = set(&[
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/bridges.rs",
+            "crates/engine/src/bridges/scoring.rs",
+        ]);
+        assert_eq!(
+            resolve_import("crates/engine/src/bridges.rs", "scoring::rank", &known),
+            Some("crates/engine/src/bridges/scoring.rs".to_string())
+        );
+        // …and it must NOT reach a crate-root sibling, which is not what a
+        // uniform path means from a non-root module.
+        let siblings = set(&[
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/hubs.rs",
+            "crates/engine/src/bridges.rs",
+        ]);
+        assert_eq!(
+            resolve_import("crates/engine/src/bridges.rs", "hubs::HubNode", &siblings),
+            None
+        );
+    }
+
+    /// The local-module rule must not swallow external crates: it requires a
+    /// module file to actually exist next to the importer.
+    #[test]
+    fn a_uniform_path_does_not_invent_a_module_for_an_external_crate() {
+        let known = set(&[
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/hubs.rs",
+            "crates/other/src/lib.rs",
+        ]);
+        assert_eq!(
+            resolve_import("crates/engine/src/lib.rs", "serde::Deserialize", &known),
+            None
+        );
+        // …and it must not reach ACROSS crates for a same-named module.
+        assert_eq!(
+            resolve_import("crates/other/src/lib.rs", "hubs::HubNode", &known),
+            None
+        );
     }
 }

@@ -788,6 +788,17 @@ pub struct RepoConfig {
     ///
     /// A pattern ending in `/**` also prunes the directory it names, so an
     /// excluded tree is never descended.
+    ///
+    /// nw-325 — the paragraph above is true in ONE DIRECTION only, and the
+    /// other direction was the defect. "Anything git ignores is excluded" holds;
+    /// "anything git tracks is included" did NOT. `index::SKIP_DIRS` prunes 33
+    /// directory NAMES at any depth, unconditionally, before this `exclude` is
+    /// consulted and independently of `git_ignore(true)` — so tracked,
+    /// non-ignored first-party source in a directory called `public`, `build`,
+    /// `dist`, `out`, `env` or `vendor` is still absent from the graph. It is
+    /// now DISCLOSED (`FilesystemReader::skipped_dirs`) and can be re-admitted
+    /// per repo (`FilesystemReader::unskipping`), but it is not git's answer.
+    /// These globs are additive and do not remove that override.
     #[serde(default)]
     pub exclude: Vec<String>,
 }

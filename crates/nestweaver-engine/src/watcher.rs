@@ -61,7 +61,20 @@ const MANIFEST_FILES: &[&str] = &[
     "CMakeLists.txt",
 ];
 
-/// Names of directories the watcher never descends into.
+/// Names of directories the MARKDOWN VAULT watcher never descends into.
+///
+/// nw-325 asked whether this should be unified with `index::SKIP_DIRS`. It
+/// should NOT. This list guards a vault of notes, not a code index: both call
+/// sites are gated on `is_markdown(path)` first, the list carries `.obsidian`
+/// and `.trash` which are meaningless to a code walk, and it deliberately omits
+/// `ios`/`android`/`public`/`out`/`env`, which are perfectly ordinary folder
+/// names for notes. Pointing this at the 33-entry code list would start
+/// silently dropping a user's notes.
+///
+/// The property nw-325 is actually about — a prune must be disclosed — already
+/// holds here: both call sites return `UpdateOutcome::Skipped { reason: "in
+/// skip dir" }`, which is logged. The code walk had no such channel, which is
+/// what made it dangerous rather than merely opinionated.
 const SKIP_DIRS: &[&str] = &[
     ".obsidian",
     ".trash",

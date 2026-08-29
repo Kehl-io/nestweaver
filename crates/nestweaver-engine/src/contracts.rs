@@ -748,20 +748,171 @@ pub fn detect_handlers(
     }
 }
 
-/// Receivers a Node route registration is called on.
-const NODE_ROUTE_RECEIVERS: &[&str] = &["fastify", "app", "router", "server", "api"];
+/// Receivers a Node route registration is called on by convention.
+///
+/// nw-292 (F-CT-2): `"api"` used to be in this list. It is overwhelmingly an
+/// axios/fetch CLIENT instance in SPA code, so every `api.post('/reports')` in
+/// a front end was minted as a SERVED route and `contracts drift` then read the
+/// four inverted contracts in coyote-client as "implemented". A `Contract` has
+/// no field distinguishing a served route from an outbound call, so there is no
+/// way to record it correctly — the only correct action is not to mint it.
+const NODE_ROUTE_RECEIVERS: &[&str] = &["fastify", "app", "router", "server"];
 
 /// HTTP methods a Node route registration can name.
 const NODE_ROUTE_VERBS: &[&str] = &["get", "post", "put", "patch", "delete", "head", "options"];
 
-/// Parse one source line into `(verb, path)` when it registers a Node route.
+/// How many lines after a registration line may be joined when looking for the
+/// path literal. Prettier splits a registration across at most a handful of
+/// lines before the first argument; a small bound keeps a call that never
+/// closes from swallowing unrelated statements below it.
+const NODE_ROUTE_CONTINUATION_LINES: usize = 6;
+
+/// Receivers this FILE proves are route receivers, on top of the conventional
+/// names.
 ///
-/// Matches `<receiver>.<verb>('<path>', …)`. `fastify.route({ method: 'GET',
-/// url: '/x' })` is deliberately NOT handled: its verb and path are object
-/// properties that a line-oriented scan cannot read reliably, and a guess there
-/// would manufacture false drift in both directions.
-fn parse_node_route(line: &str) -> Option<(String, String)> {
-    for receiver in NODE_ROUTE_RECEIVERS {
+/// nw-292 (F-CT-5): the receiver set was a fixed five-name literal, so every
+/// Express sub-router (`admin.get(`, `stripe.post(`, `partner.get(`,
+/// `mux.post(`) was invisible — 30 routes in freeplay-server alone. The set has
+/// to come from the source, not from a guess about naming.
+///
+/// Two forms are treated as evidence, both unambiguous:
+///   * a binding to a router factory — `const admin = express.Router()`,
+///     `let r = Router()`, `const app = Fastify()`;
+///   * a mount — `app.use('/admin', admin)` or `fastify.register(admin, …)`.
+///
+/// Deliberately NOT treated as evidence: "an identifier that has `.get('/x')`
+/// called on it". That is exactly what an axios client looks like, so it would
+/// reinstate the F-CT-2 inversion this change removes.
+fn discovered_route_receivers(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        let name = name.trim();
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            && !name.chars().next().is_some_and(|c| c.is_numeric())
+            && !NODE_ROUTE_RECEIVERS.contains(&name)
+            && !out.iter().any(|existing| existing == name)
+        {
+            out.push(name.to_string());
+        }
+    };
+
+    for line in source.lines() {
+        // `const admin = express.Router();` / `let r = Router();` / `Fastify()`
+        if let Some(eq) = line.find('=')
+            && let Some(rhs) = line.get(eq + 1..)
+            && (rhs.contains("Router(") || rhs.contains("Fastify(") || rhs.contains("fastify("))
+        {
+            let lhs = &line[..eq];
+            if let Some(name) = lhs.split_whitespace().last() {
+                push(name);
+            }
+        }
+        // `app.use('/admin', admin)` — the mounted identifier is the receiver.
+        if let Some((_, mounted)) = parse_express_mount(line) {
+            push(&mounted);
+        }
+        // `fastify.register(admin, { prefix: '/admin' })`
+        if let Some((mounted, _)) = parse_fastify_register(line) {
+            push(&mounted);
+        }
+    }
+    out
+}
+
+/// Parse `app.use('/prefix', routerName)` into `(prefix, routerName)`.
+fn parse_express_mount(line: &str) -> Option<(String, String)> {
+    let at = line.find(".use(")?;
+    let rest = &line[at + ".use(".len()..];
+    let prefix = first_quoted_literal(rest)?;
+    if !prefix.starts_with('/') {
+        return None;
+    }
+    let after_prefix = rest.find(',').map(|c| &rest[c + 1..])?;
+    let name: String = after_prefix
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some((prefix, name))
+}
+
+/// Parse `fastify.register(routerName, { prefix: '/p' })` into
+/// `(routerName, prefix)`.
+fn parse_fastify_register(line: &str) -> Option<(String, String)> {
+    let at = line.find(".register(")?;
+    let rest = &line[at + ".register(".len()..];
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let prefix_at = rest.find("prefix")?;
+    let prefix = first_quoted_literal(&rest[prefix_at..])?;
+    if !prefix.starts_with('/') {
+        return None;
+    }
+    Some((name, prefix))
+}
+
+/// Map each receiver to the base path it is mounted at, if any.
+///
+/// nw-292 (F-CT-1e): `join_paths_dedup` has existed since the Spring/NestJS
+/// work and was never called on the Node path, so a sub-router mounted at
+/// `/admin` minted `/gyms` — a string that is not a real URL and can never
+/// match a spec entry, producing drift in both directions at once.
+fn node_mount_prefixes(source: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        if let Some((prefix, name)) = parse_express_mount(line) {
+            out.insert(name, prefix);
+        }
+        if let Some((name, prefix)) = parse_fastify_register(line) {
+            out.insert(name, prefix);
+        }
+    }
+    out
+}
+
+/// Parse the registration starting on `lines[idx]`, if any, into
+/// `(verb, path, receiver)`.
+///
+/// The registration NEEDLE must be on `lines[idx]` so the contract is still
+/// attributed to the right line, but the path literal is looked for across a
+/// bounded window of following lines.
+///
+/// nw-292 (F-CT-1/F-CT-5): the scan used to be strictly one line, and
+/// `first_string_arg` additionally required a closing paren on that same line.
+/// Between them they dropped BOTH canonical Node registration styles — the
+/// Fastify options-object form (`fastify.delete('/x', {`, what Prettier emits)
+/// and any registration split across lines. Measured on the real repo:
+/// 530 `<receiver>.<verb>(` registrations in coyote-measurement/server, of
+/// which exactly 5 have a `)` on the same line. Those 5 are precisely the 5
+/// contracts NestWeaver minted.
+///
+/// `fastify.route({ method: 'GET', url: '/x' })` is still deliberately NOT
+/// handled: its verb and path are object properties that this scan cannot read
+/// reliably, and a guess there would manufacture false drift in both
+/// directions.
+fn parse_node_route_in(
+    lines: &[&str],
+    idx: usize,
+    extra_receivers: &[String],
+) -> Option<(String, String, String)> {
+    let line = *lines.get(idx)?;
+    let receivers = NODE_ROUTE_RECEIVERS
+        .iter()
+        .map(|r| (*r).to_string())
+        .chain(extra_receivers.iter().cloned());
+    for receiver in receivers {
         for verb in NODE_ROUTE_VERBS {
             let needle = format!("{receiver}.{verb}(");
             let Some(at) = line.find(&needle) else {
@@ -775,11 +926,23 @@ fn parse_node_route(line: &str) -> Option<(String, String)> {
                     continue;
                 }
             }
-            let path = first_string_arg(&line[at + needle.len() - 1..])?;
+            let mut window = String::from(&line[at + needle.len() - 1..]);
+            let end = (idx + 1 + NODE_ROUTE_CONTINUATION_LINES).min(lines.len());
+            for continuation in &lines[idx + 1..end] {
+                window.push('\n');
+                window.push_str(continuation);
+            }
+            let Some(path) = first_string_arg(&window) else {
+                continue;
+            };
             if !path.starts_with('/') {
                 continue;
             }
-            return Some((verb.to_uppercase(), normalize_http_path(&path)));
+            return Some((
+                verb.to_uppercase(),
+                normalize_http_path(&path),
+                receiver.clone(),
+            ));
         }
     }
     None
@@ -794,9 +957,11 @@ fn parse_node_route(line: &str) -> Option<(String, String)> {
 /// same source-recovery route `detect_nestjs_controller_index` already takes
 /// for `@Controller`, which the TS parser likewise drops.
 pub fn detect_node_route_framework(source: &str) -> Option<&'static str> {
+    let lines: Vec<&str> = source.lines().collect();
+    let extra_receivers = discovered_route_receivers(source);
     let mut fallback = None;
-    for line in source.lines() {
-        if parse_node_route(line).is_none() {
+    for (offset, line) in lines.iter().enumerate() {
+        if parse_node_route_in(&lines, offset, &extra_receivers).is_none() {
             continue;
         }
         // A file mixing both is reported as fastify, since an Express app
@@ -807,6 +972,38 @@ pub fn detect_node_route_framework(source: &str) -> Option<&'static str> {
         fallback = Some("express");
     }
     fallback
+}
+
+/// Languages whose source can contain a Node route registration.
+///
+/// Values match `nestweaver_parser::Language`'s lowercase string form.
+const NODE_ROUTE_LANGUAGES: &[&str] = &[
+    "javascript",
+    "typescript",
+    "tsx",
+    "jsx",
+    "vue",
+    "svelte",
+    "astro",
+];
+
+/// [`detect_node_route_framework`], gated on the file's language.
+///
+/// nw-292 (F-CT-4): the framework sniffer was called on EVERY file of EVERY
+/// language, so NestWeaver minted `GET /a` and `POST /a` out of Rust
+/// `assert_eq!` arguments in `frameworks.rs`, and `POST /oauth/token` /
+/// `DELETE /item/{}` out of its OWN test fixture in this file. A route literal
+/// inside a Rust string is not a route registration, and no amount of path
+/// filtering can tell the difference — the language is the discriminator, and
+/// `detect_frameworks` was already gated this way at the same call site.
+pub fn detect_node_route_framework_for_language(
+    source: &str,
+    language: &str,
+) -> Option<&'static str> {
+    if !NODE_ROUTE_LANGUAGES.contains(&language) {
+        return None;
+    }
+    detect_node_route_framework(source)
 }
 
 /// Mint HTTP contracts from Express/Fastify route registrations.
@@ -823,10 +1020,22 @@ pub fn detect_node_route_framework(source: &str) -> Option<&'static str> {
 /// nearest enclosing symbol — the last one declared at or above its line.
 fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<HandlerMatch> {
     let mut out = Vec::new();
-    for (offset, line) in source.lines().enumerate() {
+    let lines: Vec<&str> = source.lines().collect();
+    let extra_receivers = discovered_route_receivers(source);
+    let prefixes = node_mount_prefixes(source);
+    for offset in 0..lines.len() {
         let line_no = (offset + 1) as u32;
-        let Some((verb, path)) = parse_node_route(line) else {
+        let Some((verb, sub_path, receiver)) =
+            parse_node_route_in(&lines, offset, &extra_receivers)
+        else {
             continue;
+        };
+        // nw-292: a mounted sub-router's routes are relative to its mount
+        // point. `join_paths_dedup` already existed for Spring/NestJS and was
+        // simply never called here.
+        let path = match prefixes.get(&receiver) {
+            Some(base) => join_paths_dedup(base, &sub_path),
+            None => sub_path,
         };
         let owner = symbols
             .iter()
@@ -899,8 +1108,21 @@ fn preceding_decorator_block(source: &str, start_line: u32) -> String {
 fn first_string_arg(after: &str) -> Option<String> {
     let open = after.find('(')?;
     let rest = &after[open + 1..];
-    let close = rest.find(')')?;
-    let inner = &rest[..close];
+    // nw-292 (F-CT-1): a closing paren is NOT needed to find the first
+    // argument, and requiring one on the same line was the whole of the 99.1%
+    // recall miss — `fastify.delete('/x', {` has no `)` on its line, so 526 of
+    // 531 real routes were dropped. Where a `)` IS present it still bounds the
+    // scan, which is what keeps `app.get(handler);` from reaching a string
+    // literal on a later, unrelated line.
+    //
+    // Note the doc comment above records a PREVIOUS fix to this same function
+    // for the same class of miss (the whole-body-is-one-string requirement).
+    // That fix was scoped to the reported Spring forms; the multi-line case was
+    // left. This is the property, not the instance.
+    let inner = match rest.find(')') {
+        Some(close) => &rest[..close],
+        None => rest,
+    };
     // Return the FIRST quoted literal inside the annotation args. The old code
     // required the ENTIRE paren body to be a single quoted string, so it missed
     // the most common Spring forms — `@GetMapping(value = "/x")`,
@@ -1226,31 +1448,34 @@ pub fn compute_drift(
 /// would match nothing and get a false "clean" report. Resolve names here so the
 /// MCP and CLI front-ends agree. An unmatched value is passed through unchanged
 /// (an explicit unknown UID still yields an empty result, as before).
+/// Resolve a user-facing repo selector for the contract commands.
+///
+/// nw-294: this used to be a hand-rolled restatement of
+/// [`crate::resolve_repo_selector`] implementing the first two of its four
+/// tiers, whose fall-through was `Ok(Some(filter.to_string()))` — an
+/// unresolvable selector was passed through verbatim as a UID, matched nothing,
+/// and the empty result was reported as `clean: true, contracts_status:
+/// "complete"`: the field designed to say "do not trust this read" asserting the
+/// read was complete. `brain_diff` hard-errors on the same input, and so does
+/// the CLI's own `resolve_contract_repo_filter`, which already calls the
+/// canonical resolver. Call it here too rather than keeping a weaker twin.
 fn resolve_repo_uid(
     store: &nestweaver_store::GraphStore,
     filter: Option<&str>,
-) -> Result<Option<String>, nestweaver_store::StoreError> {
+) -> Result<Option<String>, anyhow::Error> {
     let Some(filter) = filter else {
         return Ok(None);
     };
     let repos = store.list_repos(None)?;
-    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
-        return Ok(Some(r.uid.clone()));
-    }
-    let needle = filter.to_lowercase();
-    if let Some(r) = repos
-        .iter()
-        .find(|r| crate::repo_display_name(r).to_lowercase() == needle)
-    {
-        return Ok(Some(r.uid.clone()));
-    }
-    Ok(Some(filter.to_string()))
+    Ok(Some(
+        crate::resolve_repo_selector(&repos, filter)?.uid.clone(),
+    ))
 }
 
 pub fn drift_for_store(
     store: &nestweaver_store::GraphStore,
     repo_uid: Option<&str>,
-) -> Result<DriftReport, nestweaver_store::StoreError> {
+) -> Result<DriftReport, anyhow::Error> {
     let repo_uid = resolve_repo_uid(store, repo_uid)?;
     let all = store.list_contracts(repo_uid.as_deref())?;
     let implemented: std::collections::HashSet<String> = match repo_uid.as_deref() {
@@ -1746,6 +1971,39 @@ mod tests {
         assert_eq!(value["clean"], false);
         assert_eq!(value["contracts_status"], "degraded");
         assert_eq!(value["degraded_repos"], serde_json::json!(["repo:broken"]));
+    }
+
+    /// nw-294 / F-MCP-2: an unresolvable repo selector was passed through
+    /// verbatim as a UID, matched nothing, and the empty result was reported as
+    /// `clean: true, contracts_status: "complete"` — the field designed to warn
+    /// "do not trust this read" asserting the read was complete. `brain_diff`
+    /// (engine::resolve_repo_selector) hard-errors on the same input.
+    #[test]
+    fn drift_rejects_a_repo_that_is_not_in_the_graph() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:real:abc".to_string(),
+                url: "file:///tmp/real-repo".to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: Some("real-repo".to_string()),
+                root_path: Some("/tmp/real-repo".to_string()),
+            })
+            .unwrap();
+
+        let err = drift_for_store(&store, Some("no-such-repo-xyz-123"))
+            .expect_err("an unindexed repo must not produce a clean verdict");
+        assert!(
+            err.to_string().contains("not found in graph"),
+            "must match the message brain_diff gives the same input, got: {err}"
+        );
+
+        // The resolvable cases must be unaffected.
+        assert!(drift_for_store(&store, Some("real-repo")).is_ok());
+        assert!(drift_for_store(&store, Some("repo:real:abc")).is_ok());
+        assert!(drift_for_store(&store, None).is_ok());
     }
 
     #[test]
@@ -2281,6 +2539,155 @@ type Query {
             "contract:http:GET:/v1/approvals/{}"
         );
         assert_eq!(get.confidence, 1.0);
+    }
+
+    /// nw-292 / F-CT-1: `first_string_arg` required a closing paren on the SAME
+    /// LINE, so the canonical Fastify options-object form and every multi-line
+    /// registration were dropped. Measured: 5 of 531 routes minted in
+    /// coyote-server. F-CT-5: the receiver allowlist omitted Express
+    /// sub-routers, so all 30 `admin.*` / `stripe.*` routes were invisible.
+    #[test]
+    fn canonical_fastify_and_subrouter_registrations_are_minted() {
+        let source = "\
+export function registerRoutes(fastify) {
+  fastify.delete('/reports/templates/:id', {
+    schema: deleteSchema,
+    preHandler: [auth],
+  }, handler);
+  fastify.get(
+    '/reconciliation/dashboard',
+    { schema: s },
+    handler,
+  );
+}
+const admin = express.Router();
+admin.get('/gyms', requireAdmin, listGyms);
+";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "registerRoutes".into(),
+                signature: "export function registerRoutes(fastify)".into(),
+                start_line: 1,
+            },
+            HandlerSymbol {
+                name: "admin".into(),
+                signature: "const admin = express.Router()".into(),
+                start_line: 12,
+            },
+        ];
+
+        let found: Vec<(String, String)> = detect_handlers("fastify", source, &symbols)
+            .iter()
+            .map(|m| {
+                (
+                    m.contract.verb.clone().unwrap(),
+                    m.contract.path.clone().unwrap(),
+                )
+            })
+            .collect();
+
+        assert!(
+            found.contains(&("DELETE".to_string(), "/reports/templates/{}".to_string())),
+            "options-object form must be minted (no `)` on the line): {found:?}"
+        );
+        assert!(
+            found.contains(&("GET".to_string(), "/reconciliation/dashboard".to_string())),
+            "multi-line registration must be minted: {found:?}"
+        );
+        assert!(
+            found.contains(&("GET".to_string(), "/gyms".to_string())),
+            "a receiver bound to express.Router() must be recognised as a \
+             route receiver, not just the five hard-coded names: {found:?}"
+        );
+    }
+
+    /// nw-292 / F-CT-2: the direction inversion. `api` is overwhelmingly an
+    /// axios/fetch CLIENT instance in SPA code, and it sat in the same
+    /// receiver allowlist as `app`/`fastify`, so four outbound client calls in
+    /// coyote-client were minted as served routes and `contracts drift` read
+    /// them as "implemented".
+    #[test]
+    fn an_api_client_call_is_not_minted_as_a_served_route() {
+        let source = "\
+export async function createReport(body) {
+  return api.post('/reports', body);
+}
+";
+        let symbols = vec![HandlerSymbol {
+            name: "createReport".into(),
+            signature: "export async function createReport(body)".into(),
+            start_line: 1,
+        }];
+        let found = detect_handlers("express", source, &symbols);
+        assert!(
+            found.is_empty(),
+            "an axios/fetch client call must not become a server route: {found:?}"
+        );
+    }
+
+    /// nw-292 / F-CT-1(e): prefixes are dropped. `join_paths_dedup` exists and
+    /// is never called on the Node path, so a sub-router mounted at `/admin`
+    /// mints `/gyms` — a path that is not a real URL and can never match a spec.
+    #[test]
+    fn a_mounted_subrouter_gets_its_mount_prefix() {
+        let source = "\
+export function build(app) {
+  app.use('/admin', admin);
+}
+export function registerAdmin(admin) {
+  admin.get('/gyms', listGyms);
+}
+";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "build".into(),
+                signature: "export function build(app)".into(),
+                start_line: 1,
+            },
+            HandlerSymbol {
+                name: "registerAdmin".into(),
+                signature: "export function registerAdmin(admin)".into(),
+                start_line: 4,
+            },
+        ];
+        let found: Vec<String> = detect_handlers("express", source, &symbols)
+            .iter()
+            .filter_map(|m| m.contract.path.clone())
+            .collect();
+        assert!(
+            found.contains(&"/admin/gyms".to_string()),
+            "a mounted sub-router route must carry its prefix: {found:?}"
+        );
+    }
+
+    /// nw-292 / F-CT-4: route minting must not run on non-web source.
+    /// NestWeaver minted `POST /oauth/token` out of its OWN Rust test fixture
+    /// (the `node_route_registrations_become_http_contracts` source string
+    /// below) because index.rs called the framework sniffer on every file
+    /// regardless of language.
+    #[test]
+    fn rust_source_containing_a_route_literal_is_not_a_node_route_file() {
+        let rust = "assert_eq!(http_route_framework(\"app.get('/a', h)\"), Some(\"express\"));";
+        assert_eq!(
+            detect_node_route_framework_for_language(rust, "rust"),
+            None,
+            "a Rust assertion is not a route registration"
+        );
+        // Where else does this property hold? Every non-JS/TS language.
+        assert_eq!(
+            detect_node_route_framework_for_language(rust, "python"),
+            None
+        );
+        assert_eq!(detect_node_route_framework_for_language(rust, "go"), None);
+        // …and the real JS/TS case must still be detected.
+        assert_eq!(
+            detect_node_route_framework_for_language("app.get('/a', h);", "javascript"),
+            Some("express")
+        );
+        assert_eq!(
+            detect_node_route_framework_for_language("fastify.get('/a', h);", "typescript"),
+            Some("fastify")
+        );
     }
 
     /// nw-160: HTTP contracts were minted only from Spring/NestJS decorators,
