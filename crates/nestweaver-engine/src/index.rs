@@ -3251,10 +3251,22 @@ where
                                 // registered inside a function BODY, so recover
                                 // it from the retained source.
                                 //
-                                source
-                                    .as_deref()
-                                    .and_then(crate::contracts::detect_node_route_framework)
+                                // nw-292 (F-CT-4): this recovery is LANGUAGE
+                                // GATED. The `framework_language_str(lang)`
+                                // check above guards `detect_frameworks` only,
+                                // so this `or_else` used to run on every file of
+                                // every language — which is why NestWeaver
+                                // minted `GET /a` out of a Rust `assert_eq!`
+                                // and `POST /oauth/token` out of its own test
+                                // fixture in `contracts.rs`.
+                                source.as_deref().and_then(|src| {
+                                    crate::contracts::detect_node_route_framework_for_language(
+                                        src,
+                                        crate::contracts::framework_language_str(lang)
+                                            .unwrap_or(""),
+                                    )
                                     .map(str::to_string)
+                                })
                             })
                     });
                 let mut handler_file = controller_framework.map(|framework| {
