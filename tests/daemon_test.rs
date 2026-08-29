@@ -5711,18 +5711,6 @@ fn clusters_text_honours_limit_on_the_daemon_route() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// nw-309 (client half) — a daemon that will never boot must be reported at
-// once, not at the boot ceiling.
-// ---------------------------------------------------------------------------
-
-/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
-/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
-/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
-/// nothing to observe: "will never boot" and "still booting" are the same
-/// observation, and the caller waits out the whole ceiling.
-///
-/// Staged with an unwritable state directory, so the daemon cannot create its
 /// Flatten a miette-rendered diagnostic so a phrase assertion cannot be broken
 /// by line wrapping.
 ///
@@ -5745,6 +5733,18 @@ fn flatten_diagnostic(stderr: &str) -> String {
         .join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// nw-309 (client half) — a daemon that will never boot must be reported at
+// once, not at the boot ceiling.
+// ---------------------------------------------------------------------------
+
+/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
+/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
+/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
+/// nothing to observe: "will never boot" and "still booting" are the same
+/// observation, and the caller waits out the whole ceiling.
+///
+/// Staged with an unwritable state directory, so the daemon cannot create its
 /// runtime directory and exits in milliseconds without ever writing a pidfile.
 /// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
 /// this without touching the operator's real state tree.
