@@ -95,6 +95,14 @@ message WatchVaultRequest {
   // vault side did not, so a `brain watch` whose CLI was killed without
   // sending StopWatch (SIGKILL, or a closed terminal — SIGHUP is not handled)
   // blocked every later vault watch for the daemon's lifetime.
+  //
+  // nw-302: that ORPHAN case no longer needs it. The daemon records the
+  // requesting client's pid from the unix socket's peer credentials, so an
+  // incumbent whose owner has died is reclaimed automatically. `force` is now
+  // only what its name says: an override for an incumbent that is genuinely
+  // still owned by a LIVE process. There is deliberately no `owner_pid` field
+  // here — a self-reported pid could be forged, and asking the kernel covers
+  // clients built before this change.
   bool force = 5;
 }
 
@@ -106,8 +114,10 @@ message WatchVaultResponse {
 message WatchCodeRequest {
   string repo_path = 1;
   string instance_id = 2;
-  // Replace an already-running watcher (e.g. one orphaned when its owning
-  // `watch` CLI was kill -9'd) instead of failing with "already running".
+  // Replace an already-running watcher instead of failing with "already
+  // running". nw-302: an orphan — one whose owning `watch` CLI was kill -9'd —
+  // is now reclaimed automatically from the socket's peer credentials, so this
+  // is the override for an incumbent whose owner is still LIVE.
   bool force = 3;
 }
 

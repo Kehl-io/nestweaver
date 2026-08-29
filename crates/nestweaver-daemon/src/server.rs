@@ -541,6 +541,25 @@ enum SearchIndexReconciliation {
 pub struct WatcherRegistration {
     id: u64,
     handle: nestweaver_engine::ShutdownHandle,
+    /// nw-302: the process that ASKED for this watcher.
+    ///
+    /// The registration models a daemon-side resource but stands for a
+    /// client-side session, and `WatchVault`/`WatchCode` are UNARY: the daemon
+    /// returns immediately and holds no connection to the client afterwards,
+    /// so a `kill -9`'d `brain watch` produces no observable event — no stream
+    /// close, no RST. Without an owner recorded here there is nothing to
+    /// observe, and the slot stayed occupied for the daemon's lifetime, which
+    /// is the whole of nw-302.
+    ///
+    /// Read from the KERNEL, not from the request: the unix socket's peer
+    /// credentials (`SO_PEERCRED` / `LOCAL_PEEREPID`) via [`peer_owner_pid`].
+    /// A caller cannot claim to be another process, and clients shipped before
+    /// this change are covered without a protocol change.
+    ///
+    /// `None` means "no owner could be established" — a TCP (server-mode)
+    /// connection, or an in-process call — and is deliberately NOT treated as
+    /// orphaned. Absence of evidence of death is not evidence of death.
+    owner_pid: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1845,26 +1864,76 @@ fn register_watcher(
     state: &DaemonState,
     handle: nestweaver_engine::ShutdownHandle,
     force: bool,
+    owner_pid: Option<i32>,
 ) -> Result<u64, Status> {
     let mut guard = state
         .watcher_stop
         .lock()
         .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
     if let Some(existing) = guard.as_ref() {
-        if !force {
+        // nw-302: an incumbent whose OWNER IS GONE is reclaimed automatically.
+        //
+        // 8.0.0's changelog says "reclaim an orphaned watcher". What shipped
+        // was `force` on `WatchVaultRequest` — an operator override, not a
+        // reclaim, because the daemon could not tell an orphan from a live
+        // watcher: the registration recorded no owner, and the log line below
+        // could only say "possibly orphaned". A vault watcher under launchd
+        // that is OOM-killed left the vault silently unwatched AND blocked its
+        // own automatic restart until someone typed `--force` by hand — which
+        // is exactly what an unattended supervisor cannot do.
+        //
+        // Narrow by construction: only a KNOWN owner that is provably dead
+        // reclaims. An unknown owner (`None`) and a live owner both still
+        // refuse, so this cannot become "any watch request steals the slot".
+        let orphaned = existing
+            .owner_pid
+            .is_some_and(|pid| !lifecycle::process_is_live(pid));
+        if !force && !orphaned {
             return Err(Status::already_exists(
                 "a watcher is already running; stop it first (StopWatch) or retry with force",
             ));
         }
-        tracing::info!(
-            watcher_id = existing.id,
-            "force-stopping existing watcher (possibly orphaned)"
-        );
+        if orphaned && !force {
+            tracing::info!(
+                watcher_id = existing.id,
+                owner_pid = existing.owner_pid.unwrap_or_default(),
+                "reclaiming orphaned watcher — its owning client process is gone"
+            );
+        } else {
+            tracing::info!(
+                watcher_id = existing.id,
+                "force-stopping existing watcher (possibly orphaned)"
+            );
+        }
         existing.handle.stop();
     }
     let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
-    *guard = Some(WatcherRegistration { id, handle });
+    *guard = Some(WatcherRegistration {
+        id,
+        handle,
+        owner_pid,
+    });
     Ok(id)
+}
+
+/// The pid of the process on the other end of the unix socket a request
+/// arrived on, as reported by the kernel.
+///
+/// nw-302. `SO_PEERCRED` on Linux, `LOCAL_PEEREPID` on macOS, surfaced by
+/// tonic as [`UdsConnectInfo`](tonic::transport::server::UdsConnectInfo). This
+/// is deliberately not a request field: a self-reported pid could be wrong or
+/// forged, would need a protocol change, and would leave every already-shipped
+/// client (and the MCP proxy) unowned.
+///
+/// `None` for a TCP connection (server mode has no local watch sessions) and
+/// for direct in-process calls in tests — both correctly meaning "unknown
+/// owner", which preserves the pre-nw-302 refusal exactly.
+fn peer_owner_pid<T>(request: &Request<T>) -> Option<i32> {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred)
+        .and_then(|cred| cred.pid())
 }
 
 /// Clear a watcher registration on watcher-thread exit — but only when the
@@ -4092,6 +4161,9 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
+        // nw-302: read the owner BEFORE `into_inner()` consumes the request's
+        // extensions — that is where the transport puts the peer credentials.
+        let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -4154,11 +4226,13 @@ impl NestWeaverDaemon for DaemonService {
         let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // `force` now reaches here, as it always has for `watch_code`: the
-        // watcher slot is global and has no client-liveness check, so an
-        // orphaned registration otherwise blocks every later vault watch until
-        // the daemon restarts.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+        // `force` reaches here, as it always has for `watch_code`. nw-302: the
+        // slot is still global, but it is no longer ownerless — the incumbent
+        // records the pid of the client that asked for it, so a registration
+        // orphaned by a killed CLI is reclaimed automatically instead of
+        // blocking every later vault watch until the daemon restarts. `force`
+        // remains the override for an incumbent whose owner is ALIVE.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
             Ok(id) => id,
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchVaultResponse {
@@ -4229,6 +4303,9 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
+        // nw-302: read the owner BEFORE `into_inner()` consumes the request's
+        // extensions — that is where the transport puts the peer credentials.
+        let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let force = req.force;
@@ -4276,10 +4353,11 @@ impl NestWeaverDaemon for DaemonService {
         let admission_guard = ConnectionGuard::write(&self.state)?;
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
-        // With `force`, an already-running watcher (e.g. orphaned by a
-        // kill -9'd `watch` CLI) is stopped and replaced instead of
-        // failing every new watch session.
-        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+        // With `force`, an already-running watcher whose owner is ALIVE is
+        // stopped and replaced. nw-302: one orphaned by a kill -9'd `watch`
+        // CLI no longer needs `force` — its owner pid is recorded, so the
+        // reclaim is automatic.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force, owner_pid) {
             Ok(id) => id,
             Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
@@ -18747,7 +18825,7 @@ external_model = "unavailable-test-model"
         // that `--force` would otherwise tear down.
         let incumbent =
             nestweaver_engine::CodeWatcher::new(&state.db_path, repo_dir.path(), "test-instance");
-        register_watcher(&state, incumbent.shutdown_handle(), false)
+        register_watcher(&state, incumbent.shutdown_handle(), false, None)
             .expect("the incumbent registers before shutdown");
 
         state.active_writes.store(1, Ordering::Relaxed);
@@ -19287,6 +19365,10 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_a.clone()),
             false,
+            // nw-302: a LIVE owner, so this test still exercises the `force`
+            // override it is named for rather than silently becoming a test of
+            // automatic reclaim.
+            Some(std::process::id() as i32),
         )
         .expect("first registration");
 
@@ -19295,6 +19377,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
             false,
+            Some(std::process::id() as i32),
         )
         .expect_err("second registration without force must fail");
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
@@ -19308,6 +19391,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
             true,
+            Some(std::process::id() as i32),
         )
         .expect("force registration");
         assert!(
@@ -19327,6 +19411,148 @@ external_model = "unavailable-test-model"
         assert!(state.watcher_stop.lock().unwrap().is_none());
     }
 
+    /// Spawn a process, wait for it, and return its pid — a pid that is
+    /// provably not live by the time this returns, without guessing at a
+    /// number. Reaping matters: a zombie is still `kill(pid, 0)`-visible, so an
+    /// unwaited child would report LIVE and the test would pass for the wrong
+    /// reason.
+    fn spawn_and_reap_a_short_lived_process() -> i32 {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn a trivially short-lived process");
+        let pid = child.id() as i32;
+        child.wait().expect("reap it");
+        pid
+    }
+
+    /// nw-302: an incumbent whose owning client is GONE must be reclaimed
+    /// automatically, not left blocking every later watch for the daemon's
+    /// lifetime.
+    ///
+    /// 8.0.0 claims "reclaim an orphaned watcher". What shipped was `force` on
+    /// `WatchVaultRequest` — an operator override, not a reclaim: the daemon
+    /// could not tell an orphan from a live watcher, because
+    /// `WatcherRegistration` recorded no owner. `WatchVault` is unary, so the
+    /// client's death produces no observable event; without an owner there was
+    /// nothing to observe.
+    ///
+    /// The operational shape this is actually about: a vault watcher under
+    /// launchd. An OOM kill leaves the vault silently unwatched AND blocks the
+    /// automatic restart, and an unattended supervisor cannot type `--force`.
+    #[test]
+    fn a_watcher_whose_owner_process_is_gone_is_reclaimed_without_force() {
+        let state = test_state_with_writer();
+        let orphan = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+
+        let dead_pid = spawn_and_reap_a_short_lived_process();
+        assert!(
+            !lifecycle::process_is_live(dead_pid),
+            "the fixture must actually be dead or the test proves nothing"
+        );
+
+        let orphan_id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(orphan.clone()),
+            false,
+            Some(dead_pid),
+        )
+        .expect("first registration");
+
+        // The client is gone. A plain (non-force) watch must now SUCCEED.
+        let new_id = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(replacement.clone()),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .expect(
+            "an incumbent whose owner is dead must be reclaimed automatically; \
+             refusing here is the nw-302 wedge — every later watcher is refused \
+             until the daemon restarts",
+        );
+
+        assert_ne!(orphan_id, new_id);
+        assert!(
+            orphan.load(Ordering::Relaxed),
+            "reclaiming must stop the orphaned watcher, not merely overwrite its slot"
+        );
+        assert!(!replacement.load(Ordering::Relaxed));
+    }
+
+    /// The reclaim must be narrow: a LIVE owner is still protected, and the
+    /// operator override still works. This is the fence that stops the nw-302
+    /// fix from becoming "any watch request steals the slot".
+    #[test]
+    fn a_watcher_with_a_live_owner_is_still_refused_without_force() {
+        let state = test_state_with_writer();
+        let incumbent = Arc::new(AtomicBool::new(false));
+
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(incumbent.clone()),
+            false,
+            Some(std::process::id() as i32), // alive, by construction
+        )
+        .expect("first registration");
+
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            Some(std::process::id() as i32),
+        )
+        .expect_err("a live owner must still be protected");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !incumbent.load(Ordering::Relaxed),
+            "a refused registration must not stop the incumbent"
+        );
+    }
+
+    /// An UNKNOWN owner (`None` — a TCP caller, or an in-process call) must
+    /// behave exactly as before nw-302: refuse without force. Absence of
+    /// evidence of death is not evidence of death, and treating it as such
+    /// would let one watch request evict another for no reason.
+    #[test]
+    fn an_unknown_owner_is_refused_without_force_exactly_as_today() {
+        let state = test_state_with_writer();
+        let incumbent = Arc::new(AtomicBool::new(false));
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(incumbent.clone()),
+            false,
+            None,
+        )
+        .expect("first registration");
+
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(Arc::new(AtomicBool::new(false))),
+            false,
+            None,
+        )
+        .expect_err("unknown ownership must not be treated as orphaned");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !incumbent.load(Ordering::Relaxed),
+            "a refused registration must not stop the incumbent"
+        );
+    }
+
+    /// nw-302's liveness predicate must not read a permission failure as
+    /// death. `kill(pid, 0)` returns EPERM for a process owned by another
+    /// user — pid 1 (launchd/init) is the portable example — and treating that
+    /// as "gone" would let any user's watch request reclaim a slot from a
+    /// process it merely cannot signal.
+    #[test]
+    fn process_liveness_does_not_read_a_permission_failure_as_death() {
+        assert!(lifecycle::process_is_live(std::process::id() as i32));
+        assert!(lifecycle::process_is_live(1), "pid 1 is always running");
+        assert!(!lifecycle::process_is_live(0));
+        assert!(!lifecycle::process_is_live(-1));
+    }
+
     /// The shutdown RPC stops any active watcher up front, so an
     /// orphaned watcher's blocking thread can't pin the drain until the
     /// client's SIGKILL.
@@ -19338,6 +19564,7 @@ external_model = "unavailable-test-model"
             &state,
             nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
             false,
+            None,
         )
         .unwrap();
 
