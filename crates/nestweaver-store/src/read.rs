@@ -291,7 +291,8 @@ pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.fi
      s.framework_hint, s.canonical_id, s.visibility";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
-     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
+     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score, \
+     n.frontmatter_raw";
 
 pub(crate) const HEADING_COLUMNS: &str = "h.uid, h.note_uid, h.level, h.text, h.slug, \
      h.start_line, h.end_line, h.content_hash";
@@ -361,7 +362,10 @@ fn parse_note_kind(s: &str) -> NoteKind {
 
 /// Build a Note from a query row with columns:
 /// uid, vault_uid, file_path, title, note_kind, word_count, content_hash,
-/// frontmatter, created_at, modified_at, pagerank_score
+/// frontmatter, created_at, modified_at, pagerank_score, frontmatter_raw
+///
+/// `frontmatter_raw` is APPENDED, not inserted next to `frontmatter`, so every
+/// existing positional index in this function stays valid.
 pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let uid = extract_string(row, 0)?;
     let vault_uid = extract_string(row, 1)?;
@@ -375,6 +379,12 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let created_at = extract_opt_string(row, 8)?;
     let modified_at = extract_opt_string(row, 9)?;
     let pagerank_score = extract_f64(row, 10)?;
+    // Absent on a database written before the column existed; `extract_opt_string`
+    // maps both a missing value and the `''` migration default to `None`.
+    let frontmatter_raw = row
+        .get(11)
+        .and_then(|_| extract_opt_string(row, 11).ok())
+        .flatten();
 
     Ok(Note {
         uid,
@@ -385,6 +395,7 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
         word_count,
         content_hash,
         frontmatter,
+        frontmatter_raw,
         created_at,
         modified_at,
         pagerank_score: Some(pagerank_score),
@@ -2927,7 +2938,33 @@ impl GraphStore {
             }
         }
 
-        Ok(order.into_iter().filter_map(|k| seen.remove(&k)).collect())
+        // nw-297: the two blocks above are appended in QUERY order — every
+        // low-confidence resolution before any genuinely-unresolved link — and
+        // every consumer head-truncates. On a real vault that made the default
+        // 50-row page a pure sample of the BENIGN category, so `broken-links`
+        // printed "0 unresolved (genuinely broken)" against 226 of them. The
+        // list is grouped by category, not ranked by severity, so any head
+        // slice smaller than the first group is a sample of that group alone.
+        //
+        // Order by severity here rather than in each of the three consumers:
+        // the insertion-order dedup above stays exactly as it was, and callers
+        // that page get a severity ranking instead of a query artefact.
+        let mut rows: Vec<BrokenWikilinkRow> =
+            order.into_iter().filter_map(|k| seen.remove(&k)).collect();
+        rows.sort_by(|a, b| {
+            let a_unresolved = a.current_target_uid.is_empty();
+            let b_unresolved = b.current_target_uid.is_empty();
+            b_unresolved
+                .cmp(&a_unresolved)
+                .then(
+                    a.confidence
+                        .partial_cmp(&b.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then_with(|| a.source_path.cmp(&b.source_path))
+                .then_with(|| a.wikilink_text.cmp(&b.wikilink_text))
+        });
+        Ok(rows)
     }
 
     /// Set of Note UIDs that have at least one OUTBOUND wikilink (to a note or
@@ -3296,6 +3333,7 @@ mod repo_has_content_tests {
                 word_count: 1,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

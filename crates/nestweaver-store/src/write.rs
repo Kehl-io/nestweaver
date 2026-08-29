@@ -2103,7 +2103,7 @@ impl GraphStore {
                 &conn,
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
              note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
-             created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
+             frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
                 vec![
                     ("uid", lbug::Value::String(note.uid.clone())),
                     ("vid", lbug::Value::String(note.vault_uid.clone())),
@@ -2115,6 +2115,10 @@ impl GraphStore {
                     (
                         "fm",
                         lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "fmr",
+                        lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
                     ),
                     (
                         "ca",
@@ -2156,7 +2160,7 @@ impl GraphStore {
             .prepare(
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
                  note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
-                 created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
+                 frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for note in notes {
@@ -2173,6 +2177,10 @@ impl GraphStore {
                     (
                         "fm",
                         lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "fmr",
+                        lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
                     ),
                     (
                         "ca",
@@ -8310,6 +8318,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "one".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -8450,6 +8459,7 @@ mod tests {
                     word_count: 1,
                     content_hash: n.to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -8524,6 +8534,7 @@ mod tests {
             word_count: 1,
             content_hash: "old".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -9376,6 +9387,7 @@ mod tests {
                     word_count: 1,
                     content_hash: "one".to_string(),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
@@ -9775,6 +9787,7 @@ mod tests {
                 word_count: 3,
                 content_hash: "null-project-delete-hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -9954,6 +9967,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "note-hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10052,6 +10066,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "stable".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10068,6 +10083,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "new".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10160,6 +10176,7 @@ mod tests {
                 word_count: 1,
                 content_hash: "stable".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -10329,6 +10346,7 @@ mod tests {
             word_count: 1,
             content_hash: "old".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,

@@ -33,6 +33,16 @@ pub struct ParsedNote {
     pub content_hash: String,
     /// Raw frontmatter as a JSON object (`{}` when absent or unparseable).
     pub frontmatter: serde_json::Value,
+    /// The frontmatter's ORIGINAL text, between the `---` fences, exactly as
+    /// written. `None` when the note has no frontmatter block.
+    ///
+    /// Kept alongside `frontmatter` rather than derived from it: that field is
+    /// a parsed map re-encoded as JSON, so a YAML-shaped pattern
+    /// (`(?m)^\s*id: nw-231`) and a line number are both unrecoverable from it.
+    /// Indexing the JSON would make bare-token searches work and leave
+    /// YAML-shaped ones silently failing — a new asymmetry replacing the old
+    /// one (nw-298).
+    pub frontmatter_raw: Option<String>,
     /// Set if frontmatter was present but failed to parse — we keep the note,
     /// just record the error for diagnostics.
     pub frontmatter_error: Option<String>,
@@ -267,6 +277,7 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
         word_count,
         content_hash,
         frontmatter: frontmatter_json,
+        frontmatter_raw: frontmatter_raw.map(str::to_string),
         frontmatter_error,
         headings,
         sections,

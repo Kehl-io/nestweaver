@@ -312,6 +312,29 @@ impl ContentReader for FilesystemReader {
     fn list_files(&self) -> Result<Vec<PathBuf>> {
         use ignore::WalkBuilder;
 
+        // Enumeration failure is not emptiness (nw-287).
+        //
+        // `WalkBuilder` surfaces an unreadable ROOT as a single `Err` item and
+        // no entries, and the per-entry arm below downgrades every walk error
+        // to a `tracing::warn!` — invisible at the CLI's default log level. So
+        // `list_files` returned `Ok(vec![])` for a vault it could not read at
+        // all. The markdown refresh treats its scan as the AUTHORITATIVE new
+        // state of the vault and `bulk_vault_reindex_write` deletes the old
+        // one first, which makes "not observed" and "deleted" the same input:
+        // a `chmod 000` vault directory silently emptied the graph and reported
+        // rc=0.
+        //
+        // Probing `read_dir` up front is deterministic and does not depend on
+        // how `ignore` chooses to surface the failure. A per-entry error BELOW
+        // the root keeps its `continue` — one unreadable child is a
+        // partial-coverage problem, not a failure to enumerate the tree.
+        std::fs::read_dir(&self.repo_path).with_context(|| {
+            format!(
+                "cannot enumerate {} — refusing to report an unreadable directory as empty",
+                self.repo_path.display()
+            )
+        })?;
+
         let mut files = Vec::new();
         let root = self.repo_path.clone();
         let dir_excludes = self.dir_excludes.clone();
@@ -1732,6 +1755,86 @@ mod tests {
         let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
         assert_eq!(oversized.observed_bytes, limit + 1);
         assert_eq!(oversized.limit_bytes, limit);
+    }
+
+    /// True when the current process bypasses filesystem permission bits.
+    /// A `0o000` directory is still readable by root, so the nw-287 tests have
+    /// nothing to observe there and skip rather than fail spuriously.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// nw-287: an unreadable vault ROOT must be an error, not an empty listing.
+    /// Returning `Ok(vec![])` is what lets the caller's stale-drop read
+    /// "I saw no files" as "every file was deleted".
+    #[cfg(unix)]
+    #[test]
+    fn list_files_errors_when_the_root_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A\n").unwrap();
+
+        let reader = FilesystemReader::new(&root);
+        assert_eq!(reader.list_files().unwrap().len(), 1, "precondition");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = reader.list_files();
+        // Restore BEFORE asserting so a failure still lets TempDir clean up.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = observed.expect_err(
+            "an unreadable vault root must surface as Err; Ok(vec![]) is \
+             indistinguishable from an empty vault and drives the nw-287 stale-drop",
+        );
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("permission")
+                || msg.contains("denied")
+                || msg.contains(&root.display().to_string().to_lowercase()),
+            "the error must name the cause or the path, got: {err:#}"
+        );
+    }
+
+    /// The contrast case that keeps the nw-287 fix from over-firing: a single
+    /// unreadable SUBDIRECTORY is a partial-coverage problem, not an
+    /// enumeration failure, so the files that were seen must still be returned.
+    #[cfg(unix)]
+    #[test]
+    fn list_files_tolerates_one_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::create_dir_all(root.join("closed")).unwrap();
+        std::fs::write(root.join("open/a.md"), "# A\n").unwrap();
+        std::fs::write(root.join("closed/b.md"), "# B\n").unwrap();
+
+        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let reader = FilesystemReader::new(&root);
+        let observed = reader.list_files();
+        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let files = observed.expect("one unreadable child must not fail the whole enumeration");
+        assert!(
+            files.iter().any(|p| p.ends_with("a.md")),
+            "the readable half must still be listed, got {files:?}"
+        );
     }
 }
 #[cfg(test)]

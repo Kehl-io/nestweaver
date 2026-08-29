@@ -6983,6 +6983,7 @@ mod tests {
                     word_count: 10,
                     content_hash: format!("hash-{publisher}-{n}"),
                     frontmatter: None,
+                    frontmatter_raw: None,
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,

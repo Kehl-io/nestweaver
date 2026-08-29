@@ -313,6 +313,56 @@ pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
 }
 
+/// Every domain prefix a graph-node UID minted by this module can carry.
+///
+/// Kept beside the constructors deliberately: a new node kind that adds a
+/// constructor above and forgets this list makes [`is_node_uid`] silently
+/// reject its UIDs.
+const NODE_UID_PREFIXES: &[&str] = &[
+    "repo:",
+    "file:",
+    "svc:",
+    "sym:",
+    "vlt:",
+    "note:",
+    "head:",
+    "sec:",
+    "tag:",
+    "proj:",
+    "contract:",
+];
+
+/// Upper bound on a node UID's length.
+///
+/// Every constructor above emits a prefix plus fixed-width hashes and a line
+/// number; the only variable-length component is a `contract:` route. This
+/// bound exists to reject caller-supplied strings, not to describe the
+/// constructors — a 1 MB request field is not a UID however it starts.
+pub const MAX_NODE_UID_LEN: usize = 1024;
+
+/// True when `value` has the SHAPE of a graph-node UID.
+///
+/// This is a cheap structural filter, not a liveness check: it says "this
+/// COULD name a node", never "this node exists". Use it at boundaries that
+/// accept caller-supplied strings and then use them as node identities.
+///
+/// The boundary that needed it is `record_interaction` (nw-296), which took
+/// `arguments.seeds` verbatim off the JSON-RPC wire and used each string as an
+/// interaction `node_scores` key. Raw titles and a 1 MB request field were
+/// written into a sidecar that has no delete path, while the strongest ranking
+/// signal — `query_seed_count`, weight 0.5 — never once landed on a real node.
+pub fn is_node_uid(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_NODE_UID_LEN {
+        return false;
+    }
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    NODE_UID_PREFIXES
+        .iter()
+        .any(|prefix| value.len() > prefix.len() && value.starts_with(prefix))
+}
+
 /// Compute a canonical symbol ID that is instance-independent.
 ///
 /// Format: `<repo_url_hash>:<file_path>#<name>:<scope_hash>`
@@ -517,6 +567,40 @@ mod tests {
         assert_eq!(note_uid_of_heading(&heading), Some(note.as_str()));
         assert_eq!(note_uid_of_heading(&note), None);
         assert_eq!(note_uid_of_heading("head:"), None);
+    }
+
+    #[test]
+    fn is_node_uid_accepts_every_constructor_and_rejects_caller_text() {
+        for uid in [
+            repo_uid("i", "https://example.com/a.git"),
+            vault_uid("i", "/vault"),
+            note_uid(&vault_uid("i", "/vault"), "a.md"),
+            heading_uid(&note_uid(&vault_uid("i", "/vault"), "a.md"), "slug", 3),
+            section_uid(&note_uid(&vault_uid("i", "/vault"), "a.md"), 1, "abc"),
+            tag_uid(&vault_uid("i", "/vault"), "t"),
+            symbol_uid(&repo_uid("i", "u"), "a.rs", "f", 1),
+            file_uid(&repo_uid("i", "u"), "a.rs"),
+            service_uid(&repo_uid("i", "u"), "s"),
+            project_uid("i", "p"),
+        ] {
+            assert!(
+                is_node_uid(&uid),
+                "constructor output must be accepted: {uid}"
+            );
+        }
+
+        // The nw-296 population: raw caller text used as a node key.
+        assert!(!is_node_uid("AuthService"));
+        assert!(!is_node_uid(
+            "Route All Write Operations Through Daemon RPC"
+        ));
+        assert!(!is_node_uid(""));
+        assert!(!is_node_uid("note:"), "a bare prefix names no node");
+        assert!(!is_node_uid(&"x".repeat(MAX_NODE_UID_LEN + 1)));
+        assert!(
+            !is_node_uid(&format!("note:{}", "x".repeat(MAX_NODE_UID_LEN))),
+            "a UID-shaped prefix does not license an unbounded key"
+        );
     }
 
     #[test]

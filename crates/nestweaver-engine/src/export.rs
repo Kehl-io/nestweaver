@@ -767,6 +767,7 @@ mod tests {
                 word_count: 3,
                 content_hash: "hash".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

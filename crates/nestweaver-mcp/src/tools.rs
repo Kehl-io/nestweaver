@@ -2964,7 +2964,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts one match per node, not per occurrence within a node\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Frontmatter is not in the exact-match corpus\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -2999,16 +2999,26 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
     )?;
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
+    // nw-297: classify over the POPULATION, before the truncation. The page is
+    // a sample, and a caller that reads the page's own composition as the
+    // vault's composition gets the wrong answer at every limit — which is
+    // exactly what the CLI's summary line did.
+    let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
+    let low_confidence = total - unresolved;
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
-    Ok(
-        json!({ "broken_links": serde_json::to_value(&links)?, "total": total, "returned": links.len() }),
-    )
+    Ok(json!({
+        "broken_links": serde_json::to_value(&links)?,
+        "total": total,
+        "returned": links.len(),
+        "unresolved": unresolved,
+        "low_confidence": low_confidence,
+    }))
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly — ambiguous or low-confidence targets (confidence < 1.0).\n\nGuidelines:\n- Use when auditing vault health or before bulk link repairs\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `total` and `returned` describe the page. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5047,6 +5057,7 @@ mod brain_search_total_contract_tests {
             word_count: 20,
             content_hash: format!("hash-{uid}"),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -12026,7 +12037,9 @@ mod server_mode_tests {
 #[cfg(test)]
 mod project_context_bug12_tests {
     use super::*;
-    use nestweaver_schema::{Note, NoteKind, Project, Symbol, SymbolKind, Vault, Visibility};
+    use nestweaver_schema::{
+        Note, NoteKind, Project, Section, Symbol, SymbolKind, Vault, Visibility,
+    };
 
     fn mk_note(uid: &str, vault_uid: &str, file_path: &str, title: &str) -> Note {
         Note {
@@ -12038,6 +12051,7 @@ mod project_context_bug12_tests {
             word_count: 100,
             content_hash: format!("hash-{uid}"),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,
@@ -12074,6 +12088,168 @@ mod project_context_bug12_tests {
     // land in `seeds`, disjoint from the rendered `connected` list — and must
     // be promoted into `connected`. This guards the wiring at the call site:
     // removing the promote step leaves notes in `seeds` only and fails here.
+    /// nw-305 / F-VAULT-6 — CHARACTERISATION, not a fix.
+    ///
+    /// `project_context` seeds a PPR walk from the project and its members,
+    /// multiplies member relevance by 5, sorts, and then fills the token budget
+    /// from whatever the walk reached. Every scope filter — `kinds`, `repos`,
+    /// `path_prefix`, `tags`, `exclude_tags`, `since` — is opt-in from `args`
+    /// and defaults to off, so NOTHING narrows the result back to the project.
+    /// This is a designed absence, not a scoring bug or a broken filter: the
+    /// boost is working (the members are ranked first), nothing removes the
+    /// rest.
+    ///
+    /// The test pins that behaviour deliberately rather than asserting "no
+    /// foreign notes", which would encode a design decision nobody has made —
+    /// and the two candidate fixes (disclose `in_project` / add a
+    /// `scope: "strict"` argument) want different assertions here.
+    ///
+    /// It also runs the measurement the ticket asks for. The ticket's framing
+    /// is "degrades when a project has FEW notes". The model that fits the code
+    /// is budget-driven: foreign nodes appear iff the budget buys more slots
+    /// than the project's own reachable mass fills, which makes the leak
+    /// UNIVERSAL rather than small-project-specific — every project hits it
+    /// once the budget outgrows it. Raising the budget on a fixed fixture
+    /// discriminates the two: under the budget model the foreign count rises,
+    /// under a similarity model it does not.
+    #[test]
+    fn project_context_fills_budget_from_outside_the_project() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".into(),
+                name: "t".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:alpha".into(),
+                name: "Alpha".into(),
+                summary: None,
+                instance_id: "default".into(),
+            })
+            .unwrap();
+
+        // Alpha has exactly two notes, like Carson Elevator.
+        let members = ["note:a1", "note:a2"];
+        for (i, uid) in members.iter().enumerate() {
+            store
+                .insert_note(&mk_note(
+                    uid,
+                    "vlt:t",
+                    &format!("Workspaces/Alpha/doc{i}.md"),
+                    &format!("Alpha Doc {i}"),
+                ))
+                .unwrap();
+        }
+        store
+            .batch_insert_project_note_edges(
+                &members
+                    .iter()
+                    .map(|m| ("proj:alpha", *m))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        // Ten unrelated notes belonging to nobody, reachable from Alpha's notes
+        // through ordinary wikilinks — exactly how the PPR walk leaves a small
+        // project's subgraph on the real vault.
+        let foreign: Vec<String> = (0..10).map(|i| format!("note:f{i}")).collect();
+        for (i, uid) in foreign.iter().enumerate() {
+            store
+                .insert_note(&mk_note(
+                    uid,
+                    "vlt:t",
+                    &format!("Workspaces/Bravo/other{i}.md"),
+                    &format!("Bravo Doc {i}"),
+                ))
+                .unwrap();
+        }
+        for (i, member) in members.iter().enumerate() {
+            let section_uid = format!("sec:{member}");
+            store
+                .insert_section(&Section {
+                    uid: section_uid.clone(),
+                    note_uid: (*member).to_string(),
+                    heading_uid: None,
+                    start_line: 1,
+                    end_line: 2,
+                    text_hash: format!("th-{i}"),
+                    text_content: "links out".to_string(),
+                    word_count: 2,
+                    pagerank_score: None,
+                })
+                .unwrap();
+            store
+                .batch_insert_note_section_edges(&[(member, section_uid.as_str())])
+                .unwrap();
+            let edges: Vec<(&str, &str, f32, &str, &str)> = foreign
+                .iter()
+                .map(|f| (section_uid.as_str(), f.as_str(), 1.0_f32, "link", "link"))
+                .collect();
+            store.batch_insert_wikilink_to_note_edges(&edges).unwrap();
+        }
+
+        let member_set: std::collections::HashSet<&str> = members.iter().copied().collect();
+        let foreign_count = |budget: u64| -> usize {
+            let resp = tool_project_context(
+                &store,
+                None,
+                json!({
+                    "project": "Alpha",
+                    "token_budget": budget,
+                    "response_format": "detailed"
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+            resp["connected"]
+                .as_array()
+                .expect("connected array")
+                .iter()
+                .filter_map(|n| n["uid"].as_str())
+                .filter(|uid| !member_set.contains(uid) && uid.starts_with("note:f"))
+                .count()
+        };
+
+        // The measured sweep on this fixture, which is the ticket's open
+        // question answered: foreign notes per token_budget =
+        //   100 -> 0, 200 -> 0, 400 -> 6, 800 -> 10, 1600 -> 10, 3200 -> 10,
+        //   16000 -> 10
+        // Zero while the budget is smaller than the project's own mass, then
+        // monotonically rising, then flat once the walk runs out of reachable
+        // foreign notes. That is a budget-fill signature, not a similarity one:
+        // no PPR-weight change can fix it, and it is not specific to small
+        // projects — it is what every project does once `token_budget` exceeds
+        // its in-project reachable mass.
+        let tight = foreign_count(200);
+        let roomy = foreign_count(800);
+
+        assert_eq!(
+            tight, 0,
+            "characterisation: a budget smaller than the project's own mass \
+             leaks nothing — the members fill it first"
+        );
+        assert!(
+            roomy > tight,
+            "characterisation: with no scope filter on by default, the surplus \
+             budget is filled from whatever the PPR walk reached, including \
+             notes belonging to no project (nw-305). Measured {tight} foreign \
+             at budget 200 and {roomy} at 800. Flip this assertion once the \
+             owner picks between `in_project` disclosure and a `scope` argument."
+        );
+        assert!(
+            foreign_count(16_000) >= roomy,
+            "the leak is BUDGET-driven, not similarity-driven: the foreign \
+             count must not SHRINK as the budget grows. If this ever inverts, \
+             the ticket's 'small projects leak' framing is right after all and \
+             the fix belongs in ranking rather than in scoping."
+        );
+    }
+
     #[test]
     fn project_context_surfaces_member_notes_when_project_has_symbol_mass() {
         let store = GraphStore::in_memory().unwrap();
@@ -14433,6 +14609,7 @@ mod arg_alias_tests {
                 word_count: 1,
                 content_hash: "hash-seed".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -15576,6 +15753,7 @@ mod stale_check_tool_tests {
                 word_count: 1,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

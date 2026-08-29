@@ -3983,6 +3983,7 @@ fn daemon_merge_rejects_self_merge_without_mutation() {
             word_count: 42,
             content_hash: "authored-hash".to_string(),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,

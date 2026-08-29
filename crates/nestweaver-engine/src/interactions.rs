@@ -615,6 +615,48 @@ pub fn top_uids_by_kind(db_path: &Path, kind: &str, n: usize) -> Vec<(String, f6
     ranked
 }
 
+/// Remove exactly one UID from the interaction sidecar and durably publish the
+/// replacement. Returns `true` when a key was removed. A missing sidecar or a
+/// missing UID is a confirmed no-op, not an error.
+///
+/// The sidecar had a write path and a NUKE and nothing in between (nw-313), so
+/// a single poisoned entry — of which nw-296 supplied a steady stream, including
+/// a 1 MB caller-controlled key — could only be cleared by destroying every
+/// accumulated ranking signal. Kory's standing decision to LEAVE the observed
+/// pollution rather than pay that price is the clearest statement of the gap.
+///
+/// Unlike the read helpers in this module, this mutation path is STRICT:
+/// unreadable or malformed input is an error, so a cleanup can never overwrite
+/// real signal with an empty map. Mirrors
+/// [`crate::extensions::remove_extension_uid_durable`], which is the proven
+/// template for durable single-key removal from a sidecar.
+pub fn remove_node_score(db_path: &Path, uid: &str) -> Result<bool, anyhow::Error> {
+    let path = interaction_sidecar_path(db_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read interaction sidecar {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut store: InteractionStore = serde_json::from_str(&text).map_err(|error| {
+        anyhow::anyhow!("parse interaction sidecar {}: {error}", path.display())
+    })?;
+    if store.node_scores.remove(uid).is_none() {
+        return Ok(false);
+    }
+    // The sidecar holds only the CONSOLIDATED per-node counters — raw events
+    // live in the tracker's in-memory buffer and are folded in at flush — so
+    // removing the score is the whole removal. A tracker with the uid still
+    // buffered will re-create it on its next flush, which is correct: that is a
+    // new interaction, not the forgotten one.
+    save_interaction_store(db_path, &store)?;
+    Ok(true)
+}
+
 /// Delete the interaction sidecar file. Returns `true` if a file was
 /// removed.
 pub fn clear_interaction_sidecar(db_path: &Path) -> bool {
@@ -687,6 +729,69 @@ mod tests {
         let _ = tmp.into_temp_path();
         let tracker = InteractionTracker::new_with_options(&db_path, 50, "test-session");
         (tracker, db_path)
+    }
+
+    #[test]
+    fn forget_removes_one_uid_and_keeps_the_rest() {
+        // nw-313: the sidecar had a write path and a nuke and nothing between,
+        // so clearing one poisoned key meant destroying every real signal.
+        let (tracker, db_path) = temp_tracker();
+        tracker.record_query("brain_context", &["sym:keep".to_string()], &[]);
+        tracker.record_query("brain_context", &["sym:drop".to_string()], &[]);
+        tracker.flush().unwrap();
+        assert!(load_node_score(&db_path, "sym:keep").is_some());
+        assert!(load_node_score(&db_path, "sym:drop").is_some());
+        let before = load_interaction_data(&db_path).unwrap().scores.len();
+
+        assert!(remove_node_score(&db_path, "sym:drop").unwrap());
+
+        assert!(
+            load_node_score(&db_path, "sym:drop").is_none(),
+            "the forgotten uid must be gone"
+        );
+        assert!(
+            load_node_score(&db_path, "sym:keep").is_some(),
+            "forgetting one uid must not destroy the rest — that is the nuke it replaces"
+        );
+        assert_eq!(
+            load_interaction_data(&db_path).unwrap().scores.len(),
+            before - 1
+        );
+    }
+
+    #[test]
+    fn forget_is_a_confirmed_no_op_for_an_absent_uid_or_sidecar() {
+        let (tracker, db_path) = temp_tracker();
+        assert!(
+            !remove_node_score(&db_path, "sym:nothing").unwrap(),
+            "no sidecar yet is a no-op, not an error"
+        );
+        tracker.record_query("brain_context", &["sym:keep".to_string()], &[]);
+        tracker.flush().unwrap();
+        assert!(!remove_node_score(&db_path, "sym:absent").unwrap());
+        assert!(load_node_score(&db_path, "sym:keep").is_some());
+    }
+
+    #[test]
+    fn forget_leaves_the_sidecar_parseable_and_the_survivors_intact() {
+        // The mutation is a read-modify-write of the whole store, so the risk
+        // is writing a shape the readers cannot load — which would look like
+        // "everything was forgotten".
+        let (tracker, db_path) = temp_tracker();
+        tracker.record_query("brain_context", &["sym:a".to_string()], &[]);
+        tracker.record_query("brain_context", &["sym:b".to_string()], &[]);
+        tracker.record_access("note_get", "sym:c");
+        tracker.flush().unwrap();
+        let before = load_node_score(&db_path, "sym:a").unwrap();
+
+        remove_node_score(&db_path, "sym:b").unwrap();
+
+        let store = load_interaction_store_public(&db_path)
+            .expect("the sidecar must still parse after a selective delete");
+        assert!(!store.node_scores.contains_key("sym:b"));
+        assert!(store.node_scores.contains_key("sym:c"));
+        let after = load_node_score(&db_path, "sym:a").unwrap();
+        assert_eq!(after.query_seed_count, before.query_seed_count);
     }
 
     #[test]
