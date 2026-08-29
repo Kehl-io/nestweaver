@@ -18,6 +18,18 @@
 //! floors (T1 parse sweep, T2 env-var roles, T3b write-remedy denylist) live
 //! in `src/main.rs`'s `cli_help_contract_tests`, where they need no fixture.
 //!
+//! ## nw-285: the harness had only one assertion FORM, and missed a whole class
+//!
+//! `suggested_command` returns `None` unless the message contains the literal
+//! `"nestweaver "`, so every assertion here silently no-opped on a remedy that
+//! is an INSTRUCTION rather than an INVOCATION. A truncated database was
+//! answered with "The database may be checkpointing; please retry later." —
+//! a remedy nobody ran, invisible to the harness built to catch remedies nobody
+//! ran, because it named no command. `assert_no_transient_advice` is the second
+//! form; the four corruption rows below are what it took to notice the first
+//! form was not enough. Adding rows to a harness that cannot see the defect is
+//! how a check goes vacuous.
+//!
 //! Every invocation pins its daemon routing explicitly, per
 //! `every_cli_invocation_pins_its_daemon_routing` in `tests/cli_test.rs`.
 //! Every fixture is a temp directory with a temp database; nothing here reads
@@ -35,6 +47,231 @@ fn direct() -> Command {
         .env_remove("NESTWEAVER_DB")
         .env_remove("NESTWEAVER_CONFIG");
     cmd
+}
+
+/// Phrases that tell the operator the condition may clear on its own.
+///
+/// nw-285. The harness above extracts remedies with `suggested_command`, which
+/// returns `None` unless the message contains the literal `"nestweaver "`. Every
+/// assertion in this file therefore no-ops on a remedy that is an INSTRUCTION
+/// rather than an INVOCATION — and "please retry later" is exactly that. A
+/// truncated database was answered with `The database may be checkpointing;
+/// please retry later.`, which is a remedy nobody ran and which this file, built
+/// to catch remedies nobody ran, could not see. This is the second assertion
+/// form the harness was missing, not a fifth row.
+const TRANSIENT_ADVICE: &[&str] = &[
+    "retry later",
+    "please retry",
+    "try again later",
+    "may be checkpointing",
+    "wait and retry",
+];
+
+/// Assert that `message` does not tell the operator to wait for a permanent
+/// condition to clear.
+///
+/// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every diagnostic for a
+/// deterministic failure, which is a set no fixture can enumerate — so the
+/// mechanical half lives in `src/main.rs`'s
+/// `no_permanent_diagnostic_advises_waiting_it_out`, an exhaustive match over
+/// `CliDiagnostic`. This function is the end-to-end half: it proves the
+/// property survives the ENGINE's own text, which the variant-level check
+/// cannot see because that text is interpolated at runtime.
+fn assert_no_transient_advice(message: &str, context: &str) {
+    for phrase in TRANSIENT_ADVICE {
+        assert!(
+            !message.to_lowercase().contains(phrase),
+            "{context}: the remedy says {phrase:?}, but this condition is \
+             deterministic — waiting changes nothing and the operator has been \
+             given something to do that cannot work:\n{message}"
+        );
+    }
+}
+
+/// Index a two-file repo and return `(tempdir, db_path)`.
+fn indexed_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("a.py"),
+        "def a():\n    return b()\n\ndef b():\n    return 1\n",
+    )
+    .unwrap();
+    let db = dir.path().join("code.lbug");
+    direct()
+        .args(["index", "--db"])
+        .arg(&db)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+    (dir, db)
+}
+
+/// nw-285, mode "truncated file". The storage engine reports the truncation
+/// precisely — "catalog page range starts at 3567 and spans 5 pages, outside
+/// the database file with 1696 pages" — and then appends its own GUESS at a
+/// cause it never tested for: "The database may be checkpointing; please retry
+/// later." Nothing on that path asks whether a checkpoint is running or whether
+/// a writer exists, and retrying never lengthens a truncated file.
+///
+/// Reproduced against a real 20 MB index before the fix; the message reached
+/// the user through `nestweaver::error`, which carries no `help` at all.
+#[test]
+fn a_truncated_database_is_not_answered_with_retry_later() {
+    let (_dir, db) = indexed_fixture();
+    let len = std::fs::metadata(&db).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+    file.set_len(len / 3).unwrap();
+    drop(file);
+
+    let output = direct()
+        .args(["dead-code", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "a truncated database must not answer as if it were readable: {stderr}"
+    );
+    assert_no_transient_advice(&stderr, "truncated database");
+    assert!(
+        stderr.contains("nestweaver::db_corrupt"),
+        "a truncated file is corrupt, not unavailable and not a missing WAL: {stderr}"
+    );
+    let remedy = suggested_command(&stderr)
+        .unwrap_or_else(|| panic!("no runnable remedy offered: {stderr}"));
+    assert!(
+        !remedy.contains('<') || remedy.contains("<archive>"),
+        "the remedy must name real values, or a placeholder the message \
+         explains: {remedy}"
+    );
+}
+
+/// nw-285, mode "random bytes mid-file". lbug is built from source in the cargo
+/// registry and its `ASSERT` macro interpolates `__FILE__`, so a mid-file
+/// corruption printed
+/// `Assertion failed in file "/Users/<name>/.cargo/registry/.../column.cpp" on
+/// line 289: startOffsetInSegment + length <= state.metadata.numValues` — an
+/// internal invariant, a build machine's home directory, and no remedy.
+///
+/// Two properties, because they fail independently: nothing internal leaks, AND
+/// something followable is offered.
+#[test]
+fn mid_file_corruption_neither_leaks_a_build_path_nor_omits_a_remedy() {
+    // Corruption is not one behaviour. Measured on a real 20 MB index, the same
+    // 0xFF fill produces a SIGSEGV at some offsets (caught by
+    // `open_crash_guard`, which already answered well), an ordinary unwinding
+    // C++ exception at others (the leak), and a clean read of garbage at
+    // others still. Sweeping is what makes this row non-vacuous: a single
+    // offset on a small fixture lands on the path that was ALREADY correct.
+    let mut failed_at_least_once = false;
+    for (offset_num, offset_den, len_den) in [(1_u64, 4_u64, 10_u64), (1, 20, 3), (3, 5, 8)] {
+        let (_dir, db) = indexed_fixture();
+        let len = std::fs::metadata(&db).unwrap().len();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+            file.seek(SeekFrom::Start(len * offset_num / offset_den))
+                .unwrap();
+            file.write_all(&vec![0xFF_u8; (len / len_den) as usize])
+                .unwrap();
+        }
+
+        let output = direct()
+            .args(["dead-code", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The nw-285 property that already held and must keep holding.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                output.status.signal().is_none(),
+                "opening a corrupt database must not die on a signal: {combined}"
+            );
+        }
+        if output.status.success() {
+            continue;
+        }
+        failed_at_least_once = true;
+        assert!(
+            !combined.contains(".cargo/registry"),
+            "a dependency's build path reached the user, including the username \
+             in it: {combined}"
+        );
+        assert!(
+            !combined.contains("Assertion failed in file \"/"),
+            "a raw C++ assertion with an absolute path reached the user: {combined}"
+        );
+        assert_no_transient_advice(&combined, "mid-file corruption");
+        assert!(
+            combined.contains("backup restore") || combined.contains("re-index"),
+            "corruption must name a recovery, not just a failure: {combined}"
+        );
+    }
+    assert!(
+        failed_at_least_once,
+        "no offset produced a failure, so nothing above was asserted"
+    );
+}
+
+/// nw-285, mode "zero-length file". `require_openable_db` passes a zero-byte
+/// `.lbug` deliberately — it is what an interrupted create leaves and what the
+/// store itself initialises — and `open_read_only` does not run `init_schema`,
+/// so the first query died in the engine's binder with `Table Symbol does not
+/// exist`: an internal sentence, no remedy, for the one corruption mode whose
+/// remedy is both obvious and safe to prescribe.
+#[test]
+fn a_zero_length_database_says_what_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("empty.lbug");
+    std::fs::write(&db, b"").unwrap();
+
+    let output = direct()
+        .args(["dead-code", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Binder exception"),
+        "the engine's binder error is not a user-facing sentence: {stderr}"
+    );
+    assert!(
+        stderr.contains("nestweaver::db_no_schema"),
+        "a zero-length database must be named as such: {stderr}"
+    );
+    assert!(
+        stderr.contains("0 bytes"),
+        "the size is the whole diagnosis and must be stated: {stderr}"
+    );
+    assert_no_transient_advice(&stderr, "zero-length database");
+    let remedy = suggested_command(&stderr)
+        .unwrap_or_else(|| panic!("no runnable remedy offered: {stderr}"));
+    assert!(
+        remedy.starts_with("nestweaver index"),
+        "the remedy for a schema-less database is to index one: {remedy}"
+    );
+    // Assertion (2) of the T3 contract: it parses.
+    let mut probe: Vec<String> = remedy
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect();
+    probe.push("--help".to_string());
+    direct().args(&probe).assert().success();
 }
 
 /// Pull the first `nestweaver ...` command out of a message, as a user would.

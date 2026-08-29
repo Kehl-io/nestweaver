@@ -354,14 +354,36 @@ enum CliDiagnostic {
     /// A crashed daemon leaves an unreplayed write-ahead log. Replay needs
     /// read-write access, so the read-only path can never perform it and the
     /// generic "could not open" message sends the user nowhere (nw-126).
+    ///
+    /// nw-285. The second clause used to read: *"If that also fails, move {wal}
+    /// aside and retry — it is replayed or discarded on the next read-write
+    /// open, and the database itself is intact."* Three things were wrong with
+    /// it, and `no_permanent_diagnostic_advises_waiting_it_out` is what found
+    /// them:
+    ///
+    /// 1. "and retry" is not a remedy. Nothing about the database changes
+    ///    between the two attempts, so the second one fails identically.
+    /// 2. "the database itself is intact" is asserted, never tested. This
+    ///    diagnostic is reached by a TEXT match on the engine's "shadow pages"
+    ///    sentence, which a truncated or scribbled file produces just as
+    ///    readily as a genuinely unreplayed log.
+    /// 3. Moving a WAL aside is destructive, and the sentence framed it as
+    ///    free. The writes in it are gone once the database opens without it.
+    ///
+    /// Corruption is now classified BEFORE this arm (`db_corrupt`), so what
+    /// reaches here is far more likely to be a real unreplayed log — but "more
+    /// likely" is not "known", so the text no longer claims to know.
     #[error("Database has an unreplayed write-ahead log: {path}")]
     #[diagnostic(
         code(nestweaver::db_wal_unreplayed),
         help(
             "{cause}\nThis usually follows a daemon crash. Replay requires read-write \
-             access:\n  nestweaver daemon --db {path} start\n\
-             If that also fails, move {wal} aside and retry — it is replayed or \
-             discarded on the next read-write open, and the database itself is intact."
+             access, which the read path cannot take:\n  nestweaver daemon --db {path} start\n\
+             If that fails too, the log cannot be replayed. Moving {wal} aside \
+             DISCARDS the writes it holds, so take a copy of both files first; a \
+             read that still fails afterwards means the database file itself is \
+             damaged, and the remedy is `nestweaver backup restore <archive>` or \
+             a re-index."
         )
     )]
     DatabaseWalUnreplayed {
@@ -370,17 +392,227 @@ enum CliDiagnostic {
         cause: String,
     },
 
+    /// nw-285. The file is present and its header is intact, but its CONTENTS
+    /// do not describe a database the engine can read. Distinct from
+    /// `db_unavailable` (something else holds it — wait or stop that process)
+    /// and from `db_wal_unreplayed` (the data is fine, a replay is owed):
+    /// nothing that runs later fixes this file, so a remedy that says "retry"
+    /// is a remedy nobody can run.
+    ///
+    /// The wording deliberately matches `open_crash_guard`'s SIGSEGV message
+    /// verbatim in its recovery clause. Corruption reaches the user two ways —
+    /// as a signal the guard catches, and as an ordinary error that unwinds —
+    /// and the two are the same event to the person holding the file, so they
+    /// must not offer two different sets of instructions.
+    #[error("Database file is corrupt: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_corrupt),
+        help(
+            "{cause}\nThe file exists and its header is intact, but its contents \
+             do not describe a readable database.\n\
+             Recover it: restore the most recent backup with `nestweaver backup \
+             restore <archive>`, or delete this database and re-index the \
+             repositories it held.\n\
+             Do not keep retrying: this is deterministic, not transient."
+        )
+    )]
+    DatabaseCorrupt { path: String, cause: String },
+
+    /// nw-285. A zero-length `.lbug`, or one that was created but never
+    /// indexed. `require_openable_db` passes a zero-byte file on purpose (it
+    /// is what the store itself initialises), and a read-only open does not
+    /// run `init_schema`, so the first query fails in the engine's binder with
+    /// `Table <X> does not exist` — an internal sentence with no remedy, for a
+    /// condition whose remedy is obvious and safe to name.
+    ///
+    /// This is the one database-shaped diagnostic that MAY prescribe a write:
+    /// `read_path_diagnostics_never_prescribe_a_write` bars a write when the
+    /// database might hold data, and a file with no schema demonstrably holds
+    /// none, so `index` cannot destroy anything here. The size is reported
+    /// rather than asserted, because "0 bytes" and "never indexed" want
+    /// different next steps from the operator.
+    #[error("Database has no graph schema: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_no_schema),
+        help(
+            "{detail}\nThis database has never been indexed, so the tables a \
+             query needs do not exist yet.\n\
+             Create them by indexing a repository into it:\n  \
+             nestweaver index --repo <path> --db {path}"
+        )
+    )]
+    DatabaseNoSchema { path: String, detail: String },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
+}
+
+/// Replace any absolute path into a Rust build tree with the crate it points
+/// at, so a message the storage engine wrote with `__FILE__` cannot ship a
+/// developer's home directory to a user.
+///
+/// nw-285: a mid-file corruption surfaced as
+/// `Assertion failed in file "/Users/<name>/.cargo/registry/src/index.crates.io-<hash>/lbug-0.19.1/lbug-src/src/storage/table/column.cpp" on line 289: ...`.
+/// lbug is built from source in the cargo registry and `ASSERT` interpolates
+/// `__FILE__`, so the absolute build path is baked into the binary and printed
+/// verbatim. The username in it is the part that must never leave the machine.
+///
+/// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every message, not on the
+/// corruption arm — which is why this runs at the TOP of `into_diagnostic`, on
+/// the message every arm below then classifies, rather than inside the arm that
+/// happened to be reported. Any error text that ever embeds a `__FILE__`, a
+/// `panic::Location`, or a registry path is covered by construction. The same
+/// reasoning already governs the committed `.wasm` artifact, which is built
+/// with `--remap-path-prefix` for exactly this leak.
+fn redact_build_paths(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find("/.cargo/registry/") {
+        // Walk back to the start of the absolute path so the home prefix goes
+        // with it, not just the registry tail.
+        let head = &rest[..at];
+        let start = head
+            .rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .map_or(0, |i| i + 1);
+        out.push_str(&head[..start]);
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '"')
+            .unwrap_or(tail.len());
+        // Keep the crate-relative remainder: it is the only diagnostic part.
+        let path = &tail[..end];
+        let short = path
+            .split("/index.crates.io-")
+            .nth(1)
+            .and_then(|s| s.split_once('/'))
+            .map_or("<dependency source>", |(_, rel)| rel);
+        out.push_str("<dep>/");
+        out.push_str(short);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove the storage engine's own guess at a transient cause from a message
+/// we have already classified as permanent.
+///
+/// nw-285. lbug appends "The database may be checkpointing; please retry
+/// later." to its truncation error — a guess, not a test: nothing in that code
+/// path asks whether a checkpoint is in progress or whether any writer exists.
+/// Quoting it under a diagnostic that ends "Do not keep retrying: this is
+/// deterministic, not transient" would hand the operator two instructions and
+/// let them pick, which is how the nw-318/nw-328 class survives. The engine's
+/// FACTS ("catalog page range ... outside the database file with 1696 pages")
+/// are the load-bearing part and are kept verbatim; only the advice goes.
+fn drop_engine_retry_advice(message: &str) -> String {
+    const GUESSES: &[&str] = &[
+        " The database may be checkpointing; please retry later.",
+        "The database may be checkpointing; please retry later.",
+    ];
+    let mut out = message.to_string();
+    for guess in GUESSES {
+        out = out.replace(guess, "");
+    }
+    out.trim_end().to_string()
+}
+
+/// The database this process last attempted to open on the read path.
+///
+/// Set by `open_store`, read only by `into_diagnostic`. A `Mutex<Option<..>>`
+/// rather than a `OnceLock` because a single invocation can open more than one
+/// database (federation, `instance merge`) and the interesting one is the last.
+static LAST_OPENED_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn record_opened_db_path(path: &Path) {
+    if let Ok(mut slot) = LAST_OPENED_DB.lock() {
+        *slot = Some(path.display().to_string());
+    }
+}
+
+/// Name the database an error is about.
+///
+/// Prefers a path the message itself carries ("failed to open database at
+/// <path>: ..."), because that one is certainly the subject. Falls back to the
+/// last database `open_store` opened, which is what the binder and assertion
+/// failures need — they carry no path at all.
+fn extract_db_path(message: &str) -> String {
+    if let Some(path) = message
+        .split("database at ")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        return path;
+    }
+    LAST_OPENED_DB
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| default_db_path().display().to_string())
 }
 
 /// Inspect an `anyhow::Error` and, when it matches a known pattern, convert it
 /// into a `miette::Report` with rich diagnostic information (help text, error
 /// code). Falls back to a plain `miette::Report` for unrecognised errors.
 fn into_diagnostic(err: anyhow::Error) -> miette::Report {
-    let message = format!("{err:#}");
+    let message = redact_build_paths(&format!("{err:#}"));
     let lower = message.to_lowercase();
+
+    // nw-285. Corruption must be classified BEFORE the WAL and not-found arms,
+    // because a corrupt file produces text those arms recognise while their
+    // remedies cannot help it. All three signals below were reproduced against
+    // a real 20 MB index; each previously fell through to `nestweaver::error`,
+    // which has no `help` at all.
+    //
+    // 1. TRUNCATION. The engine says, in its own words, that the file is too
+    //    short: "catalog page range starts at 3567 and spans 5 pages, outside
+    //    the database file with 1696 pages" — and then appends "The database
+    //    may be checkpointing; please retry later." That trailer is the engine
+    //    guessing at a transient cause it did not test for. Retrying never
+    //    lengthens a truncated file, and the same sentence is what nw-318 and
+    //    nw-328 were about: a remedy nobody ran.
+    // 2. A C++ ASSERTION. `Assertion failed in file "..." on line 289: ...`
+    //    escapes as an ordinary unwinding error, so `open_crash_guard` — which
+    //    handles SIGSEGV/SIGBUS only — never sees it.
+    // 3. `basic_string`. A bare C++ exception `what()` with no sentence in it,
+    //    produced by a different corruption offset.
+    //
+    // Matched on the storage engine's phrasing rather than on a `StoreError`
+    // variant because there is no variant for it: `From<lbug::Error>` collapses
+    // every engine failure into `StoreError::Database(String)`. That is the
+    // deeper fix and it is a store-crate change, noted here so the next reader
+    // knows this arm is the workaround and not the design.
+    let engine_corruption = lower.contains("outside the database file")
+        || lower.contains("assertion failed in file")
+        || lower.contains("database error: basic_string")
+        || lower.contains("corrupted wal");
+    if engine_corruption {
+        let path = extract_db_path(&message);
+        return CliDiagnostic::DatabaseCorrupt {
+            path,
+            cause: drop_engine_retry_advice(&message),
+        }
+        .into();
+    }
+
+    // nw-285. A zero-length `.lbug` passes `require_openable_db` by design, and
+    // `open_read_only` does not run `init_schema`, so the first query dies in
+    // the binder. `Table Symbol does not exist` / `Table Vault does not exist`
+    // is an internal sentence for a condition with an obvious remedy.
+    if lower.contains("does not exist")
+        && (lower.contains("binder exception") || lower.contains("table "))
+    {
+        let path = extract_db_path(&message);
+        let detail = match std::fs::metadata(&path).map(|m| m.len()) {
+            Ok(0) => format!("{path} is 0 bytes — an interrupted create leaves exactly this."),
+            Ok(bytes) => format!("{path} is {bytes} bytes, but holds no graph tables."),
+            Err(_) => message.clone(),
+        };
+        return CliDiagnostic::DatabaseNoSchema { path, detail }.into();
+    }
 
     // Only genuine "the DB file is absent" failures map here. A create-path
     // error (`index` / `brain add`) like "open/create store at <path>.lbug:
@@ -6836,6 +7068,12 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // report an unopenable `--db` identically instead of one erroring at once
     // and the other after a 30s boot ceiling.
     require_openable_db(path)?;
+    // nw-285: remember what we tried to open. The engine's binder and assertion
+    // failures ("Table Vault does not exist", "Assertion failed in file ...")
+    // name no path at all, so a diagnostic derived from the message alone
+    // cannot tell the operator WHICH database is broken — and with several
+    // scratch databases open that is the only fact that matters.
+    record_opened_db_path(path);
     let store = GraphStore::open_read_only(path)
         .map_err(|e| daemon_held_store_error(path, &e.to_string()))?;
 
@@ -23955,6 +24193,231 @@ mod cli_help_contract_tests {
                  'no writes', not 'no help'"
             );
         }
+    }
+
+    /// S1/T3c — nw-285. THE FORM THE HARNESS DID NOT HAVE.
+    ///
+    /// `read_path_diagnostics_never_prescribe_a_write` above asks "is this
+    /// remedy dangerous?" and `tests/error_remedy_test.rs` asks "does this
+    /// command exist?". Neither asks "can running this change the outcome?",
+    /// and that is the question every defect in this class turns on. A
+    /// truncated database was answered with "The database may be checkpointing;
+    /// please retry later." — a remedy nobody ran, on a file that no amount of
+    /// waiting lengthens.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? On every `CliDiagnostic`,
+    /// which is why the inventory below is EXHAUSTIVE and destructured rather
+    /// than sampled: adding a variant fails to compile until it is classified,
+    /// and the classification is a human deciding whether the condition can
+    /// clear on its own. `read_path_diagnostics_never_prescribe_a_write`'s own
+    /// inventory holds ONE variant and calls itself explicit; this one holds
+    /// all of them.
+    #[test]
+    fn no_permanent_diagnostic_advises_waiting_it_out() {
+        use miette::Diagnostic;
+
+        /// Can this condition clear without the operator doing anything?
+        #[derive(PartialEq, Debug)]
+        enum Clears {
+            /// Another process is doing something that will finish.
+            OnItsOwn,
+            /// Nothing that runs later changes this file or this fact.
+            Never,
+        }
+
+        let sample = |name: &str| name.to_string();
+        let inventory: Vec<(CliDiagnostic, Clears)> = vec![
+            (
+                CliDiagnostic::DatabaseNotFound { path: sample("d") },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::RepoPathNotFound { path: sample("r") },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
+                Clears::Never,
+            ),
+            (CliDiagnostic::EmptyDatabase, Clears::Never),
+            // The one genuinely transient case: a live holder of the write lock
+            // releases it. Its help says to stop that process rather than to
+            // wait, which is stronger, but waiting is not a lie here.
+            (
+                CliDiagnostic::DatabaseUnavailable {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::OnItsOwn,
+            ),
+            (
+                CliDiagnostic::DatabaseWalUnreplayed {
+                    path: sample("d"),
+                    wal: sample("w"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::DatabaseCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::DatabaseNoSchema {
+                    path: sample("d"),
+                    detail: sample("0 bytes"),
+                },
+                Clears::Never,
+            ),
+            (
+                CliDiagnostic::General {
+                    message: sample("m"),
+                },
+                Clears::Never,
+            ),
+        ];
+
+        // Compile-time completeness: destructuring every variant means a new
+        // one cannot be added without touching this match, and the arm count
+        // must equal the inventory length.
+        fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
+            match diagnostic {
+                CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
+                CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
+                CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
+                CliDiagnostic::EmptyDatabase => "empty_db",
+                CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
+                CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
+                CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+                CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
+                CliDiagnostic::General { .. } => "error",
+            }
+        }
+        let covered: std::collections::HashSet<&str> = inventory
+            .iter()
+            .map(|(diagnostic, _)| classify_is_total(diagnostic))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            inventory.len(),
+            "the inventory must name every variant exactly once"
+        );
+
+        for (diagnostic, clears) in &inventory {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            if *clears == Clears::OnItsOwn {
+                continue;
+            }
+            for phrase in [
+                "retry later",
+                "please retry",
+                "try again later",
+                "and retry",
+            ] {
+                assert!(
+                    !help.to_lowercase().contains(phrase),
+                    "`{code}` is classified as never clearing on its own, yet its \
+                     help says {phrase:?}. That is a remedy nobody can run — the \
+                     nw-318/nw-328 class. Help: {help}"
+                );
+            }
+        }
+    }
+
+    /// nw-285. lbug is built from source in the cargo registry and its `ASSERT`
+    /// macro interpolates `__FILE__`, so a mid-file corruption printed the
+    /// build machine's home directory to the user, verbatim, with no remedy.
+    ///
+    /// The input below is the message reproduced against a real 20 MB index,
+    /// character for character. Asserted here rather than only end to end
+    /// because which corruption OFFSET produces an unwinding C++ exception
+    /// (this) versus a SIGSEGV (`open_crash_guard`, already correct) versus a
+    /// clean read of garbage is not stable across fixture sizes — a test that
+    /// depended on hitting this path would pass for the wrong reason on a small
+    /// database, which is exactly what the first draft of the end-to-end row
+    /// did.
+    #[test]
+    fn a_raw_engine_assertion_is_redacted_and_named_as_corruption() {
+        let raw = "list_all_symbols: query error: Query execution failed: \
+                   Assertion failed in file \
+                   \"/Users/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
+lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
+                   startOffsetInSegment + length <= state.metadata.numValues";
+
+        let redacted = redact_build_paths(raw);
+        assert!(
+            !redacted.contains(".cargo/registry"),
+            "the registry path survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("/Users/someone"),
+            "the username survived, which is the part that must never leave the \
+             machine: {redacted}"
+        );
+        assert!(
+            redacted.contains("lbug-0.19.1"),
+            "the crate and version are the diagnostic part and must survive: \
+             {redacted}"
+        );
+
+        let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+        let code = report
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            code, "nestweaver::db_corrupt",
+            "a C++ assertion escaping the engine is corruption, not a generic \
+             error with no help"
+        );
+        let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("backup restore") && help.contains("re-index"),
+            "corruption must name a recovery: {help}"
+        );
+        assert!(
+            !help.contains(".cargo/registry"),
+            "the redaction must survive classification: {help}"
+        );
+    }
+
+    /// nw-285. The engine appends its own untested guess at a transient cause —
+    /// "The database may be checkpointing; please retry later." — to a
+    /// truncation error whose own facts prove the opposite. Quoting the guess
+    /// under a diagnostic that ends "Do not keep retrying" hands the operator
+    /// two instructions and lets them pick.
+    #[test]
+    fn the_engines_own_retry_guess_is_dropped_but_its_facts_are_kept() {
+        let raw = "failed to open database at /tmp/x.lbug: database error: Runtime \
+                   exception: Cannot read checkpoint: catalog page range starts at \
+                   3567 and spans 5 pages, outside the database file with 1696 \
+                   pages. The database may be checkpointing; please retry later.";
+
+        let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+        assert_eq!(
+            report.code().map(|c| c.to_string()).unwrap_or_default(),
+            "nestweaver::db_corrupt",
+            "a file shorter than its own catalog is truncated, not checkpointing"
+        );
+        let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            !help.to_lowercase().contains("retry later"),
+            "the engine's guess reached the user through the quoted cause: {help}"
+        );
+        assert!(
+            help.contains("outside the database file with 1696 pages"),
+            "the engine's FACTS are the load-bearing part and must survive: {help}"
+        );
     }
 
     /// nw-318 (defect A). `open_store`'s daemon-held refusal is reached ONLY
