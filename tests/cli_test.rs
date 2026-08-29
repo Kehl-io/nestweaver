@@ -6137,3 +6137,138 @@ fn a_bare_calendar_date_is_still_accepted_by_since() {
         }
     }
 }
+
+// ── F-DC-11: `summary --level cluster` computed `total` AFTER the cap ──────
+//
+// `generate_cluster_summaries` truncated to 50 and returned a bare `Vec`,
+// which has nowhere to say "I dropped some". The CLI then took `total` from
+// the already-capped vector, so a 71,184-community graph reported
+// `{returned: 50, total: 50, truncated: false}` — the cap made invisible in
+// exactly the two fields that exist to disclose it.
+//
+// The honesty machinery already existed for `SummaryLevel::Symbol`
+// (`generate_symbol_summaries_bounded` -> `cap_dropped`) and was wired for
+// that level only.
+
+/// 60 modules with three functions each, calling only within their own module.
+/// That is 60 disjoint components of size 3 — comfortably over the cap of 50,
+/// and with no cross-module edge that could let the clusterer merge them.
+fn write_sixty_disjoint_communities(root: &std::path::Path) {
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 1..=60 {
+        std::fs::write(
+            src.join(format!("m{i}.js")),
+            format!(
+                "export function alpha{i}() {{ return beta{i}() + gamma{i}(); }}\n\
+                 export function beta{i}() {{ return gamma{i}(); }}\n\
+                 export function gamma{i}() {{ return {i}; }}\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn summary_at_cluster_level_reports_the_pre_cap_match_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    write_sixty_disjoint_communities(dir.path());
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["summary", "--level", "cluster", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .args(["--token-budget", "0"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("summary --json must emit JSON ({e}):\n{stdout}"));
+
+    let returned = value["returned"].as_u64().unwrap();
+    let total = value["total"].as_u64().unwrap();
+    let truncated = value["truncated"].as_bool().unwrap();
+
+    // The counterweight first: if the cap did not bite, this test proves
+    // nothing and must say so rather than passing vacuously.
+    assert_eq!(
+        returned, 50,
+        "this fixture exists to exercise the 50-cluster cap; if it did not \
+         bite, the assertions below are vacuous:\n{stdout}"
+    );
+    assert!(
+        total > returned,
+        "`total` must count what MATCHED, not what survived the cap. Reporting \
+         `total == returned` beside a capped list is not merely imprecise — it \
+         is the one number a caller would use to decide whether to look \
+         further, saying there is nothing further to look at. \
+         got total={total}, returned={returned}"
+    );
+    assert!(
+        truncated,
+        "`returned == total` and `truncated: false` together are a claim that \
+         the answer is complete. It was not."
+    );
+}
+
+/// The third offender, and the reason this file sweeps all four levels rather
+/// than fixing the one that was reported. `HUB_COUNT` is an internal 30 that
+/// the caller never stated, so `total: 30` is not a truncation notice — it is
+/// a claim that the graph HAS thirty hubs.
+///
+/// `File` is uncapped and `Symbol`'s cap is 500, so on this fixture only
+/// `Cluster` (50) and `Hub` (30) can bite; measured before the fix, both
+/// reported `total == returned` and `truncated: false`.
+#[test]
+fn summary_at_hub_level_reports_the_candidate_population() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    write_sixty_disjoint_communities(dir.path());
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let output = nestweaver_cmd()
+        .args(["summary", "--level", "hub", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .args(["--token-budget", "0"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("summary --json must emit JSON ({e}):\n{stdout}"));
+
+    let returned = value["returned"].as_u64().unwrap();
+    let total = value["total"].as_u64().unwrap();
+    assert_eq!(
+        returned, 30,
+        "this fixture exists to exercise the internal 30-hub bound; if it did \
+         not bite the assertion below is vacuous:\n{stdout}"
+    );
+    assert!(
+        total > returned,
+        "180 symbols carry code edges in this fixture, so 30 is a selection \
+         from a much larger candidate set, not the size of it. \
+         got total={total}, returned={returned}"
+    );
+    assert!(
+        value["truncated"].as_bool().unwrap(),
+        "a bound the caller never asked for and cannot see must at minimum be \
+         disclosed:\n{stdout}"
+    );
+}

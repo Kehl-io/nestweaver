@@ -126,9 +126,35 @@ fn hub_role(in_degree: usize, out_degree: usize) -> &'static str {
 /// cached (generation-gated via the summary sidecar), so `get_summary --level
 /// hub` gives architectural orientation without the ~500ms live hub scan.
 fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
+    generate_hub_summaries_bounded(store).map(|out| out.summaries)
+}
+
+/// Hub summaries with the two facts that say whether the list is complete.
+pub struct HubSummaries {
+    pub summaries: Vec<Summary>,
+    /// Symbols with at least one code edge — the population hubs are drawn from.
+    pub matched_total: usize,
+    pub capped: bool,
+}
+
+/// Hub summaries plus the candidate count they were selected from.
+///
+/// Same finding as [`generate_cluster_summaries_bounded`], one level down, and
+/// found by sweeping the other three `SummaryLevel`s rather than by a report:
+/// `HUB_COUNT` is an INTERNAL constant the caller never stated, so reporting
+/// `total: 30` is a claim that the graph HAS thirty hubs. Measured on a
+/// 60-module fixture with 180 edge-bearing symbols, `summary --level hub`
+/// answered `{returned: 30, total: 30, truncated: false}`.
+///
+/// `Commands::Hubs` is deliberately NOT changed: there `--top N` is the
+/// caller's own request, and returning N of N is the correct answer to it.
+/// The lie is specific to a bound the caller could not see or state.
+pub fn generate_hub_summaries_bounded(store: &GraphStore) -> Result<HubSummaries> {
     const HUB_COUNT: usize = 30;
-    let hubs = crate::hubs::find_hub_nodes(store, HUB_COUNT)?;
-    let summaries = hubs
+    let found = crate::hubs::find_hub_nodes_bounded(store, HUB_COUNT)?;
+    let candidate_total = found.candidate_total;
+    let summaries: Vec<Summary> = found
+        .hubs
         .iter()
         .map(|h| {
             let role = hub_role(h.in_degree, h.out_degree);
@@ -147,7 +173,11 @@ fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             }
         })
         .collect();
-    Ok(summaries)
+    Ok(HubSummaries {
+        capped: candidate_total > summaries.len(),
+        matched_total: candidate_total,
+        summaries,
+    })
 }
 
 /// Default cap on how many symbols an *untargeted* symbol-level summary will

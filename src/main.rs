@@ -11879,6 +11879,57 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
                 }
                 out.summaries
+            } else if parsed_level == SummaryLevel::Cluster {
+                // F-DC-11. Cluster level has the identical shape to Symbol —
+                // an unconditional cap upstream — and had none of the
+                // disclosure. `generate_cluster_summaries` truncated to 50 and
+                // returned a bare `Vec`, which has nowhere to say it dropped
+                // anything, so `total` was taken from the capped vector and a
+                // 71,184-community graph answered
+                // `{returned: 50, total: 50, truncated: false}`.
+                //
+                // The `else` branch below is deliberately not widened to cover
+                // this: File and Hub levels are NOT capped, and folding a
+                // no-op cap into their path would make the disclosure
+                // unfalsifiable for them.
+                let out = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
+                    &store,
+                    nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+                )?;
+                if out.capped {
+                    cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
+                }
+                // Persisted exactly as before: `generate_summaries` saved this
+                // same capped set, and changing WHAT the sidecar holds is a
+                // different decision from reporting the count honestly.
+                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                if let Some(ref t) = target {
+                    filter_by_target(&out.summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    out.summaries
+                }
+            } else if parsed_level == SummaryLevel::Hub {
+                // The third offender, found by sweeping all four levels rather
+                // than by a report: `HUB_COUNT` is an internal 30 the caller
+                // never stated, so `total: 30` was a claim that the graph has
+                // thirty hubs. Measured on a 180-candidate fixture:
+                // `{returned: 30, total: 30, truncated: false}`.
+                let out = nestweaver_engine::summaries::generate_hub_summaries_bounded(&store)?;
+                if out.capped {
+                    cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
+                }
+                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                if let Some(ref t) = target {
+                    filter_by_target(&out.summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    out.summaries
+                }
             } else {
                 let summaries = generate_summaries(&store, parsed_level)?;
                 // Save to sidecar for later use.

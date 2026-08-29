@@ -10132,25 +10132,38 @@ fn tool_schema_get_summary() -> Value {
 
 /// `generate_summaries`, plus the count its return type cannot express.
 ///
-/// Only `SummaryLevel::Cluster` caps inside the generator today, so only that
-/// arm has anything to report — but the shape is per-level on purpose, so a
-/// second capped level cannot be added without deciding what it reports.
+/// The shape is per-level on purpose, so a capped level cannot be added
+/// without deciding what it reports. That paid off: this arm's earlier note
+/// said Cluster was the only generator that caps, and a sweep of all four
+/// levels found `Hub` doing the same thing with an internal `HUB_COUNT` of 30
+/// — measured at `{returned: 30, total: 30, truncated: false}` on a
+/// 180-candidate graph. `File` genuinely does not cap; `Symbol` is handled on
+/// its own fast path above.
 fn generate_summaries_reporting_cap(
     store: &GraphStore,
     level: nestweaver_engine::SummaryLevel,
     cap_dropped: &mut usize,
 ) -> Result<Vec<nestweaver_engine::Summary>, anyhow::Error> {
-    if matches!(level, nestweaver_engine::SummaryLevel::Cluster) {
-        let bounded = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
-            store,
-            nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
-        )?;
-        *cap_dropped = bounded
-            .matched_total
-            .saturating_sub(bounded.summaries.len());
-        return Ok(bounded.summaries);
+    match level {
+        nestweaver_engine::SummaryLevel::Cluster => {
+            let bounded = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
+                store,
+                nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+            )?;
+            *cap_dropped = bounded
+                .matched_total
+                .saturating_sub(bounded.summaries.len());
+            Ok(bounded.summaries)
+        }
+        nestweaver_engine::SummaryLevel::Hub => {
+            let bounded = nestweaver_engine::summaries::generate_hub_summaries_bounded(store)?;
+            *cap_dropped = bounded
+                .matched_total
+                .saturating_sub(bounded.summaries.len());
+            Ok(bounded.summaries)
+        }
+        _ => generate_summaries(store, level),
     }
-    generate_summaries(store, level)
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
