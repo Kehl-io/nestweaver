@@ -6272,3 +6272,85 @@ fn summary_at_hub_level_reports_the_candidate_population() {
          disclosed:\n{stdout}"
     );
 }
+
+// ── nw-289 (deeper property): a generation advance orphans its artifacts ───
+//
+// `.manifests.json` is an identity- AND generation-bound artifact: its
+// envelope records `source_graph_generation`, and `load_manifest_cache_for_db`
+// refuses to decode it when that no longer matches the live graph. The
+// deletion path already handles this — it reads the manifest payload at
+// generation N, advances to N+1, and republishes at N+1. The index/watcher
+// path advances the generation and does not.
+//
+// A markdown/vault index cannot change any code manifest, so the payload stays
+// correct while its BINDING goes stale. The graph then has no manifests for as
+// long as nobody runs a code index, and every CLI consumer loads them with
+// `.unwrap_or_default()` — so the failure is not an error, it is
+// `dead-code` losing its manifest-driven entry points and `suggest-links`
+// losing its cross-repo signal, both silently.
+
+#[test]
+fn a_vault_index_does_not_orphan_the_code_manifest_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"demo-pkg","version":"1.2.3","dependencies":{"left-pad":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/a.js"),
+        "export function hello(){return 1;}\n",
+    )
+    .unwrap();
+    std::fs::write(vault.join("n.md"), "# Note\n").unwrap();
+
+    let db_path = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Baseline: the code index leaves the cache readable. If it did not, the
+    // assertion after the vault index would prove nothing about the vault.
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let manifests = nestweaver_engine::load_manifest_cache_for_db(&store, &db_path)
+            .expect("a code index must leave its own manifest cache readable");
+        assert!(
+            !manifests.is_empty(),
+            "the fixture must actually produce manifests, or the test below is \
+             vacuous"
+        );
+    }
+
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    let manifests = nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).expect(
+        "indexing a VAULT advanced the graph generation and left the code \
+         manifest cache bound to the previous one. A markdown index cannot \
+         change a code manifest, so the payload is still correct — only its \
+         binding went stale, and every CLI consumer swallows that with \
+         `.unwrap_or_default()`",
+    );
+    assert!(
+        !manifests.is_empty(),
+        "and it must still carry the manifests, not merely decode to an empty \
+         map — an invalidation that silently becomes 'this repo has no \
+         manifests' is the same outcome with a different spelling"
+    );
+}

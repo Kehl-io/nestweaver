@@ -93,6 +93,63 @@ pub fn load_manifest_cache_for_db(
     .unwrap_or_default())
 }
 
+/// Advance the graph generation while carrying the manifest cache across the
+/// boundary.
+///
+/// nw-289, deeper property. `.manifests.json` is identity- AND
+/// generation-bound: its envelope records `source_graph_generation`, and
+/// [`load_manifest_cache_for_db`] refuses to decode it once that no longer
+/// matches the live graph. Only the DELETION path reconciled that; every other
+/// generation advance left the artifact orphaned.
+///
+/// Measured before the fix: a code index leaves graph and manifest cache both
+/// at generation 2; a subsequent `brain add` moves the graph to 3, the
+/// manifest cache stays at 2, and from then on
+/// `load_manifest_cache_for_db` fails with "stale artifact generation" until a
+/// code index happens to run. Every CLI consumer loads it with
+/// `.unwrap_or_default()`, so the graph does not report an error — `dead-code`
+/// quietly loses its manifest-driven entry points and `suggest-links` its
+/// cross-repo signal.
+///
+/// REPUBLISH, not invalidate. A markdown index cannot change a code manifest,
+/// so the payload is still correct and only its binding went stale; deleting
+/// the artifact would force a full code re-index to recover data that was
+/// never wrong. The deletion path is the one case whose payload genuinely must
+/// be FILTERED first, and it still does that separately.
+///
+/// Taking the advance as a closure is the point: the read must happen before
+/// it and the write after, and the deletion path's own comment records what
+/// the other ordering costs — "saving at N and then advancing to N+1 makes a
+/// freshly written, identity-bound artifact stale immediately". A helper that
+/// only did the write could be called in the wrong place; this one cannot be.
+///
+/// Read failures are ignored by design. An absent cache is the normal state
+/// for a graph with no code repos, and an ALREADY-stale or corrupt one must
+/// not be re-blessed against a generation it was never derived from — both
+/// simply skip the republish. A WRITE failure is logged rather than returned,
+/// because the graph mutation is already committed and the caller cannot undo
+/// it; the artifact is left stale, which is the pre-existing behaviour.
+pub(crate) fn advancing_generation_rebinding_manifests<T>(
+    store: &nestweaver_store::GraphStore,
+    advance: impl FnOnce() -> T,
+) -> T {
+    let carried = store.db_path().and_then(|db_path| {
+        load_manifest_cache_for_db(store, db_path)
+            .ok()
+            .filter(|manifests| !manifests.is_empty())
+            .map(|manifests| (db_path.to_path_buf(), manifests))
+    });
+    let outcome = advance();
+    if let Some((db_path, manifests)) = carried
+        && let Err(error) = save_manifest_cache_for_db(&manifests, store, &db_path)
+    {
+        tracing::warn!(
+            "could not rebind the manifest cache to the published generation: {error:#};              it stays bound to the previous one and a code re-index will restore it"
+        );
+    }
+    outcome
+}
+
 /// Persist the canonical manifest sidecar and retire the legacy copy only
 /// after the replacement has been durably flushed and renamed into place.
 pub fn save_manifest_cache_for_db(

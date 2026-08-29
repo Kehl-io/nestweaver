@@ -1054,11 +1054,19 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
     // dirty (fail-closed) rather than treating it as a clean commit.
     let mut publication_clean = false;
     if publish_clean {
-        let generation_advanced = if db_path.is_some() {
-            lease.clean_generation()
-        } else {
-            store.try_bump_graph_generation()
-        };
+        // nw-289: the code-index path advances the same generation
+        // `.manifests.json` is bound to. It usually rewrites that cache from
+        // source afterwards, so this is normally a no-op — but "usually" is
+        // not a property, and a scope that indexes no manifest-bearing repo
+        // would otherwise orphan the cache exactly as the vault path did.
+        let generation_advanced =
+            crate::manifest::advancing_generation_rebinding_manifests(store, || {
+                if db_path.is_some() {
+                    lease.clean_generation()
+                } else {
+                    store.try_bump_graph_generation()
+                }
+            });
         let generation_durable = match generation_advanced {
             Err(error) => {
                 push_reconciliation_failure(

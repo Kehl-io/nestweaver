@@ -1030,7 +1030,14 @@ fn index_markdown_since_with_reader(
     // candidate-node count unchanged — the generation bump is the only signal
     // that stales the trigram posting table (mirrors `index.rs` and the full
     // vault index above).
-    store.bump_and_persist_generation();
+    //
+    // nw-289: wrapped so the code manifest cache is carried across the
+    // boundary. A VAULT index advances the generation that `.manifests.json`
+    // is bound to, while being incapable of changing anything the manifest
+    // describes.
+    crate::manifest::advancing_generation_rebinding_manifests(store, || {
+        store.bump_and_persist_generation();
+    });
 
     // Best-effort and AFTER the commit, like the symbol epilogue: a
     // tombstoning failure must not fail a refresh that already succeeded.
@@ -2068,7 +2075,12 @@ where
     // note content. `bump_and_persist_generation` persists to the
     // `<db>.generation` sidecar for persistent stores and just bumps for
     // in-memory ones.
-    store.bump_and_persist_generation();
+    //
+    // nw-289: wrapped for the same reason as the incremental path — see
+    // `advancing_generation_rebinding_manifests`.
+    crate::manifest::advancing_generation_rebinding_manifests(store, || {
+        store.bump_and_persist_generation();
+    });
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
