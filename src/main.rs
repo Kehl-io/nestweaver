@@ -12150,12 +12150,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(requested) => requested,
                 None => {
                     let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
-                    // Adaptive resolution: pick a sensible default based on
-                    // graph size. Large graphs (>10 K symbols) benefit from
-                    // lower resolution to avoid the explosion of tiny
-                    // communities that resolution=1.0 produces.
+                    // F-DC-7: ONE rule, shared with the `clusters` tool and
+                    // `generate_cluster_summaries`. Community IDs are
+                    // ASSIGNMENT-dependent, so two runs at different
+                    // resolutions are two different ID SPACES, not two
+                    // orderings of one. Four copies of this 0.3/0.5 rule
+                    // existed and a fifth (`generate_cluster_summaries`, hard
+                    // coded to 1.0) drifted — which is why 26 of 50 IDs from
+                    // `summary --level cluster` did not resolve through
+                    // `cluster <id>`.
                     let count = store.count_symbols().unwrap_or(0);
-                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };
+                    let adaptive = nestweaver_engine::default_cluster_resolution(&store);
                     symbol_count = Some(count);
                     opened = Some(store);
                     adaptive
@@ -12235,8 +12240,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => {
                     out.status("No cached clusters found; computing with default resolution...");
                     let store = open_store(Some(&db_path))?;
-                    let sym_count = store.count_symbols().unwrap_or(0);
-                    let default_res = if sym_count > 10_000 { 0.3 } else { 0.5 };
+                    // F-DC-7: the same single authority `clusters` uses. This
+                    // is the command that RESOLVES the IDs the others emit, so
+                    // a private copy of the rule here is the one that decides
+                    // whether their output is addressable at all.
+                    let default_res = nestweaver_engine::default_cluster_resolution(&store);
                     let computed = compute_clusters(&store, default_res)?;
                     save_clusters(&db_path, &computed)?;
                     computed

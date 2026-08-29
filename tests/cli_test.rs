@@ -6354,3 +6354,68 @@ fn a_vault_index_does_not_orphan_the_code_manifest_cache() {
          manifests' is the same outcome with a different spelling"
     );
 }
+
+// ── F-DC-7: the adaptive cluster resolution has exactly one definition ─────
+//
+// Community IDs are ASSIGNMENT-dependent, so two runs at different
+// resolutions produce two different ID SPACES rather than two orderings of
+// one. Five copies of the 0.3/0.5 rule existed; the fifth
+// (`generate_cluster_summaries`) was hard-coded to 1.0, which is how
+// `summary --level cluster` came to emit IDs that `cluster <id>` could not
+// resolve — 26 of 50.
+//
+// A behavioural test cannot catch the recurrence: every surviving copy agreed
+// with the authority, so an end-to-end assertion passes on a tree with all of
+// them restored. The defect appears only when one copy is edited and the
+// others are not. What IS checkable is that no second copy exists.
+//
+// This lives in the integration suite, not beside the code, because a sweep
+// that scans `src/main.rs` from within `src/main.rs` matches its own predicate
+// and its own fixture. The alternative — teaching it to skip its own module —
+// is the over-skipping that once let a `src/main.rs` check pass against a tree
+// with the known bugs restored, by cutting the file at line 548 of 29,000.
+
+fn cli_source() -> String {
+    std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+        .expect("src/main.rs must be readable")
+}
+
+#[test]
+fn the_adaptive_cluster_resolution_is_not_open_coded_in_the_cli() {
+    let source = cli_source();
+    // Matched as a PAIR: either literal alone appears legitimately — 0.5 is a
+    // common default and 10_000 a common bound — so either alone would be a
+    // sweep that cries wolf and gets deleted.
+    let offenders: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("10_000") && line.contains("0.3"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the adaptive cluster resolution must come from \
+         `nestweaver_engine::default_cluster_resolution`, not be restated in \
+         the CLI — a private copy silently re-partitions the graph and makes \
+         the IDs every other command emits unaddressable. Found:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The counterweight. A sweep's silence means nothing unless it can be shown
+/// to SEE the shape it forbids, and to be reading the whole file.
+#[test]
+fn the_cluster_resolution_sweep_can_detect_what_it_forbids() {
+    let restored = "                    let adaptive = if count > 10_000 { 0.3 } else { 0.5 };";
+    assert!(
+        restored.trim().contains("10_000") && restored.trim().contains("0.3"),
+        "the predicate must match the literal form the removed copies had"
+    );
+
+    let source = cli_source();
+    assert!(
+        source.lines().count() > 30_000,
+        "the sweep reads {} lines of src/main.rs; if that ever collapses to a \
+         prefix, the test above passes by not looking",
+        source.lines().count()
+    );
+}
