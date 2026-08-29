@@ -81,12 +81,20 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex, StoreError> {
         .map_err(|e| StoreError::Query(format!("invalid regex: {e}")))
 }
 
+/// File line of a frontmatter block's FIRST content line.
+///
+/// Line 1 is the opening `---` fence, so the YAML itself starts at 2. The
+/// markdown parser already shifts every heading/section/wikilink line to be
+/// file-absolute, so a frontmatter candidate anchored here keeps `regex_search`
+/// line numbers honest across the whole file (nw-298).
+const FRONTMATTER_START_LINE: u32 = 2;
+
 /// A single regex match hit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegexMatch {
     /// Node UID (sym:..., sec:..., note:...).
     pub uid: String,
-    /// Node kind discriminator: "Symbol", "Section", or "Note".
+    /// Node kind discriminator: "Symbol", "Section", "Note" or "Frontmatter".
     pub kind: String,
     /// Human-readable title (symbol name, heading text, or note title).
     pub title: String,
@@ -740,9 +748,17 @@ impl GraphStore {
         Ok(scopes)
     }
 
-    /// Collect all searchable candidate nodes (Sections, Notes, Symbols),
-    /// optionally filtered by `path_prefix` (matched against location) and
-    /// `kinds` (case-insensitive kind names: "Section", "Note", "Symbol").
+    /// Collect all searchable candidate nodes (Sections, Notes, Frontmatter,
+    /// Symbols), optionally filtered by `path_prefix` (matched against
+    /// location) and `kinds` (case-insensitive kind names: "Section", "Note",
+    /// "Frontmatter", "Symbol").
+    ///
+    /// "Frontmatter" is the fourth shape and was absent (nw-298). Frontmatter
+    /// is split off the source before sectioning, so it reaches no Section, and
+    /// the Note branch indexes only the title — so a string present ONLY in
+    /// frontmatter was in the graph as a column and in no candidate at all.
+    /// `brain_search` found the same string because its indexer reads the file
+    /// off disk, so one database answered "yes" and "no" to the same question.
     fn collect_candidates(
         &self,
         path_prefix: Option<&str>,
@@ -841,6 +857,42 @@ impl GraphStore {
                     text: n.title,
                     // A note's title has no meaningful file line offset.
                     start_line: 1,
+                });
+            }
+        }
+
+        // Frontmatter — the raw YAML, with a real file line offset.
+        if want_kind("Frontmatter") {
+            for n in self.list_notes(None)? {
+                if interrupted()? {
+                    return Ok((out, Some(RegexTruncationReason::Deadline)));
+                }
+                let Some(raw) = n.frontmatter_raw.filter(|raw| !raw.is_empty()) else {
+                    continue;
+                };
+                if let Some(prefix) = path_prefix
+                    && !n.file_path.starts_with(prefix)
+                {
+                    continue;
+                }
+                if out.len() >= limits.max_candidates {
+                    return Ok((out, Some(RegexTruncationReason::CandidateCap)));
+                }
+                out.push(Candidate {
+                    // The note's own uid, deliberately: a synthetic
+                    // `uid#frontmatter` would leak a string that names no node
+                    // into `RegexMatch.uid`. Two candidates may share a uid with
+                    // different kinds; the trigram loader yields both and the
+                    // verification pass decides.
+                    uid: n.uid,
+                    scope_uid: n.vault_uid,
+                    text_hash: text_hash(&raw),
+                    kind: "Frontmatter".to_string(),
+                    title: n.title,
+                    location: format!("{}:{FRONTMATTER_START_LINE}", n.file_path),
+                    text: raw,
+                    // Line 1 is the opening `---`; the block's first line is 2.
+                    start_line: FRONTMATTER_START_LINE,
                 });
             }
         }
@@ -950,7 +1002,7 @@ impl GraphStore {
                 .map(|note| (note.uid.clone(), note.file_path.clone()))
                 .collect();
             if want_kind("Note") {
-                for note in notes {
+                for note in &notes {
                     if interrupted()? {
                         return Ok((candidates, Some(RegexTruncationReason::Deadline)));
                     }
@@ -963,14 +1015,44 @@ impl GraphStore {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
                     candidates.push(Candidate {
-                        uid: note.uid,
-                        scope_uid: note.vault_uid,
+                        uid: note.uid.clone(),
+                        scope_uid: note.vault_uid.clone(),
                         text_hash: text_hash(&note.title),
                         kind: "Note".to_string(),
                         title: note.title.clone(),
-                        location: note.file_path,
-                        text: note.title,
+                        location: note.file_path.clone(),
+                        text: note.title.clone(),
                         start_line: 1,
+                    });
+                }
+            }
+            // nw-298: the same fourth shape the corpus-wide collector emits, so
+            // the trusted-shard path and the full-scan path cannot disagree
+            // about whether a frontmatter string exists.
+            if want_kind("Frontmatter") {
+                for note in &notes {
+                    if interrupted()? {
+                        return Ok((candidates, Some(RegexTruncationReason::Deadline)));
+                    }
+                    let Some(raw) = note.frontmatter_raw.as_deref().filter(|r| !r.is_empty())
+                    else {
+                        continue;
+                    };
+                    if path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix)) {
+                        continue;
+                    }
+                    if candidates.len() >= limits.max_candidates {
+                        return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
+                    }
+                    candidates.push(Candidate {
+                        uid: note.uid.clone(),
+                        scope_uid: note.vault_uid.clone(),
+                        text_hash: text_hash(raw),
+                        kind: "Frontmatter".to_string(),
+                        title: note.title.clone(),
+                        location: format!("{}:{FRONTMATTER_START_LINE}", note.file_path),
+                        text: raw.to_string(),
+                        start_line: FRONTMATTER_START_LINE,
                     });
                 }
             }
@@ -1091,19 +1173,38 @@ impl GraphStore {
                 }
             }
         }
-        if want_kind("Note") {
+        // Notes and Frontmatter share a uid, so one lookup serves both.
+        if want_kind("Note") || want_kind("Frontmatter") {
             for chunk in ordered.chunks(256) {
                 if interrupted()? {
                     return Ok((candidates, Some(RegexTruncationReason::Deadline)));
                 }
                 for note in self.lookup_notes_by_uids(chunk)? {
-                    if note.title.is_empty()
-                        || path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix))
-                    {
+                    if path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix)) {
                         continue;
                     }
                     if candidates.len() >= limits.max_candidates {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
+                    }
+                    // nw-298: a posting for this uid may have come from the
+                    // note's TITLE or from its FRONTMATTER — the two share a
+                    // uid — so emit both shapes and let verification decide.
+                    if let Some(raw) = note.frontmatter_raw.as_deref().filter(|r| !r.is_empty())
+                        && want_kind("Frontmatter")
+                    {
+                        candidates.push(Candidate {
+                            uid: note.uid.clone(),
+                            scope_uid: note.vault_uid.clone(),
+                            text_hash: text_hash(raw),
+                            kind: "Frontmatter".to_string(),
+                            title: note.title.clone(),
+                            location: format!("{}:{FRONTMATTER_START_LINE}", note.file_path),
+                            text: raw.to_string(),
+                            start_line: FRONTMATTER_START_LINE,
+                        });
+                    }
+                    if note.title.is_empty() || !want_kind("Note") {
+                        continue;
                     }
                     candidates.push(Candidate {
                         uid: note.uid,
@@ -1897,6 +1998,7 @@ mod tests {
                 word_count: 0,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -2103,6 +2205,7 @@ mod tests {
                 word_count: 0,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -2155,6 +2258,7 @@ mod tests {
                 word_count: 0,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -2836,6 +2940,7 @@ mod tests {
                 word_count: 0,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
@@ -2932,6 +3037,7 @@ mod tests {
                 word_count: 0,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

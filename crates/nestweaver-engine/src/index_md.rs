@@ -1250,6 +1250,7 @@ fn prepare_single_note(
         note_kind: parsed.note_kind,
         word_count: parsed.word_count,
         content_hash: parsed.content_hash.clone(),
+        frontmatter_raw: parsed.frontmatter_raw.clone(),
         frontmatter: frontmatter_json,
         created_at,
         modified_at,
@@ -1620,6 +1621,7 @@ where
             word_count: parsed.word_count,
             content_hash: parsed.content_hash.clone(),
             frontmatter: frontmatter_json,
+            frontmatter_raw: parsed.frontmatter_raw.clone(),
             created_at,
             modified_at,
             pagerank_score: None,
@@ -3223,6 +3225,59 @@ mod tests {
         );
     }
 
+    /// nw-298 / F-VAULT-5: a string present ONLY in YAML frontmatter is
+    /// invisible to `regex_search` / `count_patterns` while `brain_search`
+    /// finds it. Two query surfaces over one database must not disagree about
+    /// whether a string exists.
+    #[test]
+    fn regex_search_sees_frontmatter_only_text() {
+        let (_dir, root) = make_vault(&[(
+            "Backlog.md",
+            "---\nitems:\n  - id: nw-231\n    note: 'saves-and-exits on device'\n---\n             # Backlog\n\nBody text only.\n",
+        )]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let hits = store
+            .regex_search("saves-and-exits", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "frontmatter text must be reachable from the exact-match surface; \
+             brain_search finds it and regex_search reports posting_hits: 0"
+        );
+
+        let counts = store
+            .count_patterns(&["nw-231".to_string()], None, None)
+            .unwrap();
+        assert_eq!(
+            counts[0].files_matched, 1,
+            "count_patterns must not report a confident zero for text that is present"
+        );
+    }
+
+    /// nw-298, the half that makes the visibility UNSTABLE rather than merely
+    /// asymmetric: a YAML-shaped pattern must match too. Indexing the stored
+    /// `Note.frontmatter` JSON column would satisfy the bare-token test above
+    /// and still fail this one.
+    #[test]
+    fn regex_search_matches_yaml_shaped_frontmatter_patterns() {
+        let (_dir, root) = make_vault(&[(
+            "Backlog.md",
+            "---\nid: nw-231\nstatus: ready\n---\n# Backlog\n\nBody.\n",
+        )]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let hits = store
+            .regex_search(r"(?m)^status: ready$", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "the RAW frontmatter text must be indexed, not the JSON re-encoding \
+             — a YAML-shaped regex is exactly what the vault's own backlog \
+             queries look like (nw-298)"
+        );
+    }
+
     #[test]
     fn indexes_simple_vault() {
         let (_dir, root) = make_vault(&[
@@ -4732,6 +4787,7 @@ sub b body
             word_count: 3,
             content_hash: format!("hash{i}"),
             frontmatter: None,
+            frontmatter_raw: None,
             created_at: None,
             modified_at: None,
             pagerank_score: None,

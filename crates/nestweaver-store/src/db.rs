@@ -2767,6 +2767,9 @@ impl GraphStore {
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
         // Migration: add `name` column to pre-existing Repo tables that lack it.
+        // nw-298: the raw frontmatter text. Existing databases predate the
+        // column, and `CREATE TABLE IF NOT EXISTS` will not add it.
+        let _ = conn.query("ALTER TABLE Note ADD frontmatter_raw STRING DEFAULT ''");
         let _ = conn.query("ALTER TABLE Repo ADD name STRING DEFAULT ''");
         // Migration: add `root_path` column to pre-existing Repo tables that
         // lack it. Empty string maps to `None` on read (see read.rs).
@@ -2926,6 +2929,7 @@ impl GraphStore {
                 word_count INT64, \
                 content_hash STRING, \
                 frontmatter STRING, \
+                frontmatter_raw STRING, \
                 created_at STRING, \
                 modified_at STRING, \
                 pagerank_score DOUBLE, \

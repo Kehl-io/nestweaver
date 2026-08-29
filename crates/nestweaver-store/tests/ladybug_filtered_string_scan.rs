@@ -41,6 +41,7 @@ fn filtered_string_scan_preserves_every_selected_value_across_batches() {
                 word_count: index as u32,
                 content_hash: format!("hash-{index:05}"),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

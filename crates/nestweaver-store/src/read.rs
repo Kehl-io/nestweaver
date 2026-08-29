@@ -269,7 +269,8 @@ pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.fi
      s.framework_hint, s.canonical_id";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
-     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
+     n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score, \
+     n.frontmatter_raw";
 
 pub(crate) const HEADING_COLUMNS: &str = "h.uid, h.note_uid, h.level, h.text, h.slug, \
      h.start_line, h.end_line, h.content_hash";
@@ -339,7 +340,10 @@ fn parse_note_kind(s: &str) -> NoteKind {
 
 /// Build a Note from a query row with columns:
 /// uid, vault_uid, file_path, title, note_kind, word_count, content_hash,
-/// frontmatter, created_at, modified_at, pagerank_score
+/// frontmatter, created_at, modified_at, pagerank_score, frontmatter_raw
+///
+/// `frontmatter_raw` is APPENDED, not inserted next to `frontmatter`, so every
+/// existing positional index in this function stays valid.
 pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let uid = extract_string(row, 0)?;
     let vault_uid = extract_string(row, 1)?;
@@ -353,6 +357,12 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     let created_at = extract_opt_string(row, 8)?;
     let modified_at = extract_opt_string(row, 9)?;
     let pagerank_score = extract_f64(row, 10)?;
+    // Absent on a database written before the column existed; `extract_opt_string`
+    // maps both a missing value and the `''` migration default to `None`.
+    let frontmatter_raw = row
+        .get(11)
+        .and_then(|_| extract_opt_string(row, 11).ok())
+        .flatten();
 
     Ok(Note {
         uid,
@@ -363,6 +373,7 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
         word_count,
         content_hash,
         frontmatter,
+        frontmatter_raw,
         created_at,
         modified_at,
         pagerank_score: Some(pagerank_score),
@@ -3279,6 +3290,7 @@ mod repo_has_content_tests {
                 word_count: 1,
                 content_hash: "h".to_string(),
                 frontmatter: None,
+                frontmatter_raw: None,
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,

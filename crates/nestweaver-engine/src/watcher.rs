@@ -784,7 +784,20 @@ impl BrainWatcher {
                     (s_uid, s.text.clone(), heading_title)
                 })
                 .collect();
-            let body_chunks: Vec<String> = parsed.sections.iter().map(|s| s.text.clone()).collect();
+            // nw-298: the BM25 body must include the frontmatter, or search
+            // visibility becomes TIME-DEPENDENT rather than merely asymmetric.
+            // The cold full-reindex path reads the whole file off disk
+            // (`tantivy_index.rs::write_full_corpus`), frontmatter included; this
+            // incremental path rebuilds the body from section text, and sections
+            // are cut from the body AFTER frontmatter is split off. So a note's
+            // frontmatter silently dropped out of `brain_search` on the first
+            // watcher-driven re-index — invisible from the CLI, and a different
+            // answer to the same query depending on when it was asked.
+            let mut body_chunks: Vec<String> = Vec::with_capacity(parsed.sections.len() + 1);
+            if let Some(raw) = parsed.frontmatter_raw.as_deref().filter(|r| !r.is_empty()) {
+                body_chunks.push(raw.to_string());
+            }
+            body_chunks.extend(parsed.sections.iter().map(|s| s.text.clone()));
             let tag_names: Vec<String> = parsed.tags.iter().map(|t| t.name.clone()).collect();
             if let Err(e) = t.update_note(
                 &n_uid,
@@ -1007,6 +1020,7 @@ fn reinsert_note(
             word_count: parsed.word_count,
             content_hash: parsed.content_hash.clone(),
             frontmatter: frontmatter_json,
+            frontmatter_raw: parsed.frontmatter_raw.clone(),
             created_at,
             modified_at,
             pagerank_score: None,
@@ -1422,6 +1436,51 @@ mod tests {
         assert_eq!(
             manifests.values().next().unwrap().package_name.as_deref(),
             Some("watched-package")
+        );
+    }
+
+    /// nw-298, the UNSTABLE half: `brain_search`'s ability to find a
+    /// frontmatter-only string was an accident of the cold full-reindex path,
+    /// which reads the whole file off disk. This incremental path rebuilds the
+    /// BM25 body from SECTION text, and sections are cut from the body after
+    /// frontmatter is split off — so a note's frontmatter silently dropped out
+    /// of search on the first watcher-driven re-index. Same query, different
+    /// answer depending on when it was asked, and invisible from the CLI.
+    #[test]
+    fn watcher_reindex_keeps_frontmatter_searchable() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[(
+            "backlog.md",
+            "---\nid: nw-231\nnote: saves-and-exits on device\n---\n# Backlog\n\nBody text only.\n",
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let tantivy_path = db_dir.path().join("tantivy");
+        let tantivy = TantivyIndex::open_or_create(&tantivy_path).unwrap();
+
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .handle_event(
+                &store,
+                Some(&tantivy),
+                "vlt:test",
+                root.join("backlog.md"),
+                None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .unwrap();
+
+        assert!(
+            !tantivy.search("Backlog", 10).unwrap().is_empty(),
+            "precondition: the note itself is indexed"
+        );
+        assert!(
+            !tantivy.search("saves-and-exits", 10).unwrap().is_empty(),
+            "a frontmatter-only string must survive an incremental re-index — \
+             the cold path finds it by reading the file off disk, so without \
+             this the two paths disagree over time (nw-298)"
         );
     }
 

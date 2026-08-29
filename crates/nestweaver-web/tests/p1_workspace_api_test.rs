@@ -90,6 +90,7 @@ fn note(uid: &str, vault_uid: &str, title: &str, score: f64) -> Note {
         word_count: 25,
         content_hash: format!("{title}-hash"),
         frontmatter: None,
+        frontmatter_raw: None,
         created_at: None,
         modified_at: None,
         pagerank_score: Some(score),
