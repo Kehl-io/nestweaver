@@ -748,8 +748,22 @@ fn verify_requested_config_evidence(
             RestartConfig::Configured(path) => path.display().to_string(),
             RestartConfig::CompiledDefaults => "compiled defaults".to_string(),
         };
+        // nw-303: the REFUSAL is correct and stays. `--config` is a
+        // daemon-lifetime binding, not a per-command flag: one file carries
+        // `[authz]` policy, ranking priors, indexing limits, the repo list and
+        // server settings, and the daemon builds its permission source ONCE at
+        // startup. A running daemon cannot adopt another config's
+        // authorization policy per request, so honouring only the identity
+        // half while silently dropping the rest would be worse than saying no.
+        //
+        // What was missing is the other half of the sentence. A user who
+        // arrives here from `docs/guide/instance-id-migration.md` wants to put
+        // data under a named instance; they were told only the thing that does
+        // not work for a single command. `--instance` IS carried per-request
+        // (it is a field on the RPC, unlike a config), works against a running
+        // daemon, and needs no restart — so name it.
         anyhow::bail!(
-            "explicit --config {} does not match the running daemon's effective config ({effective_description}). {}",
+            "explicit --config {} does not match the running daemon's effective config              ({effective_description}).\n--config binds a daemon for its LIFETIME — it              also carries [authz], ranking priors, indexing limits and server settings,              which a running daemon built once at startup and cannot re-adopt per              request. {}\nTo place this ONE command's data under a different instance              without restarting anything, pass `--instance <id>` instead: it is carried              per-request and overrides the daemon's default.",
             requested.as_path().unwrap().display(),
             restart_with_requested_config_remedy(db_path, requested)
         );
@@ -1762,6 +1776,26 @@ credential_method = "gh"
         );
         assert!(message.contains("daemon --db"), "{message}");
         assert!(message.contains("restart --config"), "{message}");
+
+        // nw-303: the refusal must also name the thing that DOES work for a
+        // single command. Backlog filed this `high` and the black-box evidence
+        // graded it `low`, recommending documentation; the refusal itself is a
+        // deliberate safety property (a `--config` also carries [authz], which
+        // a running daemon built once at startup and cannot re-adopt per
+        // request — half-applying it silently would be worse than refusing).
+        // So the behaviour stays and the MESSAGE is the fix: a user who
+        // arrives from the instance-id migration runbook was told only the
+        // thing that cannot work.
+        assert!(
+            message.contains("--instance"),
+            "the refusal must name the per-command identity override, which \
+             unlike --config is carried on the RPC and reaches a running \
+             daemon: {message}"
+        );
+        assert!(
+            message.contains("LIFETIME"),
+            "and must say WHY --config cannot be adopted per-request: {message}"
+        );
 
         let defaults = verify_requested_config_evidence(
             &db,
