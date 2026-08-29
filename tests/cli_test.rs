@@ -5791,3 +5791,101 @@ fn detect_implicit_projects_refuses_a_vault_it_cannot_enumerate() {
         "the error must name the readability failure: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// nw-308 / F-DC-13 — `hubs` / `bridges` must disclose stale rankings on the
+// JSON payload, not only on stderr.
+// ---------------------------------------------------------------------------
+
+/// Index a small repo and return its database path.
+fn indexed_ranking_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("a.js"),
+        "import { b } from './b.js';\nexport function a() { return b(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("b.js"),
+        "export function b() { return 1; }\nexport function c() { return b(); }\n",
+    )
+    .unwrap();
+    let db = dir.path().join("graph.lbug");
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    db
+}
+
+fn ranking_json(db: &std::path::Path, command: &str) -> serde_json::Value {
+    let out = nestweaver_cmd()
+        .args([command, "--json", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{command} --json: {e}\n{stdout}"))
+}
+
+/// A database whose resolver-generation record is absent is exactly the
+/// upgrade case: every repo's edges predate the current resolver, so every
+/// ranking is stale. `warn_stale_resolver_rankings` already says so — on
+/// stderr, where the `--json` consumer most likely to act on it cannot see it.
+fn forget_resolver_generation(db: &std::path::Path) {
+    let sidecar = sidecar_path(db, ".resolver_generation.json");
+    std::fs::remove_file(&sidecar).unwrap();
+}
+
+#[test]
+fn hubs_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    // Freshly indexed: current by construction, and the disclosure must not
+    // cry wolf.
+    let fresh = ranking_json(&db, "hubs");
+    assert_eq!(
+        fresh["rankings_stale"], false,
+        "a repo indexed by this binary is not stale: {fresh}"
+    );
+    assert!(
+        fresh["hubs"].is_array(),
+        "the rows keep their own key: {fresh}"
+    );
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "hubs");
+    assert_eq!(
+        stale["rankings_stale"], true,
+        "no generation record means every repo predates the current resolver: {stale}"
+    );
+    assert!(
+        stale["stale_repos"].as_array().is_some_and(|a| !a.is_empty()),
+        "and the payload must name which repos, so the caller can re-index them: {stale}"
+    );
+}
+
+/// `bridges` is the same shape one screen away. Fixing only `hubs` would be
+/// the same scoping error this remediation is about.
+#[test]
+fn bridges_json_discloses_stale_rankings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = indexed_ranking_db(&dir);
+
+    let fresh = ranking_json(&db, "bridges");
+    assert_eq!(fresh["rankings_stale"], false, "payload: {fresh}");
+    assert!(fresh["bridges"].is_array(), "payload: {fresh}");
+
+    forget_resolver_generation(&db);
+    let stale = ranking_json(&db, "bridges");
+    assert_eq!(stale["rankings_stale"], true, "payload: {stale}");
+    assert!(
+        stale["stale_repos"].as_array().is_some_and(|a| !a.is_empty()),
+        "payload: {stale}"
+    );
+}

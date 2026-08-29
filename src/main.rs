@@ -1340,6 +1340,88 @@ fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
     );
 }
 
+/// The ranking-staleness disclosure, as fields on a `--json` payload.
+///
+/// nw-308: [`warn_stale_resolver_rankings`] carries exactly these facts, but
+/// sends them to STDERR only — deliberately, so `--json` could keep emitting a
+/// bare array. That contract is what makes the disclosure unreachable: an agent
+/// reading `--json` parses stdout, so the consumer most likely to ACT on a
+/// stale ranking is the one that cannot see it. Bumping `RESOLVER_GENERATION`
+/// marks every already-indexed repo stale at a stroke, which turns "an agent
+/// might miss the warning" into "every repo in the graph returns pre-fix
+/// rankings and nothing on stdout says so".
+struct ResolverStaleness {
+    /// True when at least one repo's edges are known to predate the current
+    /// resolver, or when no generation record exists at all.
+    rankings_stale: bool,
+    /// The repos that can be PROVEN stale, so the caller knows what to
+    /// re-index. May be empty while `rankings_stale` is true — see
+    /// [`ResolverStaleness::from_sidecar`].
+    stale_repos: Vec<String>,
+}
+
+impl ResolverStaleness {
+    /// Exact answer: enumerate the repos and compare each recorded generation.
+    /// Available only where we hold the store, i.e. the direct path.
+    fn from_store(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) -> Self {
+        let uids: Vec<String> = store
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.uid)
+            .collect();
+        let stale_repos = nestweaver_engine::resolver_generation::load(db_path)
+            .stale_repos(uids.iter().map(String::as_str));
+        Self {
+            rankings_stale: !stale_repos.is_empty(),
+            stale_repos,
+        }
+    }
+
+    /// Sidecar-only answer, for the daemon path — which has no store handle and
+    /// must not open one, since the daemon owns the write lock.
+    ///
+    /// This is an UNDER-approximation and deliberately so. It catches the two
+    /// cases the sidecar can prove: no record at all (every repo predates the
+    /// record, the common upgrade case), and a recorded repo whose generation
+    /// is behind. A repo that is in the graph but absent from a non-empty
+    /// sidecar is stale and invisible here — the same blind spot
+    /// [`warn_stale_resolver_rankings_no_store`] already has on this route.
+    /// Reporting what can be proven beats reporting nothing, and it is never
+    /// a FALSE alarm.
+    fn from_sidecar(db_path: &std::path::Path) -> Self {
+        let sidecar = nestweaver_engine::sidecar_path(
+            db_path,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        let generations = nestweaver_engine::resolver_generation::load(db_path);
+        let recorded: Vec<String> = generations.repos.keys().cloned().collect();
+        let stale_repos = generations.stale_repos(recorded.iter().map(String::as_str));
+        Self {
+            rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
+            stale_repos,
+        }
+    }
+}
+
+/// Print a ranking payload as an OBJECT carrying its own staleness, rather than
+/// the bare array that had nowhere to put it (nw-308).
+fn print_ranking_json<T: serde::Serialize>(
+    key: &str,
+    rows: &T,
+    staleness: &ResolverStaleness,
+) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            key: rows,
+            "rankings_stale": staleness.rankings_stale,
+            "stale_repos": staleness.stale_repos,
+        }))?
+    );
+    Ok(())
+}
+
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
 /// mistaken for a result set.
 ///
@@ -11347,7 +11429,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None => Vec::new(),
                 };
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&hubs)?);
+                    // nw-308: the daemon route is the DEFAULT route, so the
+                    // payload disclosure has to be here as well as on the
+                    // direct path below.
+                    print_ranking_json("hubs", &hubs, &ResolverStaleness::from_sidecar(&db_path))?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
@@ -11395,12 +11480,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // this machine the FIXED binary still returned the bug report's
             // exact ranking until the repo was re-indexed. Say so rather than
             // presenting stale numbers as current. Written to stderr so it
-            // reaches the user in --json mode too, without altering the
-            // documented bare-array payload.
+            // reaches the user in --json mode too. nw-308: stderr alone was
+            // not enough — the bare-array payload had nowhere to put this, so
+            // the `--json` consumer never saw it. The payload now carries it.
             warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&hubs)?);
+                print_ranking_json("hubs", &hubs, &ResolverStaleness::from_store(&store, &db_path))?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
             } else {
@@ -11456,7 +11542,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .context("decode bridge nodes from the daemon")?,
                         };
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&bridges)?);
+                        // nw-308: same disclosure as `hubs`; bridges are
+                        // downstream of the same edges.
+                        print_ranking_json(
+                            "bridges",
+                            &bridges,
+                            &ResolverStaleness::from_sidecar(&db_path),
+                        )?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
                     } else {
@@ -11507,7 +11599,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&bridges)?);
+                print_ranking_json(
+                    "bridges",
+                    &bridges,
+                    &ResolverStaleness::from_store(&store, &db_path),
+                )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
             } else {
