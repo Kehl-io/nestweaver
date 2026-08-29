@@ -23608,11 +23608,29 @@ mod cli_help_contract_tests {
             // beside the database, so it resolves the pair through the same
             // `resolve_db_with_config` helper every other entry here uses.
             "nestweaver extensions list",
+            // nw-281(b): added deliberately, and it is the first MUTATING
+            // entry in this inventory that writes a sidecar rather than the
+            // graph. It resolves the pair through `resolve_db_with_config` —
+            // the same helper `extensions list` beside it uses — which is the
+            // resolver that also runs `assert_config_expected_brain`, so a
+            // pinned config cannot delete out of a different instance's graph.
+            // That is the decision this inventory exists to force: a delete
+            // verb inheriting a READ command's resolution would be the wrong
+            // answer even though it is the neighbouring one.
+            "nestweaver extensions unset",
             "nestweaver flow-trace",
             "nestweaver generate-guide",
             "nestweaver hubs",
             "nestweaver impact",
             "nestweaver index",
+            // nw-313: added deliberately, and deliberately UNLIKE its three
+            // siblings. `interactions status`/`clear`/`show` take only `--db`
+            // and resolve it with `db.unwrap_or_else(default_db_path)`; they
+            // read. This one mutates, so it takes `--config` and resolves
+            // through `resolve_db_with_config`, which additionally asserts the
+            // config's expected brain. Matching the siblings would have been
+            // the consistent choice and the wrong one.
+            "nestweaver interactions forget",
             "nestweaver list-links",
             "nestweaver list-projects",
             "nestweaver list-repos",
