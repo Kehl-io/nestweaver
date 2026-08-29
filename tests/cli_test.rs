@@ -6419,3 +6419,156 @@ fn the_cluster_resolution_sweep_can_detect_what_it_forbids() {
         source.lines().count()
     );
 }
+
+// ── nw-311 / D2-E4: `service-summary` renders the pre-resolver shape ───────
+//
+// `nestweaver_engine::query::service_summary` is the single resolver: it
+// returns the chosen service FLATTENED alongside `matched`, `alternatives` and
+// `entry_points`, and carries the ambiguity text as
+// `ServiceSummary::ambiguity_warning`. The CLI calls neither. Its daemon
+// branch deserializes the envelope back down to a bare `Service` — which still
+// succeeds, because the service is flattened, so nothing looks broken — and
+// its direct branch re-implements the resolution with its own
+// `list_services` + filter and its own copy of the warning.
+//
+// Two consequences. The daemon route drops the ambiguity disclosure entirely,
+// which is the divergence nw-311 is about. And BOTH routes drop the entry
+// points, which `--help` has always promised: "Show a service summary with
+// entry points".
+
+/// Two services with the same name, in two repos, each with one entry-point
+/// symbol and one ordinary symbol so the entry-point filter has something to
+/// exclude. Persistent (not in-memory) because the CLI opens by path.
+fn seed_ambiguous_services(db_path: &std::path::Path) {
+    use nestweaver_schema::{Repo, Service, Symbol, SymbolKind, Visibility};
+
+    let store = nestweaver_store::GraphStore::open_or_create(db_path).unwrap();
+    for i in 0..2 {
+        let repo_uid = format!("repo:test:{i:012x}");
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.clone(),
+                url: format!("https://github.com/example/r{i}"),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: Some(format!("r{i}")),
+                root_path: None,
+            })
+            .unwrap();
+        let svc_uid = format!("svc:{repo_uid}:{i:012x}");
+        store
+            .insert_service(&Service {
+                uid: svc_uid.clone(),
+                name: "checkout".to_string(),
+                repo_uid: repo_uid.clone(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            })
+            .unwrap();
+        let mk = |suffix: &str, name: &str, entry: bool| Symbol {
+            uid: format!("sym:{repo_uid}:{suffix}"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.clone(),
+            file_path: format!("src/{suffix}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("{repo_uid}:{suffix}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let entry = mk("entry", "handler", true);
+        let plain = mk("plain", "helper", false);
+        store.insert_symbol(&entry).unwrap();
+        store.insert_symbol(&plain).unwrap();
+        store
+            .batch_insert_service_symbol_edges(&[
+                (svc_uid.as_str(), entry.uid.as_str()),
+                (svc_uid.as_str(), plain.uid.as_str()),
+            ])
+            .unwrap();
+    }
+    drop(store);
+}
+
+#[test]
+fn service_summary_json_carries_the_resolvers_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    seed_ambiguous_services(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["service-summary", "checkout", "--json"])
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--json must emit JSON ({e}):\n{stdout}"));
+
+    // The flattened `Service` must still be there — the envelope is a
+    // SUPERSET, so an existing consumer keeps working.
+    assert!(
+        value.get("uid").is_some() && value["name"] == "checkout",
+        "the payload must stay a superset of the bare Service it replaced:\n{stdout}"
+    );
+    assert_eq!(
+        value["matched"], 2,
+        "two services carry this name; a payload that cannot say so is how \
+         `service-summary` silently answered one of several questions:\n{stdout}"
+    );
+    assert_eq!(
+        value["alternatives"].as_array().map(Vec::len),
+        Some(1),
+        "the candidate it did NOT choose must be listed, or the caller cannot \
+         re-ask unambiguously:\n{stdout}"
+    );
+    assert_eq!(
+        value["entry_points"].as_array().map(Vec::len),
+        Some(1),
+        "`--help` says 'Show a service summary with entry points'; the one \
+         entry-point symbol must be there and the ordinary symbol must \
+         not:\n{stdout}"
+    );
+}
+
+#[test]
+fn service_summary_text_warns_about_ambiguity_and_lists_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    seed_ambiguous_services(&db_path);
+
+    let output = nestweaver_cmd()
+        .args(["service-summary", "checkout"])
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("matches 2 services"),
+        "an ambiguous name must warn, on stderr, naming the count:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("handler"),
+        "the entry point `--help` promises must actually be printed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("helper"),
+        "and only ENTRY POINTS — listing every symbol in the service would be \
+         a different command:\n{stdout}"
+    );
+}

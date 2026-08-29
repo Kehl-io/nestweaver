@@ -2590,6 +2590,15 @@ enum Commands {
         name: String,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
+        /// nw-311: 6.4.0 shipped `--repo` for `impact` ("apply it to
+        /// uniquely-resolving names, not just ambiguous ones") and left
+        /// `service-summary` without it, so the one command that most often
+        /// hits a same-named service in several repos had no way to say which.
+        #[arg(
+            long,
+            help = "Restrict to one repository (uid, name, url or local root)"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -10504,80 +10513,90 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::ServiceSummary {
             name,
             instance,
+            repo,
             json,
             db,
         } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
+            // nw-311. ONE shape for both routes.
+            //
+            // The previous divergence was not a missing feature — it was a
+            // warning that existed on one route and had nowhere to live on the
+            // other. The daemon branch deserialized the envelope back down to
+            // a bare `Service`, which SUCCEEDS because the service is
+            // flattened, so the disclosure was dropped without anything
+            // looking broken; and the direct branch re-implemented the
+            // resolution with its own `list_services` filter and its own copy
+            // of the warning text. Both now call
+            // `nestweaver_engine::query::service_summary`, which is the single
+            // resolver, and render its envelope.
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+
+            let summary: Option<nestweaver_engine::query::ServiceSummary> = {
                 let mut args = serde_json::json!({ "name": name });
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)?
-                {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                        return Ok((EXIT_SUCCESS, None));
-                    }
-                    // A real service deserializes with a non-empty uid. Do NOT fabricate an
-                    // empty Service on a not-found/error response — that would print a fake
-                    // "Service: <name>" header and exit 0. Report not found with the right code.
-                    match serde_json::from_value::<nestweaver_schema::Service>(value) {
-                        Ok(s) if !s.uid.is_empty() => {
-                            println!("Service: {}", s.name);
-                            if let Some(ref summary) = s.summary {
-                                println!("Summary: {summary}");
-                            }
-                            return Ok((EXIT_SUCCESS, None));
-                        }
-                        _ => {
-                            if !out.quiet {
-                                println!("Service not found: {name}");
-                            }
-                            return Ok((EXIT_NOT_FOUND, None));
-                        }
+                if let Some(ref r) = repo {
+                    args["repo"] = serde_json::json!(r);
+                }
+                match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args)? {
+                    // A not-found/error response does not deserialize into a
+                    // summary with a non-empty uid, so it falls through to the
+                    // NOT_FOUND arm below rather than fabricating an empty
+                    // service and printing a header for it.
+                    Some(value) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
+                    None => {
+                        let store = open_store(db.as_deref())?;
+                        nestweaver_engine::query::service_summary(
+                            &store,
+                            &name,
+                            instance.as_deref(),
+                            repo.as_deref(),
+                        )?
                     }
                 }
+            };
+
+            let Some(summary) = summary.filter(|s| !s.service.uid.is_empty()) else {
+                if !out.quiet {
+                    println!("Service not found: {name}");
+                }
+                return Ok((EXIT_NOT_FOUND, None));
+            };
+
+            // Rendered by whichever route ran, from the resolver's own text.
+            //
+            // Exit code deliberately left at 0 for an ambiguous match, on both
+            // routes, exactly as before. `EXIT_AMBIGUOUS` exists and `impact`
+            // uses it, but adopting it here is a product decision and not one
+            // to make inside a bug fix. Because it stays 0, this warning is
+            // the ONLY signal, which is precisely why it must not be dropped.
+            if let Some(warning) = summary.ambiguity_warning(&name) {
+                eprint!("{warning}");
             }
 
-            let store = open_store(db.as_deref())?;
-            let services = list_services(&store, instance.as_deref())?;
-            let matches: Vec<&nestweaver_schema::Service> = services
-                .iter()
-                .filter(|s| s.name == name || s.uid == name)
-                .collect();
-            // An ambiguous name silently picked the first match — at
-            // least warn so the user knows to disambiguate by UID.
-            if matches.len() > 1 {
-                eprintln!(
-                    "warning: '{name}' matches {} services; showing the first — \
-                     pass the full UID to disambiguate:",
-                    matches.len()
-                );
-                for s in &matches {
-                    eprintln!("  {} ({})", s.uid, s.name);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Service: {}", summary.service.name);
+                if let Some(ref s) = summary.service.summary {
+                    println!("Summary: {s}");
                 }
-            }
-            let service = matches.first().copied();
-            match service {
-                Some(s) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(s)?);
-                    } else {
-                        println!("Service: {}", s.name);
-                        if let Some(ref summary) = s.summary {
-                            println!("Summary: {summary}");
-                        }
+                // `--help` has said "with entry points" since this command
+                // shipped, and neither route printed any.
+                if summary.entry_points.is_empty() {
+                    println!("Entry points: none indexed");
+                } else {
+                    println!("Entry points ({}):", summary.entry_points.len());
+                    for ep in &summary.entry_points {
+                        println!(
+                            "  {} ({}) {}:{}",
+                            ep.name, ep.kind, ep.file_path, ep.start_line
+                        );
                     }
-                    Ok((EXIT_SUCCESS, None))
-                }
-                None => {
-                    eprintln!("Service not found: {name}");
-                    Ok((EXIT_NOT_FOUND, None))
                 }
             }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::RepoMap {
