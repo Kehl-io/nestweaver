@@ -453,7 +453,9 @@ pub use brain_memory::{
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
-    ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
+    ClusterMember, ClusteringOutput, CommunityInfo, LARGE_GRAPH_CLUSTER_RESOLUTION,
+    LARGE_GRAPH_SYMBOL_THRESHOLD, SMALL_GRAPH_CLUSTER_RESOLUTION, compute_clusters,
+    default_cluster_resolution, load_clusters, save_clusters,
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{

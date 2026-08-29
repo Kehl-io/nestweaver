@@ -8244,14 +8244,44 @@ fn tool_schema_clusters() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                // F-MCP-6: no `default` key. The applied resolution depends
+                // on the corpus (0.3 above 10K symbols, 0.5 at or below), which
+                // JSON Schema cannot express — so the schema advertised 0.5
+                // while the handler applied 0.3 on every graph this tool exists
+                // to serve. Same precedent as `project_context.token_budget`:
+                // state the truth in the description rather than a different
+                // wrong number in the key.
                 "resolution": {
                     "type": "number",
-                    "description": "Community-detection resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
-                    "default": 0.5
+                    "exclusiveMinimum": 0.0,
+                    "description": "Community-detection resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. When omitted the applied value depends on graph size: 0.3 for large graphs (>10K symbols), 0.5 at or below. Try 2.0 for fine-grained modules."
                 },
+                // nw-299(a). This was the only list-returning tool in the
+                // catalogue with no bounding parameter, and
+                // `additionalProperties: false` meant a caller-supplied `limit`
+                // was actively REJECTED — 98.7 MB on the wire from a default
+                // call, with no way for a client to prevent it. 50/20 are the
+                // CLI twin's existing defaults, not new numbers; any others
+                // would be a THIRD set for one concept.
+                "limit": limit_schema(
+                    "Max clusters to return (0 = all, default 50). `total`/`returned`/`truncated` always report what was dropped.",
+                    50,
+                    0,
+                    RESULT_LIMIT_MAX,
+                ),
+                // Maximum 200, not 2000: `limit` and `members` multiply, and
+                // 1000 clusters x 2000 members is the original failure with
+                // extra steps. The documented way to page INTO one cluster is
+                // `cluster_id`, which this bound does not touch.
+                "members": limit_schema(
+                    "Max members previewed per cluster in the multi-cluster listing (0 = all, default 20). Ignored when `cluster_id` is set — that path returns the cluster's full member list, capped at 2000.",
+                    20,
+                    0,
+                    200,
+                ),
                 "cluster_id": {
                     "type": "integer",
-                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the 20-member preview. Use the same resolution as the call that produced the id."
+                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the preview. Use the same resolution as the call that produced the id."
                 }
             }
         }
@@ -8259,11 +8289,17 @@ fn tool_schema_clusters() -> Value {
 }
 
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let user_resolution = args.get("resolution").and_then(|v| v.as_f64());
-    let resolution = user_resolution.unwrap_or_else(|| {
-        let sym_count = store.count_symbols().unwrap_or(0);
-        if sym_count > 10_000 { 0.3 } else { 0.5 }
-    });
+    // F-DC-7: the adaptive default now comes from the engine, so this tool,
+    // the `clusters`/`cluster` CLI commands and `summary --level cluster` all
+    // partition the graph the same way. They did not: summaries hard-coded
+    // resolution 1.0, which put its cluster IDs in a different ID SPACE from
+    // the one `cluster <id>` resolves against — 26 of 50 IDs did not resolve.
+    let resolution = args
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
+    let limit = read_limit(&args, "limit", 50, 0, RESULT_LIMIT_MAX)?;
+    let preview_members = read_limit(&args, "members", 20, 0, 200)?;
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -8283,18 +8319,23 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     // count), which made large clusters' membership unretrievable from the tool.
     let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
     // Full membership when a specific cluster is requested (bounded so a giant
-    // cluster can't blow the context window), a small preview otherwise.
+    // cluster can't blow the context window), a caller-sized preview otherwise.
     const FULL_MEMBER_CAP: usize = 2000;
-    const PREVIEW_MEMBER_CAP: usize = 20;
-    let clusters_json: Vec<Value> = output
+    let matching: Vec<&nestweaver_engine::CommunityInfo> = output
         .communities
         .iter()
         .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
-        .map(|c| {
+        .collect();
+    // Cut BEFORE rendering, and capture the pre-cut total. Rendering the whole
+    // corpus for a bounded answer is the other half of this defect class.
+    let bounded = Bounded::take(matching, limit).map(|c| {
+        {
             let member_cap = if requested_id.is_some() {
                 FULL_MEMBER_CAP
+            } else if preview_members == 0 {
+                c.members.len()
             } else {
-                PREVIEW_MEMBER_CAP
+                preview_members
             };
             let members: Vec<Value> = c
                 .members
@@ -8311,6 +8352,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                     })
                 })
                 .collect();
+            let members_returned = members.len();
             json!({
                 "id": c.id,
                 "name": c.name,
@@ -8318,20 +8360,26 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 "cohesion": c.cohesion,
                 "key_files": c.key_files,
                 "members": members,
+                "returned_members": members_returned,
                 "members_truncated": c.members.len() > member_cap,
             })
-        })
-        .collect();
+        }
+    });
 
     let symbol_count: usize = output.communities.iter().map(|c| c.member_count).sum();
 
-    Ok(json!({
+    let mut payload = json!({
         "resolution": resolution,
+        // The graph-wide community count, unchanged. `total` below is the
+        // number that MATCHED this call's filter; with no `cluster_id` the two
+        // agree, and with one they must not.
         "cluster_count": output.communities.len(),
         "symbol_count": symbol_count,
         "modularity": output.modularity,
-        "clusters": clusters_json,
-    }))
+        "limit": limit,
+    });
+    bounded.merge_into(&mut payload, "clusters");
+    Ok(payload)
 }
 
 // ── 13. stale_check ────────────────────────────────────────────────────────
@@ -10005,6 +10053,29 @@ fn tool_schema_get_summary() -> Value {
     })
 }
 
+/// `generate_summaries`, plus the count its return type cannot express.
+///
+/// Only `SummaryLevel::Cluster` caps inside the generator today, so only that
+/// arm has anything to report — but the shape is per-level on purpose, so a
+/// second capped level cannot be added without deciding what it reports.
+fn generate_summaries_reporting_cap(
+    store: &GraphStore,
+    level: nestweaver_engine::SummaryLevel,
+    cap_dropped: &mut usize,
+) -> Result<Vec<nestweaver_engine::Summary>, anyhow::Error> {
+    if matches!(level, nestweaver_engine::SummaryLevel::Cluster) {
+        let bounded = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
+            store,
+            nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+        )?;
+        *cap_dropped = bounded
+            .matched_total
+            .saturating_sub(bounded.summaries.len());
+        return Ok(bounded.summaries);
+    }
+    generate_summaries(store, level)
+}
+
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     use nestweaver_engine::{load_summaries, merge_and_save_summaries};
 
@@ -10098,6 +10169,11 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // the F16 response cache — otherwise a caller asking for fresh data got
     // `cached: true` served from the sidecar, which reads as contradictory.
     let bypass = cache_bypassed(&args);
+    // F-DC-11. `generate_cluster_summaries` truncates to 50 INSIDE the
+    // generator, so a total taken from what it returned reports 50 against a
+    // 71,184-community graph and `truncated` computes to false. The honesty
+    // machinery existed and was wired for `SummaryLevel::Symbol` only.
+    let mut cap_dropped: usize = 0;
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && !bypass
         && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
@@ -10109,13 +10185,13 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
                 level = level_str,
                 "sidecar has summaries but none at requested level; regenerating"
             );
-            let fresh = generate_summaries(store, level)?;
+            let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
             (fresh, false)
         } else {
             (level_filtered, true)
         }
     } else {
-        let fresh = generate_summaries(store, level)?;
+        let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
         (fresh, false)
     };
 
@@ -10125,7 +10201,8 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
     }
 
-    let total_available = summaries.len();
+    // Counts what MATCHED, not what survived the generator's cap.
+    let total_available = summaries.len() + cap_dropped;
 
     // Build the display list: filter by target, then truncate by budget.
     let after_filter: Vec<nestweaver_engine::Summary> = if let Some(t) = target {
@@ -10415,15 +10492,6 @@ impl<T> Bounded<T> {
         Self { items, total }
     }
 
-    /// For producers that already dropped rows upstream and separately know
-    /// the pre-cap total (a store query with its own `LIMIT`, a budget cut).
-    /// `total` is clamped up to `items.len()` so the pair can never claim to
-    /// have returned more than matched.
-    fn with_total(items: Vec<T>, total: usize) -> Self {
-        let total = total.max(items.len());
-        Self { items, total }
-    }
-
     fn total(&self) -> usize {
         self.total
     }
@@ -10434,10 +10502,6 @@ impl<T> Bounded<T> {
 
     fn truncated(&self) -> bool {
         self.items.len() < self.total
-    }
-
-    fn items(&self) -> &[T] {
-        &self.items
     }
 
     /// Render only what survived the cut. Rendering before the cut is the
@@ -10452,18 +10516,14 @@ impl<T> Bounded<T> {
 }
 
 impl Bounded<Value> {
-    /// The one canonical disclosure shape: `{<key>: [...], returned, total,
-    /// truncated}`. `returned`/`total` are the spellings 8.0.0 standardised
-    /// `brain_impact` and `brain_search` on; every new bounded list uses them
-    /// so an agent parses one shape rather than five.
-    fn into_json(self, key: &str) -> Value {
-        let mut payload = json!({});
-        self.merge_into(&mut payload, key);
-        payload
-    }
-
-    /// Merge the triple into an existing object payload, for tools that carry
-    /// additional top-level keys.
+    /// Merge the canonical disclosure triple into an object payload:
+    /// `{<key>: [...], returned, total, truncated}`.
+    ///
+    /// `returned`/`total` are the spellings 8.0.0 standardised `brain_impact`
+    /// and `brain_search` on; every new bounded list uses them so an agent
+    /// parses one shape rather than five. Merging rather than constructing,
+    /// because every tool in this catalogue carries additional top-level keys
+    /// beside its list.
     fn merge_into(self, target: &mut Value, key: &str) {
         let (returned, total, truncated) = (self.returned(), self.total(), self.truncated());
         let Some(object) = target.as_object_mut() else {
@@ -10496,15 +10556,9 @@ mod bounds_seam_tests {
     }
 
     #[test]
-    fn with_total_cannot_claim_to_have_returned_more_than_matched() {
-        let bounded = Bounded::with_total(vec![json!(1), json!(2)], 1);
-        assert_eq!(bounded.total(), 2);
-        assert!(!bounded.truncated());
-    }
-
-    #[test]
-    fn into_json_emits_one_canonical_shape() {
-        let payload = Bounded::take(vec![json!("a"), json!("b"), json!("c")], 2).into_json("rows");
+    fn merge_into_emits_one_canonical_shape() {
+        let mut payload = json!({ "unrelated": true });
+        Bounded::take(vec![json!("a"), json!("b"), json!("c")], 2).merge_into(&mut payload, "rows");
         assert_eq!(payload["rows"].as_array().unwrap().len(), 2);
         assert_eq!(payload["returned"], json!(2));
         assert_eq!(payload["total"], json!(3));
@@ -15378,6 +15432,109 @@ merged = {merged}"
 #[cfg(test)]
 mod schema_default_honesty_tests {
     use super::*;
+
+    /// nw-299(a). `clusters` was the only list-returning tool in the catalogue
+    /// with no bounding parameter, and `additionalProperties: false` meant a
+    /// caller-supplied `limit` was actively REJECTED — 98.7 MB on the wire with
+    /// no way for an MCP client to prevent it.
+    #[test]
+    fn clusters_declares_a_bound_like_every_other_list_tool() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "clusters")
+            .expect("clusters must be registered");
+        let props = &tool["inputSchema"]["properties"];
+
+        assert_eq!(
+            props["limit"]["default"],
+            json!(50),
+            "must match the CLI twin's documented default"
+        );
+        assert_eq!(
+            props["limit"]["maximum"],
+            json!(RESULT_LIMIT_MAX),
+            "1000 is the ceiling every comparable list tool already uses"
+        );
+        assert_eq!(props["members"]["default"], json!(20));
+        assert_eq!(props["members"]["maximum"], json!(200));
+    }
+
+    /// F-MCP-6. `clusters.resolution` advertised 0.5 while the handler applies
+    /// 0.3 on any graph over 10K symbols — i.e. on every graph this tool exists
+    /// to serve. A conditional default is not expressible in JSON Schema, so
+    /// the correct fix is to omit the key (the precedent
+    /// `project_context.token_budget` already set), not to state a different
+    /// wrong one.
+    #[test]
+    fn clusters_does_not_advertise_a_resolution_it_may_not_apply() {
+        let tool = all_tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "clusters")
+            .expect("clusters must be registered");
+        let resolution = &tool["inputSchema"]["properties"]["resolution"];
+        assert!(
+            resolution.get("default").is_none(),
+            "the applied resolution depends on symbol count (0.3 above 10K, 0.5 below), \
+             so a fixed `default` here is a claim the handler does not honour"
+        );
+        let description = resolution["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("0.3") && description.contains("0.5"),
+            "the description must state BOTH, since the schema cannot: {description}"
+        );
+    }
+
+    /// nw-317 leg 2. Every `intent` enum in the registry must accept exactly
+    /// what `QueryIntent::from_str` accepts. Restating a parser in a schema is
+    /// how `blast-radius` came to be documented by `--help`, accepted on the
+    /// direct route, and rejected through the daemon with a raw JSON-Schema
+    /// error naming an internal MCP tool.
+    #[test]
+    fn declared_intent_enums_match_the_query_intent_parser() {
+        let accepted = nestweaver_store::ranking::QueryIntent::accepted_spellings();
+        assert!(
+            accepted.contains(&"blast-radius"),
+            "fixture drifted from the parser"
+        );
+
+        let mut rejected = Vec::new();
+        let mut undeclared = Vec::new();
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>").to_string();
+            let Some(intent) = tool["inputSchema"]["properties"].get("intent") else {
+                continue;
+            };
+            let Some(values) = intent["enum"].as_array() else {
+                undeclared.push(name);
+                continue;
+            };
+            let declared: std::collections::BTreeSet<&str> =
+                values.iter().filter_map(Value::as_str).collect();
+            for spelling in accepted {
+                if !declared.contains(spelling) {
+                    rejected.push(format!("{name} rejects `{spelling}`"));
+                }
+            }
+            for spelling in &declared {
+                assert!(
+                    spelling
+                        .parse::<nestweaver_store::ranking::QueryIntent>()
+                        .is_ok(),
+                    "{name} declares `{spelling}`, which the engine's parser rejects"
+                );
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "these schemas reject an intent the engine accepts and the CLI `--help` \
+             documents: {rejected:?}"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "these tools take an `intent` but declare no enum, so the same string is \
+             valid on one tool and invalid on its sibling: {undeclared:?}"
+        );
+    }
 
     /// nw-304. Where a schema declares `minimum`/`maximum` the validator
     /// enforces it perfectly. The gap is the ten params that declare a
