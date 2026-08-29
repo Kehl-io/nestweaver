@@ -1469,13 +1469,28 @@ impl GraphStore {
                 break;
             }
             scanned_candidates += 1;
-            if let Some(m) = re.find(&c.text) {
+            // nw-300, the wider half: this walked `re.find`, the FIRST match
+            // only, so exactly one result was emitted per candidate NODE and
+            // `line`/`snippet` described that first occurrence alone. 449
+            // occurrences in one file came back as 2 results with
+            // `truncated: false` — a silent collapse that, unlike
+            // `count_patterns`, was disclosed on NEITHER the MCP nor the CLI
+            // surface.
+            //
+            // `find_iter` is the same non-overlapping leftmost-first walk
+            // `count_patterns` uses, so the two exact-match surfaces now agree
+            // about how many matches exist. The limit is still enforced, and
+            // `truncated` now accounts for occurrences left unemitted WITHIN a
+            // node as well as candidates left unscanned after it.
+            let mut matched_any = false;
+            let mut node_exhausted = true;
+            for m in re.find_iter(&c.text) {
+                matched_any = true;
                 // Check the limit BEFORE pushing: with `--limit 0` the caller
                 // asked for no results, so even the first match must not be
                 // returned (previously one result slipped through).
                 if results.len() >= limit {
-                    truncated = true;
-                    truncation_reason = Some(RegexTruncationReason::ResultLimit);
+                    node_exhausted = false;
                     break;
                 }
                 let (line_in_text, snippet) = line_and_snippet(&c.text, m.start());
@@ -1504,13 +1519,13 @@ impl GraphStore {
                     line: Some(file_line),
                     snippet,
                 });
-                if results.len() >= limit {
-                    truncated = i + 1 < candidates.len();
-                    if truncated {
-                        truncation_reason = Some(RegexTruncationReason::ResultLimit);
-                    }
-                    break;
+            }
+            if matched_any && results.len() >= limit {
+                truncated = !node_exhausted || i + 1 < candidates.len();
+                if truncated {
+                    truncation_reason = Some(RegexTruncationReason::ResultLimit);
                 }
+                break;
             }
         }
         let verification_ms = elapsed_millis(verification_started);
@@ -1539,10 +1554,14 @@ impl GraphStore {
         .with_scan_budget_note())
     }
 
-    /// Counts-only companion to `regex_search`. For each pattern, returns total
-    /// match count (one per matching node), the number of distinct files that
-    /// matched, and the top files by match count. Reuses the same trigram
+    /// Counts-only companion to `regex_search`. For each pattern, returns the
+    /// number of OCCURRENCES (non-overlapping, leftmost-first — exactly what
+    /// `grep -o | wc -l` counts), the number of distinct files that matched,
+    /// and the top files by occurrence count. Reuses the same trigram
     /// pre-filter and full-scan fallback.
+    ///
+    /// It used to count one per matching NODE and report that as
+    /// `total_matches` (nw-300).
     pub fn count_patterns(
         &self,
         patterns: &[String],
@@ -1621,10 +1640,20 @@ impl GraphStore {
             let verification_started = Instant::now();
             for c in &candidates {
                 scanned_candidates += 1;
-                if re.is_match(&c.text) {
-                    total += 1;
+                // nw-300: `is_match` is a boolean, so `total` counted NODES
+                // that contained at least one match and reported that under a
+                // field named `total_matches`. 449 occurrences of a word inside
+                // two sections came back as 2, next to `truncated: false`.
+                //
+                // `find_iter` is non-overlapping leftmost-first, which is what
+                // `grep -o` counts — so the value now equals the ground truth a
+                // caller would verify against. Cost is one extra scan of
+                // already-hot text, on matching candidates only.
+                let occurrences = re.find_iter(&c.text).count() as u64;
+                if occurrences > 0 {
+                    total += occurrences;
                     let file = file_of(&c.location);
-                    *per_file.entry(file).or_insert(0) += 1;
+                    *per_file.entry(file).or_insert(0) += occurrences;
                 }
             }
             let verification_ms = elapsed_millis(verification_started);
@@ -2056,6 +2085,112 @@ mod tests {
         );
         // It still matches every text-bearing node.
         assert!(!res.results.is_empty());
+    }
+
+    #[test]
+    fn count_patterns_counts_occurrences_not_nodes() {
+        // nw-300 / F-VAULT-4: 449 occurrences in one file were reported as
+        // `total_matches: 2` because the verification loop increments once per
+        // matching NODE. Five occurrences inside ONE section must count as 5.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:v:1".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "notes/dup.md".to_string(),
+                title: "Dup".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:v:1:a".to_string(),
+                note_uid: "note:v:1".to_string(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 3,
+                text_hash: "th".to_string(),
+                text_content: "identical identical identical identical identical".to_string(),
+                word_count: 5,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let counts = store
+            .count_patterns(&["identical".to_string()], None, None)
+            .unwrap();
+        assert_eq!(counts[0].files_matched, 1);
+        assert_eq!(
+            counts[0].total_matches, 5,
+            "total_matches must count occurrences, not the number of nodes \
+             containing at least one match"
+        );
+        assert_eq!(
+            counts[0].top_files[0].count, 5,
+            "top_files[].count is named `count` and must be occurrence-based too"
+        );
+    }
+
+    /// nw-300, the wider half: `regex_search` collapses the same way via
+    /// `re.find` (first match only), and unlike `count_patterns` it discloses
+    /// this on NEITHER surface. Five occurrences in one node must produce five
+    /// results with five distinct line numbers, not one.
+    #[test]
+    fn regex_search_returns_every_occurrence_within_a_node() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:v:1".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "notes/dup.md".to_string(),
+                title: "Dup".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:v:1:a".to_string(),
+                note_uid: "note:v:1".to_string(),
+                heading_uid: None,
+                start_line: 10,
+                end_line: 12,
+                text_hash: "th".to_string(),
+                text_content: "identical\nidentical\nidentical".to_string(),
+                word_count: 3,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let res = store
+            .regex_search("identical", None, None, Some(10_000), Some(5_000))
+            .unwrap();
+        assert_eq!(
+            res.results.len(),
+            3,
+            "regex_search reports one result per NODE; `line`/`snippet` describe \
+             the FIRST occurrence only and `truncated` stays false (nw-300)"
+        );
+        let lines: Vec<Option<u32>> = res.results.iter().map(|m| m.line).collect();
+        assert_eq!(
+            lines,
+            vec![Some(10), Some(11), Some(12)],
+            "each occurrence must carry its own file line"
+        );
+        assert!(!res.truncated);
     }
 
     #[test]
