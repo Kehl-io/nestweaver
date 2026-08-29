@@ -14319,10 +14319,25 @@ mod arg_alias_tests {
         assert_eq!(via_name["count"], json!(1));
         assert_eq!(via_name["total_available"], json!(1));
         assert_eq!(via_name["partial"], json!(false));
+        // nw-321: `summaries` is the STRUCTURED list on both routes now, with
+        // the rendered prose under `summaries_text`. The agent used to get the
+        // string and the human the records, which is backwards.
+        assert_eq!(
+            via_name["summaries"]
+                .as_array()
+                .expect("summaries is a list")
+                .len(),
+            1
+        );
         assert!(
-            via_name["summaries"].as_str().unwrap().contains("greet"),
+            via_name["summaries_text"]
+                .as_str()
+                .unwrap()
+                .contains("greet"),
             "summary should describe the targeted symbol"
         );
+        assert_eq!(via_name["returned"], json!(1), "the canonical count name");
+        assert_eq!(via_name["total"], json!(1), "the canonical total name");
         // `target` works identically.
         let via_target =
             tool_get_summary(&store, json!({ "level": "symbol", "target": "hello" })).unwrap();

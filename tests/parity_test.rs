@@ -790,6 +790,29 @@ fn parity_hubs_direct_vs_daemon() {
     check_parity(&fixture.db_path, "hubs", &["hubs", "--top", "3"]);
 }
 
+/// nw-321. `summary`'s text route through the daemon reads the tool's
+/// `summaries` field, and this lane changed that field from a "\n"-joined
+/// STRING to the structured list the CLI twin has always returned — because an
+/// agent receiving prose it has to re-parse, while the human receives records,
+/// is the finding. `src/main.rs` is Lane E's file and its reader still expects
+/// the string, so it now falls through to the direct path instead.
+///
+/// That fall-through is a route change, and the whole point of this batch is
+/// that a silent route change is a defect. So it is PINNED here rather than
+/// assumed benign: the two routes must still produce identical human output and
+/// identical exit codes. When Lane E lands D2-E5 (delete the `&& !json`
+/// carve-out and read `summaries_text`), this test keeps holding — it asserts
+/// the OUTPUT, not which route produced it.
+#[test]
+fn parity_summary_text_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "summary",
+        &["summary", "--level", "file", "--token-budget", "0"],
+    );
+}
+
 #[test]
 fn parity_bridges_direct_vs_daemon() {
     let fixture = setup_fixture();
