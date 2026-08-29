@@ -5,6 +5,7 @@ pub mod edges;
 pub mod embedding;
 pub mod limits;
 pub mod nodes;
+pub mod provenance;
 pub mod repo_url;
 pub mod uid;
 pub mod version;

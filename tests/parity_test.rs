@@ -1778,22 +1778,18 @@ fn intent_vocabulary_agrees_across_all_three_routes() {
 /// CONTAINMENT — closing one shrinks the set safely, opening a new one fails.
 #[test]
 fn the_mcp_route_does_not_grow_new_disclosure_gaps() {
-    /// Owned by nw-315: `_meta` (scope/sources/stale_repos) is authored in the
-    /// CLI/client layer, and `stale_check`'s two summary lists are derived in
-    /// `src/main.rs`, so the MCP route — which calls `tools::dispatch`
-    /// directly — never sees either. Not fixed here; pinned so it cannot grow.
-    const KNOWN_GAPS: &[&str] = &[
-        ".needs_reindex_repos",
-        ".needs_reindex_repos[]",
-        ".stale_repos",
-        ".stale_repos[]",
-        "._meta",
-        "._meta.scope",
-        "._meta.sources",
-        "._meta.sources[]",
-        "._meta.stale_repos",
-        "._meta.stale_repos[]",
-    ];
+    /// EMPTY, and that is the point. nw-315 owned every entry that used to be
+    /// here: `stale_check`'s two summary lists were derived in `src/main.rs`
+    /// (twice — once per CLI route) instead of by the tool, so the MCP route,
+    /// which calls `tools::dispatch` directly, never saw them.
+    ///
+    /// The `._meta*` entries that also sat here were INERT and are not evidence
+    /// of anything: `stale-check --json` on the direct route emits no `_meta`
+    /// at all, so a containment check CLI ⊆ MCP could never have failed on
+    /// them. `_meta` on the MCP route is proved by
+    /// `the_mcp_route_carries_the_provenance_its_own_instructions_promise`,
+    /// which asserts on the field rather than on its absence from a diff.
+    const KNOWN_GAPS: &[&str] = &[];
 
     let fixture = setup_fixture();
     let db = &fixture.db_path;
@@ -1820,4 +1816,80 @@ fn the_mcp_route_does_not_grow_new_disclosure_gaps() {
          not in the list of gaps this batch knowingly left open: {missing:?}\n\
          CLI: {cli_json}\nMCP: {mcp_json}"
     );
+}
+
+/// nw-315. `_meta` was never ADDED on the MCP stdio route — not dropped. The
+/// four provenance authors were `src/main.rs` (CLI direct), the federation
+/// client (CLI daemon), `http.rs` under a third and namespaced spelling, and
+/// stdio: nothing. Meanwhile `SERVER_INSTRUCTIONS` — returned by `initialize`
+/// on all three transports — tells the agent "Results include `_meta.sources`
+/// indicating which data sources contributed". An agent therefore had no way to
+/// learn that its answer was scoped, drawn from a partial source set, or built
+/// on stale repos, while the human got all three for free. That is the precise
+/// inverse of 8.0.0's "disclose stale rankings to the agent, not just to the
+/// human".
+///
+/// Asserted on the WIRE (a real `nestweaver mcp` process) rather than on
+/// `tools::dispatch`, because the unit test one layer down cannot see a
+/// serialization step that drops the key.
+#[test]
+fn the_mcp_route_carries_the_provenance_its_own_instructions_promise() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    for (tool, args) in [
+        ("brain_status", serde_json::json!({})),
+        ("stale_check", serde_json::json!({})),
+        ("dead_code", serde_json::json!({})),
+        ("detect_changes", serde_json::json!({ "changed_files": ["src/a.js"] })),
+        ("cross_repo_contracts", serde_json::json!({ "name": "mainA" })),
+        ("flow_trace", serde_json::json!({ "symbol": "mainA" })),
+    ] {
+        let payload = run_via_mcp(db, tool, args);
+        let meta = &payload["_meta"];
+        assert!(
+            meta["sources"].is_array(),
+            "{tool}: the MCP response has no `_meta.sources`, but the server's \
+             own `initialize` instructions promise the agent \"Results include \
+             _meta.sources indicating which data sources contributed\": {payload}"
+        );
+        for leg in ["scope", "stale_repos"] {
+            assert!(
+                meta.get(leg).is_some(),
+                "{tool}: `_meta` is missing `{leg}`, which the CLI emits — \
+                 partial provenance is how an agent learns the wrong thing \
+                 confidently: {payload}"
+            );
+        }
+    }
+}
+
+/// The `stale_check` half of nw-315, on the wire. MCP returned
+/// `[any_needs_reindex, any_stale, repo_count, repos]` where the CLI returned
+/// those plus the two pre-summarised lists, so the agent was told "at least one
+/// repo needs re-indexing" and had to linearly scan the array to find out
+/// which. `needs_reindex_repos` is the field 8.0.0 added as a documented
+/// breaking change; it had never reached the MCP surface at all.
+#[test]
+fn mcp_stale_check_reports_which_repos_not_merely_that_some_do() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(db, &["stale-check", "--json"]);
+    assert!(
+        cli.status.success(),
+        "stale-check (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("stale-check", &cli);
+    let mcp_json = run_via_mcp(db, "stale_check", serde_json::json!({}));
+
+    for field in ["stale_repos", "needs_reindex_repos"] {
+        assert_eq!(
+            mcp_json[field], cli_json[field],
+            "stale_check: `{field}` differs between the CLI and MCP routes — \
+             the agent cannot act on a summary it is not given.\nCLI: \
+             {cli_json}\nMCP: {mcp_json}"
+        );
+    }
 }

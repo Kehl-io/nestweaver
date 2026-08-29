@@ -1771,6 +1771,36 @@ pub fn dispatch_cancellable(
         dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
     };
 
+    // nw-315: THE tool layer is the author of provenance, because it is the
+    // only layer every route passes through.
+    //
+    // `_meta` (scope/sources/stale_repos) used to be written by the CLI
+    // presentation layer — `attach_local_meta` on the direct route, the
+    // federation client on the daemon route — and MCP over stdio has no
+    // presentation layer, so it never received the field at all. Not dropped:
+    // never added. Meanwhile `SERVER_INSTRUCTIONS` (lib.rs) promises the agent
+    // "Results include `_meta.sources` indicating which data sources
+    // contributed", so the server documented a field it did not send.
+    //
+    // Stamped here rather than in the stdio server so that the property holds
+    // for EVERY route through `dispatch` — stdio, HTTP, and the daemon's
+    // `dispatch_tool_json` — instead of for the one route that was reported.
+    //
+    // `ensure` and not `set`: a federating caller knows strictly more than this
+    // layer does (it can name upstreams and a background staleness verdict this
+    // process cannot compute without I/O), so its richer stamp wins. What this
+    // layer can say honestly is that the answer came from the local graph, and
+    // saying that is what makes the absence of a richer verdict legible.
+    let result = result.map(|mut value| {
+        nestweaver_schema::provenance::ensure(
+            &mut value,
+            nestweaver_schema::provenance::SCOPE_LOCAL,
+            &[nestweaver_schema::provenance::SOURCE_LOCAL],
+            &[],
+        );
+        value
+    });
+
     // Tools that do not consult PageRank still succeed during a dirty
     // publication, so the classification is applied to the ERROR rather than
     // used to fail early.
@@ -6462,15 +6492,17 @@ pub fn mark_brain_status_daemon_bypassed(value: &mut Value, cause: &str) {
         "degraded_components".to_string(),
         json!([DAEMON_RUNTIME_DEGRADED]),
     );
-    obj.insert(
-        "_meta".to_string(),
-        json!({
-            "sources": ["direct"],
-            "stale_repos": [],
-            "scope": "direct",
-            "degraded_components": [DAEMON_RUNTIME_DEGRADED],
-        }),
-    );
+    // nw-315: built through the one provenance author so this cannot become a
+    // sixth spelling of the same three keys; the `degraded_components` leg is
+    // this path's own addition and is merged on top.
+    let mut meta = nestweaver_schema::provenance::provenance("direct", &["direct"], &[]);
+    if let Some(meta_obj) = meta.as_object_mut() {
+        meta_obj.insert(
+            "degraded_components".to_string(),
+            json!([DAEMON_RUNTIME_DEGRADED]),
+        );
+    }
+    obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
     if let Some(warnings) = obj
         .entry("warnings".to_string())
         .or_insert_with(|| json!([]))
@@ -8497,12 +8529,38 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         }));
     }
 
+    // nw-315: the two PRE-SUMMARISED lists, authored here rather than in the
+    // CLI. Both routes of `stale-check --json` derived them from `repos`
+    // themselves — Route A by post-processing the daemon's payload
+    // (`src/main.rs`), Route B by a complete second implementation of this
+    // whole loop — so an MCP caller was told "at least one repo needs
+    // re-indexing" and had to linearly scan a 43-entry array to learn which.
+    // `needs_reindex_repos` is the field 8.0.0 added as a documented breaking
+    // change and it had never reached the MCP surface at all.
+    //
+    // Deriving them from `results` (not from a parallel pass) is what keeps
+    // them from drifting from `is_stale`/`needs_reindex` the way they drifted
+    // three times before.
+    let urls_where = |field: &str| -> Vec<Value> {
+        results
+            .iter()
+            .filter(|repo| repo[field].as_bool().unwrap_or(false))
+            .filter_map(|repo| repo["url"].as_str().map(Value::from))
+            .collect()
+    };
+    let stale_repos = urls_where("is_stale");
+    let needs_reindex_repos = urls_where("needs_reindex");
+
     Ok(json!({
         "repo_count": repos.len(),
         // Behind HEAD only. Kept because it is what the word means; a CI gate
         // wanting "is my graph usable" should read `any_needs_reindex`.
         "any_stale": any_stale,
         "any_needs_reindex": any_needs_reindex,
+        // Behind HEAD only, matching `any_stale`/`is_stale`.
+        "stale_repos": stale_repos,
+        // The ACTIONABLE set, matching `any_needs_reindex`/`needs_reindex`.
+        "needs_reindex_repos": needs_reindex_repos,
         "repos": results,
     }))
 }
@@ -12205,6 +12263,155 @@ mod cache_dispatch_tests {
         CACHE_MISSES.with(|c| c.set(0));
         RESPONSE_CACHE.with(|m| m.borrow_mut().clear());
         FLUSH_COUNTER.with(|c| c.set(0));
+    }
+
+    /// The smallest argument object a schema accepts, so the only thing under
+    /// test is what the dispatch seam adds.
+    fn smallest_valid_args(schema: &Value) -> Value {
+        let mut args = serde_json::Map::new();
+        let properties = schema["properties"].as_object();
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let Some(field) = required.as_str() else {
+                continue;
+            };
+            let declared = properties.and_then(|properties| properties.get(field));
+            let kind = declared
+                .and_then(|value| value["type"].as_str())
+                .unwrap_or("string");
+            let value = match kind {
+                "array" => json!(["greet"]),
+                "integer" | "number" => json!(1),
+                "boolean" => json!(true),
+                "object" => json!({}),
+                _ => declared
+                    .and_then(|value| value["enum"].as_array())
+                    .and_then(|values| values.first().cloned())
+                    .unwrap_or_else(|| json!("greet")),
+            };
+            args.insert(field.to_string(), value);
+        }
+        Value::Object(args)
+    }
+
+    /// nw-315. `_meta` (scope/sources/stale_repos) was never added on the MCP
+    /// route — not dropped, never added. Four provenance authors existed and
+    /// the stdio server was not one of them: `src/main.rs` for the CLI direct
+    /// route, the federation client for the CLI daemon route, `http.rs` under a
+    /// third, namespaced spelling, and stdio nothing — while
+    /// `SERVER_INSTRUCTIONS` promises the agent that "Results include
+    /// `_meta.sources` indicating which data sources contributed". The server
+    /// documented a field it did not send.
+    ///
+    /// WHERE ELSE DOES THIS PROPERTY NEED TO HOLD? The report named ten tools.
+    /// Asserting on those ten would have re-created the defect the moment an
+    /// eleventh tool was registered, because the real problem is that
+    /// provenance was authored per-command instead of at the seam every route
+    /// passes through. So this asserts over the REGISTRY: every registered
+    /// read-only tool that answers at all must carry provenance.
+    #[test]
+    fn every_tool_that_answers_stamps_its_provenance() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let schemas = all_tool_schemas();
+        let mut answered: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for tool in &schemas {
+            let Some(name) = tool["name"].as_str() else {
+                continue;
+            };
+            // Mutating tools are excluded because exercising them here would
+            // write to the fixture, not because provenance is optional for
+            // them: they reach the same seam and inherit the same stamp.
+            if crate::http::MUTATING_TOOLS.contains(&name) {
+                continue;
+            }
+            let args = smallest_valid_args(&tool["inputSchema"]);
+            let Ok(value) = dispatch(&store, None, name, args, None) else {
+                // A tool that cannot answer on this two-symbol fixture proves
+                // nothing either way; the ones that DO answer are the sample.
+                continue;
+            };
+            // A bare array has nowhere to put a key. Those exist (legacy JSON
+            // RPCs) and are a separate shape defect, not this one.
+            if !value.is_object() {
+                continue;
+            }
+            answered.push(name.to_string());
+            if value["_meta"]["sources"].as_array().is_none() {
+                missing.push(name.to_string());
+            }
+        }
+
+        assert!(
+            answered.len() >= 10,
+            "only {} tools answered on the fixture — too small a sample to \
+             prove anything: {answered:?}",
+            answered.len()
+        );
+        assert!(
+            missing.is_empty(),
+            "these tools returned an object with no `_meta.sources`, while the \
+             server's own `initialize` instructions tell the agent \"Results \
+             include _meta.sources indicating which data sources contributed\": \
+             {missing:?}"
+        );
+    }
+
+    /// The `stale_check` half of nw-315: both CLI routes derived
+    /// `stale_repos` / `needs_reindex_repos` from `repos` themselves — Route A
+    /// by post-processing the daemon payload, Route B in a complete second
+    /// implementation of the whole loop — so the agent was told "at least one
+    /// repo needs re-indexing" and had to scan a 43-entry array to learn which.
+    /// `needs_reindex_repos` is the field 8.0.0 added as a documented breaking
+    /// change and it had never reached the MCP surface.
+    #[test]
+    fn stale_check_reports_the_two_summary_lists_itself() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let value = tool_stale_check(&store).unwrap();
+        for field in ["stale_repos", "needs_reindex_repos"] {
+            assert!(
+                value[field].is_array(),
+                "stale_check must author `{field}` itself; deriving it above the \
+                 tool is what made it invisible to MCP: {value}"
+            );
+        }
+
+        // And they must agree with the per-repo flags they summarise — the
+        // three prior drifts in this pair were all disagreements of exactly
+        // this kind.
+        let names = |field: &str, flag: &str| {
+            let summary: Vec<&str> = value[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            let derived: Vec<&str> = value["repos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|repo| repo[flag].as_bool().unwrap_or(false))
+                .filter_map(|repo| repo["url"].as_str())
+                .collect();
+            (summary, derived)
+        };
+        for (field, flag) in [
+            ("stale_repos", "is_stale"),
+            ("needs_reindex_repos", "needs_reindex"),
+        ] {
+            let (summary, derived) = names(field, flag);
+            assert_eq!(
+                summary, derived,
+                "`{field}` disagrees with the `{flag}` flags it summarises: {value}"
+            );
+        }
     }
 
     /// H1: an upgrade must not serve a pre-upgrade response shape.

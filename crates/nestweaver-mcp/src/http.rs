@@ -530,28 +530,34 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
 /// configured) so staleness reporting is uniform across all tools, not just the
 /// federated ones — a caller can always read which repos the local index is
 /// behind an upstream on.
-fn add_provenance_metadata(
-    mut result: Value,
-    upstream_source: Option<&str>,
-    stale_repos: &[String],
-) -> Value {
-    if let Some(obj) = result.as_object_mut() {
-        let meta = obj.entry("_meta").or_insert_with(|| json!({}));
-        if let Some(meta_obj) = meta.as_object_mut() {
-            match upstream_source {
-                Some(name) => {
-                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon", name]));
-                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("federated"));
-                }
-                None => {
-                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon"]));
-                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("single-node"));
-                }
-            }
-            meta_obj.insert("nestweaver.io/stale_repos".to_string(), json!(stale_repos));
-        }
+fn add_provenance_metadata(payload: &mut Value, upstream_source: Option<&str>, stale_repos: &[String]) {
+    // nw-315. This used to write `nestweaver.io/sources` / `nestweaver.io/scope`
+    // / `nestweaver.io/stale_repos` onto the OUTER `tools/call` envelope — a
+    // THIRD spelling of the same three facts, in a different place, so an HTTP
+    // MCP client and a CLI user learned the provenance of the same answer under
+    // different key names and a stdio client learned it not at all. There is
+    // now one author (`nestweaver_schema::provenance`), one spelling, and one
+    // location: the payload, which is where both CLI routes have always put it
+    // and what `SERVER_INSTRUCTIONS` promises.
+    //
+    // `set`, not `ensure`: `tools::dispatch` has already stamped the honest but
+    // narrow local verdict, and this boundary knows strictly more — it can name
+    // the contributing upstream and carry the federation health check's
+    // staleness verdict, neither of which the tool layer can compute.
+    match upstream_source {
+        Some(name) => nestweaver_schema::provenance::set(
+            payload,
+            "federated",
+            &["daemon", name],
+            stale_repos,
+        ),
+        None => nestweaver_schema::provenance::set(
+            payload,
+            "single-node",
+            &["daemon"],
+            stale_repos,
+        ),
     }
-    result
 }
 
 /// Check per-session rate limit. Returns `true` if the request is allowed.
@@ -1159,11 +1165,13 @@ async fn handle_mcp(
                         Vec<String>,
                     ) = (value, None, Vec::new());
 
-                    let result = add_provenance_metadata(
-                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits),
-                        upstream_source.as_deref(),
-                        &stale_repos,
-                    );
+                    // Provenance goes on the PAYLOAD, before wrapping, so the
+                    // key an HTTP client reads is the key a stdio client and a
+                    // CLI user read (nw-315).
+                    let mut value = value;
+                    add_provenance_metadata(&mut value, upstream_source.as_deref(), &stale_repos);
+                    let result =
+                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits);
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -1233,36 +1241,37 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// nw-315. The HTTP boundary used to stamp `nestweaver.io/*` keys on the
+    /// outer envelope while the CLI stamped bare `scope`/`sources`/`stale_repos`
+    /// on the payload and stdio stamped nothing — three spellings of one fact,
+    /// which is why nobody noticed the third route had none. One author now, so
+    /// this test asserts the SPELLING as well as the values.
     #[test]
-    fn provenance_metadata_injects_namespaced_single_node_scope() {
-        // A raw /mcp client must get in-band provenance so the schema (which mentions _meta)
-        // is honest: a standalone daemon reports itself as the sole source + single-node scope.
-        let out = add_provenance_metadata(json!({ "content": [], "isError": false }), None, &[]);
+    fn provenance_metadata_uses_the_one_spelling_on_the_payload() {
+        let mut out = json!({ "repos": [] });
+        add_provenance_metadata(&mut out, None, &[]);
         let meta = &out["_meta"];
-        assert_eq!(meta["nestweaver.io/scope"], json!("single-node"));
-        assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+        assert_eq!(meta["scope"], json!("single-node"));
+        assert_eq!(meta["sources"], json!(["daemon"]));
         // Staleness is stamped uniformly — empty when no upstream is configured.
-        assert_eq!(meta["nestweaver.io/stale_repos"], json!([]));
+        assert_eq!(meta["stale_repos"], json!([]));
+        assert!(
+            meta.get("nestweaver.io/sources").is_none(),
+            "the namespaced spelling is gone, not duplicated: {out}"
+        );
 
-        // Merges with pre-existing _meta (e.g. limits) rather than clobbering it.
-        let with_limits = json!({ "content": [], "_meta": { "limits": [{"param": "depth"}] } });
-        let out = add_provenance_metadata(with_limits, None, &[]);
-        assert_eq!(out["_meta"]["nestweaver.io/scope"], json!("single-node"));
-        assert!(out["_meta"]["limits"].is_array());
-
-        // A federated result names the contributing upstream and flips scope.
-        let fed = add_provenance_metadata(
-            json!({ "content": [] }),
+        // A federated result names the contributing upstream and flips scope,
+        // overriding the tool layer's narrower local stamp.
+        let mut fed = json!({ "repos": [], "_meta": { "scope": "local", "sources": ["local"], "stale_repos": [] } });
+        add_provenance_metadata(
+            &mut fed,
             Some("acme"),
             &["https://github.com/acme/api.git".to_string()],
         );
-        assert_eq!(fed["_meta"]["nestweaver.io/scope"], json!("federated"));
+        assert_eq!(fed["_meta"]["scope"], json!("federated"));
+        assert_eq!(fed["_meta"]["sources"], json!(["daemon", "acme"]));
         assert_eq!(
-            fed["_meta"]["nestweaver.io/sources"],
-            json!(["daemon", "acme"])
-        );
-        assert_eq!(
-            fed["_meta"]["nestweaver.io/stale_repos"],
+            fed["_meta"]["stale_repos"],
             json!(["https://github.com/acme/api.git"])
         );
     }

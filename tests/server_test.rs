@@ -3151,18 +3151,24 @@ async fn daemon_mcp_boundary_federates_two_tier() {
     );
 
     // In-band provenance: federated scope, both daemon + upstream sourced.
-    let meta = &body["result"]["_meta"];
+    //
+    // nw-315: on the PAYLOAD under bare keys, not on the outer envelope under
+    // `nestweaver.io/*`. The namespaced spelling was a third spelling of the
+    // same three facts — the CLI has always emitted `scope`/`sources`/
+    // `stale_repos` on the payload and `SERVER_INSTRUCTIONS` promises that one
+    // — and having three is why nobody noticed the stdio route had none.
+    let meta = &body["result"]["structuredContent"]["_meta"];
     assert_eq!(
-        meta["nestweaver.io/sources"],
+        meta["sources"],
         json!(["daemon", "orgserver"]),
         "federated result must list daemon + upstream as sources; got {meta}"
     );
     assert_eq!(
-        meta["nestweaver.io/scope"], "federated",
+        meta["scope"], "federated",
         "federated result must stamp scope=federated; got {meta}"
     );
     assert!(
-        meta["nestweaver.io/stale_repos"].is_array(),
+        meta["stale_repos"].is_array(),
         "stale_repos must be present as an array; got {meta}"
     );
 }
@@ -3381,11 +3387,11 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
             "restricted response leaked hidden upstream marker {hidden_marker}: {restricted_body}"
         );
     }
-    let meta = &restricted_body["result"]["_meta"];
-    assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
-    assert_eq!(meta["nestweaver.io/scope"], "single-node");
+    let meta = &restricted_body["result"]["structuredContent"]["_meta"];
+    assert_eq!(meta["sources"], json!(["daemon"]));
+    assert_eq!(meta["scope"], "single-node");
     assert_eq!(
-        meta["nestweaver.io/stale_repos"],
+        meta["stale_repos"],
         json!([]),
         "global staleness cache must not leak repo URLs across caller scope"
     );
@@ -3613,18 +3619,18 @@ async fn daemon_mcp_boundary_single_node_without_upstream() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["result"]["isError"], false, "got: {body}");
 
-    let meta = &body["result"]["_meta"];
+    let meta = &body["result"]["structuredContent"]["_meta"];
     assert_eq!(
-        meta["nestweaver.io/sources"],
+        meta["sources"],
         json!(["daemon"]),
         "single-node daemon must report only itself as a source; got {meta}"
     );
     assert_eq!(
-        meta["nestweaver.io/scope"], "single-node",
+        meta["scope"], "single-node",
         "no upstream configured => scope must stay single-node; got {meta}"
     );
     assert_eq!(
-        meta["nestweaver.io/stale_repos"],
+        meta["stale_repos"],
         json!([]),
         "stale_repos must be an empty array when no upstream is configured; got {meta}"
     );
