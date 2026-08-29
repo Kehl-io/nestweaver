@@ -612,7 +612,7 @@ fn resolve_single_reference(
     let value_receiver = reference
         .receiver
         .as_deref()
-        .filter(|receiver| !receiver.contains("::"));
+        .filter(|r| !is_path_receiver(r));
 
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
@@ -756,6 +756,32 @@ fn resolve_single_reference(
 /// unbounded walk would reinstate exactly the fan-out that nw-103 and nw-153
 /// exist to prevent. Three covers the observed chains with headroom.
 const REEXPORT_MAX_HOPS: usize = 3;
+
+/// Whether `receiver` is a PATH receiver — `HashMap`, `std::collections::HashMap`,
+/// `Foo::Bar` — as opposed to a value expression.
+///
+/// The distinction matters because path receivers are handled by the
+/// path-qualified tier and are deliberately exempt from the value-receiver gate.
+///
+/// Measured defect: the exemption used to be `receiver.contains("::")`, which is
+/// not the same question. A chained Rust expression that merely MENTIONS a path
+/// somewhere inside it — `arr.iter().filter_map(|v| v.as_str().map(String::from))`
+/// — contains `::` and so escaped the gate entirely. That is how `collect`,
+/// `len` and `contains` kept their in-degree after the nw-308 gate was added to
+/// every tier: the gate was there, and this predicate waved them past it. A path
+/// receiver is a path ALL THE WAY THROUGH, so test the whole string rather than
+/// asking whether a substring occurs in it.
+fn is_path_receiver(receiver: &str) -> bool {
+    if !receiver.contains("::") {
+        return false;
+    }
+    receiver.split("::").all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    })
+}
 
 /// Whether `receiver` could plausibly denote a symbol declared in
 /// `candidate_file`.
@@ -1073,6 +1099,83 @@ mod tests {
                 .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == phantom),
             "a chained .collect() must not bind to an unrelated `collect` merely \
              because the file was imported for something else: {edges:?}"
+        );
+    }
+
+    /// The `::` exemption must test whether the receiver IS a path, not whether
+    /// it CONTAINS one. Measured on this repo: with `contains("::")`,
+    /// `collect` kept an in-degree of 771 and `len` 673 even with the gate
+    /// applied to every tier, because a chained Rust expression mentioning
+    /// `String::from` was classified as a path receiver and waved through.
+    #[test]
+    fn a_chain_mentioning_a_path_is_still_a_value_receiver() {
+        assert!(is_path_receiver("HashMap::new"));
+        assert!(is_path_receiver("std::collections::HashMap"));
+        assert!(!is_path_receiver("store"));
+        assert!(!is_path_receiver(
+            "arr.iter().filter_map(|v| v.as_str().map(String::from))"
+        ));
+        assert!(!is_path_receiver("self.store.query()"));
+        assert!(!is_path_receiver("xs.iter().map(Vec::new)"));
+    }
+
+    /// End to end: the real shape that survived the first cut of the gate.
+    #[test]
+    fn a_chained_call_mentioning_a_path_does_not_donate_a_method_name() {
+        let mut caller = make_symbol("extract_string_array", 10);
+        caller.end_line = 60;
+        let mut call = make_ref("collect", ReferenceKind::Call, 40);
+        call.receiver = Some("arr.iter().filter_map(|v| v.as_str().map(String::from))".to_string());
+
+        let files = vec![
+            (
+                "src/tools.js".to_string(),
+                vec![caller],
+                vec![make_ref("./tantivy_index", ReferenceKind::Import, 1), call],
+            ),
+            (
+                "src/tantivy_index.js".to_string(),
+                vec![make_symbol("SearchTotal", 5), make_symbol("collect", 202)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let phantom = symbol_uid("repo:test:abc", "src/tantivy_index.js", "collect", 202);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == phantom),
+            "a chain that merely MENTIONS `String::from` is a value receiver \
+             and must be gated: {edges:?}"
+        );
+    }
+
+    /// Guard rail: a genuine path receiver must still reach the qualified tier.
+    #[test]
+    fn a_genuine_path_receiver_still_resolves() {
+        let mut caller = make_symbol("main", 5);
+        caller.end_line = 20;
+        let mut call = make_ref("new", ReferenceKind::Call, 10);
+        call.receiver = Some("store::GraphStore".to_string());
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![caller],
+                vec![make_ref("./store", ReferenceKind::Import, 1), call],
+            ),
+            (
+                "src/store.rs".to_string(),
+                vec![make_symbol("new", 5)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/store.rs", "new", 5);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected),
+            "a real path receiver must still resolve: {edges:?}"
         );
     }
 

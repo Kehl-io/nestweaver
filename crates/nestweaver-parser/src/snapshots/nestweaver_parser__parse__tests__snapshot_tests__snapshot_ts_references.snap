@@ -26,7 +26,7 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: ReadAccess
   start_line: 22
   context: console.log(message)
-  receiver: ~
+  receiver: console
 - name: ConsoleGreeter
   kind: Extends
   start_line: 26
@@ -41,7 +41,7 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: ReadAccess
   start_line: 28
   context: "this.log(`Greeting ${name}`)"
-  receiver: ~
+  receiver: this
 - name: greet
   kind: Call
   start_line: 29
@@ -51,7 +51,7 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: ReadAccess
   start_line: 29
   context: super.greet(name)
-  receiver: ~
+  receiver: super
 - name: Greeter
   kind: TypeRef
   start_line: 33
@@ -76,4 +76,4 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: ReadAccess
   start_line: 38
   context: "greeter.greet('world')"
-  receiver: ~
+  receiver: greeter

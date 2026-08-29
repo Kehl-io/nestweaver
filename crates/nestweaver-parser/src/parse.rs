@@ -1270,6 +1270,36 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         .or(from_receiver_field)
                         .or(from_scoped_path)
                         .map(|s| s.to_string())
+                } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
+                    // nw-308: a FIELD ACCESS has a receiver too, and until this
+                    // existed it was thrown away — extraction was gated to
+                    // `Call`, so every ReadAccess/WriteAccess reference carried
+                    // `receiver: None` and the resolver's receiver gate waved
+                    // all of them through. Measured on this repo: with the gate
+                    // covering CALLS only, `impact collect` fell from 162 to 9
+                    // while `hubs` in-degree barely moved (771 -> 618), because
+                    // `hubs` counts ALL_SYMBOL_EDGE_TYPES — the residual was
+                    // ACCESSES and USES, the exact edges the gate could not see.
+                    //
+                    // Here the CAPTURED node is the member/field/selector node
+                    // itself rather than a call wrapping one, so the object is a
+                    // direct child rather than one level down under `function`.
+                    let k = node.kind();
+                    if k.contains("field")
+                        || k.contains("member")
+                        || k.contains("selector")
+                        || k.contains("attribute")
+                        || k.contains("navigation")
+                    {
+                        node.child_by_field_name("object")
+                            .or_else(|| node.child_by_field_name("value"))
+                            .or_else(|| node.child_by_field_name("operand"))
+                            .or_else(|| node.child_by_field_name("expression"))
+                            .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };

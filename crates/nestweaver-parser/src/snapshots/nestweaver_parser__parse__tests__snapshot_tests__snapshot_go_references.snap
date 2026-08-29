@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4143
 expression: "parsed_references(\"simple.go\", &source)"
 ---
 - name: fmt
@@ -47,7 +46,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 18
   context: "(\"%s Hello, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: g
 - name: Sprintf
   kind: Call
   start_line: 18
@@ -57,7 +56,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: fmt
 - name: ConsoleGreeter
   kind: TypeRef
   start_line: 21
@@ -77,7 +76,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 22
   context: "(\"%s Goodbye, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: g
 - name: Sprintf
   kind: Call
   start_line: 22
@@ -87,7 +86,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: fmt
 - name: Greeter
   kind: TypeRef
   start_line: 25
@@ -107,7 +106,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 26
   context: strings.TrimSpace(prefix)
-  receiver: ~
+  receiver: strings
 - name: NewGreeter
   kind: Call
   start_line: 30
@@ -122,7 +121,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 31
   context: "greeter.Greet(\"world\")"
-  receiver: ~
+  receiver: greeter
 - name: Println
   kind: Call
   start_line: 32
@@ -132,4 +131,4 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: ReadAccess
   start_line: 32
   context: fmt.Println(result)
-  receiver: ~
+  receiver: fmt

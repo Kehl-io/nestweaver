@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4213
 expression: "parsed_references(\"Simple.java\", &source)"
 ---
 - name: java.util.List
@@ -52,7 +51,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
   kind: ReadAccess
   start_line: 13
   context: this.prefix = prefix
-  receiver: ~
+  receiver: this
 - name: Override
   kind: Call
   start_line: 16
@@ -102,7 +101,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
   kind: ReadAccess
   start_line: 29
   context: System.out.println(result)
-  receiver: ~
+  receiver: System
 - name: println
   kind: Call
   start_line: 29

@@ -31,7 +31,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 20
   context: self.get_primary()
-  receiver: ~
+  receiver: self
 - name: value
   kind: Call
   start_line: 20
@@ -41,7 +41,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 20
   context: self.get_primary().value()
-  receiver: ~
+  receiver: self.get_primary()
 - name: for_each
   kind: Call
   start_line: 24
@@ -51,7 +51,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut().for_each(|s| s.reset())
-  receiver: ~
+  receiver: self.sensors.values_mut()
 - name: reset
   kind: Call
   start_line: 24
@@ -61,12 +61,12 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 24
   context: s.reset()
-  receiver: ~
+  receiver: s
 - name: sensors
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut
-  receiver: ~
+  receiver: self
 - name: values_mut
   kind: Call
   start_line: 24
@@ -76,7 +76,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut()
-  receiver: ~
+  receiver: self.sensors
 - name: Self
   kind: TypeRef
   start_line: 29
@@ -101,12 +101,12 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\")"
-  receiver: ~
+  receiver: self.sensors
 - name: sensors
   kind: ReadAccess
   start_line: 36
   context: self.sensors.get
-  receiver: ~
+  receiver: self
 - name: unwrap
   kind: Call
   start_line: 36
@@ -116,7 +116,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap()"
-  receiver: ~
+  receiver: "self.sensors.get(\"primary\")"
 - name: SensorManager
   kind: TypeRef
   start_line: 40
