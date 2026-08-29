@@ -3530,8 +3530,22 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
-        #[arg(long, help = "Also include notes/symbols from component sub-projects")]
-        include_components: bool,
+        /// nw-316: `Option<bool>`, because a bare clap `bool` cannot express
+        /// "unset" and the tool's documented default is TRUE. Sending clap's
+        /// `false` unconditionally made that default UNREACHABLE on this
+        /// route, and `component_uids` feeds both the PPR seed set and the x5
+        /// membership boost — so the daemon and direct routes ranked the same
+        /// request differently, and neither said so.
+        ///
+        /// `--include-components` bare still means true; `--include-components
+        /// false` is how you opt out.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            help = "Also include notes/symbols from component sub-projects (default: true)"
+        )]
+        include_components: Option<bool>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15512,7 +15526,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "project": name,
                     "token_budget": token_budget,
                     "response_format": response_format,
-                    "include_components": include_components,
+                    // nw-316: omitted when unset, so the TOOL's documented
+                    // default of `true` governs. Sending clap's `false` here
+                    // was what pinned this route to the opposite of the
+                    // documented behaviour.
                     // nw-295: absent `since` sends `""`, not the key omitted.
                     // The daemon strips empty strings at `server.rs`, so this is
                     // benign THERE — but it is benign by the receiver's grace,
@@ -15524,6 +15541,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             });
             if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
                 project_args["since"] = serde_json::json!(since);
+            }
+            if let Some(include_components) = include_components {
+                project_args["include_components"] = serde_json::json!(include_components);
             }
             let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
@@ -15622,7 +15642,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             member_uids.extend(sym_uids);
 
-            let comp_uids = if include_components {
+            // nw-316: the same documented default the tool applies
+            // (`unwrap_or(true)` in `tool_project_context`). Both routes now
+            // land on the schema's `default: true` rather than one of them on
+            // clap's.
+            let comp_uids = if include_components.unwrap_or(true) {
                 store
                     .list_project_component_uids(&project.uid)
                     .map_err(|e| anyhow::anyhow!(e))?
@@ -33582,5 +33606,95 @@ mod clusters_forwarding_tests {
         let all = clusters_tool_args(0, 0, None);
         assert_eq!(all["limit"], 0, "`--limit 0` means all, on both sides");
         assert_eq!(all["members"], 0);
+    }
+}
+
+/// nw-316: `--include-components` must be able to be UNSET, so the tool's
+/// documented default governs both routes.
+///
+/// The tool's schema says `"default": true` and its handler applies
+/// `unwrap_or(true)`. A bare clap `bool` has no third state, so the CLI sent
+/// `false` unconditionally and pinned Route A to the opposite of the
+/// documented behaviour. `component_uids` feeds both the PPR seed set and the
+/// x5 membership boost, so the two routes ranked the same request differently
+/// and neither disclosed it.
+#[cfg(test)]
+mod include_components_tri_state_tests {
+    use super::*;
+
+    fn parse(args: Vec<String>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn flag_state(extra: &[&str]) -> Option<bool> {
+        let mut argv: Vec<String> = ["nestweaver", "project-context", "p"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        argv.extend(extra.iter().map(|s| (*s).to_string()));
+        match parse(argv).expect("must parse").command {
+            Commands::ProjectContext {
+                include_components, ..
+            } => include_components,
+            _ => panic!("expected `project-context`"),
+        }
+    }
+
+    #[test]
+    fn an_absent_flag_stays_absent_rather_than_becoming_false() {
+        assert_eq!(
+            flag_state(&[]),
+            None,
+            "`None` is the whole point: it is what lets the request omit the \
+             key so the tool's documented `default: true` decides. A bare \
+             clap bool collapses this to `false` and makes the documented \
+             default unreachable on this route."
+        );
+    }
+
+    #[test]
+    fn the_flag_can_still_be_stated_either_way() {
+        assert_eq!(
+            flag_state(&["--include-components"]),
+            Some(true),
+            "the bare flag must keep meaning 'yes' — it did before this change"
+        );
+        assert_eq!(
+            flag_state(&["--include-components", "false"]),
+            Some(false),
+            "and opting OUT must remain expressible, or the tri-state has just \
+             moved the unreachable value rather than removed it"
+        );
+        assert_eq!(flag_state(&["--include-components", "true"]), Some(true));
+    }
+
+    /// The CLI's direct path must resolve an absent flag to the same value the
+    /// tool does. Restating `true` in two places is how these routes diverged.
+    #[test]
+    fn the_direct_path_default_matches_the_tools_documented_default() {
+        let schema = nestweaver_mcp::tools::tool_list(false);
+        let tool = schema["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .find(|t| t["name"] == "project_context")
+            .expect("project_context must be in the catalogue");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["include_components"]["default"],
+            serde_json::json!(true),
+            "the CLI's `unwrap_or(true)` is only correct while the tool \
+             documents `true`; if the documented default ever changes, this \
+             test is the thing that says the CLI has to change with it"
+        );
+        // And the value the CLI actually applies for an absent flag.
+        assert!(
+            flag_state(&[]).unwrap_or(true),
+            "an absent flag must resolve to the documented default"
+        );
     }
 }
