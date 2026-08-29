@@ -730,6 +730,207 @@ fn open_lbug_with_recovery(
     }
 }
 
+/// One additive column migration: a column a later release added to a table an
+/// earlier release had already created.
+///
+/// Declared in ONE list rather than inline beside each `CREATE TABLE`, for the
+/// two reasons the 8.0.1 upgrade regression made concrete.
+///
+/// First, an `ALTER TABLE` written beside the column it mirrors can end up
+/// textually *before* the table exists. `Note.frontmatter_raw` did: it sat in
+/// the *Repo* block, ~160 lines ahead of `CREATE NODE TABLE Note`, so on a
+/// fresh database it failed with "Table Note does not exist" on every single
+/// open. Applying the whole list after every `CREATE` makes that ordering
+/// mistake unrepresentable.
+///
+/// Second, a read-only connection cannot run DDL at all, so the read path has
+/// to *ask* which columns are missing before deciding whether it is worth
+/// taking the writer lock. That question is only answerable against a declared
+/// list — see [`GraphStore::missing_migration_columns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnMigration {
+    /// Node or rel table the column belongs to. Must be created by
+    /// `init_schema`; anything else can never be migrated.
+    table: &'static str,
+    column: &'static str,
+    /// Type and default clause, e.g. `STRING DEFAULT ''`. The default is what
+    /// rows written before the column existed read back as.
+    type_and_default: &'static str,
+}
+
+impl ColumnMigration {
+    /// `ADD IF NOT EXISTS` so an already-migrated database — the steady state,
+    /// hit on every open — reports success instead of an error we would then
+    /// have to pattern-match away. Verified supported by lbug 0.19.1: the
+    /// grammar is `ADD SP (IF NOT EXISTS SP)? name type (DEFAULT expr)?`, and
+    /// a present column returns one row reading "<table> table already has
+    /// property <column>." rather than raising.
+    fn ddl(&self) -> String {
+        format!(
+            "ALTER TABLE {} ADD IF NOT EXISTS {} {}",
+            self.table, self.column, self.type_and_default
+        )
+    }
+}
+
+/// Every additive column migration this release knows about.
+///
+/// Adding a column to a `CREATE TABLE` above is only half the change: fresh
+/// databases get it, upgraded ones do not. Add the matching entry here in the
+/// same commit and `schema_migration_tests` covers it automatically — those
+/// tests are driven by this list, so they widen as it does.
+const COLUMN_MIGRATIONS: &[ColumnMigration] = &[
+    // Repo display name; empty string means the row predates the column.
+    ColumnMigration {
+        table: "Repo",
+        column: "name",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // Repo checkout root. Empty string maps to `None` on read (see read.rs).
+    ColumnMigration {
+        table: "Repo",
+        column: "root_path",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // P0.1: symbol end line. Old rows stay 0 until re-indexed with `--force`.
+    ColumnMigration {
+        table: "Symbol",
+        column: "end_line",
+        type_and_default: "INT64 DEFAULT 0",
+    },
+    // F2.0: "framework:role" (e.g. "spring:controller"); empty for none.
+    ColumnMigration {
+        table: "Symbol",
+        column: "framework_hint",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // Phase 4: cross-boundary symbol matching key, from the scope chain.
+    ColumnMigration {
+        table: "Symbol",
+        column: "canonical_id",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // nw-291: the parser has always inferred visibility but nothing persisted
+    // it, so `read.rs` rebuilt every symbol as `Inferred` and BOTH visibility
+    // guards in `dead_code::infer_confidence` were unreachable. Rows written
+    // before the column read back as "", which maps to `Inferred` — the honest
+    // answer, and identical to 8.0.0 behaviour until `index --force`.
+    ColumnMigration {
+        table: "Symbol",
+        column: "visibility",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // nw-298: the raw frontmatter text, kept verbatim for round-tripping.
+    ColumnMigration {
+        table: "Note",
+        column: "frontmatter_raw",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // Edge evidence: the snippet that justified the edge. Empty = pre-column.
+    ColumnMigration {
+        table: "CALLS",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "USES",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "ACCESSES",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "IMPORTS",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "EXTENDS_SYM",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "IMPLEMENTS_SYM",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "INCLUDES_SYM",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "MEMBER_OF",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "CROSS_REPO_LINK",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // nw-122: `display` alone cannot answer both questions a wikilink is asked.
+    // For `[[Home|workspace]]` BACKLINKS wants the visible text while
+    // BROKEN-LINKS wants the target; reporting the alias there rendered
+    // `[[workspace]]`, a string that appears nowhere in the vault. Carry both.
+    // Empty means "written before this column"; readers fall back to `display`.
+    ColumnMigration {
+        table: "WIKILINK_TO_NOTE",
+        column: "target",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "WIKILINK_TO_HEADING",
+        column: "target",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    // F11 memory-bank typed Note→Note edges.
+    ColumnMigration {
+        table: "SUPERSEDES",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "DEPENDS_ON",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "CAUSED_BY",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "RELATES_TO",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+    ColumnMigration {
+        table: "PROJECT_INCLUDES_NOTE",
+        column: "confidence",
+        type_and_default: "FLOAT DEFAULT 1.0",
+    },
+    ColumnMigration {
+        table: "IMPLEMENTS_CONTRACT",
+        column: "evidence",
+        type_and_default: "STRING DEFAULT ''",
+    },
+];
+
+/// Does this engine error mean "the column is already there"?
+///
+/// `ADD IF NOT EXISTS` already reports that as success, so this is a second
+/// line of defence: it keeps a normal open of an already-migrated database
+/// benign even if the engine ever reports a present column as an error again.
+/// Nothing else may be swallowed — the whole defect this replaces was a real
+/// failure that looked exactly like a no-op.
+fn is_column_already_present(message: &str) -> bool {
+    message.contains("already has property") || message.contains("already exists")
+}
+
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
@@ -858,8 +1059,51 @@ impl GraphStore {
 
     /// Open an existing database in read-only mode. Allows concurrent access
     /// while another process (e.g. the web UI) holds the write lock.
+    ///
+    /// A read-only connection cannot run DDL, so this open used to skip
+    /// `init_schema` entirely — and with it every column migration. That is
+    /// what broke `search`, `dead-code` and `brain status` on every upgraded
+    /// database in 8.0.1: the CLI read funnel (`open_store`) opens read-only,
+    /// so the migrations adding `Symbol.visibility` and `Note.frontmatter_raw`
+    /// never ran on the one code path that needed them. The ALTER statements
+    /// themselves were always correct.
+    ///
+    /// So: probe the catalog read-only (cheap, no lock), and only when a column
+    /// is genuinely missing take the writer lock to add it and reopen. On an
+    /// up-to-date database — the steady state — this costs one catalog query
+    /// per migrated table and touches no lock at all.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+        let mut db =
+            open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+        let stale = lbug::Connection::new(&db)
+            .map(|conn| {
+                Self::missing_migration_columns(&conn)
+                    .iter()
+                    .map(|migration| format!("{}.{}", migration.table, migration.column))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !stale.is_empty() {
+            drop(db);
+            match Self::migrate_for_read_only(path) {
+                Ok(()) => tracing::info!(
+                    "upgraded the schema of {} in place before a read-only open; \
+                     added {} column(s): {}",
+                    path.display(),
+                    stale.len(),
+                    stale.join(", ")
+                ),
+                Err(error) => tracing::warn!(
+                    "{} is missing {} schema column(s) ({}) and could not be \
+                     upgraded now ({error}); reads needing them will fail until a \
+                     writer opens it",
+                    path.display(),
+                    stale.len(),
+                    stale.join(", ")
+                ),
+            }
+            db = open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+        }
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -2783,15 +3027,6 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
-        // Migration: add `name` column to pre-existing Repo tables that lack it.
-        // nw-298: the raw frontmatter text. Existing databases predate the
-        // column, and `CREATE TABLE IF NOT EXISTS` will not add it.
-        let _ = conn.query("ALTER TABLE Note ADD frontmatter_raw STRING DEFAULT ''");
-        let _ = conn.query("ALTER TABLE Repo ADD name STRING DEFAULT ''");
-        // Migration: add `root_path` column to pre-existing Repo tables that
-        // lack it. Empty string maps to `None` on read (see read.rs).
-        let _ = conn.query("ALTER TABLE Repo ADD root_path STRING DEFAULT ''");
-
         conn.query(
             "CREATE NODE TABLE IF NOT EXISTS File(\
                 uid STRING, \
@@ -2835,28 +3070,6 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
-        // Migration: add `end_line` to pre-existing Symbol tables that lack it
-        // (P0.1). Old rows default to 0 until re-indexed with `index --force`.
-        let _ = conn.query("ALTER TABLE Symbol ADD end_line INT64 DEFAULT 0");
-
-        // Migration (F2.0): add `framework_hint` to pre-existing Symbol tables.
-        // Stored as "framework:role" (e.g. "spring:controller"); empty for none.
-        let _ = conn.query("ALTER TABLE Symbol ADD framework_hint STRING DEFAULT ''");
-
-        // Migration (Phase 4): add `canonical_id` for cross-boundary symbol matching.
-        // Existing symbols get empty string until re-indexed with scope-chain extraction.
-        let _ = conn.query("ALTER TABLE Symbol ADD canonical_id STRING DEFAULT ''");
-
-        // Migration (nw-291): add `visibility`. The parser has always inferred
-        // it, but nothing persisted it, so `read.rs` rebuilt every symbol as
-        // `Inferred` and BOTH visibility guards in `dead_code::infer_confidence`
-        // were unreachable branches — the only live discriminator left was a
-        // leading underscore. Existing symbols read back as the empty string,
-        // which maps to `Inferred`: the honest answer for a row written before
-        // the column existed, and identical to today's behaviour until
-        // `index --force`.
-        let _ = conn.query("ALTER TABLE Symbol ADD visibility STRING DEFAULT ''");
-
         // --- Relationship tables ---
         conn.query("CREATE REL TABLE IF NOT EXISTS REPO_HAS_FILE(FROM Repo TO File)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -2872,63 +3085,54 @@ impl GraphStore {
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE CALLS ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS USES(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE USES ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS ACCESSES(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE ACCESSES ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPORTS(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE IMPORTS ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS EXTENDS_SYM(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE EXTENDS_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS_SYM(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE IMPLEMENTS_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS INCLUDES_SYM(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE INCLUDES_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS MEMBER_OF(\
                 FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE MEMBER_OF ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS CROSS_REPO_LINK(\
                 FROM Symbol TO Symbol, confidence FLOAT, link_type STRING, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE CROSS_REPO_LINK ADD evidence STRING DEFAULT ''");
 
         // ── Brain extension: markdown nodes (walking skeleton) ──────────────
         //
@@ -3047,16 +3251,6 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
-        // Migration: `display` alone cannot answer both questions a wikilink is
-        // asked. For a piped link `[[Home|workspace]]` the BACKLINKS view wants
-        // the visible text ("workspace") while BROKEN-LINKS wants the link
-        // target ("Home") — reporting the alias there rendered `[[workspace]]`,
-        // a string that appears nowhere in the vault (nw-122). Carry both.
-        // Empty string means "written before this column existed"; readers fall
-        // back to `display`, which is what those rows have always held.
-        let _ = conn.query("ALTER TABLE WIKILINK_TO_NOTE ADD target STRING DEFAULT ''");
-        let _ = conn.query("ALTER TABLE WIKILINK_TO_HEADING ADD target STRING DEFAULT ''");
-
         // ── F11 memory-bank: typed Note→Note relationships ─────────────────
         // Explicit, semantically-typed knowledge edges derived from frontmatter
         // keys and heading-grouped wikilinks. Map to PROV-O / SKOS vocab:
@@ -3067,25 +3261,21 @@ impl GraphStore {
                 FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE SUPERSEDES ADD evidence STRING DEFAULT ''");
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(\
                 FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE DEPENDS_ON ADD evidence STRING DEFAULT ''");
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS CAUSED_BY(\
                 FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE CAUSED_BY ADD evidence STRING DEFAULT ''");
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS RELATES_TO(\
                 FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE RELATES_TO ADD evidence STRING DEFAULT ''");
 
         conn.query("CREATE REL TABLE IF NOT EXISTS NOTE_TAGGED_WITH(FROM Note TO Tag)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -3098,9 +3288,6 @@ impl GraphStore {
                 FROM Project TO Note, confidence FLOAT)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-
-        // Migration: add confidence column for databases created before it existed.
-        let _ = conn.query("ALTER TABLE PROJECT_INCLUDES_NOTE ADD confidence FLOAT DEFAULT 1.0");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_SYMBOL(\
@@ -3162,7 +3349,6 @@ impl GraphStore {
                 FROM Symbol TO Contract, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        let _ = conn.query("ALTER TABLE IMPLEMENTS_CONTRACT ADD evidence STRING DEFAULT ''");
 
         // Regex v3 stores postings in disposable per-scope Tantivy shards.
         // Fresh graphs intentionally create no graph-resident posting tables;
@@ -3224,7 +3410,130 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // Additive column migrations run LAST, after every `CREATE TABLE`
+        // above, so no migration can name a table that does not exist yet.
+        Self::apply_column_migrations(&conn)?;
+
         Ok(())
+    }
+
+    /// Apply every declared additive column migration, reporting anything that
+    /// is not "the column is already there".
+    ///
+    /// The form this replaces was `let _ = conn.query("ALTER TABLE ...")` at 24
+    /// sites: the result was discarded, so a migration that never ran was
+    /// indistinguishable from one that succeeded. That went unnoticed for two
+    /// releases because every column these add was ALSO in the neighbouring
+    /// `CREATE TABLE`, so only an *upgraded* database could tell the difference
+    /// — and no test ever opened one.
+    ///
+    /// Failing the open is deliberate. The alternative, which 8.0.1 shipped, is
+    /// that the open succeeds and the next read dies on "Binder exception:
+    /// Cannot find property visibility for s" — an error naming neither the
+    /// migration nor the database that needs one.
+    fn apply_column_migrations(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        Self::apply_migrations(conn, COLUMN_MIGRATIONS.iter())
+    }
+
+    /// Apply a chosen subset. Failures are COLLECTED, never short-circuited: a
+    /// migration that cannot run must not stop the ones after it from running,
+    /// or one absent table would withhold every column behind it.
+    fn apply_migrations<'a>(
+        conn: &lbug::Connection<'_>,
+        migrations: impl Iterator<Item = &'a ColumnMigration>,
+    ) -> Result<(), StoreError> {
+        let mut failures = Vec::new();
+        for migration in migrations {
+            if let Err(error) = conn.query(&migration.ddl()) {
+                let message = error.to_string();
+                if is_column_already_present(&message) {
+                    continue;
+                }
+                failures.push(format!(
+                    "{}.{} ({message})",
+                    migration.table, migration.column
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(StoreError::Query(format!(
+            "schema migration failed for {} column(s): {}. This database is a \
+             version behind and could not be upgraded in place; reads that need \
+             these columns would fail with an unattributable binder error.",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+
+    /// Which declared migration columns this database does not have yet.
+    ///
+    /// Answerable over a READ-ONLY connection — `TABLE_INFO` is a catalog read
+    /// — which is the entire point. `open_read_only` cannot run DDL, so it has
+    /// to be able to detect that it needs the writer lock without first taking
+    /// it (briefly grabbing the write lock on every read open would race the
+    /// daemon or watcher that legitimately owns it).
+    ///
+    /// A table `TABLE_INFO` cannot resolve is NOT reported as missing columns:
+    /// it does not exist yet, so `init_schema` will `CREATE` it with the column
+    /// already in place and there is nothing to migrate.
+    fn missing_migration_columns(conn: &lbug::Connection<'_>) -> Vec<&'static ColumnMigration> {
+        let mut columns_by_table: HashMap<&'static str, Option<Vec<String>>> = HashMap::new();
+        let mut missing = Vec::new();
+        for migration in COLUMN_MIGRATIONS {
+            let known = columns_by_table
+                .entry(migration.table)
+                .or_insert_with(|| Self::table_columns(conn, migration.table));
+            if let Some(known) = known
+                && !known.iter().any(|column| column == migration.column)
+            {
+                missing.push(migration);
+            }
+        }
+        missing
+    }
+
+    /// Column names of `table`, or `None` when the table does not exist.
+    fn table_columns(conn: &lbug::Connection<'_>, table: &str) -> Option<Vec<String>> {
+        let rows = conn
+            .query(&format!("CALL TABLE_INFO('{table}') RETURN *"))
+            .ok()?;
+        let mut names = Vec::new();
+        for row in rows {
+            // TABLE_INFO yields (property id, name, type, default, is primary key).
+            if let Ok(name) = crate::read::extract_string(&row, 1) {
+                names.push(name);
+            }
+        }
+        Some(names)
+    }
+
+    /// Bring an out-of-date database up to the current schema before a
+    /// read-only open, or explain why it could not be.
+    ///
+    /// Best-effort by construction: if another process holds the writer lock we
+    /// cannot migrate, and must not fail the read — that process is normally a
+    /// current-version daemon which has already migrated, and the reopen below
+    /// will simply see the columns. What we must NOT do is stay silent when the
+    /// columns really are absent, which is exactly how 8.0.1 shipped.
+    fn migrate_for_read_only(path: &Path) -> Result<(), StoreError> {
+        // `read_write: false` even though this open IS write-capable. That flag
+        // gates only the orphaned-WAL quarantine arm, and the hazard its doc
+        // describes — "a read-only caller quarantining a log out from under a
+        // live writer" — is exactly this caller. A missing column is worth
+        // taking the writer lock for; it is not worth moving someone else's
+        // write-ahead log aside for. An orphaned WAL here is reported, not
+        // cleared.
+        let db = open_lbug_with_recovery(path, false, hardened_system_config)?;
+        let conn = lbug::Connection::new(&db)?;
+        // Only what is actually missing, re-derived under the writer so the
+        // decision is made against the schema we are about to change rather
+        // than the one a read-only connection saw a moment ago. Reporting a
+        // failure for a migration this database never needed would make the
+        // warning below say something untrue.
+        let missing = Self::missing_migration_columns(&conn);
+        Self::apply_migrations(&conn, missing.into_iter())
     }
 }
 
@@ -4318,5 +4627,310 @@ mod data_instance_identity_tests {
 
         assert!(store.ensure_data_instance_id("   ").is_err());
         assert!(store.data_instance_id().unwrap().is_none());
+    }
+}
+
+/// Coverage for the defect class the 8.0.1 upgrade regression belongs to: a
+/// column added to `CREATE TABLE` reaches fresh databases, an `ALTER TABLE`
+/// beside it is supposed to reach upgraded ones, and NO test ever opened an
+/// upgraded one — so a migration that had never worked looked exactly like a
+/// migration that always had. Every test here opens an old-shaped database.
+#[cfg(test)]
+mod schema_migration_tests {
+    use super::{COLUMN_MIGRATIONS, GraphStore, bounded_system_config, is_column_already_present};
+
+    /// Column names of `table`, read straight from the catalog.
+    fn columns(path: &std::path::Path, table: &str) -> Vec<String> {
+        let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        GraphStore::table_columns(&conn, table).unwrap_or_default()
+    }
+
+    /// Run DDL against a closed database.
+    fn run(path: &std::path::Path, statements: &[String]) {
+        let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        for statement in statements {
+            conn.query(statement)
+                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        }
+    }
+
+    fn rows(conn: &lbug::Connection<'_>, query: &str) -> Vec<Vec<lbug::Value>> {
+        let result = conn.query(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        result.collect()
+    }
+
+    /// Build a database in the shape a PREVIOUS release left behind: the whole
+    /// current schema, minus every column `COLUMN_MIGRATIONS` declares.
+    ///
+    /// Reconstructed from the catalog of a fresh database rather than from a
+    /// checked-in fixture or a literal copy of the old DDL, so it cannot drift
+    /// as the schema grows — a column added to `CREATE TABLE` and to
+    /// `COLUMN_MIGRATIONS` is automatically covered here too.
+    ///
+    /// Reconstructing rather than `ALTER TABLE ... DROP`-ing is not a stylistic
+    /// choice. Altering a NODE table that has zero rows — `DROP` or `ADD`
+    /// alike — leaves lbug 0.19.1 unable to reopen the database at all
+    /// (`hash_index.cpp:497`, `hashIndexStorageInfo.overflowHeaderPage ==
+    /// INVALID_PAGE_IDX`; a `DASSERT`, live in debug and relwithdebinfo builds
+    /// and compiled out of release), and a database straight from
+    /// `GraphStore::create` has no rows in it anywhere. So the downgrade is
+    /// built forwards, and the node tables a migration touches are seeded.
+    fn build_old_schema_database(path: &std::path::Path) {
+        let reference = tempfile::tempdir().unwrap();
+        let reference_path = reference.path().join("reference.lbug");
+        drop(GraphStore::create(&reference_path).unwrap());
+
+        // Scoped: the reference database must be CLOSED before the old-shaped
+        // one is written. Holding both open at once leaves the second
+        // unopenable in lbug 0.19.1 (`hash_index.cpp:497`).
+        let ddl = {
+            let db = lbug::Database::new(&reference_path, bounded_system_config()).unwrap();
+            let conn = lbug::Connection::new(&db).unwrap();
+
+            let tables: Vec<(String, String)> = rows(&conn, "CALL SHOW_TABLES() RETURN *")
+                .iter()
+                .map(|row| {
+                    (
+                        crate::read::extract_string(row, 1).unwrap(),
+                        crate::read::extract_string(row, 2).unwrap(),
+                    )
+                })
+                .collect();
+
+            let omitted = |table: &str, column: &str| {
+                COLUMN_MIGRATIONS
+                    .iter()
+                    .any(|migration| migration.table == table && migration.column == column)
+            };
+
+            // Properties, minus anything a migration is responsible for adding.
+            let properties = |table: &str| -> (Vec<String>, Option<String>) {
+                let mut columns = Vec::new();
+                let mut primary_key = None;
+                for row in rows(&conn, &format!("CALL TABLE_INFO('{table}') RETURN *")) {
+                    let name = crate::read::extract_string(&row, 1).unwrap();
+                    let ty = crate::read::extract_string(&row, 2).unwrap();
+                    if matches!(row.get(4), Some(lbug::Value::Bool(true))) {
+                        primary_key = Some(name.clone());
+                    }
+                    if !omitted(table, &name) {
+                        columns.push(format!("{name} {ty}"));
+                    }
+                }
+                (columns, primary_key)
+            };
+
+            // Node tables first: rel tables name them in FROM/TO.
+            let mut ddl = Vec::new();
+            let mut seeds = Vec::new();
+            for (table, kind) in tables.iter().filter(|(_, kind)| kind == "NODE") {
+                let (columns, primary_key) = properties(table);
+                assert!(kind == "NODE");
+                let primary_key = primary_key.unwrap_or_else(|| {
+                    panic!("node table {table} has no primary key in TABLE_INFO")
+                });
+                ddl.push(format!(
+                    "CREATE NODE TABLE {table}({}, PRIMARY KEY({primary_key}))",
+                    columns.join(", ")
+                ));
+                // Seed one row into every node table a migration touches, per
+                // the lbug empty-node-table note above. This is also the more
+                // faithful fixture: a real upgraded database has repos,
+                // symbols and notes in it. Rel tables need no seed — they are
+                // unaffected, empty or not.
+                if COLUMN_MIGRATIONS
+                    .iter()
+                    .any(|migration| migration.table == table)
+                {
+                    seeds.push(format!(
+                        "CREATE (:{table} {{{primary_key}: 'seed-{table}'}})"
+                    ));
+                }
+            }
+            for (table, _) in tables.iter().filter(|(_, kind)| kind == "REL") {
+                let connection = rows(&conn, &format!("CALL SHOW_CONNECTION('{table}') RETURN *"));
+                let Some(pair) = connection.first() else {
+                    continue;
+                };
+                let from = crate::read::extract_string(pair, 0).unwrap();
+                let to = crate::read::extract_string(pair, 1).unwrap();
+                let (columns, _) = properties(table);
+                let mut parts = vec![format!("FROM {from} TO {to}")];
+                parts.extend(columns);
+                ddl.push(format!("CREATE REL TABLE {table}({})", parts.join(", ")));
+            }
+            ddl.extend(seeds);
+            ddl
+        };
+
+        run(path, &ddl);
+    }
+
+    /// THE regression test. Open a previous release's database the way the CLI
+    /// read path opens one, and require every declared column back.
+    ///
+    /// Covers all of `COLUMN_MIGRATIONS`, not just the two columns the 8.0.1
+    /// bug reported: the answer to "where else does this need to hold?" is
+    /// every migration site, and a list-driven test cannot drift from the list.
+    ///
+    /// Before the fix this failed on all 24 columns. `open_read_only` — which
+    /// `open_store` funnels every CLI read command through — never called
+    /// `init_schema` at all, so no migration ever ran on the one path that
+    /// needed them, and `search`/`dead-code` died on "Binder exception: Cannot
+    /// find property visibility for s".
+    #[test]
+    fn an_old_schema_database_gains_every_migrated_column_on_a_read_only_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+
+        for migration in COLUMN_MIGRATIONS {
+            assert!(
+                !columns(&path, migration.table).contains(&migration.column.to_string()),
+                "the reconstructed old database already has {}.{}; the test would \
+                 pass vacuously",
+                migration.table,
+                migration.column
+            );
+        }
+
+        drop(GraphStore::open_read_only(&path).unwrap());
+
+        for migration in COLUMN_MIGRATIONS {
+            assert!(
+                columns(&path, migration.table).contains(&migration.column.to_string()),
+                "{}.{} was not added by a read-only open of an upgraded database",
+                migration.table,
+                migration.column
+            );
+        }
+    }
+
+    /// The same database opened read-WRITE must recover too. `open` does run
+    /// `init_schema`, so this pins the ordering fix: `Note.frontmatter_raw` was
+    /// issued ~160 lines before `CREATE NODE TABLE Note` existed in the same
+    /// function, and would have failed with "Table Note does not exist" here.
+    #[test]
+    fn an_old_schema_database_gains_every_migrated_column_on_a_read_write_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+
+        drop(GraphStore::open(&path).unwrap());
+
+        for migration in COLUMN_MIGRATIONS {
+            assert!(
+                columns(&path, migration.table).contains(&migration.column.to_string()),
+                "{}.{} was not added by a read-write open of an upgraded database",
+                migration.table,
+                migration.column
+            );
+        }
+    }
+
+    /// The reported symptom, end to end: an 8.0.0-shaped `Symbol` table with a
+    /// row in it, read back through a query that names the new column.
+    ///
+    /// Dropping and re-adding a column is not quite the same as never having
+    /// had one, so this builds the old table shape literally and puts data in
+    /// it — the pre-existing row must survive the migration and read back as
+    /// the declared default.
+    #[test]
+    fn a_symbol_written_before_the_visibility_column_reads_back_as_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v800.lbug");
+
+        // The 8.0.0 Symbol table: no `visibility`.
+        run(
+            &path,
+            &[
+                "CREATE NODE TABLE Symbol(\
+                    uid STRING, name STRING, kind STRING, repo_uid STRING, \
+                    file_path STRING, start_line INT64, end_line INT64, \
+                    signature STRING, summary STRING, content_hash STRING, \
+                    pagerank_score DOUBLE, is_entry_point STRING, \
+                    entry_point_kind STRING, framework_hint STRING, \
+                    canonical_id STRING, PRIMARY KEY(uid))"
+                    .to_string(),
+                "CREATE (:Symbol {uid: 'old', name: 'GraphStore', kind: 'Class'})".to_string(),
+            ],
+        );
+
+        let store = GraphStore::open_read_only(&path).unwrap();
+        let conn = store.conn().unwrap();
+        let mut rows = conn
+            .query("MATCH (s:Symbol) WHERE s.uid = 'old' RETURN s.name, s.visibility")
+            .expect("a query naming the migrated column must bind");
+        let row = rows.next().expect("the pre-existing symbol must survive");
+        assert_eq!(crate::read::extract_string(&row, 0).unwrap(), "GraphStore");
+        assert_eq!(
+            crate::read::extract_string(&row, 1).unwrap(),
+            "",
+            "a row written before the column existed reads back as the declared default"
+        );
+    }
+
+    /// Every migration must name a table `init_schema` actually creates.
+    ///
+    /// This is the check the `Note.frontmatter_raw` ordering bug needed and did
+    /// not have: a migration against a table that does not exist can only ever
+    /// fail, and with the result discarded it failed invisibly.
+    #[test]
+    fn every_migration_names_a_table_the_schema_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.lbug");
+        drop(GraphStore::create(&path).unwrap());
+
+        for migration in COLUMN_MIGRATIONS {
+            let columns = columns(&path, migration.table);
+            assert!(
+                !columns.is_empty(),
+                "migration {}.{} names a table `init_schema` never creates",
+                migration.table,
+                migration.column
+            );
+            assert!(
+                columns.contains(&migration.column.to_string()),
+                "{}.{} is migrated but absent from the CREATE TABLE, so a fresh \
+                 database would never get it",
+                migration.table,
+                migration.column
+            );
+        }
+    }
+
+    /// A fresh database reports nothing to migrate. Without this the read-only
+    /// probe could be vacuous in the opposite direction — always "stale", so
+    /// every read open would take the writer lock.
+    #[test]
+    fn a_current_database_needs_no_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.lbug");
+        let store = GraphStore::create(&path).unwrap();
+        let conn = store.conn().unwrap();
+        assert!(
+            GraphStore::missing_migration_columns(&conn).is_empty(),
+            "a database created by this release must need no column migration"
+        );
+        // And re-applying them all is benign, which is what every normal open
+        // does. The pre-fix code could not have told you either way.
+        GraphStore::apply_column_migrations(&conn).unwrap();
+    }
+
+    /// Only "already there" is benign. The old `let _ =` swallowed everything,
+    /// including "Table Note does not exist" and every read-only refusal.
+    #[test]
+    fn only_an_already_present_column_is_treated_as_benign() {
+        assert!(is_column_already_present(
+            "Runtime exception: Symbol table already has property visibility."
+        ));
+        assert!(!is_column_already_present(
+            "Binder exception: Table Note does not exist."
+        ));
+        assert!(!is_column_already_present(
+            "Connection exception: Cannot execute write operations in a read-only database!"
+        ));
     }
 }
