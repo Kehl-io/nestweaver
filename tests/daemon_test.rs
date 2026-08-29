@@ -5723,9 +5723,47 @@ fn clusters_text_honours_limit_on_the_daemon_route() {
 /// observation, and the caller waits out the whole ceiling.
 ///
 /// Staged with an unwritable state directory, so the daemon cannot create its
+/// Flatten a miette-rendered diagnostic so a phrase assertion cannot be broken
+/// by line wrapping.
+///
+/// miette wraps to the terminal width and prefixes continuation lines with its
+/// box-drawing gutter, so a two-word phrase can arrive as `Permission\n  │
+/// denied`. That is exactly how this test failed on CI while passing on a
+/// developer machine: the wrap point moved with the tempdir path length, so the
+/// assertion was width-dependent rather than behaviour-dependent.
+///
+/// Only assertions against text that is rendered *inside* a diagnostic block
+/// need this. A phrase from a plain `eprintln!` warning cannot wrap.
+fn flatten_diagnostic(stderr: &str) -> String {
+    stderr
+        .replace(
+            ['\u{2502}', '\u{256d}', '\u{2570}', '\u{2500}', '\u{00d7}'],
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// runtime directory and exits in milliseconds without ever writing a pidfile.
 /// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
 /// this without touching the operator's real state tree.
+/// The wrapped form this helper exists for, captured verbatim from the CI run
+/// that failed on 2026-08-29 while the same test passed locally. Asserting on
+/// the raw string here would fail, which is what makes this test non-vacuous:
+/// it pins the actual defect rather than the fixed rendering.
+#[test]
+fn flatten_diagnostic_recovers_a_phrase_miette_wrapped() {
+    let as_ci_rendered = "  \u{00d7} create log dir: /tmp/.tmph9AjEh/state/nestweaver/982eefe7: Permission\n  \u{2502} denied (os error 13). Check the daemon logs:";
+
+    assert!(
+        !as_ci_rendered.contains("Permission denied"),
+        "fixture must reproduce the wrap, or this test proves nothing"
+    );
+    assert!(flatten_diagnostic(as_ci_rendered).contains("Permission denied"));
+    assert!(flatten_diagnostic(as_ci_rendered).contains("create log dir"));
+}
+
 #[test]
 fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
     use std::os::unix::fs::PermissionsExt;
@@ -5788,7 +5826,7 @@ fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
          timeout:\n{stderr}"
     );
     assert!(
-        stderr.contains("Permission denied"),
+        flatten_diagnostic(&stderr).contains("Permission denied"),
         "and it must carry the launcher's own reason:\n{stderr}"
     );
     assert!(
