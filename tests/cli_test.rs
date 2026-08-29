@@ -5646,3 +5646,148 @@ fn memory_lint_splits_the_broken_wikilink_count() {
         "the bare length conflates two categories: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// nw-287 — a precondition must test the operation the caller will perform.
+// ---------------------------------------------------------------------------
+
+/// `chmod 000` on a directory leaves `stat(2)` working — that needs `+x` on the
+/// PARENT, not on the directory itself — so `exists()` and `is_dir()` both pass
+/// on a vault that cannot be ENUMERATED. Only `read_dir` fails, two layers down,
+/// where the empty scan was indistinguishable from "the user deleted every
+/// note": `brain refresh` reported rc=0 and dropped the whole vault.
+fn unreadable_vault(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("keep.md"),
+        "---\ntitle: Keep Me\n---\n\nimportant content\n",
+    )
+    .unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    (vault, db)
+}
+
+fn make_readable_again(vault: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(vault, std::fs::Permissions::from_mode(0o755));
+}
+
+fn note_count(db: &std::path::Path) -> String {
+    let out = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(db)
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn brain_refresh_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error, not an empty vault: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must say the directory could not be READ, not that it is not a \
+         directory — it is one: {stderr}"
+    );
+
+    let status = note_count(&db);
+    assert!(
+        status.contains("Notes:     1"),
+        "the indexed note must survive a refresh that could not see it: {status}"
+    );
+}
+
+#[test]
+fn brain_watch_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["brain", "watch"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "watch must refuse before it starts a watcher on a directory it cannot \
+         enumerate: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}
+
+/// The same `!exists() || !is_dir()` shape guards `detect-implicit-projects`,
+/// which enumerates the vault too. Not named in the nw-287 report — found by
+/// asking where else the property has to hold.
+#[test]
+fn detect_implicit_projects_refuses_a_vault_it_cannot_enumerate() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, db) = unreadable_vault(&dir);
+
+    let assertion = nestweaver_cmd()
+        .args(["detect-implicit-projects", "--vault"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert();
+    let output = assertion.get_output().clone();
+    make_readable_again(&vault);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "an unreadable vault is an error here too: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the error must name the readability failure: {stderr}"
+    );
+}

@@ -15739,6 +15739,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 eprintln!("Error: vault path is not a directory: {}", vault.display());
                 return Ok((EXIT_ERROR, None));
             }
+            // Same `stat(2)`-only guard as `brain refresh` / `brain watch`, and
+            // this command enumerates the vault too (nw-287). Not named in the
+            // report — found by asking where else the property has to hold.
+            if let Err(err) = std::fs::read_dir(&vault) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    vault.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
 
             // ── daemon guard ──────────────────────────────────────
             // nw-161: NOT taken for --dry-run. The daemon RPC has no dry-run
@@ -20487,6 +20497,18 @@ fn run_brain(
                 eprintln!("Error: vault path is not a directory: {}", path.display());
                 return Ok((EXIT_ERROR, None));
             }
+            // `is_dir()` only needs `stat(2)`, which succeeds on a `chmod 000`
+            // directory — that needs `+x` on the PARENT, not on the directory
+            // itself — so the guard above passes on a vault that cannot be
+            // ENUMERATED. Probing `read_dir` is the cheapest predicate that
+            // actually tests the operation the refresh depends on (nw-287).
+            if let Err(err) = std::fs::read_dir(&path) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    path.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
@@ -20741,6 +20763,18 @@ fn run_brain(
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
+                return Ok((EXIT_ERROR, None));
+            }
+            // `is_dir()` only needs `stat(2)`, which succeeds on a `chmod 000`
+            // directory — that needs `+x` on the PARENT, not on the directory
+            // itself — so the guard above passes on a vault that cannot be
+            // ENUMERATED. Probing `read_dir` is the cheapest predicate that
+            // actually tests the operation the refresh depends on (nw-287).
+            if let Err(err) = std::fs::read_dir(&path) {
+                eprintln!(
+                    "Error: vault directory cannot be read: {} ({err})",
+                    path.display()
+                );
                 return Ok((EXIT_ERROR, None));
             }
             let vault_name = name.unwrap_or_else(|| {
