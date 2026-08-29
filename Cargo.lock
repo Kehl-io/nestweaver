@@ -4376,6 +4376,7 @@ dependencies = [
  "cc",
  "csv",
  "lbug",
+ "libc",
  "lru 0.18.2",
  "memmap2",
  "nestweaver-algorithms",
