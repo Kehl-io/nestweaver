@@ -243,6 +243,7 @@ pub mod index;
 pub mod index_limits;
 pub mod index_md;
 pub mod index_publication;
+pub mod instance_remedy;
 pub mod interactions;
 pub mod investigate;
 pub mod jobs;
