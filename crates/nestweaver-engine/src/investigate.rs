@@ -712,6 +712,7 @@ pub fn investigate_expand(
                 // fetch is a refresh there, not the thing that made it usable.
                 Err(_) if bundle.entries[idx].inline_body.is_some() => {
                     bundle.entries[idx].expanded = true;
+                    bundle.entries[idx].unavailable_reason = None;
                 }
                 Err(reason) => {
                     bundle.entries[idx].expanded = false;
