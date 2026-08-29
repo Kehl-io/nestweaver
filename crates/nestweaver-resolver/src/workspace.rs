@@ -314,7 +314,15 @@ fn expand_workspace_globs(
 /// runaway traversal in deeply nested or symlinked directory trees.
 const MAX_PACKAGE_RECURSION_DEPTH: usize = 10;
 
-/// Directories that are never useful for workspace package discovery.
+/// Directories that are never useful for workspace PACKAGE DISCOVERY.
+///
+/// nw-325 asked whether this should be unified with `index::SKIP_DIRS`. It
+/// should NOT, and it is not the same kind of thing. This list bounds a search
+/// for `package.json` manifests, not the set of files that enter the graph:
+/// missing a manifest degrades alias resolution, it does not silently remove
+/// source from the index. Widening it to the 33-entry code list would slow
+/// discovery for no benefit; narrowing the code list to these five would
+/// re-admit the bundle noise that list exists to keep out.
 const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target", "build", "dist"];
 
 /// Recursively collect packages from a directory tree.

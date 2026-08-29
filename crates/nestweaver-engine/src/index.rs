@@ -1934,6 +1934,27 @@ fn tiered_change_check(
 }
 
 /// Directory names to skip when walking the repository tree.
+///
+/// This is a DEFAULT, not a definition of coverage. Three properties hold:
+///
+///  1. Every prune is DISCLOSED (`FilesystemReader::skipped_dirs`, surfaced as
+///     `IndexResult::skipped_files`). nw-325: the prune runs inside
+///     `WalkBuilder::filter_entry`, which cuts the subtree before enumeration,
+///     so nothing below it could ever reach the `SkippedFile` channel and a
+///     wrong answer was indistinguishable from a complete one.
+///  2. A repo can opt any entry back in (`FilesystemReader::unskipping`).
+///  3. `ios` and `android` are NOT here. In an Expo / React Native / Capacitor
+///     layout they are first-party source by default — a nested
+///     `modules/<name>/ios/Foo.swift` is tracked and not gitignored, and this
+///     list pruned it at any depth, so the native half of a bridge was absent
+///     while its TypeScript shim was present. The genuinely-generated case is
+///     already covered: repos that generate them gitignore them, and the walker
+///     honours gitignore.
+///
+/// The remaining ambiguous entries (`build`, `dist`, `out`, `public`, `env`,
+/// `vendor`, `target`) are kept because removing them trades a false-negative
+/// class for a false-positive one — a JS monorepo's `dist/` is genuinely
+/// megabytes of minified output. They are now visible and overridable instead.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -1962,8 +1983,6 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".env",
     ".pio",
     "Pods",
-    "ios",
-    "android",
     ".gradle",
     "public",
     "out",
@@ -3231,6 +3250,7 @@ where
                                 // The signature-based hint cannot see a route
                                 // registered inside a function BODY, so recover
                                 // it from the retained source.
+                                //
                                 source
                                     .as_deref()
                                     .and_then(crate::contracts::detect_node_route_framework)
