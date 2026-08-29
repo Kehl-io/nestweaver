@@ -748,89 +748,86 @@ pub fn investigate_hydrate(
 
     let (hydrated, already_hydrated, skipped, skipped_reasons, entries) =
         update_bundle_store(db_path, |bundle_store| {
-        let bundle = bundle_store
-            .bundles
-            .get_mut(bundle_id)
-            .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
+            let bundle = bundle_store
+                .bundles
+                .get_mut(bundle_id)
+                .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
 
-        let mut used_tokens = 0usize;
-        let mut hydrated = 0usize;
-        let mut already_hydrated = 0usize;
-        // nw-301: both `continue`s below used to exit without touching EITHER
-        // counter, which is why the reported `hydrated: 7, already_hydrated: 5`
-        // summed to 12 — the Note count — on a 30-entry bundle, and the other
-        // 18 entries appeared nowhere. A command whose entire job is filling
-        // bodies did not account for the entries it failed to fill.
-        let mut skipped_reasons: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        let skip = |reason: String,
-                    entry: &mut BundleEntry,
-                    reasons: &mut std::collections::BTreeMap<String, usize>| {
-            *reasons.entry(reason.clone()).or_insert(0) += 1;
-            entry.unavailable_reason = Some(reason);
-        };
-        for entry in bundle.entries.iter_mut() {
-            if entry.inline_body.is_some() {
-                already_hydrated += 1;
-                entry.unavailable_reason = None;
-                continue;
-            }
-            let body = match fetch_full_body(store, &entry.uid, root) {
-                Ok(body) => body,
-                Err(reason) => {
-                    skip(reason.reason(), entry, &mut skipped_reasons);
+            let mut used_tokens = 0usize;
+            let mut hydrated = 0usize;
+            let mut already_hydrated = 0usize;
+            // nw-301: both `continue`s below used to exit without touching EITHER
+            // counter, which is why the reported `hydrated: 7, already_hydrated: 5`
+            // summed to 12 — the Note count — on a 30-entry bundle, and the other
+            // 18 entries appeared nowhere. A command whose entire job is filling
+            // bodies did not account for the entries it failed to fill.
+            let mut skipped_reasons: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let skip =
+                |reason: String,
+                 entry: &mut BundleEntry,
+                 reasons: &mut std::collections::BTreeMap<String, usize>| {
+                    *reasons.entry(reason.clone()).or_insert(0) += 1;
+                    entry.unavailable_reason = Some(reason);
+                };
+            for entry in bundle.entries.iter_mut() {
+                if entry.inline_body.is_some() {
+                    already_hydrated += 1;
+                    entry.unavailable_reason = None;
                     continue;
                 }
-            };
-            if body.is_empty() {
-                skip(
-                    BodyUnavailable::Empty.reason(),
-                    entry,
-                    &mut skipped_reasons,
-                );
-                continue;
-            }
-            let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
-            // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
-            // `complete` flag is propagated to BundleEntry.body_complete so
-            // consumers can decide whether to fall back to `read_symbols` for the
-            // full source.
-            let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
-            let cost = body.len().div_ceil(4);
-            if hydrated > 0 && used_tokens + cost > budget {
-                // Over budget: skip THIS body and keep going — a later, smaller
-                // body may still fit. (Previously a `break` aborted every
-                // remaining entry.)
-                skip(
-                    format!("token budget of {budget} exhausted"),
-                    entry,
-                    &mut skipped_reasons,
-                );
-                continue;
-            }
-            used_tokens += cost;
-            if entry.summary.is_none() {
-                let s = summarize(&body);
-                if !s.is_empty() {
-                    entry.summary = Some(s);
+                let body = match fetch_full_body(store, &entry.uid, root) {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        skip(reason.reason(), entry, &mut skipped_reasons);
+                        continue;
+                    }
+                };
+                if body.is_empty() {
+                    skip(BodyUnavailable::Empty.reason(), entry, &mut skipped_reasons);
+                    continue;
                 }
+                let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
+                // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
+                // `complete` flag is propagated to BundleEntry.body_complete so
+                // consumers can decide whether to fall back to `read_symbols` for the
+                // full source.
+                let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
+                let cost = body.len().div_ceil(4);
+                if hydrated > 0 && used_tokens + cost > budget {
+                    // Over budget: skip THIS body and keep going — a later, smaller
+                    // body may still fit. (Previously a `break` aborted every
+                    // remaining entry.)
+                    skip(
+                        format!("token budget of {budget} exhausted"),
+                        entry,
+                        &mut skipped_reasons,
+                    );
+                    continue;
+                }
+                used_tokens += cost;
+                if entry.summary.is_none() {
+                    let s = summarize(&body);
+                    if !s.is_empty() {
+                        entry.summary = Some(s);
+                    }
+                }
+                entry.inline_body = Some(body);
+                entry.body_complete = complete;
+                entry.unavailable_reason = None;
+                hydrated += 1;
             }
-            entry.inline_body = Some(body);
-            entry.body_complete = complete;
-            entry.unavailable_reason = None;
-            hydrated += 1;
-        }
 
-        let skipped: usize = skipped_reasons.values().sum();
-        let entries = bundle.entries.clone();
-        Ok((
-            hydrated,
-            already_hydrated,
-            skipped,
-            skipped_reasons,
-            entries,
-        ))
-    })?;
+            let skipped: usize = skipped_reasons.values().sum();
+            let entries = bundle.entries.clone();
+            Ok((
+                hydrated,
+                already_hydrated,
+                skipped,
+                skipped_reasons,
+                entries,
+            ))
+        })?;
 
     Ok(HydrateResult {
         bundle_id: bundle_id.to_string(),
@@ -1125,11 +1122,7 @@ impl BodyUnavailable {
 /// the five kinds a bundle can contain: `head:` and `tag:` fell off the end into
 /// `None` and were unhydratable forever — no `--root`, no token budget and no
 /// retry could ever have filled them.
-fn fetch_full_body(
-    store: &GraphStore,
-    uid: &str,
-    root: &Path,
-) -> Result<String, BodyUnavailable> {
+fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Result<String, BodyUnavailable> {
     use nestweaver_schema::UidKind;
 
     let non_empty = |text: String| {
@@ -1205,10 +1198,15 @@ fn fetch_full_body(
         // Stated, not fallen through. "Tags have no body" is a fact the caller
         // can act on; "no body" with no reason reads as "this failed" and
         // invites an infinite retry.
-        Some(kind @ (UidKind::Tag | UidKind::Repo | UidKind::File | UidKind::Service
-        | UidKind::Vault | UidKind::Project | UidKind::Contract)) => {
-            Err(BodyUnavailable::NoBodyForKind(kind.label()))
-        }
+        Some(
+            kind @ (UidKind::Tag
+            | UidKind::Repo
+            | UidKind::File
+            | UidKind::Service
+            | UidKind::Vault
+            | UidKind::Project
+            | UidKind::Contract),
+        ) => Err(BodyUnavailable::NoBodyForKind(kind.label())),
         None => Err(BodyUnavailable::UnknownUid),
     }
 }
@@ -1558,7 +1556,8 @@ mod tests {
         let total = entries.len();
         let bundle_id = bundle_of(&db_path, entries);
 
-        let result = investigate_hydrate(&store, &db_path, &vault, &bundle_id, Some(16000)).unwrap();
+        let result =
+            investigate_hydrate(&store, &db_path, &vault, &bundle_id, Some(16000)).unwrap();
 
         assert_eq!(
             result.hydrated + result.already_hydrated + result.skipped,
@@ -1617,9 +1616,14 @@ mod tests {
         // where symbol paths are repo-relative and one root can serve one repo.
         let bogus_root = dir.path().join("not-the-repo");
         fs::create_dir_all(&bogus_root).unwrap();
-        let out =
-            investigate_expand(&store, &db_path, &bogus_root, &bundle_id, &[asset_id.clone()])
-                .unwrap();
+        let out = investigate_expand(
+            &store,
+            &db_path,
+            &bogus_root,
+            &bundle_id,
+            std::slice::from_ref(&asset_id),
+        )
+        .unwrap();
 
         let expanded = out
             .expanded

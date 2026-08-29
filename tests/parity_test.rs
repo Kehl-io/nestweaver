@@ -1841,8 +1841,14 @@ fn the_mcp_route_carries_the_provenance_its_own_instructions_promise() {
         ("brain_status", serde_json::json!({})),
         ("stale_check", serde_json::json!({})),
         ("dead_code", serde_json::json!({})),
-        ("detect_changes", serde_json::json!({ "changed_files": ["src/a.js"] })),
-        ("cross_repo_contracts", serde_json::json!({ "name": "mainA" })),
+        (
+            "detect_changes",
+            serde_json::json!({ "changed_files": ["src/a.js"] }),
+        ),
+        (
+            "cross_repo_contracts",
+            serde_json::json!({ "name": "mainA" }),
+        ),
         ("flow_trace", serde_json::json!({ "symbol": "mainA" })),
     ] {
         let payload = run_via_mcp(db, tool, args);

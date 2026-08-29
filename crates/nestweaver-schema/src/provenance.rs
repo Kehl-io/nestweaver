@@ -70,7 +70,10 @@ pub fn provenance(scope: &str, sources: &[&str], stale_repos: &[String]) -> Valu
 /// need a bare array to become addressable.
 pub fn set(result: &mut Value, scope: &str, sources: &[&str], stale_repos: &[String]) {
     if let Some(obj) = result.as_object_mut() {
-        obj.insert(META_KEY.to_string(), provenance(scope, sources, stale_repos));
+        obj.insert(
+            META_KEY.to_string(),
+            provenance(scope, sources, stale_repos),
+        );
     }
 }
 

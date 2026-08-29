@@ -530,7 +530,11 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
 /// configured) so staleness reporting is uniform across all tools, not just the
 /// federated ones — a caller can always read which repos the local index is
 /// behind an upstream on.
-fn add_provenance_metadata(payload: &mut Value, upstream_source: Option<&str>, stale_repos: &[String]) {
+fn add_provenance_metadata(
+    payload: &mut Value,
+    upstream_source: Option<&str>,
+    stale_repos: &[String],
+) {
     // nw-315. This used to write `nestweaver.io/sources` / `nestweaver.io/scope`
     // / `nestweaver.io/stale_repos` onto the OUTER `tools/call` envelope — a
     // THIRD spelling of the same three facts, in a different place, so an HTTP
@@ -545,18 +549,12 @@ fn add_provenance_metadata(payload: &mut Value, upstream_source: Option<&str>, s
     // the contributing upstream and carry the federation health check's
     // staleness verdict, neither of which the tool layer can compute.
     match upstream_source {
-        Some(name) => nestweaver_schema::provenance::set(
-            payload,
-            "federated",
-            &["daemon", name],
-            stale_repos,
-        ),
-        None => nestweaver_schema::provenance::set(
-            payload,
-            "single-node",
-            &["daemon"],
-            stale_repos,
-        ),
+        Some(name) => {
+            nestweaver_schema::provenance::set(payload, "federated", &["daemon", name], stale_repos)
+        }
+        None => {
+            nestweaver_schema::provenance::set(payload, "single-node", &["daemon"], stale_repos)
+        }
     }
 }
 

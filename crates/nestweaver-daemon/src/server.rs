@@ -7013,10 +7013,9 @@ impl NestWeaverDaemon for DaemonService {
             // RPC used to return: an older CLI still deserializes it as a
             // `Service`, and every caller gains `matched` / `alternatives` /
             // `entry_points` without a coordinated upgrade.
-            let summary = nestweaver_engine::query::service_summary(
-                &state.store, name, instance, repo,
-            )
-            .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+            let summary =
+                nestweaver_engine::query::service_summary(&state.store, name, instance, repo)
+                    .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
             match summary {
                 Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),

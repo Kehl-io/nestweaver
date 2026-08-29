@@ -2439,7 +2439,9 @@ pub fn service_summary(
 
     let repo_uid = match repo {
         Some(selector) => {
-            let repos = store.list_repos(instance_id).map_err(|e| anyhow::anyhow!(e))?;
+            let repos = store
+                .list_repos(instance_id)
+                .map_err(|e| anyhow::anyhow!(e))?;
             Some(crate::resolve_repo_selector(&repos, selector)?.uid.clone())
         }
         None => None,
@@ -4054,7 +4056,9 @@ mod service_summary_tests {
 
         // A unique name must NOT warn — a disclosure that always fires is noise.
         let unique = store_with_same_named_service_in_n_repos("api", 1);
-        let only = service_summary(&unique, "api", None, None).unwrap().unwrap();
+        let only = service_summary(&unique, "api", None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(only.matched, 1);
         assert!(only.ambiguity_warning("api").is_none());
     }
