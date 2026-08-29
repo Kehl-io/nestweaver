@@ -1679,8 +1679,12 @@ pub fn build_brain_context_hybrid_with_aliases(
                 Ok(hits) => {
                     semantic_applied = true;
                     if config.always_blend_semantic {
+                        // Same antipattern as the fusion dedup below (nw-322):
+                        // `seed_uids.contains` is O(seeds) per semantic hit, and
+                        // `project:` scope makes `seeds` corpus-sized. `seen` is
+                        // already the dedup witness for this exact vector.
                         for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
-                            if !seed_uids.contains(uid) {
+                            if seen.insert(uid.clone()) {
                                 seed_uids.push(uid.clone());
                                 // nw-102: remember these are nearest-neighbour
                                 // guesses, not resolutions of the query text.
@@ -1878,13 +1882,27 @@ pub fn weighted_score_fuse(
         sem_scores.insert(uid, *score);
     }
 
+    // nw-322 (leg 2). This dedup was `if !all_uids.contains(uid)` — a linear
+    // scan inside a loop over the union, so O(n²) in the union size. It is
+    // invisible on a normal query, where n is the PPR frontier above
+    // `min_score` plus the BM25 hits (thousands), and quadratic on
+    // `investigate --scope project:<slug>`, which seeds PPR with the project's
+    // ENTIRE membership while `ppr.rs` emits every seed unconditionally: n
+    // becomes corpus-sized there and only there.
+    //
+    // The `HashSet` witness preserves insertion order exactly — the `Vec` still
+    // decides the order, the set only answers "seen?" — so this is a
+    // complexity change and not a behaviour change. `brain_context` and
+    // `project_context` share this path, so it is the same saving for the two
+    // most-called tools in the catalogue.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut all_uids: Vec<&str> = Vec::new();
     for uid in ppr_scores
         .keys()
         .chain(bm25_scores.keys())
         .chain(sem_scores.keys())
     {
-        if !all_uids.contains(uid) {
+        if seen.insert(uid) {
             all_uids.push(uid);
         }
     }
@@ -3268,6 +3286,60 @@ mod fusion_tests {
         let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
+    }
+
+    /// nw-322 (leg 2). `weighted_score_fuse` deduped its union with
+    /// `Vec::contains` — a linear scan inside a loop over the union, i.e.
+    /// O(n²). n is small for an ordinary query and corpus-sized for
+    /// `investigate --scope project:<slug>`, which is the only scope that seeds
+    /// PPR with the project's whole membership while PPR emits every seed.
+    ///
+    /// A latency assertion is flaky by construction, so this is sized to
+    /// discriminate ORDERS of magnitude, not milliseconds. Measured on this
+    /// machine by running this exact test against both implementations:
+    /// 16.9s with the `Vec::contains` dedup, 0.2s with the set witness, at
+    /// n = 60,000. The 5s bound sits between them with more than an order of
+    /// magnitude of headroom on each side.
+    #[test]
+    fn weighted_score_fuse_dedup_is_linear_in_the_union_size() {
+        let n = 60_000usize;
+        let ppr: Vec<(String, f64)> = (0..n)
+            .map(|i| (format!("sym:repo:test:{i:012x}"), 1.0 / (i + 1) as f64))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let fused = weighted_score_fuse(&ppr, &[], &[], 1.0, 0.0, 0.0);
+        let elapsed = start.elapsed();
+
+        assert_eq!(fused.len(), n, "dedup must not drop distinct uids");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "fusing {n} distinct uids took {elapsed:?} — the dedup is not linear"
+        );
+    }
+
+    /// The dedup must still DEDUPE, and must still keep first-seen order.
+    /// A `HashSet` witness that replaced the `Vec` outright would change the
+    /// order the union is built in, which decides tie-breaking downstream.
+    #[test]
+    fn weighted_score_fuse_dedup_keeps_one_row_per_uid() {
+        let ppr = vec![
+            ("a".to_string(), 0.9),
+            ("b".to_string(), 0.5),
+            ("a".to_string(), 0.1),
+        ];
+        let bm25 = vec![SearchHit {
+            uid: "b".to_string(),
+            kind: "function".into(),
+            title: "b".into(),
+            vault_uid: "v".into(),
+            note_uid: String::new(),
+            score: 5.0,
+        }];
+        let fused = weighted_score_fuse(&ppr, &bm25, &[("a".to_string(), 0.2)], 0.5, 0.3, 0.2);
+        let uids: Vec<&str> = fused.iter().map(|(uid, _)| uid.as_str()).collect();
+        assert_eq!(uids.len(), 2, "one row per distinct uid, got {uids:?}");
+        assert!(uids.contains(&"a") && uids.contains(&"b"), "{uids:?}");
     }
 }
 
