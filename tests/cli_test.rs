@@ -5893,3 +5893,162 @@ fn bridges_json_discloses_stale_rankings() {
         "payload: {stale}"
     );
 }
+
+// ── nw-313 + nw-281(b): the selective delete verbs ─────────────────────────
+//
+// `interactions clear` and the extension teardown are both all-or-nothing, so
+// one poisoned entry could only be removed by destroying every accumulated
+// signal beside it. The engine primitives (`remove_node_score`,
+// `remove_extension_key_durable`) landed with the sidecar work; these are the
+// user-facing verbs, and the property they must hold is SELECTIVITY — the
+// neighbouring entries have to survive, which is the whole reason the verbs
+// exist and the one thing `clear` cannot do.
+
+/// Seed a two-node interaction sidecar so "the other node survived" is
+/// assertable rather than assumed.
+fn seed_interaction_sidecar(db_path: &std::path::Path) {
+    std::fs::write(
+        sidecar_path(db_path, ".interactions.json"),
+        r#"{"version":1,"last_compacted":0.0,"node_scores":{
+             "sym:repo:keep":  {"access_count":3,"query_seed_count":1,
+                                "result_used_count":1,"result_shown_count":2,
+                                "last_accessed":1.0,"content_hash_at_access":null,
+                                "distinct_sessions":1,"computed_score":0.5},
+             "sym:repo:forget":{"access_count":9,"query_seed_count":4,
+                                "result_used_count":0,"result_shown_count":9,
+                                "last_accessed":2.0,"content_hash_at_access":null,
+                                "distinct_sessions":2,"computed_score":0.9}}}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn interactions_forget_removes_one_node_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    seed_interaction_sidecar(&db_path);
+
+    nestweaver_cmd()
+        .args([
+            "interactions",
+            "forget",
+            "sym:repo:forget",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("sym:repo:forget"));
+
+    let after = std::fs::read_to_string(sidecar_path(&db_path, ".interactions.json")).unwrap();
+    assert!(
+        !after.contains("sym:repo:forget"),
+        "the named node's interaction memory must be gone:\n{after}"
+    );
+    assert!(
+        after.contains("sym:repo:keep"),
+        "SELECTIVITY is the entire point of this verb — `clear` already removes \
+         everything, and a forget that took the neighbours with it would be \
+         `clear` with a longer name:\n{after}"
+    );
+}
+
+#[test]
+fn interactions_forget_separates_nothing_to_forget_from_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    seed_interaction_sidecar(&db_path);
+
+    // Idempotent verbs are not errors, but the caller must still be able to
+    // tell "I removed it" from "there was nothing there" — otherwise a typo'd
+    // UID reports the same success as a real deletion.
+    let output = nestweaver_cmd()
+        .args([
+            "interactions",
+            "forget",
+            "sym:repo:never-recorded",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a uid with no recorded memory must exit NOT_FOUND, not SUCCESS: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn extensions_unset_removes_one_key_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"owner": "platform", "tier": "gold"},
+            "sym:repo:other":  {"owner": "search"}}"#,
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "extensions",
+            "unset",
+            "sym:repo:widget",
+            "owner",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(sidecar_path(&db_path, ".extensions.json")).unwrap();
+    let store: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert!(
+        store["sym:repo:widget"]["owner"].is_null(),
+        "the named key must be gone:\n{after}"
+    );
+    assert_eq!(
+        store["sym:repo:widget"]["tier"], "gold",
+        "the node's OTHER properties must survive — the only delete that \
+         existed removed all of them:\n{after}"
+    );
+    assert_eq!(
+        store["sym:repo:other"]["owner"], "search",
+        "and so must the same key on a DIFFERENT node:\n{after}"
+    );
+}
+
+#[test]
+fn extensions_unset_separates_nothing_to_remove_from_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+    std::fs::write(
+        sidecar_path(&db_path, ".extensions.json"),
+        r#"{"sym:repo:widget": {"owner": "platform"}}"#,
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args([
+            "extensions",
+            "unset",
+            "sym:repo:widget",
+            "tier",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a key that was never set must exit NOT_FOUND: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

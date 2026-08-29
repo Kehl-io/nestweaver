@@ -4617,6 +4617,24 @@ enum ExtensionCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
+    /// Remove one extension property from one node.
+    ///
+    /// `set_extension` requires `value`, so not even a null-set was
+    /// expressible, and the only existing delete removes ALL of a uid's
+    /// properties and is reachable solely from daemon reindex paths (nw-281b).
+    Unset {
+        /// Node UID.
+        uid: String,
+        /// Property key to remove.
+        key: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5622,6 +5640,22 @@ enum InteractionCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Forget one node's interaction memory, leaving the rest intact.
+    ///
+    /// `clear` is all-or-nothing. A single poisoned entry — a phantom key from
+    /// a pre-nw-296 binary, or an oversized caller-supplied seed — could only
+    /// be removed by destroying every accumulated ranking signal (nw-313).
+    Forget {
+        /// Node UID to forget.
+        uid: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Show recorded interaction events / decayed score for a UID, or the
     /// top UIDs by a given event kind.
@@ -9999,6 +10033,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
+        // nw-281(b): the only delete that existed removed ALL of a uid's
+        // properties and was reachable solely from daemon reindex paths, so
+        // no user or agent could retract a single annotation they had set.
+        //
+        // NOT guarded by `wholly_inferred_write_refusal` (nw-284/S2): that
+        // guard exists for commands whose SOURCE and TARGET both default and
+        // compose. Here the source is the required `<uid> <key>` positional
+        // pair, so the caller has necessarily stated one end — the same
+        // reasoning that excluded `backup`/`snapshot`/`instance` from it.
+        Commands::Extensions {
+            command:
+                ExtensionCommands::Unset {
+                    uid,
+                    key,
+                    db,
+                    config,
+                },
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // Same precedent as `extensions list`: a typo'd `--db` is not an
+            // empty store, and this one would otherwise report a confident
+            // "no such property" about a database that does not exist.
+            require_existing_db(&db_path)?;
+            if nestweaver_engine::remove_extension_key_durable(&db_path, &uid, &key)? {
+                println!("Removed extension property '{key}' from {uid}");
+                Ok((EXIT_SUCCESS, None))
+            } else {
+                println!("No extension property '{key}' on {uid}");
+                Ok((EXIT_NOT_FOUND, None))
+            }
+        }
+
         Commands::ListRepos {
             instance,
             json,
@@ -12176,6 +12242,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!("No interaction data to clear.");
                 }
                 Ok((EXIT_SUCCESS, None))
+            }
+            // nw-313: the selective counterpart to `clear`. One poisoned entry
+            // — a phantom key from a pre-nw-296 binary, or an oversized
+            // caller-supplied seed — previously cost every accumulated ranking
+            // signal in the sidecar to remove.
+            //
+            // Takes `--config` where its three siblings take only `--db`,
+            // because unlike them it MUTATES: `resolve_db_with_config` is the
+            // resolver that also runs `assert_config_expected_brain`, so a
+            // pinned config cannot delete out of a different instance's graph.
+            InteractionCommands::Forget { uid, db, config } => {
+                let db_path = resolve_db_with_config(db, config.as_deref())?;
+                if nestweaver_engine::remove_node_score(&db_path, &uid)? {
+                    println!("Forgot interaction memory for {uid}");
+                    Ok((EXIT_SUCCESS, None))
+                } else {
+                    // Not an error: "there was nothing to forget" is a
+                    // successful outcome for an idempotent verb, but the caller
+                    // should be able to tell the two apart — otherwise a typo'd
+                    // UID reports the same success as a real deletion.
+                    println!("No interaction memory recorded for {uid}");
+                    Ok((EXIT_NOT_FOUND, None))
+                }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
                 let db_path = db.unwrap_or_else(default_db_path);
@@ -33089,9 +33178,17 @@ mod vault_command_config_parity_tests {
         let Commands::Extensions { command } = cli.command else {
             panic!("expected `extensions`");
         };
+        // Was an irrefutable `let`, which compiled only while `List` was the
+        // sole variant of `ExtensionCommands`. nw-281(b)'s `unset` added a
+        // second one and broke it — correctly: this test's subject is that
+        // bare `extensions list` still routes to `List`, and that is now a
+        // claim with a way to be false.
         let ExtensionCommands::List {
             uid, key, value, ..
-        } = command;
+        } = command
+        else {
+            panic!("`extensions list` must still route to `List`");
+        };
         assert!(
             uid.is_none() && key.is_none() && value.is_none(),
             "an unfiltered list must be the default — auditing starts with 'show me everything'"
