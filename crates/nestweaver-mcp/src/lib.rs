@@ -821,22 +821,74 @@ fn record_interaction(
         | "investigate"
         | "investigate_expand"
         | "investigate_hydrate" => {
-            let seeds = extract_string_array(arguments, "seeds");
+            let seeds = seed_node_uids(arguments, result);
             let results = extract_result_uids(result);
             tracker.record_query(name, &seeds, &results);
         }
         "note_get" | "backlinks" | "get_summary" | "read_symbols" | "hub_nodes"
         | "bridge_nodes" | "clusters" => {
-            if let Some(uid) = arguments.get("uid").and_then(|v| v.as_str()) {
+            // Same property as `seed_node_uids`: `uid` here is also raw request
+            // text. `backlinks` even accepts a `title` instead, so a caller can
+            // put anything in this field.
+            if let Some(uid) = arguments.get("uid").and_then(|v| v.as_str())
+                && nestweaver_schema::uid::is_node_uid(uid)
+            {
                 tracker.record_access(name, uid);
             }
         }
         "brain_impact" | "blast_radius" | "affected_tests" | "dead_code" | "flow_trace" => {
-            let seeds = extract_string_array(arguments, "seeds");
+            let seeds = seed_node_uids(arguments, result);
             tracker.record_impact(name, &seeds);
         }
         _ => {}
     }
+}
+
+/// The node UIDs a call actually seeded, for interaction accounting.
+///
+/// Prefers what the TOOL resolved (`result["seeds"][].uid`) over what the
+/// caller asked for, and otherwise keeps only request seeds that could name a
+/// node at all.
+///
+/// `record_interaction` sits outside the tool boundary, at the JSON-RPC
+/// dispatch site, where only the unvalidated request and the serialised
+/// response are in scope — so it reconstructed "what the agent asked for" from
+/// the wire and used each raw string verbatim as a `node_scores` key. Note the
+/// asymmetry it introduced inside a single match arm: results already went
+/// through `extract_result_uids`, which reads real UIDs off the response.
+///
+/// Two consequences, both live (nw-296):
+///   * `query_seed_count` carries the heaviest interaction weight and is the
+///     only signal meaning "the agent deliberately chose this node". It had
+///     never once been applied to a real node, so interaction bias ran on the
+///     weak passive counters alone — degraded by OMISSION, not by phantoms
+///     outranking anything (a non-UID key is never visited by the PPR loops,
+///     which iterate the graph's own uids).
+///   * The sidecar accumulated unbounded caller-controlled keys (1 MB observed)
+///     in a store with no selective delete (nw-313).
+///
+/// The resolved-seed half only applies when the response carries the resolution
+/// — `resp["seeds"]` is emitted on `include_seeds: true`, and its `uid` is
+/// omitted in concise mode. On a default call the filter is what runs, which is
+/// still strictly better than recording the request: a caller that seeded a
+/// real UID gets its credit, and a caller that seeded a title gets nothing
+/// instead of a phantom.
+fn seed_node_uids(arguments: &Value, result: &Value) -> Vec<String> {
+    if let Some(seeds) = result.get("seeds").and_then(|s| s.as_array()) {
+        let resolved: Vec<String> = seeds
+            .iter()
+            .filter_map(|s| s.get("uid").and_then(|u| u.as_str()))
+            .filter(|uid| nestweaver_schema::uid::is_node_uid(uid))
+            .map(String::from)
+            .collect();
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+    extract_string_array(arguments, "seeds")
+        .into_iter()
+        .filter(|seed| nestweaver_schema::uid::is_node_uid(seed))
+        .collect()
 }
 
 /// Extract a string array from a JSON object by key.
@@ -1207,11 +1259,105 @@ mod tests {
     }
 
     #[test]
+    fn record_interaction_never_stores_a_raw_seed_string_as_a_node_key() {
+        // nw-296: `extract_string_array(arguments, "seeds")` feeds the RAW
+        // caller argument to record_query, which uses it verbatim as a
+        // node_scores key. A title seed that the tool RESOLVED still lands as a
+        // phantom, and the real node it resolved to gets no seed credit.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({ "seeds": ["Route All Write Operations Through Daemon RPC"] });
+        let result = json!({
+            "seeds": [{
+                "uid": "note:vlt:v:abcd",
+                "kind": "Note",
+                "title": "Route All Write Operations Through Daemon RPC"
+            }],
+            "connected": [{ "uid": "sec:vlt:v:abcd:7", "kind": "Section", "title": "Body" }]
+        });
+
+        record_interaction(&tracker, "brain_context", &args, &result);
+        tracker.flush().unwrap();
+
+        assert!(
+            nestweaver_engine::load_node_score(
+                &db_path,
+                "Route All Write Operations Through Daemon RPC"
+            )
+            .is_none(),
+            "a raw seed string must never become an interaction key — it is not \
+             a graph node and the store has no delete path (nw-313)"
+        );
+
+        let seeded = nestweaver_engine::load_node_score(&db_path, "note:vlt:v:abcd")
+            .expect("the RESOLVED seed UID must receive the seed credit");
+        assert_eq!(
+            seeded.query_seed_count, 1,
+            "query_seed_count is the heaviest interaction weight and has never \
+             once landed on a real node"
+        );
+    }
+
+    #[test]
+    fn record_interaction_drops_an_oversized_seed_string() {
+        // nw-296 / mcp.md:389 — a 1 MB `arguments.seeds[0]` was written into
+        // the sidecar as a key. Unbounded and caller-controlled.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let huge = "x".repeat(1_000_000);
+        let args = json!({ "seeds": [huge.clone()] });
+        let result = json!({ "connected": [{ "uid": "sym:a" }] });
+
+        record_interaction(&tracker, "brain_context", &args, &result);
+        tracker.flush().unwrap();
+
+        assert!(
+            nestweaver_engine::load_node_score(&db_path, &huge).is_none(),
+            "an oversized caller-controlled string must never become a sidecar key"
+        );
+    }
+
+    #[test]
+    fn record_interaction_filters_non_uid_impact_seeds() {
+        // The `brain_impact` arm takes the identical unresolved path.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({ "seeds": ["AuthService", "sym:repo:i:aabbccddeeff:aabbccddeeff:aabbccddeeff:12"] });
+        let result = json!({ "target": "AuthService", "impact_nodes": [] });
+
+        record_interaction(&tracker, "brain_impact", &args, &result);
+        tracker.flush().unwrap();
+
+        assert!(
+            nestweaver_engine::load_node_score(&db_path, "AuthService").is_none(),
+            "a raw symbol NAME is not a UID and must not become a key"
+        );
+        assert!(
+            nestweaver_engine::load_node_score(
+                &db_path,
+                "sym:repo:i:aabbccddeeff:aabbccddeeff:aabbccddeeff:12"
+            )
+            .is_some(),
+            "a genuine UID seed must still receive credit"
+        );
+    }
+
+    #[test]
     fn record_interaction_records_query_for_brain_context() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
 
+        // The seed is a raw TITLE, which is not a node UID. The event is still
+        // recorded — the RESULT uids are real — but the title must not become a
+        // key. Asserting only `pending_count == 1` is what let nw-296 look
+        // covered while every seed credit landed on a phantom.
         let args = json!({ "seeds": ["AuthService"] });
         let result = json!({
             "connected": [
@@ -1221,6 +1367,15 @@ mod tests {
 
         record_interaction(&tracker, "brain_context", &args, &result);
         assert_eq!(tracker.pending_count(), 1);
+        tracker.flush().unwrap();
+        assert!(
+            nestweaver_engine::load_node_score(&db_path, "AuthService").is_none(),
+            "nw-296: an unresolvable raw seed must not be stored as a node key"
+        );
+        assert!(
+            nestweaver_engine::load_node_score(&db_path, "sym:a").is_some(),
+            "the result UIDs still earn their shown-credit"
+        );
     }
 
     #[test]
