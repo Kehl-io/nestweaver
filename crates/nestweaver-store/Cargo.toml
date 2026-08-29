@@ -31,6 +31,10 @@ csv = "1"
 tempfile = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# nw-285: the crash-attribution guard around an lbug open needs sigaction/write.
+libc = "0.2"
+
 [build-dependencies]
 # tree-sitter-sequel 0.3.x requires cc ~1.2.1; keep the workspace build
 # dependency on the same resolvable line until that grammar relaxes its bound.

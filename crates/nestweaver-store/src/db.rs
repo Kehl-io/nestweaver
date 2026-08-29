@@ -691,6 +691,14 @@ fn open_lbug_with_recovery(
     read_write: bool,
     make_config: impl Fn() -> lbug::SystemConfig,
 ) -> Result<lbug::Database, StoreError> {
+    // nw-285. Every arm below inspects an `Err` that `lbug::Database::new`
+    // RETURNED. A corrupt on-disk index makes the vendored C++ dereference
+    // garbage and take the process down with SIGSEGV instead — so no arm here
+    // can ever fire for it, and the user saw exit 139 with zero output. The
+    // guard does not survive the fault; it makes the death attributable. See
+    // `open_crash_guard` for why a header check and an out-of-process probe
+    // were both rejected.
+    let _crash_guard = crate::open_crash_guard::arm(path);
     match lbug::Database::new(path, make_config()) {
         Ok(db) => Ok(db),
         Err(e) => {

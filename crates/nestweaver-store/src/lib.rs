@@ -6,6 +6,7 @@ pub mod error;
 pub mod generation;
 pub mod git_activity_sidecar;
 pub mod index_publication;
+mod open_crash_guard;
 pub mod ranking;
 pub mod read;
 pub mod regex;
