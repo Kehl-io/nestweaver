@@ -3543,9 +3543,20 @@ enum Commands {
         config: Option<PathBuf>,
         /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
         /// Symbol nodes are always kept.
+        ///
+        /// nw-295: validated AND normalised at the clap boundary, not at the
+        /// filter. `modified_at` is a String column, so the downstream
+        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        /// `'2'` (0x32), which made an unparseable value byte-identical to
+        /// `2099-12-31`: it matched no note and silently dropped every Note and
+        /// Section from the answer while exiting 0. Parsing here is the only
+        /// layer that runs before BOTH the daemon and direct routes, so neither
+        /// can be reached with a value the other would have rejected.
         #[arg(
             long = "since",
-            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+            value_parser = |s: &str| nestweaver_engine::parse_since(s),
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp (2026-01-31 or 2026-01-31T00:00:00Z)"
         )]
         since: Option<String>,
         /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
@@ -4955,9 +4966,20 @@ enum BrainCommands {
         weight_semantic: Option<f64>,
         /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
         /// Symbol nodes are always kept.
+        ///
+        /// nw-295: validated AND normalised at the clap boundary, not at the
+        /// filter. `modified_at` is a String column, so the downstream
+        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        /// `'2'` (0x32), which made an unparseable value byte-identical to
+        /// `2099-12-31`: it matched no note and silently dropped every Note and
+        /// Section from the answer while exiting 0. Parsing here is the only
+        /// layer that runs before BOTH the daemon and direct routes, so neither
+        /// can be reached with a value the other would have rejected.
         #[arg(
             long = "since",
-            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+            value_parser = |s: &str| nestweaver_engine::parse_since(s),
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp (2026-01-31 or 2026-01-31T00:00:00Z)"
         )]
         since: Option<String>,
         /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
@@ -15404,20 +15426,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
+            let mut project_args = serde_json::json!({
+                    "project": name,
+                    "token_budget": token_budget,
+                    "response_format": response_format,
+                    "include_components": include_components,
+                    // nw-295: absent `since` sends `""`, not the key omitted.
+                    // The daemon strips empty strings at `server.rs`, so this is
+                    // benign THERE — but it is benign by the receiver's grace,
+                    // and any caller reaching `tools::dispatch` directly with
+                    // `since: ""` gets a spurious filter. Omit the key instead,
+                    // so the request does not depend on who reads it.
+                    "recency_weight": recency_weight,
+                    "recency_half_life_days": recency_half_life_days,
+            });
+            if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
+                project_args["since"] = serde_json::json!(since);
+            }
             let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "project_context",
-                serde_json::json!({
-                    "project": name,
-                    "token_budget": token_budget,
-                    "response_format": response_format,
-                    "include_components": include_components,
-                    "since": since.clone().unwrap_or_default(),
-                    "recency_weight": recency_weight,
-                    "recency_half_life_days": recency_half_life_days,
-                }),
+                project_args,
             );
             // A project that does not exist is NOT FOUND, not a generic
             // failure. The direct path returns `EXIT_NOT_FOUND` with an
@@ -21853,10 +21884,15 @@ fn run_brain(
                         "prf": prf,
                         "rerank": rerank,
                         "weight_semantic": if no_embed { 0.0 } else { weight_semantic.unwrap_or(0.0) },
-                        "since": since.as_deref().unwrap_or(""),
+                        // nw-295: see the twin in `project-context` — an
+                        // absent filter is omitted rather than sent as `""`.
                         "recency_weight": recency_weight,
                         "recency_half_life_days": recency_half_life_days,
                 });
+                let mut context_params = context_params;
+                if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
+                    context_params["since"] = serde_json::json!(since);
+                }
 
                 if let Some(result_json) = try_hybrid_json_rpc_checked(
                     true,
@@ -33288,5 +33324,98 @@ mod optional_count_rendering_tests {
             unknown.contains("unavailable") && unknown.contains("NOT zero"),
             "and it must say so in words a reader cannot mistake: {unknown}"
         );
+    }
+}
+
+/// nw-295: `--since` is validated AND normalised by clap, so every route
+/// downstream sees one shape.
+///
+/// The normalisation is the half that is easy to drop: an offset timestamp
+/// compared bytewise against a `Z`-suffixed column is wrong BY THE OFFSET, and
+/// wrong quietly — it still returns rows, just the wrong ones. A validator that
+/// only said yes/no would leave that intact.
+#[cfg(test)]
+mod since_boundary_tests {
+    use super::*;
+
+    fn parse(args: Vec<String>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn since_of(command: Commands) -> Option<String> {
+        match command {
+            Commands::ProjectContext { since, .. } => since,
+            Commands::Brain { command } => match *command {
+                BrainCommands::Context { since, .. } => since,
+                _ => panic!("expected `brain context`"),
+            },
+            _ => panic!("expected `project-context` or `brain context`"),
+        }
+    }
+
+    /// Both flags, one table, because the defect was that two commands
+    /// declaring the same flag treated it two different ways.
+    fn both_since_flags(value: &str) -> Vec<Result<Cli, clap::Error>> {
+        vec![
+            parse(vec![
+                "nestweaver".into(),
+                "project-context".into(),
+                "p".into(),
+                "--since".into(),
+                value.into(),
+            ]),
+            parse(vec![
+                "nestweaver".into(),
+                "brain".into(),
+                "context".into(),
+                "q".into(),
+                "--since".into(),
+                value.into(),
+            ]),
+        ]
+    }
+
+    #[test]
+    fn every_accepted_since_reaches_the_command_normalised_to_utc() {
+        // `modified_at` is stored as `YYYY-MM-DDTHH:MM:SSZ`. All three inputs
+        // denote the same instant and must arrive as the same bytes, because
+        // the comparison downstream is lexicographic.
+        for value in [
+            "2026-01-31",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T02:00:00+02:00",
+        ] {
+            for parsed in both_since_flags(value) {
+                let cli = parsed.unwrap_or_else(|e| panic!("`--since {value}` must parse: {e}"));
+                assert_eq!(
+                    since_of(cli.command).as_deref(),
+                    Some("2026-01-31T00:00:00Z"),
+                    "`--since {value}` must arrive normalised: a +02:00 offset \
+                     compared bytewise against a Z-suffixed column is wrong by \
+                     the offset, and wrong QUIETLY — it returns rows, just the \
+                     wrong ones"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unparseable_since_cannot_reach_either_command() {
+        for value in ["garbage", "2026-13-01", "", "2099"] {
+            for parsed in both_since_flags(value) {
+                assert!(
+                    parsed.is_err(),
+                    "`--since {value:?}` must be rejected at the boundary. It \
+                     cannot be rejected downstream: `modified_at >= $since` is a \
+                     byte comparison that never fails, so a bad value does not \
+                     error — it matches nothing and reports success"
+                );
+            }
+        }
     }
 }

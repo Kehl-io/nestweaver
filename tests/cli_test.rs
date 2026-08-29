@@ -6052,3 +6052,88 @@ fn extensions_unset_separates_nothing_to_remove_from_success() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+// ── nw-295: `--since` was never parsed ────────────────────────────────────
+//
+// `since` went straight into `WHERE n.modified_at >= $since`. `modified_at` is
+// a String column, so that is a LEXICOGRAPHIC comparison which cannot fail:
+// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with `'2'`
+// (0x32), so an unparseable value matched no note and silently dropped every
+// Note and Section from the answer — byte-identical to `--since 2099-12-31`.
+//
+// The failure direction is the harmful one. It does not no-op; it narrows the
+// result toward emptiness while reporting success, so the caller reads "this
+// project has no notes" off a typo.
+
+/// Every `--since` that reaches a lexicographic comparison, with the command
+/// name and the flag's own value. `brain refresh` is deliberately in the list:
+/// it already validated (via `parse_iso8601_to_system_time`) before nw-295, and
+/// its presence here is what makes this a sweep over the flag rather than a
+/// re-statement of the two sites that were broken.
+const SINCE_ACCEPTING_COMMANDS: &[&[&str]] = &[
+    &["project-context", "anything"],
+    &["brain", "context", "anything"],
+];
+
+#[test]
+fn an_unparseable_since_is_refused_rather_than_silently_matching_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    for command in SINCE_ACCEPTING_COMMANDS {
+        let output = nestweaver_cmd()
+            .args(*command)
+            .args(["--db", &db_path.display().to_string()])
+            .args(["--since", "garbage"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "`{}` --since garbage must FAIL. Exiting 0 with a filtered answer is \
+             how a typo reads as 'this project has no recent notes'.\nstdout={}\nstderr={stderr}",
+            command.join(" "),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("since") || stderr.contains("garbage"),
+            "the refusal must name the flag or the value it rejected, or the \
+             caller cannot tell it apart from any other failure:\n{stderr}"
+        );
+    }
+}
+
+/// The counterweight, and the one that matters most: a validator that rejects
+/// a currently-working input is a regression dressed as a fix. A bare
+/// `YYYY-MM-DD` is not RFC 3339, is the natural thing to type, and works
+/// today — an Rfc3339-only parser would break it.
+#[test]
+fn a_bare_calendar_date_is_still_accepted_by_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+    for command in SINCE_ACCEPTING_COMMANDS {
+        for value in [
+            "2026-01-31",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T02:00:00+02:00",
+        ] {
+            let output = nestweaver_cmd()
+                .args(*command)
+                .args(["--db", &db_path.display().to_string()])
+                .args(["--since", value])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The command may still fail for its OWN reasons (no such project
+            // in an empty graph); what it may not do is reject the timestamp.
+            assert!(
+                !stderr.contains("--since") && !stderr.contains(&format!("'{value}'")),
+                "`{}` --since {value} must be accepted:\n{stderr}",
+                command.join(" ")
+            );
+        }
+    }
+}
