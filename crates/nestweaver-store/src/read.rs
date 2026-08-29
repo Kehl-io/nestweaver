@@ -2884,7 +2884,33 @@ impl GraphStore {
             }
         }
 
-        Ok(order.into_iter().filter_map(|k| seen.remove(&k)).collect())
+        // nw-297: the two blocks above are appended in QUERY order — every
+        // low-confidence resolution before any genuinely-unresolved link — and
+        // every consumer head-truncates. On a real vault that made the default
+        // 50-row page a pure sample of the BENIGN category, so `broken-links`
+        // printed "0 unresolved (genuinely broken)" against 226 of them. The
+        // list is grouped by category, not ranked by severity, so any head
+        // slice smaller than the first group is a sample of that group alone.
+        //
+        // Order by severity here rather than in each of the three consumers:
+        // the insertion-order dedup above stays exactly as it was, and callers
+        // that page get a severity ranking instead of a query artefact.
+        let mut rows: Vec<BrokenWikilinkRow> =
+            order.into_iter().filter_map(|k| seen.remove(&k)).collect();
+        rows.sort_by(|a, b| {
+            let a_unresolved = a.current_target_uid.is_empty();
+            let b_unresolved = b.current_target_uid.is_empty();
+            b_unresolved
+                .cmp(&a_unresolved)
+                .then(
+                    a.confidence
+                        .partial_cmp(&b.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then_with(|| a.source_path.cmp(&b.source_path))
+                .then_with(|| a.wikilink_text.cmp(&b.wikilink_text))
+        });
+        Ok(rows)
     }
 
     /// Set of Note UIDs that have at least one OUTBOUND wikilink (to a note or

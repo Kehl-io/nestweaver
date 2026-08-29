@@ -2804,16 +2804,26 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         .unwrap_or_else(configured_result_limit);
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
+    // nw-297: classify over the POPULATION, before the truncation. The page is
+    // a sample, and a caller that reads the page's own composition as the
+    // vault's composition gets the wrong answer at every limit — which is
+    // exactly what the CLI's summary line did.
+    let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
+    let low_confidence = total - unresolved;
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
-    Ok(
-        json!({ "broken_links": serde_json::to_value(&links)?, "total": total, "returned": links.len() }),
-    )
+    Ok(json!({
+        "broken_links": serde_json::to_value(&links)?,
+        "total": total,
+        "returned": links.len(),
+        "unresolved": unresolved,
+        "low_confidence": low_confidence,
+    }))
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly — ambiguous or low-confidence targets (confidence < 1.0).\n\nGuidelines:\n- Use when auditing vault health or before bulk link repairs\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `total` and `returned` describe the page. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
