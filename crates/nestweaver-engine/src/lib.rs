@@ -415,7 +415,7 @@ pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, CODE_CONTEXT_DEFAULT_LIMIT, ContextNode, ContextResult,
     CrossRepoLink, EmbedModelProvider, EmbedQueryFn, FeatureContextResult, FeatureInfo,
-    HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
+    HybridSearchConfig, LinkInfo, LookupResult, SearchIndexProvider, SymbolCandidate, SymbolDetail,
     apply_ranking_priors, build_brain_context, build_brain_context_hybrid,
     build_brain_context_hybrid_with_aliases, build_context, build_context_with_intent,
     build_feature_context, dedup_heading_section_pairs, expand_query_with_aliases,

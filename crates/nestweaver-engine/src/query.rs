@@ -38,6 +38,20 @@ pub trait EmbedModelProvider: Send + Sync {
     fn current_model(&self) -> Option<std::sync::Arc<dyn EmbedQueryFn>>;
 }
 
+/// Supplies the full-text search index a long-lived process currently has —
+/// which is not necessarily the one it had at boot.
+///
+/// The same indirection as [`EmbedModelProvider`], and for the same reason. A
+/// daemon that could not open its Tantivy sidecar at startup (it was locked by
+/// another process, or had not been created yet) held `None` for the rest of
+/// its life and answered every query from the substring fallback, saying so
+/// only in one boot-time log line. A transport that captures
+/// `Option<Arc<TantivyIndex>>` by value at construction inherits that freeze;
+/// one that holds a provider does not.
+pub trait SearchIndexProvider: Send + Sync {
+    fn search_index(&self) -> Option<std::sync::Arc<nestweaver_store::TantivyIndex>>;
+}
+
 #[cfg(feature = "embed")]
 impl EmbedQueryFn for nestweaver_embed::EmbedModel {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {

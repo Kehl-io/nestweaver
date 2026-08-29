@@ -533,6 +533,176 @@ enum SearchIndexReconciliation {
     Unavailable(String),
 }
 
+/// How long to wait before retrying a search-index open that failed.
+///
+/// The thing being waited out is another process holding the Tantivy writer
+/// lock, or a sidecar that has not been created yet. Both are resolved by
+/// someone else finishing, on a human timescale — so retrying per query would
+/// pay a failed open on the hot path for nothing, and retrying never is the
+/// bug. A minute is short enough that a repaired sidecar is picked up without
+/// a restart and long enough to be invisible.
+const SEARCH_REOPEN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The daemon's full-text search capability, re-establishable.
+///
+/// This is the `tantivy` + `search_reconciliation` pair that used to sit
+/// frozen on [`DaemonState`]. They were opened once from the filesystem during
+/// `serve()` and had no re-open path, so a daemon that booted while the
+/// Tantivy sidecar was locked by another process — or before it existed —
+/// served substring-fallback search for its ENTIRE life and disclosed that in
+/// exactly one boot-time log line. Repairing or creating the sidecar
+/// externally changed nothing until the daemon was restarted.
+///
+/// Same lifetime error as nw-286: a field whose lifetime is the process,
+/// holding a fact whose lifetime is shorter. `embedding_runtime` on the same
+/// struct was deliberately given interior mutability so embedding readiness
+/// could be re-established; this is that pattern, applied to the field that
+/// did not get it.
+///
+/// Re-opening is attempted only when the current state is not fully healthy,
+/// and at most once per [`SEARCH_REOPEN_RETRY_INTERVAL`]. A daemon with a
+/// working writer never pays anything.
+pub struct SearchRuntime {
+    tantivy_path: PathBuf,
+    read_only: bool,
+    retry_interval: Duration,
+    inner: std::sync::RwLock<SearchRuntimeSnapshot>,
+    /// Guards the re-open attempt itself, so a burst of concurrent queries
+    /// against a broken sidecar performs ONE open, not one per query.
+    next_attempt: std::sync::Mutex<Instant>,
+}
+
+/// Readiness and the exact usable handle as one value, so a caller can never
+/// observe a reconciliation verdict that disagrees with the index it holds.
+#[derive(Clone)]
+struct SearchRuntimeSnapshot {
+    tantivy: Option<Arc<TantivyIndex>>,
+    reconciliation: SearchIndexReconciliation,
+}
+
+impl SearchRuntimeSnapshot {
+    /// Whether this state is as good as it can get. A writer-backed index is;
+    /// a reader-only fallback is NOT, because the writer lock it lost may have
+    /// since been released, and without a writer no index or vault mutation
+    /// reaches BM25.
+    fn is_healthy(&self) -> bool {
+        match &self.reconciliation {
+            // A read-only replica legitimately has no writer: that is the
+            // configured shape, not a degraded one, and retrying would open
+            // the sidecar for writing against a snapshot it must not touch.
+            SearchIndexReconciliation::Disabled => true,
+            SearchIndexReconciliation::Available(_) => true,
+            SearchIndexReconciliation::Unavailable(_) => false,
+        }
+    }
+}
+
+impl SearchRuntime {
+    fn open(tantivy_path: PathBuf, read_only: bool) -> Self {
+        Self::with_retry_interval(tantivy_path, read_only, SEARCH_REOPEN_RETRY_INTERVAL)
+    }
+
+    fn with_retry_interval(
+        tantivy_path: PathBuf,
+        read_only: bool,
+        retry_interval: Duration,
+    ) -> Self {
+        let (tantivy, reconciliation) = open_search_index(&tantivy_path, read_only);
+        Self::from_parts(
+            tantivy_path,
+            read_only,
+            retry_interval,
+            SearchRuntimeSnapshot {
+                tantivy,
+                reconciliation,
+            },
+        )
+    }
+
+    fn from_parts(
+        tantivy_path: PathBuf,
+        read_only: bool,
+        retry_interval: Duration,
+        snapshot: SearchRuntimeSnapshot,
+    ) -> Self {
+        Self {
+            tantivy_path,
+            read_only,
+            retry_interval,
+            inner: std::sync::RwLock::new(snapshot),
+            next_attempt: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// The current search state, re-establishing it first if it is degraded
+    /// and the retry window has elapsed.
+    fn snapshot(&self) -> SearchRuntimeSnapshot {
+        {
+            let current = self
+                .inner
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current.is_healthy() {
+                return current.clone();
+            }
+        }
+        self.try_reopen();
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn try_reopen(&self) {
+        let now = Instant::now();
+        {
+            let mut next = self
+                .next_attempt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if now < *next {
+                return;
+            }
+            *next = now + self.retry_interval;
+        }
+        let (tantivy, reconciliation) = open_search_index(&self.tantivy_path, self.read_only);
+        let candidate = SearchRuntimeSnapshot {
+            tantivy,
+            reconciliation,
+        };
+        if !candidate.is_healthy() {
+            // Still broken. Keep whatever we already had — a reader-only
+            // fallback is strictly better than dropping to None because a
+            // later open failed harder.
+            return;
+        }
+        tracing::info!(
+            path = %self.tantivy_path.display(),
+            "search index re-opened after a degraded start — BM25 search is live again"
+        );
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+    }
+
+    /// Replace the reconciliation verdict. Used by the deletion-reconciliation
+    /// tests to install a failing or disabled index.
+    #[cfg(test)]
+    fn set_reconciliation(&self, reconciliation: SearchIndexReconciliation) {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reconciliation = reconciliation;
+    }
+}
+
+impl nestweaver_engine::SearchIndexProvider for SearchRuntime {
+    fn search_index(&self) -> Option<Arc<TantivyIndex>> {
+        self.snapshot().tantivy
+    }
+}
+
 /// A registered daemon-side file watcher and its shutdown handle.
 ///
 /// The `id` lets the watcher thread clear only ITS OWN registration on exit:
@@ -936,8 +1106,11 @@ impl Drop for EffectiveConfigBindingCleanup {
 
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
-    pub tantivy: Option<Arc<TantivyIndex>>,
-    search_reconciliation: SearchIndexReconciliation,
+    /// Full-text search, held behind interior mutability so a daemon that
+    /// booted without its Tantivy sidecar can pick it up later instead of
+    /// serving substring fallback for the rest of its life. See
+    /// [`SearchRuntime`]; read it through [`DaemonState::tantivy`].
+    search: Arc<SearchRuntime>,
     pub db_path: PathBuf,
     /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
     /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
@@ -1098,6 +1271,24 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// The daemon's full-text search index, **as of now**.
+    ///
+    /// Not a field. It used to be one, opened from the filesystem at boot with
+    /// no re-open path, which meant a daemon that started while the Tantivy
+    /// sidecar was locked answered every search from the substring fallback
+    /// for its whole life. Every reader goes through here so the recovery is
+    /// available to all of them, and so a future reader cannot reintroduce the
+    /// freeze by capturing the handle.
+    pub fn tantivy(&self) -> Option<Arc<TantivyIndex>> {
+        self.search.snapshot().tantivy
+    }
+
+    /// The current search-index reconciliation verdict, paired atomically with
+    /// the handle [`Self::tantivy`] returns.
+    fn search_reconciliation(&self) -> SearchIndexReconciliation {
+        self.search.snapshot().reconciliation
+    }
+
     /// The logical instance this database's data belongs to, **as of now**.
     ///
     /// nw-286: [`Self::data_instance_id`] is a BOOT SNAPSHOT of a mutable
@@ -2116,9 +2307,10 @@ impl DaemonService {
             );
 
             let t_dispatch = std::time::Instant::now();
+            let dispatch_tantivy = state.tantivy();
             let mut value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
-                state.tantivy.as_deref(),
+                dispatch_tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
@@ -2253,9 +2445,10 @@ impl DaemonService {
             let embed_ref = embed_arc.as_deref();
 
             let t_dispatch = std::time::Instant::now();
+            let dispatch_tantivy = state.tantivy();
             let value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
-                state.tantivy.as_deref(),
+                dispatch_tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
@@ -2959,7 +3152,7 @@ where
 fn indexed_search_rows_before(
     state: &DaemonState,
 ) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>> {
-    indexed_search_rows_before_with(&state.search_reconciliation, || {
+    indexed_search_rows_before_with(&state.search_reconciliation(), || {
         indexed_search_rows(&state.store)
     })
 }
@@ -3338,7 +3531,7 @@ fn rebuild_tantivy_after_mutation(
     operation: &str,
 ) -> Result<(), anyhow::Error> {
     reconcile_search_index(
-        &state.search_reconciliation,
+        &state.search_reconciliation(),
         &state.store,
         mutation,
         operation,
@@ -4206,10 +4399,10 @@ impl NestWeaverDaemon for DaemonService {
         // so live edits update BM25 in place. Opening a separate handle
         // (reader-only or read-write) would either silently no-op writes
         // or collide on the writer lock.
-        if let Some(ref tantivy) = self.state.tantivy
+        if let Some(tantivy) = self.state.tantivy()
             && tantivy.has_writer()
         {
-            watcher = watcher.with_external_tantivy(Arc::clone(tantivy));
+            watcher = watcher.with_external_tantivy(tantivy);
         } else {
             watcher = watcher.with_tantivy_index(&tantivy_path);
         }
@@ -4592,7 +4785,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
-            state.tantivy.clone(),
+            // Per-RPC construction, so this is already as live as the runtime
+            // — but through the accessor, so it stays that way.
+            state.tantivy(),
             state.db_path.clone(),
         );
 
@@ -5276,10 +5471,8 @@ impl NestWeaverDaemon for DaemonService {
                     // error: a read-only replica legitimately has no writer.
                     // So it is disclosed rather than failed, and the phrasing
                     // says which of the two happened.
-                    let search_index_rebuilt = state
-                        .tantivy
-                        .as_ref()
-                        .is_some_and(|tantivy| tantivy.has_writer());
+                    let search_index_rebuilt =
+                        state.tantivy().is_some_and(|tantivy| tantivy.has_writer());
                     if !search_index_rebuilt {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "note: the graph was updated but the BM25 search index \
@@ -5290,7 +5483,7 @@ impl NestWeaverDaemon for DaemonService {
                             ..Default::default()
                         }));
                     }
-                    if let Some(ref tantivy) = state.tantivy
+                    if let Some(tantivy) = state.tantivy()
                         && tantivy.has_writer()
                     {
                         match tantivy.reindex_from_store(&state.store) {
@@ -5408,7 +5601,7 @@ impl NestWeaverDaemon for DaemonService {
                 &extra_patterns,
             ) {
                 Ok(result) => {
-                    if let Some(ref tantivy) = state.tantivy
+                    if let Some(tantivy) = state.tantivy()
                         && tantivy.has_writer()
                         && let Err(error) = tantivy.reindex_from_store(&state.store)
                     {
@@ -5980,13 +6173,9 @@ impl NestWeaverDaemon for DaemonService {
         let state = self.state.clone();
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let tantivy = state
-                .tantivy
-                .as_ref()
-                .filter(|t| t.has_writer())
-                .ok_or_else(|| {
-                    Status::failed_precondition("daemon has no writer-mode Tantivy index")
-                })?;
+            let tantivy = state.tantivy().filter(|t| t.has_writer()).ok_or_else(|| {
+                Status::failed_precondition("daemon has no writer-mode Tantivy index")
+            })?;
             let count = tantivy
                 .reindex_from_store(&state.store)
                 .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
@@ -10242,7 +10431,7 @@ pub async fn run_server(
     // the configured-index failure.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
     let tantivy_started = std::time::Instant::now();
-    let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
+    let search = Arc::new(SearchRuntime::open(tantivy_path.clone(), read_only));
     let tantivy_open_ms = tantivy_started.elapsed().as_millis() as u64;
 
     let idle_notify = Arc::new(Notify::new());
@@ -10461,8 +10650,7 @@ pub async fn run_server(
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
-        tantivy,
-        search_reconciliation,
+        search: Arc::clone(&search),
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
@@ -10746,7 +10934,7 @@ pub async fn run_server(
                 nestweaver_mcp::http::McpHttpState::with_auth(
                     false,
                     state.store.clone(),
-                    state.tantivy.clone(),
+                    state.tantivy(),
                     state.db_path.clone(),
                     state.instance_cfg.clone(),
                     state.server_mode,
@@ -10757,7 +10945,7 @@ pub async fn run_server(
                 nestweaver_mcp::http::McpHttpState::new(
                     false,
                     state.store.clone(),
-                    state.tantivy.clone(),
+                    state.tantivy(),
                     state.db_path.clone(),
                     state.instance_cfg.clone(),
                     state.server_mode,
@@ -10768,6 +10956,13 @@ pub async fn run_server(
             s.embed_model_provider =
                 Some(state.embedding_runtime.clone()
                     as Arc<dyn nestweaver_engine::EmbedModelProvider>);
+            // Class B: and the search index for the same reason. This state is
+            // built ONCE, at boot, in server mode — so the `Option<Arc<..>>`
+            // above is a snapshot of the worst possible moment. The provider
+            // is what lets `/mcp` observe a sidecar that was repaired or
+            // created after this daemon started.
+            s.search_index_provider =
+                Some(Arc::clone(&search) as Arc<dyn nestweaver_engine::SearchIndexProvider>);
             // A read-only replica must reject mutating MCP tools before dispatch,
             // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
             s.read_only = read_only;
@@ -10954,7 +11149,7 @@ pub async fn run_server(
                     std::collections::HashMap::new(),
                 )),
                 daemon_store: state.store.clone(),
-                tantivy: state.tantivy.clone(),
+                tantivy: state.tantivy(),
                 instance_id: state.instance_id.clone(),
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
@@ -12760,7 +12955,7 @@ mod startup_helper_tests {
     #[test]
     fn nonexistent_vault_skips_all_reconciliation_after_unknown_preflight() {
         let state = test_state_with_writer();
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:nonexistent-vault-noop",
@@ -12810,11 +13005,12 @@ mod startup_helper_tests {
             "confirmed no-op must not rebuild available search"
         );
 
-        let mut unavailable = test_state_with_writer();
-        Arc::get_mut(&mut unavailable)
-            .unwrap()
-            .search_reconciliation =
-            SearchIndexReconciliation::Unavailable("configured search unavailable".to_string());
+        let unavailable = test_state_with_writer();
+        unavailable
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "configured search unavailable".to_string(),
+            ));
         let generation_before = unavailable.store.graph_generation();
         let response = run_remove_vault_with_projection(
             &unavailable,
@@ -12840,7 +13036,7 @@ mod startup_helper_tests {
         let embedding_path = state.store.embedding_sidecar_path().unwrap();
         std::fs::remove_file(&embedding_path).unwrap();
         std::fs::create_dir(&embedding_path).unwrap();
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:stale-vault-reconciliation",
@@ -13560,7 +13756,7 @@ mod startup_helper_tests {
         let (source_note_uid, _) =
             seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
         reconcile_search_index(
-            &state.search_reconciliation,
+            &state.search_reconciliation(),
             &state.store,
             IndexedSearchMutation::Changed,
             "seed_crash_recovery_vault",
@@ -13585,7 +13781,7 @@ mod startup_helper_tests {
         )
         .unwrap();
         let destination_vault_uid = state.store.list_vaults(Some("new")).unwrap()[0].uid.clone();
-        let stale_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        let stale_hits = state.tantivy().unwrap().search("Note", 10).unwrap();
         assert!(
             stale_hits
                 .iter()
@@ -13599,7 +13795,7 @@ mod startup_helper_tests {
 
         recover_pending_instance_extension_migration(&state).unwrap();
 
-        let recovered_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        let recovered_hits = state.tantivy().unwrap().search("Note", 10).unwrap();
         assert!(
             !recovered_hits
                 .iter()
@@ -13763,12 +13959,15 @@ mod startup_helper_tests {
     fn unavailable_search_finalizer_keeps_graph_applied_journal_until_restart_retry() {
         use nestweaver_schema::uid::vault_uid;
 
-        let mut state = test_state_with_writer();
+        let state = test_state_with_writer();
         let root = "/missing/unavailable-search-retry";
         let source_vault_uid = vault_uid("old", root);
         seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
-        Arc::get_mut(&mut state).unwrap().search_reconciliation =
-            SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Unavailable(
+                "injected writer outage".to_string(),
+            ));
 
         run_merge_instance_with(
             &state,
@@ -13790,9 +13989,10 @@ mod startup_helper_tests {
         assert!(!pending.reconciled());
         assert!(pending.search_reconciliation_required());
 
-        let tantivy = Arc::clone(state.tantivy.as_ref().unwrap());
-        Arc::get_mut(&mut state).unwrap().search_reconciliation =
-            SearchIndexReconciliation::Available(tantivy);
+        let tantivy = state.tantivy().unwrap();
+        state
+            .search
+            .set_reconciliation(SearchIndexReconciliation::Available(tantivy));
         recover_pending_instance_extension_migration(&state).unwrap();
         assert!(
             !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
@@ -14726,6 +14926,110 @@ mod startup_helper_tests {
             }
             _ => panic!("writer lock must remain explicit unavailable mutation state"),
         }
+    }
+
+    /// Class B (the same lifetime error as nw-286, in the field beside it):
+    /// a daemon that could not open its search index at BOOT must be able to
+    /// pick it up later.
+    ///
+    /// `tantivy` and `search_reconciliation` were opened once from the
+    /// filesystem during `serve()` and had no re-open path, so a daemon that
+    /// started while the sidecar was locked — or before it existed — answered
+    /// every search from the substring fallback for its ENTIRE life, and said
+    /// so in exactly one boot-time log line. Repairing the sidecar externally
+    /// changed nothing until the process was restarted.
+    ///
+    /// The failure is induced with a plain FILE where the index directory
+    /// belongs: `open_or_create` cannot `create_dir_all` over it and
+    /// `open_reader_only` cannot read it, which is exactly the (None,
+    /// Unavailable) boot state the defect describes.
+    #[test]
+    fn a_search_index_that_could_not_be_opened_at_boot_is_reopened_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        // A file, not a directory: the index cannot be opened over it.
+        std::fs::write(&tantivy_path, b"not an index").unwrap();
+
+        let runtime = SearchRuntime::with_retry_interval(
+            tantivy_path.clone(),
+            false,
+            std::time::Duration::ZERO,
+        );
+        let booted = runtime.snapshot();
+        assert!(
+            booted.tantivy.is_none(),
+            "precondition: the daemon boots with no search index — this is the \
+             state the defect is about"
+        );
+        assert!(!booted.is_healthy());
+
+        // The obstruction clears — an operator repaired the sidecar, or the
+        // process that held it exited. Nothing restarts the daemon.
+        std::fs::remove_file(&tantivy_path).unwrap();
+
+        let recovered = runtime.snapshot();
+        assert!(
+            recovered.tantivy.is_some(),
+            "a repaired sidecar must be picked up without a daemon restart; \
+             holding None here is the Class B freeze — substring-fallback \
+             search for the whole life of the process"
+        );
+        assert!(matches!(
+            recovered.reconciliation,
+            SearchIndexReconciliation::Available(_)
+        ));
+        assert!(
+            recovered.tantivy.as_ref().unwrap().has_writer(),
+            "and it must be the WRITER, or index and vault mutations still \
+             never reach BM25"
+        );
+    }
+
+    /// The retry must be throttled and must never DOWNGRADE what it already
+    /// has. A burst of queries against a still-broken sidecar would otherwise
+    /// pay a failed open each, and a harder failure on a later attempt must
+    /// not turn a working reader-only fallback into nothing.
+    #[test]
+    fn a_still_broken_search_index_is_retried_at_most_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        std::fs::write(&tantivy_path, b"not an index").unwrap();
+
+        let runtime = SearchRuntime::with_retry_interval(
+            tantivy_path.clone(),
+            false,
+            std::time::Duration::from_secs(3600),
+        );
+        assert!(runtime.snapshot().tantivy.is_none());
+
+        // Repair it, but stay inside the retry window: still no index.
+        std::fs::remove_file(&tantivy_path).unwrap();
+        assert!(
+            runtime.snapshot().tantivy.is_none(),
+            "the retry window must actually bound the reopen attempts, or a \
+             broken sidecar costs a failed open on every query"
+        );
+    }
+
+    /// A healthy runtime must never re-open. This is the fence that keeps the
+    /// recovery free for the overwhelmingly common case.
+    #[test]
+    fn a_healthy_search_index_is_never_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        let runtime =
+            SearchRuntime::with_retry_interval(tantivy_path, false, std::time::Duration::ZERO);
+        let first = runtime.snapshot();
+        assert!(matches!(
+            first.reconciliation,
+            SearchIndexReconciliation::Available(_)
+        ));
+        let first_handle = first.tantivy.unwrap();
+        let second_handle = runtime.snapshot().tantivy.unwrap();
+        assert!(
+            Arc::ptr_eq(&first_handle, &second_handle),
+            "a healthy runtime must hand back the SAME handle, not re-open"
+        );
     }
 
     #[test]
@@ -15734,7 +16038,7 @@ mod startup_helper_tests {
         deps.save(&deps_path).unwrap();
 
         let pagerank_path = seed_pagerank_cache(&state, "MATCH (n:Repo) RETURN n.uid");
-        let tantivy = state.tantivy.as_ref().unwrap();
+        let tantivy = state.tantivy().unwrap();
         tantivy
             .update_note(
                 "note:late-remove",
@@ -17082,14 +17386,22 @@ mod startup_helper_tests {
             std::fs::write(generation_path, generation.to_string()).unwrap();
         }
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
-        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        let dir_path = dir.path().to_path_buf();
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir_path.join("tantivy")).unwrap());
         // Keep the temp dir alive for the duration of the test process.
         std::mem::forget(dir);
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: Some(Arc::clone(&tantivy)),
-            search_reconciliation: SearchIndexReconciliation::Available(tantivy),
+            search: Arc::new(SearchRuntime::from_parts(
+                dir_path.join("tantivy"),
+                false,
+                SEARCH_REOPEN_RETRY_INTERVAL,
+                SearchRuntimeSnapshot {
+                    tantivy: Some(Arc::clone(&tantivy)),
+                    reconciliation: SearchIndexReconciliation::Available(tantivy),
+                },
+            )),
             db_path,
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
@@ -17173,8 +17485,15 @@ credential_method = "gh"
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: None,
-            search_reconciliation: SearchIndexReconciliation::Disabled,
+            search: Arc::new(SearchRuntime::from_parts(
+                std::path::PathBuf::from(":memory:.tantivy"),
+                false,
+                SEARCH_REOPEN_RETRY_INTERVAL,
+                SearchRuntimeSnapshot {
+                    tantivy: None,
+                    reconciliation: SearchIndexReconciliation::Disabled,
+                },
+            )),
             db_path: std::path::PathBuf::from(":memory:"),
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
