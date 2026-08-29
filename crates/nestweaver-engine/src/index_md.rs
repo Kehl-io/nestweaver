@@ -579,6 +579,20 @@ fn index_markdown_since_with_reader(
         });
     }
 
+    // nw-287: the incremental path deletes just as totally as the full one.
+    // With an empty scan every indexed note falls into `removed_uids` below, so
+    // an unreadable or unmounted vault empties the graph here too. Same guard,
+    // same reason: a deletion must be observed, never inferred from silence.
+    if eligible_note_uids.is_empty() && vault_existed && !existing_notes.is_empty() {
+        anyhow::bail!(
+            "refusing to refresh vault '{vault_name}': the scan found no note files, but {} \
+             note(s) are indexed. Committing this would delete every one of them. Check that \
+             the vault directory is readable and mounted; if it really is empty, drop it with \
+             `nestweaver brain remove`.",
+            existing_notes.len()
+        );
+    }
+
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
         .filter(|note| !eligible_note_uids.contains(&note.uid))
@@ -1838,6 +1852,32 @@ where
     // gate, before the write.
     let vault_existed = store.lookup_vault(&v_uid).is_ok();
 
+    // nw-287: refuse a whole-vault deletion that was INFERRED rather than
+    // observed. `bulk_vault_reindex_write` is a total replacement — it
+    // cascade-deletes the old vault and inserts the scan's result — so an empty
+    // scan over a vault that HELD notes commits as "every note was deleted".
+    //
+    // `FilesystemReader::list_files` now refuses an unreadable root, which
+    // closes the reported case. This guard is the belt: an unmounted volume
+    // presents as an empty-but-READABLE directory, which no enumeration check
+    // can distinguish from a genuinely emptied vault. The destructive reading
+    // must not be the default one, and the watcher route has no human reading
+    // the exit code.
+    if all_notes.is_empty() && vault_existed {
+        let existing = store
+            .list_notes(Some(&v_uid))
+            .context("count indexed notes before the stale-drop")?;
+        if !existing.is_empty() {
+            anyhow::bail!(
+                "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
+                 note files, but {} note(s) are indexed. Committing this would delete every \
+                 one of them. Check that the vault directory is readable and mounted; if it \
+                 really is empty, drop it with `nestweaver brain remove`.",
+                existing.len()
+            );
+        }
+    }
+
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
 
@@ -2771,6 +2811,156 @@ mod tests {
             fs::write(&path, content).unwrap();
         }
         (dir, root)
+    }
+
+    /// True when the current process bypasses filesystem permission bits.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// nw-287 (CRITICAL, data loss): a full refresh whose scan could not read
+    /// the vault DIRECTORY must fail. It must not commit the stale-drop, and
+    /// it must not report success. Confirmed 3x black-box: rc=0,
+    /// "dropped 2 stale note(s), reindexed 0", and `brain search` then empty.
+    #[cfg(unix)]
+    #[test]
+    fn refresh_of_an_unreadable_vault_directory_refuses_the_stale_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let (_dir, root) = make_vault(&[
+            ("f1.md", "# F1\n\ncontent one\n"),
+            ("f2.md", "# F2\n\ncontent two\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+
+        let first = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            first.index.notes_count, 2,
+            "precondition: two notes indexed"
+        );
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        // Restore BEFORE asserting so a failure still lets TempDir clean up.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match observed {
+            Err(_) => {}
+            Ok(result) => panic!(
+                "refresh reported SUCCESS on an unreadable vault directory: \
+                 dropped {} stale note(s), reindexed {}. This is nw-287: the \
+                 EACCES is swallowed in FilesystemReader::list_files and the \
+                 empty scan is committed as a whole-vault deletion.",
+                result.notes_deleted, result.index.notes_count
+            ),
+        }
+
+        // The graph must be intact whether the refresh errored or not.
+        assert_eq!(
+            store.list_notes(None).unwrap().len(),
+            2,
+            "an unreadable vault directory must never delete indexed notes"
+        );
+    }
+
+    /// nw-287, the case `list_files` alone cannot catch: an UNMOUNTED volume
+    /// presents as an empty-but-readable directory. A total-replacement
+    /// refresh must not read "I saw no files" as "every file was deleted".
+    #[test]
+    fn refresh_that_scans_zero_notes_refuses_to_empty_a_populated_vault() {
+        let (_dir, root) = make_vault(&[
+            ("f1.md", "# F1\n\ncontent one\n"),
+            ("f2.md", "# F2\n\ncontent two\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+
+        // Simulate the mount going away: the directory is readable and empty.
+        std::fs::remove_file(root.join("f1.md")).unwrap();
+        std::fs::remove_file(root.join("f2.md")).unwrap();
+
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        assert!(
+            observed.is_err(),
+            "an empty scan over a vault that held notes must fail closed, not \
+             commit a whole-vault deletion (nw-287)"
+        );
+        assert_eq!(
+            store.list_notes(None).unwrap().len(),
+            2,
+            "the previously indexed notes must survive the refusal"
+        );
+    }
+
+    /// The counterpart that keeps the empty-scan guard from becoming a wall: a
+    /// vault that was ALREADY empty must still refresh cleanly, and so must a
+    /// vault being indexed for the first time.
+    #[test]
+    fn refresh_of_a_genuinely_empty_vault_still_succeeds() {
+        let (_dir, root) = make_vault(&[]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+
+        let first = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .expect("first index of an empty vault is not a deletion");
+        assert_eq!(first.index.notes_count, 0);
+
+        let second = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .expect("re-refreshing an already-empty vault deletes nothing");
+        assert_eq!(second.index.notes_count, 0);
+        assert_eq!(second.notes_deleted, 0);
     }
 
     #[test]
@@ -3979,11 +4169,21 @@ sub b body
 
     #[test]
     fn since_refresh_preserves_project_membership_for_replacements_only() {
-        let (_dir, root) = make_vault(&[("a.md", "# A\n\nold\n")]);
+        // Two notes on purpose. With one, removing it also EMPTIES the vault,
+        // which the nw-287 guard refuses — and the subject here is "a removed
+        // file drops its project membership", not "a vault may be emptied by a
+        // refresh". The second note keeps those two variables apart.
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nold\n"), ("keep.md", "# Keep\n")]);
         let store = GraphStore::in_memory().unwrap();
         let db_path = root.join("unused.lbug");
         index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
-        let note_uid = store.list_notes(None).unwrap()[0].uid.clone();
+        let note_uid = store
+            .list_notes(None)
+            .unwrap()
+            .iter()
+            .find(|n| n.file_path.ends_with("a.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
         let project_uid = "proj:test:incremental-membership";
         store
             .insert_project(&nestweaver_schema::Project {
