@@ -292,11 +292,16 @@ fn suggested_command(message: &str) -> Option<String> {
 /// in scope at the bail site.
 ///
 /// Assertion (1) of the T3 contract: no `<placeholder>` when the values were
-/// in scope. Assertion (2): it parses. Assertion (4) — "run it, then re-run
-/// the original, and it succeeds" — is deliberately NOT made here: `instance
-/// merge` does not yet update the recorded instance identity, so a test that
-/// asserted the round-trip would be pinning a behaviour the product does not
-/// have. The message says so too, which is why it stops short of "run this".
+/// in scope. Assertion (2): it parses. Assertion (4) — "run it, then re-run the
+/// original, and it succeeds" — IS now made here.
+///
+/// It was deliberately withheld before, because `instance merge` did not update
+/// the recorded instance identity (nw-264), so the round-trip would have been
+/// pinning a behaviour the product did not have; the remedy string carried a
+/// matching hedge and stopped short of "run this". nw-264 closed that, so the
+/// round trip is the proof — and it is the only thing that can honestly justify
+/// deleting the hedge. A remedy nobody executed is the exact defect class this
+/// file exists to close.
 #[test]
 fn multi_instance_refusal_emits_a_runnable_consolidation_command() {
     let dir = tempfile::tempdir().unwrap();
@@ -363,6 +368,52 @@ fn multi_instance_refusal_emits_a_runnable_consolidation_command() {
     let mut argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     argv.remove(0); // the binary name
     direct().args(&argv).arg("--help").assert().success();
+
+    // Assertion (4), nw-264: RUN the remedy, then re-run the invocation that
+    // failed. The merge must both consolidate the graph AND move the recorded
+    // identity, or the config-less index refuses again for the same reason and
+    // the remedy is one the operator can follow to no effect.
+    let merged = direct()
+        .args(&argv)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        merged.status.success(),
+        "the remedy this product printed must actually run:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+
+    // `instance merge` autostarts a daemon even under `NESTWEAVER_NO_DAEMON=1`
+    // (it is a write path and dials the daemon), and that daemon holds the
+    // write LEASE on this temp database for its idle timeout — an hour. Leaving
+    // it up would make the direct re-index below fail for a reason that has
+    // nothing to do with nw-264, and would leak a daemon out of the test.
+    // Stopping it is best-effort: if the merge ran directly there is nothing to
+    // stop, and that is not a failure.
+    let _ = direct()
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("stop")
+        .output();
+
+    let after = direct()
+        .args(["index", "--db"])
+        .arg(&db)
+        .arg("--repo")
+        .arg(&repo_one)
+        .output()
+        .unwrap();
+    let after_stderr = String::from_utf8_lossy(&after.stderr).to_string();
+    assert!(
+        after.status.success(),
+        "after the remedy the original invocation must succeed; it still \
+         refuses, so the merge left the recorded identity naming the \
+         merged-away instance and the fork returns on the next index \
+         (nw-264):\n{after_stderr}"
+    );
 }
 
 /// nw-328. Two symbols with the same name inside ONE repo: `--repo` is already

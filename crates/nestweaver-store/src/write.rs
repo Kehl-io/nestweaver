@@ -6997,12 +6997,17 @@ impl GraphStore {
             }
         };
         if initial_state == InstanceUidRemapPlanState::Applied {
+            // An idempotent re-run of an already-applied plan. The graph needs
+            // nothing; the RECORD may still name the merged-away instance, and
+            // this is the only route that would otherwise never converge it.
+            let mut mutation_warnings = Vec::new();
+            self.converge_merged_instance_identity(from, to, &mut mutation_warnings);
             return Ok(MutationOutcome {
                 disposition: MutationDisposition::CommittedComplete,
                 confirmed_changed: true,
                 value: MergeResult::default(),
                 primary_failure: None,
-                mutation_warnings: Vec::new(),
+                mutation_warnings,
             });
         }
         let mut confirmed_changed = initial_state == InstanceUidRemapPlanState::PartiallyApplied;
@@ -7415,13 +7420,17 @@ impl GraphStore {
             self.verify_merge_plan(from, to, &remaining_plan, faults.verify)
         };
         match final_state {
-            Ok(InstanceUidRemapPlanState::Applied) => Ok(MutationOutcome {
-                disposition: MutationDisposition::CommittedComplete,
-                confirmed_changed,
-                value,
-                primary_failure: None,
-                mutation_warnings,
-            }),
+            Ok(InstanceUidRemapPlanState::Applied) => {
+                let mut mutation_warnings = mutation_warnings;
+                self.converge_merged_instance_identity(from, to, &mut mutation_warnings);
+                Ok(MutationOutcome {
+                    disposition: MutationDisposition::CommittedComplete,
+                    confirmed_changed,
+                    value,
+                    primary_failure: None,
+                    mutation_warnings,
+                })
+            }
             Ok(state) => self.classify_merge_error(
                 from,
                 to,
@@ -7445,6 +7454,48 @@ impl GraphStore {
                 )),
                 mutation_warnings,
             }),
+        }
+    }
+
+    /// nw-264. Converge the recorded identity on the surviving instance, at
+    /// every point a merge reports its plan fully `Applied`.
+    ///
+    /// Called from THREE places rather than one because a merge can reach
+    /// `Applied` three ways — an idempotent re-run of an already-applied plan,
+    /// the normal final probe, and a stage error whose probe nonetheless finds
+    /// the plan applied. A record that converged on only one of those routes
+    /// would be a fork that reappears depending on how the merge finished,
+    /// which is worse than one that never converges at all.
+    ///
+    /// A failure here is a WARNING, not a merge failure: the graph is already
+    /// correctly reparented, and turning a successful merge into an error
+    /// because a single Meta row would not move loses more than it protects.
+    /// `rerecord_data_instance_id` refuses unless the graph already shows the
+    /// merge complete, so the warning is the honest report of a record that is
+    /// now stale.
+    fn converge_merged_instance_identity(
+        &self,
+        from: &str,
+        to: &str,
+        mutation_warnings: &mut Vec<MutationFailure>,
+    ) {
+        match self.rerecord_data_instance_id(from, to) {
+            Ok(true) => {
+                tracing::info!(
+                    from = %from,
+                    to = %to,
+                    "merge moved the recorded data instance id to the surviving instance"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => mutation_warnings.push(MutationFailure::new(
+                "merge-identity",
+                format!(
+                    "the graph was merged into {to:?} but the recorded data instance id \
+                     could not be moved off {from:?} ({error}); a config-less `index` \
+                     may re-adopt {from:?} and re-fork this graph"
+                ),
+            )),
         }
     }
 
@@ -7489,6 +7540,7 @@ impl GraphStore {
             }
             InstanceUidRemapPlanState::Applied => {
                 mutation_warnings.push(MutationFailure::new(stage, primary));
+                self.converge_merged_instance_identity(from, to, &mut mutation_warnings);
                 Ok(MutationOutcome {
                     disposition: MutationDisposition::CommittedComplete,
                     confirmed_changed: true,
@@ -9426,6 +9478,113 @@ mod tests {
             .merge_instance_ids("merge-coll-source", "merge-coll-target")
             .unwrap();
         assert_eq!(merged.vaults, 1);
+    }
+
+    /// nw-264 fixture: one vault under `instance`, which is enough for the
+    /// merge to have a non-empty plan and for `observed_instance_ids` to see it.
+    fn seed_vault(store: &GraphStore, instance: &str, root_path: &str) {
+        store
+            .insert_vault(&Vault {
+                uid: format!("vlt:{instance}:{}", root_path.replace('/', "-")),
+                name: root_path.to_string(),
+                root_path: root_path.to_string(),
+                instance_id: instance.to_string(),
+            })
+            .unwrap();
+    }
+
+    /// nw-264. The guard nw-246 ships tells the operator to run `instance
+    /// merge`. If the merge leaves the recorded identity naming the instance it
+    /// just merged AWAY, the next config-less `index` adopts that name and
+    /// re-forks the graph the merge healed — so the remedy the product prints
+    /// undoes itself. nw-310's shipped remedy string carried a hedge saying
+    /// exactly this.
+    #[test]
+    fn a_merge_moves_the_recorded_identity_to_the_surviving_instance() {
+        let store = GraphStore::in_memory().expect("store");
+        assert_eq!(store.ensure_data_instance_id("old").unwrap(), "old");
+        seed_vault(&store, "old", "/repo-a");
+        seed_vault(&store, "new", "/repo-b");
+
+        store.merge_instance_ids("old", "new").unwrap();
+
+        assert_eq!(
+            store.observed_instance_ids().unwrap(),
+            vec!["new".to_string()],
+            "precondition: the merge itself reparented every row"
+        );
+        assert_eq!(
+            store.data_instance_id().unwrap(),
+            Some("new".to_string()),
+            "the record still names the instance the merge removed; a \
+             config-less `index` will adopt it and re-fork the graph"
+        );
+    }
+
+    /// The guard that keeps the fix narrow. A merge between two instances,
+    /// NEITHER of which is the recorded one, must leave the record untouched —
+    /// the write-once discipline of `ensure_data_instance_id` still applies to
+    /// everything except the merged-away name.
+    #[test]
+    fn a_merge_that_does_not_involve_the_recorded_instance_leaves_it_alone() {
+        let store = GraphStore::in_memory().expect("store");
+        store.ensure_data_instance_id("keeper").unwrap();
+        seed_vault(&store, "a", "/repo-a");
+        seed_vault(&store, "b", "/repo-b");
+
+        store.merge_instance_ids("a", "b").unwrap();
+
+        assert_eq!(
+            store.data_instance_id().unwrap(),
+            Some("keeper".to_string())
+        );
+    }
+
+    /// Re-running an already-applied merge must converge the record too. This
+    /// is the route that returns before any graph mutation, and it is the one a
+    /// retry after a partial failure actually takes.
+    #[test]
+    fn re_running_an_applied_merge_still_converges_the_record() {
+        let store = GraphStore::in_memory().expect("store");
+        store.ensure_data_instance_id("old").unwrap();
+        seed_vault(&store, "old", "/repo-a");
+        seed_vault(&store, "new", "/repo-b");
+
+        store.merge_instance_ids("old", "new").unwrap();
+        // A second, no-op merge must be idempotent in BOTH the graph and the
+        // record.
+        store.merge_instance_ids("old", "new").unwrap();
+
+        assert_eq!(store.data_instance_id().unwrap(), Some("new".to_string()));
+    }
+
+    /// The record must never claim a completion the graph does not show. Called
+    /// directly, because reaching a half-merged graph through the public merge
+    /// API is exactly what the merge's own classification prevents.
+    #[test]
+    fn the_record_refuses_to_move_while_rows_remain_under_the_source() {
+        let store = GraphStore::in_memory().expect("store");
+        store.ensure_data_instance_id("old").unwrap();
+        seed_vault(&store, "old", "/repo-a");
+
+        let error = store
+            .rerecord_data_instance_id("old", "new")
+            .expect_err("a graph still showing `old` must not be re-recorded as `new`");
+        assert!(
+            error.to_string().contains("merge is not complete"),
+            "the refusal must say why: {error}"
+        );
+        assert_eq!(store.data_instance_id().unwrap(), Some("old".to_string()));
+    }
+
+    /// An empty target is refused for the same reason `ensure_data_instance_id`
+    /// refuses one: an unnamed instance is not an identity.
+    #[test]
+    fn the_record_refuses_an_empty_surviving_instance() {
+        let store = GraphStore::in_memory().expect("store");
+        store.ensure_data_instance_id("old").unwrap();
+        assert!(store.rerecord_data_instance_id("old", "   ").is_err());
+        assert_eq!(store.data_instance_id().unwrap(), Some("old".to_string()));
     }
 
     #[test]

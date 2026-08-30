@@ -2722,6 +2722,25 @@ impl GraphStore {
         Ok(())
     }
 
+    fn update_publication_meta_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(key.to_string())),
+                ("value", lbug::Value::String(value.to_string())),
+            ],
+        )
+        .map_err(|error| StoreError::Query(format!("update publication identity: {error}")))?;
+        Ok(())
+    }
+
     /// Read the database-bound identity. A legacy read-only database may have
     /// neither key and returns `None`; a partial or malformed identity is an
     /// error because silently inventing the missing half could attach foreign
@@ -2877,6 +2896,90 @@ impl GraphStore {
                     StoreError::Query(format!("commit data instance id: {error}"))
                 })?;
                 Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.query("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Move the recorded identity from a merged-away instance to the surviving
+    /// one.
+    ///
+    /// nw-264. DELIBERATELY DISTINCT from [`Self::ensure_data_instance_id`],
+    /// which must keep refusing to replace. That one guards against
+    /// *accidental* re-identification — a default changing under a database and
+    /// silently renaming its data. A merge is a *deliberate* re-identification,
+    /// and before this there was no API that could express one: the whole
+    /// workspace had exactly ONE writer of this key and it never replaced, so
+    /// `instance merge` rewrote every Repo/Vault/Project UID and left the
+    /// record naming the instance it had just merged away. The next config-less
+    /// `index` then adopted that name and re-forked the graph the merge healed
+    /// — the remedy nw-246's guard prints undid itself.
+    ///
+    /// Three guards keep it narrow:
+    ///
+    /// 1. It is a NO-OP unless the record currently equals `from`. A merge
+    ///    between two instances neither of which is the recorded one leaves the
+    ///    record alone; the write-once discipline still applies to every name
+    ///    except the merged-away one.
+    /// 2. It REFUSES if `observed_instance_ids` still contains `from`. The
+    ///    record must never claim a completion the graph does not show.
+    /// 3. It refuses an empty `to`, for the same reason `ensure_data_instance_id`
+    ///    does.
+    ///
+    /// On ordering: the merge has no single enclosing transaction to run inside
+    /// — it is a sequence of classified mutations with a final plan probe — so
+    /// this is called only where that probe has already reported `Applied`.
+    /// Guard 2 is what makes that safe rather than merely conventional: a
+    /// half-merged graph still shows `from`, and this refuses.
+    ///
+    /// Returns `true` when the record was moved.
+    pub fn rerecord_data_instance_id(&self, from: &str, to: &str) -> Result<bool, StoreError> {
+        let from = from.trim();
+        let to = to.trim();
+        if to.is_empty() {
+            return Err(StoreError::Query(
+                "refusing to record an empty data instance id".to_string(),
+            ));
+        }
+        if from == to {
+            return Ok(false);
+        }
+        // Guard 1: only the merged-away name is eligible.
+        if self.data_instance_id()?.as_deref() != Some(from) {
+            return Ok(false);
+        }
+        // Guard 2: the graph must already show the merge is done.
+        if self
+            .observed_instance_ids()?
+            .iter()
+            .any(|observed| observed == from)
+        {
+            return Err(StoreError::Query(format!(
+                "refusing to re-record the data instance id as {to:?}: rows still \
+                 observed under {from:?}, so the merge is not complete"
+            )));
+        }
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|error| StoreError::Query(format!("begin re-record instance id: {error}")))?;
+        // Re-check inside the transaction, exactly as `ensure_data_instance_id`
+        // does, so two concurrent mergers cannot both win.
+        let result = (|| match Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)? {
+            Some(existing) if existing == from => {
+                Self::update_publication_meta_on(&conn, DATA_INSTANCE_ID_META_KEY, to)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        })();
+        match result {
+            Ok(moved) => {
+                conn.query("COMMIT").map_err(|error| {
+                    StoreError::Query(format!("commit re-record instance id: {error}"))
+                })?;
+                Ok(moved)
             }
             Err(error) => {
                 let _ = conn.query("ROLLBACK");
