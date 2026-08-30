@@ -3059,28 +3059,41 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         1,
         RESULT_LIMIT_MAX,
     )?;
+    // nw-341: the ONLY axis that unblocks verification. The rows sort
+    // unresolved-first then by ascending confidence, so the 0.92
+    // nearest-ancestor and 0.95 same-folder tiers are the tail -- exactly what
+    // a cap removes and exactly what a reviewer of the tier ladder has to see.
+    // Reversing the sort is not an option: it would regress nw-297's
+    // `genuinely_broken_links_sort_before_lower_tier_resolutions`.
+    let offset = read_limit(&args, "offset", 0, 0, RESULT_LIMIT_MAX)?;
     let all_links = broken_links(store, max_suggestions)?;
-    let total = all_links.len();
-    // nw-297: classify over the POPULATION, before the truncation. The page is
+    // nw-297: classify over the POPULATION, before the window. The page is
     // a sample, and a caller that reads the page's own composition as the
     // vault's composition gets the wrong answer at every limit — which is
     // exactly what the CLI's summary line did.
     let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = total - unresolved;
-    let links: Vec<_> = all_links.into_iter().take(limit).collect();
-    Ok(json!({
-        "broken_links": serde_json::to_value(&links)?,
-        "total": total,
-        "returned": links.len(),
+    let low_confidence = all_links.len() - unresolved;
+    let rows: Vec<Value> = all_links
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, serde_json::Error>>()?;
+    // nw-341: through `Bounded`, not hand-rolled. This was the last bounded
+    // list in the catalogue still building its own (total, returned) pair, so
+    // it was also the only one that never emitted `truncated` -- a caller could
+    // not tell a complete page from a cut one without comparing two numbers.
+    let mut out = json!({
         "unresolved": unresolved,
         "low_confidence": low_confidence,
-    }))
+        "offset": offset,
+    });
+    Bounded::window(rows, offset, limit).merge_into(&mut out, "broken_links");
+    Ok(out)
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `total` and `returned` describe the page. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `returned` and `truncated` describe the page and `total` is the pre-offset population. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe — and the HIGHEST-confidence tiers are the tail, reachable only via `offset`\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -3093,7 +3106,10 @@ fn tool_schema_brain_broken_links() -> Value {
                     "Max suggested target UIDs per broken link (1-50, default 5).", 5, 1, 50),
                 "limit": limit_schema(
                     "Max broken links to return (1-1000, default 50). The total count is always reported.",
-                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX),
+                "offset": bounded_integer_schema(
+                    "Skip this many rows before the page (default 0). Rows sort unresolved-first then by ASCENDING confidence, so the high-confidence tiers (0.90/0.92/0.95) are the TAIL — offset is how you reach them. `total` stays the PRE-offset population.",
+                    0, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3235,7 +3251,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All seven keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags, notes_by_year}\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -6884,8 +6900,16 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "headings": result.headings_count,
                 "sections": result.sections_count,
                 "tags": result.tags_count,
-                "wikilinks_resolved": result.wikilinks_resolved,
-                "wikilinks_unresolved": result.wikilinks_unresolved,
+                // nw-345: each key names the POPULATION it counts. `resolved`
+                // is EDGES (an ambiguous link contributes N); the three
+                // unresolved numbers are occurrences, distinct (section,
+                // target), and distinct (note, target) — the last is the one
+                // `brain_doc_stats` and `brain_broken_links` report, and it is
+                // why one run used to print two different "unresolved" counts.
+                "resolved_link_edges": result.resolved_link_edges,
+                "unresolved_link_occurrences": result.unresolved_link_occurrences,
+                "unresolved_link_section_targets": result.unresolved_link_section_targets,
+                "unresolved_link_targets": result.unresolved_link_targets,
                 "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped.len(),
                 "skipped_files": result.skipped,
@@ -10691,9 +10715,27 @@ impl<T> Bounded<T> {
     /// `limit == 0` means unlimited, matching the CLI's documented
     /// `--limit 0 = all` convention. A tool that does not offer that escape
     /// hatch declares `minimum: 1` and never passes 0 here.
-    fn take(mut items: Vec<T>, limit: usize) -> Self {
+    fn take(items: Vec<T>, limit: usize) -> Self {
+        Self::window(items, 0, limit)
+    }
+
+    /// Cut `items` to the window `[offset, offset + limit)`, capturing the
+    /// PRE-WINDOW total.
+    ///
+    /// nw-341: `take` can only ever return the HEAD of a list. When the
+    /// ordering deliberately puts the rows a reviewer must inspect at the TAIL
+    /// -- as `broken_wikilinks` does, sorting unresolved-first then by
+    /// ASCENDING confidence so the most severe rows come first (nw-297) -- the
+    /// head is precisely the wrong page and there is no second one. A health
+    /// tool that cannot be used to verify its own fixes.
+    ///
+    /// `total` stays PRE-offset for the same reason it stays pre-cap: it
+    /// answers "how many matched", not "how many are left". Reporting the
+    /// remainder would make a caller's page arithmetic drift with every step.
+    fn window(mut items: Vec<T>, offset: usize, limit: usize) -> Self {
         let total = items.len();
-        if limit != 0 && total > limit {
+        items.drain(..offset.min(total));
+        if limit != 0 && items.len() > limit {
             items.truncate(limit);
         }
         Self { items, total }
@@ -16633,6 +16675,117 @@ mod cluster_flag_forwarding_precondition_tests {
             validate_tool_arguments("clusters", &json!({ "members": 500 })).is_err(),
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
+        );
+    }
+}
+
+#[cfg(test)]
+mod broken_links_window_tests {
+    use super::*;
+    use nestweaver_engine::index_markdown_directory_in_memory;
+    use std::fs;
+
+    fn make_vault(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        for (rel, content) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+        }
+        (dir, root)
+    }
+
+    /// nw-341: the ascending-confidence sort puts the same-folder (0.95) and
+    /// nearest-ancestor (0.92) tiers at the TAIL -- deliberately, so the most
+    /// severe rows come first (nw-297). With a cap and no offset, the tiers a
+    /// reviewer must inspect are exactly the ones that fall off the end: a
+    /// health tool that cannot be used to verify its own fixes.
+    ///
+    /// Note what this does NOT claim. The cap is not silent -- `read_limit`
+    /// REJECTS an out-of-range limit with an explicit error and `total` is
+    /// always in the envelope. The residual defects are the missing window and
+    /// the missing `truncated` flag, because `tool_brain_broken_links`
+    /// hand-rolls its disclosure instead of using the `Bounded` seam.
+    #[test]
+    fn the_high_confidence_tail_is_reachable_by_offset() {
+        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row.
+        let (_dir, root) = make_vault(&[
+            (
+                "f/a.md",
+                "# A\n\nSee [[Sibling]], [[al-one]], [[al-two]], [[al-three]].\n",
+            ),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("g/one.md", "---\naliases: [al-one]\n---\n# One\n"),
+            ("g/two.md", "---\naliases: [al-two]\n---\n# Two\n"),
+            ("g/three.md", "---\naliases: [al-three]\n---\n# Three\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "limit": 3 })).unwrap();
+        assert_eq!(page["total"], 4, "envelope: {page}");
+        assert_eq!(
+            page["truncated"],
+            json!(true),
+            "nw-341: a truncated page must SAY it is truncated, through the same \
+             (returned, total, truncated) seam every other bounded list uses: {page}"
+        );
+        let head: Vec<&str> = page["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            !head.contains(&"Sibling"),
+            "precondition: the 0.95 row must be the one the cap removes, got {head:?}"
+        );
+
+        let tail = tool_brain_broken_links(&store, json!({ "limit": 3, "offset": 3 })).unwrap();
+        let tail_texts: Vec<&str> = tail["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            tail_texts.contains(&"Sibling"),
+            "nw-341: the 0.95 same-folder tier must be REACHABLE -- it is precisely \
+             what a reviewer of the wikilink tier ladder has to inspect, got {tail_texts:?}"
+        );
+        assert_eq!(
+            tail["total"], 4,
+            "total must stay the PRE-offset population: {tail}"
+        );
+        assert_eq!(
+            tail["offset"], 3,
+            "the window's origin must be echoed, or a caller paging through \
+             cannot tell which page it is holding: {tail}"
+        );
+    }
+
+    /// nw-341: an offset past the end is an empty page, not an error and not a
+    /// wrapped-around page. It must still report the true population.
+    #[test]
+    fn an_offset_past_the_population_is_an_honest_empty_page() {
+        let (_dir, root) = make_vault(&[
+            ("f/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "offset": 500 })).unwrap();
+        assert_eq!(page["returned"], json!(0));
+        assert_eq!(page["total"], json!(1), "population, not remainder: {page}");
+        assert_eq!(page["truncated"], json!(true));
+        assert_eq!(
+            page["unresolved"].as_u64().unwrap() + page["low_confidence"].as_u64().unwrap(),
+            1,
+            "nw-297: classification is over the POPULATION, so it survives any \
+             window: {page}"
         );
     }
 }

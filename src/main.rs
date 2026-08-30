@@ -5482,6 +5482,15 @@ enum BrainCommands {
             help = "Max broken links to return (default: 50, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
+        /// nw-341: rows sort unresolved-first then by ASCENDING confidence, so
+        /// the 0.90/0.92/0.95 tiers are the TAIL. Without this the tiers a
+        /// reviewer must inspect are exactly the ones a limit removes.
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Skip this many rows before the page. The high-confidence tiers sort LAST, so this is how you reach them"
+        )]
+        offset: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -20575,14 +20584,16 @@ fn run_brain(
             } else {
                 println!(
                     "Indexed vault '{}': {} note(s), {} heading(s), {} section(s), \
-                     {} tag(s), {} wikilink(s) ({} unresolved).",
+                     {} tag(s), {} wikilink edge(s), {} unresolved link \
+                     occurrence(s) across {} distinct target(s).",
                     result.vault_name,
                     result.notes_count,
                     result.headings_count,
                     result.sections_count,
                     result.tags_count,
-                    result.wikilinks_resolved,
-                    result.wikilinks_unresolved,
+                    result.resolved_link_edges,
+                    result.unresolved_link_occurrences,
+                    result.unresolved_link_targets,
                 );
             }
 
@@ -21928,7 +21939,8 @@ fn run_brain(
                 println!(
                     "Incremental refresh of vault '{}' (since {}): \
                      checked {} file(s), updated {} note(s), dropped {} prior note(s), \
-                     {} heading(s), {} section(s), {} tag(s), {} wikilink(s).",
+                     {} heading(s), {} section(s), {} tag(s), \
+                     {} wikilink edge(s) on changed notes.",
                     result.vault_name,
                     since_str,
                     result.files_checked,
@@ -21937,7 +21949,7 @@ fn run_brain(
                     result.headings_count,
                     result.sections_count,
                     result.tags_count,
-                    result.wikilinks_resolved,
+                    result.changed_note_link_edges,
                 );
             } else {
                 // Full refresh: the markdown indexer's writable store performs
@@ -22903,6 +22915,7 @@ fn run_brain(
         BrainCommands::BrokenLinks {
             max_suggestions,
             limit,
+            offset,
             json,
             db,
             config,
@@ -22916,7 +22929,11 @@ fn run_brain(
                 &db_path,
                 config.as_deref(),
                 "brain_broken_links",
-                serde_json::json!({ "max_suggestions": max_suggestions, "limit": limit }),
+                serde_json::json!({
+                    "max_suggestions": max_suggestions,
+                    "limit": limit,
+                    "offset": offset,
+                }),
             )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -22977,7 +22994,8 @@ fn run_brain(
             // is grouped by category, not ranked by severity (nw-297).
             let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
             let low_confidence = total - unresolved;
-            let links: Vec<_> = all_links.into_iter().take(limit).collect();
+            // nw-341: `total` stays the PRE-offset population on both routes.
+            let links: Vec<_> = all_links.into_iter().skip(offset).take(limit).collect();
             if json {
                 println!(
                     "{}",
@@ -22985,6 +23003,8 @@ fn run_brain(
                         "broken_links": links,
                         "total": total,
                         "returned": links.len(),
+                        "truncated": links.len() < total,
+                        "offset": offset,
                         "unresolved": unresolved,
                         "low_confidence": low_confidence,
                     }))?
@@ -22992,7 +23012,14 @@ fn run_brain(
             } else if links.is_empty() {
                 println!("No broken or ambiguous wikilinks found.");
             } else {
-                println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                if offset > 0 {
+                    println!(
+                        "Broken / ambiguous wikilinks ({} of {total}, from offset {offset}):",
+                        links.len()
+                    );
+                } else {
+                    println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                }
                 print_link_classification(unresolved, low_confidence);
                 for l in &links {
                     println!(
@@ -23328,11 +23355,23 @@ fn run_brain(
                     let stats: nestweaver_engine::DocStats = serde_json::from_value(value)?;
                     println!("Document graph stats:");
                     println!("  total notes:      {}", stats.total_notes);
-                    println!("  total wikilinks:  {}", stats.total_wikilinks);
-                    println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                    // nw-345: each line says which POPULATION it counts. They
+                    // do not agree, and they are not meant to.
+                    println!(
+                        "  wikilink edges:                        {}",
+                        stats.wikilink_edges
+                    );
+                    println!(
+                        "  unresolved links (note + text):        {}",
+                        stats.unresolved_link_targets
+                    );
+                    println!(
+                        "  unresolved links (section + text):     {}",
+                        stats.unresolved_link_section_targets
+                    );
                     println!(
                         "  low-confidence (resolved, not broken): {}",
-                        stats.low_confidence_wikilinks
+                        stats.low_confidence_link_targets
                     );
                     println!("  orphans:          {}", stats.orphans);
                     println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
@@ -23362,11 +23401,22 @@ fn run_brain(
             } else {
                 println!("Document graph stats:");
                 println!("  total notes:      {}", stats.total_notes);
-                println!("  total wikilinks:  {}", stats.total_wikilinks);
-                println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                // nw-345: each line says which POPULATION it counts.
+                println!(
+                    "  wikilink edges:                        {}",
+                    stats.wikilink_edges
+                );
+                println!(
+                    "  unresolved links (note + text):        {}",
+                    stats.unresolved_link_targets
+                );
+                println!(
+                    "  unresolved links (section + text):     {}",
+                    stats.unresolved_link_section_targets
+                );
                 println!(
                     "  low-confidence (resolved, not broken): {}",
-                    stats.low_confidence_wikilinks
+                    stats.low_confidence_link_targets
                 );
                 println!("  orphans:          {}", stats.orphans);
                 println!("  avg out-degree:   {:.2}", stats.avg_outdegree);

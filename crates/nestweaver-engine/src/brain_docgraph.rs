@@ -509,19 +509,42 @@ pub struct TagCount {
     pub count: usize,
 }
 
-/// Aggregate statistics over the document graph. All seven keys are always
-/// present (empty DB → zeros / empty collections).
+/// Aggregate statistics over the document graph. Every key is always present
+/// (empty DB → zeros / empty collections).
+///
+/// nw-345: the link counts do not agree with each other and are not meant to —
+/// each names the population it counts. See
+/// [`crate::index_md::MarkdownIndexResult`] for the full set and why a
+/// de-duplication introduced to make a LIST readable is not a definition of a
+/// METRIC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocStats {
     pub total_notes: usize,
-    pub total_wikilinks: usize,
-    /// Links that point at no note at all. This is the vault-health number.
-    pub broken_wikilinks: usize,
+    /// nw-345: one per WIKILINK_TO_NOTE / WIKILINK_TO_HEADING EDGE, so a single
+    /// ambiguous link contributes N. It was printed as `total wikilinks:` one
+    /// line above a numerator that counts neither edges nor occurrences — a
+    /// denominator that matched nothing on the same screen.
+    pub wikilink_edges: usize,
+    /// Links that point at no note at all, deduped to distinct (source note,
+    /// target text). This is the vault-health number, and it is a strictly
+    /// smaller population than the indexer's occurrence count — see
+    /// [`crate::index_md::MarkdownIndexResult`] for all five.
+    pub unresolved_link_targets: usize,
+    /// The same links deduped only to (source section, target text) — the
+    /// granularity the graph actually stores. Reported so the step between the
+    /// indexer's occurrence count and `unresolved_link_targets` is visible
+    /// rather than left as an unexplained gap (nw-345).
+    ///
+    /// OCCURRENCES are deliberately absent: the graph does not record them, and
+    /// inventing a proxy for them here would recreate exactly the defect this
+    /// field exists to close. `brain add` reports them.
+    pub unresolved_link_section_targets: usize,
     /// Links that DID resolve, but below full confidence — a same-folder or
     /// unique filename-stem match rather than a path or unique-title match.
-    /// Counted separately because folding them into `broken_wikilinks` reported
-    /// 75% of a healthy vault as broken when the real figure was 11% (nw-100).
-    pub low_confidence_wikilinks: usize,
+    /// Counted separately because folding them into the unresolved count
+    /// reported 75% of a healthy vault as broken when the real figure was 11%
+    /// (nw-100). Same (source note, target text) dedup.
+    pub low_confidence_link_targets: usize,
     pub orphans: usize,
     pub avg_outdegree: f64,
     pub top_tags: Vec<TagCount>,
@@ -532,8 +555,11 @@ pub struct DocStats {
 /// summary. `top_tags` is capped at `top_tags_limit`. Graceful on empty DB.
 pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> {
     let total_notes = store.count_notes().map_err(|e| anyhow::anyhow!(e))?;
-    let total_wikilinks = store
+    let wikilink_edges = store
         .count_wikilink_edges()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let unresolved_link_section_targets = store
+        .count_unresolved_wikilink_nodes()
         .map_err(|e| anyhow::anyhow!(e))?;
     let suspect = broken_links(store, 0)?;
     let broken = suspect.iter().filter(|l| l.is_unresolved()).count();
@@ -576,9 +602,10 @@ pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> 
 
     Ok(DocStats {
         total_notes,
-        total_wikilinks,
-        broken_wikilinks: broken,
-        low_confidence_wikilinks: low_confidence,
+        wikilink_edges,
+        unresolved_link_targets: broken,
+        unresolved_link_section_targets,
+        low_confidence_link_targets: low_confidence,
         orphans,
         avg_outdegree,
         top_tags,
@@ -767,11 +794,11 @@ mod tests {
         // The headline metric must count only the dangling one.
         let stats = doc_stats(&store, 5).unwrap();
         assert_eq!(
-            stats.broken_wikilinks, 1,
+            stats.unresolved_link_targets, 1,
             "only [[Nowhere At All]] is broken; counting the resolved one is the nw-100 defect"
         );
         assert!(
-            stats.low_confidence_wikilinks >= 1,
+            stats.low_confidence_link_targets >= 1,
             "the lower-tier resolution must still be reported, just not as broken"
         );
     }
@@ -922,8 +949,8 @@ mod tests {
         // doc-stats broken count must be > 0.
         let stats = doc_stats(&store, 5).unwrap();
         assert!(
-            stats.broken_wikilinks > 0,
-            "doc-stats broken_wikilinks must be > 0"
+            stats.unresolved_link_targets > 0,
+            "doc-stats unresolved_link_targets must be > 0"
         );
     }
 
@@ -1063,15 +1090,16 @@ mod tests {
     }
 
     #[test]
-    fn doc_stats_returns_all_seven_keys() {
+    fn doc_stats_returns_every_key_with_its_population_named() {
         let (_dir, store) = f9_vault();
         let stats = doc_stats(&store, 10).unwrap();
-        // Serialize and assert the seven keys exist (graceful, all present).
+        // Serialize and assert every key exists (graceful, all present).
         let v = serde_json::to_value(&stats).unwrap();
         for key in [
             "total_notes",
-            "total_wikilinks",
-            "broken_wikilinks",
+            "wikilink_edges",
+            "unresolved_link_targets",
+            "unresolved_link_section_targets",
             "orphans",
             "avg_outdegree",
             "top_tags",
@@ -1081,7 +1109,7 @@ mod tests {
         }
         assert_eq!(stats.total_notes, 6);
         assert!(stats.orphans >= 1, "Island is an orphan");
-        assert!(stats.total_wikilinks > 0);
+        assert!(stats.wikilink_edges > 0);
     }
 
     #[test]
