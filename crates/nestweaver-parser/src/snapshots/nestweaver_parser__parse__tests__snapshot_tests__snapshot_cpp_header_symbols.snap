@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6209
+assertion_line: 6236
 expression: "parsed_symbols(\"inline.h\", &source)"
 ---
 - name: SensorRegistry
@@ -25,7 +25,7 @@ expression: "parsed_symbols(\"inline.h\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorRegistry
   scope_chain: "demo::SensorRegistry"
 - name: count_
   kind: Property
@@ -37,7 +37,7 @@ expression: "parsed_symbols(\"inline.h\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorRegistry
   scope_chain: "demo::SensorRegistry"
 - name: SensorSlot
   kind: Class
@@ -61,7 +61,7 @@ expression: "parsed_symbols(\"inline.h\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorSlot
   scope_chain: "demo::SensorSlot"
 - name: reset
   kind: Method
@@ -73,5 +73,5 @@ expression: "parsed_symbols(\"inline.h\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorSlot
   scope_chain: "demo::SensorSlot"

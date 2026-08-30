@@ -999,6 +999,33 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| s.to_string());
             }
+            // nw-351. C/C++: class/struct/union Name { ... }.
+            //
+            // MEMBER_OF is minted only for symbols carrying `parent_name`
+            // (`index.rs:4019`), and none of the arms above is a C-family node
+            // kind — so C and C++ produced NO member edges at all, whether or
+            // not the container extracted. The control is the struct half of
+            // nw-352: 1,092 structs extracted at 91%, all of them
+            // `SymbolKind::Class` and therefore in `container_map`, and they
+            // produced zero MEMBER_OF edges between them.
+            //
+            // Unlike the arms above this one does not give up when the
+            // container is anonymous (`struct { ... } x;`): it keeps walking
+            // outward, so a member of an anonymous inner struct binds to the
+            // named container that encloses it rather than to nothing.
+            // `enum_specifier` is deliberately absent: an enumerator is
+            // `SymbolKind::Constant`, and the call site only asks for a parent
+            // name when the kind is `Method` or `Property` (`parse.rs:1253`),
+            // so the arm would be unreachable. Widening THAT gate is a
+            // cross-language decision, not part of this one.
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name) = parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    return Some(name.to_string());
+                }
+            }
             _ => {}
         }
         current = parent.parent();
@@ -5885,6 +5912,43 @@ function formatTitle(title) {
             "nested object/array braces must not close the function early"
         );
         assert_eq!(span_of("a.astro", source, "formatTitle"), (8, 10));
+    }
+
+    // ── round 3: nw-351 / nw-364 ────────────────────────────────────────
+
+    /// nw-351: MEMBER_OF is minted only when a symbol carries `parent_name`
+    /// (`index.rs:4019`), and `find_parent_name` knew `impl_item`,
+    /// `class_declaration`, `class_definition`, `interface_declaration` and
+    /// `trait_item` — Rust / Java / TS / Python kinds only. C and C++ use
+    /// `class_specifier` / `struct_specifier` / `union_specifier`, so a C++
+    /// method never bound to its class even when the class itself extracted
+    /// correctly: 1,092 structs extracted at 91% on a real corpus and produced
+    /// zero member edges.
+    #[test]
+    fn cpp_method_carries_its_enclosing_class_as_parent_name() {
+        let source = "class Sensor {\npublic:\n    void read() { poll(); }\n};\n";
+        let parsed = parse_source(Path::new("sensor.cpp"), source).unwrap();
+        let read = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "read")
+            .unwrap_or_else(|| panic!("no read in {:#?}", parsed.symbols));
+        assert_eq!(read.parent_name.as_deref(), Some("Sensor"));
+    }
+
+    /// nw-351: the same property must hold for a `struct` container and for
+    /// plain C, which shares `find_parent_name` — a C struct field belongs to
+    /// its struct exactly as a C++ method belongs to its class.
+    #[test]
+    fn c_struct_field_carries_its_struct_as_parent_name() {
+        let source = "struct Reading {\n    int value;\n};\n";
+        let parsed = parse_source(Path::new("reading.c"), source).unwrap();
+        let value = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "value")
+            .unwrap_or_else(|| panic!("no value in {:#?}", parsed.symbols));
+        assert_eq!(value.parent_name.as_deref(), Some("Reading"));
     }
 
     // ── Snapshot tests ────────────────────────────────────────────────────

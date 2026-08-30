@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 5800
+assertion_line: 6220
 expression: "parsed_symbols(\"simple.cpp\", &source)"
 ---
 - name: SensorManager
@@ -25,7 +25,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorManager
   scope_chain: SensorManager
 - name: readTemperature
   kind: Method
@@ -37,7 +37,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorManager
   scope_chain: SensorManager
 - name: sensorId
   kind: Property
@@ -49,7 +49,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorManager
   scope_chain: SensorManager
 - name: initialize
   kind: Method
@@ -97,7 +97,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorConfig
   scope_chain: SensorConfig
 - name: threshold
   kind: Property
@@ -109,7 +109,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorConfig
   scope_chain: SensorConfig
 - name: SensorType
   kind: Enum
