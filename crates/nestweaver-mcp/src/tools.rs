@@ -7848,6 +7848,13 @@ fn tool_brain_impact(
         // caller could not detect truncation here at all. Same "confident
         // answer to a partial read" family as nw-320, one field over.
         "truncated": truncated_by_threshold || truncated_by_depth || rows.len() < total,
+        // nw-357 step 2. The result-set cap had no flag beside the two
+        // traversal ones on EITHER route, so `truncated` was the only signal
+        // and it cannot say which of three independent remedies applies.
+        // Independent boolean, not a `truncated_by` scalar: raising `--depth`,
+        // lowering `--min-score` and raising `limit` do not compose in an
+        // order, so blaming exactly one would discard two live remedies.
+        "truncated_by_limit": rows.len() < total,
         "note": note,
     }))
 }

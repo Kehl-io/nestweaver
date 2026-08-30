@@ -1701,6 +1701,16 @@ fn impact_json_ok(
         "truncated": truncated_by_threshold || truncated_by_depth || capped,
         "truncated_by_threshold": truncated_by_threshold,
         "truncated_by_depth": truncated_by_depth,
+        // nw-357 step 2. An INDEPENDENT boolean beside the other two, not a
+        // `truncated_by` scalar: these three caps do not compose in an order,
+        // so all three remedies — raise `--depth`, lower `--min-score`, raise
+        // `--limit` — stay independently useful when more than one fires.
+        // That is the same reasoning `summary` records for its own pair, and
+        // the opposite of `context`, whose caps DO compose.
+        //
+        // Derived from `capped` rather than taken as a parameter, so it cannot
+        // disagree with the `returned`/`total` printed beside it.
+        "truncated_by_limit": capped,
     });
     if let Some(obj) = payload.as_object_mut() {
         // nw-123: `total` and `returned` used to be inserted only when the
@@ -3236,6 +3246,23 @@ enum Commands {
         instance: Option<String>,
         #[arg(long, help = "Filter to symbols in this repo")]
         repo: Option<String>,
+        /// nw-357. The `brain_impact` schema has carried a `limit` with a
+        /// default of 50 all along, and this command had none — it neither
+        /// declared one nor sent one, so with a daemon `impact X --json`
+        /// returned at most 50 rows and without one it returned every row.
+        /// The bound was a property of the TRANSPORT rather than of the
+        /// contract, which is nw-259(b)'s shape exactly, and it made
+        /// `returned < total` structurally unreachable on the direct route.
+        ///
+        /// The range is COPIED from the schema (`RESULT_LIMIT_MAX`), not
+        /// re-derived, exactly as `hubs --top` / `bridges --top` do after
+        /// nw-251.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum impact nodes to return (1-1000; default 50, matching the MCP brain_impact schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -15721,6 +15748,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             depth,
             confidence,
             min_score,
+            limit,
             json,
             db,
             repo: repo_filter,
@@ -15728,6 +15756,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ..
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+            // nw-357. ONE effective limit for both routes, resolved the same
+            // way `configured_result_limit()` resolves it inside the tool:
+            // explicit flag, else `[limits].default_result_limit`, else the
+            // schema's own 50. Computed here rather than per-branch so the two
+            // routes cannot fall to different defaults again.
+            let limit = resolve_limit(
+                limit,
+                load_instance_config_opt(config_opt.as_deref()).as_ref(),
+                nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+            );
             // ── daemon guard ──────────────────────────────────────
             // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
             // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
@@ -15754,8 +15792,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // additionalProperties:false, so the daemon path would
                     // reject the call outright.
                     serde_json::json!({
+                        // nw-357: `limit` was never sent, so the daemon fell
+                        // to the schema default of 50 while the direct route
+                        // capped nothing. Sending the effective limit is what
+                        // makes the cap a property of the contract.
                         "symbol": name_or_uid,
                         "depth": depth,
+                        "limit": limit,
                     }),
                 )? {
                     // Honor the daemon tool's status so daemon mode matches the direct path's
@@ -15973,7 +16016,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let result = store.impact_with_flags_and_threshold(
                         &uid, depth, confidence, threshold, None,
                     )?;
-                    let nodes = &result.nodes;
+                    // nw-357. The result-set cap now applies HERE too, not
+                    // only on the daemon route, and it applies to BOTH
+                    // renderers — a flag that bounded `--json` and not the
+                    // text output would just move the divergence rather than
+                    // close it. `total` is the PRE-cap population, which is
+                    // what the daemon has always reported under that name.
+                    let total = result.nodes.len();
+                    let nodes: Vec<_> = result.nodes.iter().take(limit).collect();
                     let count = nodes.len();
 
                     if json {
@@ -15999,7 +16049,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         let json_nodes: Vec<_> = nodes
                             .iter()
-                            .map(|n| ImpactNodeJson {
+                            .map(|&n| ImpactNodeJson {
                                 uid: &n.uid,
                                 name: &n.name,
                                 file_path: &n.file_path,
@@ -16034,10 +16084,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 result.truncated_by_depth,
                                 // `total` is the RESULT-SET size, matching the
                                 // daemon, which computes `nodes.len()` after
-                                // its visibility retain and regardless of
-                                // truncation. The truncation flags carry the
-                                // "this set is a FLOOR" meaning; `total` does
-                                // not.
+                                // its visibility retain and BEFORE its
+                                // `.take(limit)`. The truncation flags carry
+                                // the "this set is a FLOOR" meaning; `total`
+                                // does not.
                                 //
                                 // An earlier version of this emitted `None`
                                 // when truncated, reasoning that the
@@ -16048,7 +16098,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // divergence it was meant to close, in the one
                                 // case the happy-path parity fixture cannot
                                 // reach.
-                                Some(json_nodes.len() as u64),
+                                //
+                                // nw-357: these two were BOTH `json_nodes.len()`,
+                                // so `returned < total` could never hold and
+                                // the daemon's documented cap signal had no
+                                // counterpart here. They are now the pre-cap
+                                // and post-cap counts, the same two quantities
+                                // `tool_brain_impact` computes.
+                                Some(total as u64),
                                 Some(json_nodes.len() as u64),
                                 note,
                             ))?
@@ -16062,7 +16119,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     } else {
                         if !out.quiet {
-                            println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                            // nw-357: say when the list is a SAMPLE. The
+                            // daemon route already returns a capped list here;
+                            // printing a bare count on either route is how a
+                            // reader came to believe the walk found exactly
+                            // this many.
+                            if count < total {
+                                println!(
+                                    "Impact of '{name_or_uid}' ({count} of {total} nodes, \
+                                     capped by --limit):"
+                                );
+                            } else {
+                                println!("Impact of '{name_or_uid}' ({count} nodes):");
+                            }
                         }
                         for n in nodes {
                             if out.verbose {

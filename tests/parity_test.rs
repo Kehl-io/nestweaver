@@ -2948,3 +2948,97 @@ fn the_cli_writes_a_capped_summary_set_that_mcp_must_still_call_capped() {
          from the same dropped count\ncli: {cli}\nmcp: {mcp}"
     );
 }
+
+/// nw-357. `impact`'s result-set cap is a property of the TRANSPORT: the
+/// daemon route defaults `limit` to 50 from the `brain_impact` schema, and the
+/// CLI had no `--limit` at all — it neither declared one nor sent one, so the
+/// direct route capped nothing. `returned < total`, the documented way to
+/// detect the cap, was therefore structurally impossible on the direct route,
+/// and the two routes returned DIFFERENT ROW COUNTS for the same command.
+///
+/// That is worse than the field-meaning divergence it was filed as. It is
+/// nw-259(b)'s shape verbatim — the bound is a property of the transport, not
+/// of the contract — which also makes it an nw-217b instance.
+///
+/// The counterweight is the second half: a limit the result set FITS must
+/// report `returned == total` on both routes, or a fix that always reports a
+/// cap passes.
+#[test]
+fn impact_applies_the_same_result_set_cap_on_both_routes() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+    // The 40-link chain gives `fn_39` far more than one transitive dependent,
+    // so a `--limit 1` genuinely cuts on a route that applies one.
+    let args = &["impact", "fn_39", "--json", "--limit", "1", "--depth", "15"];
+
+    let direct = run_direct(db, args);
+    assert!(
+        direct.status.success(),
+        "impact (direct) failed:\n{}",
+        flatten_miette(&direct.stderr)
+    );
+    let direct = parse_stdout("impact (direct)", &direct);
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+    assert!(
+        daemon.status.success(),
+        "impact (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    let daemon = parse_stdout("impact (daemon)", &daemon);
+
+    assert_eq!(
+        direct["returned"], daemon["returned"],
+        "the same --limit returns a different number of rows depending on \
+         whether a daemon is running\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        direct["total"], daemon["total"],
+        "`total` means two things\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    for (label, payload) in [("direct", &direct), ("daemon", &daemon)] {
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(true),
+            "{label}: the cap must actually bite or this proves nothing: {payload}"
+        );
+        assert!(
+            payload["returned"].as_u64().unwrap() < payload["total"].as_u64().unwrap(),
+            "{label}: `returned < total` is the documented cap signal and it is \
+             structurally unreachable here: {payload}"
+        );
+        // nw-357 step 2. `truncated` alone cannot say WHICH of the three caps
+        // fired, and the three remedies are independent: raise `--depth`,
+        // lower `--min-score`, raise `--limit`.
+        assert_eq!(
+            payload["truncated_by_limit"],
+            serde_json::json!(true),
+            "{label}: the result-set cap has no flag beside the depth and \
+             threshold ones, so a caller reads `truncated` and raises the wrong \
+             knob: {payload}"
+        );
+    }
+
+    // COUNTERWEIGHT: a limit the set fits must report no cap on either route.
+    let roomy = &["impact", "fn_39", "--json", "--limit", "1000", "--depth", "15"];
+    let roomy_direct = parse_stdout("impact (direct, roomy)", &run_direct(db, roomy));
+    let roomy_daemon = parse_stdout("impact (daemon, roomy)", &run_via_daemon(db, roomy));
+    for (label, payload) in [("direct", &roomy_direct), ("daemon", &roomy_daemon)] {
+        assert_eq!(
+            payload["returned"], payload["total"],
+            "{label}: nothing was capped: {payload}"
+        );
+        assert_eq!(
+            payload["truncated_by_limit"],
+            serde_json::json!(false),
+            "{label}: a complete answer must not blame the limit: {payload}"
+        );
+    }
+    assert_eq!(roomy_direct["returned"], roomy_daemon["returned"]);
+    assert!(
+        roomy_direct["returned"].as_u64().unwrap() > 1,
+        "the roomy leg must return more than the capped leg, or the two halves \
+         of this test are the same measurement: {roomy_direct}"
+    );
+}
