@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 5850
 expression: "parsed_symbols(\"Simple.java\", &source)"
 ---
 - name: Greeter
@@ -84,24 +85,30 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   kind: Method
   start_line: 16
   end_line: 19
-  signature: "@Override"
+  signature: "@Override public String greet(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Inferred
-  type_info: ~
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
   parent_name: SimpleGreeter
   scope_chain: SimpleGreeter
 - name: farewell
   kind: Method
   start_line: 21
   end_line: 24
-  signature: "@Override"
+  signature: "@Override public String farewell(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Inferred
-  type_info: ~
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
   parent_name: SimpleGreeter
   scope_chain: SimpleGreeter
 - name: main

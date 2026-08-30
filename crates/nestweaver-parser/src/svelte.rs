@@ -97,7 +97,14 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
         name: component_name.clone(),
         kind: SymbolKind::Class,
         start_line: 1,
-        end_line: 1,
+        // The component IS the file, so its span is the file. It used to be
+        // 1-1, which made every module-scope reference in the file belong to no
+        // symbol at all — the resolver then either dropped it or handed it to
+        // whatever one-line symbol happened to precede it. A file-spanning
+        // component is not a widened guess: it is the true containment, and
+        // because `find_enclosing_symbol` returns the INNERMOST containing
+        // span, a call inside a function still attributes to that function.
+        end_line: source.lines().count().max(1) as u32,
         signature: format!("<svelte:component name=\"{component_name}\">"),
         content_hash: sha256_hex(&component_name),
         is_entry_point: false,
@@ -114,8 +121,20 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
     for (script_content, script_start_line) in &script_blocks {
         let offset = *script_start_line;
 
-        for (idx, line) in script_content.lines().enumerate() {
-            let line_no = offset + idx as u32 + 1;
+        let block_lines: Vec<&str> = script_content.lines().collect();
+
+        for (idx, line) in block_lines.iter().enumerate() {
+            let line_no = crate::block_span::file_line(offset, idx);
+            // nw-349 span family: a declaration's span must cover its BODY.
+            // This scanner used to record `end_line: line_no`, so every
+            // function it extracted was ZERO-HEIGHT — `read-symbols` returned
+            // the signature alone, and the resolver could not place any call in
+            // the body inside its own function. `brace_block_end` returns None
+            // for a declaration that opens no block (a genuine one-liner) and
+            // for one it cannot match, so an unhandled shape degrades to the
+            // old span rather than to a confident wrong one.
+            let end_line = crate::block_span::brace_block_end(&block_lines, idx)
+                .map_or(line_no, |e| crate::block_span::file_line(offset, e));
             let trimmed = line.trim();
 
             // Skip empty lines and comments
@@ -132,7 +151,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     name,
                     kind: SymbolKind::Function,
                     start_line: line_no,
-                    end_line: line_no,
+                    end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
                     is_entry_point: false,
@@ -153,7 +172,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     name,
                     kind: SymbolKind::Function,
                     start_line: line_no,
-                    end_line: line_no,
+                    end_line,
                     signature: trimmed.to_string(),
                     content_hash: sha256_hex(trimmed),
                     is_entry_point: false,

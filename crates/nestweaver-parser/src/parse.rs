@@ -261,6 +261,76 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// The signature of a symbol: the first line of its node, plus — when that
+/// first line is an annotation the grammar folded INTO the node — the
+/// declaration line it decorates.
+///
+/// Most grammars keep annotations outside the declaration node (Rust's
+/// `#[test]` is a preceding sibling — see `leading_rust_attributes`), but some
+/// fold them in. Dart's `method_declaration` carries `annotation` as a child,
+/// so anchoring the capture on the declaration rather than on the bodiless
+/// signature made `SimpleGreeter.greet`'s signature the bare string
+/// `"@override"` — the span became correct and the signature became useless in
+/// the same change. Java already had that defect: BOTH overriding methods in
+/// `testdata/java/simple.java` recorded `signature: "@Override"`, which is also
+/// why neither carried any `type_info`.
+///
+/// # Why the annotation is APPENDED TO rather than replaced
+///
+/// The annotation is load-bearing. `frameworks.rs` recognises Spring by
+/// `signature.contains("@RestController")` and Flask/FastAPI by `@app.route` /
+/// `@router.`, and contract derivation reads the route out of
+/// `@GetMapping("/users/{id}")`. Dropping it to recover the declaration
+/// silently disabled all of that — seven engine tests, which is how it was
+/// caught. `frameworks.rs`'s own fixture spells a Spring controller as
+/// `"@RestController public class UserController"`, so the appended form is the
+/// shape the rest of the codebase already expects.
+///
+/// # Why only the FIRST annotation
+///
+/// So this change cannot alter which annotations are visible to any consumer.
+/// Joining *every* leading annotation makes a class-level
+/// `@RequestMapping("/v1/items")` visible for the first time, and contract
+/// derivation then mints it as an `ANY /v1/items` ROUTE with the controller
+/// class as its implementer — a base path is not an endpoint. That is a real
+/// latent defect in contract derivation, but it is not this change's to make
+/// observable: keeping the first line exactly as it is today means the set of
+/// annotations any consumer can see is unchanged, and all that is added is the
+/// declaration being decorated.
+///
+/// # Objective-C
+///
+/// Excluded: there `@` is a declaration KEYWORD, not an annotation marker.
+/// `@interface`, `@protocol`, `@implementation` and `@property` ARE the
+/// declarations, and appending folds a protocol's first method onto its header.
+/// `@Override` and `@protocol` are indistinguishable as text, so the exception
+/// is named rather than inferred from shape.
+fn signature_line(text: &str, lang_str: &str) -> String {
+    let first = first_line(text);
+    if lang_str == "objc" || !is_folded_annotation(&first) {
+        return first;
+    }
+    match text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| !is_folded_annotation(l))
+    {
+        Some(declaration) => format!("{first} {declaration}"),
+        None => first,
+    }
+}
+
+/// Whether a trimmed line is an annotation the grammar folded into the node,
+/// rather than the declaration itself.
+fn is_folded_annotation(line: &str) -> bool {
+    line.starts_with("#[")
+        || (line.starts_with('@')
+            && !line.contains('{')
+            && !line.contains(';')
+            && !line.contains("=>"))
+}
+
 /// Whether a captured declaration node sits inside an `export_statement`.
 ///
 /// Tree-sitter's JS/TS grammars wrap exported declarations (`export function`,
@@ -1071,7 +1141,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 }
 
                 let content_hash = sha256_hex(node_text);
-                let signature = first_line(node_text);
+                let signature = signature_line(node_text, lang_str);
 
                 let kind_label = match kind {
                     SymbolKind::Function => "function",
@@ -5300,6 +5370,306 @@ use crate::config::{Settings, load as load_config};
             matches!(err, ParseError::UnsupportedLanguage(_)),
             "expected UnsupportedLanguage, got: {err:?}"
         );
+    }
+
+    // ── Signature: annotations that the grammar folds in are JOINED ───────
+
+    #[test]
+    fn an_annotation_folded_into_a_declaration_is_joined_not_dropped_or_kept_alone() {
+        // Anchoring Dart methods on `method_declaration` (so the span covers
+        // the body) pulls `@override` into the node, and Java's class/method
+        // nodes already carried `@Override`/`@RestController`. Neither the
+        // annotation nor the declaration may be lost:
+        //
+        //  - dropping the annotation silently disabled Spring/Flask framework
+        //    detection and contract-route derivation, which read
+        //    `signature.contains("@RestController")` / `@app.route`;
+        //  - keeping only the annotation is what produced `signature:
+        //    "@Override"` with no `type_info` on both Java overrides.
+        assert_eq!(
+            signature_line("@Override\npublic String greet(String n) {\n}", "java"),
+            "@Override public String greet(String n) {"
+        );
+        assert_eq!(
+            signature_line(
+                "@RestController\n@RequestMapping(\"/api\")\npublic class C {",
+                "java"
+            ),
+            "@RestController public class C {",
+            "ONLY the first line is kept, so the set of annotations any consumer \
+             can see is exactly what it was before this function existed — \
+             making the second one visible mints a class-level @RequestMapping \
+             base path as an `ANY` route"
+        );
+        assert_eq!(
+            signature_line("public class Plain {\n}", "java"),
+            "public class Plain {",
+            "a declaration with no annotation is untouched"
+        );
+    }
+
+    #[test]
+    fn objective_c_at_signs_are_declarations_and_are_never_joined() {
+        // `@` is a declaration KEYWORD in Objective-C, not an annotation
+        // marker. Joining folded a protocol's first method onto its header:
+        // `@protocol GreeterProtocol` became `- (NSString *)greet:...;`.
+        assert_eq!(
+            signature_line(
+                "@protocol GreeterProtocol\n- (NSString *)greet;\n@end",
+                "objc"
+            ),
+            "@protocol GreeterProtocol"
+        );
+        assert_eq!(
+            signature_line(
+                "@interface SimpleGreeter : NSObject\n@property (nonatomic) NSString *p;\n@end",
+                "objc"
+            ),
+            "@interface SimpleGreeter : NSObject"
+        );
+    }
+
+    // ── Span coverage: a symbol's span must cover its own body ────────────
+    //
+    // Six languages recorded `end_line == start_line` for functions that have a
+    // body: cpp, dart (via tree-sitter queries anchored on the signature rather
+    // than the definition) and cobol, svelte, vue, astro (via line-scanning
+    // regex parsers that had no second line to point at). Fixing one and
+    // leaving five is how the identical defect survived a previous round, so
+    // all six are pinned here together.
+
+    /// Return the (start, end) span of the named symbol, for span assertions.
+    fn span_of(filename: &str, source: &str, name: &str) -> (u32, u32) {
+        let parsed = parse_source(Path::new(filename), source).unwrap();
+        let sym = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol named `{name}` in {filename}; got {:?}",
+                    parsed
+                        .symbols
+                        .iter()
+                        .map(|s| (&s.name, s.kind, s.start_line, s.end_line))
+                        .collect::<Vec<_>>()
+                )
+            });
+        (sym.start_line, sym.end_line)
+    }
+
+    #[test]
+    fn cpp_function_span_covers_the_body_not_just_the_declarator() {
+        // queries/cpp.scm anchored @definition.function/@definition.method on
+        // `(function_declarator ..)`, which is the signature WITHOUT the body,
+        // so every C++ function recorded end_line == start_line.
+        // queries/c.scm anchors the same capture on `(function_definition ..)`
+        // and has always been correct.
+        let source = "\
+void setup() {
+    SensorManager mgr;
+    mgr.initialize();
+}
+";
+        assert_eq!(
+            span_of("span.cpp", source, "setup"),
+            (1, 4),
+            "a 4-line C++ function must span 1..=4"
+        );
+    }
+
+    #[test]
+    fn cpp_out_of_line_method_span_covers_the_body() {
+        let source = "\
+void SensorManager::initialize() {
+    calibrate();
+}
+";
+        assert_eq!(span_of("m.cpp", source, "initialize"), (1, 3));
+    }
+
+    #[test]
+    fn cpp_inline_method_span_covers_the_body() {
+        // The `field_identifier` rule has to keep matching methods DEFINED
+        // inline in a class body, which is the common shape in a header.
+        let source = "\
+class Sensor {
+public:
+    void calibrate() {
+        reset();
+    }
+};
+";
+        assert_eq!(span_of("i.cpp", source, "calibrate"), (3, 5));
+    }
+
+    #[test]
+    fn cpp_bodiless_declarations_are_still_extracted_and_stay_one_line() {
+        // The other half of the same change, and the one that would have made
+        // this a regression rather than a fix: a C++ HEADER is nothing but
+        // declarations. Anchoring only on `function_definition` — the naive
+        // reading of "mirror queries/c.scm" — would extract ZERO symbols from
+        // every .h in the corpus. Declarations keep their own rule, and are
+        // genuinely one line, so `end_line == start_line` is CORRECT for them.
+        let source = "\
+class SensorManager {
+public:
+    void initialize();
+    double readTemperature();
+};
+
+void freeProto(int x);
+";
+        assert_eq!(span_of("h.cpp", source, "initialize"), (3, 3));
+        assert_eq!(span_of("h.cpp", source, "readTemperature"), (4, 4));
+        assert_eq!(span_of("h.cpp", source, "freeProto"), (7, 7));
+
+        // And a definition must NOT also match a declaration rule and mint a
+        // second, zero-height symbol for the same function.
+        let defined = "void setup() {\n    work();\n}\n";
+        let parsed = parse_source(Path::new("d.cpp"), defined).unwrap();
+        let setups: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "setup")
+            .collect();
+        assert_eq!(
+            setups.len(),
+            1,
+            "one definition, one symbol: {:?}",
+            setups
+                .iter()
+                .map(|s| (s.start_line, s.end_line))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dart_method_span_covers_the_body() {
+        // queries/dart.scm anchored @definition.method on `(method_signature
+        // ..)`. The top-level `function_declaration` rule right above it was
+        // already anchored correctly, so `main` had a real span while every
+        // method in the same file did not.
+        let source = "\
+class Greeter {
+  String greet(String name) {
+    return 'Hello, $name!';
+  }
+}
+";
+        assert_eq!(span_of("s.dart", source, "greet"), (2, 4));
+    }
+
+    #[test]
+    fn dart_abstract_method_declaration_is_extracted_and_stays_one_line() {
+        // The other half, and the reason "just anchor on the declaration" was
+        // not enough: an abstract member is a `declaration` wrapping a bare
+        // `function_signature`, never a `method_signature`, so
+        // testdata/dart/simple.dart's `Greeter.greet` was extracted as NOTHING
+        // at all. It has no body, so one line is the correct span.
+        let source = "\
+abstract class Greeter {
+  String greet(String name);
+}
+";
+        assert_eq!(span_of("a.dart", source, "greet"), (2, 2));
+    }
+
+    #[test]
+    fn cobol_paragraph_span_covers_its_statements() {
+        // A COBOL paragraph has no closing delimiter — it runs to the next
+        // label. The scanner recorded the label line as both ends, so every
+        // paragraph was zero-height and no PERFORM could be placed inside the
+        // paragraph that issued it.
+        let source = "\
+       PROCEDURE DIVISION.
+       MAIN-LOGIC SECTION.
+           PERFORM INITIALIZE-DATA
+           STOP RUN.
+
+       INITIALIZE-DATA.
+           MOVE \"World\" TO WS-NAME.
+
+       DISPLAY-RESULT.
+           DISPLAY WS-GREETING.
+";
+        assert_eq!(
+            span_of("p.cbl", source, "MAIN-LOGIC"),
+            (2, 4),
+            "the section ends at its last statement, not at the blank line after it"
+        );
+        assert_eq!(span_of("p.cbl", source, "INITIALIZE-DATA"), (6, 7));
+        assert_eq!(
+            span_of("p.cbl", source, "DISPLAY-RESULT"),
+            (9, 10),
+            "the last symbol runs to the last code line in the file"
+        );
+    }
+
+    #[test]
+    fn svelte_function_span_covers_the_body_and_a_one_liner_does_not_grow() {
+        let source = "\
+<script>
+  export function greet(name) {
+    return `Hello, ${name}!`
+  }
+
+  export let count = 0
+
+  function handleClick() {
+    count += 1
+  }
+</script>
+";
+        assert_eq!(span_of("s.svelte", source, "greet"), (2, 4));
+        assert_eq!(span_of("s.svelte", source, "handleClick"), (8, 10));
+        assert_eq!(
+            span_of("s.svelte", source, "count"),
+            (6, 6),
+            "`export let count = 0` opens no block; inventing a span for it \
+             would be the same defect pointing the other way"
+        );
+    }
+
+    #[test]
+    fn vue_function_span_covers_the_body() {
+        let source = "\
+<script>
+export function formatName(name) {
+  return name.trim()
+}
+
+function handleClick() {
+  console.log(formatName())
+}
+</script>
+";
+        assert_eq!(span_of("v.vue", source, "formatName"), (2, 4));
+        assert_eq!(span_of("v.vue", source, "handleClick"), (6, 8));
+    }
+
+    #[test]
+    fn astro_function_span_covers_the_body() {
+        let source = "\
+---
+export function getStaticPaths() {
+  return [
+    { params: { id: '1' } },
+  ]
+}
+
+function formatTitle(title) {
+  return title.toUpperCase()
+}
+---
+<main />
+";
+        assert_eq!(
+            span_of("a.astro", source, "getStaticPaths"),
+            (2, 6),
+            "nested object/array braces must not close the function early"
+        );
+        assert_eq!(span_of("a.astro", source, "formatTitle"), (8, 10));
     }
 
     // ── Snapshot tests ────────────────────────────────────────────────────

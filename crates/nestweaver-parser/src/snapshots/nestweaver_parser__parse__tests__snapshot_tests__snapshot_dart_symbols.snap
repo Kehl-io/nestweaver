@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 5836
 expression: "parsed_symbols(\"simple.dart\", &source)"
 ---
 - name: Greeter
@@ -14,6 +15,18 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: ~
+- name: greet
+  kind: Method
+  start_line: 5
+  end_line: 5
+  signature: String greet(String name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: Greeter
+  scope_chain: Greeter
 - name: Loggable
   kind: Trait
   start_line: 8
@@ -29,8 +42,8 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: log
   kind: Method
   start_line: 9
-  end_line: 9
-  signature: void log(String message)
+  end_line: 11
+  signature: "void log(String message) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -52,9 +65,9 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   scope_chain: ~
 - name: greet
   kind: Method
-  start_line: 16
-  end_line: 16
-  signature: String greet(String name)
+  start_line: 15
+  end_line: 19
+  signature: "@override String greet(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -65,8 +78,8 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: _formatName
   kind: Method
   start_line: 21
-  end_line: 21
-  signature: String _formatName(String name)
+  end_line: 23
+  signature: "String _formatName(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
