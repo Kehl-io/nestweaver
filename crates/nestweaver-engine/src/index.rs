@@ -3988,6 +3988,12 @@ where
         {
             use nestweaver_schema::{EdgeType, ResolvedEdge};
 
+            // nw-330: `Extension` is deliberately NOT a container kind here.
+            // `container_map` is keyed by (file, name) and overwrites, so while
+            // Rust `impl` blocks were `SymbolKind::Class` a type's methods
+            // bound to whichever impl block was parsed LAST rather than to the
+            // type. Now that impl blocks carry their own kind, the struct is
+            // the only candidate and the binding is deterministic.
             let container_kinds = [
                 nestweaver_schema::SymbolKind::Class,
                 nestweaver_schema::SymbolKind::Interface,
@@ -13922,8 +13928,9 @@ function hello(name) { return "Hello " + name; }
     #[test]
     fn index_emits_member_of_edges_for_rust_struct_methods() {
         // Task 4: MEMBER_OF edges must be emitted from methods to their parent
-        // struct (which the parser classifies as SymbolKind::Class via the impl
-        // block).
+        // struct. nw-330: the parent is the `struct` itself (SymbolKind::Class);
+        // the `impl` block is now SymbolKind::Extension and no longer competes
+        // for the same (file, name) container key.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
         fs::create_dir_all(&src).unwrap();

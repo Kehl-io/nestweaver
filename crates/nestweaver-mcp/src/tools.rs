@@ -7824,7 +7824,12 @@ fn tool_flow_trace(
 
     // Classes don't have CALLS edges — only their methods do. When the root
     // symbol is a class, expand to its methods and return a flow tree per method.
-    if root.kind == SymbolKind::Class {
+    //
+    // nw-330: an `Extension` (a Rust `impl` block) is in exactly the same
+    // position — a container whose members hold the calls — and used to BE
+    // `SymbolKind::Class`. Without this, `flow` on an impl block would return
+    // an empty tree instead of one per method.
+    if matches!(root.kind, SymbolKind::Class | SymbolKind::Extension) {
         let direct_callees = store
             .callees_of(&root.uid)
             .map_err(|e| anyhow!("callees_of: {e}"))?;

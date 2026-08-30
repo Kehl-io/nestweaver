@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 5758
 expression: "parsed_symbols(\"simple.rs\", &source)"
 ---
 - name: SensorManager
@@ -51,7 +52,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   parent_name: ~
   scope_chain: ~
 - name: SensorManager
-  kind: Class
+  kind: Extension
   start_line: 18
   end_line: 26
   signature: "impl Readable for SensorManager {"
@@ -90,7 +91,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   parent_name: SensorManager
   scope_chain: SensorManager
 - name: SensorManager
-  kind: Class
+  kind: Extension
   start_line: 28
   end_line: 38
   signature: "impl SensorManager {"

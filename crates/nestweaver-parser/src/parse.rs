@@ -1099,7 +1099,19 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "type" | "type_alias" => SymbolKind::TypeAlias,
                     "variable" | "var" => SymbolKind::Variable,
                     "macro" => SymbolKind::Function,
-                    "impl" => SymbolKind::Class,
+                    // nw-330 / nw-349 (5). `@definition.impl` is a distinct
+                    // capture in queries/rust.scm, and mapping it onto the
+                    // same SymbolKind::Class as `struct_item` threw that
+                    // distinction away at the last step: testdata/rust/simple.rs
+                    // minted THREE `Class SensorManager` rows (lines 4, 18, 28)
+                    // for ONE type, indistinguishable by name and kind.
+                    //
+                    // `Extension` already exists in the schema, already
+                    // round-trips through the store, and is semantically the
+                    // same thing an `impl` block is — a set of members attached
+                    // to a type — so the fact the query already carries now has
+                    // somewhere to live.
+                    "impl" => SymbolKind::Extension,
                     "constructor" => SymbolKind::Method,
                     other => {
                         tracing::debug!(
@@ -5426,6 +5438,83 @@ use crate::config::{Settings, load as load_config};
                 "objc"
             ),
             "@interface SimpleGreeter : NSObject"
+        );
+    }
+
+    // ── nw-330 / nw-349 (5): impl blocks need an identity of their own ────
+
+    #[test]
+    fn a_rust_impl_block_is_not_the_same_symbol_as_the_struct_it_implements() {
+        // `@definition.impl` is a distinct capture in queries/rust.scm, and
+        // parse.rs mapped it onto the SAME SymbolKind::Class as `struct_item`.
+        // testdata/rust/simple.rs therefore minted THREE `Class SensorManager`
+        // rows (lines 4, 18, 28) for one type, indistinguishable by name and
+        // kind — so "which impl block is this method from" was unanswerable and
+        // the impl rows were structural dead-code candidates.
+        let source = "\
+pub struct Foo {
+    x: u32,
+}
+
+pub trait Greet {
+    fn hi(&self);
+}
+
+impl Greet for Foo {
+    fn hi(&self) {}
+}
+
+impl Foo {
+    fn new() -> Self { Foo { x: 0 } }
+}
+";
+        let parsed = parse_source(Path::new("i.rs"), source).unwrap();
+        let foos: Vec<_> = parsed.symbols.iter().filter(|s| s.name == "Foo").collect();
+        assert_eq!(
+            foos.len(),
+            3,
+            "struct + two impl blocks: {:?}",
+            foos.iter()
+                .map(|s| (s.start_line, s.kind))
+                .collect::<Vec<_>>()
+        );
+
+        let classes: Vec<_> = foos
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(
+            classes.len(),
+            1,
+            "exactly ONE of the three may be a Class — the struct. The impl \
+             blocks must carry their own kind or they are indistinguishable \
+             from it: {:?}",
+            foos.iter()
+                .map(|s| (s.start_line, s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(classes[0].start_line, 1, "the Class is the struct");
+        assert!(
+            foos.iter()
+                .filter(|s| s.start_line != 1)
+                .all(|s| s.kind == SymbolKind::Extension),
+            "both impl blocks are Extensions"
+        );
+
+        // The trait relationship must stay recoverable STRUCTURALLY, not only
+        // from the signature string. nw-330's "the trait is simply absent from
+        // the model" is overstated — this reference already existed, and the
+        // kind change must not lose it.
+        assert!(
+            parsed.references.iter().any(|r| r.name == "Greet"
+                && r.kind == ReferenceKind::Extends
+                && r.start_line == 9),
+            "the trait impl must still emit an Extends reference: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind, r.start_line))
+                .collect::<Vec<_>>()
         );
     }
 

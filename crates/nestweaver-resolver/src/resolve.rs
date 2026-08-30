@@ -111,12 +111,21 @@ pub fn resolve_references_with_context(
             for reference in references {
                 if reference.kind == ReferenceKind::Extends
                     && let Some(sym) = find_enclosing_symbol(sorted_syms, reference.start_line)
+                    // nw-330: `Extension` belongs here. A Rust `impl Trait
+                    // for Type` block IS the symbol that encloses the `Extends`
+                    // reference to the trait, and it used to be
+                    // `SymbolKind::Class`. Giving impl blocks their own kind
+                    // without widening this filter would have silently deleted
+                    // every Rust trait relationship from the MRO map — a
+                    // modelling fix quietly losing the one structural fact the
+                    // model already had.
                     && matches!(
                         sym.kind,
                         SymbolKind::Class
                             | SymbolKind::Enum
                             | SymbolKind::Interface
                             | SymbolKind::Trait
+                            | SymbolKind::Extension
                     )
                 {
                     map.entry(sym.name.clone())
