@@ -418,6 +418,50 @@ enum CliDiagnostic {
     )]
     DatabaseCorrupt { path: String, cause: String },
 
+    /// nw-332. The write-ahead log cannot be READ. Deliberately its own
+    /// diagnostic, sitting between `db_wal_unreplayed` (the log is fine, a
+    /// replay is owed) and `db_corrupt` (the database file itself is damaged),
+    /// because before this the one condition reached the operator through
+    /// THREE code paths that gave three different, mutually contradictory
+    /// answers — and two of them made recovery HARDER:
+    ///
+    ///   * the CLI read funnel said `nestweaver daemon --db <p> start`, which
+    ///     against this state IS the crash-restart loop;
+    ///   * `db_corrupt` said "delete this database and re-index", for a state
+    ///     where moving five sidecars aside restored 1125 notes, 43 repos and
+    ///     189519 vectors — and per nw-289 its other branch, `backup restore
+    ///     <archive>`, may name an archive that does not exist because `backup
+    ///     save` was failing 100%;
+    ///   * `repair` said "another process holds the write lock", naming a
+    ///     process that does not exist.
+    ///
+    /// It MUST NOT inherit `db_corrupt`'s "delete this database" clause. The
+    /// database file was intact in the incident this comes from; the log was
+    /// not.
+    ///
+    /// The last release made this path WORSE, and that is worth stating:
+    /// `1e4de638` added `lower.contains("corrupted wal")` to the `db_corrupt`
+    /// classifier — from the commit whose entire purpose was making corruption
+    /// remedies accurate — routing a recoverable WAL state to a destructive
+    /// remedy.
+    #[error("Database write-ahead log is unreadable: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_wal_corrupt),
+        help(
+            "{cause}\nThe database FILE may well be intact; its write-ahead log \
+             is not, and no read-only or read-write open can replay a log whose \
+             records do not parse.\n\
+             Do NOT start or restart the daemon against this state — a writer \
+             that crashes on open is what produces the crash-restart loop.\n\
+             {runbook}"
+        )
+    )]
+    DatabaseWalCorrupt {
+        path: String,
+        cause: String,
+        runbook: String,
+    },
+
     /// nw-285. A zero-length `.lbug`, or one that was created but never
     /// indexed. `require_openable_db` passes a zero-byte file on purpose (it
     /// is what the store itself initialises), and a read-only open does not
@@ -554,12 +598,118 @@ fn extract_db_path(message: &str) -> String {
         .unwrap_or_else(|| default_db_path().display().to_string())
 }
 
+/// THE recovery runbook for an unreadable write-ahead log. ONE definition,
+/// rendered by ONE diagnostic, reached by every path that can detect the
+/// condition.
+///
+/// nw-332 / nw-333. Before this, three independent sites each answered this
+/// condition from a different substring of a different message and landed on
+/// three different remedies, two of which made recovery harder. The remedy
+/// below is the one that was VERIFIED to work in the 2026-07-30 incident: five
+/// artifacts moved aside, reopen, full re-index.
+///
+/// Every clause is load-bearing:
+///
+///   * MOVE, never delete. A `.wal` can hold committed work, so destroying it
+///     to fix an outage trades one data-loss story for another. This is the
+///     same discipline `quarantine_orphaned_wal` already applies in the store.
+///   * ALL FIVE. The incident report first listed four and the reopen failed
+///     IDENTICALLY until the fifth moved (lbug-009). A partial list is
+///     indistinguishable from no list.
+///   * The re-index is REQUIRED, not advisory, and no message in this codebase
+///     said so before. Measured on 2026-08-28: raw `[[wikilink]]` occurrences in
+///     the vault grew 2183 -> 2394 while graph Wikilinks FELL 1838 -> 1791 and
+///     stayed there. Occurrences up, edges down — a real edge deficit, and
+///     nothing in `brain status` discloses it.
+///
+/// This is deliberately a runbook and NOT an automated recovery. The signature
+/// is not yet characterised well enough to act on: `quarantine_orphaned_wal`
+/// fires only on an exactly-diagnosable shape (`.wal` present, `.shadow`
+/// absent) which this state does NOT match — `.shadow` was present — and a full
+/// re-index is not something `repair` can perform. Print it; do not run it.
+fn wal_corruption_runbook(db: &str) -> String {
+    format!(
+        "Recover it in this order:\n  \
+         1. Stop everything that opens this database (daemon, watcher, UI).\n  \
+         2. MOVE ASIDE — do not delete — all five of these that exist:\n       \
+         {db}.wal\n       {db}.wal.checkpoint\n       {db}.shadow\n       \
+         {db}.checkpoint.apply.lock\n       {db}.checkpoint.intent.lock\n  \
+         3. Reopen the database. If it opens, the un-checkpointed tail of the \
+         log is lost; the graph already committed is not.\n  \
+         4. Run a full re-index. REQUIRED, not optional: derived edges for \
+         unchanged files are not rebuilt by the watcher, and nothing in \
+         `brain status` discloses the deficit.\n\
+         Moving only some of the five fails identically to moving none."
+    )
+}
+
+/// nw-346. ONE place turns a [`nestweaver_store::CorruptionKind`] into the
+/// diagnostic the operator sees.
+///
+/// Both routes into `into_diagnostic` — the typed one and the prose fallback —
+/// come through here, so they cannot disagree about what a given kind means.
+/// That divergence, across three call sites, is nw-332.
+fn corruption_diagnostic(
+    kind: nestweaver_store::CorruptionKind,
+    path: String,
+    message: String,
+) -> miette::Report {
+    use nestweaver_store::CorruptionKind;
+    match kind {
+        // The log is readable and merely owed a replay, which a read-only open
+        // cannot perform. Not a damaged file.
+        CorruptionKind::WalUnreplayed => CliDiagnostic::DatabaseWalUnreplayed {
+            wal: format!("{path}.wal"),
+            path,
+            cause: message,
+        }
+        .into(),
+        // nw-332. Its OWN diagnostic. Sending this to `db_corrupt` is what
+        // told an operator to delete a database a five-file `mv` restored.
+        CorruptionKind::WalUnreadable => CliDiagnostic::DatabaseWalCorrupt {
+            runbook: wal_corruption_runbook(&path),
+            path,
+            cause: drop_engine_retry_advice(&message),
+        }
+        .into(),
+        CorruptionKind::FileTruncated
+        | CorruptionKind::EngineAssertion
+        | CorruptionKind::Unclassified => CliDiagnostic::DatabaseCorrupt {
+            path,
+            cause: drop_engine_retry_advice(&message),
+        }
+        .into(),
+    }
+}
+
 /// Inspect an `anyhow::Error` and, when it matches a known pattern, convert it
 /// into a `miette::Report` with rich diagnostic information (help text, error
 /// code). Falls back to a plain `miette::Report` for unrecognised errors.
 fn into_diagnostic(err: anyhow::Error) -> miette::Report {
+    // nw-346. Ask the TYPE before asking the prose. `StoreError::Corruption`
+    // is classified once, at the FFI boundary, so an error that reached here
+    // with its source chain intact already knows what it is. The text arms
+    // below remain for errors that arrive from OUTSIDE the store — relayed
+    // over gRPC as a string, or synthesised by a CLI layer — where no type
+    // survived to consult.
+    let typed = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .and_then(|store_error| {
+            store_error
+                .corruption_kind()
+                .map(|kind| (kind, store_error.corruption_path().map(Path::to_path_buf)))
+        });
+
     let message = redact_build_paths(&format!("{err:#}"));
     let lower = message.to_lowercase();
+
+    if let Some((kind, typed_path)) = typed {
+        let path = typed_path
+            .map(|p| redact_build_paths(&p.display().to_string()))
+            .unwrap_or_else(|| extract_db_path(&message));
+        return corruption_diagnostic(kind, path, message);
+    }
 
     // nw-285. Corruption must be classified BEFORE the WAL and not-found arms,
     // because a corrupt file produces text those arms recognise while their
@@ -580,22 +730,20 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // 3. `basic_string`. A bare C++ exception `what()` with no sentence in it,
     //    produced by a different corruption offset.
     //
-    // Matched on the storage engine's phrasing rather than on a `StoreError`
-    // variant because there is no variant for it: `From<lbug::Error>` collapses
-    // every engine failure into `StoreError::Database(String)`. That is the
-    // deeper fix and it is a store-crate change, noted here so the next reader
-    // knows this arm is the workaround and not the design.
-    let engine_corruption = lower.contains("outside the database file")
-        || lower.contains("assertion failed in file")
-        || lower.contains("database error: basic_string")
-        || lower.contains("corrupted wal");
-    if engine_corruption {
+    // nw-346. These phrases NO LONGER LIVE HERE. They moved verbatim into
+    // `nestweaver_store::classify_engine_corruption`, the single classifier,
+    // so an engine wording change is a one-file edit instead of a silent
+    // reclassification in whichever of seven call sites happened to miss it.
+    // The comment this replaces called itself the workaround; the workaround is
+    // gone.
+    //
+    // `WalUnreplayed` deliberately falls THROUGH to the WAL arm below, which
+    // has always owned that condition and extracts its path differently.
+    if let Some(kind) = nestweaver_store::classify_engine_corruption(&message)
+        && kind != nestweaver_store::CorruptionKind::WalUnreplayed
+    {
         let path = extract_db_path(&message);
-        return CliDiagnostic::DatabaseCorrupt {
-            path,
-            cause: drop_engine_retry_advice(&message),
-        }
-        .into();
+        return corruption_diagnostic(kind, path, message);
     }
 
     // nw-285. A zero-length `.lbug` passes `require_openable_db` by design, and
@@ -7014,36 +7162,61 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
 ///
 /// The two matched substrings are also NOT the same condition, and were being
 /// given one answer. `Could not set lock` is live contention — stopping the
-/// daemon resolves it. `Corrupted wal` is a non-replayable write-ahead log,
-/// which a READ-ONLY open can never replay however many times it is retried
-/// (the same nw-126 hazard the `db_wal_unreplayed` diagnostic documents), so
-/// the only way through is a read-write open, i.e. the daemon.
+/// daemon resolves it. `Corrupted wal` is something else again, and this
+/// function used to get it exactly backwards.
+///
+/// nw-332. The `Corrupted wal` arm used to say *"Let this command route through
+/// the daemon, which holds the database read-write: `nestweaver daemon --db <p>
+/// start`."* That reasoning is right for an UNREPLAYED log and wrong for an
+/// UNREADABLE one — and `Corrupted wal` selects the unreadable case
+/// specifically. Starting a writer against a log whose records do not parse is
+/// the crash-restart loop, verbatim.
+///
+/// It had a second, subtler cost. `anyhow::anyhow!` with a plain message
+/// attaches NO source, so the engine's own text was destroyed right here — at
+/// the one site that had correctly identified the condition. `into_diagnostic`
+/// then saw only this paraphrase, which contains "replay" and "read-only", and
+/// classified it as `db_wal_unreplayed`. The typed error is now attached as the
+/// anyhow SOURCE so every layer above classifies on facts instead of on this
+/// function's prose.
+///
+/// The runbook itself is deliberately NOT repeated here: it is rendered once,
+/// by `db_wal_corrupt`'s help, which this error now reaches. One condition, one
+/// remedy, one definition.
 ///
 /// Extracted from a closure so the message is testable at all; see
 /// `no_daemon_refusal_never_prescribes_the_flag_already_passed`.
-fn daemon_held_store_error(path: &Path, upstream: &str) -> anyhow::Error {
-    if upstream.contains("Corrupted wal") {
-        anyhow::anyhow!(
-            "The database at {} has write-ahead log state that a read-only open \
-             cannot replay.\n\
-             Replay needs read-write access, which is why opening it directly \
-             cannot succeed here however often it is retried.\n\
-             Let this command route through the daemon, which holds the \
-             database read-write: `nestweaver daemon --db {} start`.",
-            path.display(),
-            path.display()
-        )
-    } else if upstream.contains("Could not set lock") {
-        anyhow::anyhow!(
+fn daemon_held_store_error(path: &Path, upstream: nestweaver_store::StoreError) -> anyhow::Error {
+    // nw-346: the phrase test moved into the store's single classifier, and the
+    // typed error is preserved rather than paraphrased away.
+    //
+    // Name the database ON THE ERROR rather than leaving `into_diagnostic` to
+    // recover it from prose. `extract_db_path` splits this function's own
+    // sentence on "database at " and then on ":", so a message that does not
+    // happen to put a colon after the path yields the rest of the sentence as
+    // the filename — and that filename is then interpolated into a recovery
+    // runbook. `with_db_path` only fills an EMPTY slot, so the store's own
+    // attribution (attached at the open funnel, closer to the failure) still
+    // wins when it is present.
+    let upstream = upstream.with_db_path(path);
+    if upstream.corruption_kind() == Some(nestweaver_store::CorruptionKind::WalUnreadable) {
+        let path = path.display().to_string();
+        return anyhow::Error::new(upstream).context(format!(
+            "The write-ahead log of the database at {path} cannot be READ, so no \
+             open can replay it — read-only or read-write, however often it is \
+             retried. Do not start or restart the daemon against this state."
+        ));
+    }
+    if upstream.is_lock_contention() {
+        return anyhow::Error::new(upstream).context(format!(
             "The NestWeaver daemon holds the write lock on the database at {}.\n\
              Either let this command route through the daemon, or stop the \
              daemon first: `nestweaver daemon --db {} stop`.",
             path.display(),
             path.display()
-        )
-    } else {
-        anyhow::anyhow!("failed to open database at {}: {upstream}", path.display())
+        ));
     }
+    anyhow::Error::new(upstream).context(format!("failed to open database at {}", path.display()))
 }
 
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
@@ -7074,8 +7247,7 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // cannot tell the operator WHICH database is broken — and with several
     // scratch databases open that is the only fact that matters.
     record_opened_db_path(path);
-    let store = GraphStore::open_read_only(path)
-        .map_err(|e| daemon_held_store_error(path, &e.to_string()))?;
+    let store = GraphStore::open_read_only(path).map_err(|e| daemon_held_store_error(path, e))?;
 
     // nw-029: load the PageRank sidecar from the canonical path. Every writer
     // and `migrate_sidecar` produce `<db>.lbug.pagerank.json` via
@@ -9157,6 +9329,58 @@ fn repair_outcome_name(
 /// `rm <db>.index-dirty`, discoverable only by reading the source — and an `rm`
 /// is the *wrong* repair, because it makes sidecars that predate the committed
 /// graph authoritative again.
+/// nw-333. Say what actually went wrong when `repair` cannot open the database
+/// read-write.
+///
+/// The arm this replaces bound `Err(error)`, interpolated it into a
+/// parenthetical, and then ignored it — attributing EVERY open failure to lock
+/// contention. Its own comment said "almost always"; the code said always. A
+/// corrupt WAL, a truncated file, a missing parent directory and a genuine
+/// `flock` conflict all produced the same sentence, and that sentence prescribed
+/// a daemon restart. Against a damaged database, restarting the daemon is what
+/// produces the crash-restart loop: of the whole error-remedy class this
+/// release, it is the first where following the advice was worse than ignoring
+/// it. The message *stated* the cause in its own parenthetical and prescribed a
+/// remedy for a different cause in the next clause.
+///
+/// The chicken-and-egg nw-333 names is real but narrower than it looks.
+/// `repair`'s subject is the publication MARKER, a sidecar file; it needs
+/// read-write on the database only to reconcile graph state against sidecars. So
+/// the three answers below are genuinely separable, and the classification comes
+/// from nw-346's variant rather than from a fifth substring match.
+fn repair_open_failure(db_path: &Path, error: nestweaver_store::StoreError) -> anyhow::Error {
+    // Name the database on the error; see `daemon_held_store_error` for why
+    // leaving it to prose extraction put the WRONG database in the runbook.
+    let error = error.with_db_path(db_path);
+    if error.corruption_kind().is_some() {
+        // The database itself is damaged. `repair` cannot and must not touch
+        // it. The publication marker is the lesser problem, and saying so is
+        // the point — the operator came here for the marker.
+        return anyhow::Error::new(error).context(format!(
+            "cannot repair the index publication for {}: the database itself \
+             could not be opened. The publication marker is the lesser problem \
+             and `repair` will not touch a damaged database.",
+            db_path.display()
+        ));
+    }
+    if error.is_lock_contention() {
+        // Correct here, and ONLY here.
+        return anyhow::Error::new(error).context(format!(
+            "could not open {} read-write. Another process holds the write lock; \
+             if that is the daemon, restart it (`nestweaver daemon --db {} stop` \
+             then start) and it will reconcile the publication itself.",
+            db_path.display(),
+            db_path.display()
+        ));
+    }
+    // Anything else: report it verbatim with NO attribution. A wrong guess is
+    // worse than no guess, which is the whole finding.
+    anyhow::Error::new(error).context(format!(
+        "could not open {} read-write, so the index publication was not repaired.",
+        db_path.display()
+    ))
+}
+
 fn run_repair_index_publication(
     db_path: &std::path::Path,
     json: bool,
@@ -9167,7 +9391,7 @@ fn run_repair_index_publication(
 
     let status = pubstat::status(db_path);
     let mut outcome: Option<nestweaver_engine::index::IndexPublicationRecovery> = None;
-    let mut open_error: Option<String> = None;
+    let mut open_error: Option<anyhow::Error> = None;
 
     if status.dirty && !dry_run {
         match nestweaver_store::GraphStore::open(db_path) {
@@ -9178,18 +9402,7 @@ fn run_repair_index_publication(
                     nestweaver_engine::index::recover_abandoned_index_publication(&store, true)?
                 });
             }
-            Err(error) => {
-                // The write lock is held — almost always by a running daemon,
-                // which is itself a writer and reconciles at startup. Say so
-                // instead of emitting a raw store error.
-                open_error = Some(format!(
-                    "could not open {} read-write ({error}). Another process holds the write \
-                     lock; if that is the daemon, restart it (`nestweaver daemon --db {} stop` \
-                     then start) and it will reconcile the publication itself.",
-                    db_path.display(),
-                    db_path.display()
-                ));
-            }
+            Err(error) => open_error = Some(repair_open_failure(db_path, error)),
         }
     }
 
@@ -9221,7 +9434,7 @@ fn run_repair_index_publication(
             "recovered": recovered,
             "outcome": outcome.as_ref().map(repair_outcome_name),
             "message": outcome.as_ref().map(|o| o.describe()),
-            "error": open_error,
+            "error": open_error.as_ref().map(|error| format!("{error:#}")),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(exit);
@@ -9258,8 +9471,14 @@ fn run_repair_index_publication(
         return Ok(exit);
     }
     if let Some(error) = open_error {
-        eprintln!("Error: {error}");
-        return Ok(EXIT_ERROR);
+        // nw-333 (fourth defect). This used to be a bare `eprintln!`, so the
+        // message never became a `CliDiagnostic` and never passed through
+        // `into_diagnostic` — which means
+        // `no_permanent_diagnostic_advises_waiting_it_out`, the exhaustive
+        // inventory built for exactly this class of remedy, was STRUCTURALLY
+        // BLIND to it. Returning the error puts it on the one funnel every
+        // other CLI failure uses, so it is classified, redacted and covered.
+        return Err(error);
     }
     if let Some(outcome) = outcome {
         println!("{}", outcome.describe());
@@ -24265,6 +24484,17 @@ mod cli_help_contract_tests {
                 },
                 Clears::Never,
             ),
+            // nw-332. An unreadable write-ahead log is deterministic: no
+            // amount of waiting makes its records parse, and starting a
+            // writer against it is the crash-restart loop.
+            (
+                CliDiagnostic::DatabaseWalCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                    runbook: wal_corruption_runbook("d"),
+                },
+                Clears::Never,
+            ),
             (
                 CliDiagnostic::DatabaseNoSchema {
                     path: sample("d"),
@@ -24292,6 +24522,7 @@ mod cli_help_contract_tests {
                 CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
                 CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
                 CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+                CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
                 CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
                 CliDiagnostic::General { .. } => "error",
             }
@@ -24420,6 +24651,202 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
         );
     }
 
+    /// nw-332. The production WAL corruption reached the operator through
+    /// THREE independent paths that DISAGREED, and two of the three made
+    /// recovery harder. Each is pinned here on the engine's message
+    /// character-for-character, so none of them needs the crash that produced
+    /// it (lbug-001, which nobody can reproduce).
+    ///
+    /// The engine fault is upstream and is NOT NestWeaver's to fix. This is the
+    /// NestWeaver half: detect, report honestly, and give ONE recovery runbook.
+    #[test]
+    fn a_corrupt_wal_gets_one_remedy_and_it_is_the_one_that_worked() {
+        const ENGINE: &str = "Corrupted wal file. Read out invalid WAL record type.";
+
+        // (a) The CLI read funnel must not send the operator into the
+        //     crash-restart loop — and it must not destroy the engine's words
+        //     on the way, which is what made the diagnostic below misclassify.
+        let funnel = daemon_held_store_error(
+            std::path::Path::new("/tmp/x.lbug"),
+            nestweaver_store::StoreError::from_engine_message(ENGINE),
+        );
+        let funnel_text = format!("{funnel:#}");
+        assert!(
+            !funnel_text.contains("daemon --db /tmp/x.lbug start"),
+            "starting the daemon against a corrupt WAL IS the crash-restart \
+             loop:\n{funnel_text}"
+        );
+        assert!(
+            funnel_text.contains(ENGINE),
+            "the engine's own sentence is the only evidence of what happened \
+             and must survive to the classifier:\n{funnel_text}"
+        );
+
+        // (b) The diagnostic mapper must not prescribe destroying a database
+        //     whose graph a five-file `mv` restores. Both routes into
+        //     `into_diagnostic` are checked: the typed one (the funnel error,
+        //     which carries a `StoreError` source) and the prose fallback (a
+        //     message relayed as a bare string, e.g. over gRPC).
+        let typed = into_diagnostic(funnel);
+        let prose = into_diagnostic(anyhow::anyhow!(
+            "failed to open database at /tmp/x.lbug: {ENGINE}"
+        ));
+
+        for (label, report) in [("typed", &typed), ("prose", &prose)] {
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            assert_eq!(
+                code, "nestweaver::db_wal_corrupt",
+                "{label}: an unreadable WAL is neither an unreplayed one nor a \
+                 damaged FILE, and both of those diagnostics give it the wrong \
+                 remedy"
+            );
+            let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(
+                !help.contains("delete this database"),
+                "{label}: the verified recovery preserved 1125 notes, 43 repos \
+                 and 189519 vectors; `db_corrupt`'s remedy discards them — and \
+                 per nw-289 its other branch names a backup archive that may not \
+                 exist:\n{help}"
+            );
+            // (c) It must name the recovery that actually worked, in full,
+            //     including the re-index — the step the 2026-08-28 measurement
+            //     showed is REQUIRED and that no message stated.
+            for artifact in [
+                ".wal",
+                ".wal.checkpoint",
+                ".shadow",
+                ".checkpoint.apply.lock",
+                ".checkpoint.intent.lock",
+            ] {
+                assert!(
+                    help.contains(artifact),
+                    "{label}: the runbook is FIVE artifacts; a partial list \
+                     failed IDENTICALLY until the fifth file moved. Missing \
+                     {artifact}:\n{help}"
+                );
+            }
+            assert!(
+                help.to_lowercase().contains("re-index"),
+                "{label}: WAL-loss recovery leaves the graph consistent but \
+                 INCOMPLETE and nothing in `brain status` discloses it:\n{help}"
+            );
+            assert!(
+                help.contains("MOVE ASIDE") && !help.to_lowercase().contains("delete <"),
+                "{label}: a `.wal` can hold committed work, so the runbook moves \
+                 rather than deletes:\n{help}"
+            );
+            assert!(
+                !help.contains("nestweaver daemon --db /tmp/x.lbug start"),
+                "{label}: the remedy must not restart the writer that crashes on \
+                 open:\n{help}"
+            );
+            assert!(
+                help.contains("/tmp/x.lbug.wal.checkpoint"),
+                "{label}: the runbook names files to MOVE, so it must name the \
+                 right database. Recovering the path from prose put \
+                 `./nestweaver.lbug` — an entirely different database — into \
+                 these instructions:\n{help}"
+            );
+        }
+
+        // All three paths, one text. `repair`'s open failure is the third, and
+        // it used to be a bare `eprintln!` the diagnostic inventory could not
+        // see at all.
+        let repair = into_diagnostic(repair_open_failure(
+            std::path::Path::new("/tmp/x.lbug"),
+            nestweaver_store::StoreError::from_engine_message(ENGINE),
+        ));
+        assert_eq!(
+            repair.code().map(|c| c.to_string()).unwrap_or_default(),
+            "nestweaver::db_wal_corrupt",
+            "`repair` blamed a lock nobody held; it must now report the same \
+             condition, with the same remedy, as the other two paths"
+        );
+        // Three paths, ONE remedy, from one constant. Each path keeps its own
+        // leading `{cause}` — they describe genuinely different situations, a
+        // read that could not open versus a repair that will not act — but the
+        // REMEDY below it must be byte-identical, because the divergence of the
+        // remedy is the whole defect.
+        let runbook = wal_corruption_runbook("/tmp/x.lbug");
+        for (label, report) in [("read funnel", &typed), ("repair", &repair)] {
+            let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(
+                help.contains(&runbook),
+                "{label}: the remedy must be the shared constant verbatim, not a \
+                 restatement of it — three restatements is exactly how one \
+                 condition acquired three contradictory answers:\n{help}"
+            );
+        }
+    }
+
+    /// nw-333. The other half, and what keeps the first from over-correcting:
+    /// a repair blocked by a REAL lock must still say so, and an open failure
+    /// that is neither corruption nor contention must be reported with NO
+    /// attribution at all. A wrong guess is worse than no guess.
+    #[test]
+    fn repair_only_blames_a_lock_when_the_engine_says_a_lock() {
+        let db = std::path::Path::new("/tmp/x.lbug");
+
+        let lock = format!(
+            "{:#}",
+            repair_open_failure(
+                db,
+                nestweaver_store::StoreError::from_engine_message(
+                    "Could not set lock on file /tmp/x.lbug.lock"
+                )
+            )
+        );
+        assert!(
+            lock.contains("Another process holds the write lock"),
+            "a genuinely held lock must still be reported as one: {lock}"
+        );
+
+        for damaged in [
+            "Corrupted wal file. Read out invalid WAL record type.",
+            "catalog page range starts at 3567 and spans 5 pages, outside the \
+             database file with 1696 pages",
+        ] {
+            let rendered = format!(
+                "{:#}",
+                repair_open_failure(
+                    db,
+                    nestweaver_store::StoreError::from_engine_message(damaged)
+                )
+            );
+            assert!(
+                !rendered.contains("Another process holds the write lock"),
+                "no process holds this database; the open failed because the \
+                 FILE is damaged, and the old message said so in its own \
+                 parenthetical before ignoring it:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("then start"),
+                "restarting the daemon against a damaged database is what \
+                 produces the crash-restart loop — the one remedy in this class \
+                 that makes recovery HARDER rather than merely wasting \
+                 time:\n{rendered}"
+            );
+        }
+
+        let unknown = format!(
+            "{:#}",
+            repair_open_failure(
+                db,
+                nestweaver_store::StoreError::from_engine_message(
+                    "Runtime exception: something nobody has classified"
+                )
+            )
+        );
+        assert!(
+            !unknown.contains("Another process holds the write lock"),
+            "an unrecognised failure must carry NO attribution: {unknown}"
+        );
+        assert!(
+            unknown.contains("something nobody has classified"),
+            "…and must still report what the engine said: {unknown}"
+        );
+    }
+
     /// nw-318 (defect A). `open_store`'s daemon-held refusal is reached ONLY
     /// by a caller who already bypassed the daemon, so prescribing
     /// `--no-daemon` to that caller is a closed loop — and "report it as a bug"
@@ -24427,8 +24854,13 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
     #[test]
     fn no_daemon_refusal_never_prescribes_the_flag_already_passed() {
         for upstream in ["Could not set lock on file", "Corrupted wal detected"] {
-            let rendered =
-                daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), upstream).to_string();
+            let rendered = format!(
+                "{:#}",
+                daemon_held_store_error(
+                    std::path::Path::new("/tmp/x.lbug"),
+                    nestweaver_store::StoreError::from_engine_message(upstream)
+                )
+            );
 
             assert!(
                 !rendered.contains("--no-daemon"),
@@ -24441,25 +24873,48 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
                  product defect. Got: {rendered}"
             );
             assert!(
-                rendered.contains("nestweaver daemon"),
-                "the refusal must name an action the caller has NOT already \
-                 taken. Got: {rendered}"
-            );
-            assert!(
                 rendered.contains("/tmp/x.lbug"),
-                "and it must name the database. Got: {rendered}"
+                "it must name the database. Got: {rendered}"
             );
         }
 
-        // The two conditions are NOT the same and must not get one answer: a
-        // read-only open can never replay a WAL however many times the caller
-        // stops and restarts things, so `stop` is the wrong advice for it.
-        let wal = daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Corrupted wal")
-            .to_string();
-        assert!(wal.contains("start"), "{wal}");
-        let lock =
-            daemon_held_store_error(std::path::Path::new("/tmp/x.lbug"), "Could not set lock")
-                .to_string();
+        // The two conditions are NOT the same and must not get one answer.
+        //
+        // nw-332 REVERSED what this pair used to assert for the WAL case. It
+        // used to require `wal.contains("start")` — because the shipped message
+        // said "Let this command route through the daemon: `nestweaver daemon
+        // --db <p> start`". That reasoning is correct for an UNREPLAYED log and
+        // wrong for an UNREADABLE one, and `Corrupted wal` selects the
+        // unreadable case specifically. Starting a writer against a log whose
+        // records do not parse is the crash-restart loop, so the old assertion
+        // was pinning the defect.
+        let wal = format!(
+            "{:#}",
+            daemon_held_store_error(
+                std::path::Path::new("/tmp/x.lbug"),
+                nestweaver_store::StoreError::from_engine_message("Corrupted wal")
+            )
+        );
+        assert!(
+            !wal.contains("daemon --db /tmp/x.lbug start"),
+            "starting the daemon against an unreadable WAL IS the crash-restart \
+             loop: {wal}"
+        );
+        assert!(
+            wal.to_lowercase().contains("do not start"),
+            "and it must say so, not merely omit it: {wal}"
+        );
+
+        // Live contention still gets the answer that works, and it still names
+        // an action the caller has not already taken.
+        let lock = format!(
+            "{:#}",
+            daemon_held_store_error(
+                std::path::Path::new("/tmp/x.lbug"),
+                nestweaver_store::StoreError::from_engine_message("Could not set lock")
+            )
+        );
+        assert!(lock.contains("nestweaver daemon"), "{lock}");
         assert!(lock.contains("stop"), "{lock}");
     }
 
