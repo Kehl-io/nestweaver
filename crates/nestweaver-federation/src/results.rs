@@ -644,8 +644,52 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             };
-            result["truncated"] =
-                Value::from(merged_overflowed || tier_truncated(local) || tier_truncated(server));
+            let merged_truncated =
+                merged_overflowed || tier_truncated(local) || tier_truncated(server);
+            result["truncated"] = Value::from(merged_truncated);
+
+            // nw-259(a). `truncated` alone sends a caller to the wrong knob, so
+            // the CAUSE has to survive the merge with it — this envelope is
+            // rebuilt key by key, and a key not re-added here is silently
+            // dropped. Federating is precisely the case where a caller cannot
+            // reason it out themselves.
+            //
+            // `token_budget` beats `limit` for the same reason it does on a
+            // single tier: it is applied last, so raising the row cap alone
+            // cannot get past it. `merged_overflowed` contributes `limit`,
+            // because reapplying the requested cap to the merged array is a
+            // ROW cut.
+            fn tier_cause(tier: &Value) -> Option<&str> {
+                tier.get("truncated_by").and_then(Value::as_str)
+            }
+            let cause = if [local, server]
+                .iter()
+                .any(|tier| tier_cause(tier) == Some("token_budget"))
+            {
+                Some("token_budget")
+            } else if merged_overflowed
+                || [local, server]
+                    .iter()
+                    .any(|tier| tier_cause(tier) == Some("limit"))
+            {
+                Some("limit")
+            } else {
+                None
+            };
+            match cause {
+                Some(cause) if merged_truncated => {
+                    result["truncated_by"] = Value::String(cause.to_string());
+                }
+                // Present-but-null, matching what the tools emit: a caller
+                // parsing a fixed shape should not have to tell "absent
+                // because complete" from "absent because dropped in a merge".
+                _ if local.get("truncated_by").is_some()
+                    || server.get("truncated_by").is_some() =>
+                {
+                    result["truncated_by"] = Value::Null;
+                }
+                _ => {}
+            }
         }
 
         // Recomputed AFTER the cap above, so it describes the array the caller
@@ -678,6 +722,20 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             if total > connected_len {
                 result["truncated"] = Value::from(true);
             }
+        }
+        // Reconciled LAST, because the `total` block above can flip
+        // `truncated` on after the cause was resolved — which would leave a
+        // caller holding `truncated: true` with `truncated_by: null`, the
+        // exact silence this field exists to remove. A shortfall of the merged
+        // array against the summed total is a ROW shortfall, so `limit` is the
+        // cause; a budget cause already set above is never downgraded.
+        if result["truncated"] == Value::Bool(true)
+            && result
+                .get("truncated_by")
+                .is_none_or(|cause| cause.is_null())
+            && (local.get("truncated_by").is_some() || server.get("truncated_by").is_some())
+        {
+            result["truncated_by"] = Value::String("limit".to_string());
         }
         // This envelope is rebuilt key by key above, so anything not re-added
         // here is silently dropped. `semantic_applied` / `degraded_components`

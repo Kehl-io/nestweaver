@@ -3494,7 +3494,7 @@ fn tool_schema_code_context() -> Value {
                     // knob with a minimum and no maximum is an omission either
                     // way.
                     "maximum": 5000,
-                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count` and `truncated` so an omitted limit is never silently lossy."
+                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count`, `truncated` and `truncated_by` (which cap cut) so an omitted limit is never silently lossy."
                 },
                 "intent": intent_schema(
                     "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
@@ -3721,6 +3721,18 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     // that counts survivors is not a total of anything.
     let returned = result.connected.len();
     let total = result.connected_total.unwrap_or(returned).max(returned);
+    // nw-259(a), machine route. This tool has exactly ONE cap, so `truncated`
+    // was never ambiguous HERE — but the CLI's daemon route parses this very
+    // payload into `ContextResult` and then applies `--token-budget` on top of
+    // it. Stating the cause explicitly is what lets that layer OVERRIDE a
+    // known cause rather than re-derive one, and it is what an MCP client
+    // reading this tool directly needs in order to parse one shape across
+    // `code_context` and `nestweaver context --json`.
+    //
+    // `resolve` rather than a literal: the precedence rule lives in ONE place
+    // even where only one branch of it is reachable.
+    let truncated_flag = truncated || total > returned;
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(false, truncated_flag);
     let payload = json!({
         "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
         "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
@@ -3733,7 +3745,12 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "returned": returned,
         "total": total,
         "limit": limit,
-        "truncated": truncated || total > returned,
+        "truncated": truncated_flag,
+        // Emitted even when null, unlike the CLI's `skip_serializing_if`,
+        // because this payload always emits `truncated` and a caller parsing a
+        // fixed shape should not have to distinguish "absent because complete"
+        // from "absent because this producer is old".
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
     });
     Ok(payload)
 }
@@ -10436,6 +10453,26 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         };
         let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
         let truncated_by_budget = display.len() < matched_total;
+        // nw-259(a), same property, different command. TWO caps reach this
+        // payload — the generator's `DEFAULT_SYMBOL_SUMMARY_CAP` and
+        // `token_budget` — and `truncated` was one boolean for both, so a
+        // caller could not tell whether to raise the budget or narrow with
+        // `target`.
+        //
+        // Named as INDEPENDENT booleans, the shape `brain_impact` already uses
+        // for `truncated_by_depth` / `truncated_by_threshold`, and deliberately
+        // NOT the single `truncated_by` string that `code_context` and
+        // `nestweaver context` carry. The difference is not cosmetic: there,
+        // the budget is applied to what the row cap left, so raising the row
+        // cap alone provably cannot help and naming both would prescribe a
+        // useless remedy. Here BOTH remedies stay independently useful — a
+        // narrower `target` shrinks the matched set even when the budget cut,
+        // and a bigger budget shows more even when the generator capped — so
+        // collapsing them to one winner would throw away a remedy that works.
+        //
+        // `partial` is kept as an alias of `truncated_by_cap` rather than a
+        // second computation, so the two cannot drift.
+        let truncated_by_cap = capped;
         let note = if capped {
             Some(format!(
                 "symbol-level summary is capped at {} symbols of {matched_total}; pass `target` \
@@ -10467,8 +10504,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "total_available": matched_total,
             "tokens_used": total_tokens,
             "token_budget": token_budget,
-            "truncated": truncated_by_budget || capped,
-            "partial": capped,
+            "truncated": truncated_by_budget || truncated_by_cap,
+            "truncated_by_budget": truncated_by_budget,
+            "truncated_by_cap": truncated_by_cap,
+            "partial": truncated_by_cap,
             "cached": false,
             "note": note,
             "summaries": display,
@@ -10571,6 +10610,19 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // Either cause: the generator's cap upstream, or the budget here.
         // Reporting only the second made the first vanish (F-DC-11).
         "truncated": display.len() < after_filter_len || cap_dropped > 0,
+        // nw-259(a). `truncated` alone does not say WHICH, and the two
+        // remedies are different: raise `token_budget`, or narrow with
+        // `target`. Independent booleans, per the symbol-level rationale
+        // above — both remedies stay useful when both caps fire.
+        //
+        // `truncated_by_cap` is `cap_dropped > 0`, which is FALSE on a sidecar
+        // cache hit even when the cached set was itself capped, because the
+        // generator did not run and nothing recorded what it dropped. That is
+        // a pre-existing hole in `truncated` itself, not one this field adds;
+        // it is called out here so the next reader does not mistake the field
+        // for a guarantee.
+        "truncated_by_budget": display.len() < after_filter_len,
+        "truncated_by_cap": cap_dropped > 0,
         "cached": from_cache,
         "summaries": display,
         "summaries_text": text,

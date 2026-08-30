@@ -2371,3 +2371,288 @@ fn context_limit_is_bounded_identically_on_both_routes() {
     );
     assert!(run_via_daemon(db, ok_args).status.success());
 }
+
+/// nw-259(a), machine route. **Which cap cut** must be readable by a consumer
+/// that cannot read prose.
+///
+/// The human route already names the cause — `TRUNCATED by --token-budget 200
+/// — raise it for more` versus `TRUNCATED at limit 5 — pass --limit for more`
+/// — but that disclosure lived only in the `--stats` string. `--json` emitted
+/// `{"total": 576, "limit": 5000, "truncated": true}` for a cut the BUDGET
+/// made, so an agent read "truncated at limit 5000", raised `--limit`, and got
+/// the same rows back. That is the wrong-remedy defect nw-259 exists to close,
+/// still live for every script and every agent — the audience with no prose to
+/// fall back on.
+///
+/// Asserted on all three routes, because the direct path, the daemon path and
+/// the MCP tool each decide this independently and a fix to one is how they
+/// diverged before.
+#[test]
+fn context_truncation_names_the_cause_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // A LIMIT cut: the budget is roomy, so only `--limit` can have cut.
+    let by_limit = ["context", "mainA", "--json", "--limit", "1"];
+    // A BUDGET cut: the limit is the schema maximum and cannot bite, so only
+    // the budget can have cut. This is the case that reported `limit`.
+    let by_budget = [
+        "context",
+        "mainA",
+        "--json",
+        "--limit",
+        "5000",
+        "--token-budget",
+        "1",
+    ];
+    // BOTH fired. The budget cut LAST, so raising `--limit` alone cannot get
+    // past it — naming the limit here is the wrong remedy.
+    let by_both = [
+        "context",
+        "mainA",
+        "--json",
+        "--limit",
+        "1",
+        "--token-budget",
+        "1",
+    ];
+    // Neither fired: the field must not accuse a cap that did nothing.
+    let uncapped = ["context", "mainA", "--json", "--limit", "5000"];
+
+    let assert_cause =
+        |route: &str, payload: &serde_json::Value, expected: Option<&str>| match expected {
+            Some(cause) => {
+                assert_eq!(
+                    payload["truncated"],
+                    serde_json::json!(true),
+                    "{route}: the cap must actually bite or this proves nothing: {payload}"
+                );
+                assert_eq!(
+                    payload.get("truncated_by").and_then(|v| v.as_str()),
+                    Some(cause),
+                    "{route}: a consumer cannot tell WHICH cap cut, so it will raise the \
+                     wrong knob and get the same rows: {payload}"
+                );
+            }
+            None => {
+                assert_ne!(
+                    payload["truncated"],
+                    serde_json::json!(true),
+                    "{route}: nothing was capped: {payload}"
+                );
+                assert!(
+                    payload
+                        .get("truncated_by")
+                        .is_none_or(serde_json::Value::is_null),
+                    "{route}: a complete answer must not blame a cap: {payload}"
+                );
+            }
+        };
+
+    // ── Route 1: direct ──
+    for (args, expected) in [
+        (&by_limit[..], Some("limit")),
+        (&by_budget[..], Some("token_budget")),
+        (&by_both[..], Some("token_budget")),
+        (&uncapped[..], None),
+    ] {
+        let out = run_direct(db, args);
+        assert!(
+            out.status.success(),
+            "context (direct) {args:?} failed:\n{}",
+            flatten_miette(&out.stderr)
+        );
+        assert_cause(
+            &format!("direct {args:?}"),
+            &parse_stdout("context (direct)", &out),
+            expected,
+        );
+    }
+
+    // ── Route 3: MCP, before the daemon takes the DB lock ──
+    //
+    // `code_context` has ONE cap, so `truncated: true` is unambiguous there
+    // *today* — but the CLI's daemon route parses this very payload and then
+    // applies its own budget on top, so the cause has to be IN the payload for
+    // route 2 to be able to override it rather than recompute it.
+    let mcp_capped = run_via_mcp(
+        db,
+        "code_context",
+        serde_json::json!({ "seeds": ["mainA"], "limit": 1 }),
+    );
+    assert_cause("mcp code_context limit=1", &mcp_capped, Some("limit"));
+    let mcp_uncapped = run_via_mcp(
+        db,
+        "code_context",
+        serde_json::json!({ "seeds": ["mainA"], "limit": 5000 }),
+    );
+    assert_cause("mcp code_context limit=5000", &mcp_uncapped, None);
+
+    // ── Route 2: daemon ──
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    for (args, expected) in [
+        (&by_limit[..], Some("limit")),
+        (&by_budget[..], Some("token_budget")),
+        (&by_both[..], Some("token_budget")),
+        (&uncapped[..], None),
+    ] {
+        let out = run_via_daemon(db, args);
+        assert!(
+            out.status.success(),
+            "context (daemon) {args:?} failed:\n{}",
+            flatten_miette(&out.stderr)
+        );
+        assert_cause(
+            &format!("daemon {args:?}"),
+            &parse_stdout("context (daemon)", &out),
+            expected,
+        );
+    }
+}
+
+/// nw-259(a), the human half. `--stats` is OFF by default.
+///
+/// The truncation clause was built into the `--stats` line, so the DEFAULT
+/// human output of a capped `context` was byte-identical to a complete one:
+/// the reader saw `Connected (1 symbols, ranked by relevance)` and had nothing
+/// to compare it against. Disclosure that only appears under an opt-in flag is
+/// the same silence the cap was supposed to stop being.
+///
+/// Asserted with `--stats` absent on purpose. The counterweight is the second
+/// half: an UNCAPPED run must stay quiet, or printing the notice
+/// unconditionally would satisfy the first assertion.
+#[test]
+fn a_capped_context_says_so_with_stats_off() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let capped = run_direct(db, &["context", "mainA", "--limit", "1"]);
+    let stdout = String::from_utf8_lossy(&capped.stdout);
+    assert!(
+        stdout.contains("TRUNCATED at limit 1"),
+        "a capped result renders identically to a complete one with `--stats` \
+         off, which is the whole defect:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("pass --limit for more"),
+        "the notice must carry the remedy, not just the fact:\n{stdout}"
+    );
+
+    let budgeted = run_direct(
+        db,
+        &["context", "mainA", "--limit", "5000", "--token-budget", "1"],
+    );
+    let stdout = String::from_utf8_lossy(&budgeted.stdout);
+    assert!(
+        stdout.contains("--token-budget"),
+        "the human notice must name the cap that actually cut, exactly as the \
+         `--stats` line does — they read the SAME field:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("pass --limit for more"),
+        "a budget cut prescribed `--limit`, which cannot change the outcome:\n{stdout}"
+    );
+
+    let complete = run_direct(db, &["context", "mainA", "--limit", "5000"]);
+    let stdout = String::from_utf8_lossy(&complete.stdout);
+    assert!(
+        !stdout.contains("TRUNCATED"),
+        "nothing was capped, so nothing may be claimed:\n{stdout}"
+    );
+}
+
+/// Where else does the property hold? `summary` — TWO caps, one boolean.
+///
+/// A `summary` result can be cut by the level's generator cap (500 symbols, 50
+/// clusters, 30 hubs — none of them a knob the caller passed) or by
+/// `--token-budget`, and both routes reported a single `truncated` for both.
+/// The remedies are different — narrow with `--target`, or raise the budget —
+/// so `truncated: true` alone leaves a consumer guessing.
+///
+/// Named as INDEPENDENT booleans, not as `context`'s single `truncated_by`
+/// string, because these two caps do not compose in an order: both remedies
+/// stay useful when both fire. That is `brain_impact`'s existing shape
+/// (`truncated_by_depth` / `truncated_by_threshold`), not a new one.
+#[test]
+fn summary_names_which_cap_cut_on_both_routes() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(
+        db,
+        &[
+            "summary",
+            "--level",
+            "file",
+            "--json",
+            "--token-budget",
+            "1",
+        ],
+    );
+    assert!(
+        cli.status.success(),
+        "summary (direct) failed:\n{}",
+        flatten_miette(&cli.stderr)
+    );
+    let payload = parse_stdout("summary (direct)", &cli);
+    assert_eq!(
+        payload["truncated"],
+        serde_json::json!(true),
+        "the budget must bite or this proves nothing: {payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_budget"],
+        serde_json::json!(true),
+        "a budget cut must say so: {payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_cap"],
+        serde_json::json!(false),
+        "the generator cap did not fire; blaming it sends the caller to \
+         `--target`, which cannot help here: {payload}"
+    );
+
+    let mcp = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "file", "token_budget": 1 }),
+    );
+    assert_eq!(
+        mcp["truncated"],
+        serde_json::json!(true),
+        "the budget must bite on the MCP route too: {mcp}"
+    );
+    assert_eq!(
+        mcp["truncated_by_budget"],
+        serde_json::json!(true),
+        "the agent-facing route is the one with no prose to fall back on: {mcp}"
+    );
+    assert_eq!(mcp["truncated_by_cap"], serde_json::json!(false));
+
+    // Counterweight: an unbounded run must set neither, or hardcoding `true`
+    // would satisfy everything above.
+    let roomy = run_direct(
+        db,
+        &[
+            "summary",
+            "--level",
+            "file",
+            "--json",
+            "--token-budget",
+            "0",
+        ],
+    );
+    let payload = parse_stdout("summary (unbounded)", &roomy);
+    assert_eq!(payload["truncated"], serde_json::json!(false), "{payload}");
+    assert_eq!(
+        payload["truncated_by_budget"],
+        serde_json::json!(false),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_cap"],
+        serde_json::json!(false),
+        "{payload}"
+    );
+}

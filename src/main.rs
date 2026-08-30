@@ -11664,12 +11664,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     limit,
                 ) {
                     Ok(mut result) => {
+                        // The SAME two caps as seed-mode, resolved by the SAME
+                        // rule. `build_feature_context` answers for the row cap
+                        // it applied; `--token-budget` is applied here and can
+                        // upgrade the cause, because it cuts LAST.
+                        let cut_by_limit = result.truncated == Some(true);
+                        let mut cut_by_budget = false;
                         if let Some(budget) = token_budget {
                             let cut = context_token_budgeted_truncate(&result.connected, budget);
+                            if cut < result.connected.len() {
+                                result.truncated = Some(true);
+                                cut_by_budget = true;
+                            }
                             result.connected.truncate(cut);
                         }
+                        result.truncated_by = nestweaver_engine::TruncationCause::resolve(
+                            cut_by_budget,
+                            cut_by_limit,
+                        );
+                        result.token_budget = token_budget;
+                        let truncation = context_truncation_notice(
+                            result.truncated_by,
+                            result.limit,
+                            result.token_budget,
+                        )
+                        .map(|notice| format!(", {notice}"))
+                        .unwrap_or_default();
                         let stats = format!(
-                            "{} seeds, {} connected nodes in {}",
+                            "{} seeds, {} connected nodes in {}{truncation}",
                             result.seeds.len(),
                             result.connected.len(),
                             format_elapsed(t0.elapsed())
@@ -11791,32 +11813,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The limit cut is whatever the builder already recorded —
                     // on either route. The budget cut happens here.
                     let cut_by_limit = result.truncated == Some(true);
-                    let mut cut_by_budget: Option<usize> = None;
+                    let mut cut_by_budget = false;
                     if let Some(budget) = token_budget {
                         let cut = context_token_budgeted_truncate(&result.connected, budget);
                         if cut < result.connected.len() {
                             result.truncated = Some(true);
-                            cut_by_budget = Some(budget);
+                            cut_by_budget = true;
                         }
                         result.connected.truncate(cut);
                     }
-                    // Say so, and say WHICH. A capped result that renders
-                    // identically to a complete one is the defect this reports
-                    // on; a capped result that blames the wrong cap is the same
-                    // defect wearing a disclosure.
+                    // Say so, and say WHICH — in the PAYLOAD, not only in the
+                    // prose. A capped result that renders identically to a
+                    // complete one is the defect this reports on; a capped
+                    // result that blames the wrong cap is the same defect
+                    // wearing a disclosure; and a disclosure that exists only
+                    // in the `--stats` string is that same defect for every
+                    // consumer that reads `--json`, which is the audience with
+                    // no prose to fall back on.
                     //
-                    // The budget wins when both fired, because it cut LAST:
-                    // raising `--limit` alone cannot get past a budget that is
-                    // already full.
-                    let truncation = match (cut_by_budget, cut_by_limit, result.limit) {
-                        (Some(budget), _, _) => {
-                            format!(", TRUNCATED by --token-budget {budget} — raise it for more")
-                        }
-                        (None, true, Some(limit)) => {
-                            format!(", TRUNCATED at limit {limit} — pass --limit for more")
-                        }
-                        _ => String::new(),
-                    };
+                    // Resolved ONCE, here, through the engine's shared
+                    // precedence rule. The `--stats` line below reads the
+                    // field rather than re-deciding, so the two cannot
+                    // disagree — a second copy of this decision is exactly how
+                    // the human route and the machine route diverged.
+                    result.truncated_by =
+                        nestweaver_engine::TruncationCause::resolve(cut_by_budget, cut_by_limit);
+                    result.token_budget = token_budget;
+                    let truncation = context_truncation_notice(
+                        result.truncated_by,
+                        result.limit,
+                        result.token_budget,
+                    )
+                    .map(|notice| format!(", {notice}"))
+                    .unwrap_or_default();
                     let stats = format!(
                         "{} seeds, {} connected nodes in {} ({}){}",
                         result.seeds.len(),
@@ -12657,7 +12686,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Truncation is either cause: the symbol cap upstream, or the
             // token budget here. Reporting only the second made the first
             // vanish.
-            let truncated = display.len() < total || cap_dropped > 0;
+            //
+            // nw-259(a). Naming the CAUSE is the other half, and it has to be
+            // in the payload, not only in the stderr note below — the note
+            // lists both remedies at once, which is unhelpful rather than
+            // wrong, and a `--json` consumer never sees it at all.
+            //
+            // Independent booleans, matching `impact_json_ok`'s
+            // `truncated_by_threshold` / `truncated_by_depth` and the twin
+            // `get_summary` tool — not the single `truncated_by` string
+            // `context` carries. `context`'s caps compose in a strict order
+            // (the budget cuts what the limit left, so raising the limit alone
+            // cannot help); these two do not, and both remedies remain
+            // independently useful when both fire.
+            let truncated_by_budget = display.len() < total;
+            let truncated_by_cap = cap_dropped > 0;
+            let truncated = truncated_by_budget || truncated_by_cap;
 
             if json {
                 println!(
@@ -12670,6 +12714,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "total": total + cap_dropped,
                         "returned": display.len(),
                         "truncated": truncated,
+                        "truncated_by_budget": truncated_by_budget,
+                        "truncated_by_cap": truncated_by_cap,
                     }))?
                 );
             } else if display.is_empty() {
@@ -19043,6 +19089,18 @@ fn print_context_text(result: &ContextResult) {
         }
     }
 
+    // `--stats` is OFF by default, and the truncation clause lived only there:
+    // with stats off, a capped list printed exactly like a complete one and the
+    // reader's only clue was a count they had nothing to compare against. The
+    // notice belongs to the RESULT, not to the timing line that happened to
+    // carry it. Printed after the rows, where a reader who scrolled to the end
+    // of a short list is looking.
+    if let Some(notice) =
+        context_truncation_notice(result.truncated_by, result.limit, result.token_budget)
+    {
+        println!("  … {notice}");
+    }
+
     if !result.cross_repo_links.is_empty() {
         println!();
         println!("Cross-repo links:");
@@ -19097,6 +19155,14 @@ fn print_feature_context_text(result: &FeatureContextResult) {
                 node.name, node.kind, node.file_path, node.start_line, node.relevance
             );
         }
+    }
+
+    // Same reason as `print_context_text`: `--stats` is off by default and a
+    // capped feature context printed identically to a complete one.
+    if let Some(notice) =
+        context_truncation_notice(result.truncated_by, result.limit, result.token_budget)
+    {
+        println!("  … {notice}");
     }
 }
 
@@ -23351,6 +23417,35 @@ fn token_budgeted_truncate(
         taken += 1;
     }
     taken
+}
+
+/// The ONE place the `context` truncation remedy is worded.
+///
+/// nw-259(a). Two readers need this sentence — the `--stats` line and the
+/// human renderer — and a third (`--json`) needs the same DECISION in
+/// machine-readable form. The decision is made once, by
+/// `TruncationCause::resolve`, and lands in `ContextResult::truncated_by`;
+/// this function is the only thing that turns that value into prose. A second
+/// copy of either half is how the human route came to name the right cap while
+/// the JSON payload named the wrong one.
+///
+/// Returns `None` when nothing was cut — and also when the cause is known but
+/// the cap's VALUE is not, because a remedy that cannot name the number to
+/// raise is not a remedy.
+fn context_truncation_notice(
+    truncated_by: Option<nestweaver_engine::TruncationCause>,
+    limit: Option<usize>,
+    token_budget: Option<usize>,
+) -> Option<String> {
+    match (truncated_by?, limit, token_budget) {
+        (nestweaver_engine::TruncationCause::TokenBudget, _, Some(budget)) => Some(format!(
+            "TRUNCATED by --token-budget {budget} — raise it for more"
+        )),
+        (nestweaver_engine::TruncationCause::Limit, Some(limit), _) => Some(format!(
+            "TRUNCATED at limit {limit} — pass --limit for more"
+        )),
+        _ => None,
+    }
 }
 
 fn context_token_budgeted_truncate(
