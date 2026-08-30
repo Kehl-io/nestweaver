@@ -3025,6 +3025,21 @@ where
                             oversized.limit_bytes,
                         ));
                     }
+                    // nw-355. `SourceTooLarge` was the ONLY typed read fault
+                    // modelled as policy; the equally typed `BinarySource` fell
+                    // through to `Failed`, and one `Failed` aborts publication
+                    // for the whole run at :3092. Measured: 98 real C++ files,
+                    // one holding two NUL bytes, exit 1, zero symbols
+                    // published, 97 clean files lost to a byte the user did not
+                    // write. The watcher already degrades correctly
+                    // (`watch_code.rs:1285`); this is that behaviour on the
+                    // index path.
+                    if err
+                        .downcast_ref::<crate::content_reader::BinarySource>()
+                        .is_some()
+                    {
+                        return ParseOutcome::Skipped(SkippedFile::binary(display_name));
+                    }
                     return ParseOutcome::Failed(format!("stat/read {}: {err}", path.display()));
                 }
             };
@@ -6017,6 +6032,18 @@ fn prepare_incremental_file(
                         oversized.observed_bytes,
                         oversized.limit_bytes,
                     ),
+                ));
+            }
+            // nw-355, the incremental half of the same defect: this `?`
+            // propagates to `prepare_incremental_files` and is wrapped as
+            // "prepare incremental source files", so one binary file killed the
+            // whole batch and left the repo's indexed SHA behind.
+            if error
+                .downcast_ref::<crate::content_reader::BinarySource>()
+                .is_some()
+            {
+                return Ok(PreparedIncrementalOutcome::PolicySkipped(
+                    SkippedFile::binary(rel_str),
                 ));
             }
             return Err(error).with_context(|| format!("read {}", abs_path.display()));
@@ -12536,6 +12563,118 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
+    /// nw-355: `SourceTooLarge` was the only typed read fault treated as a
+    /// POLICY skip; the equally typed `BinarySource` fell through to
+    /// `ParseOutcome::Failed`, and one `Failed` aborts publication for the
+    /// whole run (`index.rs:3092`). Measured: 98 real C++ files, one holding
+    /// two NUL bytes, exit 1, zero symbols published, 97 clean files lost to a
+    /// byte the user did not write.
+    ///
+    /// The NUL is deliberately inside the 8 KiB sniff window. nw-335 added
+    /// `strip_nul_bytes` at `content_reader.rs:314` and its commit message
+    /// claims to cover the code pipeline -- but the sniff at `:294` returns
+    /// `Err(BinarySource)` twenty lines earlier, so the strip only ever ran for
+    /// a NUL PAST the window. That is why the item survived nw-335.
+    #[test]
+    fn one_binary_file_does_not_void_the_whole_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean_a.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(repo.join("clean_b.rs"), "pub fn beta() {}\n").unwrap();
+        fs::write(repo.join("poisoned.rs"), b"pub fn gamma() {}\n\x00\x00\n").unwrap();
+
+        let result = index_directory(&repo, &db, "test", "https://example.com/nul", "sha")
+            .expect("one binary file must not abort publication");
+
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let names: Vec<String> = store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.contains(&"alpha".to_string()) && names.contains(&"beta".to_string()),
+            "the clean files must survive: {names:?}"
+        );
+        assert!(
+            !names.contains(&"gamma".to_string()),
+            "the binary file itself is still skipped: {names:?}"
+        );
+        // Disclosed once, on the existing channel, with a code a caller can
+        // branch on -- not only in a log line nobody reads.
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].path, "poisoned.rs");
+        assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Binary);
+    }
+
+    /// nw-355, the incremental half. `prepare_incremental_file` had the same
+    /// `SourceTooLarge`-only downcast and then a bare `?`, which
+    /// `prepare_incremental_files` propagates and `:5458` wraps as "prepare
+    /// incremental source files" -- one file killing the batch and leaving the
+    /// repo's indexed SHA behind.
+    #[test]
+    fn incremental_binary_file_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "pub fn incumbent() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.rs"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/incremental-nul";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::write(repo.join("added.rs"), "pub fn arrival() {}\n").unwrap();
+        fs::write(repo.join("blob.rs"), b"pub fn ghost() {}\n\x00\x00\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one binary, one clean"]);
+        let new_sha = git(&["rev-parse", "HEAD"]);
+
+        let result = incremental_index_with_name_and_limits(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .expect("one binary file must not kill the batch");
+
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Binary);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store
+                .symbols_in_file("added.rs")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "arrival"),
+            "the clean file in the same batch must be indexed"
+        );
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        assert_eq!(
+            store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
+            new_sha,
+            "the batch committed, so the SHA advances"
+        );
+    }
+
     #[test]
     fn incremental_transient_read_failure_preserves_graph_and_sha() {
         let dir = tempfile::tempdir().unwrap();
@@ -12562,11 +12701,15 @@ function hello(name) { return "Hello " + name; }
         index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
 
         // nw-190: invalid UTF-8 now decodes lossily and is no longer a read
-        // failure, so it cannot stand in for one. Use genuinely binary content
-        // (a NUL byte), which the reader refuses with a typed BinarySource.
-        fs::write(repo.join("main.rs"), [0x00, 0xfe, 0xfd]).unwrap();
+        // failure, so it cannot stand in for one. nw-355: neither can a binary
+        // file -- that is a POLICY skip now, and conflating the two is why the
+        // fatal behaviour survived. Use a genuinely transient fault: the file
+        // is committed and then removed from the worktree, so the diff still
+        // names it and the read fails with ENOENT.
+        fs::write(repo.join("main.rs"), "pub fn replacement() {}\n").unwrap();
         git(&["add", "main.rs"]);
-        git(&["commit", "-q", "-m", "binary-source"]);
+        git(&["commit", "-q", "-m", "rewrite"]);
+        fs::remove_file(repo.join("main.rs")).unwrap();
         let error = incremental_index_with_name_and_limits(
             &repo,
             &db_path,

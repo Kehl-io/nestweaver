@@ -212,6 +212,11 @@ pub enum SkipReasonCode {
     Ignored,
     Unsupported,
     Oversized,
+    /// The file is binary: it holds a NUL byte inside the leading 8 KiB the
+    /// reader sniffs. nw-355 — this is a POLICY skip like `Oversized`, not a
+    /// defect. It was the only typed read fault the index treated as fatal,
+    /// and one such file in a 98-file repo aborted publication for all 98.
+    Binary,
     ReadError,
     ParseError,
     Cancelled,
@@ -254,6 +259,16 @@ impl SkippedFile {
             observed_bytes: None,
             limit_bytes: None,
         }
+    }
+
+    /// nw-355. A file the user did not write, holding one byte they did not
+    /// type, is a policy skip — not a reason to publish nothing.
+    pub fn binary(path: impl Into<String>) -> Self {
+        Self::new(
+            path,
+            SkipReasonCode::Binary,
+            "binary content (NUL byte in the leading 8 KiB)",
+        )
     }
 
     pub fn oversized(path: impl Into<String>, observed_bytes: u64, limit_bytes: u64) -> Self {
