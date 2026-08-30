@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6267
 expression: "parsed_references(\"simple.py\", &source)"
 ---
 - name: ".utils"
@@ -10,7 +11,7 @@ expression: "parsed_references(\"simple.py\", &source)"
 - name: os
   kind: Import
   start_line: 2
-  context: from .utils import helper
+  context: import os
   receiver: ~
 - name: func
   kind: Call
@@ -35,7 +36,7 @@ expression: "parsed_references(\"simple.py\", &source)"
 - name: Animal
   kind: Extends
   start_line: 25
-  context: from .utils import helper
+  context: "class Dog(Animal):"
   receiver: ~
 - name: name
   kind: ReadAccess

@@ -283,6 +283,31 @@ pub(crate) fn sha256_hex(text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Map a JS declaration keyword to the [`SymbolKind`] it declares.
+///
+/// nw-364(3). The three regex-parsed SFC formats — Svelte, Vue and Astro —
+/// each matched `export (?:function|const|let|var|class) NAME` with a
+/// NON-capturing keyword group, so the keyword was matched and then thrown
+/// away and every named export was minted `SymbolKind::Function`. A mis-kinded
+/// `Function` is eligible to be chosen as a fabricated reference source under
+/// `87e800c5`'s code-bearing-kinds fallback, so this is not cosmetic.
+///
+/// `const` maps to `Constant` to agree with the tree-sitter JS/TS path, where
+/// `queries/javascript.scm:56-62` kinds `export const` as `@definition.const`.
+/// A Svelte `export let` IS a component prop, so `Property` is defensible —
+/// but prop-ness is a framework-semantic fact a line regex cannot establish
+/// (an `export let` in a `context="module"` script is not a prop), and kinding
+/// it `Property` would assert something not observed. The keyword is what was
+/// observed, so the keyword is what is recorded.
+pub(crate) fn export_declaration_kind(keyword: &str) -> SymbolKind {
+    match keyword {
+        "function" => SymbolKind::Function,
+        "class" => SymbolKind::Class,
+        "const" => SymbolKind::Constant,
+        _ => SymbolKind::Variable,
+    }
+}
+
 /// Extract the first line of a node's text as its signature.
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
@@ -1297,13 +1322,31 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     _ => continue,
                 };
 
-                let context = node
-                    .parent()
-                    .map(|p| {
-                        let parent_text = p.utf8_text(source_bytes).unwrap_or("");
-                        first_line(parent_text)
-                    })
-                    .unwrap_or_default();
+                // nw-364(2). `context` is the EVIDENCE for this reference, so
+                // the line it names must be a line the reference actually sits
+                // on. "The parent's first line" satisfies that only when the
+                // parent begins on the reference's own row — which is true for
+                // the small leaf captures most rules use (an identifier inside
+                // a call) and false whenever the capture is a whole
+                // statement-sized item.
+                //
+                // The instance was `queries/rust.scm:77-78`, which captures
+                // `@reference.extends` on the entire `impl_item`: for a
+                // top-level impl the parent is the root node, so a CORRECT
+                // `Extends` fact at simple.rs:18 carried
+                // `use std::collections::HashMap;` — line 1 of the file — as
+                // its evidence. Wrong evidence is worse than none for anyone
+                // auditing an edge. The same held for every `#include` in
+                // every C and C++ file, and for every other top-level capture
+                // in all 49 grammars, which is why the rule is stated over
+                // rows rather than special-cased to `impl_item`.
+                let context_node = match node.parent() {
+                    Some(parent) if parent.start_position().row == node.start_position().row => {
+                        parent
+                    }
+                    _ => node,
+                };
+                let context = first_line(context_node.utf8_text(source_bytes).unwrap_or(""));
 
                 let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
@@ -5951,6 +5994,207 @@ function formatTitle(title) {
         assert_eq!(value.parent_name.as_deref(), Some("Reading"));
     }
 
+    /// nw-364(1): tree-sitter-julia's `assignment` node has no lhs/rhs FIELDS,
+    /// so the short-form pattern's unanchored `(call_expression …)` matched the
+    /// RIGHT side too. `greeting = greet(animal.name)` minted `greet` as a
+    /// DEFINITION at line 35 — a bodiless symbol that can then be picked as an
+    /// enclosing scope for a reference it does not contain.
+    #[test]
+    fn julia_rhs_call_is_not_a_definition() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+        let symbols = parsed.symbols;
+        // Both names ARE legitimate definitions elsewhere in the file
+        // (`struct Animal` at 7, `function greet` at 16), so the assertion has
+        // to be per-line: it is the CALL SITE that must not mint. Neither real
+        // definition was extracted before this change either -- the phantoms
+        // were standing in for them in the symbol table, which is exactly why
+        // two further query gaps went unnoticed.
+        for (forbidden, call_site) in [("Animal", 34u32), ("greet", 35u32)] {
+            assert!(
+                !symbols
+                    .iter()
+                    .any(|s| s.name == forbidden && s.start_line == call_site),
+                "{forbidden} at simple.jl:{call_site} is a call site, not a \
+                 definition: {symbols:#?}"
+            );
+        }
+        // The real definitions must be present -- `function greet(x)::String`
+        // at 16 (return-type annotation) and `struct Animal <: LivingThing` at
+        // 7 (supertype clause), neither of which the query could reach before.
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "greet" && s.start_line == 16 && s.kind == SymbolKind::Function),
+            "{symbols:#?}"
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Animal" && s.start_line == 7 && s.kind == SymbolKind::Class),
+            "{symbols:#?}"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "double"),
+            "the short-form definition `double(x) = x * 2` must still mint: \
+             {symbols:#?}"
+        );
+        assert!(symbols.iter().any(|s| s.name == "main"), "{symbols:#?}");
+    }
+
+    /// nw-364(2): `@reference.extends` is captured on the whole `impl_item`,
+    /// and `context` was "the parent's FIRST LINE". For a top-level item the
+    /// parent is the root node, so the evidence attached to a CORRECT fact was
+    /// line 1 of the file — `use std::collections::HashMap;` for an `Extends`
+    /// at `simple.rs:18`. Wrong evidence is worse than none for anyone
+    /// auditing the edge.
+    #[test]
+    fn rust_extends_context_is_the_impl_line() {
+        let source = fixture("rust/simple.rs");
+        let parsed = parse_source(Path::new("simple.rs"), &source).unwrap();
+        let extends = parsed
+            .references
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Extends)
+            .unwrap_or_else(|| panic!("no Extends in {:#?}", parsed.references));
+        assert!(
+            extends.context.contains("impl"),
+            "context must be the impl line, not the file's first line: \
+             {extends:#?}"
+        );
+    }
+
+    /// nw-364(2), the property rather than the instance: a reference's
+    /// `context` is EVIDENCE for that reference, so the line it names must be
+    /// a line the reference actually sits on. `first_line(parent)` satisfies
+    /// that only when the parent begins on the reference's own line.
+    #[test]
+    fn reference_context_always_contains_the_reference_line() {
+        // Every fixture that has a `*_references` snapshot, so the property
+        // is guarded across all 49 grammars rather than in the one language
+        // the defect was reported in.
+        let cases = [
+            ("simple.js", "js/simple.js"),
+            ("simple.ts", "ts/simple.ts"),
+            ("simple.py", "python/simple.py"),
+            ("simple.rs", "rust/simple.rs"),
+            ("simple.go", "go/simple.go"),
+            ("simple.c", "c/simple.c"),
+            ("simple.cpp", "cpp/simple.cpp"),
+            ("inline.h", "cpp/inline.h"),
+            ("Simple.cs", "csharp/Simple.cs"),
+            ("simple.dart", "dart/simple.dart"),
+            ("Simple.java", "java/Simple.java"),
+            ("Simple.kt", "kotlin/Simple.kt"),
+            ("simple.php", "php/simple.php"),
+            ("simple.rb", "ruby/simple.rb"),
+            ("simple.swift", "swift/simple.swift"),
+            ("simple.cbl", "cobol/simple.cbl"),
+            ("simple.lua", "lua/simple.lua"),
+            ("simple.sh", "bash/simple.sh"),
+            ("Simple.scala", "scala/Simple.scala"),
+            ("simple.ex", "elixir/simple.ex"),
+            ("simple.zig", "zig/simple.zig"),
+            ("simple.m", "objc/simple.m"),
+            ("simple.groovy", "groovy/simple.groovy"),
+            ("simple.ps1", "powershell/simple.ps1"),
+            ("simple.jl", "julia/simple.jl"),
+            ("simple.sql", "sql/simple.sql"),
+            ("simple.tf", "hcl/simple.tf"),
+            ("simple.f90", "fortran/simple.f90"),
+            ("simple.pas", "pascal/simple.pas"),
+            ("simple.vue", "vue/simple.vue"),
+            ("simple.svelte", "svelte/simple.svelte"),
+            ("simple.astro", "astro/simple.astro"),
+            ("simple.sv", "systemverilog/simple.sv"),
+        ];
+        for (name, rel) in cases {
+            let source = fixture(rel);
+            let parsed = parse_source(Path::new(name), &source).unwrap();
+            let lines: Vec<&str> = source.lines().collect();
+            for reference in &parsed.references {
+                if reference.context.is_empty() {
+                    continue;
+                }
+                let own_line = lines
+                    .get(reference.start_line as usize - 1)
+                    .unwrap_or(&"")
+                    .trim();
+                assert!(
+                    own_line.starts_with(reference.context.as_str())
+                        || reference.context.starts_with(own_line)
+                        || own_line.contains(reference.context.as_str()),
+                    "{name}: reference {} at line {} carries context {:?}, \
+                     which is not its own line {:?}",
+                    reference.name,
+                    reference.start_line,
+                    reference.context,
+                    own_line
+                );
+            }
+        }
+    }
+
+    /// nw-364(3): the keyword alternation in `RE_EXPORT_NAMED` is a
+    /// NON-capturing group, so the declaration keyword is matched and then
+    /// thrown away — every `export let` / `export const` / `export var` /
+    /// `export class` was minted `Function`. `904a2dc4` fixed this exact
+    /// declaration's SPAN and left the KIND. A mis-kinded `Function` is
+    /// eligible to be a fabricated reference source under the
+    /// code-bearing-kinds fallback.
+    #[test]
+    fn svelte_export_let_is_not_a_function() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+        let count = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "count")
+            .unwrap_or_else(|| panic!("no count in {:#?}", parsed.symbols));
+        assert_eq!(count.kind, SymbolKind::Variable, "{count:#?}");
+        let greet = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .unwrap_or_else(|| panic!("no greet in {:#?}", parsed.symbols));
+        assert_eq!(
+            greet.kind,
+            SymbolKind::Function,
+            "`export function` must stay a Function: {greet:#?}"
+        );
+    }
+
+    /// nw-364(3) "where else": every keyword the regex accepts must map to the
+    /// kind it declares, not just the one the fixture happens to use — and the
+    /// SAME regex, with the same non-capturing group and the same hardcoded
+    /// `SymbolKind::Function`, was in `vue.rs:27` and `astro.rs:11` too. One
+    /// defect, three copies.
+    #[test]
+    fn sfc_export_kinds_follow_the_declaration_keyword() {
+        let script = "  export function f() {}\n  export class C {}\n  \
+                      export const K = 1\n  export let l = 2\n  export var v = 3\n";
+        let cases = [
+            ("Kinds.svelte", format!("<script>\n{script}</script>\n")),
+            ("Kinds.vue", format!("<script>\n{script}</script>\n")),
+            ("Kinds.astro", format!("---\n{script}---\n<div />\n")),
+        ];
+        for (name, source) in cases {
+            let parsed = parse_source(Path::new(name), &source).unwrap();
+            let kind_of = |sym: &str| {
+                parsed
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == sym)
+                    .unwrap_or_else(|| panic!("no {sym} in {name}: {:#?}", parsed.symbols))
+                    .kind
+            };
+            assert_eq!(kind_of("f"), SymbolKind::Function, "{name}");
+            assert_eq!(kind_of("C"), SymbolKind::Class, "{name}");
+            assert_eq!(kind_of("K"), SymbolKind::Constant, "{name}");
+            assert_eq!(kind_of("l"), SymbolKind::Variable, "{name}");
+            assert_eq!(kind_of("v"), SymbolKind::Variable, "{name}");
+        }
+    }
     // ── Snapshot tests ────────────────────────────────────────────────────
 
     mod snapshot_tests {

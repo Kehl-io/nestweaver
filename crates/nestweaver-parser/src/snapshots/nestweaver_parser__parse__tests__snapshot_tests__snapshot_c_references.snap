@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4126
+assertion_line: 6309
 expression: "parsed_references(\"simple.c\", &source)"
 ---
 - name: sensor.h
@@ -11,7 +11,7 @@ expression: "parsed_references(\"simple.c\", &source)"
 - name: stdio.h
   kind: Includes
   start_line: 2
-  context: "#include \"sensor.h\""
+  context: "#include <stdio.h>"
   receiver: ~
 - name: initialize
   kind: Call

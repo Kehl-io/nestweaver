@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4185
+assertion_line: 6353
 expression: "parsed_references(\"Simple.cs\", &source)"
 ---
 - name: System
@@ -11,7 +11,7 @@ expression: "parsed_references(\"Simple.cs\", &source)"
 - name: System.Collections.Generic
   kind: Uses
   start_line: 2
-  context: using System;
+  context: using System.Collections.Generic;
   receiver: ~
 - name: IGreeter
   kind: Extends

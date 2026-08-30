@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4377
+assertion_line: 6577
 expression: "parsed_references(\"simple.jl\", &source)"
 ---
 - name: greet
@@ -16,7 +16,7 @@ expression: "parsed_references(\"simple.jl\", &source)"
 - name: println
   kind: Call
   start_line: 22
-  context: for item in items
+  context: println(item)
   receiver: ~
 - name: log_call
   kind: Call
@@ -26,7 +26,7 @@ expression: "parsed_references(\"simple.jl\", &source)"
 - name: println
   kind: Call
   start_line: 28
-  context: quote
+  context: "println(\"Calling: \", $(string(expr)))"
   receiver: ~
 - name: string
   kind: Call
@@ -56,10 +56,15 @@ expression: "parsed_references(\"simple.jl\", &source)"
 - name: println
   kind: Call
   start_line: 36
-  context: function main()
+  context: println(greeting)
   receiver: ~
 - name: process
   kind: Call
   start_line: 37
   context: "process([1, 2, 3])"
+  receiver: ~
+- name: double
+  kind: Call
+  start_line: 40
+  context: double(x) = x * 2
   receiver: ~

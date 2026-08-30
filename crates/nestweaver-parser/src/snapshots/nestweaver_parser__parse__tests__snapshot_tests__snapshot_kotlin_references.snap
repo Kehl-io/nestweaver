@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3947
+assertion_line: 6395
 expression: "parsed_references(\"Simple.kt\", &source)"
 ---
 - name: com.example.utils.Helper
@@ -31,10 +31,10 @@ expression: "parsed_references(\"Simple.kt\", &source)"
 - name: println
   kind: Call
   start_line: 26
-  context: val greeter = SimpleGreeter()
+  context: println(result)
   receiver: ~
 - name: assist
   kind: Call
   start_line: 27
-  context: val greeter = SimpleGreeter()
+  context: Helper.assist()
   receiver: ~

@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6281
 expression: "parsed_references(\"simple.rs\", &source)"
 ---
 - name: "std::collections::HashMap"
@@ -20,7 +21,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: Readable
   kind: Extends
   start_line: 18
-  context: "use std::collections::HashMap;"
+  context: "impl Readable for SensorManager {"
   receiver: ~
 - name: get_primary
   kind: Call
@@ -35,7 +36,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: value
   kind: Call
   start_line: 20
-  context: "{"
+  context: self.get_primary().value()
   receiver: self.get_primary()
 - name: value
   kind: ReadAccess
@@ -80,12 +81,12 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: Self
   kind: TypeRef
   start_line: 29
-  context: "{"
+  context: "pub fn new() -> Self {"
   receiver: ~
 - name: SensorManager
   kind: TypeRef
   start_line: 30
-  context: "{"
+  context: "SensorManager {"
   receiver: ~
 - name: HashMap
   kind: TypeRef
@@ -120,7 +121,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: unwrap
   kind: Call
   start_line: 36
-  context: "{"
+  context: "self.sensors.get(\"primary\").unwrap()"
   receiver: "self.sensors.get(\"primary\")"
 - name: unwrap
   kind: ReadAccess
@@ -130,7 +131,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: SensorManager
   kind: TypeRef
   start_line: 40
-  context: "use std::collections::HashMap;"
+  context: "pub fn initialize(config: &Settings) -> SensorManager {"
   receiver: ~
 - name: Settings
   kind: TypeRef

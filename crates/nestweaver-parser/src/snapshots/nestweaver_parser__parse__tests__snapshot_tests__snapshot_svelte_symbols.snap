@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6122
+assertion_line: 6605
 expression: "parsed_symbols(\"simple.svelte\", &source)"
 ---
 - name: simple
@@ -28,7 +28,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   parent_name: ~
   scope_chain: ~
 - name: count
-  kind: Function
+  kind: Variable
   start_line: 9
   end_line: 9
   signature: export let count = 0

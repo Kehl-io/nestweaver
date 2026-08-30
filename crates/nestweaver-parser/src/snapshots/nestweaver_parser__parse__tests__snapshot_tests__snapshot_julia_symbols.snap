@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6486
 expression: "parsed_symbols(\"simple.jl\", &source)"
 ---
 - name: Greetings
   kind: Module
   start_line: 1
-  end_line: 40
+  end_line: 42
   signature: module Greetings
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -26,11 +27,35 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: Greetings
+- name: Animal
+  kind: Class
+  start_line: 7
+  end_line: 10
+  signature: "struct Animal <: LivingThing"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+  parent_name: ~
+  scope_chain: Greetings
 - name: Counter
   kind: Class
   start_line: 12
   end_line: 14
   signature: mutable struct Counter
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+  parent_name: ~
+  scope_chain: Greetings
+- name: greet
+  kind: Function
+  start_line: 16
+  end_line: 18
+  signature: "function greet(name::String)::String"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -74,23 +99,11 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: Greetings
-- name: Animal
+- name: double
   kind: Function
-  start_line: 34
-  end_line: 34
-  signature: "animal = Animal(\"Dog\", \"Woof\")"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Inferred
-  type_info: ~
-  parent_name: ~
-  scope_chain: Greetings
-- name: greet
-  kind: Function
-  start_line: 35
-  end_line: 35
-  signature: greeting = greet(animal.name)
+  start_line: 40
+  end_line: 40
+  signature: double(x) = x * 2
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
