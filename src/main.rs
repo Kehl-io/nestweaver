@@ -103,9 +103,9 @@ use nestweaver_engine::{
     generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
     index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
-    load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
-    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at, render_text,
+    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
+    truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -15866,6 +15866,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(include_components) = include_components {
                 project_args["include_components"] = serde_json::json!(include_components);
             }
+            // Both routes send the SAME arguments. The direct leg used to
+            // build its own set from the same clap fields, which is how
+            // `include_components` came to differ between them (nw-316 leg 2).
+            let direct_args = project_args.clone();
             let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
@@ -15893,6 +15897,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
+            // nw-316. This route used to be a hand-written SECOND
+            // implementation of `tool_project_context`: ~295 lines of member
+            // collection, PPR seeding, promotion/dedup/boost/sort, recency and
+            // budgeting, ending in a renderer that omitted `truncated`,
+            // `more_available` and `seed_tokens_charged` — so a `--no-daemon`
+            // caller could not tell a complete answer from the first N of one.
+            // It also cut with `token_budgeted_truncate` and then measured the
+            // finished object AFTER THE FACT, where the tool runs a
+            // serialized-size probe loop and re-cuts; this route could report
+            // `budget_exceeded: true` and still emit an over-budget payload.
+            //
+            // It now calls the tool, exactly as `BrainCommands::Search`'s direct
+            // leg does and as `context` was changed to do in 8.0.0. That closes
+            // the three missing fields and the probe-loop gap in one change
+            // instead of three, and it is why the alias/UID-substring resolution
+            // deleted here is not lost: the tool carries the identical
+            // resolution, extension-sidecar alias match included.
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -15900,294 +15921,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 tracing::info!("Tantivy index unavailable — BM25 search disabled for this query");
             }
 
-            // Resolve the project: name -> alias -> UID substring.
-            let project = if name.starts_with("proj:") {
-                let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
-                all.into_iter()
-                    .find(|p| p.uid == name || p.uid.contains(&name))
-                    .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?
-            } else {
-                match store
-                    .lookup_project_by_name(&name)
-                    .map_err(|e| anyhow::anyhow!(e))?
-                {
-                    Some(p) => p,
-                    None => {
-                        // Try alias match via extension sidecar, then UID substring.
-                        let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
-                        let ext_store = load_extensions(&db_path);
-                        let needle = name.to_lowercase();
-                        let alias_match = all.iter().find(|p| {
-                            if let Some(serde_json::Value::Array(aliases)) =
-                                ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
-                            {
-                                aliases
-                                    .iter()
-                                    .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
-                            } else {
-                                false
-                            }
-                        });
-                        if let Some(p) = alias_match {
-                            p.clone()
-                        } else {
-                            match all.into_iter().find(|p| p.uid.contains(&name)) {
-                                Some(p) => p,
-                                None => {
-                                    eprintln!(
-                                        "Project '{}' not found. Try: nestweaver list-projects",
-                                        name
-                                    );
-                                    return Ok((EXIT_NOT_FOUND, None));
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Collect member UIDs for the post-PPR boost. These are the
-            // notes and symbols declared as belonging to this project.
-            // Member note UIDs are tracked separately: they get seeded into
-            // PPR and surfaced into `connected` (Bug #12).
-            let mut member_uids: Vec<String> = Vec::new();
-            let mut member_note_uids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let note_uids = store
-                .list_project_note_uids(&project.uid)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_note_uids.extend(note_uids.iter().cloned());
-            member_uids.extend(note_uids);
-            let sym_uids = store
-                .list_project_symbol_uids(&project.uid)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_uids.extend(sym_uids);
-
-            // nw-316: the same documented default the tool applies
-            // (`unwrap_or(true)` in `tool_project_context`). Both routes now
-            // land on the schema's `default: true` rather than one of them on
-            // clap's.
-            let comp_uids = if include_components.unwrap_or(true) {
-                store
-                    .list_project_component_uids(&project.uid)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            } else {
-                vec![]
-            };
-            for comp_uid in &comp_uids {
-                let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
-                member_note_uids.extend(comp_notes.iter().cloned());
-                member_uids.extend(comp_notes);
-                member_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
-            }
-
-            // Deduplicate members.
-            let mut seen = std::collections::HashSet::new();
-            member_uids.retain(|u| seen.insert(u.clone()));
-
-            if member_uids.is_empty() {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "project": project.name,
-                            "seeds": [],
-                            "connected": [],
-                            "note": "No notes or symbols associated with this project.",
-                        }))?
-                    );
-                } else {
-                    println!(
-                        "Project '{}' has no associated notes or symbols.",
-                        project.name
-                    );
-                }
-                return Ok((EXIT_SUCCESS, None));
-            }
-
-            // Seed PPR from the project node, its components, and the
-            // project's member notes (Bug #12). Seeding the notes guarantees
-            // they survive the `min_score` filter in PPR — when a project
-            // declares repos, the project node's mass is split across tens of
-            // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
-            // below threshold so it never reaches `connected`.
-            //
-            // Member symbols suffer the identical fan-out, so seed the
-            // top-K of them by PageRank as well. Without this, a project
-            // that declares any repo returns notes-only context even after
-            // `materialize-projects` writes hundreds of thousands of
-            // PROJECT_INCLUDES_SYMBOL edges (Bug #18 / wave-5 regression).
-            const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
-            let mut member_symbol_uids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let top_symbols = store
-                .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_symbol_uids.extend(top_symbols.iter().cloned());
-            for comp_uid in &comp_uids {
-                let comp_top = store
-                    .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
-                    .unwrap_or_default();
-                member_symbol_uids.extend(comp_top);
-            }
-
-            let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
-            ppr_seeds.extend(comp_uids);
-            ppr_seeds.extend(member_note_uids.iter().cloned());
-            ppr_seeds.extend(member_symbol_uids.iter().cloned());
-
-            let defaults = HybridSearchConfig::default();
-            let search_config = if no_embed {
-                HybridSearchConfig {
-                    weight_semantic: 0.0,
-                    ..defaults
-                }
-            } else {
-                defaults
-            };
-            let aliases = load_alias_sidecar(&db_path);
-            match build_brain_context_hybrid_with_aliases(
+            nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+            nestweaver_mcp::tools::set_current_instance_config(
+                load_instance_config_opt(config.as_deref()).map(std::sync::Arc::new),
+            );
+            let response = nestweaver_mcp::tools::dispatch(
                 &store,
-                &ppr_seeds,
                 tantivy.as_ref(),
-                &search_config,
-                &aliases,
-                Some(&db_path),
-                Some(nestweaver_store::QueryIntent::ProjectContext),
+                "project_context",
+                direct_args,
                 None,
-                None,
-            ) {
-                Ok(mut result) => {
-                    // Surface the project's curated member notes into
-                    // `connected` (Bug #12). Seeded notes land in `seeds`,
-                    // which print_brain_context_json does not render.
-                    nestweaver_engine::promote_member_notes_into_connected(
-                        &mut result,
-                        &member_note_uids,
-                    );
-                    // Surface the seeded member symbols into `connected`
-                    // for the same reason (companion to the notes promotion).
-                    nestweaver_engine::promote_member_symbols_into_connected(
-                        &mut result,
-                        &member_symbol_uids,
-                    );
-                    // Drop Heading/Section duplicates: notes-heavy projects
-                    // would otherwise spend ~25% of a 2000-token budget on
-                    // pairs that share `(file, title)` and add no information.
-                    nestweaver_engine::dedup_heading_section_pairs(&mut result);
+            );
+            nestweaver_mcp::tools::set_current_instance_config(None);
 
-                    // Post-PPR scope boost: multiply relevance for nodes that
-                    // belong to the project so declared content ranks highest.
-                    let member_set: std::collections::HashSet<&str> =
-                        member_uids.iter().map(|s| s.as_str()).collect();
-                    for node in &mut result.connected {
-                        if member_set.contains(node.uid.as_str()) {
-                            node.relevance *= 5.0;
-                        }
-                    }
-                    result.connected.sort_by(|a, b| {
-                        b.relevance
-                            .partial_cmp(&a.relevance)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    // since filter: hard filter Note/Section nodes by modified_at.
-                    if let Some(ref since_ts) = since {
-                        let recent_notes = store
-                            .list_note_uids_modified_since(since_ts)
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        let recent_sections = store
-                            .list_section_uids_modified_since(since_ts)
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-                            nodes.retain(|item| {
-                                if item.kind.to_lowercase().contains("symbol") {
-                                    return true;
-                                }
-                                recent_notes.contains(&item.uid)
-                                    || recent_sections.contains(&item.uid)
-                            });
-                        };
-                        filter_since(&mut result.seeds);
-                        filter_since(&mut result.connected);
-                    }
-
-                    // recency bias: soft boost based on note modified_at age.
-                    if recency_weight > 0.0 {
-                        apply_recency_bias_cli(
-                            &store,
-                            &mut result.connected,
-                            recency_weight,
-                            recency_half_life_days,
-                        );
-                        apply_recency_bias_cli(
-                            &store,
-                            &mut result.seeds,
-                            recency_weight,
-                            recency_half_life_days,
-                        );
-                    }
-
-                    // Compute seed token cost and allocate the remainder to
-                    // connected. Don't double-count items the promotion helpers
-                    // copied from `seeds` into `connected` — those tokens belong
-                    // to the connected budget, not the seed overhead.
-                    let connected_uids: std::collections::HashSet<&str> =
-                        result.connected.iter().map(|n| n.uid.as_str()).collect();
-                    // nw-316: the SAME flag the renderer below is handed
-                    // (`!detailed`). Charging the detailed rate for a concise
-                    // response is what made this route return fewer items than
-                    // the daemon for an identical budget.
-                    let concise = !detailed;
-                    let seed_tokens: usize = result
-                        .seeds
-                        .iter()
-                        .filter(|n| !connected_uids.contains(n.uid.as_str()))
-                        .map(|n| render_cost_tokens(n, concise))
-                        .sum();
-                    let remaining_budget = token_budget.saturating_sub(seed_tokens);
-                    let cut = token_budgeted_truncate(&result.connected, remaining_budget, concise);
-                    let connected_tokens: usize = result
-                        .connected
-                        .iter()
-                        .take(cut)
-                        .map(|n| render_cost_tokens(n, concise))
-                        .sum();
-                    let used_tokens = seed_tokens + connected_tokens;
-                    // Load external_refs from the extension sidecar so the
-                    // local (--no-daemon) path matches the daemon/MCP wrapper
-                    // shape — agents rely on this for Workfront / wiki PRD
-                    // surfacing.
-                    let ext_store = nestweaver_engine::load_extensions(&db_path);
-                    let external_refs =
-                        nestweaver_engine::get_all_properties(&ext_store, &project.uid)
-                            .get("external_refs")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                    if json {
-                        print_project_context_json(
-                            &project,
-                            &result,
-                            cut,
-                            used_tokens,
-                            token_budget,
-                            &external_refs,
-                            !detailed,
-                        )?;
-                    } else {
-                        println!("Project: {}  ({})", project.name, project.uid);
-                        if let Some(ref summary) = project.summary {
-                            println!("  {summary}");
-                        }
-                        println!();
-                        print_brain_context_text(&result, cut, Some(token_budget));
-                    }
-                    Ok((EXIT_SUCCESS, None))
+            // The same NOT_FOUND classification the daemon leg above applies,
+            // for the same reason: a script must be able to tell "no such
+            // project" from "the query failed", and which one it is told must
+            // not depend on which transport answered.
+            let value = match response {
+                Ok(value) => value,
+                Err(error) if format!("{error:#}").contains("not found") => {
+                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+                    return Ok((EXIT_NOT_FOUND, None));
                 }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    Ok((EXIT_ERROR, None))
-                }
-            }
+                Err(error) => return Err(error),
+            };
+            render_project_context_daemon_response(&value, json, token_budget);
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Investigate {
@@ -25114,94 +24874,6 @@ fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_
     resp
 }
 
-/// Render the `project-context` JSON for the local (--no-daemon) path with
-/// the same wrapper shape the daemon / MCP `project_context` tool emits:
-/// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
-/// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
-/// depend on these fields, so the local and daemon paths must stay aligned.
-#[allow(clippy::too_many_arguments)]
-fn print_project_context_json(
-    project: &nestweaver_schema::Project,
-    result: &BrainContextResult,
-    limit: usize,
-    tokens_used: usize,
-    token_budget: usize,
-    external_refs: &serde_json::Value,
-    concise: bool,
-) -> anyhow::Result<()> {
-    let resp = project_context_json_value(
-        project,
-        result,
-        limit,
-        tokens_used,
-        token_budget,
-        external_refs,
-        concise,
-    );
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn project_context_json_value(
-    project: &nestweaver_schema::Project,
-    result: &BrainContextResult,
-    limit: usize,
-    tokens_used: usize,
-    token_budget: usize,
-    external_refs: &serde_json::Value,
-    concise: bool,
-) -> serde_json::Value {
-    // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
-    // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
-    // emitted full nodes regardless of response_format, diverging from the daemon path.
-    let render = |n: &nestweaver_engine::BrainNode| -> serde_json::Value {
-        if concise {
-            serde_json::json!({ "kind": n.kind, "title": n.title, "location": n.location })
-        } else {
-            serde_json::json!({
-                "uid": n.uid,
-                "kind": n.kind,
-                "title": n.title,
-                "location": n.location,
-                "relevance": n.relevance,
-            })
-        }
-    };
-    let connected: Vec<serde_json::Value> =
-        result.connected.iter().take(limit).map(render).collect();
-    let mut resp = serde_json::json!({
-        "project": project.name,
-        "project_uid": project.uid,
-        "seeds_expanded": result.seeds.len(),
-        "connected": connected,
-        "tokens_used": tokens_used,
-        "token_budget": token_budget,
-        "semantic_applied": result.semantic_applied,
-        "degraded_components": result.degraded_components,
-    });
-    if !result.unresolved_seeds.is_empty() {
-        resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
-    }
-    if result.semantic_seed_count > 0 {
-        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
-    }
-    if !result.expansion_terms.is_empty() {
-        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
-    }
-    if !external_refs.is_null() {
-        resp["external_refs"] = external_refs.clone();
-    }
-    // Measured on the FINISHED object, so every optional field above is
-    // counted. Same 4-bytes-per-token rule the daemon path uses.
-    let actual_tokens = serde_json::to_string(&resp)
-        .map(|serialized| serialized.len().div_ceil(4))
-        .unwrap_or(0);
-    resp["tokens_used"] = serde_json::json!(actual_tokens);
-    resp["budget_exceeded"] = serde_json::json!(actual_tokens > token_budget);
-    resp
-}
-
 #[cfg(test)]
 mod context_json_renderer_tests {
     use super::*;
@@ -25227,31 +24899,6 @@ mod context_json_renderer_tests {
             serde_json::json!(["semantic"])
         );
         assert_eq!(value["unresolved_seeds"], serde_json::json!(["missing"]));
-    }
-
-    #[test]
-    fn direct_project_context_never_drops_semantic_honesty() {
-        let project = nestweaver_schema::Project {
-            uid: "project:test".to_string(),
-            name: "test".to_string(),
-            summary: None,
-            instance_id: "default".to_string(),
-        };
-        let value = project_context_json_value(
-            &project,
-            &degraded_context(),
-            30,
-            0,
-            1_000,
-            &serde_json::Value::Null,
-            false,
-        );
-        assert_eq!(value["semantic_applied"], false);
-        assert_eq!(
-            value["degraded_components"],
-            serde_json::json!(["semantic"])
-        );
-        assert_eq!(value["project_uid"], "project:test");
     }
 }
 

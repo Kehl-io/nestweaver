@@ -232,6 +232,53 @@ fn setup_fixture() -> Fixture {
     Fixture { _dir: dir, db_path }
 }
 
+/// A fixture that carries a real Project.
+///
+/// nw-218. `project-context` cannot be compared on a database that has none:
+/// a NOT_FOUND on both routes is a byte-identical failure that asserts nothing,
+/// which is why `parity_project_context_direct_vs_daemon` was DELETED rather
+/// than kept. `setup_fixture` indexes four plain `.js` files and indexing never
+/// creates a Project node.
+///
+/// The blocker was smaller than the tombstone implies: projects do not need
+/// `materialize-projects` (which needs a live daemon). Three store writers are
+/// enough, and all three are already used by fixtures elsewhere in this
+/// workspace — `insert_project` in `tests/cli_test.rs` and
+/// `tests/daemon_test.rs`, and both batch edge writers in
+/// `crates/nestweaver-mcp/src/tools.rs`.
+fn setup_project_fixture() -> Fixture {
+    let fixture = setup_fixture();
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(&fixture.db_path).unwrap();
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:parity:demo".to_string(),
+                name: "demo".to_string(),
+                summary: Some("parity fixture".to_string()),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        // Every indexed symbol is a member, so the project has real mass and a
+        // small `--token-budget` genuinely truncates. A project whose members
+        // all fit is a fixture that cannot observe truncation at all.
+        let members: Vec<String> = store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.uid)
+            .collect();
+        assert!(
+            members.len() >= 4,
+            "the fixture must have symbol mass, or a budget cannot cut: {}",
+            members.len()
+        );
+        store
+            .batch_insert_project_symbol_edges("proj:parity:demo", &members, 1.0)
+            .unwrap();
+    }
+    fixture
+}
+
 fn setup_contract_fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("ContrÁct-Repo");
@@ -1220,13 +1267,71 @@ fn parity_detect_changes_direct_vs_daemon() {
     );
 }
 
-// `parity_project_context_direct_vs_daemon` is deliberately absent until the
-// fixture can carry a project. `setup_fixture` indexes four plain `.js` files
-// and creates no Project node, so `project-context demo` exited NOT_FOUND on
-// both routes — the byte comparison then passed on two identical failures and
-// asserted nothing about the four nw-188 honesty fields it was written for.
-// Re-add it with a fixture that materializes a project; a vacuous test is
-// worse than a missing one because it reports coverage that does not exist.
+/// nw-218. `parity_project_context_direct_vs_daemon` was DELETED in 8.0.0
+/// because `setup_fixture` creates no Project, so both routes exited NOT_FOUND
+/// and the byte comparison passed on two identical failures. `setup_project_fixture`
+/// removes that blocker.
+///
+/// Restored as a KEY-SET comparison, not the byte comparison it used to be.
+/// The two routes legitimately differ on `semantic_applied` and
+/// `degraded_components` — the direct path passes `HybridSearchConfig::default()`
+/// and `embed_model: None` — so a byte comparison would fail for a reason that
+/// is not the defect, and "the test is red for a known-benign reason" is how a
+/// suite stops being read.
+#[test]
+fn parity_project_context_direct_vs_daemon() {
+    let fixture = setup_project_fixture();
+    let db = &fixture.db_path;
+    let args = &["project-context", "demo", "--json", "--token-budget", "400"];
+
+    let direct = run_direct(db, args);
+    assert!(
+        direct.status.success(),
+        "project-context (direct) failed:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+    assert!(
+        daemon.status.success(),
+        "project-context (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+
+    assert_both_ran_for_real("project-context", "json", &direct, &daemon);
+    assert_same_key_sets("project-context", &direct, &daemon);
+
+    // The nw-188 honesty fields the deleted test was written for. These are
+    // the ones a caller acts on, so they must AGREE, not merely both exist.
+    let direct_json = parse_stdout("project-context (direct)", &direct);
+    let daemon_json = parse_stdout("project-context (daemon)", &daemon);
+    for field in ["truncated", "more_available", "seed_tokens_charged"] {
+        assert_eq!(
+            direct_json[field], daemon_json[field],
+            "`{field}` differs between routes for the same project and the same \
+             budget, so how much was dropped depends on which transport \
+             answered.\ndirect: {direct_json}\ndaemon: {daemon_json}"
+        );
+    }
+
+    // Counterweight: a budget the project fits must report NOT truncated, or
+    // the equality above is satisfiable by both routes hardcoding `true`.
+    let roomy = &[
+        "project-context",
+        "demo",
+        "--json",
+        "--token-budget",
+        "16000",
+    ];
+    let roomy_direct = parse_stdout("project-context (roomy)", &run_direct(db, roomy));
+    assert_eq!(
+        roomy_direct["truncated"],
+        serde_json::json!(false),
+        "a budget that fits must not report truncation: {roomy_direct}"
+    );
+}
 
 /// msgpack must honour `--scope` on BOTH routes.
 ///

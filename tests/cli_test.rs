@@ -776,7 +776,17 @@ credential_method = "gh"
         .arg(&config_path)
         .assert()
         .success()
-        .stdout(contains("has no associated notes or symbols"));
+        // nw-316: the phrase moved because the direct route stopped
+        // re-implementing the tool. It used to print "<name> has no associated
+        // notes or symbols" while the daemon route printed the TOOL's note,
+        // "No notes or symbols are associated with this project yet." — one
+        // condition, two sentences, chosen by transport. What this assertion
+        // is actually for is the CONFIG resolution (the project named in
+        // `--config`'s database was found at all), and that is unchanged.
+        .stdout(contains(
+            "No notes or symbols are associated with this project yet.",
+        ))
+        .stdout(contains("configured-project"));
 
     // Repository-scoped commands have a different final fallback
     // (`<repo>/nestweaver.lbug`), so cover their shared resolver explicitly.
