@@ -3077,6 +3077,60 @@ mod tests {
         (dir, root)
     }
 
+    /// nw-339 does NOT reproduce, and the fallback it asks for would be actively
+    /// harmful — so this pins the opposite: a headingless note IS searchable,
+    /// and adding a whole-body fallback Section would double-index it.
+    ///
+    /// The stated mechanism ("a note with no `#` heading produces no Section")
+    /// is false at the parser: `extract_sections` emits a preamble covering the
+    /// WHOLE body when `headings` is empty, which
+    /// `note_with_only_preamble_has_one_section` already pins. The observation
+    /// behind the ticket is explained by the other half — a file that is almost
+    /// entirely FRONTMATTER — and `6d99b96d` fixed that by indexing
+    /// `frontmatter_raw` as a fourth candidate shape. That commit is not an
+    /// ancestor of v8.0.0, which is the build the measurement was taken on.
+    ///
+    /// RESIDUAL, and it is real: `frontmatter_raw` is an additive column with no
+    /// backfill, so it is NULL for every note indexed by 8.0.0 and both
+    /// collectors `continue` past a `None`. Upgrading without a full reindex
+    /// preserves the exact symptom and says nothing. Filed separately.
+    #[test]
+    fn a_headingless_note_is_searchable_and_indexed_exactly_once() {
+        let (_dir, root) = make_vault(&[(
+            "backlog.md",
+            "---\nstatus: open\nid: nw-339\n---\n\nloadbearing prose with no heading at all.\n",
+        )]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        assert!(result.headings_count == 0, "precondition: no headings");
+        assert_eq!(
+            result.sections_count, 1,
+            "the whole body is ONE preamble section — a fallback section would \
+             make this 2 and double-count every headingless note in \
+             `count_patterns` and in `sections_count`"
+        );
+
+        let body = store
+            .regex_search("loadbearing", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert_eq!(
+            body.results.len(),
+            1,
+            "the body must be searchable EXACTLY ONCE: {:?}",
+            body.results
+        );
+
+        // And the frontmatter is reachable too — the half that actually
+        // explained the reported observation.
+        let fm = store
+            .regex_search("nw-339", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert!(
+            !fm.results.is_empty(),
+            "frontmatter must be an exact-match candidate shape (6d99b96d)"
+        );
+    }
+
     /// nw-345: a single run produced TWO numbers for "unresolved links" and
     /// disclosed neither definition — the indexer counted OCCURRENCES,
     /// `doc-stats` and `broken-links` count DISTINCT TARGETS. Both are
