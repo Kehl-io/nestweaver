@@ -859,7 +859,29 @@ fn index_markdown_since_with_reader(
         rebuild_link_source_uids.push(candidate.note_uid.clone());
         let context = context_by_uid[&candidate.note_uid.as_str()];
         for wikilink in &context.wikilinks {
+            // nw-344: the same silent drop as the full-index path above, and it
+            // has to close on both or `--since` and a full re-index disagree
+            // about the vault's own link count.
             let Some(source_section) = context.section_uids.get(wikilink.section_idx) else {
+                tracing::warn!(
+                    "wikilink '{}' in '{}' names section {} of {}; recording it as \
+                     unresolved rather than dropping it silently",
+                    wikilink.target,
+                    candidate.rel_path,
+                    wikilink.section_idx,
+                    context.section_uids.len(),
+                );
+                unresolved.push((
+                    format!(
+                        "unresolved:{}:{}",
+                        candidate.note_uid,
+                        crate::hash::blake3_hex_short(&wikilink.target)
+                    ),
+                    candidate.note_uid.clone(),
+                    candidate.rel_path.clone(),
+                    candidate.parsed.title.clone(),
+                    wikilink.target.clone(),
+                ));
                 continue;
             };
             let display = wikilink
@@ -1900,10 +1922,38 @@ where
     for ctx in &note_contexts {
         for wl in &ctx.wikilinks {
             // Pass the source section's UID (where the link appears).
-            if wl.section_idx >= ctx.section_uids.len() {
+            //
+            // nw-344: this was a bare `continue`. A link taken by it produced no
+            // WIKILINK_TO_NOTE edge, no UnresolvedWikilink node and no increment
+            // to either counter — invisible on BOTH surfaces at once, which is a
+            // health tool reporting nothing wrong because it never saw the link.
+            // Record it as unresolved instead. `UnresolvedWikilink` is keyed on
+            // the source NOTE, not the section, so a note-scoped uid is enough,
+            // and LINK COUNT IN == EDGES OUT PLUS BROKEN ROWS becomes structural
+            // rather than a property of whichever fixture happens to be on hand.
+            let Some(source_section_uid) = ctx.section_uids.get(wl.section_idx) else {
+                tracing::warn!(
+                    "wikilink '{}' in '{}' names section {} of {}; recording it as \
+                     unresolved rather than dropping it silently",
+                    wl.target,
+                    ctx.rel_path,
+                    wl.section_idx,
+                    ctx.section_uids.len(),
+                );
+                wikilinks_unresolved += 1;
+                unresolved_records.push((
+                    format!(
+                        "unresolved:{}:{}",
+                        ctx.note_uid,
+                        crate::hash::blake3_hex_short(&wl.target)
+                    ),
+                    ctx.note_uid.clone(),
+                    ctx.rel_path.clone(),
+                    ctx.title.clone(),
+                    wl.target.clone(),
+                ));
                 continue;
-            }
-            let source_section_uid = &ctx.section_uids[wl.section_idx];
+            };
             let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
 
             match lookup.resolve(&wl.target, &ctx.folder) {
