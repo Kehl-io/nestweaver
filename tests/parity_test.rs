@@ -189,6 +189,11 @@ struct Fixture {
     // Keeps the tempdir alive for the duration of the test.
     _dir: TempDir,
     db_path: PathBuf,
+    /// The indexed repo's checkout root. `read-symbols` resolves each symbol's
+    /// repo-relative `file_path` against a root, so a test that omits it reads
+    /// against the test process's cwd, finds nothing, and compares two empty
+    /// bodies (nw-340).
+    repo_dir: PathBuf,
 }
 
 /// Create a scratch DB indexing a small JS repo with enough cross-directory
@@ -229,7 +234,11 @@ fn setup_fixture() -> Fixture {
     );
     create_db(&repo_dir, &db_path);
 
-    Fixture { _dir: dir, db_path }
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
 }
 
 fn setup_contract_fixture() -> Fixture {
@@ -245,7 +254,11 @@ fn setup_contract_fixture() -> Fixture {
         )],
     );
     create_db(&repo_dir, &db_path);
-    Fixture { _dir: dir, db_path }
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
 }
 
 // ─── Mode runners ────────────────────────────────────────────────────────────
@@ -1206,8 +1219,30 @@ fn parity_search_direct_vs_daemon() {
 
 #[test]
 fn parity_read_symbols_direct_vs_daemon() {
+    // nw-340: `--root` is not decoration here. Without it the DIRECT route
+    // resolves `src/a.js` against the test process's cwd and the DAEMON route
+    // against its own — neither is the fixture repo — so both printed a header
+    // with a blank line under it and this test compared two empty bodies and
+    // called it parity. It is also the reason the exit code had to become a
+    // discriminator: with `EXIT_SUCCESS` on an unreadable body there was
+    // nothing for the test to notice.
     let fixture = setup_fixture();
-    check_parity(&fixture.db_path, "read-symbols", &["read-symbols", "mainA"]);
+    let root = fixture.repo_dir.display().to_string();
+    let args = ["read-symbols", "mainA", "--root", root.as_str()];
+    check_parity(&fixture.db_path, "read-symbols", &args);
+
+    // And the body must actually be there, on both routes. Parity alone would
+    // still pass on two identical blanks.
+    let direct = run_direct(&fixture.db_path, &args);
+    let stdout = String::from_utf8_lossy(&direct.stdout);
+    assert!(
+        stdout.contains("export function mainA"),
+        "read-symbols must emit the symbol's SOURCE, not just its header: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("source unavailable"),
+        "the fixture root was passed, so the body must be readable: {stdout:?}"
+    );
 }
 
 #[test]
@@ -1294,7 +1329,11 @@ fn export_defaults_to_the_all_scope_not_code() {
         .args(["--db", &db_path.display().to_string()])
         .assert()
         .success();
-    let fixture = Fixture { _dir: dir, db_path };
+    let fixture = Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    };
 
     let defaulted = run_direct(&fixture.db_path, &["export", "--format", "graphml"]);
     assert!(
