@@ -47,7 +47,23 @@ use std::path::Path;
 ///     blocks changing from `Class` to `Extension` changes the UIDs those edges
 ///     point at. None of it is observable on a repo already indexed: the edges
 ///     are on disk with the old sources.
-pub const RESOLVER_GENERATION: u32 = 3;
+/// 4 — nw-352/nw-356: `.h` was dispatched to the C grammar, so every C++ header
+///     was read by `queries/c.scm`. Measured on 874 real headers, moving it to
+///     C++ takes them from 7,166 symbols to 17,872 and from 0 `class`
+///     definitions to 1,373. Symbol UIDs are `(repo, path, name, start_line)`,
+///     so both the symbol set and every edge endpoint in every header change,
+///     and `#include` moves from `@reference.import` to `@reference.includes`.
+///     nw-351: `find_parent_name` learned the C-family container node kinds, so
+///     C and C++ members now mint MEMBER_OF edges that did not exist at all
+///     before — a new edge family, invisible on a repo already indexed.
+///     nw-349 (cross-lane): C++ `#include` now resolves instead of being
+///     discarded, which is a new IMPORTS edge family for every C++ repo.
+///     nw-364: julia call sites are no longer minted as definitions (UIDs
+///     removed) while two previously-unreachable julia definitions appear (UIDs
+///     added); every reference's persisted `context` changes; and svelte/vue/
+///     astro named exports change `SymbolKind`, which the degenerate-span
+///     fallback gates on. All of it is on-disk shape.
+pub const RESOLVER_GENERATION: u32 = 4;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
