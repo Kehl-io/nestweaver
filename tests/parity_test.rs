@@ -2176,3 +2176,159 @@ fn mcp_stale_check_reports_which_repos_not_merely_that_some_do() {
         );
     }
 }
+
+/// nw-347. `_meta` is a promise `SERVER_INSTRUCTIONS` makes on every route, and
+/// three of the four CLI emitters break it. `print_ranking_json` (`hubs`,
+/// `bridges`) has no `_meta` parameter at all, and the `bridges` daemon leg
+/// actively runs `strip_hybrid_meta` over the envelope before rendering it —
+/// so the daemon's own stamp is discarded and the renderer has nothing to put
+/// back. Meanwhile `hub_nodes`/`bridge_nodes` over MCP carry one, because
+/// `tools::dispatch` stamps.
+///
+/// Asserted CLI-vs-MCP rather than CLI-vs-CLI because MCP is the route with no
+/// presentation layer above the tool: whatever the CLI does not print, the
+/// human never learns, and the two surfaces are documented to agree.
+#[test]
+fn every_json_cli_surface_carries_the_provenance_mcp_carries() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    for (argv, tool, args) in [
+        (
+            vec!["hubs", "--json", "--top", "3"],
+            "hub_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["bridges", "--json", "--top", "3"],
+            "bridge_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["brain", "search", "mainA", "--json"],
+            "brain_search",
+            serde_json::json!({ "query": "mainA" }),
+        ),
+    ] {
+        let label = argv.join(" ");
+        let cli = run_direct(db, &argv);
+        assert!(
+            cli.status.success(),
+            "{label} failed:\n{}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let cli_json = parse_stdout(&label, &cli);
+        let mcp_json = run_via_mcp(db, tool, args);
+
+        assert!(
+            cli_json["_meta"]["sources"].is_array(),
+            "`{label}` --json carries no `_meta`, while `{tool}` over MCP does. A \
+             renderer that rebuilds from a typed struct dropped the field the tool \
+             layer was given one author for (nw-315/nw-347): {cli_json}"
+        );
+        for leg in ["scope", "stale_repos"] {
+            assert!(
+                cli_json["_meta"].get(leg).is_some(),
+                "`{label}`: partial provenance is how a caller learns the wrong \
+                 thing confidently: {cli_json}"
+            );
+        }
+        assert_eq!(
+            cli_json["_meta"], mcp_json["_meta"],
+            "`{label}`: the CLI and MCP disagree about where the same answer came \
+             from"
+        );
+    }
+}
+
+/// nw-347, the sharpest leg: the split is INSIDE one command. `brain search
+/// --json` prints `tools::dispatch`'s stamped payload verbatim on the direct
+/// route (`src/main.rs`, the `BrainCommands::Search` direct leg) and rebuilds
+/// field-by-field from `nestweaver_proto::BrainSearchResponse` on the daemon
+/// route (`render_brain_search_response`), and that proto has no `_meta` field.
+/// So the SHAPE of the answer tracks whether a daemon happens to be running
+/// rather than what the caller asked for — nw-108's defect recurring on the
+/// provenance field, on the DEFAULT route.
+#[test]
+fn brain_search_json_has_one_shape_whether_or_not_a_daemon_is_running() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let argv = ["brain", "search", "mainA", "--json"];
+
+    let direct = run_direct(db, &argv);
+    assert!(
+        direct.status.success(),
+        "brain search (direct) failed:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_json = parse_stdout("brain search (direct)", &direct);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &argv);
+    assert!(
+        daemon.status.success(),
+        "brain search (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    let daemon_json = parse_stdout("brain search (daemon)", &daemon);
+
+    assert_eq!(
+        direct_json["_meta"].is_object(),
+        daemon_json["_meta"].is_object(),
+        "`brain search --json` emits `_meta` on one route and not the other, so a \
+         caller parsing the response has to know which transport answered.\n\
+         direct: {direct_json}\ndaemon: {daemon_json}"
+    );
+    assert!(
+        daemon_json["_meta"]["sources"].is_array(),
+        "the daemon route lost the provenance the proto boundary could not \
+         carry: {daemon_json}"
+    );
+}
+
+/// nw-259(b). `--token-budget` got `range(1..=16000)` to match its schema;
+/// `--limit`, declared six lines below it, got nothing — while `code_context`'s
+/// schema carries `maximum: 5000` (with a comment explaining that the tool asks
+/// for `limit + 1` and an unbounded value overflows it) and the daemon proxy
+/// validates against that schema. So the same invocation was accepted or
+/// rejected by whether a daemon happened to be running: the bound was a
+/// property of the transport, not of the contract.
+#[test]
+fn context_limit_is_bounded_identically_on_both_routes() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let args = &["context", "mainA", "--limit", "6000"];
+
+    let direct = run_direct(db, args);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "`--limit 6000` is rejected on one route and accepted on the other.\n\
+         direct ({:?}):\n{}\ndaemon ({:?}):\n{}",
+        direct.status.code(),
+        flatten_miette(&direct.stderr),
+        daemon.status.code(),
+        flatten_miette(&daemon.stderr)
+    );
+    assert_eq!(
+        direct.status.code(),
+        Some(64),
+        "an out-of-range argument is a USAGE error; `--token-budget` already \
+         classifies it that way on this same command"
+    );
+
+    // Counterweight: a value INSIDE the bound must still be accepted on both,
+    // or a parser with the wrong range would satisfy the above.
+    let ok_args = &["context", "mainA", "--limit", "5000"];
+    assert!(
+        run_direct(db, ok_args).status.success(),
+        "5000 is the schema's maximum and must be accepted"
+    );
+    assert!(run_via_daemon(db, ok_args).status.success());
+}

@@ -3365,12 +3365,30 @@ enum Commands {
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
         )]
         intent: Option<String>,
-        #[arg(long, help = "Maximum number of connected nodes to return")]
+        // nw-259(b). `--token-budget`, declared immediately below, carries
+        // `range(1..=16000)` to match its schema. This carried nothing, while
+        // `code_context`'s schema says `"minimum": 1, "maximum": 5000` — with
+        // a comment explaining that the tool asks for `limit + 1` and an
+        // unbounded value overflows it — and the daemon proxy validates
+        // against that schema. So `context --limit 6000` was ACCEPTED without
+        // a daemon and REJECTED with one: the bound was a property of the
+        // transport rather than of the contract. The bound here is the
+        // schema's; it is not a new one.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5000),
+            help = "Maximum connected nodes to return (1-5000, matching the code_context schema; default 500). Applied BEFORE --token-budget, not instead of it"
+        )]
         limit: Option<usize>,
+        // nw-259(c): the help used to say `--token-budget` "takes precedence
+        // over --limit". It does not. `--limit` caps the walk FIRST and
+        // `--token-budget` then cuts the already-capped list, so
+        // `--limit 5 --token-budget 16000` returns 5 — the opposite of what
+        // the caller was told. They compose; neither overrides.
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
-            help = "Approximate token budget for output (1-16000; takes precedence over --limit; matches the MCP brain_context schema)"
+            help = "Approximate token budget for output (1-16000; matches the MCP brain_context schema). Applied AFTER --limit, to whatever --limit left"
         )]
         token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -11421,8 +11439,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let mut context_result: Option<nestweaver_engine::ContextResult> = None;
             if use_daemon {
                 let mut code_args = serde_json::json!({ "seeds": seeds.clone() });
-                // Omit rather than default: absent `--limit` means "no cap" on
-                // the direct path, and the schema rejects a 0.
+                // Omit rather than default, so the TOOL's documented default
+                // governs — which is the same `CODE_CONTEXT_DEFAULT_LIMIT` the
+                // direct path applies below. nw-259(c): this comment used to
+                // claim absent `--limit` meant "no cap" on the direct path,
+                // contradicted twelve lines later by
+                // `limit.unwrap_or(CODE_CONTEXT_DEFAULT_LIMIT)`.
                 if let Some(limit) = limit {
                     code_args["limit"] = serde_json::json!(limit);
                 }
@@ -11484,19 +11506,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             match built {
                 Ok(mut result) => {
+                    // nw-259(a). This arm carries THREE caps — `--limit`,
+                    // `--token-budget` and `CODE_CONTEXT_DEFAULT_LIMIT` — and
+                    // had one `truncated` boolean and one `limit` field to
+                    // explain all of them. A token-budget cut set `truncated`
+                    // and left `limit` at whatever the earlier cap set (always
+                    // `Some` on the direct path), so the message named the
+                    // wrong cap and prescribed a flag that cannot change the
+                    // outcome: raising `--limit` after a BUDGET cut returns the
+                    // same rows. Same shape as `impact`'s three JSON outputs
+                    // before `impact_json_ok` gave it a discriminator.
+                    //
+                    // The limit cut is whatever the builder already recorded —
+                    // on either route. The budget cut happens here.
+                    let cut_by_limit = result.truncated == Some(true);
+                    let mut cut_by_budget: Option<usize> = None;
                     if let Some(budget) = token_budget {
                         let cut = context_token_budgeted_truncate(&result.connected, budget);
                         if cut < result.connected.len() {
                             result.truncated = Some(true);
+                            cut_by_budget = Some(budget);
                         }
                         result.connected.truncate(cut);
                     }
-                    // Say so. A capped result that renders identically to a
-                    // complete one is the whole defect this reports on: the
-                    // caller cannot tell "this is the answer" from "this is
-                    // the first N of the answer".
-                    let truncation = match (result.truncated, result.limit) {
-                        (Some(true), Some(limit)) => {
+                    // Say so, and say WHICH. A capped result that renders
+                    // identically to a complete one is the defect this reports
+                    // on; a capped result that blames the wrong cap is the same
+                    // defect wearing a disclosure.
+                    //
+                    // The budget wins when both fired, because it cut LAST:
+                    // raising `--limit` alone cannot get past a budget that is
+                    // already full.
+                    let truncation = match (cut_by_budget, cut_by_limit, result.limit) {
+                        (Some(budget), _, _) => {
+                            format!(", TRUNCATED by --token-budget {budget} — raise it for more")
+                        }
+                        (None, true, Some(limit)) => {
                             format!(", TRUNCATED at limit {limit} — pass --limit for more")
                         }
                         _ => String::new(),

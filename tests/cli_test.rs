@@ -6756,3 +6756,90 @@ fn a_diagnostic_phrase_survives_a_narrow_render() {
         String::from_utf8_lossy(&ambient.stderr)
     );
 }
+
+/// nw-259(a). A token-budget cut must not tell the caller it hit `--limit`.
+///
+/// The `context` arm carries three caps and had one `truncated` boolean and one
+/// `limit` field to explain all of them, so a BUDGET cut set `truncated` and
+/// left `limit` at whatever the earlier cap set — reporting "TRUNCATED at limit
+/// 500 — pass --limit for more" for a cut `--limit` did not make and cannot
+/// undo. An agent following that remedy raises `--limit`, gets the same rows,
+/// and has no next move. That is an nw-334 instance none of the four shipped
+/// tiers can see: it is not a `CliDiagnostic`, not an environment variable, and
+/// not a backtick-quoted subcommand.
+///
+/// The counterweight is the second half: a genuine LIMIT cut must still say
+/// `--limit`, or deleting the message entirely would pass.
+#[test]
+fn a_context_budget_cut_names_the_budget_and_a_limit_cut_names_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("a.js"),
+        "export function mainA(x){return helperB(x)+helperC(x);}\n\
+         export function helperB(n){return helperC(n)+1;}\n\
+         export function helperC(n){return n*3;}\n\
+         export function extraB(n){return n-1;}\n\
+         export function otherC(n){return n+7;}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // `--stats` is what prints the truncation clause.
+    let budget = nestweaver_cmd()
+        .args([
+            "--stats",
+            "context",
+            "mainA",
+            "--token-budget",
+            "1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = flatten_miette(&budget.stderr);
+    assert!(
+        stderr.contains("TRUNCATED"),
+        "the fixture must actually truncate, or this test proves nothing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("pass --limit for more"),
+        "a token-budget cut prescribed `--limit`, which cannot change the \
+         outcome — the budget is what cut, and it cut LAST: {stderr}"
+    );
+    assert!(
+        stderr.contains("--token-budget"),
+        "the message must name the cap that actually cut: {stderr}"
+    );
+
+    let limited = nestweaver_cmd()
+        .args([
+            "--stats",
+            "context",
+            "mainA",
+            "--limit",
+            "1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = flatten_miette(&limited.stderr);
+    assert!(
+        stderr.contains("pass --limit for more"),
+        "a real limit cut must still say so, or deleting the message would \
+         satisfy the assertions above: {stderr}"
+    );
+}
