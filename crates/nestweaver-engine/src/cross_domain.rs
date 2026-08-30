@@ -150,8 +150,16 @@ fn discover_cross_domain_links_full(
         return Ok(CrossDomainResult::default());
     }
 
-    let notes = store.list_notes(None).context("list_notes")?;
+    // A note the STORE could not decode is a note this pass did not scan, and
+    // `skipped_unreadable` is already the field that says so — it just never
+    // saw these, because nw-335's corrupt-row tolerance drops them inside the
+    // scan and reports it in a log line. Left unwired, `notes_scanned` counts
+    // them in neither column and the pass claims it covered the vault.
+    let (notes, integrity) = store
+        .list_notes_with_integrity(None)
+        .context("list_notes")?;
     let mut result = CrossDomainResult::default();
+    result.skipped_unreadable += integrity.skipped_corrupt;
 
     // Scan all notes in memory first (no DB writes), then flush in
     // transaction-batched chunks. Earlier versions committed once per
@@ -691,6 +699,113 @@ mod tests {
 
         let count = store.count_references_code_edges().unwrap();
         assert!(count >= 1, "edges should be persisted");
+    }
+
+    /// This pass reports `notes_scanned` and already carries
+    /// `skipped_unreadable` for a note it could not read. nw-335 made the note
+    /// scan itself drop a row it cannot decode and say so only in a log line,
+    /// which put such a note in NEITHER column — the pass then reported having
+    /// covered the vault when it had not. The two counters must still account
+    /// for every note the vault holds.
+    #[test]
+    fn a_note_the_store_cannot_decode_is_counted_as_skipped_not_as_absent() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(
+            vault_root.join("design.md"),
+            "# Auth Design\n\nThe AuthService.authenticate flow handles login.\n",
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let v_uid = vault_uid("default", &vault_root.to_string_lossy());
+        store
+            .insert_vault(&Vault {
+                uid: v_uid.clone(),
+                name: "v".to_string(),
+                root_path: vault_root.to_string_lossy().into_owned(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+
+        let note = |uid: &str, title: &str, file: &str| Note {
+            uid: uid.to_string(),
+            vault_uid: v_uid.clone(),
+            file_path: file.to_string(),
+            title: title.to_string(),
+            note_kind: NoteKind::Design,
+            word_count: 10,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store
+            .insert_note(&note(
+                &format!("note:{v_uid}:ok"),
+                "Auth Design",
+                "design.md",
+            ))
+            .unwrap();
+        // A NUL in a note the store WROTE is the LadybugDB #678 pattern the
+        // canary exists to catch; the scan drops this row.
+        store
+            .insert_note(&note(
+                &format!("note:{v_uid}:bad"),
+                "Poi\u{0}soned",
+                "poisoned.md",
+            ))
+            .unwrap();
+
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1),
+                name: "AuthService".to_string(),
+                kind: SymbolKind::Class,
+                repo_uid: r_uid,
+                file_path: "src/auth.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "class AuthService".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let result = discover_cross_domain_links(&store).unwrap();
+        assert_eq!(
+            result.skipped_unreadable, 1,
+            "a note the STORE could not decode is a note this pass did not \
+             scan, and `skipped_unreadable` is the field that says so: {result:?}"
+        );
+        assert_eq!(
+            result.notes_scanned, 1,
+            "the undecodable note must NOT be counted as scanned: {result:?}"
+        );
     }
 
     #[test]

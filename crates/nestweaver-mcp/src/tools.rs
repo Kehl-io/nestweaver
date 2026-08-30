@@ -3059,28 +3059,41 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         1,
         RESULT_LIMIT_MAX,
     )?;
+    // nw-341: the ONLY axis that unblocks verification. The rows sort
+    // unresolved-first then by ascending confidence, so the 0.92
+    // nearest-ancestor and 0.95 same-folder tiers are the tail -- exactly what
+    // a cap removes and exactly what a reviewer of the tier ladder has to see.
+    // Reversing the sort is not an option: it would regress nw-297's
+    // `genuinely_broken_links_sort_before_lower_tier_resolutions`.
+    let offset = read_limit(&args, "offset", 0, 0, RESULT_LIMIT_MAX)?;
     let all_links = broken_links(store, max_suggestions)?;
-    let total = all_links.len();
-    // nw-297: classify over the POPULATION, before the truncation. The page is
+    // nw-297: classify over the POPULATION, before the window. The page is
     // a sample, and a caller that reads the page's own composition as the
     // vault's composition gets the wrong answer at every limit — which is
     // exactly what the CLI's summary line did.
     let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = total - unresolved;
-    let links: Vec<_> = all_links.into_iter().take(limit).collect();
-    Ok(json!({
-        "broken_links": serde_json::to_value(&links)?,
-        "total": total,
-        "returned": links.len(),
+    let low_confidence = all_links.len() - unresolved;
+    let rows: Vec<Value> = all_links
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, serde_json::Error>>()?;
+    // nw-341: through `Bounded`, not hand-rolled. This was the last bounded
+    // list in the catalogue still building its own (total, returned) pair, so
+    // it was also the only one that never emitted `truncated` -- a caller could
+    // not tell a complete page from a cut one without comparing two numbers.
+    let mut out = json!({
         "unresolved": unresolved,
         "low_confidence": low_confidence,
-    }))
+        "offset": offset,
+    });
+    Bounded::window(rows, offset, limit).merge_into(&mut out, "broken_links");
+    Ok(out)
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `total` and `returned` describe the page. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `returned` and `truncated` describe the page and `total` is the pre-offset population. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe — and the HIGHEST-confidence tiers are the tail, reachable only via `offset`\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -3093,7 +3106,10 @@ fn tool_schema_brain_broken_links() -> Value {
                     "Max suggested target UIDs per broken link (1-50, default 5).", 5, 1, 50),
                 "limit": limit_schema(
                     "Max broken links to return (1-1000, default 50). The total count is always reported.",
-                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX),
+                "offset": bounded_integer_schema(
+                    "Skip this many rows before the page (default 0). Rows sort unresolved-first then by ASCENDING confidence, so the high-confidence tiers (0.90/0.92/0.95) are the TAIL — offset is how you reach them. `total` stays the PRE-offset population.",
+                    0, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -3235,7 +3251,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All seven keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags, notes_by_year}\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -3478,7 +3494,7 @@ fn tool_schema_code_context() -> Value {
                     // knob with a minimum and no maximum is an omission either
                     // way.
                     "maximum": 5000,
-                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count` and `truncated` so an omitted limit is never silently lossy."
+                    "description": "Maximum connected symbols to return. Defaults to 500 when omitted; the response reports `connected_count`, `truncated` and `truncated_by` (which cap cut) so an omitted limit is never silently lossy."
                 },
                 "intent": intent_schema(
                     "Tunes PPR damping and edge weights. Omit for the standard damping (0.85)."
@@ -3705,6 +3721,18 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     // that counts survivors is not a total of anything.
     let returned = result.connected.len();
     let total = result.connected_total.unwrap_or(returned).max(returned);
+    // nw-259(a), machine route. This tool has exactly ONE cap, so `truncated`
+    // was never ambiguous HERE — but the CLI's daemon route parses this very
+    // payload into `ContextResult` and then applies `--token-budget` on top of
+    // it. Stating the cause explicitly is what lets that layer OVERRIDE a
+    // known cause rather than re-derive one, and it is what an MCP client
+    // reading this tool directly needs in order to parse one shape across
+    // `code_context` and `nestweaver context --json`.
+    //
+    // `resolve` rather than a literal: the precedence rule lives in ONE place
+    // even where only one branch of it is reachable.
+    let truncated_flag = truncated || total > returned;
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(false, truncated_flag);
     let payload = json!({
         "seeds": result.seeds.iter().map(render).collect::<Vec<_>>(),
         "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
@@ -3717,7 +3745,12 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "returned": returned,
         "total": total,
         "limit": limit,
-        "truncated": truncated || total > returned,
+        "truncated": truncated_flag,
+        // Emitted even when null, unlike the CLI's `skip_serializing_if`,
+        // because this payload always emits `truncated` and a caller parsing a
+        // fixed shape should not have to distinguish "absent because complete"
+        // from "absent because this producer is old".
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
     });
     Ok(payload)
 }
@@ -6109,6 +6142,28 @@ fn resolve_note_by_title(
     store: &GraphStore,
     title: &str,
 ) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
+    resolve_note_by_title_with(store, title, |uid| store.lookup_note(uid))
+}
+
+/// [`resolve_note_by_title`] with the HYDRATION step as an argument.
+///
+/// nw-260. The test that claimed to pin this contract asserted that a title
+/// matching nothing returns `Ok(None)` — which takes the `None => Ok(None)`
+/// arm and is true of the `.ok()` version this fix replaced. The contract is
+/// about the OTHER arm: a title that MATCHED a row and then failed to hydrate
+/// it must be an error, because `None` renders as "no note found with title
+/// '<title>'" — a claim about the vault made on the strength of a failure to
+/// read it.
+///
+/// That arm was unreachable from a test: `nestweaver-store` has no raw query
+/// API, so hydration cannot be made to fail on a store that opened. Taking the
+/// hydrator as a parameter is the seam; the production caller passes
+/// `store.lookup_note`.
+fn resolve_note_by_title_with(
+    store: &GraphStore,
+    title: &str,
+    hydrate: impl Fn(&str) -> Result<nestweaver_schema::Note, nestweaver_store::StoreError>,
+) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
     let mut matches = store
         .lookup_notes_by_title(title)
         .with_context(|| format!("failed to look up notes with title '{title}'"))?;
@@ -6148,8 +6203,7 @@ fn resolve_note_by_title(
         // — "no note found with that title" about a note we had just found.
         // The uid branch at the top of this function already propagates with
         // `with_context(...)?`; same function, opposite handling.
-        Some(hit) => store
-            .lookup_note(&hit.uid)
+        Some(hit) => hydrate(&hit.uid)
             .map(Some)
             .with_context(|| format!("hydrate note '{}' matched by title", hit.uid)),
         None => Ok(None),
@@ -6212,6 +6266,130 @@ fn tool_brain_status(
     tantivy: Option<&TantivyIndex>,
 ) -> Result<Value, anyhow::Error> {
     brain_status_json(store, tantivy)
+}
+
+/// Build one `vaults[]` row, and say whether its note count could be READ.
+///
+/// # Why this is a free function
+///
+/// nw-260. The two tests #310 added for this disclosure asserted
+/// `counts_complete == true` and `note_count.is_number()` against
+/// `index_on_disk()` — a HEALTHY store — so every revert of the fixes they
+/// named still passed. That is not an assertion gap, it is a SEAM gap:
+/// `nestweaver-store` exposes no raw query escape hatch, so a test cannot make
+/// `list_notes` fail without corrupting a database file, which fails the OPEN
+/// long before `brain_status` runs. A disclosure contract about a failed read
+/// was untestable at the level those tests sat at, and nobody noticed because
+/// the healthy-path assertions were true.
+///
+/// Lifting the row builder out of the loop makes the failure an ARGUMENT. The
+/// error type is generic so a caller (or a test) can hand it any failure
+/// without this module depending on `StoreError`'s shape.
+///
+/// The returned bool is "this vault's count could not be read", which
+/// [`counts_disclosure`] folds into `unavailable`/`counts_complete`.
+///
+/// The read is handed in as `(rows, ScanIntegrity)` because a whole-corpus scan
+/// can now come back SHORT without coming back `Err` (nw-335 tolerates a row it
+/// cannot decode rather than losing the corpus). A short scan reported as a
+/// confident smaller number is the same CWE-390 defect nw-260 fixed, just
+/// arriving through `Ok` instead of `unwrap_or_default()` — so an incomplete
+/// read takes the identical null-and-disclose path as a failed one.
+fn vault_status_json<E: std::fmt::Display>(
+    vault: &nestweaver_schema::Vault,
+    notes: Result<
+        (
+            Vec<nestweaver_schema::Note>,
+            nestweaver_store::ScanIntegrity,
+        ),
+        E,
+    >,
+    ext_ts: Option<String>,
+) -> (Value, bool) {
+    // `unwrap_or_default()` turned a failed read into a vault holding zero
+    // notes. The per-vault number is the one a caller actually looks at when
+    // deciding whether a vault indexed correctly, so a confident zero here is
+    // the most misleading of the set (CWE-390) — and this tool's own
+    // description tells the caller to re-index on a zero.
+    let (notes, note_count, read_failed) = match notes {
+        Ok((notes, integrity)) if integrity.is_complete() => {
+            let count = notes.len();
+            (notes, json!(count), false)
+        }
+        Ok((_, integrity)) => {
+            // Read, but not all of it. A number derived from part of a vault
+            // is not that vault's note count, and this tool tells the caller
+            // to re-index on a low one — so it is `null` plus a disclosure,
+            // exactly as a failed read is.
+            tracing::warn!(
+                vault = %vault.uid,
+                "brain_status: per-vault note count incomplete: {}",
+                integrity.disclosure().unwrap_or_default()
+            );
+            (Vec::new(), Value::Null, true)
+        }
+        Err(error) => {
+            tracing::warn!(
+                vault = %vault.uid,
+                "brain_status: per-vault note count unavailable: {error}"
+            );
+            (Vec::new(), Value::Null, true)
+        }
+    };
+    let (last_indexed, last_indexed_source) = if let Some(ts) = ext_ts {
+        (Some(ts), "extension_store")
+    } else if read_failed {
+        // `"none"` is a VERIFIED-ABSENCE claim, and it used to be manufactured
+        // from the same failed read that nulled the count: `notes` was bound to
+        // an empty vec, the fallback over it found no timestamp, and the row
+        // reported `"none"` next to `note_count: null`. "none" means "we looked
+        // and found no timestamp"; here we did not look.
+        (None, "unavailable")
+    } else {
+        let fallback = notes
+            .iter()
+            .filter_map(|n| n.modified_at.as_deref())
+            .max()
+            .map(|s| s.to_string());
+        if fallback.is_some() {
+            (fallback, "file_mtime")
+        } else {
+            (None, "none")
+        }
+    };
+    let row = json!({
+        // `uid` + `instance_id` let callers disambiguate rows that share a
+        // name/root_path (collision state) and target precise operations like
+        // `brain remove --instance <id>`.
+        "uid": vault.uid,
+        "instance_id": vault.instance_id,
+        "name": vault.name,
+        "root_path": vault.root_path,
+        "note_count": note_count,
+        "last_indexed": last_indexed,
+        "last_indexed_source": last_indexed_source,
+    });
+    (row, read_failed)
+}
+
+/// Fold per-vault read failures into the payload's own disclosure, and derive
+/// `counts_complete` from the same fold.
+///
+/// nw-260. These were two independent expressions — a `push` and an
+/// `unavailable.is_empty() && vault_count_failures == 0` — either of which
+/// could be deleted without any test noticing, because the only fixture that
+/// reached them was healthy and produced `(vec![], 0)` for both. Computing them
+/// together means a caller cannot be told "nothing is unavailable" and
+/// "counts are incomplete", or the reverse.
+fn counts_disclosure(
+    mut unavailable: Vec<&'static str>,
+    vault_count_failures: usize,
+) -> (Vec<&'static str>, bool) {
+    if vault_count_failures > 0 {
+        unavailable.push("per-vault note counts");
+    }
+    let counts_complete = unavailable.is_empty();
+    (unavailable, counts_complete)
 }
 
 /// The ONE `brain_status` document builder, shared by every serving path:
@@ -6291,26 +6469,6 @@ pub fn brain_status_json(
     let vaults_json: Vec<Value> = vaults
         .iter()
         .map(|v| {
-            // Same defect as the totals above, and it survived the fix that
-            // wrote that comment: `unwrap_or_default()` turns a failed read
-            // into a vault holding zero notes. The per-vault number is the one
-            // a caller actually looks at when deciding whether a vault indexed
-            // correctly, so a confident zero here is the most misleading of
-            // the set.
-            let (notes, note_count) = match store.list_notes(Some(&v.uid)) {
-                Ok(notes) => {
-                    let count = notes.len();
-                    (notes, json!(count))
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        vault = %v.uid,
-                        "brain_status: per-vault note count unavailable: {error}"
-                    );
-                    vault_count_failures += 1;
-                    (Vec::new(), Value::Null)
-                }
-            };
             // Prefer the extension-store timestamp (actual indexer run);
             // fall back to max(note.modified_at) for older databases.
             let ext_ts = db_path
@@ -6323,32 +6481,12 @@ pub fn brain_status_json(
                     "no extension-store timestamp; falling back to max(modified_at)"
                 );
             }
-            let (last_indexed, last_indexed_source) = if let Some(ts) = ext_ts {
-                (Some(ts), "extension_store")
-            } else {
-                let fallback = notes
-                    .iter()
-                    .filter_map(|n| n.modified_at.as_deref())
-                    .max()
-                    .map(|s| s.to_string());
-                if fallback.is_some() {
-                    (fallback, "file_mtime")
-                } else {
-                    (None, "none")
-                }
-            };
-            json!({
-                // `uid` + `instance_id` let callers disambiguate rows that
-                // share a name/root_path (collision state) and target precise
-                // operations like `brain remove --instance <id>`.
-                "uid": v.uid,
-                "instance_id": v.instance_id,
-                "name": v.name,
-                "root_path": v.root_path,
-                "note_count": note_count,
-                "last_indexed": last_indexed,
-                "last_indexed_source": last_indexed_source,
-            })
+            let (row, failed) =
+                vault_status_json(v, store.list_notes_with_integrity(Some(&v.uid)), ext_ts);
+            if failed {
+                vault_count_failures += 1;
+            }
+            row
         })
         .collect();
 
@@ -6469,9 +6607,7 @@ pub fn brain_status_json(
 
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
-    if vault_count_failures > 0 {
-        unavailable.push("per-vault note counts");
-    }
+    let (unavailable, counts_complete) = counts_disclosure(unavailable, vault_count_failures);
 
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
@@ -6493,8 +6629,10 @@ pub fn brain_status_json(
         // A caller must not act on a null the way it would act on a 0.
         "unavailable": unavailable,
         // `counts_complete` must account for the PER-VAULT counts too, or it
-        // claims completeness for a payload that carries nulls.
-        "counts_complete": unavailable.is_empty() && vault_count_failures == 0,
+        // claims completeness for a payload that carries nulls. Computed by
+        // `counts_disclosure` alongside `unavailable`, so the two cannot
+        // disagree about the same failure.
+        "counts_complete": counts_complete,
         "repos": repos_json,
         "repo_count": repos.len(),
         "server_mode": is_server_mode(),
@@ -6884,8 +7022,16 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "headings": result.headings_count,
                 "sections": result.sections_count,
                 "tags": result.tags_count,
-                "wikilinks_resolved": result.wikilinks_resolved,
-                "wikilinks_unresolved": result.wikilinks_unresolved,
+                // nw-345: each key names the POPULATION it counts. `resolved`
+                // is EDGES (an ambiguous link contributes N); the three
+                // unresolved numbers are occurrences, distinct (section,
+                // target), and distinct (note, target) — the last is the one
+                // `brain_doc_stats` and `brain_broken_links` report, and it is
+                // why one run used to print two different "unresolved" counts.
+                "resolved_link_edges": result.resolved_link_edges,
+                "unresolved_link_occurrences": result.unresolved_link_occurrences,
+                "unresolved_link_section_targets": result.unresolved_link_section_targets,
+                "unresolved_link_targets": result.unresolved_link_targets,
                 "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped.len(),
                 "skipped_files": result.skipped,
@@ -7824,7 +7970,12 @@ fn tool_flow_trace(
 
     // Classes don't have CALLS edges — only their methods do. When the root
     // symbol is a class, expand to its methods and return a flow tree per method.
-    if root.kind == SymbolKind::Class {
+    //
+    // nw-330: an `Extension` (a Rust `impl` block) is in exactly the same
+    // position — a container whose members hold the calls — and used to BE
+    // `SymbolKind::Class`. Without this, `flow` on an impl block would return
+    // an empty tree instead of one per method.
+    if matches!(root.kind, SymbolKind::Class | SymbolKind::Extension) {
         let direct_callees = store
             .callees_of(&root.uid)
             .map_err(|e| anyhow!("callees_of: {e}"))?;
@@ -9747,6 +9898,13 @@ fn tool_dead_code(
         "truncated": matching_count > filtered.len(),
         "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
+        // Coverage contract: the counts above are a completeness claim over the
+        // whole symbol corpus. The store's whole-corpus scan TOLERATES a row it
+        // cannot decode (nw-335) rather than losing the corpus, so `coverage`
+        // says whether it actually saw everything — without it, "N of M" over a
+        // silently-shortened corpus reads as exact.
+        "coverage": if result.coverage_is_complete() { "complete" } else { "degraded" },
+        "undecodable_symbols": result.undecodable_symbols,
         "min_confidence": min_conf_str,
         "unreachable_symbols": filtered,
     }))
@@ -9844,10 +10002,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
             "cluster_id is null because clustering has not been computed. Run 'nestweaver cluster' to populate.".to_string(),
         );
     }
-    if let Some(note) = ranking_staleness_note(store) {
-        resp["rankings_stale"] = json!(true);
-        attach_note(&mut resp, note);
-    }
+    attach_ranking_staleness(&mut resp, store);
     Ok(resp)
 }
 
@@ -9931,10 +10086,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "count": nodes_json.len(),
         "bridges": nodes_json,
     });
-    if let Some(note) = ranking_staleness_note(store) {
-        resp["rankings_stale"] = json!(true);
-        attach_note(&mut resp, note);
-    }
+    attach_ranking_staleness(&mut resp, store);
     Ok(resp)
 }
 
@@ -10301,6 +10453,26 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         };
         let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
         let truncated_by_budget = display.len() < matched_total;
+        // nw-259(a), same property, different command. TWO caps reach this
+        // payload — the generator's `DEFAULT_SYMBOL_SUMMARY_CAP` and
+        // `token_budget` — and `truncated` was one boolean for both, so a
+        // caller could not tell whether to raise the budget or narrow with
+        // `target`.
+        //
+        // Named as INDEPENDENT booleans, the shape `brain_impact` already uses
+        // for `truncated_by_depth` / `truncated_by_threshold`, and deliberately
+        // NOT the single `truncated_by` string that `code_context` and
+        // `nestweaver context` carry. The difference is not cosmetic: there,
+        // the budget is applied to what the row cap left, so raising the row
+        // cap alone provably cannot help and naming both would prescribe a
+        // useless remedy. Here BOTH remedies stay independently useful — a
+        // narrower `target` shrinks the matched set even when the budget cut,
+        // and a bigger budget shows more even when the generator capped — so
+        // collapsing them to one winner would throw away a remedy that works.
+        //
+        // `partial` is kept as an alias of `truncated_by_cap` rather than a
+        // second computation, so the two cannot drift.
+        let truncated_by_cap = capped;
         let note = if capped {
             Some(format!(
                 "symbol-level summary is capped at {} symbols of {matched_total}; pass `target` \
@@ -10332,8 +10504,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "total_available": matched_total,
             "tokens_used": total_tokens,
             "token_budget": token_budget,
-            "truncated": truncated_by_budget || capped,
-            "partial": capped,
+            "truncated": truncated_by_budget || truncated_by_cap,
+            "truncated_by_budget": truncated_by_budget,
+            "truncated_by_cap": truncated_by_cap,
+            "partial": truncated_by_cap,
             "cached": false,
             "note": note,
             "summaries": display,
@@ -10436,6 +10610,19 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // Either cause: the generator's cap upstream, or the budget here.
         // Reporting only the second made the first vanish (F-DC-11).
         "truncated": display.len() < after_filter_len || cap_dropped > 0,
+        // nw-259(a). `truncated` alone does not say WHICH, and the two
+        // remedies are different: raise `token_budget`, or narrow with
+        // `target`. Independent booleans, per the symbol-level rationale
+        // above — both remedies stay useful when both caps fire.
+        //
+        // `truncated_by_cap` is `cap_dropped > 0`, which is FALSE on a sidecar
+        // cache hit even when the cached set was itself capped, because the
+        // generator did not run and nothing recorded what it dropped. That is
+        // a pre-existing hole in `truncated` itself, not one this field adds;
+        // it is called out here so the next reader does not mistake the field
+        // for a guarantee.
+        "truncated_by_budget": display.len() < after_filter_len,
+        "truncated_by_cap": cap_dropped > 0,
         "cached": from_cache,
         "summaries": display,
         "summaries_text": text,
@@ -10686,9 +10873,27 @@ impl<T> Bounded<T> {
     /// `limit == 0` means unlimited, matching the CLI's documented
     /// `--limit 0 = all` convention. A tool that does not offer that escape
     /// hatch declares `minimum: 1` and never passes 0 here.
-    fn take(mut items: Vec<T>, limit: usize) -> Self {
+    fn take(items: Vec<T>, limit: usize) -> Self {
+        Self::window(items, 0, limit)
+    }
+
+    /// Cut `items` to the window `[offset, offset + limit)`, capturing the
+    /// PRE-WINDOW total.
+    ///
+    /// nw-341: `take` can only ever return the HEAD of a list. When the
+    /// ordering deliberately puts the rows a reviewer must inspect at the TAIL
+    /// -- as `broken_wikilinks` does, sorting unresolved-first then by
+    /// ASCENDING confidence so the most severe rows come first (nw-297) -- the
+    /// head is precisely the wrong page and there is no second one. A health
+    /// tool that cannot be used to verify its own fixes.
+    ///
+    /// `total` stays PRE-offset for the same reason it stays pre-cap: it
+    /// answers "how many matched", not "how many are left". Reporting the
+    /// remainder would make a caller's page arithmetic drift with every step.
+    fn window(mut items: Vec<T>, offset: usize, limit: usize) -> Self {
         let total = items.len();
-        if limit != 0 && total > limit {
+        items.drain(..offset.min(total));
+        if limit != 0 && items.len() > limit {
             items.truncate(limit);
         }
         Self { items, total }
@@ -12052,6 +12257,42 @@ fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
     nestweaver_engine::resolver_generation::staleness_note(&db_path, &uids)
 }
 
+/// WHICH repos are stale, not merely that some are.
+///
+/// nw-217a found this by comparing `hubs --json` against `hub_nodes` over MCP:
+/// the CLI emits `rankings_stale` UNCONDITIONALLY (nw-308) plus the list of
+/// stale repos, and these tools emitted `rankings_stale` only when it was TRUE
+/// and never named a repo. Two consequences, both the shape nw-315 closed for
+/// `stale_check`:
+///
+///  * an absent key cannot be read as `false`. "Not stale" and "this tool does
+///    not say" are the same observation to an agent, and only one of them is a
+///    reason to trust the numbers.
+///  * "N of M repos were indexed by an older resolver" tells a caller to go
+///    find out which. The human gets the list; the agent got a count.
+fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
+    let Ok(db_path) = current_db_path(store) else {
+        return Vec::new();
+    };
+    let Ok(repos) = store.list_repos(None) else {
+        return Vec::new();
+    };
+    let uids: Vec<String> = repos.into_iter().map(|repo| repo.uid).collect();
+    nestweaver_engine::resolver_generation::load(&db_path)
+        .stale_repos(uids.iter().map(|uid| uid.as_str()))
+}
+
+/// Attach the ranking-staleness disclosure to a result, in the shape the CLI
+/// has emitted since nw-308: both keys, always.
+fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+    let note = ranking_staleness_note(store);
+    resp["rankings_stale"] = json!(note.is_some());
+    resp["stale_repos"] = json!(ranking_stale_repos(store));
+    if let Some(note) = note {
+        attach_note(resp, note);
+    }
+}
+
 /// Attach a disclosure to a tool result without dropping one already there.
 ///
 /// `note` is this surface's existing human-readable channel and some tools
@@ -13256,10 +13497,12 @@ mod cache_dispatch_tests {
     // answer — a count of zero, an empty list, a "not found" — so the caller
     // could not tell "we looked and there is nothing" from "we failed to look".
 
-    /// `brain_status` already disclosed unreadable TOTALS via `unavailable` +
-    /// nulls. The per-vault note count, twenty lines below that block, still
-    /// reported a failed read as a vault holding zero notes. This pins the
-    /// disclosure contract both counts now share.
+    /// nw-260. The COUNTERWEIGHT, not the contract: the disclosure path must
+    /// not fire when nothing is wrong. Kept under its own name because it is
+    /// not wrong, it is insufficient — every revert of the fixes it was
+    /// written to pin still passes it, since `index_on_disk()` is a healthy
+    /// store and the failure arms never run. The contract itself is asserted
+    /// by `a_vault_whose_notes_cannot_be_read_reports_null_and_says_so` below.
     #[test]
     fn brain_status_reports_complete_counts_on_a_healthy_store() {
         let (_dir, db_path) = index_on_disk();
@@ -13285,11 +13528,12 @@ mod cache_dispatch_tests {
         }
     }
 
-    /// `resolve_note_by_title` matched a row and then hydrated it with `.ok()`,
-    /// so a failed hydration became "no note found with that title" — a claim
-    /// about the vault made on the strength of a failure to read it. A genuine
-    /// miss must still be a clean `None`, or the fix would just trade one wrong
-    /// answer for a spurious error.
+    /// nw-260. The COUNTERWEIGHT to
+    /// `a_title_that_matched_but_could_not_hydrate_is_an_error_not_a_miss`: a
+    /// genuine miss must stay a clean `None`, or the fix would trade one wrong
+    /// answer for a spurious error. On its own it proves nothing about the
+    /// contract it was filed under — it takes the `None => Ok(None)` arm, which
+    /// the `.ok()` version it names satisfied too.
     #[test]
     fn a_title_that_matches_nothing_is_still_a_clean_miss() {
         let (_dir, db_path) = index_on_disk();
@@ -13300,6 +13544,217 @@ mod cache_dispatch_tests {
             .expect("a miss is not an error");
 
         assert!(resolved.is_none());
+    }
+
+    fn note_fixture(uid: &str) -> nestweaver_schema::Note {
+        nestweaver_schema::Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: format!("{uid}.md"),
+            title: uid.to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: Some("2026-01-01T00:00:00Z".to_string()),
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn vault_fixture() -> nestweaver_schema::Vault {
+        nestweaver_schema::Vault {
+            uid: "vlt:test".to_string(),
+            name: "test".to_string(),
+            root_path: "/v".to_string(),
+            instance_id: "default".to_string(),
+        }
+    }
+
+    /// nw-260. The test this joins asserted `counts_complete == true` on a
+    /// HEALTHY store, so all four reverts of the fixes it named still passed:
+    /// restoring `unwrap_or_default()` on the per-vault count, deleting the
+    /// failure counter, deleting `&& vault_count_failures == 0` from
+    /// `counts_complete`, and deleting the `unavailable.push` fold. A
+    /// disclosure contract is about the FAILURE, and the failure is what the
+    /// fixture has to be able to produce — which is why the fix here was a
+    /// SEAM (`vault_status_json` takes the read as an argument) rather than
+    /// more assertions against a store that cannot fail.
+    #[test]
+    fn a_vault_whose_notes_cannot_be_read_reports_null_and_says_so() {
+        let vault = vault_fixture();
+        let (row, failed) = vault_status_json(
+            &vault,
+            Err::<
+                (
+                    Vec<nestweaver_schema::Note>,
+                    nestweaver_store::ScanIntegrity,
+                ),
+                _,
+            >(nestweaver_store::StoreError::Query(
+                "execute: injected".to_string(),
+            )),
+            None,
+        );
+
+        assert!(
+            failed,
+            "a failed read must be counted, or `counts_complete` cannot \
+             account for it"
+        );
+        assert_eq!(
+            row["note_count"],
+            Value::Null,
+            "a count that could not be READ is not a count of zero (CWE-390), \
+             and this tool's own description tells the caller to re-index on a \
+             zero: {row}"
+        );
+        assert_ne!(
+            row["last_indexed_source"],
+            json!("none"),
+            "`none` is a verified-absence claim manufactured from the SAME \
+             failed read that nulled the count — we did not look, so we cannot \
+             say we looked and found nothing: {row}"
+        );
+
+        // Counterweight: a readable vault reports a real number and a real
+        // source, so the disclosure cannot be satisfied by nulling everything.
+        let (healthy, failed) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                Vec::new(),
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert!(!failed);
+        assert_eq!(healthy["note_count"], json!(0));
+        assert_eq!(
+            healthy["last_indexed_source"],
+            json!("none"),
+            "an empty vault we DID read has genuinely no timestamp: {healthy}"
+        );
+    }
+
+    /// nw-335 made `list_notes` tolerate a row it cannot decode, so the read
+    /// nw-260 hardened can now return `Ok` with FEWER notes than the vault
+    /// holds. That routes a short count straight past the null-and-disclose
+    /// path and republishes it as a confident number — the same CWE-390 defect
+    /// nw-260 fixed, arriving through the success arm. A count over part of a
+    /// vault is not that vault's count.
+    #[test]
+    fn a_vault_whose_notes_were_only_partly_read_reports_null_and_says_so() {
+        let vault = vault_fixture();
+        let degraded = nestweaver_store::ScanIntegrity {
+            returned: 2,
+            skipped_corrupt: 1,
+            first_reason: Some("column 1: embedded NUL byte".to_string()),
+        };
+        let (row, failed) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![note_fixture("note:a"), note_fixture("note:b")],
+                degraded,
+            )),
+            None,
+        );
+
+        assert!(
+            failed,
+            "an incomplete read must be counted exactly as a failed one, or              `counts_complete` claims completeness over a short scan"
+        );
+        assert_eq!(
+            row["note_count"],
+            Value::Null,
+            "2 of 3 notes is not this vault's note count, and the tool's own              description tells the caller to re-index on a low number: {row}"
+        );
+        assert_ne!(
+            row["last_indexed_source"],
+            json!("none"),
+            "we did not see the whole vault, so we cannot claim we looked and              found no timestamp: {row}"
+        );
+    }
+
+    /// nw-260, the fold. `unavailable` and `counts_complete` were two
+    /// independent expressions over the same failure, and the only fixture that
+    /// reached them handed both `(vec![], 0)` — so either could be deleted
+    /// silently. They are one function now, and this is the assertion that
+    /// notices if the fold goes away again.
+    #[test]
+    fn a_failed_per_vault_read_reaches_the_payloads_own_disclosure() {
+        let (unavailable, counts_complete) = counts_disclosure(Vec::new(), 2);
+        assert!(
+            unavailable.contains(&"per-vault note counts"),
+            "a caller has ONE place to look for what could not be read, and \
+             this failure did not reach it: {unavailable:?}"
+        );
+        assert!(
+            !counts_complete,
+            "a payload carrying nulls must not claim its counts are complete"
+        );
+
+        let (unavailable, counts_complete) = counts_disclosure(Vec::new(), 0);
+        assert!(unavailable.is_empty());
+        assert!(
+            counts_complete,
+            "nothing failed, so nothing may be listed as unavailable"
+        );
+    }
+
+    /// nw-260, second half. A title that MATCHED and then failed to hydrate
+    /// must be an error, not `None` — `None` renders as "no note found with
+    /// title '<title>'", a claim about the vault made on the strength of a
+    /// failure to read it. The old test asserted only that a genuine MISS is
+    /// `None`, which the `.ok()` version it names satisfied.
+    #[test]
+    fn a_title_that_matched_but_could_not_hydrate_is_an_error_not_a_miss() {
+        let store = GraphStore::in_memory().unwrap();
+        // A FILENAME-STEM match, because that is the tier that hydrates: an
+        // exact title hit returns from `lookup_notes_by_title` and never
+        // reaches the hydration arm at all. This is the nw-259-shaped reason
+        // the shipped test could not have covered it even with a note present.
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:home".to_string(),
+                vault_uid: "vlt:test".to_string(),
+                file_path: "Home.md".to_string(),
+                title: "Brain - Command Center".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 10,
+                content_hash: "hash-home".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let error = resolve_note_by_title_with(&store, "Home", |uid| {
+            Err(nestweaver_store::StoreError::Query(format!(
+                "execute: injected for {uid}"
+            )))
+        })
+        .expect_err("a failed hydration of a MATCHED row is not a clean miss");
+        assert!(
+            format!("{error:#}").contains("hydrate"),
+            "the error must name what failed, or the caller learns only that \
+             something went wrong: {error:#}"
+        );
+
+        // Counterweight: with a working hydrator the same title resolves, so
+        // the assertion above cannot be satisfied by failing unconditionally.
+        let resolved = resolve_note_by_title_with(&store, "Home", |uid| store.lookup_note(uid))
+            .expect("a stem-matched title resolves");
+        assert_eq!(
+            resolved.map(|n| n.uid),
+            Some("note:home".to_string()),
+            "the fixture must reach the hydration arm, or this test proves \
+             nothing"
+        );
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
@@ -13335,6 +13790,15 @@ mod cache_dispatch_tests {
                 Some(true),
                 "{tool} must flag stale rankings"
             );
+            // nw-217a: WHICH, not merely that some are. The human has had this
+            // list since nw-308; the agent was given a count and told to go
+            // find out — the same defect nw-315 closed for `stale_check`.
+            assert!(
+                value["stale_repos"]
+                    .as_array()
+                    .is_some_and(|repos| !repos.is_empty()),
+                "{tool} must name the stale repos: {value}"
+            );
             let note = value
                 .get("note")
                 .and_then(Value::as_str)
@@ -13363,9 +13827,21 @@ mod cache_dispatch_tests {
 
             let value = dispatch(&store, None, tool, json!({}), None).unwrap();
 
-            assert!(
-                value.get("rankings_stale").is_none(),
-                "{tool} must not flag staleness once every repo is current"
+            // nw-217a: `false`, not absent. An absent key cannot be read as
+            // "not stale" — "not stale" and "this tool does not say" are the
+            // same observation to an agent, and only one of them is a reason
+            // to trust the numbers. The CLI has said `false` since nw-308.
+            assert_eq!(
+                value.get("rankings_stale").and_then(Value::as_bool),
+                Some(false),
+                "{tool} must state that rankings are current, not merely omit \
+                 the claim"
+            );
+            assert_eq!(
+                value.get("stale_repos"),
+                Some(&json!([])),
+                "{tool} must name WHICH repos are stale, and an empty list is \
+                 how it says none are"
             );
             let note = value
                 .get("note")
@@ -16628,6 +17104,117 @@ mod cluster_flag_forwarding_precondition_tests {
             validate_tool_arguments("clusters", &json!({ "members": 500 })).is_err(),
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
+        );
+    }
+}
+
+#[cfg(test)]
+mod broken_links_window_tests {
+    use super::*;
+    use nestweaver_engine::index_markdown_directory_in_memory;
+    use std::fs;
+
+    fn make_vault(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        for (rel, content) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+        }
+        (dir, root)
+    }
+
+    /// nw-341: the ascending-confidence sort puts the same-folder (0.95) and
+    /// nearest-ancestor (0.92) tiers at the TAIL -- deliberately, so the most
+    /// severe rows come first (nw-297). With a cap and no offset, the tiers a
+    /// reviewer must inspect are exactly the ones that fall off the end: a
+    /// health tool that cannot be used to verify its own fixes.
+    ///
+    /// Note what this does NOT claim. The cap is not silent -- `read_limit`
+    /// REJECTS an out-of-range limit with an explicit error and `total` is
+    /// always in the envelope. The residual defects are the missing window and
+    /// the missing `truncated` flag, because `tool_brain_broken_links`
+    /// hand-rolls its disclosure instead of using the `Bounded` seam.
+    #[test]
+    fn the_high_confidence_tail_is_reachable_by_offset() {
+        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row.
+        let (_dir, root) = make_vault(&[
+            (
+                "f/a.md",
+                "# A\n\nSee [[Sibling]], [[al-one]], [[al-two]], [[al-three]].\n",
+            ),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("g/one.md", "---\naliases: [al-one]\n---\n# One\n"),
+            ("g/two.md", "---\naliases: [al-two]\n---\n# Two\n"),
+            ("g/three.md", "---\naliases: [al-three]\n---\n# Three\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "limit": 3 })).unwrap();
+        assert_eq!(page["total"], 4, "envelope: {page}");
+        assert_eq!(
+            page["truncated"],
+            json!(true),
+            "nw-341: a truncated page must SAY it is truncated, through the same \
+             (returned, total, truncated) seam every other bounded list uses: {page}"
+        );
+        let head: Vec<&str> = page["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            !head.contains(&"Sibling"),
+            "precondition: the 0.95 row must be the one the cap removes, got {head:?}"
+        );
+
+        let tail = tool_brain_broken_links(&store, json!({ "limit": 3, "offset": 3 })).unwrap();
+        let tail_texts: Vec<&str> = tail["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            tail_texts.contains(&"Sibling"),
+            "nw-341: the 0.95 same-folder tier must be REACHABLE -- it is precisely \
+             what a reviewer of the wikilink tier ladder has to inspect, got {tail_texts:?}"
+        );
+        assert_eq!(
+            tail["total"], 4,
+            "total must stay the PRE-offset population: {tail}"
+        );
+        assert_eq!(
+            tail["offset"], 3,
+            "the window's origin must be echoed, or a caller paging through \
+             cannot tell which page it is holding: {tail}"
+        );
+    }
+
+    /// nw-341: an offset past the end is an empty page, not an error and not a
+    /// wrapped-around page. It must still report the true population.
+    #[test]
+    fn an_offset_past_the_population_is_an_honest_empty_page() {
+        let (_dir, root) = make_vault(&[
+            ("f/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "offset": 500 })).unwrap();
+        assert_eq!(page["returned"], json!(0));
+        assert_eq!(page["total"], json!(1), "population, not remainder: {page}");
+        assert_eq!(page["truncated"], json!(true));
+        assert_eq!(
+            page["unresolved"].as_u64().unwrap() + page["low_confidence"].as_u64().unwrap(),
+            1,
+            "nw-297: classification is over the POPULATION, so it survives any \
+             window: {page}"
         );
     }
 }

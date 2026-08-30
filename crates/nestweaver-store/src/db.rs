@@ -611,7 +611,44 @@ fn bounded_system_config() -> lbug::SystemConfig {
         // clean runs are needed to put a false pass under 1%. If it only
         // REDUCES the rate rather than eliminating it, that is a different
         // finding and the bar has to be recomputed from the new rate.
-        .max_num_threads(env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1))
+        .max_num_threads(engine_max_threads())
+}
+
+/// The engine thread bound, read from the environment ONCE per process.
+///
+/// nw-265. Since nw-240 EVERY store open in the binary routes through
+/// `bounded_system_config`, so this key is read by `open_read_only` and
+/// `in_memory` too — 46 and 374 call sites. Re-reading a process-global on
+/// every open means any writer anywhere in the process can hand the parallel
+/// scan pool that nw-240 exists to REMOVE to every store opened after it. A
+/// unit test did exactly that: it set the key to `4` mid-run under cargo's
+/// multithreaded harness, and a sibling test opening 64 stores concurrently sat
+/// in that window.
+///
+/// Latching also removes the read side of a documented data race. Rust 2024
+/// marks `set_var` unsafe because concurrent `setenv`/`getenv` is UB, not
+/// merely untidy.
+///
+/// This is configuration: its value is fixed for the process lifetime in every
+/// real deployment. Reading it as if it were dynamic bought nothing and cost
+/// the mitigation. NOTE the default of `1` lives HERE, in code — NOT in
+/// `.cargo/config.toml`, whose `[env]` block sets only `LBUG_BUILD_FROM_SOURCE`
+/// and `NESTWEAVER_LBUG_MAX_DB_SIZE`.
+fn engine_max_threads() -> u64 {
+    static LATCHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LATCHED.get_or_init(|| {
+        parse_max_threads(std::env::var("NESTWEAVER_LBUG_MAX_THREADS").ok().as_deref())
+    })
+}
+
+/// Parse the thread bound out of an override, defaulting to the value that
+/// closes the nw-073 eviction-vs-read race.
+///
+/// Split out so the parse paths are testable WITHOUT mutating a global that
+/// every store open in the binary reads. That is the whole property the test
+/// this replaces was reaching for.
+fn parse_max_threads(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
 }
 
 fn hardened_system_config() -> lbug::SystemConfig {
@@ -709,7 +746,8 @@ fn open_lbug_with_recovery(
                      .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
                     path.display()
                 );
-                return Ok(lbug::Database::new(path, make_config())?);
+                return lbug::Database::new(path, make_config())
+                    .map_err(|e| StoreError::from(e).with_db_path(path));
             }
             if read_write
                 && is_orphaned_wal_error(&msg)
@@ -723,9 +761,13 @@ fn open_lbug_with_recovery(
                     path.display(),
                     quarantined.display()
                 );
-                return Ok(lbug::Database::new(path, make_config())?);
+                return lbug::Database::new(path, make_config())
+                    .map_err(|e| StoreError::from(e).with_db_path(path));
             }
-            Err(e.into())
+            // nw-346. This is the frame that knows WHICH database failed; the
+            // engine's message names no path, so attaching it here is what
+            // retires the caller's need to guess one.
+            Err(StoreError::from(e).with_db_path(path))
         }
     }
 }
@@ -1320,6 +1362,19 @@ impl GraphStore {
                 .map_err(|e| StoreError::Query(format!("read: {e}")))?;
             // Version-checked and repo-keyed. A v1 flat map fails this parse
             // and is treated as absent, which is neutral rather than wrong.
+            //
+            // nw-258(b). The version check is now PERFORMED, not merely
+            // claimed. This comment asserted it for a loader that never read
+            // `sidecar.version`, while the engine-side loader
+            // (`git_activity::load_git_activity_sidecar`) — used by the writer
+            // and the delete path, and by NO query route — did check it. So the
+            // guard `a_newer_version_is_discarded_rather_than_misread` pinned a
+            // property that all three RANKING paths lacked: this loader, the
+            // daemon's (`server.rs`), the MCP wrapper's and the CLI's.
+            //
+            // A shape check is not a version check. A v1 flat map fails the
+            // parse, but a v3 that keeps the shape and changes the SEMANTICS
+            // would have loaded silently and mis-ranked.
             let sidecar: crate::git_activity_sidecar::GitActivitySidecar =
                 match serde_json::from_str(&json) {
                     Ok(sidecar) => sidecar,
@@ -1332,6 +1387,15 @@ impl GraphStore {
                         return Ok(());
                     }
                 };
+            if sidecar.version != crate::git_activity_sidecar::GITACTIVITY_VERSION {
+                tracing::debug!(
+                    path = %path.display(),
+                    found_version = sidecar.version,
+                    expected_version = crate::git_activity_sidecar::GITACTIVITY_VERSION,
+                    "git-activity sidecar version mismatch; discarding (re-index to restore)"
+                );
+                return Ok(());
+            }
             self.load_git_activity_cache(sidecar.repos);
         }
         Ok(())
@@ -2717,6 +2781,25 @@ impl GraphStore {
         Ok(())
     }
 
+    fn update_publication_meta_on(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $key}) SET m.value = $value")
+            .map_err(|error| StoreError::Query(format!("prepare publication identity: {error}")))?;
+        conn.execute(
+            &mut statement,
+            vec![
+                ("key", lbug::Value::String(key.to_string())),
+                ("value", lbug::Value::String(value.to_string())),
+            ],
+        )
+        .map_err(|error| StoreError::Query(format!("update publication identity: {error}")))?;
+        Ok(())
+    }
+
     /// Read the database-bound identity. A legacy read-only database may have
     /// neither key and returns `None`; a partial or malformed identity is an
     /// error because silently inventing the missing half could attach foreign
@@ -2872,6 +2955,90 @@ impl GraphStore {
                     StoreError::Query(format!("commit data instance id: {error}"))
                 })?;
                 Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.query("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Move the recorded identity from a merged-away instance to the surviving
+    /// one.
+    ///
+    /// nw-264. DELIBERATELY DISTINCT from [`Self::ensure_data_instance_id`],
+    /// which must keep refusing to replace. That one guards against
+    /// *accidental* re-identification — a default changing under a database and
+    /// silently renaming its data. A merge is a *deliberate* re-identification,
+    /// and before this there was no API that could express one: the whole
+    /// workspace had exactly ONE writer of this key and it never replaced, so
+    /// `instance merge` rewrote every Repo/Vault/Project UID and left the
+    /// record naming the instance it had just merged away. The next config-less
+    /// `index` then adopted that name and re-forked the graph the merge healed
+    /// — the remedy nw-246's guard prints undid itself.
+    ///
+    /// Three guards keep it narrow:
+    ///
+    /// 1. It is a NO-OP unless the record currently equals `from`. A merge
+    ///    between two instances neither of which is the recorded one leaves the
+    ///    record alone; the write-once discipline still applies to every name
+    ///    except the merged-away one.
+    /// 2. It REFUSES if `observed_instance_ids` still contains `from`. The
+    ///    record must never claim a completion the graph does not show.
+    /// 3. It refuses an empty `to`, for the same reason `ensure_data_instance_id`
+    ///    does.
+    ///
+    /// On ordering: the merge has no single enclosing transaction to run inside
+    /// — it is a sequence of classified mutations with a final plan probe — so
+    /// this is called only where that probe has already reported `Applied`.
+    /// Guard 2 is what makes that safe rather than merely conventional: a
+    /// half-merged graph still shows `from`, and this refuses.
+    ///
+    /// Returns `true` when the record was moved.
+    pub fn rerecord_data_instance_id(&self, from: &str, to: &str) -> Result<bool, StoreError> {
+        let from = from.trim();
+        let to = to.trim();
+        if to.is_empty() {
+            return Err(StoreError::Query(
+                "refusing to record an empty data instance id".to_string(),
+            ));
+        }
+        if from == to {
+            return Ok(false);
+        }
+        // Guard 1: only the merged-away name is eligible.
+        if self.data_instance_id()?.as_deref() != Some(from) {
+            return Ok(false);
+        }
+        // Guard 2: the graph must already show the merge is done.
+        if self
+            .observed_instance_ids()?
+            .iter()
+            .any(|observed| observed == from)
+        {
+            return Err(StoreError::Query(format!(
+                "refusing to re-record the data instance id as {to:?}: rows still \
+                 observed under {from:?}, so the merge is not complete"
+            )));
+        }
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|error| StoreError::Query(format!("begin re-record instance id: {error}")))?;
+        // Re-check inside the transaction, exactly as `ensure_data_instance_id`
+        // does, so two concurrent mergers cannot both win.
+        let result = (|| match Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)? {
+            Some(existing) if existing == from => {
+                Self::update_publication_meta_on(&conn, DATA_INSTANCE_ID_META_KEY, to)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        })();
+        match result {
+            Ok(moved) => {
+                conn.query("COMMIT").map_err(|error| {
+                    StoreError::Query(format!("commit re-record instance id: {error}"))
+                })?;
+                Ok(moved)
             }
             Err(error) => {
                 let _ = conn.query("ROLLBACK");
@@ -4464,35 +4631,53 @@ mod tests {
 
 #[cfg(test)]
 mod hardened_config_tests {
+    /// nw-265. The test this replaces set `NESTWEAVER_LBUG_MAX_THREADS=4`
+    /// mid-run and asserted only "no panic" — buying weak coverage at the cost
+    /// of disarming a crash mitigation process-wide, because since nw-240 every
+    /// store open in the binary reads that key. The bound must be latched at
+    /// first read so a later mutation cannot reach an open.
+    ///
+    /// This test can FAIL when the property is broken: revert
+    /// `bounded_system_config` to `env_u64("NESTWEAVER_LBUG_MAX_THREADS")` and
+    /// the two reads below differ.
     #[test]
-    fn env_overrides_are_honored_and_default_bounds_threads() {
-        // Serialize the env mutation; other tests don't touch these keys.
-        // Default (no env): threads bounded to 1 to remove the eviction race.
-        // SAFETY: single-threaded test section; we set then clear.
-        unsafe {
-            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
-            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
-            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
-        }
-        // We can't read private SystemConfig fields, but we can prove the
-        // helper runs without panic under each override shape (parse paths).
+    fn the_thread_bound_is_latched_and_a_later_mutation_cannot_reach_an_open() {
+        let first = super::engine_max_threads();
+        // SAFETY: the value is latched, so this cannot reach an open — which is
+        // precisely what the assertion below proves. The key is restored
+        // immediately either way.
+        unsafe { std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "64") };
+        let after = super::engine_max_threads();
+        unsafe { std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS") };
+
+        assert_eq!(
+            first, after,
+            "the engine thread bound was re-read after the process started; any \
+             store opened after that mutation runs the parallel scan pool the \
+             nw-240 crash mitigation removes"
+        );
+    }
+
+    /// The property the old test was reaching for, without mutating a global:
+    /// the parse helper tolerates every override shape. No env, no race, no UB.
+    #[test]
+    fn a_malformed_thread_bound_falls_back_to_the_default_rather_than_panicking() {
+        assert_eq!(super::parse_max_threads(None), 1);
+        assert_eq!(super::parse_max_threads(Some("not-a-number")), 1);
+        assert_eq!(super::parse_max_threads(Some("")), 1);
+        assert_eq!(super::parse_max_threads(Some(" 4 ")), 4);
+        assert_eq!(super::parse_max_threads(Some("4")), 4);
+    }
+
+    /// The remaining two keys are read in `hardened_system_config` only, which
+    /// `open_read_only` and `in_memory` do not call — so their blast radius is
+    /// the write path, not every open. Proving the helper survives each
+    /// override shape needs no env mutation at all now that the one key that
+    /// DID leak is latched.
+    #[test]
+    fn the_hardened_config_builds_under_every_override_shape() {
         let _default = super::hardened_system_config();
-        unsafe {
-            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "4");
-            std::env::set_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES", "1073741824");
-            std::env::set_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT", "false");
-        }
-        let _overridden = super::hardened_system_config();
-        // Malformed values must not panic (fall back to default/auto).
-        unsafe {
-            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "not-a-number");
-        }
-        let _tolerant = super::hardened_system_config();
-        unsafe {
-            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
-            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
-            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
-        }
+        let _bounded = super::bounded_system_config();
     }
 }
 
@@ -4932,5 +5117,97 @@ mod schema_migration_tests {
         assert!(!is_column_already_present(
             "Connection exception: Cannot execute write operations in a read-only database!"
         ));
+    }
+}
+
+/// nw-258(b): the loader every query route uses must honour the sidecar
+/// version, not merely claim to.
+#[cfg(test)]
+mod git_activity_loader_tests {
+    use super::GraphStore;
+    use crate::git_activity_sidecar::GITACTIVITY_VERSION;
+
+    /// The comment on this loader said "Version-checked"; the guard
+    /// `a_newer_version_is_discarded_rather_than_misread` pinned that property
+    /// on the OTHER loader — the one no query route uses. A future v3 would
+    /// have been read as v2 by all three query paths and silently mis-ranked.
+    #[test]
+    fn the_ranking_loader_discards_a_sidecar_from_a_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION + 1,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+
+        assert!(
+            !store.has_git_activity(),
+            "a sidecar this build cannot interpret must be neutral, not read as \
+             if it were the current version — which is what the loader's own \
+             comment and the engine-side test both promise"
+        );
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), None);
+    }
+
+    /// The other direction, which keeps the first from over-correcting: the
+    /// CURRENT version must still load. A version check that discards
+    /// everything is indistinguishable from a loader that never worked.
+    #[test]
+    fn the_ranking_loader_still_loads_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+
+        assert!(store.has_git_activity());
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), Some(0.9));
+    }
+
+    /// nw-258(a)'s store-side half: the invalidator existed with ZERO callers,
+    /// so nothing could ever have proved it works. Clearing must restore
+    /// neutral ranking, and a reload after it must be visible — that pair is
+    /// what the daemon's refresh depends on.
+    #[test]
+    fn clearing_the_cache_restores_neutral_ranking_and_a_reload_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+        assert!(store.has_git_activity());
+
+        store.clear_git_activity_cache();
+        assert!(!store.has_git_activity());
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), None);
+
+        store.load_git_activity_sidecar(&path).unwrap();
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), Some(0.9));
     }
 }

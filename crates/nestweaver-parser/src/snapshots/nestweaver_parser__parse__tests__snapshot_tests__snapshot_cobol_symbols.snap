@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 5912
 expression: "parsed_symbols(\"simple.cbl\", &source)"
 ---
 - name: MAIN-LOGIC
   kind: Module
   start_line: 12
-  end_line: 12
+  end_line: 16
   signature: MAIN-LOGIC SECTION.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
@@ -17,7 +18,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
 - name: INITIALIZE-DATA
   kind: Function
   start_line: 18
-  end_line: 18
+  end_line: 19
   signature: INITIALIZE-DATA.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -29,7 +30,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
 - name: PROCESS-GREETING
   kind: Function
   start_line: 21
-  end_line: 21
+  end_line: 25
   signature: PROCESS-GREETING.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,7 +42,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
 - name: DISPLAY-RESULT
   kind: Function
   start_line: 27
-  end_line: 27
+  end_line: 28
   signature: DISPLAY-RESULT.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -53,7 +54,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
 - name: CALL-EXTERNAL
   kind: Module
   start_line: 30
-  end_line: 30
+  end_line: 31
   signature: CALL-EXTERNAL SECTION.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -65,7 +66,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
 - name: COPY-SECTION
   kind: Module
   start_line: 33
-  end_line: 33
+  end_line: 34
   signature: COPY-SECTION SECTION.
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

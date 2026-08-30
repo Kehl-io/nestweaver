@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 5800
 expression: "parsed_symbols(\"simple.cpp\", &source)"
 ---
 - name: SensorManager
@@ -18,7 +19,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   kind: Method
   start_line: 6
   end_line: 6
-  signature: initialize()
+  signature: void initialize();
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -30,7 +31,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   kind: Method
   start_line: 7
   end_line: 7
-  signature: readTemperature()
+  signature: double readTemperature();
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -53,8 +54,8 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
 - name: initialize
   kind: Method
   start_line: 12
-  end_line: 12
-  signature: "SensorManager::initialize()"
+  end_line: 14
+  signature: "void SensorManager::initialize() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -65,8 +66,8 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
 - name: readTemperature
   kind: Method
   start_line: 16
-  end_line: 16
-  signature: "SensorManager::readTemperature()"
+  end_line: 18
+  signature: "double SensorManager::readTemperature() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -161,8 +162,8 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
 - name: setup
   kind: Function
   start_line: 31
-  end_line: 31
-  signature: setup()
+  end_line: 36
+  signature: "void setup() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

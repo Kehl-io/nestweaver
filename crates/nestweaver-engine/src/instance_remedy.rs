@@ -16,12 +16,16 @@
 /// `nestweaver-mcp/src/tools.rs` already applies after ranking by data volume,
 /// which is the information these call sites do not have.
 ///
-/// The caveat at the end is deliberate and is NOT decoration. `instance merge`
-/// does not currently update the database's recorded instance identity, so a
-/// later index can re-create the split (nw-264). Emitting a confident,
-/// pasteable command for a known-incomplete operation would be a worse defect
-/// than the placeholder it replaces, so the command is concrete and the
-/// sentence around it is honest about what it does not finish.
+/// nw-264 CLOSED THE HEDGE THIS USED TO CARRY. The sentence read *"a merge does
+/// not yet update the database's recorded instance identity, so verify with
+/// `nestweaver brain status` before relying on it"* — deliberate, because
+/// emitting a confident pasteable command for a known-incomplete operation
+/// would have been a worse defect than the placeholder it replaced. The merge
+/// now moves the record to the surviving instance, so the command is a genuine
+/// one-step fix and the hedge is gone rather than softened.
+///
+/// The re-index that remains is NOT a hedge: it rebuilds each repo's derived
+/// edges under the surviving instance, which a UID remap does not do.
 pub fn instance_consolidation_remedy(ids: &[String], keeper: Option<&str>) -> String {
     let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -43,9 +47,8 @@ pub fn instance_consolidation_remedy(ids: &[String], keeper: Option<&str>) -> St
     }
     format!(
         "consolidate them into `{keeper}`:\n      {}\n    \
-         then re-index each repo — a merge does not yet update the database's \
-         recorded instance identity, so verify with `nestweaver brain status` \
-         before relying on it.",
+         then re-index each repo, which rebuilds its derived edges under \
+         `{keeper}`.",
         commands.join("\n      ")
     )
 }
@@ -69,8 +72,15 @@ mod tests {
             remedy.contains("nestweaver instance merge --from two --to one"),
             "the keeper must be deterministic (lexicographically smallest): {remedy}"
         );
-        // …and honest about what the merge does not finish (nw-264).
+        // The merge is now a genuine one-step fix (nw-264), so the remedy must
+        // no longer hedge that it leaves the recorded identity stale. The
+        // re-index that remains rebuilds derived edges and is real work.
         assert!(remedy.contains("re-index"), "{remedy}");
+        assert!(
+            !remedy.contains("does not yet") && !remedy.contains("before relying on it"),
+            "the hedge existed only because nw-264 was open; leaving it in tells \
+             the operator to distrust a command that now works: {remedy}"
+        );
 
         // One command per non-keeper, so N instances collapse in one pass.
         let three = vec!["b".to_string(), "c".to_string(), "a".to_string()];

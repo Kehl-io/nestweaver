@@ -189,6 +189,11 @@ struct Fixture {
     // Keeps the tempdir alive for the duration of the test.
     _dir: TempDir,
     db_path: PathBuf,
+    /// The indexed repo's checkout root. `read-symbols` resolves each symbol's
+    /// repo-relative `file_path` against a root, so a test that omits it reads
+    /// against the test process's cwd, finds nothing, and compares two empty
+    /// bodies (nw-340).
+    repo_dir: PathBuf,
 }
 
 /// Create a scratch DB indexing a small JS repo with enough cross-directory
@@ -229,7 +234,58 @@ fn setup_fixture() -> Fixture {
     );
     create_db(&repo_dir, &db_path);
 
-    Fixture { _dir: dir, db_path }
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
+}
+
+/// A fixture that carries a real Project.
+///
+/// nw-218. `project-context` cannot be compared on a database that has none:
+/// a NOT_FOUND on both routes is a byte-identical failure that asserts nothing,
+/// which is why `parity_project_context_direct_vs_daemon` was DELETED rather
+/// than kept. `setup_fixture` indexes four plain `.js` files and indexing never
+/// creates a Project node.
+///
+/// The blocker was smaller than the tombstone implies: projects do not need
+/// `materialize-projects` (which needs a live daemon). Three store writers are
+/// enough, and all three are already used by fixtures elsewhere in this
+/// workspace — `insert_project` in `tests/cli_test.rs` and
+/// `tests/daemon_test.rs`, and both batch edge writers in
+/// `crates/nestweaver-mcp/src/tools.rs`.
+fn setup_project_fixture() -> Fixture {
+    let fixture = setup_fixture();
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(&fixture.db_path).unwrap();
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:parity:demo".to_string(),
+                name: "demo".to_string(),
+                summary: Some("parity fixture".to_string()),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        // Every indexed symbol is a member, so the project has real mass and a
+        // small `--token-budget` genuinely truncates. A project whose members
+        // all fit is a fixture that cannot observe truncation at all.
+        let members: Vec<String> = store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.uid)
+            .collect();
+        assert!(
+            members.len() >= 4,
+            "the fixture must have symbol mass, or a budget cannot cut: {}",
+            members.len()
+        );
+        store
+            .batch_insert_project_symbol_edges("proj:parity:demo", &members, 1.0)
+            .unwrap();
+    }
+    fixture
 }
 
 fn setup_contract_fixture() -> Fixture {
@@ -245,7 +301,11 @@ fn setup_contract_fixture() -> Fixture {
         )],
     );
     create_db(&repo_dir, &db_path);
-    Fixture { _dir: dir, db_path }
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
 }
 
 // ─── Mode runners ────────────────────────────────────────────────────────────
@@ -1206,8 +1266,30 @@ fn parity_search_direct_vs_daemon() {
 
 #[test]
 fn parity_read_symbols_direct_vs_daemon() {
+    // nw-340: `--root` is not decoration here. Without it the DIRECT route
+    // resolves `src/a.js` against the test process's cwd and the DAEMON route
+    // against its own — neither is the fixture repo — so both printed a header
+    // with a blank line under it and this test compared two empty bodies and
+    // called it parity. It is also the reason the exit code had to become a
+    // discriminator: with `EXIT_SUCCESS` on an unreadable body there was
+    // nothing for the test to notice.
     let fixture = setup_fixture();
-    check_parity(&fixture.db_path, "read-symbols", &["read-symbols", "mainA"]);
+    let root = fixture.repo_dir.display().to_string();
+    let args = ["read-symbols", "mainA", "--root", root.as_str()];
+    check_parity(&fixture.db_path, "read-symbols", &args);
+
+    // And the body must actually be there, on both routes. Parity alone would
+    // still pass on two identical blanks.
+    let direct = run_direct(&fixture.db_path, &args);
+    let stdout = String::from_utf8_lossy(&direct.stdout);
+    assert!(
+        stdout.contains("export function mainA"),
+        "read-symbols must emit the symbol's SOURCE, not just its header: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("source unavailable"),
+        "the fixture root was passed, so the body must be readable: {stdout:?}"
+    );
 }
 
 #[test]
@@ -1220,13 +1302,71 @@ fn parity_detect_changes_direct_vs_daemon() {
     );
 }
 
-// `parity_project_context_direct_vs_daemon` is deliberately absent until the
-// fixture can carry a project. `setup_fixture` indexes four plain `.js` files
-// and creates no Project node, so `project-context demo` exited NOT_FOUND on
-// both routes — the byte comparison then passed on two identical failures and
-// asserted nothing about the four nw-188 honesty fields it was written for.
-// Re-add it with a fixture that materializes a project; a vacuous test is
-// worse than a missing one because it reports coverage that does not exist.
+/// nw-218. `parity_project_context_direct_vs_daemon` was DELETED in 8.0.0
+/// because `setup_fixture` creates no Project, so both routes exited NOT_FOUND
+/// and the byte comparison passed on two identical failures. `setup_project_fixture`
+/// removes that blocker.
+///
+/// Restored as a KEY-SET comparison, not the byte comparison it used to be.
+/// The two routes legitimately differ on `semantic_applied` and
+/// `degraded_components` — the direct path passes `HybridSearchConfig::default()`
+/// and `embed_model: None` — so a byte comparison would fail for a reason that
+/// is not the defect, and "the test is red for a known-benign reason" is how a
+/// suite stops being read.
+#[test]
+fn parity_project_context_direct_vs_daemon() {
+    let fixture = setup_project_fixture();
+    let db = &fixture.db_path;
+    let args = &["project-context", "demo", "--json", "--token-budget", "400"];
+
+    let direct = run_direct(db, args);
+    assert!(
+        direct.status.success(),
+        "project-context (direct) failed:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+    assert!(
+        daemon.status.success(),
+        "project-context (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+
+    assert_both_ran_for_real("project-context", "json", &direct, &daemon);
+    assert_same_key_sets("project-context", &direct, &daemon);
+
+    // The nw-188 honesty fields the deleted test was written for. These are
+    // the ones a caller acts on, so they must AGREE, not merely both exist.
+    let direct_json = parse_stdout("project-context (direct)", &direct);
+    let daemon_json = parse_stdout("project-context (daemon)", &daemon);
+    for field in ["truncated", "more_available", "seed_tokens_charged"] {
+        assert_eq!(
+            direct_json[field], daemon_json[field],
+            "`{field}` differs between routes for the same project and the same \
+             budget, so how much was dropped depends on which transport \
+             answered.\ndirect: {direct_json}\ndaemon: {daemon_json}"
+        );
+    }
+
+    // Counterweight: a budget the project fits must report NOT truncated, or
+    // the equality above is satisfiable by both routes hardcoding `true`.
+    let roomy = &[
+        "project-context",
+        "demo",
+        "--json",
+        "--token-budget",
+        "16000",
+    ];
+    let roomy_direct = parse_stdout("project-context (roomy)", &run_direct(db, roomy));
+    assert_eq!(
+        roomy_direct["truncated"],
+        serde_json::json!(false),
+        "a budget that fits must not report truncation: {roomy_direct}"
+    );
+}
 
 /// msgpack must honour `--scope` on BOTH routes.
 ///
@@ -1248,11 +1388,17 @@ fn parity_msgpack_scope_direct_vs_daemon() {
     );
     // An INVALID scope must fail on both, not slip through whichever route
     // happens to dispatch on format first.
+    //
+    // nw-312 moved this refusal from the handler to the PARSER, so the reason
+    // changed from `unknown export scope` (an `anyhow` chain, exit 1) to clap's
+    // usage error, which enumerates the legal values and exits 64. The parity
+    // is now structural rather than asserted: clap runs before either route
+    // dispatches, so the two cannot disagree about what a bad `--scope` is.
     check_parity_of_refusal(
         &fixture.db_path,
         "export msgpack --scope nonsense",
         &["export", "--format", "msgpack", "--scope", "nonsense"],
-        "unknown export scope",
+        "possible values: all, code, vault",
     );
 }
 
@@ -1294,7 +1440,11 @@ fn export_defaults_to_the_all_scope_not_code() {
         .args(["--db", &db_path.display().to_string()])
         .assert()
         .success();
-    let fixture = Fixture { _dir: dir, db_path };
+    let fixture = Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    };
 
     let defaulted = run_direct(&fixture.db_path, &["export", "--format", "graphml"]);
     assert!(
@@ -1795,10 +1945,153 @@ fn intent_vocabulary_agrees_across_all_three_routes() {
     );
 }
 
+/// nw-217a. The containment guard, generalised from ONE tool to a table.
+///
+/// nw-217 is the most recurrent defect class in this workspace — "a guard
+/// present in one implementation and absent in its twin" — and it decomposes
+/// into six shapes that do NOT share one answer. This is the mechanical check
+/// for the third and highest-leverage of them: response-shape drift between
+/// routes. A key the CLI emits and MCP does not is a field an agent cannot see;
+/// the converse is a field a human cannot see.
+///
+/// `the_mcp_route_does_not_grow_new_disclosure_gaps` has held `stale_check` to
+/// this since nw-315 and held nothing else to it, which is how nw-316's three
+/// missing `project_context` disclosure fields and nw-347's missing `_meta` on
+/// `hubs`/`bridges` both survived a release that spent six commits on route
+/// parity. Both of those rows are in this table now, and both fail without the
+/// fixes in this branch.
+///
+/// The assertion is CONTAINMENT against an explicit `KNOWN_GAPS` list, not
+/// equality: closing a gap shrinks the set safely, opening a new one fails, and
+/// a deliberate asymmetry has to be written down with the reason.
+///
+/// NOT covered by this, and not claimed: shapes S1 (two dispatch seams — a
+/// TYPE, `provenance_seam::Unstamped`), S2 (registry drift — enumeration),
+/// S4 (argument-contract drift — the clap/schema cross-check, nw-217b),
+/// S5 (guard call-site parity) and S6 (semantic divergence, which needs a
+/// fixture that can tell two behaviours apart and is the parity harness, one
+/// test at a time).
+#[test]
+fn no_cli_command_discloses_more_than_its_mcp_twin() {
+    /// A gap is `(tool, key path)` with the finding that owns it. EMPTY is the
+    /// goal; an entry is a promise, not a permission.
+    const KNOWN_GAPS: &[(&str, &str)] = &[];
+
+    // Rows are (CLI argv, MCP tool, MCP arguments). Arguments must be the
+    // SAME question on both sides or the diff is about the question, not the
+    // route.
+    let rows: Vec<(Vec<&str>, &str, serde_json::Value)> = vec![
+        (
+            vec!["stale-check", "--json"],
+            "stale_check",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["hubs", "--json", "--top", "3"],
+            "hub_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["bridges", "--json", "--top", "3"],
+            "bridge_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["brain", "search", "mainA", "--json"],
+            "brain_search",
+            serde_json::json!({ "query": "mainA" }),
+        ),
+        (
+            vec!["dead-code", "--json"],
+            "dead_code",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["flow-trace", "mainA", "--json"],
+            "flow_trace",
+            serde_json::json!({ "symbol": "mainA" }),
+        ),
+        (
+            vec!["blast-radius", "--files", "src/a.js", "--json"],
+            "blast_radius",
+            serde_json::json!({ "changed_files": ["src/a.js"] }),
+        ),
+    ];
+
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (argv, tool, args) in rows {
+        let label = argv.join(" ");
+        let cli = run_direct(db, &argv);
+        assert!(
+            cli.status.success(),
+            "{label} (direct) failed:\n{}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let cli_json = parse_stdout(&label, &cli);
+        let mcp_json = run_via_mcp(db, tool, args);
+
+        let mcp_keys = json_key_paths(&mcp_json);
+        let missing: Vec<String> = json_key_paths(&cli_json)
+            .into_iter()
+            .filter(|key| !mcp_keys.contains(key))
+            .filter(|key| !KNOWN_GAPS.contains(&(tool, key.as_str())))
+            .collect();
+        if !missing.is_empty() {
+            failures.push(format!(
+                "`{label}` -> `{tool}`: {missing:?}\n  CLI: {cli_json}\n  MCP: {mcp_json}"
+            ));
+        }
+    }
+
+    // `project_context` needs a project, which is why this row could not exist
+    // before nw-218 — `setup_fixture` creates none, so both routes answered
+    // NOT_FOUND and any comparison passed on two identical failures.
+    let project = setup_project_fixture();
+    let argv = ["project-context", "demo", "--json", "--token-budget", "400"];
+    let cli = run_direct(&project.db_path, &argv);
+    assert!(
+        cli.status.success(),
+        "project-context (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("project-context", &cli);
+    let mcp_json = run_via_mcp(
+        &project.db_path,
+        "project_context",
+        serde_json::json!({ "project": "demo", "token_budget": 400 }),
+    );
+    let mcp_keys = json_key_paths(&mcp_json);
+    let missing: Vec<String> = json_key_paths(&cli_json)
+        .into_iter()
+        .filter(|key| !mcp_keys.contains(key))
+        .filter(|key| !KNOWN_GAPS.contains(&("project_context", key.as_str())))
+        .collect();
+    if !missing.is_empty() {
+        failures.push(format!(
+            "`project-context` -> `project_context`: {missing:?}\n  CLI: {cli_json}\n  MCP: {mcp_json}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "these fields reach a CLI caller and not an MCP one, and they are not in \
+         the list of gaps this workspace knowingly left open:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// The structural guard: for a tool with a CLI twin, any key the CLI emits and
 /// MCP does not is a field an agent cannot see. The known gaps are listed
 /// explicitly with the finding that owns them, and the assertion is
 /// CONTAINMENT — closing one shrinks the set safely, opening a new one fails.
+///
+/// Kept alongside `no_cli_command_discloses_more_than_its_mcp_twin` rather than
+/// folded into it: this one names `stale_check` in its failure message, which
+/// is the row nw-315 closed, and its docstring records why the `._meta*`
+/// entries that used to sit in `KNOWN_GAPS` were INERT.
 #[test]
 fn the_mcp_route_does_not_grow_new_disclosure_gaps() {
     /// EMPTY, and that is the point. nw-315 owned every entry that used to be
@@ -1921,4 +2214,445 @@ fn mcp_stale_check_reports_which_repos_not_merely_that_some_do() {
              {cli_json}\nMCP: {mcp_json}"
         );
     }
+}
+
+/// nw-347. `_meta` is a promise `SERVER_INSTRUCTIONS` makes on every route, and
+/// three of the four CLI emitters break it. `print_ranking_json` (`hubs`,
+/// `bridges`) has no `_meta` parameter at all, and the `bridges` daemon leg
+/// actively runs `strip_hybrid_meta` over the envelope before rendering it —
+/// so the daemon's own stamp is discarded and the renderer has nothing to put
+/// back. Meanwhile `hub_nodes`/`bridge_nodes` over MCP carry one, because
+/// `tools::dispatch` stamps.
+///
+/// Asserted CLI-vs-MCP rather than CLI-vs-CLI because MCP is the route with no
+/// presentation layer above the tool: whatever the CLI does not print, the
+/// human never learns, and the two surfaces are documented to agree.
+#[test]
+fn every_json_cli_surface_carries_the_provenance_mcp_carries() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    for (argv, tool, args) in [
+        (
+            vec!["hubs", "--json", "--top", "3"],
+            "hub_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["bridges", "--json", "--top", "3"],
+            "bridge_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["brain", "search", "mainA", "--json"],
+            "brain_search",
+            serde_json::json!({ "query": "mainA" }),
+        ),
+    ] {
+        let label = argv.join(" ");
+        let cli = run_direct(db, &argv);
+        assert!(
+            cli.status.success(),
+            "{label} failed:\n{}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let cli_json = parse_stdout(&label, &cli);
+        let mcp_json = run_via_mcp(db, tool, args);
+
+        assert!(
+            cli_json["_meta"]["sources"].is_array(),
+            "`{label}` --json carries no `_meta`, while `{tool}` over MCP does. A \
+             renderer that rebuilds from a typed struct dropped the field the tool \
+             layer was given one author for (nw-315/nw-347): {cli_json}"
+        );
+        for leg in ["scope", "stale_repos"] {
+            assert!(
+                cli_json["_meta"].get(leg).is_some(),
+                "`{label}`: partial provenance is how a caller learns the wrong \
+                 thing confidently: {cli_json}"
+            );
+        }
+        assert_eq!(
+            cli_json["_meta"], mcp_json["_meta"],
+            "`{label}`: the CLI and MCP disagree about where the same answer came \
+             from"
+        );
+    }
+}
+
+/// nw-347, the sharpest leg: the split is INSIDE one command. `brain search
+/// --json` prints `tools::dispatch`'s stamped payload verbatim on the direct
+/// route (`src/main.rs`, the `BrainCommands::Search` direct leg) and rebuilds
+/// field-by-field from `nestweaver_proto::BrainSearchResponse` on the daemon
+/// route (`render_brain_search_response`), and that proto has no `_meta` field.
+/// So the SHAPE of the answer tracks whether a daemon happens to be running
+/// rather than what the caller asked for — nw-108's defect recurring on the
+/// provenance field, on the DEFAULT route.
+#[test]
+fn brain_search_json_has_one_shape_whether_or_not_a_daemon_is_running() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let argv = ["brain", "search", "mainA", "--json"];
+
+    let direct = run_direct(db, &argv);
+    assert!(
+        direct.status.success(),
+        "brain search (direct) failed:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_json = parse_stdout("brain search (direct)", &direct);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, &argv);
+    assert!(
+        daemon.status.success(),
+        "brain search (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    let daemon_json = parse_stdout("brain search (daemon)", &daemon);
+
+    assert_eq!(
+        direct_json["_meta"].is_object(),
+        daemon_json["_meta"].is_object(),
+        "`brain search --json` emits `_meta` on one route and not the other, so a \
+         caller parsing the response has to know which transport answered.\n\
+         direct: {direct_json}\ndaemon: {daemon_json}"
+    );
+    assert!(
+        daemon_json["_meta"]["sources"].is_array(),
+        "the daemon route lost the provenance the proto boundary could not \
+         carry: {daemon_json}"
+    );
+}
+
+/// nw-259(b). `--token-budget` got `range(1..=16000)` to match its schema;
+/// `--limit`, declared six lines below it, got nothing — while `code_context`'s
+/// schema carries `maximum: 5000` (with a comment explaining that the tool asks
+/// for `limit + 1` and an unbounded value overflows it) and the daemon proxy
+/// validates against that schema. So the same invocation was accepted or
+/// rejected by whether a daemon happened to be running: the bound was a
+/// property of the transport, not of the contract.
+#[test]
+fn context_limit_is_bounded_identically_on_both_routes() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let args = &["context", "mainA", "--limit", "6000"];
+
+    let direct = run_direct(db, args);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "`--limit 6000` is rejected on one route and accepted on the other.\n\
+         direct ({:?}):\n{}\ndaemon ({:?}):\n{}",
+        direct.status.code(),
+        flatten_miette(&direct.stderr),
+        daemon.status.code(),
+        flatten_miette(&daemon.stderr)
+    );
+    assert_eq!(
+        direct.status.code(),
+        Some(64),
+        "an out-of-range argument is a USAGE error; `--token-budget` already \
+         classifies it that way on this same command"
+    );
+
+    // Counterweight: a value INSIDE the bound must still be accepted on both,
+    // or a parser with the wrong range would satisfy the above.
+    let ok_args = &["context", "mainA", "--limit", "5000"];
+    assert!(
+        run_direct(db, ok_args).status.success(),
+        "5000 is the schema's maximum and must be accepted"
+    );
+    assert!(run_via_daemon(db, ok_args).status.success());
+}
+
+/// nw-259(a), machine route. **Which cap cut** must be readable by a consumer
+/// that cannot read prose.
+///
+/// The human route already names the cause — `TRUNCATED by --token-budget 200
+/// — raise it for more` versus `TRUNCATED at limit 5 — pass --limit for more`
+/// — but that disclosure lived only in the `--stats` string. `--json` emitted
+/// `{"total": 576, "limit": 5000, "truncated": true}` for a cut the BUDGET
+/// made, so an agent read "truncated at limit 5000", raised `--limit`, and got
+/// the same rows back. That is the wrong-remedy defect nw-259 exists to close,
+/// still live for every script and every agent — the audience with no prose to
+/// fall back on.
+///
+/// Asserted on all three routes, because the direct path, the daemon path and
+/// the MCP tool each decide this independently and a fix to one is how they
+/// diverged before.
+#[test]
+fn context_truncation_names_the_cause_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // A LIMIT cut: the budget is roomy, so only `--limit` can have cut.
+    let by_limit = ["context", "mainA", "--json", "--limit", "1"];
+    // A BUDGET cut: the limit is the schema maximum and cannot bite, so only
+    // the budget can have cut. This is the case that reported `limit`.
+    let by_budget = [
+        "context",
+        "mainA",
+        "--json",
+        "--limit",
+        "5000",
+        "--token-budget",
+        "1",
+    ];
+    // BOTH fired. The budget cut LAST, so raising `--limit` alone cannot get
+    // past it — naming the limit here is the wrong remedy.
+    let by_both = [
+        "context",
+        "mainA",
+        "--json",
+        "--limit",
+        "1",
+        "--token-budget",
+        "1",
+    ];
+    // Neither fired: the field must not accuse a cap that did nothing.
+    let uncapped = ["context", "mainA", "--json", "--limit", "5000"];
+
+    let assert_cause =
+        |route: &str, payload: &serde_json::Value, expected: Option<&str>| match expected {
+            Some(cause) => {
+                assert_eq!(
+                    payload["truncated"],
+                    serde_json::json!(true),
+                    "{route}: the cap must actually bite or this proves nothing: {payload}"
+                );
+                assert_eq!(
+                    payload.get("truncated_by").and_then(|v| v.as_str()),
+                    Some(cause),
+                    "{route}: a consumer cannot tell WHICH cap cut, so it will raise the \
+                     wrong knob and get the same rows: {payload}"
+                );
+            }
+            None => {
+                assert_ne!(
+                    payload["truncated"],
+                    serde_json::json!(true),
+                    "{route}: nothing was capped: {payload}"
+                );
+                assert!(
+                    payload
+                        .get("truncated_by")
+                        .is_none_or(serde_json::Value::is_null),
+                    "{route}: a complete answer must not blame a cap: {payload}"
+                );
+            }
+        };
+
+    // ── Route 1: direct ──
+    for (args, expected) in [
+        (&by_limit[..], Some("limit")),
+        (&by_budget[..], Some("token_budget")),
+        (&by_both[..], Some("token_budget")),
+        (&uncapped[..], None),
+    ] {
+        let out = run_direct(db, args);
+        assert!(
+            out.status.success(),
+            "context (direct) {args:?} failed:\n{}",
+            flatten_miette(&out.stderr)
+        );
+        assert_cause(
+            &format!("direct {args:?}"),
+            &parse_stdout("context (direct)", &out),
+            expected,
+        );
+    }
+
+    // ── Route 3: MCP, before the daemon takes the DB lock ──
+    //
+    // `code_context` has ONE cap, so `truncated: true` is unambiguous there
+    // *today* — but the CLI's daemon route parses this very payload and then
+    // applies its own budget on top, so the cause has to be IN the payload for
+    // route 2 to be able to override it rather than recompute it.
+    let mcp_capped = run_via_mcp(
+        db,
+        "code_context",
+        serde_json::json!({ "seeds": ["mainA"], "limit": 1 }),
+    );
+    assert_cause("mcp code_context limit=1", &mcp_capped, Some("limit"));
+    let mcp_uncapped = run_via_mcp(
+        db,
+        "code_context",
+        serde_json::json!({ "seeds": ["mainA"], "limit": 5000 }),
+    );
+    assert_cause("mcp code_context limit=5000", &mcp_uncapped, None);
+
+    // ── Route 2: daemon ──
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    for (args, expected) in [
+        (&by_limit[..], Some("limit")),
+        (&by_budget[..], Some("token_budget")),
+        (&by_both[..], Some("token_budget")),
+        (&uncapped[..], None),
+    ] {
+        let out = run_via_daemon(db, args);
+        assert!(
+            out.status.success(),
+            "context (daemon) {args:?} failed:\n{}",
+            flatten_miette(&out.stderr)
+        );
+        assert_cause(
+            &format!("daemon {args:?}"),
+            &parse_stdout("context (daemon)", &out),
+            expected,
+        );
+    }
+}
+
+/// nw-259(a), the human half. `--stats` is OFF by default.
+///
+/// The truncation clause was built into the `--stats` line, so the DEFAULT
+/// human output of a capped `context` was byte-identical to a complete one:
+/// the reader saw `Connected (1 symbols, ranked by relevance)` and had nothing
+/// to compare it against. Disclosure that only appears under an opt-in flag is
+/// the same silence the cap was supposed to stop being.
+///
+/// Asserted with `--stats` absent on purpose. The counterweight is the second
+/// half: an UNCAPPED run must stay quiet, or printing the notice
+/// unconditionally would satisfy the first assertion.
+#[test]
+fn a_capped_context_says_so_with_stats_off() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let capped = run_direct(db, &["context", "mainA", "--limit", "1"]);
+    let stdout = String::from_utf8_lossy(&capped.stdout);
+    assert!(
+        stdout.contains("TRUNCATED at limit 1"),
+        "a capped result renders identically to a complete one with `--stats` \
+         off, which is the whole defect:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("pass --limit for more"),
+        "the notice must carry the remedy, not just the fact:\n{stdout}"
+    );
+
+    let budgeted = run_direct(
+        db,
+        &["context", "mainA", "--limit", "5000", "--token-budget", "1"],
+    );
+    let stdout = String::from_utf8_lossy(&budgeted.stdout);
+    assert!(
+        stdout.contains("--token-budget"),
+        "the human notice must name the cap that actually cut, exactly as the \
+         `--stats` line does — they read the SAME field:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("pass --limit for more"),
+        "a budget cut prescribed `--limit`, which cannot change the outcome:\n{stdout}"
+    );
+
+    let complete = run_direct(db, &["context", "mainA", "--limit", "5000"]);
+    let stdout = String::from_utf8_lossy(&complete.stdout);
+    assert!(
+        !stdout.contains("TRUNCATED"),
+        "nothing was capped, so nothing may be claimed:\n{stdout}"
+    );
+}
+
+/// Where else does the property hold? `summary` — TWO caps, one boolean.
+///
+/// A `summary` result can be cut by the level's generator cap (500 symbols, 50
+/// clusters, 30 hubs — none of them a knob the caller passed) or by
+/// `--token-budget`, and both routes reported a single `truncated` for both.
+/// The remedies are different — narrow with `--target`, or raise the budget —
+/// so `truncated: true` alone leaves a consumer guessing.
+///
+/// Named as INDEPENDENT booleans, not as `context`'s single `truncated_by`
+/// string, because these two caps do not compose in an order: both remedies
+/// stay useful when both fire. That is `brain_impact`'s existing shape
+/// (`truncated_by_depth` / `truncated_by_threshold`), not a new one.
+#[test]
+fn summary_names_which_cap_cut_on_both_routes() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(
+        db,
+        &[
+            "summary",
+            "--level",
+            "file",
+            "--json",
+            "--token-budget",
+            "1",
+        ],
+    );
+    assert!(
+        cli.status.success(),
+        "summary (direct) failed:\n{}",
+        flatten_miette(&cli.stderr)
+    );
+    let payload = parse_stdout("summary (direct)", &cli);
+    assert_eq!(
+        payload["truncated"],
+        serde_json::json!(true),
+        "the budget must bite or this proves nothing: {payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_budget"],
+        serde_json::json!(true),
+        "a budget cut must say so: {payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_cap"],
+        serde_json::json!(false),
+        "the generator cap did not fire; blaming it sends the caller to \
+         `--target`, which cannot help here: {payload}"
+    );
+
+    let mcp = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "file", "token_budget": 1 }),
+    );
+    assert_eq!(
+        mcp["truncated"],
+        serde_json::json!(true),
+        "the budget must bite on the MCP route too: {mcp}"
+    );
+    assert_eq!(
+        mcp["truncated_by_budget"],
+        serde_json::json!(true),
+        "the agent-facing route is the one with no prose to fall back on: {mcp}"
+    );
+    assert_eq!(mcp["truncated_by_cap"], serde_json::json!(false));
+
+    // Counterweight: an unbounded run must set neither, or hardcoding `true`
+    // would satisfy everything above.
+    let roomy = run_direct(
+        db,
+        &[
+            "summary",
+            "--level",
+            "file",
+            "--json",
+            "--token-budget",
+            "0",
+        ],
+    );
+    let payload = parse_stdout("summary (unbounded)", &roomy);
+    assert_eq!(payload["truncated"], serde_json::json!(false), "{payload}");
+    assert_eq!(
+        payload["truncated_by_budget"],
+        serde_json::json!(false),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["truncated_by_cap"],
+        serde_json::json!(false),
+        "{payload}"
+    );
 }

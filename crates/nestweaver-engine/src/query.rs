@@ -458,6 +458,58 @@ pub struct CrossRepoLink {
     pub confidence: f32,
 }
 
+/// WHICH cap truncated a result.
+///
+/// nw-259(a), machine route. A `context` arm carries more than one cap —
+/// `--limit`, `--token-budget`, and the `CODE_CONTEXT_DEFAULT_LIMIT` that
+/// stands in for an omitted `--limit` — and had a single `truncated` boolean
+/// and a single `limit` field to explain all of them. A caller who read
+/// `{"limit": 5000, "truncated": true}` after a BUDGET cut raised `--limit`,
+/// got the same rows, and had no next move. The human `--stats` line learned
+/// to name the cause; the JSON payload, which is what every agent and script
+/// reads, did not.
+///
+/// This is deliberately NOT a sixth spelling of the `(bound, total,
+/// truncated)` triple that `Bounded` standardised. It answers a question none
+/// of those three fields can: `total` says how many matched, `truncated` says
+/// the caller is not holding all of them, and this says which knob to turn.
+/// It rides ALONGSIDE the triple and is meaningful only when `truncated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationCause {
+    /// A row-count cap: `--limit`, the `limit` tool argument, or the default
+    /// that stands in for an omitted one.
+    Limit,
+    /// An output-size cap: `--token-budget` / the `token_budget` argument.
+    TokenBudget,
+}
+
+impl TruncationCause {
+    /// The wire spelling, so a renderer never restates the serde attribute.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+            Self::TokenBudget => "token_budget",
+        }
+    }
+
+    /// Decide which cap to blame when more than one could have cut.
+    ///
+    /// **The budget wins.** It is applied AFTER the row cap, to whatever the
+    /// row cap left, so raising `--limit` alone cannot get past a budget that
+    /// is already full — prescribing it would be the wrong remedy even though
+    /// the row cap really did also fire. Every route that can apply both caps
+    /// calls this rather than restating the precedence; a second copy is how
+    /// the human route and the JSON route came to disagree in the first place.
+    pub const fn resolve(cut_by_token_budget: bool, cut_by_limit: bool) -> Option<Self> {
+        match (cut_by_token_budget, cut_by_limit) {
+            (true, _) => Some(Self::TokenBudget),
+            (false, true) => Some(Self::Limit),
+            (false, false) => None,
+        }
+    }
+}
+
 /// The full result returned by `build_context`.
 // Deserialize so the daemon's `code_context` reply round-trips back into the
 // same type the direct path builds, and BOTH render through one function.
@@ -496,6 +548,24 @@ pub struct ContextResult {
     /// were standardised on, so the CLI parses the daemon's reply into it.
     #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
     pub connected_total: Option<usize>,
+    /// WHICH cap cut, when one did.
+    ///
+    /// `truncated` says the caller is not holding everything; this says what
+    /// to do about it. Set by whichever layer applied the cap — the engine
+    /// imposes none of its own — and resolved through
+    /// `TruncationCause::resolve` when more than one could have fired, so the
+    /// `--stats` line and this field cannot disagree.
+    ///
+    /// `None` when nothing was cut, and also when the producer predates this
+    /// field; `truncated == Some(true)` with no cause is the older-producer
+    /// case, and is exactly the ambiguity this exists to remove going forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by: Option<TruncationCause>,
+    /// The token budget that was applied, echoed so a caller reading
+    /// `truncated_by: "token_budget"` can see the number it has to raise —
+    /// the same service `limit` performs for `truncated_by: "limit"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<usize>,
 }
 
 /// Detect whether an input string looks like a file path.
@@ -685,6 +755,8 @@ pub fn build_context_with_intent(
         // these after deciding whether the extra row they asked for arrived.
         limit: None,
         truncated: None,
+        truncated_by: None,
+        token_budget: None,
         // `connected_total` is different from the two above: it is not a
         // policy the caller chose, it is a fact only this traversal can
         // observe, so the engine is the only layer that CAN report it.
@@ -979,6 +1051,22 @@ pub struct FeatureContextResult {
     /// identical defect one screen away from the one that was reported.
     #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
     pub connected_total: Option<usize>,
+    /// The same disclosure `ContextResult` carries, for the same reason.
+    ///
+    /// Where else does nw-259(a)'s property need to hold? Here. `context
+    /// --feature` runs through the SAME CLI arm and applies the SAME two caps
+    /// — `--limit` here, `--token-budget` in the caller — and reported neither
+    /// a `truncated` flag nor a cause, so a budget-cut feature context
+    /// rendered byte-identically to a complete one on both routes. `total` was
+    /// the only clue, and it says nothing about which knob to turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by: Option<TruncationCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<usize>,
 }
 
 /// Build a task-focused context for a declared feature bundle.
@@ -1119,6 +1207,9 @@ pub fn build_feature_context(
         })
         .collect();
 
+    // Computed BEFORE the literal moves `connected`.
+    let limit_truncated = connected_total > connected.len();
+
     Ok(FeatureContextResult {
         feature: FeatureInfo {
             name: feature.name.clone(),
@@ -1130,6 +1221,14 @@ pub fn build_feature_context(
         connected,
         unmatched_entry_points,
         connected_total: Some(connected_total),
+        // Reported by the layer that imposed it. The row cap is this
+        // builder's, so it answers for it; `--token-budget` is applied by the
+        // caller after this returns, and the caller upgrades `truncated_by`
+        // through `TruncationCause::resolve` when it also cuts.
+        limit,
+        truncated: Some(limit_truncated),
+        truncated_by: TruncationCause::resolve(false, limit_truncated),
+        token_budget: None,
     })
 }
 

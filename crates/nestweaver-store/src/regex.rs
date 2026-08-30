@@ -168,8 +168,34 @@ pub enum RegexTruncationReason {
     ResultLimit,
     Deadline,
     CandidateCap,
+    /// The candidate corpus itself was short: a whole-corpus scan reached rows
+    /// it could not decode and dropped them (nw-335 corrupt-row tolerance).
+    ///
+    /// This module's contract is that an incomplete answer SAYS it is
+    /// incomplete — `Deadline` and `CandidateCap` exist for exactly that, and
+    /// nw-076 was this surface reporting a partial scan as definitive. A
+    /// tolerated corrupt row bypassed both: the corpus silently shrank and the
+    /// result still claimed `truncated: false`. "No matches" over a corpus with
+    /// unread rows is not a verified absence.
+    UndecodableRows,
     #[default]
     Unknown,
+}
+
+/// Pick the reason a caller can act on when two stages each reported one.
+///
+/// [`RegexTruncationReason::UndecodableRows`] describes the CORPUS, not the
+/// scan, so any genuine stop (deadline, cap, limit) outranks it — but it must
+/// survive when nothing else stopped, or a short corpus reports as complete.
+fn stronger_truncation(
+    first: Option<RegexTruncationReason>,
+    second: Option<RegexTruncationReason>,
+) -> Option<RegexTruncationReason> {
+    match (first, second) {
+        (Some(RegexTruncationReason::UndecodableRows), Some(other)) => Some(other),
+        (Some(first), _) => Some(first),
+        (None, second) => second,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -784,11 +810,17 @@ impl GraphStore {
         };
 
         let mut out = Vec::new();
+        // Whether any whole-corpus scan below came back SHORT. The scans
+        // tolerate a row they cannot decode rather than losing the corpus
+        // (nw-335), so `Ok` no longer means "all of it" — and this function's
+        // entire job is to report an incomplete candidate set as incomplete.
+        let mut degraded = false;
 
         // Sections — body text is the richest source. We need the parent note's
         // file_path for the location, so build a note_uid -> path map once.
         if want_kind("Section") {
-            let notes = self.list_notes(None)?;
+            let (notes, integrity) = self.list_notes_with_integrity(None)?;
+            degraded |= integrity.is_degraded();
             if interrupted()? {
                 return Ok((out, Some(RegexTruncationReason::Deadline)));
             }
@@ -796,7 +828,9 @@ impl GraphStore {
                 .into_iter()
                 .map(|n| (n.uid, (n.file_path, n.vault_uid)))
                 .collect();
-            for s in self.list_all_sections()? {
+            let (sections, integrity) = self.list_all_sections_with_integrity()?;
+            degraded |= integrity.is_degraded();
+            for s in sections {
                 if interrupted()? {
                     return Ok((out, Some(RegexTruncationReason::Deadline)));
                 }
@@ -832,7 +866,9 @@ impl GraphStore {
 
         // Notes — index the title (the section body carries the rest).
         if want_kind("Note") {
-            for n in self.list_notes(None)? {
+            let (all_notes, integrity) = self.list_notes_with_integrity(None)?;
+            degraded |= integrity.is_degraded();
+            for n in all_notes {
                 if interrupted()? {
                     return Ok((out, Some(RegexTruncationReason::Deadline)));
                 }
@@ -863,7 +899,9 @@ impl GraphStore {
 
         // Frontmatter — the raw YAML, with a real file line offset.
         if want_kind("Frontmatter") {
-            for n in self.list_notes(None)? {
+            let (all_notes, integrity) = self.list_notes_with_integrity(None)?;
+            degraded |= integrity.is_degraded();
+            for n in all_notes {
                 if interrupted()? {
                     return Ok((out, Some(RegexTruncationReason::Deadline)));
                 }
@@ -899,7 +937,9 @@ impl GraphStore {
 
         // Symbols — signature text.
         if want_kind("Symbol") {
-            for sym in self.list_all_symbols()? {
+            let (symbols, integrity) = self.list_all_symbols_with_integrity()?;
+            degraded |= integrity.is_degraded();
+            for sym in symbols {
                 if interrupted()? {
                     return Ok((out, Some(RegexTruncationReason::Deadline)));
                 }
@@ -930,7 +970,12 @@ impl GraphStore {
 
         Ok((
             out,
-            interrupted()?.then_some(RegexTruncationReason::Deadline),
+            interrupted()?
+                .then_some(RegexTruncationReason::Deadline)
+                // A budget stop outranks a short corpus (it is the more
+                // specific reason the caller can act on), but a corpus that
+                // lost rows must never fall through as `None`.
+                .or_else(|| degraded.then_some(RegexTruncationReason::UndecodableRows)),
         ))
     }
 
@@ -964,6 +1009,9 @@ impl GraphStore {
             .collect();
         ordered.sort();
         let mut candidates = Vec::new();
+        // See `collect_candidates`: a scan that came back short must not leave
+        // the result claiming it was complete.
+        let mut degraded = false;
         for scope_uid in ordered {
             if interrupted()? {
                 return Ok((candidates, Some(RegexTruncationReason::Deadline)));
@@ -993,7 +1041,8 @@ impl GraphStore {
                     });
                 }
             }
-            let notes = self.list_notes(Some(&scope_uid))?;
+            let (notes, integrity) = self.list_notes_with_integrity(Some(&scope_uid))?;
+            degraded |= integrity.is_degraded();
             if interrupted()? {
                 return Ok((candidates, Some(RegexTruncationReason::Deadline)));
             }
@@ -1077,7 +1126,8 @@ impl GraphStore {
                 // is missing", so an edge traversal would silently drop those
                 // sections. Ownership lives on the property; scan once and filter by
                 // this scope's notes in memory.
-                let sections = self.list_all_sections()?;
+                let (sections, integrity) = self.list_all_sections_with_integrity()?;
+                degraded |= integrity.is_degraded();
                 for section in sections {
                     if interrupted()? {
                         return Ok((candidates, Some(RegexTruncationReason::Deadline)));
@@ -1117,7 +1167,9 @@ impl GraphStore {
         }
         Ok((
             candidates,
-            interrupted()?.then_some(RegexTruncationReason::Deadline),
+            interrupted()?
+                .then_some(RegexTruncationReason::Deadline)
+                .or_else(|| degraded.then_some(RegexTruncationReason::UndecodableRows)),
         ))
     }
 
@@ -1509,7 +1561,7 @@ impl GraphStore {
                             max_candidates: CANDIDATE_CAP,
                         },
                     )?;
-                    hydration_stop = fallback_stop.or(hydrated_stop);
+                    hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
                     let remaining = CANDIDATE_CAP.saturating_sub(candidates.len());
                     if hydrated.len() > remaining {
                         hydrated.truncate(remaining);
@@ -1544,6 +1596,17 @@ impl GraphStore {
         // ONLY when the scan actually stops early, so `truncated:true` with an
         // empty `results` now genuinely means "incomplete scan" rather than
         // "the match was ordered past a 5000 cap and never scanned" (nw-076).
+        // A short CORPUS is not a stopped SCAN, and the two must not share a
+        // channel. `hydration_stop` feeds `truncated`, and `truncated` breaks
+        // the verification loop below on its first iteration — so folding
+        // "some rows were undecodable" in here would make ONE unreadable row
+        // return zero results while reporting `truncated: true`, which is the
+        // nw-076 dishonesty in its worst form. Carry it alongside instead:
+        // scan everything that COULD be read, then say the corpus was short.
+        let corpus_degraded = hydration_stop == Some(RegexTruncationReason::UndecodableRows);
+        if corpus_degraded {
+            hydration_stop = None;
+        }
         let elapsed_deadline = elapsed_millis(start) >= deadline_ms;
         let mut truncated = planning_deadline || hydration_stop.is_some() || elapsed_deadline;
         let mut truncation_reason = if planning_deadline || elapsed_deadline {
@@ -1630,6 +1693,15 @@ impl GraphStore {
             }
         }
         let verification_ms = elapsed_millis(verification_started);
+
+        // The scan ran to completion over a corpus that was missing rows. The
+        // results are real, but "no more matches exist" is not established —
+        // so the result declares itself partial and names why. A stop that
+        // already happened is the more actionable reason and keeps its place.
+        if corpus_degraded && !truncated {
+            truncated = true;
+            truncation_reason = Some(RegexTruncationReason::UndecodableRows);
+        }
 
         // nw-097: attach the note at the source so no caller has to remember.
         Ok(RegexSearchResult {
@@ -2516,6 +2588,86 @@ mod tests {
             "must never return truncated:true with empty results on a scannable corpus"
         );
         assert!(!res.truncated, "small corpus scans fully, so not truncated");
+    }
+
+    /// nw-335's corrupt-row tolerance made the whole-corpus scans this module
+    /// builds its candidate set from come back SHORT without coming back
+    /// `Err`. This module's contract is that a partial answer says it is
+    /// partial — `Deadline` and `CandidateCap` exist for that, and nw-076 was
+    /// this surface reporting a partial scan as definitive — so a corpus that
+    /// lost rows must not be reported as `truncated: false`.
+    ///
+    /// The second half matters as much as the first: the disclosure must not
+    /// come at the cost of the results. `truncated` breaks the verification
+    /// loop, so routing the corpus signal through it would return ZERO matches
+    /// on one unreadable row.
+    #[test]
+    fn a_corpus_that_lost_rows_is_reported_partial_and_still_returns_its_matches() {
+        let store = store_with_text();
+        // The clean corpus answers definitively.
+        let clean = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!clean.results.is_empty(), "baseline must match");
+        assert!(
+            !clean.truncated && clean.truncation_reason.is_none(),
+            "a corpus read in full is NOT partial, or the signal is worthless: {clean:?}"
+        );
+
+        // Poison one unrelated section with a NUL. The store now skips it.
+        store
+            .insert_section(&Section {
+                uid: "sec:v:1:corrupt".to_string(),
+                note_uid: "note:v:1".to_string(),
+                heading_uid: None,
+                start_line: 20,
+                end_line: 21,
+                text_hash: "tc".to_string(),
+                text_content: "unrelated\u{0}poison".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let degraded = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(
+            !degraded.results.is_empty(),
+            "one unreadable row must not cost every match — that is the \
+             nw-076 failure, not a fix for it: {degraded:?}"
+        );
+        assert!(
+            degraded.truncated,
+            "a scan over a corpus with unread rows has not established that \
+             no further matches exist: {degraded:?}"
+        );
+        assert_eq!(
+            degraded.truncation_reason,
+            Some(RegexTruncationReason::UndecodableRows),
+            "the caller is told WHICH kind of incompleteness this is: {degraded:?}"
+        );
+    }
+
+    /// A genuine stop is the reason a caller can act on; a short corpus must
+    /// still survive when nothing else stopped the scan.
+    #[test]
+    fn a_real_stop_outranks_a_short_corpus_but_a_short_corpus_outranks_nothing() {
+        use RegexTruncationReason::{CandidateCap, Deadline, UndecodableRows};
+        assert_eq!(
+            stronger_truncation(Some(UndecodableRows), Some(Deadline)),
+            Some(Deadline)
+        );
+        assert_eq!(
+            stronger_truncation(Some(CandidateCap), Some(UndecodableRows)),
+            Some(CandidateCap)
+        );
+        assert_eq!(
+            stronger_truncation(Some(UndecodableRows), None),
+            Some(UndecodableRows),
+            "nothing else stopped the scan, so the short corpus IS the reason"
+        );
+        assert_eq!(stronger_truncation(None, None), None);
     }
 
     /// An alternation is an OR, so the trigram pre-filter must union the

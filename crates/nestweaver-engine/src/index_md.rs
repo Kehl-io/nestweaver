@@ -26,6 +26,30 @@ use nestweaver_store::GraphStore;
 // still use direct fs access.
 
 /// Outcome of a markdown index run.
+///
+/// nw-345: every link count below names the POPULATION it counts. One run
+/// legitimately produces several and they do not agree, and calling them all
+/// "wikilinks" made a single run report two different numbers for the same
+/// English phrase with neither definition disclosed anywhere. In descending
+/// size, for one vault:
+///
+/// - OCCURRENCES — one per wikilink instance in the parse.
+/// - SECTION TARGETS — distinct (source section, target text). This is what the
+///   graph stores: an `UnresolvedWikilink` uid is derived from the source
+///   section plus the target, so two identical links in one section are one
+///   node.
+/// - TARGETS — distinct (source note, target text). This is what `broken-links`
+///   and `doc-stats` report, because `GraphStore::broken_wikilinks` dedupes on
+///   (source_uid, wikilink_text) and `source_uid` there is the NOTE.
+/// - EDGES — one per resolved CANDIDATE, so a single ambiguous link contributes
+///   N of them.
+///
+/// The de-duplication in `broken_wikilinks` was introduced for a PRESENTATION
+/// reason — collapsing N near-identical rows for one ambiguous link — and
+/// silently became a counting semantic when `doc_stats` called `len()` on the
+/// result. A de-duplication that exists to make a list readable is not a
+/// definition of a metric. Do NOT "fix" these numbers by making them agree;
+/// they are measuring different things and all of them are wanted.
 pub struct MarkdownIndexResult {
     pub vault_uid: String,
     pub vault_name: String,
@@ -33,8 +57,14 @@ pub struct MarkdownIndexResult {
     pub headings_count: usize,
     pub sections_count: usize,
     pub tags_count: usize,
-    pub wikilinks_resolved: usize,
-    pub wikilinks_unresolved: usize,
+    /// One per resolved CANDIDATE — an ambiguous link contributes N.
+    pub resolved_link_edges: usize,
+    /// One per unresolved link INSTANCE in the parse.
+    pub unresolved_link_occurrences: usize,
+    /// Distinct (source section, target) — the granularity the graph stores.
+    pub unresolved_link_section_targets: usize,
+    /// Distinct (source note, target) — what `broken-links` / `doc-stats` show.
+    pub unresolved_link_targets: usize,
     pub skipped: Vec<SkippedFile>,
 }
 
@@ -50,15 +80,17 @@ pub struct MarkdownRefreshResult {
 pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String {
     let mut summary = format!(
         "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
-         {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
+         {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s), \
+         {} unresolved link occurrence(s) across {} distinct target(s).",
         result.index.vault_name,
         result.notes_deleted,
         result.index.notes_count,
         result.index.headings_count,
         result.index.sections_count,
         result.index.tags_count,
-        result.index.wikilinks_resolved,
-        result.index.wikilinks_unresolved,
+        result.index.resolved_link_edges,
+        result.index.unresolved_link_occurrences,
+        result.index.unresolved_link_targets,
     );
     if !result.index.skipped.is_empty() {
         summary.push_str(&format!(
@@ -373,7 +405,10 @@ pub struct MarkdownSinceResult {
     pub headings_count: usize,
     pub sections_count: usize,
     pub tags_count: usize,
-    pub wikilinks_resolved: usize,
+    /// nw-345: one per resolved CANDIDATE, and only for notes this pass
+    /// actually CHANGED — a fifth population, and the narrowest of them. It is
+    /// not comparable with a full index's `resolved_link_edges`.
+    pub changed_note_link_edges: usize,
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
@@ -627,7 +662,7 @@ fn index_markdown_since_with_reader(
             headings_count: 0,
             sections_count: 0,
             tags_count: 0,
-            wikilinks_resolved: 0,
+            changed_note_link_edges: 0,
         });
     }
 
@@ -859,7 +894,29 @@ fn index_markdown_since_with_reader(
         rebuild_link_source_uids.push(candidate.note_uid.clone());
         let context = context_by_uid[&candidate.note_uid.as_str()];
         for wikilink in &context.wikilinks {
+            // nw-344: the same silent drop as the full-index path above, and it
+            // has to close on both or `--since` and a full re-index disagree
+            // about the vault's own link count.
             let Some(source_section) = context.section_uids.get(wikilink.section_idx) else {
+                tracing::warn!(
+                    "wikilink '{}' in '{}' names section {} of {}; recording it as \
+                     unresolved rather than dropping it silently",
+                    wikilink.target,
+                    candidate.rel_path,
+                    wikilink.section_idx,
+                    context.section_uids.len(),
+                );
+                unresolved.push((
+                    format!(
+                        "unresolved:{}:{}",
+                        candidate.note_uid,
+                        crate::hash::blake3_hex_short(&wikilink.target)
+                    ),
+                    candidate.note_uid.clone(),
+                    candidate.rel_path.clone(),
+                    candidate.parsed.title.clone(),
+                    wikilink.target.clone(),
+                ));
                 continue;
             };
             let display = wikilink
@@ -1066,7 +1123,7 @@ fn index_markdown_since_with_reader(
         headings_count: total_headings,
         sections_count: total_sections,
         tags_count: total_tags,
-        wikilinks_resolved: changed_wikilinks,
+        changed_note_link_edges: changed_wikilinks,
     })
 }
 
@@ -1873,8 +1930,15 @@ where
     // must not be the default one, and the watcher route has no human reading
     // the exit code.
     if all_notes.is_empty() && vault_existed {
-        let existing = store
-            .list_notes(Some(&v_uid))
+        // The guard turns on "are there notes indexed?", so it can only be
+        // trusted if the answer is COMPLETE. nw-335 made this scan skip a row
+        // it cannot decode and disclose it in a log line, so a vault whose rows
+        // are all undecodable reads as "nothing indexed" — the guard stands
+        // down and the reindex deletes the vault it could not read. A count
+        // that could not be taken in full is not a count of zero, and this is
+        // the one place where reading it as zero is destructive.
+        let (existing, integrity) = store
+            .list_notes_with_integrity(Some(&v_uid))
             .context("count indexed notes before the stale-drop")?;
         if !existing.is_empty() {
             anyhow::bail!(
@@ -1883,6 +1947,15 @@ where
                  one of them. Check that the vault directory is readable and mounted; if it \
                  really is empty, drop it with `nestweaver brain remove`.",
                 existing.len()
+            );
+        }
+        if let Some(disclosure) = integrity.disclosure() {
+            anyhow::bail!(
+                "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
+                 note files, and the indexed note count could not be read in full, so \
+                 \"nothing is indexed\" is NOT established -- {disclosure} Committing this \
+                 could delete notes this process was unable to see. Repair the graph \
+                 (`nestweaver brain add --force`) before reindexing."
             );
         }
     }
@@ -1900,10 +1973,38 @@ where
     for ctx in &note_contexts {
         for wl in &ctx.wikilinks {
             // Pass the source section's UID (where the link appears).
-            if wl.section_idx >= ctx.section_uids.len() {
+            //
+            // nw-344: this was a bare `continue`. A link taken by it produced no
+            // WIKILINK_TO_NOTE edge, no UnresolvedWikilink node and no increment
+            // to either counter — invisible on BOTH surfaces at once, which is a
+            // health tool reporting nothing wrong because it never saw the link.
+            // Record it as unresolved instead. `UnresolvedWikilink` is keyed on
+            // the source NOTE, not the section, so a note-scoped uid is enough,
+            // and LINK COUNT IN == EDGES OUT PLUS BROKEN ROWS becomes structural
+            // rather than a property of whichever fixture happens to be on hand.
+            let Some(source_section_uid) = ctx.section_uids.get(wl.section_idx) else {
+                tracing::warn!(
+                    "wikilink '{}' in '{}' names section {} of {}; recording it as \
+                     unresolved rather than dropping it silently",
+                    wl.target,
+                    ctx.rel_path,
+                    wl.section_idx,
+                    ctx.section_uids.len(),
+                );
+                wikilinks_unresolved += 1;
+                unresolved_records.push((
+                    format!(
+                        "unresolved:{}:{}",
+                        ctx.note_uid,
+                        crate::hash::blake3_hex_short(&wl.target)
+                    ),
+                    ctx.note_uid.clone(),
+                    ctx.rel_path.clone(),
+                    ctx.title.clone(),
+                    wl.target.clone(),
+                ));
                 continue;
-            }
-            let source_section_uid = &ctx.section_uids[wl.section_idx];
+            };
             let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
 
             match lookup.resolve(&wl.target, &ctx.folder) {
@@ -1964,7 +2065,21 @@ where
         }
     }
 
-    let wikilinks_resolved = wikilink_to_note.len() + wikilink_to_heading.len();
+    let resolved_link_edges = wikilink_to_note.len() + wikilink_to_heading.len();
+    // nw-345: report every population the run produces, so no consumer has to
+    // infer one from another. `unresolved_records` holds one entry per
+    // OCCURRENCE; its uid is the (section, target) key the graph dedupes on,
+    // and (note, target) is what `broken_wikilinks` collapses to downstream.
+    let unresolved_link_section_targets = unresolved_records
+        .iter()
+        .map(|record| record.0.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let unresolved_link_targets = unresolved_records
+        .iter()
+        .map(|record| (record.1.as_str(), record.4.as_str()))
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     // 3 & 4. Flush all nodes and edges for this vault in one transaction.
     let notes_deleted = {
@@ -2085,12 +2200,13 @@ where
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
     eprintln!(
-        "Done: {} notes, {} headings, {} sections, {} tags, {} wikilinks ({:.1}s)",
+        "Done: {} notes, {} headings, {} sections, {} tags, \
+         {} wikilink edges ({:.1}s)",
         notes_count,
         headings_count,
         sections_count,
         tags_count,
-        wikilinks_resolved,
+        resolved_link_edges,
         elapsed.as_secs_f64(),
     );
 
@@ -2102,8 +2218,10 @@ where
             headings_count,
             sections_count,
             tags_count,
-            wikilinks_resolved,
-            wikilinks_unresolved,
+            resolved_link_edges,
+            unresolved_link_occurrences: wikilinks_unresolved,
+            unresolved_link_section_targets,
+            unresolved_link_targets,
             skipped,
         },
         notes_deleted,
@@ -2292,6 +2410,17 @@ impl<'a> WikilinkLookup<'a> {
     /// must never score below a later one, so downstream consumers can
     /// threshold on confidence without inverting the resolver's own ordering.
     ///
+    /// ONE stated exception, and it is not a violation of the intent: priority
+    /// 7 re-enters priorities 2-4 with the key's BASENAME (nw-343), so it can
+    /// return 0.95/0.92/0.90 from a position below priority 5. The two ladders
+    /// are DISJOINT by construction — priorities 2-4 key on the whole key and
+    /// their maps can never hold a `/`, so they are a guaranteed miss for a
+    /// path-qualified key, and priority 7 is guarded by `key.contains('/')`.
+    /// Confidence therefore still reflects evidence strength: a basename that
+    /// earns the same-folder tier earns it whether or not the author also wrote
+    /// a path prefix. Do not "restore" monotonicity by capping the re-entry —
+    /// that is the confidence inversion nw-343 exists to remove.
+    ///
     /// **FILENAME BEFORE TITLE; DIRECTORY PROXIMITY BEFORE GLOBALITY.**
     ///
     /// - Priority 1: path match — target contains `/` and matches a known
@@ -2302,7 +2431,9 @@ impl<'a> WikilinkLookup<'a> {
     /// - Priority 5: unique global title → 1.0 when NO file in the vault
     ///   carries that stem, otherwise 0.80.
     /// - Priority 6: alias match → unique 0.7, ambiguous split.
-    /// - Priority 7: path-qualified fallback to the last segment → 0.85.
+    /// - Priority 7: path-qualified fallback — re-enters priorities 2-4 with
+    ///   the last path segment (0.95 / 0.92 / 0.90), then unique global title
+    ///   on that segment → 0.85.
     /// - Priority 8: ambiguous title match → same-folder narrowing 0.5,
     ///   otherwise split across all candidates.
     ///
@@ -2400,33 +2531,10 @@ impl<'a> WikilinkLookup<'a> {
         // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
         // depends on a same-folder match remaining visible there as a
         // resolved-but-lower-tier row.
-        if let Some(uids) = self
-            .by_folder_stem
-            .get(&(source_folder.to_string(), key.clone()))
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 0.95,
-            }]);
-        }
-
-        // Priority 3: nearest-ancestor filename stem (nw-306).
-        if let Some(uid) = self.nearest_ancestor_stem(&key, source_folder) {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uid,
-                confidence: 0.92,
-            }]);
-        }
-
-        // Priority 4: global filename-stem match (Obsidian shortest-path).
-        if let Some(uids) = self.by_stem.get(&key)
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 0.9,
-            }]);
+        // Priorities 2-4 are one ladder over a BARE stem, extracted so the
+        // path-qualified fallback below can RE-ENTER it (nw-343).
+        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder) {
+            return ResolveOutcome::Resolved(vec![candidate]);
         }
 
         // Priority 5: unique global title. Full confidence ONLY when no file in
@@ -2464,25 +2572,30 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         // nw-165: path-qualified fallback to the filename stem, which is what
-        // Obsidian does. by_stem / by_title / by_folder_name are keyed on bare
+        // Obsidian does. by_stem / by_title / by_folder_stem are keyed on bare
         // names and can never contain a slash, so a path-qualified key that
         // missed by_path above could not match ANY later tier and was reported
         // as a genuinely broken link -- 40 such links in the reference vault
         // had an existing target.
+        //
+        // nw-343: that fix named the miss and then hard-coded a GLOBAL lookup as
+        // the remedy, and both of its branches require `uids.len() == 1`. So a
+        // path-qualified key whose basename is not globally unique matched
+        // neither branch and died -- while the BARE form of the same link, from
+        // the same folder, resolved at 0.92 via the nearest-ancestor tier, which
+        // tolerates global ambiguity by design. Writing MORE of the path made
+        // the link resolve LESS often. Not hypothetical: the reference vault has
+        // 21 files named `_Overview.md`, so every path-qualified `_Overview`
+        // link in it was dead. Re-enter the ladder instead.
         if key.contains('/')
             && let Some(base) = key.rsplit('/').find(|segment| !segment.is_empty())
             && base != key
         {
+            if let Some(candidate) = self.resolve_bare_stem(base, source_folder) {
+                return ResolveOutcome::Resolved(vec![candidate]);
+            }
             // Below the exact-path tiers: only the filename was corroborated,
             // not the path component.
-            if let Some(uids) = self.by_stem.get(base)
-                && uids.len() == 1
-            {
-                return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                    note_uid: uids[0].to_string(),
-                    confidence: 0.85,
-                }]);
-            }
             if let Some(uids) = self.by_title.get(base)
                 && uids.len() == 1
             {
@@ -2525,6 +2638,50 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         ResolveOutcome::Unresolved
+    }
+
+    /// Priorities 2-4 as one reusable ladder over a BARE filename stem:
+    /// same folder (0.95) -> nearest ancestor (0.92) -> unique global (0.90).
+    ///
+    /// Extracted by nw-343 so the path-qualified fallback can re-enter it with
+    /// the key's basename. All three tiers key on the WHOLE key and
+    /// `by_folder_stem`/`by_stem` are built from `Path::file_stem()`, so their
+    /// keys can never contain `/` -- every one of them is a guaranteed miss for
+    /// a path-qualified key, which is why the fallback exists at all.
+    ///
+    /// Note the ORDER of tolerances, which is the whole point: 0.95 and 0.92
+    /// tolerate global ambiguity (they narrow by directory first), 0.90 does
+    /// not. Jumping straight to 0.90's global-uniqueness test threw away the
+    /// two tiers that could still have answered.
+    fn resolve_bare_stem(&self, key: &str, source_folder: &str) -> Option<ResolveCandidate> {
+        // Priority 2: same-folder filename stem.
+        if let Some(uids) = self
+            .by_folder_stem
+            .get(&(source_folder.to_string(), key.to_string()))
+            && uids.len() == 1
+        {
+            return Some(ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence: 0.95,
+            });
+        }
+        // Priority 3: nearest-ancestor filename stem (nw-306).
+        if let Some(uid) = self.nearest_ancestor_stem(key, source_folder) {
+            return Some(ResolveCandidate {
+                note_uid: uid,
+                confidence: 0.92,
+            });
+        }
+        // Priority 4: global filename-stem match (Obsidian shortest-path).
+        if let Some(uids) = self.by_stem.get(key)
+            && uids.len() == 1
+        {
+            return Some(ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence: 0.9,
+            });
+        }
+        None
     }
 
     /// Of the notes whose filename stem is `key`, return the one living in the
@@ -2936,6 +3093,461 @@ mod tests {
         (dir, root)
     }
 
+    /// nw-339 does NOT reproduce, and the fallback it asks for would be actively
+    /// harmful — so this pins the opposite: a headingless note IS searchable,
+    /// and adding a whole-body fallback Section would double-index it.
+    ///
+    /// The stated mechanism ("a note with no `#` heading produces no Section")
+    /// is false at the parser: `extract_sections` emits a preamble covering the
+    /// WHOLE body when `headings` is empty, which
+    /// `note_with_only_preamble_has_one_section` already pins. The observation
+    /// behind the ticket is explained by the other half — a file that is almost
+    /// entirely FRONTMATTER — and `6d99b96d` fixed that by indexing
+    /// `frontmatter_raw` as a fourth candidate shape. That commit is not an
+    /// ancestor of v8.0.0, which is the build the measurement was taken on.
+    ///
+    /// RESIDUAL, and it is real: `frontmatter_raw` is an additive column with no
+    /// backfill, so it is NULL for every note indexed by 8.0.0 and both
+    /// collectors `continue` past a `None`. Upgrading without a full reindex
+    /// preserves the exact symptom and says nothing. Filed separately.
+    #[test]
+    fn a_headingless_note_is_searchable_and_indexed_exactly_once() {
+        let (_dir, root) = make_vault(&[(
+            "backlog.md",
+            "---\nstatus: open\nid: nw-339\n---\n\nloadbearing prose with no heading at all.\n",
+        )]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        assert!(result.headings_count == 0, "precondition: no headings");
+        assert_eq!(
+            result.sections_count, 1,
+            "the whole body is ONE preamble section — a fallback section would \
+             make this 2 and double-count every headingless note in \
+             `count_patterns` and in `sections_count`"
+        );
+
+        let body = store
+            .regex_search("loadbearing", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert_eq!(
+            body.results.len(),
+            1,
+            "the body must be searchable EXACTLY ONCE: {:?}",
+            body.results
+        );
+
+        // And the frontmatter is reachable too — the half that actually
+        // explained the reported observation.
+        let fm = store
+            .regex_search("nw-339", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert!(
+            !fm.results.is_empty(),
+            "frontmatter must be an exact-match candidate shape (6d99b96d)"
+        );
+    }
+
+    /// nw-345: a single run produced TWO numbers for "unresolved links" and
+    /// disclosed neither definition — the indexer counted OCCURRENCES,
+    /// `doc-stats` and `broken-links` count DISTINCT TARGETS. Both are
+    /// defensible; having both under one name is not. Same class as nw-297
+    /// (page-count vs population-count) and nw-321 (`total` post-filter,
+    /// `total_available` pre-filter).
+    ///
+    /// There are THREE populations, not two. The middle one — distinct
+    /// (section, target), which is what the `UnresolvedWikilink` uid is derived
+    /// from — was never reported anywhere, and it is why the gap between the
+    /// two published numbers is not a clean factor.
+    ///
+    /// This fixture forces all three apart on purpose: the same dangling target
+    /// is written twice in one section of one note, once more in a second
+    /// section of that note, and once from a second note.
+    /// Occurrences = 4. (section, target) = 3. (note, target) = 2.
+    #[test]
+    fn every_unresolved_link_population_is_named_and_reported() {
+        let (_dir, root) = make_vault(&[
+            (
+                "a.md",
+                "# A\n\nSee [[nowhere]] and [[nowhere]].\n\n## Later\n\nAnd [[nowhere]].\n",
+            ),
+            ("b.md", "# B\n\nAlso [[nowhere]].\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        assert_eq!(
+            result.unresolved_link_occurrences, 4,
+            "the indexer counts every unresolved link INSTANCE"
+        );
+        assert_eq!(
+            result.unresolved_link_section_targets, 3,
+            "the graph stores one UnresolvedWikilink per (section, target), so \
+             the two links in one section collapse — this is the population that \
+             was never reported and that explains the gap"
+        );
+        assert_eq!(
+            result.unresolved_link_targets, 2,
+            "broken_wikilinks dedupes by (source note, link text)"
+        );
+
+        // The contract: a consumer must be able to read the published
+        // populations off EITHER surface and never have to infer one from
+        // another.
+        let stats = crate::brain_docgraph::doc_stats(&store, 5).unwrap();
+        assert_eq!(stats.unresolved_link_targets, 2);
+        assert_eq!(stats.unresolved_link_section_targets, 3);
+
+        // Precondition: the fixture must actually separate them, or every
+        // assertion above passes vacuously.
+        assert!(
+            result.unresolved_link_occurrences > result.unresolved_link_section_targets
+                && result.unresolved_link_section_targets > result.unresolved_link_targets,
+            "fixture must force OCCURRENCES > SECTION TARGETS > TARGETS"
+        );
+    }
+
+    /// nw-345: OCCURRENCES are deliberately NOT offered by `doc_stats`. The
+    /// graph stores one node per (section, target) and nothing records an
+    /// instance count, so any occurrence number produced from the store would
+    /// be a proxy presented as a measurement — which is the exact defect this
+    /// work exists to close. The indexer is the only honest source, and it
+    /// reports them.
+    #[test]
+    fn doc_stats_does_not_invent_an_occurrence_count() {
+        let (_dir, root) = make_vault(&[(
+            "a.md",
+            "# A\n\nSee [[nowhere]] and [[nowhere]] and [[nowhere]].\n",
+        )]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.unresolved_link_occurrences, 3);
+
+        let stats = crate::brain_docgraph::doc_stats(&store, 5).unwrap();
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(
+            json.get("unresolved_link_occurrences").is_none(),
+            "doc_stats must not publish a number the graph cannot support: {json}"
+        );
+        // What it CAN support, it publishes, and both collapse to 1 here.
+        assert_eq!(stats.unresolved_link_section_targets, 1);
+        assert_eq!(stats.unresolved_link_targets, 1);
+    }
+
+    /// nw-344: the double condition that makes silent link loss DETECTABLE.
+    /// A link that is neither an edge nor a broken row is invisible on BOTH
+    /// surfaces at once -- a health tool reporting nothing wrong because it
+    /// never saw the link. A test asserting only (a) would still permit that.
+    ///
+    /// LINK COUNT IN == EDGES OUT PLUS BROKEN ROWS.
+    ///
+    /// On the ticket's stated cause, honestly: `ad946989`'s nearest-ancestor
+    /// tier cannot be what repaired this shape. `nearest_ancestor_stem` compares
+    /// folder components element-wise SPECIFICALLY to reject
+    /// `Workspaces/Cortina` as an ancestor of `Workspaces/Cortina Precision/...`
+    /// -- that pair is the verbatim counter-example in its own doc comment. The
+    /// invariant below is still the right one; the narrative was not.
+    #[test]
+    fn every_link_becomes_an_edge_or_a_broken_row() {
+        // The Cortina Precision shape: a workspace hub whose links are
+        // path-qualified relative to its own folder, plus a sibling workspace
+        // sharing the `_Overview` stem so no tier can resolve by global
+        // uniqueness.
+        let (_dir, root) = make_vault(&[
+            (
+                "Workspaces/Cortina Precision/_Overview.md",
+                "# Cortina Precision\n\n\
+                 - [[plans/rollout]]\n\
+                 - [[notes/2026-08/research/recon]]\n\
+                 - [[brand-proposal-sprint/README]]\n\
+                 - [[Sibling Hub]]\n\
+                 - [[plans/does-not-exist]]\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/plans/rollout.md",
+                "# Rollout\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/notes/2026-08/research/recon.md",
+                "# Recon\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/brand-proposal-sprint/README.md",
+                "# Runbook\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/Sibling Hub.md",
+                "# Sibling Hub\n",
+            ),
+            // Shares the `_Overview` stem so global-uniqueness tiers cannot
+            // fire, and is NOT a component-wise ancestor of the source folder.
+            ("Workspaces/Cortina/_Overview.md", "# Cortina\n"),
+        ]);
+        const LINKS_IN: usize = 5;
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        // (a) Nothing vanishes between the parser and the counters. The seam
+        //     that could: the `section_idx` bounds check below in this file,
+        //     which incremented no counter and recorded nothing.
+        assert_eq!(
+            result.resolved_link_edges + result.unresolved_link_occurrences,
+            LINKS_IN,
+            "nw-344: a link that is neither resolved nor unresolved has been \
+             SILENTLY DROPPED"
+        );
+        assert_eq!(result.resolved_link_edges, LINKS_IN - 1);
+        assert_eq!(result.unresolved_link_occurrences, 1);
+
+        // (b) The condition a per-tier test cannot see: a link that did NOT
+        //     resolve must be REPORTABLE. Without this half, an absent guard
+        //     and a passing guard are indistinguishable.
+        let rows = store.broken_wikilinks().unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.wikilink_text == "plans/does-not-exist"
+                    && r.current_target_uid.is_empty()),
+            "nw-344: the unresolved link must appear in broken_wikilinks, got {rows:?}"
+        );
+
+        // The resolved four are edges, and the hub is not left at 1.
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(
+            edges.len(),
+            LINKS_IN - 1,
+            "nw-344: 1 edge against 5 links is the exact failure this pins"
+        );
+    }
+
+    /// nw-344, the counterpart that keeps the conservation law honest under
+    /// tier REORDERING (nw-343 changes exactly these tiers): the totals must
+    /// hold regardless of which tier each link lands on, so this fixture is
+    /// written so several tiers fire at once.
+    ///
+    /// `note_wikilink_edges` drops self-edges and returns one row per resolved
+    /// CANDIDATE, and `broken_wikilinks` dedupes by (source note, link text) --
+    /// so the fixture deliberately holds no self-links, no ambiguous targets
+    /// and no repeated link text.
+    #[test]
+    fn conservation_holds_across_every_resolver_tier() {
+        let (_dir, root) = make_vault(&[
+            (
+                "f/src.md",
+                "# Src\n\n\
+                 - [[sibling]]\n\
+                 - [[hub]]\n\
+                 - [[globally-unique]]\n\
+                 - [[An Only Title]]\n\
+                 - [[the-alias]]\n\
+                 - [[deep/globally-unique]]\n\
+                 - [[nowhere at all]]\n",
+            ),
+            ("hub.md", "# Root Hub\n"),
+            ("f/sibling.md", "# Not The Same Title\n"),
+            ("z/globally-unique.md", "# Unique Stem\n"),
+            ("z/titled.md", "# An Only Title\n"),
+            (
+                "z/aliased.md",
+                "---\naliases: [the-alias]\n---\n# Aliased\n",
+            ),
+        ]);
+        const LINKS_IN: usize = 7;
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.resolved_link_edges + result.unresolved_link_occurrences,
+            LINKS_IN,
+            "nw-344: conservation must survive any reordering of the tier ladder"
+        );
+
+        let edges = store.note_wikilink_edges().unwrap();
+        let broken = store
+            .broken_wikilinks()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.current_target_uid.is_empty())
+            .count();
+        assert_eq!(
+            edges.len() + broken,
+            LINKS_IN,
+            "nw-344: EDGES OUT PLUS BROKEN ROWS must equal LINKS IN"
+        );
+    }
+
+    /// nw-343, the LOSS case: a path-qualified key whose basename is not
+    /// globally unique matches NEITHER fallback branch (both require
+    /// `uids.len() == 1`) and dies -- while the BARE form of the same link,
+    /// from the same folder, resolves at 0.92 via the nearest-ancestor tier,
+    /// which tolerates global ambiguity by design. Writing MORE of the path
+    /// makes the link resolve LESS often. Not hypothetical: the reference vault
+    /// holds 21 files named `_Overview.md`.
+    #[test]
+    fn a_path_qualified_key_re_enters_the_proximity_ladder() {
+        let (_dir, root) = make_vault(&[
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            ("Workspaces/Other/_Overview.md", "# Other — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro.md",
+                "# Astro\n\nUp: [[Cortina/_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.unresolved_link_occurrences, 0,
+            "nw-343: `[[Cortina/_Overview]]` from Workspaces/Cortina/plans must not \
+             be DEAD when the bare `[[_Overview]]` from the same folder resolves \
+             at 0.92"
+        );
+        assert_eq!(result.resolved_link_edges, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let cortina = notes
+            .iter()
+            .find(|n| n.file_path.contains("Workspaces/Cortina/_Overview.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1, cortina,
+            "the nearest ancestor must win, not a global guess"
+        );
+    }
+
+    /// nw-343, the CONFIDENCE case: a path-qualified key whose basename has a
+    /// same-folder match must score the same-folder tier (0.95), not the global
+    /// path-qualified fallback (0.85). Proximity must never DECREASE confidence
+    /// -- the principle `ad946989` established one tier over.
+    #[test]
+    fn a_path_qualified_key_scores_the_tier_its_basename_earns() {
+        let (_dir, root) = make_vault(&[
+            ("f/x.md", "# X\n\nSee [[sub/target]].\n"),
+            ("f/target.md", "# Alpha\n"),
+            ("g/target.md", "# Beta\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let rows = store.broken_wikilinks().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("sub/target"))
+            .expect("the path-qualified link must be present as a sub-1.0 row");
+        assert!(
+            (row.confidence - 0.95).abs() < 1e-6,
+            "nw-343: same-folder basename evidence scores 0.95; the global \
+             path-qualified fallback's 0.85 understates it (got {})",
+            row.confidence
+        );
+    }
+
+    /// nw-343: the re-entry must WIDEN the ladder, not start inventing matches.
+    /// `a_path_qualified_link_to_nowhere_stays_unresolved` already pins the
+    /// ABSENT target; this pins the AMBIGUOUS one, which is the case a careless
+    /// re-entry breaks first. `target` exists twice, in two folders neither of
+    /// which is the source's folder nor an ancestor of it -- so P2 (same
+    /// folder), P3 (nearest ancestor) and P4 (global uniqueness) must all
+    /// decline. Guessing here is nw-290.
+    #[test]
+    fn the_ladder_re_entry_declines_rather_than_guesses() {
+        let (_dir, root) = make_vault(&[
+            ("f/x.md", "# X\n\nSee [[sub/target]].\n"),
+            ("g/target.md", "# Alpha\n"),
+            ("h/target.md", "# Beta\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
+    }
+
+    /// nw-342 end-to-end: the `\|` escape Obsidian REQUIRES inside a markdown
+    /// table must resolve at the tier its bare stem earns. `resolve` normalises
+    /// `\` to `/` (Windows path forms), so the unstripped escape produced the
+    /// key `backlog/` -- routed straight into nw-343's path-qualified fallback
+    /// and scored 0.85. One character of parsing; the count grows with table
+    /// usage, not with vault size.
+    #[test]
+    fn an_escaped_pipe_link_in_a_table_resolves_at_the_same_folder_tier() {
+        let (_dir, root) = make_vault(&[
+            (
+                "f/x.md",
+                "# X\n\n| col |\n| --- |\n| [[Backlog\\|the backlog]] |\n",
+            ),
+            ("f/Backlog.md", "# Not The Same Title\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.unresolved_link_occurrences, 0);
+        let rows = store.broken_wikilinks().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("backlog"))
+            .unwrap_or_else(|| panic!("the target must be stored as `Backlog`, got {rows:?}"));
+        assert!(
+            (row.confidence - 0.95).abs() < 1e-6,
+            "nw-342: the same-folder tier, not the path-qualified fallback (got {})",
+            row.confidence
+        );
+    }
+
+    /// nw-335: one raw NUL in one note aborted the ENTIRE Tantivy + trigram
+    /// build via `list_all_sections`' `collect::<Result<Vec<_>, _>>`, leaving
+    /// `docs=0` brain-wide while `brain status` reported a healthy graph. The
+    /// canary at `read::string_is_corrupt` is a LadybugDB #678 detector whose
+    /// stated premise is "note bodies ... none contain NUL"; a pasted NUL
+    /// falsifies the premise, so the store blames engine corruption for a byte
+    /// it recorded faithfully. The observed file carried its NUL at offset
+    /// 47,354 -- past the 8 KiB window the reader's binary sniff looks at.
+    #[test]
+    fn a_nul_byte_in_one_note_does_not_kill_the_whole_index() {
+        // The NUL must sit PAST the reader's 8 KiB binary-sniff window, or the
+        // file is (correctly) refused as binary and never reaches the graph at
+        // all -- which is a different, already-handled outcome. The reported
+        // file carried its NUL at offset 47,354, and that is what makes it a
+        // note the reader accepts and the store then refuses to read back.
+        let mut dirty = String::from("# Dirty\n\n");
+        dirty.push_str(&"filler line of ordinary vault prose.\n".repeat(400));
+        dirty.push_str("before\u{0}after\n");
+        assert!(dirty.len() > 8192, "the NUL must be past the sniff window");
+        let (_dir, root) = make_vault(&[
+            (
+                "clean.md",
+                "# Clean\n\nthe unique token loadbearing lives here.\n",
+            ),
+            ("dirty.md", dirty.as_str()),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.notes_count, 2,
+            "both notes must reach the graph; skipped: {:?}",
+            result.skipped
+        );
+
+        // The abort seam itself: one bad row must not empty the vector.
+        let sections = store
+            .list_all_sections()
+            .expect("a NUL in one note body must not fail the whole section scan");
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.text_content.contains("loadbearing")),
+            "the CLEAN note's body must survive a sibling note's NUL"
+        );
+
+        // And the exact-match surface must still be alive brain-wide.
+        let hits = store
+            .regex_search("loadbearing", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "nw-335: search must not go globally dark because one note holds a NUL"
+        );
+
+        // The poisoned note is not silently emptied either: the byte is dropped,
+        // the text around it survives, and the note stays searchable.
+        let dirty_hits = store
+            .regex_search("beforeafter", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !dirty_hits.results.is_empty(),
+            "nw-335: sanitising the NUL must keep the rest of that note indexed"
+        );
+    }
+
     /// True when the current process bypasses filesystem permission bits.
     #[cfg(unix)]
     fn running_as_root() -> bool {
@@ -3053,6 +3665,98 @@ mod tests {
         );
     }
 
+    /// nw-287's guard turns on "are there notes indexed?", and nw-335 made
+    /// that question answerable INCOMPLETELY: the scan now skips a row it
+    /// cannot decode and says so only in a log line. A vault whose rows are all
+    /// undecodable therefore reads as "nothing is indexed", the guard stands
+    /// down, and the refresh deletes the vault it was unable to read — the
+    /// exact data loss nw-287 exists to prevent, reached through the success
+    /// arm instead of the empty one. A count that could not be taken in full is
+    /// not a count of zero.
+    #[test]
+    fn refresh_refuses_when_the_indexed_note_count_could_not_be_read_in_full() {
+        let (_dir, root) = make_vault(&[("f1.md", "# F1\n\ncontent one\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+
+        // Replace the indexed row with one the reader cannot decode, so the
+        // vault holds exactly one note and the scan can see none of it.
+        let v_uid = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the index created a vault")
+            .uid;
+        for note in store.list_notes(None).unwrap() {
+            store.delete_note_cascade(&note.uid).unwrap();
+        }
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: format!("note:{v_uid}:poisoned"),
+                vault_uid: v_uid.clone(),
+                file_path: "f1.md".to_string(),
+                title: "Poi\u{0}soned".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        assert!(
+            store.list_notes(None).unwrap().is_empty(),
+            "precondition: the scan reads this vault as empty ..."
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            1,
+            "... even though the vault holds exactly one note"
+        );
+
+        // The mount goes away.
+        std::fs::remove_file(root.join("f1.md")).unwrap();
+
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        let Err(error) = observed else {
+            panic!(
+                "an empty scan over a vault whose note count could not be read \
+                 must fail closed, not commit a whole-vault deletion"
+            );
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not be read in full"),
+            "the refusal must name WHY the count is not trustworthy, so an \
+             operator can repair it rather than retry: {message}"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            1,
+            "the row the reader could not decode must survive the refusal"
+        );
+    }
+
     /// The counterpart that keeps the empty-scan guard from becoming a wall: a
     /// vault that was ALREADY empty must still refresh cleanly, and so must a
     /// vault being indexed for the first time.
@@ -3106,7 +3810,7 @@ mod tests {
             ("Workspaces/NW/Backlog.md", "some body, no heading\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |frag: &str| {
@@ -3166,10 +3870,10 @@ mod tests {
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_unresolved, 0,
+            result.unresolved_link_occurrences, 0,
             "nw-306: a hub `Up:` link one directory down must not read as broken"
         );
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |frag: &str| {
@@ -3199,9 +3903,9 @@ mod tests {
             ("g/target.md", "# Beta\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.resolved_link_edges, 0);
         assert_eq!(
-            result.wikilinks_unresolved, 1,
+            result.unresolved_link_occurrences, 1,
             "no candidate is an ancestor of logs/, so the resolver must still decline"
         );
     }
@@ -3220,8 +3924,8 @@ mod tests {
             ),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
 
         let notes = store.list_notes(None).unwrap();
         let cortina = notes
@@ -3304,7 +4008,7 @@ mod tests {
         assert_eq!(result.headings_count, 2);
         assert_eq!(result.sections_count, 2);
         assert_eq!(result.tags_count, 0);
-        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.resolved_link_edges, 0);
         assert!(result.skipped.is_empty());
 
         let notes = store.list_notes(None).unwrap();
@@ -3455,10 +4159,10 @@ sub b body
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_resolved, 1,
+            result.resolved_link_edges, 1,
             "a source-folder-relative path must resolve"
         );
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     /// A full vault-relative path must keep working — that was the only form
@@ -3476,8 +4180,8 @@ sub b body
             ),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     /// A path-qualified link that matches nothing must still be unresolved —
@@ -3489,8 +4193,8 @@ sub b body
             "# Overview\n\nSee [[plans/Does Not Exist]].\n",
         )]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -3500,16 +4204,16 @@ sub b body
             ("b.md", "# B\n\nI am B.\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     #[test]
     fn unresolved_wikilink_counted() {
         let (_dir, root) = make_vault(&[("a.md", "# A\n\n[[Nonexistent Target]]\n")]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -3522,7 +4226,7 @@ sub b body
             ("caller.md", "# Caller\n\nWe use [[AuthSvc]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
     }
 
     #[test]
@@ -3532,7 +4236,7 @@ sub b body
             ("root.md", "# R\n\nLink [[subdir/target]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
     }
 
     #[test]
@@ -3546,8 +4250,8 @@ sub b body
             ("logs/daily.md", "# Daily\n\nShipped [[Boost Billing]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     #[test]
@@ -3561,7 +4265,7 @@ sub b body
             ("g/target.md", "# Beta\n\nbody\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |path_frag: &str| {
@@ -3592,8 +4296,8 @@ sub b body
             ("g/target.md", "# Beta\n\nbody\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -3606,7 +4310,7 @@ sub b body
             ("caller.md", "# C\n\nSee [[T#Setup]].\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         // Verify the wikilink went to the Heading variant.
         let count = store.count_wikilink_edges().unwrap();
@@ -4129,7 +4833,8 @@ sub b body
         assert_eq!(
             format_markdown_refresh_summary(&direct_changed),
             "Refreshed vault 'vault': dropped 2 stale note(s), reindexed 2 note(s), \
-             2 heading(s), 2 section(s), 0 tag(s), 0 wikilink(s) (0 unresolved)."
+             2 heading(s), 2 section(s), 0 tag(s), 0 wikilink edge(s), \
+             0 unresolved link occurrence(s) across 0 distinct target(s)."
         );
     }
 

@@ -83,6 +83,24 @@ pub struct DeadCodeResult {
     /// declarations, properties, module declarations). These are not counted
     /// in `total_symbols`.
     pub excluded_count: usize,
+    /// Symbols the store reached but could NOT decode, and therefore dropped
+    /// before this analysis ever saw them (nw-335 corrupt-row tolerance).
+    ///
+    /// While this is non-zero, `total_symbols`, `reachable_symbols`,
+    /// `unreachable_symbols` and `dead_percentage` are all computed over a
+    /// corpus that is missing rows — every one of them is a FLOOR, and
+    /// "N of M unreachable" is not a truthful completeness claim. The store
+    /// only logged the skip; a number nobody can read is not a disclosure, so
+    /// it is carried here and rendered by both the CLI and the MCP tool.
+    pub undecodable_symbols: usize,
+}
+
+impl DeadCodeResult {
+    /// Whether the analysis saw the whole symbol corpus. False means the
+    /// counts above are floors — see [`Self::undecodable_symbols`].
+    pub fn coverage_is_complete(&self) -> bool {
+        self.undecodable_symbols == 0
+    }
 }
 
 /// Returns `true` for symbols that should be excluded from dead code analysis
@@ -282,9 +300,17 @@ fn detect_dead_code_inner(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
     // 1. Load all symbols and partition into analysable / excluded.
-    let raw_symbols = store
-        .list_all_symbols()
+    //
+    // Take the scan's INTEGRITY, not just its rows: this pass reports
+    // "N of M symbols unreachable", which is a completeness claim over the
+    // whole corpus. nw-335's corrupt-row tolerance makes a short scan return
+    // `Ok`, so a dropped row would make both N and M quietly wrong while the
+    // percentage still read as exact. The count of dropped rows travels with
+    // the result so the CLI and the MCP tool can say the numbers are a floor.
+    let (raw_symbols, integrity) = store
+        .list_all_symbols_with_integrity()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
+    let undecodable_symbols = integrity.skipped_corrupt;
 
     let function_local: HashSet<String> = function_local_bindings(&raw_symbols)
         .into_iter()
@@ -306,6 +332,10 @@ fn detect_dead_code_inner(
             reachable_symbols: 0,
             dead_percentage: 0.0,
             excluded_count,
+            // "0 symbols, all reachable" over a corpus that lost rows is the
+            // most misleading output this pass can produce, so the empty case
+            // discloses too.
+            undecodable_symbols,
         });
     }
 
@@ -438,9 +468,19 @@ fn detect_dead_code_inner(
         .collect();
 
     // Find unreachable class UIDs so we can suppress their members.
+    //
+    // nw-330: `Extension` counts here too. A Rust `impl` block is a container of
+    // members exactly as a class is — it used to BE `SymbolKind::Class`, and the
+    // only reason it no longer is, is that it needed an identity distinct from
+    // the struct it implements. Leaving it out would have made this suppression
+    // silently narrower as a side effect of a modelling fix, reporting every
+    // method of a dead impl block alongside the block itself.
     let unreachable_class_uids: HashSet<&str> = all_symbols
         .iter()
-        .filter(|s| !strong_reachable.contains(&s.uid) && s.kind == SymbolKind::Class)
+        .filter(|s| {
+            !strong_reachable.contains(&s.uid)
+                && matches!(s.kind, SymbolKind::Class | SymbolKind::Extension)
+        })
         .map(|s| s.uid.as_str())
         .collect();
 
@@ -526,6 +566,7 @@ fn detect_dead_code_inner(
         reachable_symbols,
         dead_percentage,
         excluded_count,
+        undecodable_symbols,
     })
 }
 
@@ -664,6 +705,52 @@ mod tests {
         assert_eq!(result.reachable_symbols, 0);
         assert!(result.unreachable_symbols.is_empty());
         assert_eq!(result.excluded_count, 0);
+        assert_eq!(result.undecodable_symbols, 0);
+        assert!(result.coverage_is_complete());
+    }
+
+    /// This pass states "N of M symbols unreachable" — a completeness claim
+    /// over the whole corpus. nw-335 made the whole-corpus scan skip a row it
+    /// cannot decode instead of failing, which silently makes BOTH numbers
+    /// wrong; the store discloses the skip only in a log line, which no caller
+    /// can read. So the shortfall must arrive as a VALUE on the result, or the
+    /// percentage is published as exact over a corpus that lost rows.
+    #[test]
+    fn an_undecodable_symbol_makes_the_counts_declare_themselves_a_floor() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("dead", "never_called", false))
+            .unwrap();
+
+        let clean = detect_dead_code(&store).unwrap();
+        assert_eq!(clean.total_symbols, 2);
+        assert!(
+            clean.coverage_is_complete(),
+            "a readable corpus must still report an EXACT total, or the \
+             degraded signal means nothing"
+        );
+
+        // A NUL anywhere in the corpus — in a symbol unrelated to either of the
+        // two above.
+        let mut corrupt = make_symbol("corrupt", "unrelated", false);
+        corrupt.name = "unre\u{0}lated".to_string();
+        store.insert_symbol(&corrupt).unwrap();
+
+        let degraded = detect_dead_code(&store).unwrap();
+        assert_eq!(
+            degraded.undecodable_symbols, 1,
+            "the dropped row must be COUNTED on the result, not just logged"
+        );
+        assert!(
+            !degraded.coverage_is_complete(),
+            "'N of M unreachable' is not truthful over a corpus that lost rows"
+        );
+        // The proof that this matters: the corrupt row is genuinely absent, so
+        // `total_symbols` is a floor and says nothing about it on its own.
+        assert_eq!(degraded.total_symbols, 2);
     }
 
     /// A pre-tripped cancel flag must make the reachability BFS return the

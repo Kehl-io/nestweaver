@@ -110,13 +110,23 @@ pub fn resolve_references_with_context(
         for ((_, _, references), sorted_syms) in files.iter().zip(sorted_symbols_per_file.iter()) {
             for reference in references {
                 if reference.kind == ReferenceKind::Extends
-                    && let Some(sym) = find_enclosing_symbol(sorted_syms, reference.start_line)
+                    && let Some(sym) =
+                        find_enclosing_symbol(sorted_syms, reference.start_line).symbol()
+                    // nw-330: `Extension` belongs here. A Rust `impl Trait
+                    // for Type` block IS the symbol that encloses the `Extends`
+                    // reference to the trait, and it used to be
+                    // `SymbolKind::Class`. Giving impl blocks their own kind
+                    // without widening this filter would have silently deleted
+                    // every Rust trait relationship from the MRO map — a
+                    // modelling fix quietly losing the one structural fact the
+                    // model already had.
                     && matches!(
                         sym.kind,
                         SymbolKind::Class
                             | SymbolKind::Enum
                             | SymbolKind::Interface
                             | SymbolKind::Trait
+                            | SymbolKind::Extension
                     )
                 {
                     map.entry(sym.name.clone())
@@ -280,8 +290,8 @@ pub fn resolve_references_with_context(
             // never-exported string constant acquired 830 out-edges and ranked
             // #5 in a 158k-symbol graph. Pass 3a already emits a file-level
             // proxy edge per import, so connectivity does not depend on this.
-            let source_sym =
-                import_line.and_then(|line| find_enclosing_symbol(source_sorted_syms, line));
+            let source_sym = import_line
+                .and_then(|line| find_enclosing_symbol(source_sorted_syms, line).symbol());
 
             let source_uid = match source_sym {
                 Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
@@ -390,7 +400,21 @@ fn resolve_single_reference(
         ReferenceKind::Import | ReferenceKind::ImportAlias | ReferenceKind::Uses => return None,
     };
 
-    let source_sym = find_enclosing_symbol(sorted_syms, reference.start_line)?;
+    // nw-349 (1). The three cases are now distinguishable, and only two of them
+    // name a source:
+    //
+    //   Exact      — a real span contains this line. Trustworthy.
+    //   Degenerate — no span contains it; the nearest preceding CODE-BEARING
+    //                one-line symbol is the best guess. Still a guess, but it can
+    //                no longer be a `Constant`/`Variable`/`Property`, which is
+    //                what it frequently was.
+    //   ModuleScope — the line belongs to no symbol. There is no source symbol to
+    //                name, and this pass declines to invent one. See the note on
+    //                `Enclosing` for why the obvious candidates were rejected.
+    let source_sym = match find_enclosing_symbol(sorted_syms, reference.start_line) {
+        Enclosing::Exact(s) | Enclosing::Degenerate(s) => s,
+        Enclosing::ModuleScope => return None,
+    };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
 
     // ── Type-aware resolution for member calls with known receiver type ──
@@ -826,6 +850,72 @@ fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str
     sym.parent_name.as_deref() == Some(denoted)
 }
 
+/// What is actually known about the source of a reference.
+///
+/// nw-349. `find_enclosing_symbol` used to return `Option<&RawSymbol>`, which
+/// collapsed THREE distinct facts into two values:
+///
+/// - a real span contains this line;
+/// - no span contains it, but a preceding one-line symbol is the best guess;
+/// - this line is module-level code and belongs to no symbol.
+///
+/// The caller could not act on the difference because the difference was not in
+/// the type. `resolve_single_reference`'s `?` silently discarded the third case
+/// — so a shell script's own `main "$@"` produced no edge at all and `dead-code`
+/// reported the script's entry point as unreachable — while trusting the second
+/// case as if it were the first.
+#[derive(Debug, Clone, Copy)]
+enum Enclosing<'a> {
+    /// A symbol's real span contains `ref_line`.
+    Exact(&'a RawSymbol),
+    /// No span contains `ref_line`, but a preceding code-bearing symbol has a
+    /// degenerate (zero-height) span, so it is the best available guess. A
+    /// GUESS, and the type says so.
+    Degenerate(&'a RawSymbol),
+    /// `ref_line` belongs to no symbol: module-level code. A fact, not a
+    /// failure to resolve.
+    ModuleScope,
+}
+
+impl<'a> Enclosing<'a> {
+    /// The symbol, for callers that only need "some enclosing symbol" and have
+    /// no use for the distinction.
+    fn symbol(self) -> Option<&'a RawSymbol> {
+        match self {
+            Enclosing::Exact(s) | Enclosing::Degenerate(s) => Some(s),
+            Enclosing::ModuleScope => None,
+        }
+    }
+}
+
+/// Whether a symbol of this kind can contain executable code, and therefore be
+/// the source of a call, type reference or field access.
+///
+/// The degenerate fallback walks backwards to the nearest one-line symbol, and
+/// with no kind restriction that was frequently a DATA symbol. Measured on the
+/// checked-in fixtures before this restriction existed:
+///
+/// - `testdata/cpp/simple.cpp:35` recorded `logValue(temp)` as **the local
+///   variable `temp`** calling `logValue`;
+/// - `testdata/python/simple.py:37` recorded `main()` as **`Property name`**;
+/// - `testdata/js/simple.js:28` recorded `greet()` as **`Constant dog`**.
+///
+/// Those are not missing edges — they are edges with fabricated sources, which
+/// is worse, because a caller cannot tell them from real ones. A `Constant`,
+/// `Variable`, `Property` or `Field` has no body and cannot call anything.
+fn can_contain_code(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Class
+            | SymbolKind::Module
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Extension
+    )
+}
+
 /// Find the enclosing symbol: the innermost symbol whose span contains the
 /// reference line (`start_line <= ref_line <= end_line`).
 ///
@@ -833,17 +923,17 @@ fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str
 /// Binary search finds the last symbol starting at or before `ref_line`; if that
 /// symbol's span does not contain the line (e.g. Python module-level statements
 /// like `if __name__ == '__main__':` after the last `def`), walk back to an
-/// earlier symbol whose span does — or return `None` when the reference is
-/// module-level code that belongs to no symbol.
+/// earlier symbol whose span does — or report `ModuleScope` when the reference
+/// is module-level code that belongs to no symbol.
 ///
-/// Degenerate-span fallback: the regex-based parsers (astro, svelte, vue,
-/// cobol) emit one-line spans (`end_line == start_line`) while emitting Call
-/// references on later lines, so no span can ever contain those refs. When no
-/// span contains the line, attribute the reference to the nearest preceding
-/// symbol with a degenerate span (`end_line <= start_line`). Symbols with
-/// real spans that ended before `ref_line` still yield `None` — module-level
-/// code belongs to no symbol.
-fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Option<&'a RawSymbol> {
+/// Degenerate-span fallback: some parsers still emit one-line spans while
+/// emitting Call references on later lines, so no span can contain those refs.
+/// When no span contains the line, attribute the reference to the nearest
+/// preceding CODE-BEARING symbol with a degenerate span (`end_line <=
+/// start_line`) and report it as `Degenerate`. Symbols with real spans that
+/// ended before `ref_line` still yield `ModuleScope` — module-level code
+/// belongs to no symbol.
+fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enclosing<'a> {
     debug_assert!(
         symbols
             .windows(2)
@@ -851,11 +941,11 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Opt
         "find_enclosing_symbol requires symbols sorted by start_line"
     );
     if symbols.is_empty() {
-        return None;
+        return Enclosing::ModuleScope;
     }
     let idx = symbols.partition_point(|s| s.start_line <= ref_line);
     if idx == 0 {
-        return None;
+        return Enclosing::ModuleScope;
     }
     if let Some(enclosing) = symbols[..idx]
         .iter()
@@ -863,13 +953,14 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Opt
         .find(|s| ref_line <= s.end_line.max(s.start_line))
         .copied()
     {
-        return Some(enclosing);
+        return Enclosing::Exact(enclosing);
     }
     symbols[..idx]
         .iter()
         .rev()
-        .find(|s| s.end_line <= s.start_line)
+        .find(|s| s.end_line <= s.start_line && can_contain_code(s.kind))
         .copied()
+        .map_or(Enclosing::ModuleScope, Enclosing::Degenerate)
 }
 
 #[cfg(test)]
@@ -1913,6 +2004,102 @@ mod tests {
     }
 
     #[test]
+    fn a_module_scope_reference_is_distinguishable_from_a_degenerate_span_guess() {
+        // nw-349 (1). find_enclosing_symbol used to return Option<&RawSymbol>,
+        // so "module scope" and "I guessed from a one-line symbol" arrived at
+        // the call site as the SAME value. resolve_single_reference's `?`
+        // discarded the former and silently trusted the latter.
+        let mut one_liner = make_symbol("helper", 1);
+        one_liner.end_line = 1; // a GENUINE one-line function
+        let real = make_symbol("caller", 10); // spans 10..=15
+
+        let syms: Vec<&RawSymbol> = {
+            let mut v = vec![&one_liner, &real];
+            v.sort_by_key(|s| s.start_line);
+            v
+        };
+
+        // Inside a real span: exact.
+        assert!(
+            matches!(find_enclosing_symbol(&syms, 12), Enclosing::Exact(s) if s.name == "caller")
+        );
+        // After every span, with a degenerate code-bearing symbol available:
+        // a GUESS, and the type must say so rather than looking like Exact.
+        assert!(matches!(
+            find_enclosing_symbol(&syms, 50),
+            Enclosing::Degenerate(s) if s.name == "helper"
+        ));
+        // Before any symbol: module scope, which is a FACT, not a failure.
+        assert!(matches!(
+            find_enclosing_symbol(&syms, 0),
+            Enclosing::ModuleScope
+        ));
+    }
+
+    #[test]
+    fn a_degenerate_span_fallback_never_attributes_a_call_to_a_data_symbol() {
+        // nw-349 (1), measured on the checked-in fixtures BEFORE this guard:
+        // testdata/cpp/simple.cpp:35 `logValue(temp);` was recorded as the
+        // LOCAL VARIABLE `temp` calling `logValue`, and
+        // testdata/python/simple.py:37 `main()` as `Property name` calling
+        // `main`. A Constant/Variable/Property/Field has no body and cannot be
+        // a call site, so an edge sourced at one is not a weak edge — it is a
+        // fabricated one, indistinguishable from a real edge downstream.
+        let mut var = make_symbol("temp", 34);
+        var.end_line = 34;
+        var.kind = SymbolKind::Variable;
+        let mut func = make_symbol("setup", 31);
+        func.end_line = 31; // the old C++ zero-height span
+        let syms: Vec<&RawSymbol> = vec![&func, &var];
+
+        match find_enclosing_symbol(&syms, 35) {
+            Enclosing::Degenerate(s) => assert_eq!(
+                s.name, "setup",
+                "the fallback must skip data symbols; got {} ({:?})",
+                s.name, s.kind
+            ),
+            other => panic!("expected a degenerate attribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reference_after_a_lone_data_symbol_is_module_scope_not_a_fabricated_edge() {
+        // The other half: with NO code-bearing degenerate symbol to fall back
+        // on, the answer is `ModuleScope` — "this belongs to no symbol" — and
+        // not "the constant did it". testdata/js/simple.js:28 is the measured
+        // case: a module-top-level `greet()` recorded as `Constant dog`.
+        let mut konst = make_symbol("dog", 20);
+        konst.end_line = 20;
+        konst.kind = SymbolKind::Constant;
+        let syms: Vec<&RawSymbol> = vec![&konst];
+
+        assert!(
+            matches!(find_enclosing_symbol(&syms, 28), Enclosing::ModuleScope),
+            "a Constant cannot call anything"
+        );
+    }
+
+    #[test]
+    fn a_call_after_a_constant_produces_no_edge_rather_than_a_wrong_one() {
+        // End to end through resolve_references: the fabricated edge must not
+        // reach the graph at all.
+        let mut konst = make_symbol("dog", 20);
+        konst.end_line = 20;
+        konst.kind = SymbolKind::Constant;
+        let greet = make_symbol("greet", 1); // spans 1..=6
+        let files = vec![(
+            "src/simple.js".to_string(),
+            vec![greet, konst],
+            vec![make_ref("greet", ReferenceKind::Call, 28)],
+        )];
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            !edges.iter().any(|e| e.source_uid.contains("dog")),
+            "a Constant must never be recorded as the source of a call: {edges:?}"
+        );
+    }
+
+    #[test]
     fn find_enclosing_symbol_binary_search_correctness() {
         // Helper that runs both an end-line-aware linear scan and the binary
         // search, asserting they agree, then returns the start_line of the result.
@@ -1931,7 +2118,9 @@ mod tests {
                 v.sort_by_key(|s| s.start_line);
                 v
             };
-            let binary = find_enclosing_symbol(&sorted, ref_line).map(|s| s.start_line);
+            let binary = find_enclosing_symbol(&sorted, ref_line)
+                .symbol()
+                .map(|s| s.start_line);
             let linear = linear_scan(symbols, ref_line);
             assert_eq!(
                 binary, linear,
@@ -2029,7 +2218,9 @@ mod tests {
                 v.sort_by_key(|s| s.start_line);
                 v
             };
-            find_enclosing_symbol(&sorted, ref_line).map(|s| s.start_line)
+            find_enclosing_symbol(&sorted, ref_line)
+                .symbol()
+                .map(|s| s.start_line)
         }
 
         // A call ref on a later line is owned by the nearest preceding

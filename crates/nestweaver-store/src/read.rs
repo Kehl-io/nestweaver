@@ -229,6 +229,120 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// What a whole-corpus scan actually covered.
+///
+/// nw-335 made the whole-corpus scans TOLERATE a corrupt row instead of losing
+/// the corpus to it, and disclosed the skip with a `tracing::warn!`. A log line
+/// is legible to a human tailing logs and invisible to the caller — so a caller
+/// that makes a COMPLETENESS claim ("N of M symbols unreachable") or a SAFETY
+/// claim ("these are the tests you need to run") could state it over a
+/// knowingly-incomplete corpus and still read as usable. That is nw-324
+/// verbatim: `affected-tests` selecting zero tests and reporting
+/// `selection-usable` while a green build shipped a regression.
+///
+/// So the skip is a RETURN VALUE, not just a log. Callers that claim
+/// completeness or safety take the `*_with_integrity` sibling of their scan and
+/// degrade on [`ScanIntegrity::is_degraded`]; callers that claim nothing keep
+/// the plain scan. Modelled on `blast_radius::Coverage`, which exists for the
+/// same reason on the traversal side: it lets a consumer tell "no impact" from
+/// "incomplete coverage".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScanIntegrity {
+    /// Rows decoded and returned to the caller.
+    pub returned: usize,
+    /// Rows the scan reached but could not decode, and therefore DROPPED. Any
+    /// total computed over `returned` is a floor while this is non-zero.
+    pub skipped_corrupt: usize,
+    /// The first corruption encountered, for disclosure to an operator.
+    pub first_reason: Option<String>,
+}
+
+impl ScanIntegrity {
+    /// The scan saw the whole corpus: every row it reached, it returned.
+    pub fn is_complete(&self) -> bool {
+        self.skipped_corrupt == 0
+    }
+
+    /// Rows were dropped — any count over this scan is a floor, and any
+    /// safety decision taken on it is taken on a partial graph.
+    pub fn is_degraded(&self) -> bool {
+        self.skipped_corrupt > 0
+    }
+
+    /// A one-line disclosure for a caller that has to tell a user why its
+    /// numbers are a floor. `None` when the scan was complete, so that
+    /// `if let Some(..)` is the whole disclosure path.
+    pub fn disclosure(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        Some(format!(
+            "coverage DEGRADED: {} corrupt row(s) skipped, {} kept; first: {}. \
+             Counts are a floor. Re-index to repair (`nestweaver brain add --force`).",
+            self.skipped_corrupt,
+            self.returned,
+            self.first_reason.as_deref().unwrap_or("unknown")
+        ))
+    }
+}
+
+/// Collect a whole-corpus scan, degrading on a corrupt row rather than losing
+/// the corpus to it.
+///
+/// nw-335: `extract_string`'s NUL canary is a LadybugDB #678 detector, and
+/// `rows.map(row_to_x).collect::<Result<Vec<_>, _>>()` short-circuits on the
+/// first `Err` -- so ONE unreadable row emptied the entire vector. Both global
+/// derived indexes are built by consuming exactly these vectors (Tantivy's
+/// `write_full_corpus_with_fields` reads notes + headings + sections; the regex
+/// trigram corpus reads notes + sections + symbols), so a single note holding a
+/// pasted NUL took search to `docs=0` brain-wide while `brain status` still
+/// reported a healthy graph. A row the reader will not return is ONE lost row.
+///
+/// Only `CorruptValue` degrades. A type mismatch or an out-of-bounds column is a
+/// real query defect and still aborts: this is a corruption-tolerance seam, not
+/// a blanket `ok()`.
+///
+/// The precedent is `traverse.rs`, which skips a garbled caller uid and keeps
+/// walking. What that site got right and `extract_string` got wrong is that the
+/// canary fires on a NAVIGATIONAL key, where a NUL genuinely cannot be
+/// legitimate; `text_content` and `title` are CONTENT, where it merely should
+/// not be -- and is now stripped at ingest so that it is not.
+/// Returns the rows AND a [`ScanIntegrity`]. The integrity value is the point:
+/// the `tracing::warn!` below discloses the skip to an operator, and only the
+/// return value discloses it to the caller.
+pub(crate) fn collect_tolerating_corrupt<T>(
+    rows: impl Iterator<Item = Result<T, StoreError>>,
+    what: &str,
+) -> Result<(Vec<T>, ScanIntegrity), StoreError> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_reason: Option<String> = None;
+    for row in rows {
+        match row {
+            Ok(value) => out.push(value),
+            Err(StoreError::CorruptValue { column, reason }) => {
+                skipped += 1;
+                if first_reason.is_none() {
+                    first_reason = Some(format!("column {column}: {reason}"));
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let integrity = ScanIntegrity {
+        returned: out.len(),
+        skipped_corrupt: skipped,
+        first_reason,
+    };
+    if let Some(disclosure) = integrity.disclosure() {
+        // Disclose, do not swallow: the caller's coverage is DEGRADED and an
+        // operator reading "search found nothing" needs to know why. The
+        // caller learns the same fact from `integrity`.
+        tracing::warn!("{what}: {disclosure}");
+    }
+    Ok((out, integrity))
+}
+
 fn extract_opt_string(row: &[Value], idx: usize) -> Result<Option<String>, StoreError> {
     let val = row
         .get(idx)
@@ -1374,7 +1488,20 @@ impl GraphStore {
     }
 
     /// List all Note nodes, optionally filtered by vault UID.
+    ///
+    /// Corrupt rows are skipped (nw-335). A caller that states a TOTAL over
+    /// notes, or claims to have covered every note, must use
+    /// [`Self::list_notes_with_integrity`] instead — this signature cannot tell
+    /// it that rows were dropped.
     pub fn list_notes(&self, vault_uid: Option<&str>) -> Result<Vec<Note>, StoreError> {
+        Ok(self.list_notes_with_integrity(vault_uid)?.0)
+    }
+
+    /// [`Self::list_notes`] plus what the scan actually covered.
+    pub fn list_notes_with_integrity(
+        &self,
+        vault_uid: Option<&str>,
+    ) -> Result<(Vec<Note>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let result = if let Some(vid) = vault_uid {
             let q = format!("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN {NOTE_COLUMNS}");
@@ -1388,7 +1515,7 @@ impl GraphStore {
             conn.query(&q)
                 .map_err(|e| StoreError::Query(e.to_string()))?
         };
-        result.map(|row| row_to_note(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_note(&row)), "list_notes")
     }
 
     /// Count of all Note nodes (cheap for status output — no body load).
@@ -1477,24 +1604,46 @@ impl GraphStore {
     /// List all Heading nodes across all vaults/notes.
     /// Used by the brain_search substring fallback to extend title-only search
     /// to heading text.
+    ///
+    /// Corrupt rows are skipped (nw-335); see
+    /// [`Self::list_all_headings_with_integrity`] for callers that claim
+    /// completeness.
     pub fn list_all_headings(&self) -> Result<Vec<Heading>, StoreError> {
+        Ok(self.list_all_headings_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_headings`] plus what the scan actually covered.
+    pub fn list_all_headings_with_integrity(
+        &self,
+    ) -> Result<(Vec<Heading>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (h:Heading) RETURN {HEADING_COLUMNS}");
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_heading(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_heading(&row)), "list_all_headings")
     }
 
     /// List all Section nodes across all vaults/notes (includes `text_content`).
     /// Used by the brain_search substring fallback to search section bodies.
+    ///
+    /// Corrupt rows are skipped (nw-335); see
+    /// [`Self::list_all_sections_with_integrity`] for callers that claim
+    /// completeness.
     pub fn list_all_sections(&self) -> Result<Vec<Section>, StoreError> {
+        Ok(self.list_all_sections_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_sections`] plus what the scan actually covered.
+    pub fn list_all_sections_with_integrity(
+        &self,
+    ) -> Result<(Vec<Section>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (s:Section) RETURN {SECTION_COLUMNS}");
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_section(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_section(&row)), "list_all_sections")
     }
 
     /// List all Heading nodes belonging to notes in the given vault.
@@ -1876,13 +2025,26 @@ impl GraphStore {
 
     /// All symbols with full details including the embedding field.
     /// Used by vector KNN search to load embeddings for cosine similarity.
+    ///
+    /// Corrupt rows are skipped (nw-335). `dead_code` and `affected_tests` —
+    /// the two callers that respectively state "N of M symbols unreachable" and
+    /// decide which tests may be skipped — take
+    /// [`Self::list_all_symbols_with_integrity`], because neither claim is
+    /// truthful over a corpus that silently lost rows.
     pub fn list_all_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        Ok(self.list_all_symbols_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_symbols`] plus what the scan actually covered.
+    pub fn list_all_symbols_with_integrity(
+        &self,
+    ) -> Result<(Vec<nestweaver_schema::Symbol>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (s:Symbol) RETURN {}", SYMBOL_COLUMNS);
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_symbol(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_symbol(&row)), "list_all_symbols")
     }
 
     /// All symbols' (uid, name, kind_string). Lightweight — no signature
@@ -1921,6 +2083,31 @@ impl GraphStore {
     /// Count of all wikilink edges (to either Note or Heading). Cheap status
     /// summary — does two separate queries since LadybugDB splits the
     /// logical WIKILINK into two physical REL tables.
+    /// Count of `UnresolvedWikilink` NODES — distinct (source section, target
+    /// text) pairs.
+    ///
+    /// nw-345: this is the population that sits between the two the product
+    /// reports, and it was never reported anywhere, which is why the gap
+    /// between the indexer's number and `doc-stats`' is not a clean factor.
+    /// The node uid is derived from the source section plus the target text, so
+    /// two identical links in ONE section collapse to one node on insert, while
+    /// `broken_wikilinks` dedupes again to (source NOTE, text). Three
+    /// populations, one word.
+    ///
+    /// OCCURRENCES — one per link instance in the parse — are deliberately not
+    /// obtainable here. The graph does not store them: it stores one node per
+    /// (section, target). Only the indexer can report occurrences, and it does.
+    pub fn count_unresolved_wikilink_nodes(&self) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        match conn.query("MATCH (u:UnresolvedWikilink) RETURN u.uid") {
+            Ok(result) => Ok(result.count()),
+            Err(e) => {
+                tracing::trace!("count_unresolved_wikilink_nodes: query skipped: {e}");
+                Ok(0)
+            }
+        }
+    }
+
     pub fn count_wikilink_edges(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
         let to_notes = conn
@@ -3603,5 +3790,245 @@ mod repo_has_content_tests {
                 .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod corrupt_row_tolerance_tests {
+    use super::*;
+
+    fn section(uid: &str, text: &str) -> Section {
+        Section {
+            uid: uid.to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 2,
+            text_hash: "h".to_string(),
+            text_content: text.to_string(),
+            word_count: 1,
+            pagerank_score: None,
+        }
+    }
+
+    fn note(uid: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: "vault:v".to_string(),
+            file_path: format!("{uid}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn heading(uid: &str, text: &str) -> Heading {
+        Heading {
+            uid: uid.to_string(),
+            note_uid: "note:clean".to_string(),
+            level: 1,
+            text: text.to_string(),
+            slug: "s".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "h".to_string(),
+            embedding: None,
+        }
+    }
+
+    fn symbol(uid: &str, signature: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: "s".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:r".to_string(),
+            file_path: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: signature.to_string(),
+            summary: None,
+            content_hash: "h".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// nw-335: a graph that ALREADY holds a NUL must stay readable without a
+    /// re-parse. `list_all_sections` collected into `Result<Vec<_>, _>`, which
+    /// short-circuits, so one unreadable row emptied the whole vector -- and
+    /// both global derived-index builds (Tantivy BM25 at
+    /// `tantivy_index.rs:1243`, the regex trigram corpus at `regex.rs:799`)
+    /// consume exactly that vector. One poisoned note therefore took search
+    /// brain-wide to `docs=0` while `brain status` still reported health.
+    ///
+    /// This is `traverse.rs:1089`'s precedent applied to the scan side: skip
+    /// the row, say so, keep the corpus.
+    #[test]
+    fn one_corrupt_row_degrades_the_scan_instead_of_emptying_it() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_section(&section("sec:clean", "loadbearing text"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:dirty", "before\u{0}after"))
+            .unwrap();
+
+        let sections = store
+            .list_all_sections()
+            .expect("nw-335: one corrupt row must not fail the whole section scan");
+        assert!(
+            sections.iter().any(|s| s.uid == "sec:clean"),
+            "the clean row must survive its neighbour's NUL: {sections:?}"
+        );
+        assert!(
+            !sections.iter().any(|s| s.uid == "sec:dirty"),
+            "the corrupt row is DROPPED, not silently repaired -- the canary is \
+             still a #678 detector on a graph the reader did not write"
+        );
+    }
+
+    /// nw-335, the "where else" half: the same short-circuit sits under EVERY
+    /// whole-corpus scan the global index builds walk, not just sections.
+    /// `write_full_corpus_with_fields` reads notes, headings and sections; the
+    /// trigram corpus additionally reads symbols. A fix scoped to
+    /// `list_all_sections` would leave three identical cliffs standing.
+    #[test]
+    fn every_whole_corpus_scan_tolerates_a_corrupt_row() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store.insert_note(&note("note:clean", "Clean")).unwrap();
+        store
+            .insert_note(&note("note:dirty", "Ti\u{0}tle"))
+            .unwrap();
+        let notes = store.list_notes(None).expect("nw-335: notes scan degrades");
+        assert!(notes.iter().any(|n| n.uid == "note:clean"));
+        assert!(!notes.iter().any(|n| n.uid == "note:dirty"));
+
+        store.insert_heading(&heading("h:clean", "Clean")).unwrap();
+        store
+            .insert_heading(&heading("h:dirty", "He\u{0}ad"))
+            .unwrap();
+        let headings = store
+            .list_all_headings()
+            .expect("nw-335: headings scan degrades");
+        assert!(headings.iter().any(|h| h.uid == "h:clean"));
+        assert!(!headings.iter().any(|h| h.uid == "h:dirty"));
+
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:dirty", "fn b\u{0}ad()"))
+            .unwrap();
+        let symbols = store
+            .list_all_symbols()
+            .expect("nw-335: symbols scan degrades");
+        assert!(symbols.iter().any(|s| s.uid == "sym:clean"));
+        assert!(!symbols.iter().any(|s| s.uid == "sym:dirty"));
+    }
+
+    /// nw-335 tolerance made the scans survive a corrupt row; it disclosed the
+    /// skip only via `tracing::warn!`, which no caller can read. A caller that
+    /// claims completeness ("N of M symbols") or safety ("these are the tests
+    /// to run") therefore stated it over a corpus it did not know was partial
+    /// — nw-324's exact failure mode. Every tolerant scan must hand the caller
+    /// a VALUE it can branch on.
+    #[test]
+    fn every_tolerant_scan_hands_the_caller_an_observable_integrity() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store.insert_note(&note("note:clean", "Clean")).unwrap();
+        store
+            .insert_note(&note("note:dirty", "Ti\u{0}tle"))
+            .unwrap();
+        store.insert_heading(&heading("h:clean", "Clean")).unwrap();
+        store
+            .insert_heading(&heading("h:dirty", "He\u{0}ad"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:clean", "loadbearing text"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:dirty", "before\u{0}after"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:dirty", "fn b\u{0}ad()"))
+            .unwrap();
+
+        let scans: Vec<(&str, ScanIntegrity)> = vec![
+            (
+                "list_notes",
+                store.list_notes_with_integrity(None).unwrap().1,
+            ),
+            (
+                "list_all_headings",
+                store.list_all_headings_with_integrity().unwrap().1,
+            ),
+            (
+                "list_all_sections",
+                store.list_all_sections_with_integrity().unwrap().1,
+            ),
+            (
+                "list_all_symbols",
+                store.list_all_symbols_with_integrity().unwrap().1,
+            ),
+        ];
+
+        for (what, integrity) in scans {
+            assert_eq!(integrity.skipped_corrupt, 1, "{what} must COUNT the skip");
+            assert_eq!(integrity.returned, 1, "{what} must keep the clean row");
+            assert!(integrity.is_degraded(), "{what} must read as degraded");
+            assert!(!integrity.is_complete(), "{what} is not complete");
+            assert!(
+                integrity
+                    .disclosure()
+                    .is_some_and(|d| d.contains("DEGRADED")),
+                "{what} must offer the caller a disclosure string"
+            );
+        }
+    }
+
+    /// The other half of the same contract: a CLEAN scan must report itself
+    /// complete, or a caller that degrades on `is_degraded()` would degrade
+    /// always and the signal would be worthless.
+    #[test]
+    fn a_clean_scan_reports_itself_complete() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        let (symbols, integrity) = store.list_all_symbols_with_integrity().unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert!(integrity.is_complete());
+        assert_eq!(integrity.skipped_corrupt, 0);
+        assert_eq!(integrity.disclosure(), None);
+    }
+
+    /// nw-335: degrading is scoped to CORRUPTION. A genuine query defect -- a
+    /// column that is not a String at all -- must still abort loudly, or the
+    /// tolerance seam turns into a blanket `ok()` that hides real bugs.
+    #[test]
+    fn a_type_mismatch_still_aborts_the_scan() {
+        let row = vec![Value::Int64(7)];
+        assert!(matches!(
+            collect_tolerating_corrupt(std::iter::once(extract_string(&row, 0)), "test"),
+            Err(StoreError::Query(_))
+        ));
     }
 }

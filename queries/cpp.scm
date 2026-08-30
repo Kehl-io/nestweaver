@@ -2,17 +2,46 @@
 ; Based on the official tree-sitter-cpp tags.scm with additions for
 ; reference extraction (calls, includes).
 
+; Function and method DEFINITIONS are anchored on `function_definition`, not on
+; `function_declarator`. The declarator is the signature WITHOUT the body, so
+; anchoring the capture there recorded `end_line == start_line` for every C++
+; function in the corpus — `setup` in testdata/cpp/simple.cpp read as 31-31
+; when it spans 31-36. `queries/c.scm` has always anchored on
+; `function_definition` and was always correct; this is that one-node diff.
+;
+; A zero-height function span is not cosmetic: `read-symbols` returns the
+; signature alone, and `find_enclosing_symbol` cannot place a call inside the
+; function containing it, so every call in a body was attributed to the nearest
+; preceding one-line symbol instead.
+
 ; Free function definitions
-(function_declarator
-  declarator: (identifier) @name) @definition.function
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
 
 ; Method definitions via qualified identifier (e.g. Foo::bar)
-(function_declarator
-  declarator: (qualified_identifier
-    name: (identifier) @name)) @definition.method
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (identifier) @name))) @definition.method
 
-(function_declarator
-  declarator: (field_identifier) @name) @definition.method
+; Inline method definitions inside a class body
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @definition.method
+
+; DECLARATIONS with no body — a class's declared interface, and the prototypes
+; that make up a header. These are genuinely one line, so they keep the
+; declarator anchor. They are matched on their enclosing declaration node
+; rather than on `function_declarator` alone so a definition can never match
+; both a definition rule and a declaration rule and mint two symbols.
+(field_declaration
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @definition.method
+
+(declaration
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
 
 ; Class definitions
 (class_specifier

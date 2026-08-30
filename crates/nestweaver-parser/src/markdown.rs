@@ -160,6 +160,12 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     // 1. Strip Obsidian `%%...%%` comments from source before any further
     //    processing so they are excluded from indexing and search.
     let stripped_source = strip_obsidian_comments(source);
+    // nw-335: drop raw NUL bytes before anything downstream can carry one into
+    // a graph column. `content_hash` above is deliberately taken from the
+    // ORIGINAL bytes, so removing the byte does not hide the edit that removes
+    // it from change detection. See `parse::strip_nul_bytes` for why this is
+    // the right seam rather than the store's canary.
+    let stripped_source = crate::parse::strip_nul_bytes(&stripped_source).into_owned();
     let source = stripped_source.as_str();
 
     // 2. Split frontmatter (if any) from body.
@@ -629,7 +635,9 @@ fn kind_from_path(rel_path: &str) -> NoteKind {
 /// `[[wikilink#heading]]`, and `![[transclude]]` forms.
 ///
 /// Uses a hand-rolled scanner rather than a regex to keep the parser
-/// dep-light and to handle escapes / nesting predictably. We do NOT match
+/// dep-light. The ONE escape it understands is `\|` in an aliased link, which
+/// Obsidian requires inside a markdown table (nw-342); it does not handle
+/// nesting, and it never claimed to correctly. We do NOT match
 /// inside fenced code blocks (```...```) or inline code (`...`) — those
 /// are not real wikilinks.
 /// Parse every `[[wikilink]]` / `![[transclusion]]` on one line into `out`.
@@ -670,7 +678,27 @@ fn push_wikilinks_from_line(
             continue;
         }
         let (target_part, display) = match inside.split_once('|') {
-            Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
+            // nw-342: inside a markdown TABLE, Obsidian REQUIRES the alias pipe
+            // to be escaped -- `[[Backlog\|alias]]` is the only correct form
+            // there. `split_once('|')` hands the target half back with the
+            // backslash still attached, so `Backlog\` became the stored target:
+            // a name no file can carry, and the string a user reads back out of
+            // `broken-links` and `note_get`.
+            //
+            // Fixing only the resolver would MASK this. `WikilinkLookup::resolve`
+            // normalises `\` to `/` for Windows path forms, so the key became
+            // `backlog/` and the path-qualified fallback happened to recover it
+            // at 0.85 -- the symptom disappears while the wrong target string
+            // stays in the graph. A trailing backslash on a wikilink TARGET has
+            // no other meaning, so stripping it is unconditional; the DISPLAY
+            // half keeps whatever the user wrote.
+            Some((t, d)) => {
+                let t = t.trim();
+                (
+                    t.strip_suffix('\\').unwrap_or(t).trim_end().to_string(),
+                    Some(d.trim().to_string()),
+                )
+            }
             None => (inside.trim().to_string(), None),
         };
         if target_part.is_empty() {
@@ -1407,6 +1435,93 @@ top 2 body
         let note = parse_markdown("x.md", "").unwrap();
         assert!(note.headings.is_empty());
         assert!(note.sections.is_empty());
+    }
+
+    /// nw-342: inside a markdown TABLE, Obsidian REQUIRES the pipe of an
+    /// aliased wikilink to be escaped -- `[[Backlog\|alias]]` is the only
+    /// correct form there. `split_once('|')` then hands the target half back
+    /// with the backslash still attached, so `Backlog\` becomes the stored
+    /// target: a name no file can carry, and the string a user reads back out
+    /// of `broken-links` and `note_get`.
+    ///
+    /// The resolver fix alone would mask this. `resolve` normalises `\` to `/`
+    /// for Windows path forms, so the key becomes `backlog/` and the
+    /// path-qualified fallback happens to recover it at 0.85 -- the symptom
+    /// goes away while the wrong target string stays in the graph.
+    #[test]
+    fn an_escaped_pipe_wikilink_yields_a_bare_stem_target() {
+        let note =
+            parse_markdown("x.md", "| col |\n| --- |\n| [[Backlog\\|the backlog]] |\n").unwrap();
+        assert_eq!(note.wikilinks.len(), 1, "got {:?}", note.wikilinks);
+        assert_eq!(
+            note.wikilinks[0].target, "Backlog",
+            "nw-342: the `\\|` escape must be stripped -- `Backlog\\` is a name no \
+             file can carry, and it is what `broken-links` prints back at the user"
+        );
+        assert_eq!(note.wikilinks[0].display.as_deref(), Some("the backlog"));
+    }
+
+    /// nw-342, "where else": the same escape is legal outside a table, and an
+    /// unaliased link is unaffected. A trailing backslash that is NOT an escape
+    /// of the alias pipe has nowhere else to come from in a wikilink target, so
+    /// stripping is unconditional on the target half only -- the DISPLAY half
+    /// keeps whatever the user wrote.
+    #[test]
+    fn stripping_the_pipe_escape_leaves_other_wikilink_forms_alone() {
+        let note = parse_markdown(
+            "x.md",
+            "[[Plain]] and [[Some/Path\\|shown]] and [[Bare|shown two]]\n",
+        )
+        .unwrap();
+        let targets: Vec<&str> = note.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["Plain", "Some/Path", "Bare"],
+            "{:?}",
+            note.wikilinks
+        );
+    }
+
+    /// nw-335: a pasted NUL is not corruption, it is a byte a user typed into a
+    /// note. The store's whole-string canary (`read::string_is_corrupt`) treats
+    /// it as LadybugDB #678 partial-scan corruption and refuses the row, which
+    /// aborted the whole-corpus section scan behind BOTH global derived indexes.
+    /// Sanitising at the single markdown ingest choke point makes the canary's
+    /// stated premise -- "note bodies ... none contain NUL" -- true again,
+    /// rather than weakening a canary that is doing real work on uids and paths.
+    #[test]
+    fn a_nul_byte_is_stripped_from_every_field_the_parser_emits() {
+        let note = parse_markdown(
+            "x.md",
+            "---\ntitle: Ti\u{0}tle\n---\n# Head\u{0}ing\n\nbe\u{0}fore [[Tar\u{0}get]] after\n",
+        )
+        .unwrap();
+        assert!(!note.title.contains('\0'), "title: {:?}", note.title);
+        assert!(
+            note.headings.iter().all(|h| !h.text.contains('\0')),
+            "headings: {:?}",
+            note.headings
+        );
+        assert!(
+            note.sections.iter().all(|s| !s.text.contains('\0')),
+            "sections: {:?}",
+            note.sections
+        );
+        assert!(
+            note.wikilinks.iter().all(|w| !w.target.contains('\0')),
+            "wikilinks: {:?}",
+            note.wikilinks
+        );
+        assert!(
+            note.frontmatter_raw
+                .as_deref()
+                .is_none_or(|r| !r.contains('\0')),
+            "frontmatter_raw: {:?}",
+            note.frontmatter_raw
+        );
+        // Deleting the byte must not delete the text around it.
+        assert!(note.sections[0].text.contains("before"));
+        assert_eq!(note.title, "Title");
     }
 
     #[test]

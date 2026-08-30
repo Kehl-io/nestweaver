@@ -776,7 +776,17 @@ credential_method = "gh"
         .arg(&config_path)
         .assert()
         .success()
-        .stdout(contains("has no associated notes or symbols"));
+        // nw-316: the phrase moved because the direct route stopped
+        // re-implementing the tool. It used to print "<name> has no associated
+        // notes or symbols" while the daemon route printed the TOOL's note,
+        // "No notes or symbols are associated with this project yet." — one
+        // condition, two sentences, chosen by transport. What this assertion
+        // is actually for is the CONFIG resolution (the project named in
+        // `--config`'s database was found at all), and that is unchanged.
+        .stdout(contains(
+            "No notes or symbols are associated with this project yet.",
+        ))
+        .stdout(contains("configured-project"));
 
     // Repository-scoped commands have a different final fallback
     // (`<repo>/nestweaver.lbug`), so cover their shared resolver explicitly.
@@ -5288,6 +5298,113 @@ fn ui_watch_refuses_a_wholly_inferred_write_and_can_be_corrected() {
         .stdout(contains("--repo"));
 }
 
+/// nw-312. The documented exit-code contract is 0 ok / 1 error / 2 not-found /
+/// 64 usage, and 8.0.0 specifically split usage errors out so a caller could
+/// tell "you asked wrongly" from "it went wrong". An invalid enum value is a
+/// usage error, and `--format`/`--scope` were bare `String`s with the legal
+/// values enumerated only in prose — so validation happened in the handler and
+/// arrived as a generic error, exit 1.
+///
+/// The internal inconsistency is both the evidence and the counterweight:
+/// `--top` on the SAME command is a `usize`, so clap's own parse rejects a bad
+/// value and the binary already answers 64. The classification exists; these
+/// two arguments took a different route to it.
+#[test]
+fn export_rejects_an_invalid_enum_as_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "export function greet(n) { return n; }",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // `--top 0` is the control: a bad value on this same command, already 64.
+    for argv in [
+        vec!["export", "--format", "bogus"],
+        vec!["export", "--scope", "bogus"],
+        vec!["export", "--top", "not-a-number"],
+    ] {
+        let output = nestweaver_cmd()
+            .args(&argv)
+            .args(["--db", &db_path.display().to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{argv:?} exited {:?}; `--top not-a-number` on this same command \
+             exits 64, so the classification exists and this path bypassed it.\
+             \nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Counterweight: every documented value must still be ACCEPTED, or a
+    // `value_parser` built from the wrong list would satisfy the above.
+    for (format, scope) in [
+        ("cypher", "code"),
+        ("graphml", "all"),
+        ("graphml", "vault"),
+        ("mermaid", "code"),
+    ] {
+        nestweaver_cmd()
+            .args([
+                "export",
+                "--format",
+                format,
+                "--scope",
+                scope,
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .assert()
+            .success();
+    }
+
+    // And `msgpack` must still reach its handler, which refuses `--scope vault`
+    // as a SEMANTIC combination rather than an unknown value — a distinction a
+    // `PossibleValuesParser` must not flatten.
+    let output = nestweaver_cmd()
+        .args([
+            "export",
+            "--format",
+            "msgpack",
+            "--scope",
+            "vault",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "msgpack cannot represent the vault subgraph and must say so"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(64),
+        "`--scope vault` is a LEGAL value that this format cannot satisfy; \
+         reporting it as a usage error would tell the caller to fix the \
+         spelling of a word that is spelled correctly.\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
 /// later widening of the guard cannot quietly break plain `nestweaver ui`.
 #[test]
@@ -6570,5 +6687,159 @@ fn service_summary_text_warns_about_ambiguity_and_lists_entry_points() {
         !stdout.contains("helper"),
         "and only ENTRY POINTS — listing every symbol in the service would be \
          a different command:\n{stdout}"
+    );
+}
+
+/// nw-261. Wrap position must not be an ambient input to the suite.
+///
+/// The failure this closes is real and has fired: a phrase the code emits
+/// contiguously arrives at a `stderr.contains(...)` assertion split across
+/// miette's box-drawing gutter, so the assertion fails for a RENDERING reason
+/// while the message is exactly right. The audit found nine more assertions
+/// with the same exposure in `tests/daemon_test.rs`, all inside one
+/// Linux-gated test nobody can reproduce locally.
+///
+/// Flattening each assertion is the local fix and it only protects the
+/// assertions someone remembered to flatten. `NESTWEAVER_DIAGNOSTIC_WIDTH`
+/// pins the wrap column instead, which does two things flattening cannot:
+/// it covers assertions nobody has audited, and it makes the property
+/// TESTABLE — a wrap that previously depended on the tempdir path and the
+/// terminal can now be forced.
+///
+/// The first assertion is the vacuity guard, and it is the same one
+/// `flatten_diagnostic_recovers_a_phrase_miette_wrapped` uses: if the fixture
+/// does not actually reproduce the wrap, the test below it proves nothing.
+#[test]
+fn a_diagnostic_phrase_survives_a_narrow_render() {
+    // Chosen because width 40 wraps between `--repo` and `<path>`, which is
+    // what makes the vacuity guard below meaningful.
+    const PHRASE: &str = "index --repo <path>";
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.lbug");
+
+    let narrow = nestweaver_cmd()
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "40")
+        .args(["hubs", "--db"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let raw = String::from_utf8_lossy(&narrow.stderr).to_string();
+
+    assert!(
+        raw.contains("nestweaver index"),
+        "the fixture must reach the diagnostic at all: {raw}"
+    );
+    assert!(
+        !raw.contains(PHRASE),
+        "the fixture must reproduce the WRAP at width 40, or this test proves \
+         nothing — `NESTWEAVER_DIAGNOSTIC_WIDTH` is not being honoured and the \
+         render used the ambient width: {raw}"
+    );
+    assert!(
+        flatten_miette(&narrow.stderr).contains(PHRASE),
+        "flattening must recover a phrase miette wrapped, which is the whole \
+         reason a width-dependent assertion is a false failure: {raw}"
+    );
+
+    // Counterweight: unset must be TODAY's behaviour exactly. A knob that
+    // changed the default would be a user-visible rendering change shipped to
+    // make a test convenient.
+    let ambient = nestweaver_cmd()
+        .env_remove("NESTWEAVER_DIAGNOSTIC_WIDTH")
+        .args(["hubs", "--db"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(
+        flatten_miette(&ambient.stderr).contains(PHRASE),
+        "{}",
+        String::from_utf8_lossy(&ambient.stderr)
+    );
+}
+
+/// nw-259(a). A token-budget cut must not tell the caller it hit `--limit`.
+///
+/// The `context` arm carries three caps and had one `truncated` boolean and one
+/// `limit` field to explain all of them, so a BUDGET cut set `truncated` and
+/// left `limit` at whatever the earlier cap set — reporting "TRUNCATED at limit
+/// 500 — pass --limit for more" for a cut `--limit` did not make and cannot
+/// undo. An agent following that remedy raises `--limit`, gets the same rows,
+/// and has no next move. That is an nw-334 instance none of the four shipped
+/// tiers can see: it is not a `CliDiagnostic`, not an environment variable, and
+/// not a backtick-quoted subcommand.
+///
+/// The counterweight is the second half: a genuine LIMIT cut must still say
+/// `--limit`, or deleting the message entirely would pass.
+#[test]
+fn a_context_budget_cut_names_the_budget_and_a_limit_cut_names_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("a.js"),
+        "export function mainA(x){return helperB(x)+helperC(x);}\n\
+         export function helperB(n){return helperC(n)+1;}\n\
+         export function helperC(n){return n*3;}\n\
+         export function extraB(n){return n-1;}\n\
+         export function otherC(n){return n+7;}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // `--stats` is what prints the truncation clause.
+    let budget = nestweaver_cmd()
+        .args([
+            "--stats",
+            "context",
+            "mainA",
+            "--token-budget",
+            "1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = flatten_miette(&budget.stderr);
+    assert!(
+        stderr.contains("TRUNCATED"),
+        "the fixture must actually truncate, or this test proves nothing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("pass --limit for more"),
+        "a token-budget cut prescribed `--limit`, which cannot change the \
+         outcome — the budget is what cut, and it cut LAST: {stderr}"
+    );
+    assert!(
+        stderr.contains("--token-budget"),
+        "the message must name the cap that actually cut: {stderr}"
+    );
+
+    let limited = nestweaver_cmd()
+        .args([
+            "--stats",
+            "context",
+            "mainA",
+            "--limit",
+            "1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = flatten_miette(&limited.stderr);
+    assert!(
+        stderr.contains("pass --limit for more"),
+        "a real limit cut must still say so, or deleting the message would \
+         satisfy the assertions above: {stderr}"
     );
 }
