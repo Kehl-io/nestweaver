@@ -93,13 +93,34 @@ pub struct DeadCodeResult {
     /// only logged the skip; a number nobody can read is not a disclosure, so
     /// it is carried here and rendered by both the CLI and the MCP tool.
     pub undecodable_symbols: usize,
+    /// Number of symbols that SEEDED the reachability walk.
+    ///
+    /// nw-351. Reachability is a BFS, so with zero seeds it visits nothing and
+    /// every symbol falls out unreachable — `reachable_symbols: 0`,
+    /// `dead_percentage: 100`, every symbol offered as a deletion candidate.
+    /// That is not a finding, it is the absence of one, and the payload had no
+    /// way to say so: `coverage` covered only the STORE half (rows that failed
+    /// to decode) and read "complete" over a graph that was never walked.
+    /// Measured on a real C++ corpus: 0 of 11,730 reachable, 1,523 called dead
+    /// at medium confidence, `coverage: "complete"`.
+    pub entry_points: usize,
 }
 
 impl DeadCodeResult {
-    /// Whether the analysis saw the whole symbol corpus. False means the
-    /// counts above are floors — see [`Self::undecodable_symbols`].
+    /// Whether this analysis is a completeness claim at all.
+    ///
+    /// False means the counts above prove nothing on their own — either the
+    /// store could not decode part of the corpus (see
+    /// [`Self::undecodable_symbols`], in which case they are FLOORS), or the
+    /// walk had no seed (see [`Self::entry_points`], in which case they are
+    /// vacuous). Both are disclosed rather than folded into one flag, because
+    /// the repairs differ: re-index for the first, an entry-point surface for
+    /// the second.
     pub fn coverage_is_complete(&self) -> bool {
-        self.undecodable_symbols == 0
+        // `total_symbols == 0` is the one honest zero-seed case: there was
+        // nothing to walk to, so nothing was concluded and nothing is offered
+        // for deletion. Every other zero-seed run reports 100% dead.
+        self.undecodable_symbols == 0 && (self.entry_points > 0 || self.total_symbols == 0)
     }
 }
 
@@ -336,6 +357,7 @@ fn detect_dead_code_inner(
             // most misleading output this pass can produce, so the empty case
             // discloses too.
             undecodable_symbols,
+            entry_points: 0,
         });
     }
 
@@ -567,6 +589,7 @@ fn detect_dead_code_inner(
         dead_percentage,
         excluded_count,
         undecodable_symbols,
+        entry_points: entry_point_uids.len(),
     })
 }
 
@@ -782,6 +805,51 @@ mod tests {
         // Untripped flag: byte-for-byte the original behavior.
         let untripped = Arc::new(AtomicBool::new(false));
         assert!(detect_dead_code_cancellable(&store, Some(&untripped)).is_ok());
+    }
+
+    /// nw-351: with zero entry points the BFS has no seed, so every symbol
+    /// reports unreachable and `dead_percentage` reads 100 — a confident
+    /// answer with no evidence behind it. `coverage` covered only the STORE
+    /// half (rows that failed to decode) and said "complete" over a graph that
+    /// was never walked. Measured on a real C++ corpus: 0 of 11,730 reachable,
+    /// 1,523 called dead at medium confidence, `coverage: "complete"`.
+    #[test]
+    fn zero_entry_points_is_not_a_complete_coverage_claim() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("a", "fn_a", false))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b", "fn_b", false))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.entry_points, 0);
+        assert_eq!(result.reachable_symbols, 0);
+        assert_eq!(result.dead_percentage, 100.0);
+        assert!(
+            !result.coverage_is_complete(),
+            "no entry point means the walk proved nothing; coverage must not \
+             read complete"
+        );
+    }
+
+    /// The counterweight: a corpus that DOES have a seed and no undecodable
+    /// rows must still read `complete`, or the new condition would make every
+    /// answer degraded and say nothing.
+    #[test]
+    fn one_entry_point_and_no_undecodable_rows_is_complete_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("a", "fn_a", false))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.entry_points, 1);
+        assert!(result.coverage_is_complete());
     }
 
     #[test]

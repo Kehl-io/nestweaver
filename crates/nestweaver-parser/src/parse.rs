@@ -5974,6 +5974,40 @@ function formatTitle(title) {
 
     // ── round 3: nw-351 / nw-364 ────────────────────────────────────────
 
+    /// nw-351: `detect_cpp`'s macro list is only worth anything if those
+    /// macros actually reach it as SYMBOL NAMES. `MACRO(ident, ident) { body }`
+    /// is syntactically a function definition, so tree-sitter-cpp reads it as
+    /// one and `queries/cpp.scm`'s free-function rule mints a symbol named
+    /// after the macro. This asserts the whole path — parse, name, entry-point
+    /// flag — rather than the lookup table in isolation, which is how the
+    /// Catch2 and Google Benchmark entries were caught as unreachable and
+    /// removed from that list.
+    #[test]
+    fn cpp_typed_and_boost_test_macros_are_entry_points() {
+        let source = "\
+TYPED_TEST(SuiteName, CaseName) {
+    check();
+}
+
+BOOST_AUTO_TEST_CASE(sanity) {
+    check();
+}
+";
+        let parsed = parse_source(Path::new("test/suite.cpp"), source).unwrap();
+        for expected in ["TYPED_TEST", "BOOST_AUTO_TEST_CASE"] {
+            let sym = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == expected)
+                .unwrap_or_else(|| panic!("no {expected} in {:#?}", parsed.symbols));
+            assert!(
+                sym.is_entry_point,
+                "{expected} must seed the reachability walk: {sym:#?}"
+            );
+            assert_eq!(sym.entry_point_kind, Some(EntryPointKind::TestEntry));
+        }
+    }
+
     /// nw-351: MEMBER_OF is minted only when a symbol carries `parent_name`
     /// (`index.rs:4019`), and `find_parent_name` knew `impl_item`,
     /// `class_declaration`, `class_definition`, `interface_declaration` and
