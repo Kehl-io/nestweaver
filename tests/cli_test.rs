@@ -6981,3 +6981,137 @@ fn a_pre_column_note_is_disclosed_and_the_printed_remedy_actually_fixes_it() {
         "a healthy vault must produce no backfill warning: {clean_rendered}"
     );
 }
+
+/// nw-367. `<db>.wal.checkpoint` left by a crash makes every read-only open
+/// report *"Cannot open database in read-only mode while checkpoint is in
+/// progress. Please retry later."* as a bare `nestweaver::error` with no help
+/// text — advice to WAIT for a state that nothing later removes.
+///
+/// Round 2 declined to classify it because a checkpoint genuinely can be in
+/// progress. It IS decidable: the engine takes `F_WRLCK` POSIX record locks on
+/// `<db>.checkpoint.{intent,apply}.lock`, the kernel releases them when the
+/// holder dies, and `releaseCheckpointLocks` runs AFTER the artifacts are
+/// removed — so "no lock held, artifacts present" cannot describe a healthy
+/// checkpoint.
+///
+/// This must NOT reach the corrupt-WAL runbook. That runbook moves the frozen
+/// WAL aside, which discards committed transactions and then demands a full
+/// re-index. A read-write open replays it and removes the debris itself — and
+/// this test RUNS that, rather than asserting the sentence.
+#[test]
+fn stale_checkpoint_debris_is_named_and_its_remedy_is_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    // The observed state, built with plain file operations: a frozen WAL plus
+    // both lock files, and NO process holding either lock. The lock files are
+    // present deliberately — the item claimed they were causal and they are
+    // not (a lock file that merely exists returns early in the engine), so
+    // including them proves the classification does not depend on them.
+    let frozen = dir.path().join("scratch.lbug.wal.checkpoint");
+    std::fs::write(&frozen, b"").unwrap();
+    std::fs::write(dir.path().join("scratch.lbug.checkpoint.apply.lock"), b"").unwrap();
+    std::fs::write(dir.path().join("scratch.lbug.checkpoint.intent.lock"), b"").unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("db_checkpoint_debris"),
+        "no process holds either checkpoint lock or the database write lock, so \
+         this is debris and must be a NAMED condition — not `nestweaver::error` \
+         with no remedy at all: {combined}"
+    );
+    assert!(
+        !combined.contains("Please retry later"),
+        "a state that never clears must not tell the operator to wait: {combined}"
+    );
+    assert!(
+        !combined.contains("MOVE ASIDE"),
+        "and it must NOT reach the corrupt-WAL runbook: moving a frozen WAL \
+         aside discards committed transactions. A read-write open replays it: \
+         {combined}"
+    );
+
+    // The remedy, RUN. `nestweaver daemon --db <path> start` is named in the
+    // help because starting the daemon is the canonical read-write open; the
+    // operation it performs on the database is exactly this one, and doing it
+    // here keeps the test free of a spawned process.
+    {
+        let _store = nestweaver_store::GraphStore::open(&db).unwrap();
+    }
+    assert!(
+        !frozen.exists(),
+        "the engine's own recovery path must have replayed the frozen log and \
+         removed it — that is what makes the printed remedy true"
+    );
+    nestweaver_store::GraphStore::open_read_only(&db)
+        .expect("and the read-only open the operator was trying to make now succeeds");
+}
+
+/// The counterweight, and the reason round 2 declined to classify at all: a
+/// checkpoint that IS in progress must keep today's transient message. Held
+/// here by a real `fcntl` write lock taken by this test process, which is
+/// precisely the evidence the classifier consults.
+#[test]
+fn a_genuinely_held_checkpoint_lock_stays_transient() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal.checkpoint"), b"").unwrap();
+
+    let apply_path = dir.path().join("scratch.lbug.checkpoint.apply.lock");
+    let apply = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&apply_path)
+        .unwrap();
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    assert_eq!(
+        unsafe { libc::fcntl(apply.as_raw_fd(), libc::F_SETLK, &fl) },
+        0,
+        "precondition: this test process holds the checkpoint write lock"
+    );
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("checkpoint is in progress"),
+        "precondition: the engine still refuses the read-only open: {combined}"
+    );
+    assert!(
+        !combined.contains("db_checkpoint_debris"),
+        "a LIVE checkpoint must not be called debris — that is an \
+         unconditional attribution wearing the other hat: {combined}"
+    );
+    drop(apply);
+}

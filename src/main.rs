@@ -486,6 +486,47 @@ enum CliDiagnostic {
         )
     )]
     DatabaseNoSchema { path: String, detail: String },
+    /// nw-367. A read-only open refused by checkpoint artifacts that no
+    /// process is holding.
+    ///
+    /// Round 2 deliberately declined to classify the engine's message, because
+    /// a checkpoint genuinely can be in progress and an unconditional
+    /// attribution is nw-333's error. It IS decidable — see
+    /// `nestweaver_daemon::lifecycle::checkpoint_artifacts`, which reads the
+    /// same POSIX record locks the engine takes and only says DEBRIS when both
+    /// checkpoint locks and the database write lock are PROVABLY free.
+    ///
+    /// This is deliberately NOT `DatabaseWalCorrupt`, and the difference is
+    /// data loss. That runbook moves `<db>.wal.checkpoint` and `<db>.shadow`
+    /// aside; a frozen WAL holds COMMITTED transactions not yet applied to the
+    /// data file, so moving it aside discards them and its step 4 then demands
+    /// a full re-index. A read-write open replays the frozen log and removes
+    /// the debris itself, losing nothing — the engine's own recovery path
+    /// (`replayFrozenWAL`), not a remedy composed here.
+    ///
+    /// The remedy was EXECUTED before it shipped, on a scratch database in the
+    /// reproduced state: a read-only open refused, one read-write open cleared
+    /// `<db>.wal.checkpoint`, and the read-only open then succeeded with the
+    /// graph intact and no re-index. If the frozen log is itself damaged the
+    /// read-write open reports `db_wal_corrupt` with the runbook — also
+    /// verified — so the instruction lands somewhere honest either way.
+    ///
+    /// It is also NOT `is_stale_checkpoint_error` (`db.rs`), whose predicate is
+    /// `"wal.checkpoint"` AND `"does not match"`. This message contains neither.
+    #[error("Read-only open of {path} is blocked by checkpoint artifacts that no process holds")]
+    #[diagnostic(
+        code(nestweaver::db_checkpoint_debris),
+        help(
+            "No process holds either checkpoint lock or the database write lock, \
+             so no checkpoint is in progress: {artifacts} is debris left by a \
+             crash during one, and it will not clear on its own. Open the \
+             database READ-WRITE once and the engine replays the frozen log and \
+             removes the debris itself: `nestweaver daemon --db {path} start`. \
+             Do NOT move these files aside — a frozen write-ahead log holds \
+             committed transactions, and discarding it loses them."
+        )
+    )]
+    DatabaseCheckpointDebris { path: String, artifacts: String },
 
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
@@ -787,6 +828,38 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
             cause: message,
         }
         .into();
+    }
+
+    // nw-367. ONE engine sentence — "Cannot open database in read-only mode
+    // while checkpoint is in progress. Please retry later." — is raised from
+    // two sites with opposite remedies. One requires a genuinely held `fcntl`
+    // write lock; the other fires on pure file existence of
+    // `<db>.wal.checkpoint` / `<db>.shadow` and consults no process at all.
+    //
+    // Round 2 refused to classify it, correctly, because attributing it
+    // unconditionally to debris would be nw-333's error pointing the other way.
+    // It IS decidable, so the classification is gated on EVIDENCE rather than
+    // on the substring: `checkpoint_artifacts` says `Debris` only when both
+    // checkpoint locks AND the database write lock are PROVABLY free, and
+    // `Unknown` on any probe keeps today's transient message. A live checkpoint
+    // therefore still reads as transient, which is the half that makes this
+    // honest.
+    //
+    // Note what this arm deliberately does NOT do: reach the corrupt-WAL
+    // runbook. That runbook moves the frozen WAL aside, which DISCARDS
+    // committed transactions; a read-write open replays it instead.
+    if lower.contains("checkpoint is in progress") {
+        let path = extract_db_path(&message);
+        if let nestweaver_daemon::lifecycle::CheckpointArtifacts::Debris { artifacts } =
+            nestweaver_daemon::lifecycle::checkpoint_artifacts(std::path::Path::new(&path))
+        {
+            let artifacts = artifacts
+                .iter()
+                .map(|artifact| redact_build_paths(&artifact.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return CliDiagnostic::DatabaseCheckpointDebris { path, artifacts }.into();
+        }
     }
 
     if lower.contains("database not found")
@@ -24165,6 +24238,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
             CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
+            CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
             CliDiagnostic::General { .. } => "error",
         }
     }
@@ -24262,6 +24336,21 @@ mod cli_help_contract_tests {
                 WriteRemedy::Allowed,
                 Remedy::Invocation,
             ),
+            (
+                // nw-367. Debris from a crashed checkpoint. `Clears::Never` is
+                // the whole point of the item: the engine's own message says
+                // "Please retry later" for a state that nothing later removes,
+                // and every retry gets the identical refusal. The remedy is one
+                // read-write open, which is an invocation, and it was run
+                // against the reproduced state before this row was written.
+                CliDiagnostic::DatabaseCheckpointDebris {
+                    path: sample("d"),
+                    artifacts: sample("d.wal.checkpoint"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
             // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
             // said, so no static tier can check it — nw-334/G3.
             (
@@ -24303,7 +24392,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            10,
+            11,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );
