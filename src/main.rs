@@ -549,9 +549,10 @@ enum CliDiagnostic {
     #[diagnostic(
         code(nestweaver::export_scope_unsupported),
         help(
-            "Both values are valid; this pair is not. {format} carries the code \
-             subgraph only. Use `--format graphml` for `--scope vault`, or drop \
-             `--scope vault` to export the code subgraph with {format}."
+            "Both values are valid; this pair is not: {format} is code-only and \
+             cannot represent the vault subgraph. Use `--format graphml` for \
+             `--scope vault`, or drop `--scope vault` to export the code \
+             subgraph with {format}."
         )
     )]
     ExportScopeUnsupported { format: String, scope: String },
@@ -27087,7 +27088,8 @@ fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> 
     }
 }
 
-/// nw-359 leg (3). Refuse a daemon-only operation when the bypass was GRANTED.
+/// nw-359 leg (3). Disclose that a daemon-only operation cannot honour a
+/// GRANTED bypass, and name what that costs.
 ///
 /// `instance merge` and `instance remove --purge-graph` exist only as daemon
 /// RPCs: the server side runs migration journals, extension-metadata
@@ -27096,29 +27098,55 @@ fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> 
 /// be one — a ~300-line CLI twin of that orchestration is the exact shape the
 /// twin rule forbids, and it would drift on the first change to either side.
 ///
-/// So the honest answer under a granted bypass is to REFUSE, naming the
-/// setting. Connecting anyway is what the caller asked us not to do, and it has
-/// a concrete cost: the daemon it auto-starts holds the write lease for its
-/// idle timeout, which blocks the follow-up `index` that merge's own remedy
-/// (`merge_reindex_guidance`) tells the user to run.
+/// # Why this WARNS instead of refusing, which is a reversal
+///
+/// Refusing was the first shape of this fix, and the end-to-end remedy harness
+/// disproved it in one run. `instance merge` is not merely a command a user may
+/// choose to run — it is a remedy this product PRINTS, from the multi-instance
+/// refusal, with the instance names substituted in.
+/// `multi_instance_refusal_emits_a_runnable_consolidation_command` runs exactly
+/// that printed string, under a granted bypass, and asserts that it works. A
+/// refusal would have made a shipped remedy un-runnable, which is a fresh
+/// instance of the class this lane exists to close (nw-334, nw-328). Trading
+/// one defect for a worse one is not a fix.
+///
+/// # What is disclosed, and the limit of it
+///
+/// The command proceeds and may auto-start a daemon. What changes is that this
+/// is no longer SILENT: the auto-started daemon holds the database write lease
+/// for its idle timeout (default 3600s), and that is what blocks the follow-up
+/// `index` which merge's own remedy (`merge_reindex_guidance`) prescribes. The
+/// same interaction is already worked around BY HAND in
+/// `tests/error_remedy_test.rs`, whose comment records the hour-long lease and
+/// stops the daemon itself — independent confirmation of the harm, written by
+/// someone who hit it. This message gives the operator what that test gave
+/// itself.
+///
+/// It does NOT release the lease, and that limit is stated rather than implied.
+/// The complete fix is to stop a daemon THIS command started, which needs a
+/// "did I start it?" answer `ensure_daemon` does not return, and a reusable
+/// stop path that exists today only as the body of the `daemon stop` arm.
+/// Reimplementing that here would be the twin this doc comment just argued
+/// against.
 ///
 /// This does NOT fire on bare `NESTWEAVER_NO_DAEMON=1`. `resolve_use_daemon`
 /// grants the bypass only on `NESTWEAVER_ALLOW_NO_DAEMON`, so a request that
 /// policy refused still routes through the daemon, correctly — which is the
 /// half the item had backwards.
-fn require_daemon_route(operation: &str, use_daemon: bool) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        use_daemon,
-        "`{operation}` cannot be performed without the daemon: the whole \
-         operation — migration journal, extension metadata, search \
-         reconciliation — runs server-side, and there is no direct \
-         implementation of it. Clear NESTWEAVER_NO_DAEMON from the environment \
-         (or drop --no-daemon) and re-run. Connecting anyway would auto-start a \
-         daemon that then holds \
-         the write lease for its idle timeout, blocking the `index` this \
-         command's own remedy tells you to run next."
+fn warn_daemon_route_unavoidable(operation: &str, db_path: &Path, use_daemon: bool) {
+    if use_daemon {
+        return;
+    }
+    eprintln!(
+        "Warning: `{operation}` runs entirely inside the daemon — migration \
+         journal, extension metadata, search reconciliation — and has no direct \
+         implementation, so the daemon bypass you granted cannot be honoured \
+         here and a daemon may be started.\n  \
+         That daemon holds the database write lease for its idle timeout, which \
+         will block a following bypassed write against {0}. Release it with: \
+         `nestweaver daemon --db {0} stop`",
+        db_path.display()
     );
-    Ok(())
 }
 
 fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i32> {
@@ -27280,7 +27308,11 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
                 // streaming RPC with no direct twin. Checked here rather than
                 // beside the `--purge-graph` parse because the registry removal
                 // above must still happen without a daemon.
-                require_daemon_route("instance remove --purge-graph", use_daemon)?;
+                warn_daemon_route_unavoidable(
+                    "instance remove --purge-graph",
+                    &db_path,
+                    use_daemon,
+                );
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt
                     .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
@@ -27339,7 +27371,7 @@ fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i
             // autostart a daemon that creates an empty DB and false-greens
             // ("No rows found").
             require_existing_db(&db_path)?;
-            require_daemon_route("instance merge", use_daemon)?;
+            warn_daemon_route_unavoidable("instance merge", &db_path, use_daemon);
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
                 .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
