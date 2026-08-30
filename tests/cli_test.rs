@@ -7332,3 +7332,111 @@ fn the_autostart_guard_only_refuses_a_log_no_open_can_replay() {
     std::fs::write(dir.path().join("corrupt.lbug.wal"), vec![0xABu8; 4096]).unwrap();
     assert!(db_wal_unreadable(&corrupt).is_some());
 }
+
+/// nw-359 leg (3). `run` resolves the daemon decision exactly once, in
+/// `resolve_use_daemon`, and `Commands::Instance` dropped it on the floor:
+/// `run_instance` took no `use_daemon` at all, so `instance merge` connected —
+/// and therefore auto-started — unconditionally.
+///
+/// The item's stated trigger was wrong and is corrected here. Bare
+/// `NESTWEAVER_NO_DAEMON=1` routing through the daemon is CORRECT by policy:
+/// `no_daemon_allowed_from` grants the bypass on `NESTWEAVER_ALLOW_NO_DAEMON`
+/// alone, and `CI`/`GITHUB_ACTIONS` confer nothing, deliberately. The defect is
+/// the case where the bypass IS granted: merge still auto-started a daemon,
+/// which then held the write lease for its idle timeout — blocking the
+/// follow-up `index` that merge's own remedy tells the user to run.
+#[test]
+fn instance_merge_honours_a_granted_daemon_bypass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["instance", "merge", "--from", "a", "--to", "b", "--db"])
+        .arg(&db)
+        // BOTH are required: `NESTWEAVER_NO_DAEMON` only REQUESTS the bypass;
+        // `no_daemon_allowed_from` grants it on the opt-in alone.
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let spawned = std::fs::read_dir(runtime.path().join("nestweaver"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        spawned, 0,
+        "a GRANTED bypass must not autostart a daemon that then holds the write \
+         lease against the very `index` the merge remedy prescribes: {combined}"
+    );
+    assert_ne!(output.status.code(), Some(0), "{combined}");
+    assert!(
+        combined.contains("NESTWEAVER_NO_DAEMON"),
+        "and the refusal must name the setting that caused it, or the caller \
+         cannot tell a policy refusal from a failure: {combined}"
+    );
+}
+
+/// The counterweight, and it is the half that keeps the refusal from being a
+/// blanket one: with NO bypass requested, `instance merge` must still take the
+/// daemon route. Bare `NESTWEAVER_NO_DAEMON=1` without the opt-in is the SAME
+/// case — the bypass was requested and REFUSED, so the daemon route is correct
+/// there too, which is what the item got backwards.
+#[test]
+fn instance_merge_still_routes_through_the_daemon_without_a_granted_bypass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["instance", "merge", "--from", "a", "--to", "b", "--db"])
+        .arg(&db)
+        // Requested but NOT granted: policy says route through the daemon.
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("cannot be performed without the daemon"),
+        "a bypass that policy REFUSED must not reach the bypass refusal — the \
+         daemon route is the correct answer there: {combined}"
+    );
+
+    // Clean up whatever this test started, in its own runtime tree.
+    let _ = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("stop")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .output();
+}
