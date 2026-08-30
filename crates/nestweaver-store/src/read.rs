@@ -1974,6 +1974,31 @@ impl GraphStore {
     /// Count of all wikilink edges (to either Note or Heading). Cheap status
     /// summary — does two separate queries since LadybugDB splits the
     /// logical WIKILINK into two physical REL tables.
+    /// Count of `UnresolvedWikilink` NODES — distinct (source section, target
+    /// text) pairs.
+    ///
+    /// nw-345: this is the population that sits between the two the product
+    /// reports, and it was never reported anywhere, which is why the gap
+    /// between the indexer's number and `doc-stats`' is not a clean factor.
+    /// The node uid is derived from the source section plus the target text, so
+    /// two identical links in ONE section collapse to one node on insert, while
+    /// `broken_wikilinks` dedupes again to (source NOTE, text). Three
+    /// populations, one word.
+    ///
+    /// OCCURRENCES — one per link instance in the parse — are deliberately not
+    /// obtainable here. The graph does not store them: it stores one node per
+    /// (section, target). Only the indexer can report occurrences, and it does.
+    pub fn count_unresolved_wikilink_nodes(&self) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        match conn.query("MATCH (u:UnresolvedWikilink) RETURN u.uid") {
+            Ok(result) => Ok(result.count()),
+            Err(e) => {
+                tracing::trace!("count_unresolved_wikilink_nodes: query skipped: {e}");
+                Ok(0)
+            }
+        }
+    }
+
     pub fn count_wikilink_edges(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
         let to_notes = conn

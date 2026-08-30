@@ -3251,7 +3251,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All seven keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags, notes_by_year}\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -6900,8 +6900,16 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "headings": result.headings_count,
                 "sections": result.sections_count,
                 "tags": result.tags_count,
-                "wikilinks_resolved": result.wikilinks_resolved,
-                "wikilinks_unresolved": result.wikilinks_unresolved,
+                // nw-345: each key names the POPULATION it counts. `resolved`
+                // is EDGES (an ambiguous link contributes N); the three
+                // unresolved numbers are occurrences, distinct (section,
+                // target), and distinct (note, target) — the last is the one
+                // `brain_doc_stats` and `brain_broken_links` report, and it is
+                // why one run used to print two different "unresolved" counts.
+                "resolved_link_edges": result.resolved_link_edges,
+                "unresolved_link_occurrences": result.unresolved_link_occurrences,
+                "unresolved_link_section_targets": result.unresolved_link_section_targets,
+                "unresolved_link_targets": result.unresolved_link_targets,
                 "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
                 "skipped_count": result.skipped.len(),
                 "skipped_files": result.skipped,

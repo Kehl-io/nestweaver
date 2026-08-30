@@ -5636,7 +5636,7 @@ impl NestWeaverDaemon for DaemonService {
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
                         message: format!(
-                            "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink(s).",
+                            "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s) on changed notes.",
                             result.vault_name,
                             result.files_checked,
                             result.notes_updated,
@@ -5644,7 +5644,7 @@ impl NestWeaverDaemon for DaemonService {
                             result.headings_count,
                             result.sections_count,
                             result.tags_count,
-                            result.wikilinks_resolved,
+                            result.changed_note_link_edges,
                         ),
                         files_processed: result.files_checked as u64,
                         files_total: result.files_checked as u64,

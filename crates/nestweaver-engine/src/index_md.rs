@@ -26,6 +26,30 @@ use nestweaver_store::GraphStore;
 // still use direct fs access.
 
 /// Outcome of a markdown index run.
+///
+/// nw-345: every link count below names the POPULATION it counts. One run
+/// legitimately produces several and they do not agree, and calling them all
+/// "wikilinks" made a single run report two different numbers for the same
+/// English phrase with neither definition disclosed anywhere. In descending
+/// size, for one vault:
+///
+/// - OCCURRENCES — one per wikilink instance in the parse.
+/// - SECTION TARGETS — distinct (source section, target text). This is what the
+///   graph stores: an `UnresolvedWikilink` uid is derived from the source
+///   section plus the target, so two identical links in one section are one
+///   node.
+/// - TARGETS — distinct (source note, target text). This is what `broken-links`
+///   and `doc-stats` report, because `GraphStore::broken_wikilinks` dedupes on
+///   (source_uid, wikilink_text) and `source_uid` there is the NOTE.
+/// - EDGES — one per resolved CANDIDATE, so a single ambiguous link contributes
+///   N of them.
+///
+/// The de-duplication in `broken_wikilinks` was introduced for a PRESENTATION
+/// reason — collapsing N near-identical rows for one ambiguous link — and
+/// silently became a counting semantic when `doc_stats` called `len()` on the
+/// result. A de-duplication that exists to make a list readable is not a
+/// definition of a metric. Do NOT "fix" these numbers by making them agree;
+/// they are measuring different things and all of them are wanted.
 pub struct MarkdownIndexResult {
     pub vault_uid: String,
     pub vault_name: String,
@@ -33,8 +57,14 @@ pub struct MarkdownIndexResult {
     pub headings_count: usize,
     pub sections_count: usize,
     pub tags_count: usize,
-    pub wikilinks_resolved: usize,
-    pub wikilinks_unresolved: usize,
+    /// One per resolved CANDIDATE — an ambiguous link contributes N.
+    pub resolved_link_edges: usize,
+    /// One per unresolved link INSTANCE in the parse.
+    pub unresolved_link_occurrences: usize,
+    /// Distinct (source section, target) — the granularity the graph stores.
+    pub unresolved_link_section_targets: usize,
+    /// Distinct (source note, target) — what `broken-links` / `doc-stats` show.
+    pub unresolved_link_targets: usize,
     pub skipped: Vec<SkippedFile>,
 }
 
@@ -50,15 +80,17 @@ pub struct MarkdownRefreshResult {
 pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String {
     let mut summary = format!(
         "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
-         {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
+         {} heading(s), {} section(s), {} tag(s), {} wikilink edge(s), \
+         {} unresolved link occurrence(s) across {} distinct target(s).",
         result.index.vault_name,
         result.notes_deleted,
         result.index.notes_count,
         result.index.headings_count,
         result.index.sections_count,
         result.index.tags_count,
-        result.index.wikilinks_resolved,
-        result.index.wikilinks_unresolved,
+        result.index.resolved_link_edges,
+        result.index.unresolved_link_occurrences,
+        result.index.unresolved_link_targets,
     );
     if !result.index.skipped.is_empty() {
         summary.push_str(&format!(
@@ -373,7 +405,10 @@ pub struct MarkdownSinceResult {
     pub headings_count: usize,
     pub sections_count: usize,
     pub tags_count: usize,
-    pub wikilinks_resolved: usize,
+    /// nw-345: one per resolved CANDIDATE, and only for notes this pass
+    /// actually CHANGED — a fifth population, and the narrowest of them. It is
+    /// not comparable with a full index's `resolved_link_edges`.
+    pub changed_note_link_edges: usize,
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
@@ -627,7 +662,7 @@ fn index_markdown_since_with_reader(
             headings_count: 0,
             sections_count: 0,
             tags_count: 0,
-            wikilinks_resolved: 0,
+            changed_note_link_edges: 0,
         });
     }
 
@@ -1088,7 +1123,7 @@ fn index_markdown_since_with_reader(
         headings_count: total_headings,
         sections_count: total_sections,
         tags_count: total_tags,
-        wikilinks_resolved: changed_wikilinks,
+        changed_note_link_edges: changed_wikilinks,
     })
 }
 
@@ -2014,7 +2049,21 @@ where
         }
     }
 
-    let wikilinks_resolved = wikilink_to_note.len() + wikilink_to_heading.len();
+    let resolved_link_edges = wikilink_to_note.len() + wikilink_to_heading.len();
+    // nw-345: report every population the run produces, so no consumer has to
+    // infer one from another. `unresolved_records` holds one entry per
+    // OCCURRENCE; its uid is the (section, target) key the graph dedupes on,
+    // and (note, target) is what `broken_wikilinks` collapses to downstream.
+    let unresolved_link_section_targets = unresolved_records
+        .iter()
+        .map(|record| record.0.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let unresolved_link_targets = unresolved_records
+        .iter()
+        .map(|record| (record.1.as_str(), record.4.as_str()))
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     // 3 & 4. Flush all nodes and edges for this vault in one transaction.
     let notes_deleted = {
@@ -2135,12 +2184,13 @@ where
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
     eprintln!(
-        "Done: {} notes, {} headings, {} sections, {} tags, {} wikilinks ({:.1}s)",
+        "Done: {} notes, {} headings, {} sections, {} tags, \
+         {} wikilink edges ({:.1}s)",
         notes_count,
         headings_count,
         sections_count,
         tags_count,
-        wikilinks_resolved,
+        resolved_link_edges,
         elapsed.as_secs_f64(),
     );
 
@@ -2152,8 +2202,10 @@ where
             headings_count,
             sections_count,
             tags_count,
-            wikilinks_resolved,
-            wikilinks_unresolved,
+            resolved_link_edges,
+            unresolved_link_occurrences: wikilinks_unresolved,
+            unresolved_link_section_targets,
+            unresolved_link_targets,
             skipped,
         },
         notes_deleted,
@@ -3025,6 +3077,90 @@ mod tests {
         (dir, root)
     }
 
+    /// nw-345: a single run produced TWO numbers for "unresolved links" and
+    /// disclosed neither definition — the indexer counted OCCURRENCES,
+    /// `doc-stats` and `broken-links` count DISTINCT TARGETS. Both are
+    /// defensible; having both under one name is not. Same class as nw-297
+    /// (page-count vs population-count) and nw-321 (`total` post-filter,
+    /// `total_available` pre-filter).
+    ///
+    /// There are THREE populations, not two. The middle one — distinct
+    /// (section, target), which is what the `UnresolvedWikilink` uid is derived
+    /// from — was never reported anywhere, and it is why the gap between the
+    /// two published numbers is not a clean factor.
+    ///
+    /// This fixture forces all three apart on purpose: the same dangling target
+    /// is written twice in one section of one note, once more in a second
+    /// section of that note, and once from a second note.
+    /// Occurrences = 4. (section, target) = 3. (note, target) = 2.
+    #[test]
+    fn every_unresolved_link_population_is_named_and_reported() {
+        let (_dir, root) = make_vault(&[
+            (
+                "a.md",
+                "# A\n\nSee [[nowhere]] and [[nowhere]].\n\n## Later\n\nAnd [[nowhere]].\n",
+            ),
+            ("b.md", "# B\n\nAlso [[nowhere]].\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        assert_eq!(
+            result.unresolved_link_occurrences, 4,
+            "the indexer counts every unresolved link INSTANCE"
+        );
+        assert_eq!(
+            result.unresolved_link_section_targets, 3,
+            "the graph stores one UnresolvedWikilink per (section, target), so \
+             the two links in one section collapse — this is the population that \
+             was never reported and that explains the gap"
+        );
+        assert_eq!(
+            result.unresolved_link_targets, 2,
+            "broken_wikilinks dedupes by (source note, link text)"
+        );
+
+        // The contract: a consumer must be able to read the published
+        // populations off EITHER surface and never have to infer one from
+        // another.
+        let stats = crate::brain_docgraph::doc_stats(&store, 5).unwrap();
+        assert_eq!(stats.unresolved_link_targets, 2);
+        assert_eq!(stats.unresolved_link_section_targets, 3);
+
+        // Precondition: the fixture must actually separate them, or every
+        // assertion above passes vacuously.
+        assert!(
+            result.unresolved_link_occurrences > result.unresolved_link_section_targets
+                && result.unresolved_link_section_targets > result.unresolved_link_targets,
+            "fixture must force OCCURRENCES > SECTION TARGETS > TARGETS"
+        );
+    }
+
+    /// nw-345: OCCURRENCES are deliberately NOT offered by `doc_stats`. The
+    /// graph stores one node per (section, target) and nothing records an
+    /// instance count, so any occurrence number produced from the store would
+    /// be a proxy presented as a measurement — which is the exact defect this
+    /// work exists to close. The indexer is the only honest source, and it
+    /// reports them.
+    #[test]
+    fn doc_stats_does_not_invent_an_occurrence_count() {
+        let (_dir, root) = make_vault(&[(
+            "a.md",
+            "# A\n\nSee [[nowhere]] and [[nowhere]] and [[nowhere]].\n",
+        )]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.unresolved_link_occurrences, 3);
+
+        let stats = crate::brain_docgraph::doc_stats(&store, 5).unwrap();
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(
+            json.get("unresolved_link_occurrences").is_none(),
+            "doc_stats must not publish a number the graph cannot support: {json}"
+        );
+        // What it CAN support, it publishes, and both collapse to 1 here.
+        assert_eq!(stats.unresolved_link_section_targets, 1);
+        assert_eq!(stats.unresolved_link_targets, 1);
+    }
+
     /// nw-344: the double condition that makes silent link loss DETECTABLE.
     /// A link that is neither an edge nor a broken row is invisible on BOTH
     /// surfaces at once -- a health tool reporting nothing wrong because it
@@ -3082,13 +3218,13 @@ mod tests {
         //     that could: the `section_idx` bounds check below in this file,
         //     which incremented no counter and recorded nothing.
         assert_eq!(
-            result.wikilinks_resolved + result.wikilinks_unresolved,
+            result.resolved_link_edges + result.unresolved_link_occurrences,
             LINKS_IN,
             "nw-344: a link that is neither resolved nor unresolved has been \
              SILENTLY DROPPED"
         );
-        assert_eq!(result.wikilinks_resolved, LINKS_IN - 1);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, LINKS_IN - 1);
+        assert_eq!(result.unresolved_link_occurrences, 1);
 
         // (b) The condition a per-tier test cannot see: a link that did NOT
         //     resolve must be REPORTABLE. Without this half, an absent guard
@@ -3146,7 +3282,7 @@ mod tests {
 
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_resolved + result.wikilinks_unresolved,
+            result.resolved_link_edges + result.unresolved_link_occurrences,
             LINKS_IN,
             "nw-344: conservation must survive any reordering of the tier ladder"
         );
@@ -3184,12 +3320,12 @@ mod tests {
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_unresolved, 0,
+            result.unresolved_link_occurrences, 0,
             "nw-343: `[[Cortina/_Overview]]` from Workspaces/Cortina/plans must not \
              be DEAD when the bare `[[_Overview]]` from the same folder resolves \
              at 0.92"
         );
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let cortina = notes
@@ -3245,8 +3381,8 @@ mod tests {
             ("h/target.md", "# Beta\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     /// nw-342 end-to-end: the `\|` escape Obsidian REQUIRES inside a markdown
@@ -3265,7 +3401,7 @@ mod tests {
             ("f/Backlog.md", "# Not The Same Title\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.unresolved_link_occurrences, 0);
         let rows = store.broken_wikilinks().unwrap();
         let row = rows
             .iter()
@@ -3512,7 +3648,7 @@ mod tests {
             ("Workspaces/NW/Backlog.md", "some body, no heading\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |frag: &str| {
@@ -3572,10 +3708,10 @@ mod tests {
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_unresolved, 0,
+            result.unresolved_link_occurrences, 0,
             "nw-306: a hub `Up:` link one directory down must not read as broken"
         );
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |frag: &str| {
@@ -3605,9 +3741,9 @@ mod tests {
             ("g/target.md", "# Beta\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.resolved_link_edges, 0);
         assert_eq!(
-            result.wikilinks_unresolved, 1,
+            result.unresolved_link_occurrences, 1,
             "no candidate is an ancestor of logs/, so the resolver must still decline"
         );
     }
@@ -3626,8 +3762,8 @@ mod tests {
             ),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
 
         let notes = store.list_notes(None).unwrap();
         let cortina = notes
@@ -3710,7 +3846,7 @@ mod tests {
         assert_eq!(result.headings_count, 2);
         assert_eq!(result.sections_count, 2);
         assert_eq!(result.tags_count, 0);
-        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.resolved_link_edges, 0);
         assert!(result.skipped.is_empty());
 
         let notes = store.list_notes(None).unwrap();
@@ -3861,10 +3997,10 @@ sub b body
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(
-            result.wikilinks_resolved, 1,
+            result.resolved_link_edges, 1,
             "a source-folder-relative path must resolve"
         );
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     /// A full vault-relative path must keep working — that was the only form
@@ -3882,8 +4018,8 @@ sub b body
             ),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     /// A path-qualified link that matches nothing must still be unresolved —
@@ -3895,8 +4031,8 @@ sub b body
             "# Overview\n\nSee [[plans/Does Not Exist]].\n",
         )]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -3906,16 +4042,16 @@ sub b body
             ("b.md", "# B\n\nI am B.\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     #[test]
     fn unresolved_wikilink_counted() {
         let (_dir, root) = make_vault(&[("a.md", "# A\n\n[[Nonexistent Target]]\n")]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -3928,7 +4064,7 @@ sub b body
             ("caller.md", "# Caller\n\nWe use [[AuthSvc]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
     }
 
     #[test]
@@ -3938,7 +4074,7 @@ sub b body
             ("root.md", "# R\n\nLink [[subdir/target]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
     }
 
     #[test]
@@ -3952,8 +4088,8 @@ sub b body
             ("logs/daily.md", "# Daily\n\nShipped [[Boost Billing]].\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
-        assert_eq!(result.wikilinks_unresolved, 0);
+        assert_eq!(result.resolved_link_edges, 1);
+        assert_eq!(result.unresolved_link_occurrences, 0);
     }
 
     #[test]
@@ -3967,7 +4103,7 @@ sub b body
             ("g/target.md", "# Beta\n\nbody\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         let notes = store.list_notes(None).unwrap();
         let uid_of = |path_frag: &str| {
@@ -3998,8 +4134,8 @@ sub b body
             ("g/target.md", "# Beta\n\nbody\n"),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 0);
-        assert_eq!(result.wikilinks_unresolved, 1);
+        assert_eq!(result.resolved_link_edges, 0);
+        assert_eq!(result.unresolved_link_occurrences, 1);
     }
 
     #[test]
@@ -4012,7 +4148,7 @@ sub b body
             ("caller.md", "# C\n\nSee [[T#Setup]].\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
-        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.resolved_link_edges, 1);
 
         // Verify the wikilink went to the Heading variant.
         let count = store.count_wikilink_edges().unwrap();
@@ -4535,7 +4671,8 @@ sub b body
         assert_eq!(
             format_markdown_refresh_summary(&direct_changed),
             "Refreshed vault 'vault': dropped 2 stale note(s), reindexed 2 note(s), \
-             2 heading(s), 2 section(s), 0 tag(s), 0 wikilink(s) (0 unresolved)."
+             2 heading(s), 2 section(s), 0 tag(s), 0 wikilink edge(s), \
+             0 unresolved link occurrence(s) across 0 distinct target(s)."
         );
     }
 

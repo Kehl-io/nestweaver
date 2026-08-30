@@ -20304,14 +20304,16 @@ fn run_brain(
             } else {
                 println!(
                     "Indexed vault '{}': {} note(s), {} heading(s), {} section(s), \
-                     {} tag(s), {} wikilink(s) ({} unresolved).",
+                     {} tag(s), {} wikilink edge(s), {} unresolved link \
+                     occurrence(s) across {} distinct target(s).",
                     result.vault_name,
                     result.notes_count,
                     result.headings_count,
                     result.sections_count,
                     result.tags_count,
-                    result.wikilinks_resolved,
-                    result.wikilinks_unresolved,
+                    result.resolved_link_edges,
+                    result.unresolved_link_occurrences,
+                    result.unresolved_link_targets,
                 );
             }
 
@@ -21657,7 +21659,8 @@ fn run_brain(
                 println!(
                     "Incremental refresh of vault '{}' (since {}): \
                      checked {} file(s), updated {} note(s), dropped {} prior note(s), \
-                     {} heading(s), {} section(s), {} tag(s), {} wikilink(s).",
+                     {} heading(s), {} section(s), {} tag(s), \
+                     {} wikilink edge(s) on changed notes.",
                     result.vault_name,
                     since_str,
                     result.files_checked,
@@ -21666,7 +21669,7 @@ fn run_brain(
                     result.headings_count,
                     result.sections_count,
                     result.tags_count,
-                    result.wikilinks_resolved,
+                    result.changed_note_link_edges,
                 );
             } else {
                 // Full refresh: the markdown indexer's writable store performs
@@ -23068,11 +23071,23 @@ fn run_brain(
                     let stats: nestweaver_engine::DocStats = serde_json::from_value(value)?;
                     println!("Document graph stats:");
                     println!("  total notes:      {}", stats.total_notes);
-                    println!("  total wikilinks:  {}", stats.total_wikilinks);
-                    println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                    // nw-345: each line says which POPULATION it counts. They
+                    // do not agree, and they are not meant to.
+                    println!(
+                        "  wikilink edges:                        {}",
+                        stats.wikilink_edges
+                    );
+                    println!(
+                        "  unresolved links (note + text):        {}",
+                        stats.unresolved_link_targets
+                    );
+                    println!(
+                        "  unresolved links (section + text):     {}",
+                        stats.unresolved_link_section_targets
+                    );
                     println!(
                         "  low-confidence (resolved, not broken): {}",
-                        stats.low_confidence_wikilinks
+                        stats.low_confidence_link_targets
                     );
                     println!("  orphans:          {}", stats.orphans);
                     println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
@@ -23102,11 +23117,22 @@ fn run_brain(
             } else {
                 println!("Document graph stats:");
                 println!("  total notes:      {}", stats.total_notes);
-                println!("  total wikilinks:  {}", stats.total_wikilinks);
-                println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                // nw-345: each line says which POPULATION it counts.
+                println!(
+                    "  wikilink edges:                        {}",
+                    stats.wikilink_edges
+                );
+                println!(
+                    "  unresolved links (note + text):        {}",
+                    stats.unresolved_link_targets
+                );
+                println!(
+                    "  unresolved links (section + text):     {}",
+                    stats.unresolved_link_section_targets
+                );
                 println!(
                     "  low-confidence (resolved, not broken): {}",
-                    stats.low_confidence_wikilinks
+                    stats.low_confidence_link_targets
                 );
                 println!("  orphans:          {}", stats.orphans);
                 println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
