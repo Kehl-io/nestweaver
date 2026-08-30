@@ -1453,19 +1453,47 @@ fn print_link_classification(total_unresolved: usize, total_low_confidence: usiz
     );
 }
 
-/// Provenance for a result computed WITHOUT the daemon.
+/// Stamp local-scope provenance onto a `--json` payload, unless a layer that
+/// knows more already stamped it.
 ///
-/// The federation layer attaches `_meta` (scope, sources, stale_repos) on the
-/// daemon path only, so `--json` returned a different SHAPE depending on whether
-/// a daemon happened to be running. The direct path is genuinely local scope, so
-/// it can state the same thing truthfully rather than omitting the field
-/// (nw-117).
-fn local_result_meta() -> serde_json::Value {
-    serde_json::json!({
-        "scope": "local",
-        "sources": ["local"],
-        "stale_repos": [],
-    })
+/// # Why this exists at all
+///
+/// `_meta` answers three questions a caller cannot answer any other way: what
+/// scope the answer covers, which sources contributed, and which repos were
+/// stale. `nestweaver_schema::provenance` is the one spelling of that answer and
+/// `nestweaver_mcp::tools` carries it on both dispatch seams (nw-315,
+/// `provenance_seam::Unstamped`). This file used to be the FOURTH and FIFTH
+/// authors of the same three keys — `local_result_meta` and `attach_local_meta`
+/// open-coded `provenance::provenance` and `provenance::ensure` byte for byte —
+/// while three other `--json` emitters (`print_ranking_json` for `hubs`/`bridges`
+/// and `render_brain_search_response`) emitted no `_meta` at all. Five authors
+/// is why the three that were missing went unnoticed (nw-347).
+///
+/// `ensure`, not `set`: the daemon envelope and the federation client both know
+/// strictly more than this layer does, so their richer verdict must survive.
+fn json_payload_with_provenance(mut payload: serde_json::Value) -> serde_json::Value {
+    nestweaver_schema::provenance::ensure(
+        &mut payload,
+        nestweaver_schema::provenance::SCOPE_LOCAL,
+        &[nestweaver_schema::provenance::SOURCE_LOCAL],
+        &[],
+    );
+    payload
+}
+
+/// Print a `--json` OBJECT payload. The only emitter that should exist.
+///
+/// Routing every `--json` object print through one function is what makes
+/// "every route discloses its provenance" a property of the code rather than of
+/// whoever wrote the most recent renderer. The enforcement is behavioural, not
+/// syntactic: `tests/parity_test.rs` compares each command's `--json` key paths
+/// against its MCP twin's, so a new emitter that forgets `_meta` fails there.
+fn print_json_payload(payload: &serde_json::Value) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_payload_with_provenance(payload.clone()))?
+    );
+    Ok(())
 }
 
 /// The single JSON shape `impact` emits, for every outcome.
@@ -1645,20 +1673,28 @@ impl ResolverStaleness {
 
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
 /// the bare array that had nowhere to put it (nw-308).
+///
+/// `daemon_meta` is the `_meta` of the daemon envelope this payload was decoded
+/// from, or `None` on the direct route. It is a parameter because the daemon
+/// route DECODES through `strip_hybrid_meta` — the stripper exists so a typed
+/// `serde_json::from_value` sees the same shape the direct store produces — and
+/// stripping for the decode used to mean the printer had nothing to put back.
+/// Strip for the decode, carry the provenance to the print (nw-347).
 fn print_ranking_json<T: serde::Serialize>(
     key: &str,
     rows: &T,
     staleness: &ResolverStaleness,
+    daemon_meta: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            key: rows,
-            "rankings_stale": staleness.rankings_stale,
-            "stale_repos": staleness.stale_repos,
-        }))?
-    );
-    Ok(())
+    let mut payload = serde_json::json!({
+        key: rows,
+        "rankings_stale": staleness.rankings_stale,
+        "stale_repos": staleness.stale_repos,
+    });
+    if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
+        obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+    }
+    print_json_payload(&payload)
 }
 
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
@@ -1819,24 +1855,6 @@ fn render_investigate_text(payload: &serde_json::Value) {
         "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
         text(payload, "bundle_id")
     );
-}
-
-/// Attach the local-scope provenance the federation layer adds on the daemon
-/// path, so `--json` has ONE shape regardless of whether a daemon is running.
-///
-/// Same divergence as nw-117: `_meta` is added by federation, which only runs in
-/// daemon mode, so a direct result was a different shape rather than a different
-/// value. The direct path is genuinely local scope and can say so truthfully.
-fn attach_local_meta(payload: &mut serde_json::Value) {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.entry("_meta").or_insert_with(|| {
-            serde_json::json!({
-                "scope": "local",
-                "sources": ["local"],
-                "stale_repos": [],
-            })
-        });
-    }
 }
 
 /// Render a `blast-radius` result as text from its JSON payload.
@@ -10965,19 +10983,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value = nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch(
                         &store,
                         None,
                         "cross_repo_contracts",
                         args,
                         None,
-                    )?;
-                    attach_local_meta(&mut value);
-                    value
+                    )?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Cross-repo contracts for {}: {} returned of {} ({})",
@@ -11030,14 +11046,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Backlinks to {} ({}):",
@@ -11937,11 +11950,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .context("decode hub nodes from the daemon")?,
                     None => Vec::new(),
                 };
+                // nw-347: the daemon knows more about provenance than this
+                // layer can (upstreams, a background staleness verdict), so its
+                // stamp is carried to the printer rather than discarded and
+                // re-invented.
+                let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
                 if json {
                     // nw-308: the daemon route is the DEFAULT route, so the
                     // payload disclosure has to be here as well as on the
                     // direct path below.
-                    print_ranking_json("hubs", &hubs, &ResolverStaleness::from_sidecar(&db_path))?;
+                    print_ranking_json(
+                        "hubs",
+                        &hubs,
+                        &ResolverStaleness::from_sidecar(&db_path),
+                        daemon_meta,
+                    )?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
@@ -11999,6 +12022,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "hubs",
                     &hubs,
                     &ResolverStaleness::from_store(&store, &db_path),
+                    None,
                 )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
@@ -12048,6 +12072,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // became an empty list and rendered as "graph may be
                     // empty". A `null` (no `bridges` key at all) is still an
                     // honest empty result and stays one.
+                    // nw-347: `strip_hybrid_meta` exists so the typed decode
+                    // below sees the shape the direct store produces. Stripping
+                    // for the decode used to mean the PRINTER had nothing to put
+                    // back, so the daemon's own stamp was discarded on a route
+                    // where it is strictly richer than anything this layer knows.
+                    let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
                     let bridges: Vec<nestweaver_engine::BridgeNode> =
                         match strip_hybrid_meta(value).get("bridges").cloned() {
                             Some(serde_json::Value::Null) | None => Vec::new(),
@@ -12061,6 +12091,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "bridges",
                             &bridges,
                             &ResolverStaleness::from_sidecar(&db_path),
+                            daemon_meta,
                         )?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
@@ -12116,6 +12147,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bridges",
                     &bridges,
                     &ResolverStaleness::from_store(&store, &db_path),
+                    None,
                 )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
@@ -12853,15 +12885,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?
                 }
             };
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_blast_radius_text(&payload);
             }
@@ -12898,19 +12927,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value = nestweaver_mcp::tools::dispatch(
-                        &store,
-                        None,
-                        "detect_changes",
-                        args,
-                        None,
-                    )?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Change impact: risk={}, status={}, gate={}",
@@ -12964,15 +12985,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?
                 }
             };
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_flow_trace_text(&payload);
             }
@@ -13055,7 +13073,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Built unconditionally so the text path renders from the SAME
             // payload the JSON path prints, and from the same payload the
             // daemon returns (nw-108).
-            let mut payload = serde_json::to_value(DeadCodeJson {
+            let payload = serde_json::to_value(DeadCodeJson {
                 total_symbols: result.total_symbols,
                 reachable_symbols: result.reachable_symbols,
                 unreachable_count: result.unreachable_symbols.len(),
@@ -13067,14 +13085,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;
-            // Match the daemon's envelope so `--json` has one shape regardless
-            // of whether a daemon is running (nw-117).
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("_meta".to_string(), local_result_meta());
-            }
-
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_dead_code_text(&payload);
             }
@@ -22218,7 +22230,7 @@ fn run_brain(
             let response = response?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&response)?);
+                print_json_payload(&response)?;
             } else {
                 render_brain_search_json(&response)?;
             }
@@ -23692,7 +23704,7 @@ fn render_brain_search_response(
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
         }
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        print_json_payload(&payload)?;
         return Ok(());
     }
 
@@ -24377,6 +24389,51 @@ mod cli_help_contract_tests {
              instead (for the daemon bypass that is NESTWEAVER_ALLOW_NO_DAEMON, \
              which `no_daemon_allowed()` actually reads): {offenders:#?}"
         );
+    }
+
+    /// nw-347, the counterweight. A stamp that is always
+    /// `{scope:"local", stale_repos:[]}` is not provenance, it is a constant —
+    /// and a fix that made every `--json` payload carry one unconditionally
+    /// would satisfy "every route has `_meta`" while telling a federated caller
+    /// its answer was local. The daemon route knows strictly more (upstreams, a
+    /// background staleness verdict this process cannot compute without I/O),
+    /// so its richer verdict must survive: the emitter calls
+    /// `provenance::ensure` (`entry().or_insert_with`), never `set`.
+    #[test]
+    fn the_cli_stamp_does_not_clobber_a_richer_verdict() {
+        let daemon_answer = serde_json::json!({
+            "hubs": [],
+            "_meta": {
+                "scope": "federated",
+                "sources": ["local", "upstream-a"],
+                "stale_repos": ["repo-a"],
+            },
+        });
+        let printed = json_payload_with_provenance(daemon_answer);
+        assert_eq!(
+            printed["_meta"]["scope"],
+            serde_json::json!("federated"),
+            "the CLI emitter overwrote a verdict it does not have the \
+             information to make: {printed}"
+        );
+        assert_eq!(
+            printed["_meta"]["stale_repos"],
+            serde_json::json!(["repo-a"]),
+            "a caller that was told which repos are stale must not have that \
+             replaced by an empty list: {printed}"
+        );
+
+        // And the direct route, which genuinely IS local scope, says so rather
+        // than omitting the field — the nw-347 defect in the other direction.
+        let direct_answer = json_payload_with_provenance(serde_json::json!({ "hubs": [] }));
+        for leg in ["scope", "sources", "stale_repos"] {
+            assert!(
+                direct_answer["_meta"].get(leg).is_some(),
+                "partial provenance is how a caller learns the wrong thing \
+                 confidently: {direct_answer}"
+            );
+        }
+        assert_eq!(direct_answer["_meta"]["scope"], serde_json::json!("local"));
     }
 
     /// S1/T3b — THE CHECK THAT CATCHES nw-329.
@@ -26226,13 +26283,12 @@ fn run_contracts(
                 cfg.as_ref(),
                 nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
             );
-            let mut value = nestweaver_engine::contracts::drift_envelope(report, limit);
-            // nw-117: `_meta` is added by the federation layer, which only runs
-            // on the daemon path. This result is genuinely local scope and can
-            // say so, keeping ONE shape in both modes.
-            attach_local_meta(&mut value);
+            let value = nestweaver_engine::contracts::drift_envelope(report, limit);
             if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                // nw-117/nw-347: `_meta` is added by the federation layer, which
+                // only runs on the daemon path. This result is genuinely local
+                // scope and the emitter says so, keeping ONE shape in both modes.
+                print_json_payload(&value)?;
             } else {
                 render_contract_drift_human(&value);
             }
