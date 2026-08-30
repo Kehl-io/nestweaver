@@ -1362,6 +1362,19 @@ impl GraphStore {
                 .map_err(|e| StoreError::Query(format!("read: {e}")))?;
             // Version-checked and repo-keyed. A v1 flat map fails this parse
             // and is treated as absent, which is neutral rather than wrong.
+            //
+            // nw-258(b). The version check is now PERFORMED, not merely
+            // claimed. This comment asserted it for a loader that never read
+            // `sidecar.version`, while the engine-side loader
+            // (`git_activity::load_git_activity_sidecar`) — used by the writer
+            // and the delete path, and by NO query route — did check it. So the
+            // guard `a_newer_version_is_discarded_rather_than_misread` pinned a
+            // property that all three RANKING paths lacked: this loader, the
+            // daemon's (`server.rs`), the MCP wrapper's and the CLI's.
+            //
+            // A shape check is not a version check. A v1 flat map fails the
+            // parse, but a v3 that keeps the shape and changes the SEMANTICS
+            // would have loaded silently and mis-ranked.
             let sidecar: crate::git_activity_sidecar::GitActivitySidecar =
                 match serde_json::from_str(&json) {
                     Ok(sidecar) => sidecar,
@@ -1374,6 +1387,15 @@ impl GraphStore {
                         return Ok(());
                     }
                 };
+            if sidecar.version != crate::git_activity_sidecar::GITACTIVITY_VERSION {
+                tracing::debug!(
+                    path = %path.display(),
+                    found_version = sidecar.version,
+                    expected_version = crate::git_activity_sidecar::GITACTIVITY_VERSION,
+                    "git-activity sidecar version mismatch; discarding (re-index to restore)"
+                );
+                return Ok(());
+            }
             self.load_git_activity_cache(sidecar.repos);
         }
         Ok(())
@@ -5095,5 +5117,97 @@ mod schema_migration_tests {
         assert!(!is_column_already_present(
             "Connection exception: Cannot execute write operations in a read-only database!"
         ));
+    }
+}
+
+/// nw-258(b): the loader every query route uses must honour the sidecar
+/// version, not merely claim to.
+#[cfg(test)]
+mod git_activity_loader_tests {
+    use super::GraphStore;
+    use crate::git_activity_sidecar::GITACTIVITY_VERSION;
+
+    /// The comment on this loader said "Version-checked"; the guard
+    /// `a_newer_version_is_discarded_rather_than_misread` pinned that property
+    /// on the OTHER loader — the one no query route uses. A future v3 would
+    /// have been read as v2 by all three query paths and silently mis-ranked.
+    #[test]
+    fn the_ranking_loader_discards_a_sidecar_from_a_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION + 1,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+
+        assert!(
+            !store.has_git_activity(),
+            "a sidecar this build cannot interpret must be neutral, not read as \
+             if it were the current version — which is what the loader's own \
+             comment and the engine-side test both promise"
+        );
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), None);
+    }
+
+    /// The other direction, which keeps the first from over-correcting: the
+    /// CURRENT version must still load. A version check that discards
+    /// everything is indistinguishable from a loader that never worked.
+    #[test]
+    fn the_ranking_loader_still_loads_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+
+        assert!(store.has_git_activity());
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), Some(0.9));
+    }
+
+    /// nw-258(a)'s store-side half: the invalidator existed with ZERO callers,
+    /// so nothing could ever have proved it works. Clearing must restore
+    /// neutral ranking, and a reload after it must be visible — that pair is
+    /// what the daemon's refresh depends on.
+    #[test]
+    fn clearing_the_cache_restores_neutral_ranking_and_a_reload_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.gitactivity.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": GITACTIVITY_VERSION,
+                "repos": { "repo:x": { "src/main.rs": 0.9 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store.load_git_activity_sidecar(&path).unwrap();
+        assert!(store.has_git_activity());
+
+        store.clear_git_activity_cache();
+        assert!(!store.has_git_activity());
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), None);
+
+        store.load_git_activity_sidecar(&path).unwrap();
+        assert_eq!(store.git_activity_score("repo:x", "src/main.rs"), Some(0.9));
     }
 }
