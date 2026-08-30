@@ -10427,7 +10427,8 @@ fn generate_summaries_reporting_cap(
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::{load_summaries, merge_and_save_summaries};
+    use nestweaver_engine::summaries::load_summaries_with_cap;
+    use nestweaver_engine::merge_and_save_summaries;
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
@@ -10557,9 +10558,18 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // 71,184-community graph and `truncated` computes to false. The honesty
     // machinery existed and was wired for `SummaryLevel::Symbol` only.
     let mut cap_dropped: usize = 0;
+    // nw-361. `load_summaries_with_cap`, not `load_summaries`: this payload
+    // publishes `truncated` and `truncated_by_cap`, so it needs the count the
+    // GENERATOR recorded when the set was written. Reading the plain sibling
+    // left `cap_dropped` at 0 on every cache hit, which reported a capped set
+    // as complete — correct on the cold path, wrong on the warm one, i.e.
+    // wrong on every path except the one a verifier would use.
+    //
+    // A sidecar with no recorded provenance comes back as `None` here, so this
+    // regenerates rather than republishing a claim its writer never made.
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && !bypass
-        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
+        && let Ok(Some((cached, drops))) = load_summaries_with_cap(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
@@ -10571,6 +10581,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
             (fresh, false)
         } else {
+            cap_dropped = drops.get(&level.to_string()).copied().unwrap_or(0);
             (level_filtered, true)
         }
     } else {
@@ -10579,9 +10590,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
 
     // Persist freshly generated summaries so subsequent calls hit the cache,
-    // preserving cached entries at other levels (shared invariant).
+    // preserving cached entries at other levels (shared invariant) — and, now,
+    // what the generator dropped, so the next reader can say it.
     if !from_cache && let Some(ref db) = db_path {
-        merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
+        merge_and_save_summaries(db, store.graph_generation(), level, &summaries, cap_dropped);
     }
 
     // Build the display list: filter by target, then truncate by budget.
@@ -10639,12 +10651,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // `target`. Independent booleans, per the symbol-level rationale
         // above — both remedies stay useful when both caps fire.
         //
-        // `truncated_by_cap` is `cap_dropped > 0`, which is FALSE on a sidecar
-        // cache hit even when the cached set was itself capped, because the
-        // generator did not run and nothing recorded what it dropped. That is
-        // a pre-existing hole in `truncated` itself, not one this field adds;
-        // it is called out here so the next reader does not mistake the field
-        // for a guarantee.
+        // nw-361 closed the hole this comment used to describe: `cap_dropped`
+        // was FALSE on a sidecar cache hit even for a set that was capped when
+        // it was written, because the generator did not run. The count now
+        // travels WITH the stored set (`SummaryStore::cap_dropped`), and a
+        // sidecar that recorded none is treated as a miss rather than as a
+        // claim of completeness.
         "truncated_by_budget": display.len() < after_filter_len,
         "truncated_by_cap": cap_dropped > 0,
         "cached": from_cache,

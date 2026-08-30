@@ -830,7 +830,7 @@ fn hub_summary_line(s: &crate::summaries::Summary) -> String {
 /// cache for the next caller. Returns an empty list when nothing is indexed.
 fn architecture_hub_lines(store: &GraphStore) -> Vec<String> {
     use crate::summaries::{
-        SummaryLevel, generate_summaries, load_summaries, merge_and_save_summaries,
+        SummaryLevel, generate_hub_summaries_bounded, load_summaries, merge_and_save_summaries,
     };
 
     // Warm cache: generation gating in `load_summaries` guarantees these are
@@ -852,14 +852,22 @@ fn architecture_hub_lines(store: &GraphStore) -> Vec<String> {
     // Cold cache (missing sidecar, stale generation, or no hub entries):
     // compute live, then best-effort warm the sidecar for subsequent callers
     // (merging with entries at other levels, mirroring `get_summary`).
-    match generate_summaries(store, SummaryLevel::Hub) {
-        Ok(hub_summaries) if !hub_summaries.is_empty() => {
+    //
+    // nw-361: the BOUNDED generator, not `generate_summaries`. Identical
+    // output — `generate_summaries(Hub)` delegates to it — but it returns the
+    // candidate population, and this is a WRITER of the sidecar `get_summary`
+    // reads back. A writer that persists a capped set without recording what
+    // it dropped reintroduces exactly the defect one warm read later.
+    match generate_hub_summaries_bounded(store) {
+        Ok(bounded) if !bounded.summaries.is_empty() => {
+            let hub_summaries = bounded.summaries;
             if let Some(db) = store.db_path() {
                 merge_and_save_summaries(
                     db,
                     store.graph_generation(),
                     SummaryLevel::Hub,
                     &hub_summaries,
+                    bounded.matched_total.saturating_sub(hub_summaries.len()),
                 );
             }
             hub_summaries
@@ -1337,7 +1345,13 @@ mod tests {
             token_estimate: 20,
             file_path: Some("src/seeded.rs".to_string()),
         };
-        crate::summaries::save_summaries(&db_path, store.graph_generation(), &[seeded]).unwrap();
+        crate::summaries::save_summaries(
+            &db_path,
+            store.graph_generation(),
+            &[seeded],
+            &crate::summaries::cap_provenance(crate::summaries::SummaryLevel::Hub, 0),
+        )
+        .unwrap();
 
         let output = generate_claude_md(&store, None).unwrap();
         assert!(

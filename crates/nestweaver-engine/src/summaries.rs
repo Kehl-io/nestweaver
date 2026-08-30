@@ -85,6 +85,37 @@ pub struct SummaryStore {
     /// pre-generation sidecars (which are then always treated as stale).
     #[serde(default)]
     pub graph_generation: u64,
+    /// nw-361. How many rows the GENERATOR dropped, per level, when this set
+    /// was written — keyed by [`SummaryLevel`]'s `Display` form.
+    ///
+    /// The cap used to be a property of the CODE PATH that produced the set
+    /// rather than of the STORED set, so on a sidecar cache hit the generator
+    /// did not run, nothing recorded what it had dropped, and a set that WAS
+    /// capped when it was written read back as complete.
+    ///
+    /// `Option`, not a bare map: `None` means "the producer did not record
+    /// this", which is NOT the same claim as "nothing was dropped". An empty
+    /// map is a positive statement that this writer looked and found no cap;
+    /// absence is the absence of a statement. [`load_summaries_with_cap`] is
+    /// where that distinction is enforced.
+    #[serde(default)]
+    pub cap_dropped: Option<std::collections::BTreeMap<String, usize>>,
+}
+
+/// Build the one-level provenance map a writer that regenerated exactly one
+/// level should persist.
+///
+/// A helper rather than a `BTreeMap::from` at each call site so the KEY
+/// spelling (`SummaryLevel`'s `Display`) is decided once — a second spelling
+/// is how the writer and the reader would come to disagree about which level
+/// a count belongs to.
+pub fn cap_provenance(
+    level: SummaryLevel,
+    dropped: usize,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(level.to_string(), dropped);
+    map
 }
 
 // ── Generation ───────────────────────────────────────────────────────────────
@@ -556,11 +587,21 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 /// Save summaries to the sidecar file.
-pub fn save_summaries(db_path: &Path, graph_generation: u64, summaries: &[Summary]) -> Result<()> {
+/// nw-361: `cap_dropped` is REQUIRED, not optional, because every writer in
+/// the tree knows the answer at the point it writes — the generators all
+/// return `matched_total` beside the summaries. Making it a parameter is what
+/// stops a fourth writer being added that silently claims completeness.
+pub fn save_summaries(
+    db_path: &Path,
+    graph_generation: u64,
+    summaries: &[Summary],
+    cap_dropped: &std::collections::BTreeMap<String, usize>,
+) -> Result<()> {
     let path = sidecar_path(db_path);
     let store = SummaryStore {
         summaries: summaries.to_vec(),
         graph_generation,
+        cap_dropped: Some(cap_dropped.clone()),
     };
     let json = serde_json::to_string_pretty(&store).context("failed to serialize summaries")?;
     fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
@@ -580,13 +621,29 @@ pub fn merge_and_save_summaries(
     generation: u64,
     level: SummaryLevel,
     fresh: &[Summary],
+    cap_dropped: usize,
 ) {
-    let mut all: Vec<Summary> = match load_summaries(db_path, generation) {
-        Ok(Some(existing)) => existing.into_iter().filter(|s| s.level != level).collect(),
-        _ => Vec::new(),
+    // nw-361: the per-level drop map is merged HERE and nowhere else, because
+    // this function already owns the "keep other levels, replace this level"
+    // invariant. A second place that merged it is how the summaries and their
+    // provenance would come to describe different sets.
+    let existing = load_summary_store(db_path, generation).ok().flatten();
+    let mut all: Vec<Summary> = match existing {
+        Some(ref store) => store
+            .summaries
+            .iter()
+            .filter(|s| s.level != level)
+            .cloned()
+            .collect(),
+        None => Vec::new(),
     };
+    let mut drops = existing.and_then(|s| s.cap_dropped).unwrap_or_default();
+    // Retain only the levels we are actually carrying forward; a count for a
+    // level whose summaries we just dropped would outlive its set.
+    drops.retain(|k, _| all.iter().any(|s| s.level.to_string() == *k));
+    drops.insert(level.to_string(), cap_dropped);
     all.extend(fresh.iter().cloned());
-    if let Err(e) = save_summaries(db_path, generation, &all) {
+    if let Err(e) = save_summaries(db_path, generation, &all, &drops) {
         tracing::warn!("failed to warm summaries sidecar (level {level:?}): {e}");
     }
 }
@@ -596,6 +653,11 @@ pub fn merge_and_save_summaries(
 /// `expected_generation` — a mismatch is treated as a miss so a reindex never
 /// serves stale summaries (the caller regenerates).
 pub fn load_summaries(db_path: &Path, expected_generation: u64) -> Result<Option<Vec<Summary>>> {
+    Ok(load_summary_store(db_path, expected_generation)?.map(|s| s.summaries))
+}
+
+/// The generation-gated sidecar read both public loaders are built on.
+fn load_summary_store(db_path: &Path, expected_generation: u64) -> Result<Option<SummaryStore>> {
     crate::migrate_sidecar(db_path, "summaries.json", ".summaries.json");
     let path = sidecar_path(db_path);
     if !path.exists() {
@@ -608,7 +670,37 @@ pub fn load_summaries(db_path: &Path, expected_generation: u64) -> Result<Option
     if store.graph_generation != expected_generation {
         return Ok(None);
     }
-    Ok(Some(store.summaries))
+    Ok(Some(store))
+}
+
+/// Load summaries for a caller that will make a TRUNCATION CLAIM about them,
+/// returning the per-level generator drop counts alongside.
+///
+/// nw-361. `load_summaries` is the plain sibling, for callers that claim
+/// nothing — the shape `collect_tolerating_corrupt` established. This one is
+/// for `get_summary`, which publishes `truncated` and `truncated_by_cap`.
+///
+/// **A sidecar with no recorded provenance is reported as a MISS.** Absent
+/// must not read as `false`: a set written by a binary older than
+/// [`SummaryStore::cap_dropped`] cannot say what its generator dropped, and
+/// serving it would republish exactly the silent-completeness claim this
+/// exists to remove. The caller then regenerates and records — one extra
+/// generation, once per database, which is the same trade `.filemeta.json`'s
+/// version gate makes for the same reason. Returning a tri-state to the wire
+/// instead was rejected: it fixes `truncated_by_cap` and leaves `truncated`
+/// itself still under-reporting, because the count it needs is the thing that
+/// is missing.
+pub fn load_summaries_with_cap(
+    db_path: &Path,
+    expected_generation: u64,
+) -> Result<Option<(Vec<Summary>, std::collections::BTreeMap<String, usize>)>> {
+    let Some(store) = load_summary_store(db_path, expected_generation)? else {
+        return Ok(None);
+    };
+    match store.cap_dropped {
+        Some(drops) => Ok(Some((store.summaries, drops))),
+        None => Ok(None),
+    }
 }
 
 // ── Token-budget truncation ──────────────────────────────────────────────────
@@ -1095,7 +1187,7 @@ mod tests {
             file_path: None,
         }];
 
-        save_summaries(&db_path, 1, &summaries).unwrap();
+        save_summaries(&db_path, 1, &summaries, &Default::default()).unwrap();
         let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].target_uid, "src/main.rs");
@@ -1115,7 +1207,7 @@ mod tests {
             file_path: None,
         }];
 
-        save_summaries(&db_path, 1, &summaries).unwrap();
+        save_summaries(&db_path, 1, &summaries, &Default::default()).unwrap();
         // Same generation → hit.
         assert!(load_summaries(&db_path, 1).unwrap().is_some());
         // A newer generation (after a reindex) must be a MISS, never a
@@ -1178,7 +1270,7 @@ mod tests {
         }];
 
         // Save file-level summaries.
-        save_summaries(&db_path, 1, &file_summaries).unwrap();
+        save_summaries(&db_path, 1, &file_summaries, &Default::default()).unwrap();
 
         // Merge with symbol-level summaries (as the MCP tool does).
         let mut all = load_summaries(&db_path, 1)
@@ -1188,7 +1280,7 @@ mod tests {
             .filter(|s| s.level != SummaryLevel::Symbol)
             .collect::<Vec<_>>();
         all.extend(symbol_summaries.iter().cloned());
-        save_summaries(&db_path, 1, &all).unwrap();
+        save_summaries(&db_path, 1, &all, &Default::default()).unwrap();
 
         // Load back and verify both levels are present.
         let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
@@ -1269,5 +1361,136 @@ mod cap_disclosure_tests {
             uncapped.summaries.len(),
             "and its total must equal what it returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod cap_provenance_tests {
+    use super::*;
+
+    fn hub(uid: &str) -> Summary {
+        Summary {
+            level: SummaryLevel::Hub,
+            target_uid: uid.to_string(),
+            target_name: uid.to_string(),
+            content: "x".to_string(),
+            token_estimate: 1,
+            file_path: None,
+        }
+    }
+
+    /// nw-361. The cap has to survive the round trip, or a reader of the
+    /// sidecar has no way to distinguish a capped set from a complete one —
+    /// which is the whole defect, one layer down from `get_summary`.
+    #[test]
+    fn the_generators_drop_count_survives_the_sidecar_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        save_summaries(
+            &db_path,
+            7,
+            &[hub("sym:a")],
+            &cap_provenance(SummaryLevel::Hub, 10),
+        )
+        .unwrap();
+
+        let (rows, drops) = load_summaries_with_cap(&db_path, 7).unwrap().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            drops.get("hub").copied(),
+            Some(10),
+            "the count the generator recorded must come back: {drops:?}"
+        );
+    }
+
+    /// COUNTERWEIGHT, and the one real decision in this item: a sidecar with
+    /// NO recorded provenance must not read as "nothing was dropped". It is
+    /// reported as a MISS so the caller regenerates and records, rather than
+    /// republishing a completeness claim nobody made.
+    ///
+    /// The plain `load_summaries` sibling still serves it, because callers
+    /// that claim nothing lose nothing by reading it.
+    #[test]
+    fn a_sidecar_that_recorded_no_cap_is_a_miss_not_a_claim_of_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        // Hand-write the pre-nw-361 shape: summaries and a generation, no
+        // `cap_dropped` key at all.
+        std::fs::write(
+            sidecar_path(&db_path),
+            serde_json::json!({
+                "summaries": [ {
+                    "level": "Hub", "target_uid": "sym:a", "target_name": "a",
+                    "content": "x", "token_estimate": 1
+                } ],
+                "graph_generation": 7
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            load_summaries_with_cap(&db_path, 7).unwrap().is_none(),
+            "an unrecorded cap must not be served to a caller that will publish \
+             `truncated_by_cap`"
+        );
+        assert!(
+            load_summaries(&db_path, 7).unwrap().is_some(),
+            "the plain sibling claims nothing and must keep serving it, or this \
+             change becomes a silent cache invalidation for every reader"
+        );
+    }
+
+    /// An EMPTY map is a positive statement — "this writer looked and the cap
+    /// did not fire" — and must be served, or a level with no cap would
+    /// regenerate on every call.
+    #[test]
+    fn a_recorded_zero_is_a_statement_and_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        save_summaries(
+            &db_path,
+            7,
+            &[hub("sym:a")],
+            &cap_provenance(SummaryLevel::Hub, 0),
+        )
+        .unwrap();
+        let (_, drops) = load_summaries_with_cap(&db_path, 7).unwrap().unwrap();
+        assert_eq!(drops.get("hub").copied(), Some(0));
+    }
+
+    /// `merge_and_save_summaries` owns the "keep other levels, replace this
+    /// level" invariant, so the per-level counts have to merge the same way —
+    /// warming one level must not erase another level's recorded cap.
+    #[test]
+    fn warming_one_level_keeps_another_levels_recorded_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let cluster = Summary {
+            level: SummaryLevel::Cluster,
+            target_uid: "cluster:1".to_string(),
+            target_name: "c".to_string(),
+            content: "x".to_string(),
+            token_estimate: 1,
+            file_path: None,
+        };
+        save_summaries(
+            &db_path,
+            7,
+            &[cluster],
+            &cap_provenance(SummaryLevel::Cluster, 21),
+        )
+        .unwrap();
+
+        merge_and_save_summaries(&db_path, 7, SummaryLevel::Hub, &[hub("sym:a")], 10);
+
+        let (rows, drops) = load_summaries_with_cap(&db_path, 7).unwrap().unwrap();
+        assert_eq!(rows.len(), 2, "both levels must survive: {rows:?}");
+        assert_eq!(
+            drops.get("cluster").copied(),
+            Some(21),
+            "warming `hub` erased what `cluster` recorded: {drops:?}"
+        );
+        assert_eq!(drops.get("hub").copied(), Some(10), "{drops:?}");
     }
 }

@@ -2792,3 +2792,159 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
         "a complete answer must not blame a cap: {mcp_roomy}"
     );
 }
+
+/// A fixture with more edge-bearing symbols than `generate_hub_summaries_bounded`'s
+/// internal `HUB_COUNT` of 30, so that cap actually BITES.
+///
+/// `setup_fixture` indexes four `.js` files and produces ~8 edge-bearing
+/// symbols, which is under every summary cap in the tree — so a cap-disclosure
+/// test written against it passes VACUOUSLY with `truncated_by_cap: false` on
+/// both sides. That trap is the reason this exists rather than a comment
+/// saying the fixture is too small.
+fn setup_hub_capped_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // A 40-link call chain: every function has at least one edge, so
+    // `candidate_total` is 40 against a `HUB_COUNT` of 30 and the generator
+    // drops exactly 10.
+    const CHAIN: usize = 40;
+    let mut body = String::new();
+    for i in 0..CHAIN {
+        if i + 1 < CHAIN {
+            body.push_str(&format!(
+                "export function fn_{i}(x) {{ return fn_{next}(x) + {i}; }}\n",
+                next = i + 1
+            ));
+        } else {
+            body.push_str(&format!("export function fn_{i}(x) {{ return x + {i}; }}\n"));
+        }
+    }
+    write_repo_files(&repo_dir, &[("src/chain.js", body.as_str())]);
+    create_db(&repo_dir, &db_path);
+
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
+}
+
+/// nw-361. The cap is a property of the SET, not of the code path that
+/// produced it. On a sidecar cache hit the generator does not run, so
+/// `cap_dropped` stays 0 and a set that WAS capped when it was written reports
+/// `truncated_by_cap: false` when it is read back.
+///
+/// Worse than a plain omission because it is correct on the COLD path, which
+/// is the path anyone verifying it will use — and because the CLI is the
+/// WRITER: `nestweaver summary --level hub` persists the already-capped set
+/// that `get_summary` later reads back and calls complete.
+///
+/// TWO counterweights, both required:
+///   - warm must EQUAL cold, not merely be non-false;
+///   - a level with no generator cap must report false on both, or a fix that
+///     flags unconditionally passes.
+#[test]
+fn a_cached_summary_still_reports_the_cap_that_produced_it() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+
+    // Cold read. `no_cache` bypasses the F16 RESPONSE cache — without it the
+    // second call below replays this very payload byte for byte and the
+    // sidecar is never consulted at all, which is how a cold/warm pair written
+    // the obvious way passes while proving nothing. It does NOT stop the
+    // generated set being written to the summary sidecar.
+    let cold = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "hub", "no_cache": true }),
+    );
+    assert_eq!(
+        cold["cached"],
+        serde_json::json!(false),
+        "the first call must be a MISS or this test proves nothing: {cold}"
+    );
+    assert_eq!(
+        cold["truncated_by_cap"],
+        serde_json::json!(true),
+        "the generator's HUB_COUNT must actually bite on this fixture, or every \
+         assertion below passes vacuously: {cold}"
+    );
+
+    // Warm read: the same question, served from `<db>.summaries.json`.
+    let warm = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "hub" }));
+    assert_eq!(
+        warm["cached"],
+        serde_json::json!(true),
+        "the second call must HIT the sidecar or this test proves nothing: {warm}"
+    );
+    for field in ["truncated", "truncated_by_cap", "total", "total_available"] {
+        assert_eq!(
+            cold[field], warm[field],
+            "`{field}` changed between a cold and a warm read of the SAME set, so \
+             how much was dropped depends on whether the cache happened to be \
+             warm\ncold: {cold}\nwarm: {warm}"
+        );
+    }
+
+    // COUNTERWEIGHT: `file` level has no generator cap, so both reads must
+    // report false — otherwise flagging unconditionally satisfies the above.
+    let cold_file = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "file", "no_cache": true }),
+    );
+    let warm_file = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "file" }));
+    for (label, payload) in [("cold", &cold_file), ("warm", &warm_file)] {
+        assert_eq!(
+            payload["truncated_by_cap"],
+            serde_json::json!(false),
+            "{label}: `file` has no generator cap; blaming one sends the caller \
+             to `--target`, which cannot help: {payload}"
+        );
+    }
+}
+
+/// nw-361, the real-world sequence and the half the finding does not name:
+/// the CLI is the WRITER. `Commands::Summary` never calls `load_summaries` —
+/// it always regenerates, so its own `truncated_by_cap` is accurate — and it
+/// persists the already-capped set that MCP then reads back. So the two routes
+/// disagree about the SAME bytes on disk.
+#[test]
+fn the_cli_writes_a_capped_summary_set_that_mcp_must_still_call_capped() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(
+        db,
+        &["summary", "--level", "hub", "--json", "--token-budget", "0"],
+    );
+    assert!(cli.status.success(), "{}", flatten_miette(&cli.stderr));
+    let cli = parse_stdout("summary (direct)", &cli);
+    assert_eq!(
+        cli["truncated_by_cap"],
+        serde_json::json!(true),
+        "the CLI regenerates and so knows the cap fired; if it does not, this \
+         fixture is too small and the test below proves nothing: {cli}"
+    );
+
+    let mcp = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "hub" }));
+    assert_eq!(
+        mcp["cached"],
+        serde_json::json!(true),
+        "the CLI must have written the sidecar MCP reads back, or the routes \
+         are not looking at the same set: {mcp}"
+    );
+    assert_eq!(
+        cli["truncated_by_cap"], mcp["truncated_by_cap"],
+        "the CLI wrote this set and knows it was capped; MCP reads the same set \
+         back and does not\ncli: {cli}\nmcp: {mcp}"
+    );
+    assert_eq!(
+        cli["total"], mcp["total"],
+        "and the population disagrees too, because `total_available` is built \
+         from the same dropped count\ncli: {cli}\nmcp: {mcp}"
+    );
+}

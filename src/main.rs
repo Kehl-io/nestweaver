@@ -12625,7 +12625,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // Persisted exactly as before: `generate_summaries` saved this
                 // same capped set, and changing WHAT the sidecar holds is a
                 // different decision from reporting the count honestly.
-                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                //
+                // nw-361: what changed is that the count travels WITH it. This
+                // CLI is the WRITER of the set `get_summary` reads back, and
+                // it is the only place that knows the cap fired, so persisting
+                // the rows without the count is what made the MCP route call a
+                // capped set complete.
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &out.summaries,
+                    &nestweaver_engine::summaries::cap_provenance(
+                        SummaryLevel::Cluster,
+                        cap_dropped,
+                    ),
+                )?;
                 if let Some(ref t) = target {
                     filter_by_target(&out.summaries, t)
                         .into_iter()
@@ -12644,7 +12658,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if out.capped {
                     cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
                 }
-                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                // nw-361: see the cluster branch — the writer records what it
+                // dropped, because no later reader can recover it.
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &out.summaries,
+                    &nestweaver_engine::summaries::cap_provenance(SummaryLevel::Hub, cap_dropped),
+                )?;
                 if let Some(ref t) = target {
                     filter_by_target(&out.summaries, t)
                         .into_iter()
@@ -12655,8 +12676,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 let summaries = generate_summaries(&store, parsed_level)?;
-                // Save to sidecar for later use.
-                save_summaries(&db_path, store.graph_generation(), &summaries)?;
+                // Save to sidecar for later use. This branch is File level
+                // only — Symbol, Cluster and Hub are handled above — and File
+                // has no generator cap, so a recorded ZERO here is a positive
+                // statement rather than a default (nw-361).
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &summaries,
+                    &nestweaver_engine::summaries::cap_provenance(parsed_level, 0),
+                )?;
                 // Optional target filter.
                 if let Some(ref t) = target {
                     filter_by_target(&summaries, t)
