@@ -3146,3 +3146,185 @@ fn stale_repos_is_the_same_list_on_every_route() {
          functions and must not be left behind: {bridges_direct}"
     );
 }
+
+// ─── nw-218: the three-route VALUE comparator ────────────────────────────────
+
+/// Compare the VALUES of named fields across all three routes.
+///
+/// `assert_same_key_sets` answers "can this route SEE the field", which is the
+/// nw-217(a) question, and both containment tables in this file compare key
+/// PATHS in ONE direction (CLI subset of MCP). That is exactly right for the
+/// defect they were built for and it cannot express this cluster's: a field
+/// present on every route whose VALUE differs. nw-316 (`more_available`
+/// differing by route) and nw-358 (`stale_repos` differing by route) are both
+/// instances, and neither was assertable here before.
+///
+/// `legitimate` names the fields ALLOWED to differ, WITH the reason, in code.
+/// Two reasons for that: a suite that goes red for a known-benign reason stops
+/// being read, and — more importantly — a difference that is written down can
+/// be RE-EXAMINED when it turns out to be the defect. nw-316's residual may BE
+/// `semantic_applied`, which this list currently excuses; keeping the excuse in
+/// prose on a ticket is how it stayed unexamined for two rounds.
+fn assert_routes_agree_on(
+    command: &str,
+    fields: &[&str],
+    legitimate: &[(&str, &str)],
+    direct: &serde_json::Value,
+    daemon: &serde_json::Value,
+    mcp: &serde_json::Value,
+) {
+    for field in fields {
+        if let Some((_, reason)) = legitimate.iter().find(|(name, _)| name == field) {
+            // Not asserted — but RECORDED, so a run's log says what was
+            // excused and why rather than silently omitting it.
+            println!(
+                "{command}: `{field}` excused: {reason}\n  direct={} daemon={} mcp={}",
+                direct[*field], daemon[*field], mcp[*field]
+            );
+            continue;
+        }
+        assert_eq!(
+            direct[*field], daemon[*field],
+            "{command}: `{field}` differs between the DIRECT and DAEMON routes, so \
+             the answer depends on whether a daemon happens to be \
+             running\ndirect: {direct}\ndaemon: {daemon}"
+        );
+        assert_eq!(
+            direct[*field], mcp[*field],
+            "{command}: `{field}` differs between the CLI and the MCP tool it is \
+             supposed to mirror\ncli: {direct}\nmcp: {mcp}"
+        );
+    }
+}
+
+/// nw-316 / nw-218. `project-context` answered from THREE routes, with every
+/// field the experiment specified recorded rather than sampled.
+///
+/// The residual has TWO ambient inputs, not one:
+///   1. the instance config (six ranking parameters read from
+///      `current_instance_config()`), which is the CLI's `--config` on the
+///      direct route and the DAEMON's boot config on the other two;
+///   2. the embedding model — the direct route passes `None` and the daemon
+///      passes its warm model — which changes which retrieval LEGS ran at all
+///      and is therefore a bigger lever on the result set than the config.
+///
+/// The restored `parity_project_context_direct_vs_daemon` excuses
+/// `semantic_applied` as a benign difference while asserting that
+/// `more_available` — which moves when the semantic leg moves — must agree.
+/// If input 2 is the residual, that pair of claims cannot both hold. This test
+/// exists to make that visible in code rather than in a ticket.
+#[test]
+fn project_context_answers_the_same_on_all_three_routes() {
+    let fixture = setup_project_fixture();
+    let db = &fixture.db_path;
+    let args = &["project-context", "demo", "--json", "--token-budget", "400"];
+
+    let direct = parse_stdout("project-context (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(
+        db,
+        "project_context",
+        // The SAME arguments the CLI sends. `response_format` defaults to
+        // "concise" on the CLI and "detailed" in the schema, so omitting it
+        // here would manufacture a difference that has nothing to do with the
+        // two ambient inputs under test.
+        serde_json::json!({
+            "project": "demo",
+            "token_budget": 400,
+            "response_format": "concise",
+        }),
+    );
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("project-context (daemon)", &run_via_daemon(db, args));
+
+    // The full record the experiment asks for, printed on every run so a
+    // failure is diagnosable without re-running it.
+    println!("nw-316 record\n  direct: {direct}\n  daemon: {daemon}\n  mcp:    {mcp}");
+
+    assert_routes_agree_on(
+        "project-context",
+        &[
+            "truncated",
+            "more_available",
+            "seed_tokens_charged",
+            "seeds_expanded",
+            "tokens_used",
+            "budget_exceeded",
+            "semantic_applied",
+            "degraded_components",
+        ],
+        &[
+            // The ONLY two entries, and both are on notice. `tools.rs` reads
+            // the embedding model from whoever dispatched, so the direct route
+            // has none; that is nw-120's declined tradeoff, not a fact about
+            // the project. If it ever differs while `more_available` also
+            // differs, this list is wrong and nw-316's option (ii) or (iii) is
+            // the fix — not a wider exclusion list.
+            (
+                "semantic_applied",
+                "the direct route passes `embed_model: None` (main.rs) and the daemon                  passes its warm model (server.rs) — nw-120's declined tradeoff",
+            ),
+            (
+                "degraded_components",
+                "derived from `semantic_applied`; excusing one and asserting the other                  would be incoherent",
+            ),
+        ],
+        &direct,
+        &daemon,
+        &mcp,
+    );
+}
+
+/// nw-218 step 2, row 3 (nw-357). `impact`'s counts are now comparable across
+/// all THREE routes, which they could not be before `--limit` existed: the
+/// direct route capped nothing, so `total` and `returned` were the same
+/// number there and a different pair everywhere else.
+///
+/// Deliberately NOT a row in `no_cli_command_discloses_more_than_its_mcp_twin`:
+/// that table compares key PATHS, and `impact`'s two envelopes name the same
+/// list `nodes` and `impact_nodes` and the same subject `symbol` and `target`.
+/// Adding it there would go red for a naming divergence that has nothing to do
+/// with this item, and a `KNOWN_GAPS` entry to silence it would be a promise
+/// nobody made. The VALUES are what nw-357 is about, so this is the table it
+/// belongs in.
+#[test]
+fn impact_counts_agree_across_all_three_routes() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+    let args = &["impact", "fn_39", "--json", "--limit", "5", "--depth", "15"];
+
+    let direct = parse_stdout("impact (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(
+        db,
+        "brain_impact",
+        serde_json::json!({ "symbol": "fn_39", "limit": 5, "depth": 15 }),
+    );
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("impact (daemon)", &run_via_daemon(db, args));
+
+    println!("nw-357 record\n  direct: {direct}\n  daemon: {daemon}\n  mcp:    {mcp}");
+
+    assert_routes_agree_on(
+        "impact",
+        &[
+            "total",
+            "returned",
+            "truncated",
+            "truncated_by_limit",
+            "truncated_by_depth",
+            "truncated_by_threshold",
+        ],
+        // EMPTY. There is no legitimate reason for any of these six to differ:
+        // they are counts of the same traversal under the same three caps.
+        &[],
+        &direct,
+        &daemon,
+        &mcp,
+    );
+    assert_eq!(
+        direct["truncated_by_limit"],
+        serde_json::json!(true),
+        "the cap must bite or the agreement above is vacuous: {direct}"
+    );
+}
