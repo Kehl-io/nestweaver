@@ -167,7 +167,14 @@ fn resolve_specifier(
         Language::Java => lang::java::resolve_import(from_file, specifier, known_files),
         Language::Go => lang::go_lang::resolve_import(from_file, specifier, known_files),
         Language::Python => lang::python::resolve_import(from_file, specifier, known_files),
-        Language::Cpp => None,
+        // nw-349 (cross-lane) / nw-351: C++ `#include` is captured by
+        // `queries/cpp.scm` and was then thrown away here, while the identical
+        // C directive resolved through `lang::c`. An import edge is one of only
+        // two routes a cross-file reference has (the other is a same-directory
+        // match), so C++ had no cross-directory resolution at all. The C
+        // resolver already handles the exact syntax, including the `<`/`>` and
+        // quote stripping C++ needs, so this is one arm, not a new module.
+        Language::Cpp => lang::c::resolve_import(from_file, specifier, known_files),
         Language::Rust => lang::rust::resolve_import(from_file, specifier, known_files),
         Language::C => lang::c::resolve_import(from_file, specifier, known_files),
         Language::CSharp => lang::csharp::resolve_import(from_file, specifier, known_files),
@@ -226,6 +233,86 @@ mod tests {
             context: String::new(),
             receiver: None,
         }
+    }
+
+    fn make_include_ref(specifier: &str) -> RawReference {
+        RawReference {
+            name: specifier.to_string(),
+            kind: ReferenceKind::Includes,
+            start_line: 1,
+            context: String::new(),
+            receiver: None,
+        }
+    }
+
+    /// nw-349 (cross-lane) / nw-351. A C++ `#include` is captured by
+    /// `queries/cpp.scm` and was then discarded, because `resolve_specifier`
+    /// had `Language::Cpp => None` while its neighbour `Language::C` used a
+    /// resolver that already strips `"`, `<` and `>`. The consequence is not
+    /// one missing edge family: an import edge is one of only two routes a
+    /// cross-file reference has, so C++ had no cross-directory resolution at
+    /// all. This is INDEPENDENT of nw-352 — extracting header classes creates
+    /// no import edge.
+    #[test]
+    fn cpp_include_of_a_corpus_file_resolves_to_that_file() {
+        let files = vec![
+            (
+                "src/app/main.cpp".to_string(),
+                vec![make_symbol("main")],
+                vec![
+                    make_include_ref("sensor.h"),
+                    make_include_ref("common/types.h"),
+                ],
+            ),
+            (
+                "src/app/sensor.h".to_string(),
+                vec![make_symbol("Sensor")],
+                vec![],
+            ),
+            (
+                "src/common/types.h".to_string(),
+                vec![make_symbol("Reading")],
+                vec![],
+            ),
+        ];
+
+        let graph = build_import_graph(&files, Language::Cpp, &WorkspaceContext::default());
+        assert!(
+            graph.resolves("src/app/main.cpp", "sensor.h", "src/app/sensor.h"),
+            "a same-directory #include must resolve: {:?}",
+            graph.imports_of("src/app/main.cpp")
+        );
+        assert!(
+            graph.resolves("src/app/main.cpp", "common/types.h", "src/common/types.h"),
+            "a cross-directory #include must resolve: {:?}",
+            graph.imports_of("src/app/main.cpp")
+        );
+    }
+
+    /// The counterweight to the arm above: a system include names no file in
+    /// the corpus and must resolve to NOTHING, or the fix mints an edge to
+    /// whatever happened to share the name.
+    #[test]
+    fn cpp_system_include_resolves_to_nothing() {
+        let files = vec![
+            (
+                "src/app/main.cpp".to_string(),
+                vec![make_symbol("main")],
+                vec![make_include_ref("vector")],
+            ),
+            (
+                "src/app/sensor.h".to_string(),
+                vec![make_symbol("Sensor")],
+                vec![],
+            ),
+        ];
+
+        let graph = build_import_graph(&files, Language::Cpp, &WorkspaceContext::default());
+        assert!(
+            graph.imports_of("src/app/main.cpp").is_empty(),
+            "a system include names nothing in the corpus: {:?}",
+            graph.imports_of("src/app/main.cpp")
+        );
     }
 
     #[test]
