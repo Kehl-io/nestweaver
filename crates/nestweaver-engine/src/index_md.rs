@@ -2342,6 +2342,17 @@ impl<'a> WikilinkLookup<'a> {
     /// must never score below a later one, so downstream consumers can
     /// threshold on confidence without inverting the resolver's own ordering.
     ///
+    /// ONE stated exception, and it is not a violation of the intent: priority
+    /// 7 re-enters priorities 2-4 with the key's BASENAME (nw-343), so it can
+    /// return 0.95/0.92/0.90 from a position below priority 5. The two ladders
+    /// are DISJOINT by construction — priorities 2-4 key on the whole key and
+    /// their maps can never hold a `/`, so they are a guaranteed miss for a
+    /// path-qualified key, and priority 7 is guarded by `key.contains('/')`.
+    /// Confidence therefore still reflects evidence strength: a basename that
+    /// earns the same-folder tier earns it whether or not the author also wrote
+    /// a path prefix. Do not "restore" monotonicity by capping the re-entry —
+    /// that is the confidence inversion nw-343 exists to remove.
+    ///
     /// **FILENAME BEFORE TITLE; DIRECTORY PROXIMITY BEFORE GLOBALITY.**
     ///
     /// - Priority 1: path match — target contains `/` and matches a known
@@ -2352,7 +2363,9 @@ impl<'a> WikilinkLookup<'a> {
     /// - Priority 5: unique global title → 1.0 when NO file in the vault
     ///   carries that stem, otherwise 0.80.
     /// - Priority 6: alias match → unique 0.7, ambiguous split.
-    /// - Priority 7: path-qualified fallback to the last segment → 0.85.
+    /// - Priority 7: path-qualified fallback — re-enters priorities 2-4 with
+    ///   the last path segment (0.95 / 0.92 / 0.90), then unique global title
+    ///   on that segment → 0.85.
     /// - Priority 8: ambiguous title match → same-folder narrowing 0.5,
     ///   otherwise split across all candidates.
     ///
@@ -2450,33 +2463,10 @@ impl<'a> WikilinkLookup<'a> {
         // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
         // depends on a same-folder match remaining visible there as a
         // resolved-but-lower-tier row.
-        if let Some(uids) = self
-            .by_folder_stem
-            .get(&(source_folder.to_string(), key.clone()))
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 0.95,
-            }]);
-        }
-
-        // Priority 3: nearest-ancestor filename stem (nw-306).
-        if let Some(uid) = self.nearest_ancestor_stem(&key, source_folder) {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uid,
-                confidence: 0.92,
-            }]);
-        }
-
-        // Priority 4: global filename-stem match (Obsidian shortest-path).
-        if let Some(uids) = self.by_stem.get(&key)
-            && uids.len() == 1
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uids[0].to_string(),
-                confidence: 0.9,
-            }]);
+        // Priorities 2-4 are one ladder over a BARE stem, extracted so the
+        // path-qualified fallback below can RE-ENTER it (nw-343).
+        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder) {
+            return ResolveOutcome::Resolved(vec![candidate]);
         }
 
         // Priority 5: unique global title. Full confidence ONLY when no file in
@@ -2514,25 +2504,30 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         // nw-165: path-qualified fallback to the filename stem, which is what
-        // Obsidian does. by_stem / by_title / by_folder_name are keyed on bare
+        // Obsidian does. by_stem / by_title / by_folder_stem are keyed on bare
         // names and can never contain a slash, so a path-qualified key that
         // missed by_path above could not match ANY later tier and was reported
         // as a genuinely broken link -- 40 such links in the reference vault
         // had an existing target.
+        //
+        // nw-343: that fix named the miss and then hard-coded a GLOBAL lookup as
+        // the remedy, and both of its branches require `uids.len() == 1`. So a
+        // path-qualified key whose basename is not globally unique matched
+        // neither branch and died -- while the BARE form of the same link, from
+        // the same folder, resolved at 0.92 via the nearest-ancestor tier, which
+        // tolerates global ambiguity by design. Writing MORE of the path made
+        // the link resolve LESS often. Not hypothetical: the reference vault has
+        // 21 files named `_Overview.md`, so every path-qualified `_Overview`
+        // link in it was dead. Re-enter the ladder instead.
         if key.contains('/')
             && let Some(base) = key.rsplit('/').find(|segment| !segment.is_empty())
             && base != key
         {
+            if let Some(candidate) = self.resolve_bare_stem(base, source_folder) {
+                return ResolveOutcome::Resolved(vec![candidate]);
+            }
             // Below the exact-path tiers: only the filename was corroborated,
             // not the path component.
-            if let Some(uids) = self.by_stem.get(base)
-                && uids.len() == 1
-            {
-                return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                    note_uid: uids[0].to_string(),
-                    confidence: 0.85,
-                }]);
-            }
             if let Some(uids) = self.by_title.get(base)
                 && uids.len() == 1
             {
@@ -2575,6 +2570,50 @@ impl<'a> WikilinkLookup<'a> {
         }
 
         ResolveOutcome::Unresolved
+    }
+
+    /// Priorities 2-4 as one reusable ladder over a BARE filename stem:
+    /// same folder (0.95) -> nearest ancestor (0.92) -> unique global (0.90).
+    ///
+    /// Extracted by nw-343 so the path-qualified fallback can re-enter it with
+    /// the key's basename. All three tiers key on the WHOLE key and
+    /// `by_folder_stem`/`by_stem` are built from `Path::file_stem()`, so their
+    /// keys can never contain `/` -- every one of them is a guaranteed miss for
+    /// a path-qualified key, which is why the fallback exists at all.
+    ///
+    /// Note the ORDER of tolerances, which is the whole point: 0.95 and 0.92
+    /// tolerate global ambiguity (they narrow by directory first), 0.90 does
+    /// not. Jumping straight to 0.90's global-uniqueness test threw away the
+    /// two tiers that could still have answered.
+    fn resolve_bare_stem(&self, key: &str, source_folder: &str) -> Option<ResolveCandidate> {
+        // Priority 2: same-folder filename stem.
+        if let Some(uids) = self
+            .by_folder_stem
+            .get(&(source_folder.to_string(), key.to_string()))
+            && uids.len() == 1
+        {
+            return Some(ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence: 0.95,
+            });
+        }
+        // Priority 3: nearest-ancestor filename stem (nw-306).
+        if let Some(uid) = self.nearest_ancestor_stem(key, source_folder) {
+            return Some(ResolveCandidate {
+                note_uid: uid,
+                confidence: 0.92,
+            });
+        }
+        // Priority 4: global filename-stem match (Obsidian shortest-path).
+        if let Some(uids) = self.by_stem.get(key)
+            && uids.len() == 1
+        {
+            return Some(ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence: 0.9,
+            });
+        }
+        None
     }
 
     /// Of the notes whose filename stem is `key`, return the one living in the

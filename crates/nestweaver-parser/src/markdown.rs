@@ -635,7 +635,9 @@ fn kind_from_path(rel_path: &str) -> NoteKind {
 /// `[[wikilink#heading]]`, and `![[transclude]]` forms.
 ///
 /// Uses a hand-rolled scanner rather than a regex to keep the parser
-/// dep-light and to handle escapes / nesting predictably. We do NOT match
+/// dep-light. The ONE escape it understands is `\|` in an aliased link, which
+/// Obsidian requires inside a markdown table (nw-342); it does not handle
+/// nesting, and it never claimed to correctly. We do NOT match
 /// inside fenced code blocks (```...```) or inline code (`...`) — those
 /// are not real wikilinks.
 /// Parse every `[[wikilink]]` / `![[transclusion]]` on one line into `out`.
@@ -676,7 +678,27 @@ fn push_wikilinks_from_line(
             continue;
         }
         let (target_part, display) = match inside.split_once('|') {
-            Some((t, d)) => (t.trim().to_string(), Some(d.trim().to_string())),
+            // nw-342: inside a markdown TABLE, Obsidian REQUIRES the alias pipe
+            // to be escaped -- `[[Backlog\|alias]]` is the only correct form
+            // there. `split_once('|')` hands the target half back with the
+            // backslash still attached, so `Backlog\` became the stored target:
+            // a name no file can carry, and the string a user reads back out of
+            // `broken-links` and `note_get`.
+            //
+            // Fixing only the resolver would MASK this. `WikilinkLookup::resolve`
+            // normalises `\` to `/` for Windows path forms, so the key became
+            // `backlog/` and the path-qualified fallback happened to recover it
+            // at 0.85 -- the symptom disappears while the wrong target string
+            // stays in the graph. A trailing backslash on a wikilink TARGET has
+            // no other meaning, so stripping it is unconditional; the DISPLAY
+            // half keeps whatever the user wrote.
+            Some((t, d)) => {
+                let t = t.trim();
+                (
+                    t.strip_suffix('\\').unwrap_or(t).trim_end().to_string(),
+                    Some(d.trim().to_string()),
+                )
+            }
             None => (inside.trim().to_string(), None),
         };
         if target_part.is_empty() {
