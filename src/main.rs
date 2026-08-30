@@ -23973,6 +23973,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
             CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
             CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
+            CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
             CliDiagnostic::General { .. } => "error",
         }
     }
