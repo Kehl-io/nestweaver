@@ -527,6 +527,34 @@ enum CliDiagnostic {
         )
     )]
     DatabaseCheckpointDebris { path: String, artifacts: String },
+    /// nw-360. Two individually VALID enum values whose combination is not
+    /// supported.
+    ///
+    /// `PossibleValuesParser` is per-argument and cannot see the other one, so
+    /// clap — which closed the spelling half of nw-312 — structurally cannot
+    /// express this. Before this variant the refusal reached the user as
+    /// `export_graph RPC failed: Client specified an invalid argument`: the
+    /// daemon's own good sentence, wrapped in a transport error, in a
+    /// `CliDiagnostic::General` with no code and no help. The direct route
+    /// refused with a bare `anyhow::bail!`, which is invisible to
+    /// `diagnostic_inventory` for the same reason `repair`'s `eprintln!` was.
+    ///
+    /// Exit code stays 1, deliberately. `d565547f` decided one round ago, with
+    /// its rationale preserved in the item, that this is a SEMANTIC refusal
+    /// rather than a usage error; reversing that without new evidence would
+    /// leave two rounds of contradictory reasoning in the record. The defect
+    /// nw-360 names is the SHAPE of the refusal, and a named condition with a
+    /// followable remedy fixes exactly that.
+    #[error("`--format {format}` cannot represent `--scope {scope}`")]
+    #[diagnostic(
+        code(nestweaver::export_scope_unsupported),
+        help(
+            "Both values are valid; this pair is not. {format} carries the code \
+             subgraph only. Use `--format graphml` for `--scope vault`, or drop \
+             `--scope vault` to export the code subgraph with {format}."
+        )
+    )]
+    ExportScopeUnsupported { format: String, scope: String },
 
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
@@ -727,6 +755,30 @@ fn corruption_diagnostic(
 /// into a `miette::Report` with rich diagnostic information (help text, error
 /// code). Falls back to a plain `miette::Report` for unrecognised errors.
 fn into_diagnostic(err: anyhow::Error) -> miette::Report {
+    // nw-360. An error that ALREADY IS a `CliDiagnostic` passes through
+    // unchanged. A call site that knows exactly which condition it has should
+    // be able to say so rather than composing prose for the classifier to
+    // re-derive — which is the shrink-the-domain move nw-334/G3 asks for, and
+    // the only way a refusal raised BEFORE a route split can carry a code.
+    //
+    // Above the typed-store branch because it is more specific: this is the
+    // CLI's own verdict, not an inference about someone else's error.
+    if let Some(diagnostic) = err.downcast_ref::<CliDiagnostic>() {
+        return match diagnostic {
+            CliDiagnostic::ExportScopeUnsupported { format, scope } => {
+                CliDiagnostic::ExportScopeUnsupported {
+                    format: format.clone(),
+                    scope: scope.clone(),
+                }
+                .into()
+            }
+            // Every other variant is currently produced BY this function rather
+            // than raised as an error, so there is nothing to pass through.
+            // A variant that starts being raised directly adds its arm here.
+            _ => miette::Report::msg(redact_build_paths(&format!("{err:#}"))),
+        };
+    }
+
     // nw-346. Ask the TYPE before asking the prose. `StoreError::Corruption`
     // is classified once, at the FFI boundary, so an error that reached here
     // with its source chain intact already knows what it is. The text arms
@@ -13656,6 +13708,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.as_deref().unwrap_or(&db_default);
             require_existing_db(db_path)?;
 
+            // nw-360. ABOVE the route split, deliberately. This is the only
+            // placement where the daemon and direct routes cannot diverge, and
+            // they already diverged once on this exact argument — the daemon
+            // refused a vault scope while the direct path emitted a code-only
+            // file and reported success.
+            //
+            // It also means an argument-only refusal never starts a daemon to
+            // deliver itself, and the caller sees the CONDITION's words instead
+            // of the transport's.
+            //
+            // `scope.parse()` is not used here: an INVALID scope is clap's
+            // business and already exits 64 at parse time (`d565547f`), so
+            // matching the accepted string keeps this check about the
+            // combination and nothing else.
+            if format == "msgpack" && scope == "vault" {
+                return Err(anyhow::Error::new(CliDiagnostic::ExportScopeUnsupported {
+                    format: format.clone(),
+                    scope: scope.clone(),
+                }));
+            }
+
             // Route through daemon when available.
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
@@ -24307,6 +24380,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
             CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
+            CliDiagnostic::ExportScopeUnsupported { .. } => "export_scope_unsupported",
             CliDiagnostic::General { .. } => "error",
         }
     }
@@ -24419,6 +24493,23 @@ mod cli_help_contract_tests {
                 WriteRemedy::Barred,
                 Remedy::Invocation,
             ),
+            (
+                // nw-360. Argument-derived and permanent: the same invocation
+                // is refused forever, and no wait changes that. The remedy is a
+                // different argument, which is a change to the invocation the
+                // caller is already writing — the same reason
+                // `RepoPathNotADirectory` carries this string.
+                CliDiagnostic::ExportScopeUnsupported {
+                    format: sample("msgpack"),
+                    scope: sample("vault"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "the fix is to pass a different argument, which is a change \
+                     to the invocation the caller is already writing",
+                ),
+            ),
             // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
             // said, so no static tier can check it — nw-334/G3.
             (
@@ -24460,7 +24551,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            11,
+            12,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );
@@ -27021,8 +27112,9 @@ fn require_daemon_route(operation: &str, use_daemon: bool) -> anyhow::Result<()>
         "`{operation}` cannot be performed without the daemon: the whole \
          operation — migration journal, extension metadata, search \
          reconciliation — runs server-side, and there is no direct \
-         implementation of it. Unset NESTWEAVER_NO_DAEMON (or drop --no-daemon) \
-         and re-run. Connecting anyway would auto-start a daemon that then holds \
+         implementation of it. Clear NESTWEAVER_NO_DAEMON from the environment \
+         (or drop --no-daemon) and re-run. Connecting anyway would auto-start a \
+         daemon that then holds \
          the write lease for its idle timeout, blocking the `index` this \
          command's own remedy tells you to run next."
     );

@@ -7440,3 +7440,124 @@ fn instance_merge_still_routes_through_the_daemon_without_a_granted_bypass() {
         .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
         .output();
 }
+
+/// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
+/// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
+/// preserved this case as a SEMANTIC refusal. That reasoning stands and the
+/// exit code is not changed here.
+///
+/// What is wrong is the SHAPE. Two individually valid enums whose COMBINATION
+/// is unsupported reached the user as a raw RPC error naming neither value:
+/// `PossibleValuesParser` is per-argument and cannot see the other one, the
+/// daemon's own good sentence arrived as a `tonic::Status` wrapped in
+/// `.context("export_graph RPC failed")`, and `into_diagnostic` had no arm for
+/// it — so it fell to `CliDiagnostic::General` and printed the transport's
+/// words instead of the condition's.
+#[test]
+fn an_unsupported_format_scope_pair_is_named_not_relayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !combined.contains("RPC failed") && !combined.contains("invalid argument"),
+        "the transport's words are not this condition's words: {combined}"
+    );
+    assert!(
+        combined.contains("export_scope_unsupported"),
+        "an unsupported COMBINATION must be a named condition: {combined}"
+    );
+    assert!(
+        combined.contains("graphml"),
+        "and the remedy must name a format that DOES satisfy --scope vault, or \
+         it is a refusal with no next step: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "semantic refusal, per d565547f — not a usage error: {combined}"
+    );
+}
+
+/// The parity half, and the reason the check is a client-side PRE-FLIGHT rather
+/// than two validations: the direct route and the daemon route must refuse the
+/// same pair with the same words. They already disagreed once on this exact
+/// argument — the daemon rejected a vault scope while the direct path emitted a
+/// code-only file and reported success.
+#[test]
+fn both_export_routes_refuse_the_pair_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let bypassed = nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    // The DEFAULT route. The pre-flight sits above the route split, so this
+    // must not even reach the daemon — and therefore must not autostart one.
+    let routed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        String::from_utf8_lossy(&bypassed.stderr),
+        String::from_utf8_lossy(&routed.stderr),
+        "one condition, one sentence, whichever route the caller happened to take"
+    );
+    assert_eq!(bypassed.status.code(), routed.status.code());
+    assert_eq!(
+        std::fs::read_dir(runtime.path().join("nestweaver"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "an argument-only refusal must not start a daemon to deliver itself"
+    );
+}
+
+/// The counterweight: the pair that IS supported must still work, or the
+/// pre-flight could satisfy the tests above by refusing every export.
+#[test]
+fn a_supported_format_scope_pair_still_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    nestweaver_cmd()
+        .args(["export", "--format", "graphml", "--scope", "vault", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "code", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+}
