@@ -2732,15 +2732,17 @@ class Config:
         let source = fixture("cpp/simple.cpp");
         let parsed = parse_source(Path::new("simple.cpp"), &source).unwrap();
 
-        let imports: Vec<_> = parsed
+        // nw-352: `#include` is `ReferenceKind::Includes` in C++ as it has
+        // always been in C -- one construct, one kind.
+        let includes: Vec<_> = parsed
             .references
             .iter()
-            .filter(|r| r.kind == ReferenceKind::Import)
+            .filter(|r| r.kind == ReferenceKind::Includes)
             .collect();
         assert!(
-            imports.iter().any(|r| r.name.contains("sensor.h")),
+            includes.iter().any(|r| r.name.contains("sensor.h")),
             "should find #include sensor.h; got: {:?}",
-            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+            includes.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
 
         let calls: Vec<_> = parsed
@@ -2754,6 +2756,103 @@ class Config:
                 .any(|r| r.name == "calibrate" || r.name == "logValue"),
             "should find function calls; got: {:?}",
             calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── C++ header (.h) tests — nw-352 / nw-356 ─────────────────────────
+
+    /// nw-352: `.h` is the canonical C++ header extension (lbug, LLVM,
+    /// Chromium, Boost). Dispatching it to the C grammar meant `queries/c.scm`
+    /// — which has no `class_specifier` rule and rides a grammar with no
+    /// `class` keyword — decided what a C++ header contains. Measured on the
+    /// 874 `.h` files of a real C++ corpus: 0 of 820 `class` definitions
+    /// extracted, 870 files with parse errors, 58% of all header symbols lost.
+    /// No fixture could see it: `testdata/` had no `.h` file at all.
+    #[test]
+    fn cpp_class_in_a_dot_h_header_is_extracted() {
+        let source = fixture("cpp/inline.h");
+        let parsed = parse_source(Path::new("inline.h"), &source).unwrap();
+        let symbols = parsed.symbols;
+        let registry = symbols
+            .iter()
+            .find(|s| s.name == "SensorRegistry")
+            .unwrap_or_else(|| panic!("no SensorRegistry in {symbols:#?}"));
+        assert_eq!(registry.kind, SymbolKind::Class);
+        assert_eq!((registry.start_line, registry.end_line), (4, 9));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "SensorSlot" && s.kind == SymbolKind::Class),
+            "the struct rule must survive the move: {symbols:#?}"
+        );
+    }
+
+    /// nw-356: under the C grammar an in-class member function with a body is
+    /// unparseable, and error recovery reads `struct S { … } f(…) { … }` as a
+    /// function returning `struct S`. The recorded span then begins at the
+    /// struct keyword: `maskMultiTable` is `semi_masker.h:19-22` and indexed
+    /// 14-22. A start line that precedes the function makes
+    /// `find_enclosing_symbol` return the wrong symbol for every reference
+    /// between the two.
+    #[test]
+    fn header_member_function_span_starts_at_its_own_line_not_the_struct() {
+        let source = fixture("cpp/inline.h");
+        let parsed = parse_source(Path::new("inline.h"), &source).unwrap();
+        let reset = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "reset")
+            .unwrap_or_else(|| panic!("no reset in {:#?}", parsed.symbols));
+        assert_eq!(
+            (reset.start_line, reset.end_line),
+            (13, 15),
+            "span must not start at the enclosing struct: {reset:#?}"
+        );
+    }
+
+    /// nw-352 parity: `queries/c.scm` has a `union_specifier` rule and
+    /// `queries/cpp.scm` did not. Moving `.h` to the C++ grammar without
+    /// closing that gap would silently drop every union in every C header.
+    #[test]
+    fn cpp_union_is_extracted() {
+        let source = "union Packet {\n    int i;\n    float f;\n};\n";
+        let parsed = parse_source(Path::new("packet.h"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.name == "Packet" && s.kind == SymbolKind::Class),
+            "union must extract under the C++ grammar too: {:#?}",
+            parsed.symbols
+        );
+    }
+
+    /// nw-352 parity: `#include` is one construct and must have one
+    /// `ReferenceKind`. `queries/c.scm` emits `@reference.includes`;
+    /// `queries/cpp.scm` emitted `@reference.import`, so moving `.h` to C++
+    /// would have flipped every C header's include edges from `INCLUDES_SYM`
+    /// to `IMPORTS`. `cpp.scm` is aligned to `c.scm` instead.
+    #[test]
+    fn cpp_include_is_an_includes_reference_like_c() {
+        let parsed = parse_source(
+            Path::new("a.cpp"),
+            "#include \"sensor.h\"\n#include <vector>\n",
+        )
+        .unwrap();
+        let includes: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Includes)
+            .collect();
+        assert!(
+            includes.iter().any(|r| r.name.contains("sensor.h")),
+            "C++ #include must use the same kind C does: {:#?}",
+            parsed.references
+        );
+        assert!(
+            includes.iter().any(|r| r.name.contains("vector")),
+            "{:#?}",
+            parsed.references
         );
     }
 
@@ -5910,6 +6009,22 @@ function formatTitle(title) {
         fn snapshot_cpp_references() {
             let source = fixture("cpp/simple.cpp");
             assert_yaml_snapshot!(parsed_references("simple.cpp", &source));
+        }
+
+        // nw-352: `.h` is a C++ header. There was no `.h` fixture anywhere in
+        // `testdata/`, which is exactly why the one wrong dispatch decision was
+        // the one no snapshot could see.
+
+        #[test]
+        fn snapshot_cpp_header_symbols() {
+            let source = fixture("cpp/inline.h");
+            assert_yaml_snapshot!(parsed_symbols("inline.h", &source));
+        }
+
+        #[test]
+        fn snapshot_cpp_header_references() {
+            let source = fixture("cpp/inline.h");
+            assert_yaml_snapshot!(parsed_references("inline.h", &source));
         }
 
         // ── C# ──────────────────────────────────────────────────────────
