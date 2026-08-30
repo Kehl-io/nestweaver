@@ -6109,6 +6109,28 @@ fn resolve_note_by_title(
     store: &GraphStore,
     title: &str,
 ) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
+    resolve_note_by_title_with(store, title, |uid| store.lookup_note(uid))
+}
+
+/// [`resolve_note_by_title`] with the HYDRATION step as an argument.
+///
+/// nw-260. The test that claimed to pin this contract asserted that a title
+/// matching nothing returns `Ok(None)` — which takes the `None => Ok(None)`
+/// arm and is true of the `.ok()` version this fix replaced. The contract is
+/// about the OTHER arm: a title that MATCHED a row and then failed to hydrate
+/// it must be an error, because `None` renders as "no note found with title
+/// '<title>'" — a claim about the vault made on the strength of a failure to
+/// read it.
+///
+/// That arm was unreachable from a test: `nestweaver-store` has no raw query
+/// API, so hydration cannot be made to fail on a store that opened. Taking the
+/// hydrator as a parameter is the seam; the production caller passes
+/// `store.lookup_note`.
+fn resolve_note_by_title_with(
+    store: &GraphStore,
+    title: &str,
+    hydrate: impl Fn(&str) -> Result<nestweaver_schema::Note, nestweaver_store::StoreError>,
+) -> Result<Option<nestweaver_schema::Note>, anyhow::Error> {
     let mut matches = store
         .lookup_notes_by_title(title)
         .with_context(|| format!("failed to look up notes with title '{title}'"))?;
@@ -6148,8 +6170,7 @@ fn resolve_note_by_title(
         // — "no note found with that title" about a note we had just found.
         // The uid branch at the top of this function already propagates with
         // `with_context(...)?`; same function, opposite handling.
-        Some(hit) => store
-            .lookup_note(&hit.uid)
+        Some(hit) => hydrate(&hit.uid)
             .map(Some)
             .with_context(|| format!("hydrate note '{}' matched by title", hit.uid)),
         None => Ok(None),
@@ -6212,6 +6233,105 @@ fn tool_brain_status(
     tantivy: Option<&TantivyIndex>,
 ) -> Result<Value, anyhow::Error> {
     brain_status_json(store, tantivy)
+}
+
+/// Build one `vaults[]` row, and say whether its note count could be READ.
+///
+/// # Why this is a free function
+///
+/// nw-260. The two tests #310 added for this disclosure asserted
+/// `counts_complete == true` and `note_count.is_number()` against
+/// `index_on_disk()` — a HEALTHY store — so every revert of the fixes they
+/// named still passed. That is not an assertion gap, it is a SEAM gap:
+/// `nestweaver-store` exposes no raw query escape hatch, so a test cannot make
+/// `list_notes` fail without corrupting a database file, which fails the OPEN
+/// long before `brain_status` runs. A disclosure contract about a failed read
+/// was untestable at the level those tests sat at, and nobody noticed because
+/// the healthy-path assertions were true.
+///
+/// Lifting the row builder out of the loop makes the failure an ARGUMENT. The
+/// error type is generic so a caller (or a test) can hand it any failure
+/// without this module depending on `StoreError`'s shape.
+///
+/// The returned bool is "this vault's count could not be read", which
+/// [`counts_disclosure`] folds into `unavailable`/`counts_complete`.
+fn vault_status_json<E: std::fmt::Display>(
+    vault: &nestweaver_schema::Vault,
+    notes: Result<Vec<nestweaver_schema::Note>, E>,
+    ext_ts: Option<String>,
+) -> (Value, bool) {
+    // `unwrap_or_default()` turned a failed read into a vault holding zero
+    // notes. The per-vault number is the one a caller actually looks at when
+    // deciding whether a vault indexed correctly, so a confident zero here is
+    // the most misleading of the set (CWE-390) — and this tool's own
+    // description tells the caller to re-index on a zero.
+    let (notes, note_count, read_failed) = match notes {
+        Ok(notes) => {
+            let count = notes.len();
+            (notes, json!(count), false)
+        }
+        Err(error) => {
+            tracing::warn!(
+                vault = %vault.uid,
+                "brain_status: per-vault note count unavailable: {error}"
+            );
+            (Vec::new(), Value::Null, true)
+        }
+    };
+    let (last_indexed, last_indexed_source) = if let Some(ts) = ext_ts {
+        (Some(ts), "extension_store")
+    } else if read_failed {
+        // `"none"` is a VERIFIED-ABSENCE claim, and it used to be manufactured
+        // from the same failed read that nulled the count: `notes` was bound to
+        // an empty vec, the fallback over it found no timestamp, and the row
+        // reported `"none"` next to `note_count: null`. "none" means "we looked
+        // and found no timestamp"; here we did not look.
+        (None, "unavailable")
+    } else {
+        let fallback = notes
+            .iter()
+            .filter_map(|n| n.modified_at.as_deref())
+            .max()
+            .map(|s| s.to_string());
+        if fallback.is_some() {
+            (fallback, "file_mtime")
+        } else {
+            (None, "none")
+        }
+    };
+    let row = json!({
+        // `uid` + `instance_id` let callers disambiguate rows that share a
+        // name/root_path (collision state) and target precise operations like
+        // `brain remove --instance <id>`.
+        "uid": vault.uid,
+        "instance_id": vault.instance_id,
+        "name": vault.name,
+        "root_path": vault.root_path,
+        "note_count": note_count,
+        "last_indexed": last_indexed,
+        "last_indexed_source": last_indexed_source,
+    });
+    (row, read_failed)
+}
+
+/// Fold per-vault read failures into the payload's own disclosure, and derive
+/// `counts_complete` from the same fold.
+///
+/// nw-260. These were two independent expressions — a `push` and an
+/// `unavailable.is_empty() && vault_count_failures == 0` — either of which
+/// could be deleted without any test noticing, because the only fixture that
+/// reached them was healthy and produced `(vec![], 0)` for both. Computing them
+/// together means a caller cannot be told "nothing is unavailable" and
+/// "counts are incomplete", or the reverse.
+fn counts_disclosure(
+    mut unavailable: Vec<&'static str>,
+    vault_count_failures: usize,
+) -> (Vec<&'static str>, bool) {
+    if vault_count_failures > 0 {
+        unavailable.push("per-vault note counts");
+    }
+    let counts_complete = unavailable.is_empty();
+    (unavailable, counts_complete)
 }
 
 /// The ONE `brain_status` document builder, shared by every serving path:
@@ -6291,26 +6411,6 @@ pub fn brain_status_json(
     let vaults_json: Vec<Value> = vaults
         .iter()
         .map(|v| {
-            // Same defect as the totals above, and it survived the fix that
-            // wrote that comment: `unwrap_or_default()` turns a failed read
-            // into a vault holding zero notes. The per-vault number is the one
-            // a caller actually looks at when deciding whether a vault indexed
-            // correctly, so a confident zero here is the most misleading of
-            // the set.
-            let (notes, note_count) = match store.list_notes(Some(&v.uid)) {
-                Ok(notes) => {
-                    let count = notes.len();
-                    (notes, json!(count))
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        vault = %v.uid,
-                        "brain_status: per-vault note count unavailable: {error}"
-                    );
-                    vault_count_failures += 1;
-                    (Vec::new(), Value::Null)
-                }
-            };
             // Prefer the extension-store timestamp (actual indexer run);
             // fall back to max(note.modified_at) for older databases.
             let ext_ts = db_path
@@ -6323,32 +6423,11 @@ pub fn brain_status_json(
                     "no extension-store timestamp; falling back to max(modified_at)"
                 );
             }
-            let (last_indexed, last_indexed_source) = if let Some(ts) = ext_ts {
-                (Some(ts), "extension_store")
-            } else {
-                let fallback = notes
-                    .iter()
-                    .filter_map(|n| n.modified_at.as_deref())
-                    .max()
-                    .map(|s| s.to_string());
-                if fallback.is_some() {
-                    (fallback, "file_mtime")
-                } else {
-                    (None, "none")
-                }
-            };
-            json!({
-                // `uid` + `instance_id` let callers disambiguate rows that
-                // share a name/root_path (collision state) and target precise
-                // operations like `brain remove --instance <id>`.
-                "uid": v.uid,
-                "instance_id": v.instance_id,
-                "name": v.name,
-                "root_path": v.root_path,
-                "note_count": note_count,
-                "last_indexed": last_indexed,
-                "last_indexed_source": last_indexed_source,
-            })
+            let (row, failed) = vault_status_json(v, store.list_notes(Some(&v.uid)), ext_ts);
+            if failed {
+                vault_count_failures += 1;
+            }
+            row
         })
         .collect();
 
@@ -6469,9 +6548,7 @@ pub fn brain_status_json(
 
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
-    if vault_count_failures > 0 {
-        unavailable.push("per-vault note counts");
-    }
+    let (unavailable, counts_complete) = counts_disclosure(unavailable, vault_count_failures);
 
     Ok(json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
@@ -6493,8 +6570,10 @@ pub fn brain_status_json(
         // A caller must not act on a null the way it would act on a 0.
         "unavailable": unavailable,
         // `counts_complete` must account for the PER-VAULT counts too, or it
-        // claims completeness for a payload that carries nulls.
-        "counts_complete": unavailable.is_empty() && vault_count_failures == 0,
+        // claims completeness for a payload that carries nulls. Computed by
+        // `counts_disclosure` alongside `unavailable`, so the two cannot
+        // disagree about the same failure.
+        "counts_complete": counts_complete,
         "repos": repos_json,
         "repo_count": repos.len(),
         "server_mode": is_server_mode(),
@@ -13256,10 +13335,12 @@ mod cache_dispatch_tests {
     // answer — a count of zero, an empty list, a "not found" — so the caller
     // could not tell "we looked and there is nothing" from "we failed to look".
 
-    /// `brain_status` already disclosed unreadable TOTALS via `unavailable` +
-    /// nulls. The per-vault note count, twenty lines below that block, still
-    /// reported a failed read as a vault holding zero notes. This pins the
-    /// disclosure contract both counts now share.
+    /// nw-260. The COUNTERWEIGHT, not the contract: the disclosure path must
+    /// not fire when nothing is wrong. Kept under its own name because it is
+    /// not wrong, it is insufficient — every revert of the fixes it was
+    /// written to pin still passes it, since `index_on_disk()` is a healthy
+    /// store and the failure arms never run. The contract itself is asserted
+    /// by `a_vault_whose_notes_cannot_be_read_reports_null_and_says_so` below.
     #[test]
     fn brain_status_reports_complete_counts_on_a_healthy_store() {
         let (_dir, db_path) = index_on_disk();
@@ -13285,11 +13366,12 @@ mod cache_dispatch_tests {
         }
     }
 
-    /// `resolve_note_by_title` matched a row and then hydrated it with `.ok()`,
-    /// so a failed hydration became "no note found with that title" — a claim
-    /// about the vault made on the strength of a failure to read it. A genuine
-    /// miss must still be a clean `None`, or the fix would just trade one wrong
-    /// answer for a spurious error.
+    /// nw-260. The COUNTERWEIGHT to
+    /// `a_title_that_matched_but_could_not_hydrate_is_an_error_not_a_miss`: a
+    /// genuine miss must stay a clean `None`, or the fix would trade one wrong
+    /// answer for a spurious error. On its own it proves nothing about the
+    /// contract it was filed under — it takes the `None => Ok(None)` arm, which
+    /// the `.ok()` version it names satisfied too.
     #[test]
     fn a_title_that_matches_nothing_is_still_a_clean_miss() {
         let (_dir, db_path) = index_on_disk();
@@ -13300,6 +13382,151 @@ mod cache_dispatch_tests {
             .expect("a miss is not an error");
 
         assert!(resolved.is_none());
+    }
+
+    fn vault_fixture() -> nestweaver_schema::Vault {
+        nestweaver_schema::Vault {
+            uid: "vlt:test".to_string(),
+            name: "test".to_string(),
+            root_path: "/v".to_string(),
+            instance_id: "default".to_string(),
+        }
+    }
+
+    /// nw-260. The test this joins asserted `counts_complete == true` on a
+    /// HEALTHY store, so all four reverts of the fixes it named still passed:
+    /// restoring `unwrap_or_default()` on the per-vault count, deleting the
+    /// failure counter, deleting `&& vault_count_failures == 0` from
+    /// `counts_complete`, and deleting the `unavailable.push` fold. A
+    /// disclosure contract is about the FAILURE, and the failure is what the
+    /// fixture has to be able to produce — which is why the fix here was a
+    /// SEAM (`vault_status_json` takes the read as an argument) rather than
+    /// more assertions against a store that cannot fail.
+    #[test]
+    fn a_vault_whose_notes_cannot_be_read_reports_null_and_says_so() {
+        let vault = vault_fixture();
+        let (row, failed) = vault_status_json(
+            &vault,
+            Err::<Vec<nestweaver_schema::Note>, _>(nestweaver_store::StoreError::Query(
+                "execute: injected".to_string(),
+            )),
+            None,
+        );
+
+        assert!(
+            failed,
+            "a failed read must be counted, or `counts_complete` cannot \
+             account for it"
+        );
+        assert_eq!(
+            row["note_count"],
+            Value::Null,
+            "a count that could not be READ is not a count of zero (CWE-390), \
+             and this tool's own description tells the caller to re-index on a \
+             zero: {row}"
+        );
+        assert_ne!(
+            row["last_indexed_source"],
+            json!("none"),
+            "`none` is a verified-absence claim manufactured from the SAME \
+             failed read that nulled the count — we did not look, so we cannot \
+             say we looked and found nothing: {row}"
+        );
+
+        // Counterweight: a readable vault reports a real number and a real
+        // source, so the disclosure cannot be satisfied by nulling everything.
+        let (healthy, failed) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>(Vec::new()),
+            None,
+        );
+        assert!(!failed);
+        assert_eq!(healthy["note_count"], json!(0));
+        assert_eq!(
+            healthy["last_indexed_source"],
+            json!("none"),
+            "an empty vault we DID read has genuinely no timestamp: {healthy}"
+        );
+    }
+
+    /// nw-260, the fold. `unavailable` and `counts_complete` were two
+    /// independent expressions over the same failure, and the only fixture that
+    /// reached them handed both `(vec![], 0)` — so either could be deleted
+    /// silently. They are one function now, and this is the assertion that
+    /// notices if the fold goes away again.
+    #[test]
+    fn a_failed_per_vault_read_reaches_the_payloads_own_disclosure() {
+        let (unavailable, counts_complete) = counts_disclosure(Vec::new(), 2);
+        assert!(
+            unavailable.contains(&"per-vault note counts"),
+            "a caller has ONE place to look for what could not be read, and \
+             this failure did not reach it: {unavailable:?}"
+        );
+        assert!(
+            !counts_complete,
+            "a payload carrying nulls must not claim its counts are complete"
+        );
+
+        let (unavailable, counts_complete) = counts_disclosure(Vec::new(), 0);
+        assert!(unavailable.is_empty());
+        assert!(
+            counts_complete,
+            "nothing failed, so nothing may be listed as unavailable"
+        );
+    }
+
+    /// nw-260, second half. A title that MATCHED and then failed to hydrate
+    /// must be an error, not `None` — `None` renders as "no note found with
+    /// title '<title>'", a claim about the vault made on the strength of a
+    /// failure to read it. The old test asserted only that a genuine MISS is
+    /// `None`, which the `.ok()` version it names satisfied.
+    #[test]
+    fn a_title_that_matched_but_could_not_hydrate_is_an_error_not_a_miss() {
+        let store = GraphStore::in_memory().unwrap();
+        // A FILENAME-STEM match, because that is the tier that hydrates: an
+        // exact title hit returns from `lookup_notes_by_title` and never
+        // reaches the hydration arm at all. This is the nw-259-shaped reason
+        // the shipped test could not have covered it even with a note present.
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:home".to_string(),
+                vault_uid: "vlt:test".to_string(),
+                file_path: "Home.md".to_string(),
+                title: "Brain - Command Center".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 10,
+                content_hash: "hash-home".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let error = resolve_note_by_title_with(&store, "Home", |uid| {
+            Err(nestweaver_store::StoreError::Query(format!(
+                "execute: injected for {uid}"
+            )))
+        })
+        .expect_err("a failed hydration of a MATCHED row is not a clean miss");
+        assert!(
+            format!("{error:#}").contains("hydrate"),
+            "the error must name what failed, or the caller learns only that \
+             something went wrong: {error:#}"
+        );
+
+        // Counterweight: with a working hydrator the same title resolves, so
+        // the assertion above cannot be satisfied by failing unconditionally.
+        let resolved = resolve_note_by_title_with(&store, "Home", |uid| store.lookup_note(uid))
+            .expect("a stem-matched title resolves");
+        assert_eq!(
+            resolved.map(|n| n.uid),
+            Some("note:home".to_string()),
+            "the fixture must reach the hydration arm, or this test proves \
+             nothing"
+        );
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
