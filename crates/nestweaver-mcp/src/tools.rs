@@ -9923,10 +9923,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
             "cluster_id is null because clustering has not been computed. Run 'nestweaver cluster' to populate.".to_string(),
         );
     }
-    if let Some(note) = ranking_staleness_note(store) {
-        resp["rankings_stale"] = json!(true);
-        attach_note(&mut resp, note);
-    }
+    attach_ranking_staleness(&mut resp, store);
     Ok(resp)
 }
 
@@ -10010,10 +10007,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "count": nodes_json.len(),
         "bridges": nodes_json,
     });
-    if let Some(note) = ranking_staleness_note(store) {
-        resp["rankings_stale"] = json!(true);
-        attach_note(&mut resp, note);
-    }
+    attach_ranking_staleness(&mut resp, store);
     Ok(resp)
 }
 
@@ -12131,6 +12125,42 @@ fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
     nestweaver_engine::resolver_generation::staleness_note(&db_path, &uids)
 }
 
+/// WHICH repos are stale, not merely that some are.
+///
+/// nw-217a found this by comparing `hubs --json` against `hub_nodes` over MCP:
+/// the CLI emits `rankings_stale` UNCONDITIONALLY (nw-308) plus the list of
+/// stale repos, and these tools emitted `rankings_stale` only when it was TRUE
+/// and never named a repo. Two consequences, both the shape nw-315 closed for
+/// `stale_check`:
+///
+///  * an absent key cannot be read as `false`. "Not stale" and "this tool does
+///    not say" are the same observation to an agent, and only one of them is a
+///    reason to trust the numbers.
+///  * "N of M repos were indexed by an older resolver" tells a caller to go
+///    find out which. The human gets the list; the agent got a count.
+fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
+    let Ok(db_path) = current_db_path(store) else {
+        return Vec::new();
+    };
+    let Ok(repos) = store.list_repos(None) else {
+        return Vec::new();
+    };
+    let uids: Vec<String> = repos.into_iter().map(|repo| repo.uid).collect();
+    nestweaver_engine::resolver_generation::load(&db_path)
+        .stale_repos(uids.iter().map(|uid| uid.as_str()))
+}
+
+/// Attach the ranking-staleness disclosure to a result, in the shape the CLI
+/// has emitted since nw-308: both keys, always.
+fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+    let note = ranking_staleness_note(store);
+    resp["rankings_stale"] = json!(note.is_some());
+    resp["stale_repos"] = json!(ranking_stale_repos(store));
+    if let Some(note) = note {
+        attach_note(resp, note);
+    }
+}
+
 /// Attach a disclosure to a tool result without dropping one already there.
 ///
 /// `note` is this surface's existing human-readable channel and some tools
@@ -13562,6 +13592,15 @@ mod cache_dispatch_tests {
                 Some(true),
                 "{tool} must flag stale rankings"
             );
+            // nw-217a: WHICH, not merely that some are. The human has had this
+            // list since nw-308; the agent was given a count and told to go
+            // find out — the same defect nw-315 closed for `stale_check`.
+            assert!(
+                value["stale_repos"]
+                    .as_array()
+                    .is_some_and(|repos| !repos.is_empty()),
+                "{tool} must name the stale repos: {value}"
+            );
             let note = value
                 .get("note")
                 .and_then(Value::as_str)
@@ -13590,9 +13629,21 @@ mod cache_dispatch_tests {
 
             let value = dispatch(&store, None, tool, json!({}), None).unwrap();
 
-            assert!(
-                value.get("rankings_stale").is_none(),
-                "{tool} must not flag staleness once every repo is current"
+            // nw-217a: `false`, not absent. An absent key cannot be read as
+            // "not stale" — "not stale" and "this tool does not say" are the
+            // same observation to an agent, and only one of them is a reason
+            // to trust the numbers. The CLI has said `false` since nw-308.
+            assert_eq!(
+                value.get("rankings_stale").and_then(Value::as_bool),
+                Some(false),
+                "{tool} must state that rankings are current, not merely omit \
+                 the claim"
+            );
+            assert_eq!(
+                value.get("stale_repos"),
+                Some(&json!([])),
+                "{tool} must name WHICH repos are stale, and an empty list is \
+                 how it says none are"
             );
             let note = value
                 .get("note")

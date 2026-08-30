@@ -1906,10 +1906,153 @@ fn intent_vocabulary_agrees_across_all_three_routes() {
     );
 }
 
+/// nw-217a. The containment guard, generalised from ONE tool to a table.
+///
+/// nw-217 is the most recurrent defect class in this workspace — "a guard
+/// present in one implementation and absent in its twin" — and it decomposes
+/// into six shapes that do NOT share one answer. This is the mechanical check
+/// for the third and highest-leverage of them: response-shape drift between
+/// routes. A key the CLI emits and MCP does not is a field an agent cannot see;
+/// the converse is a field a human cannot see.
+///
+/// `the_mcp_route_does_not_grow_new_disclosure_gaps` has held `stale_check` to
+/// this since nw-315 and held nothing else to it, which is how nw-316's three
+/// missing `project_context` disclosure fields and nw-347's missing `_meta` on
+/// `hubs`/`bridges` both survived a release that spent six commits on route
+/// parity. Both of those rows are in this table now, and both fail without the
+/// fixes in this branch.
+///
+/// The assertion is CONTAINMENT against an explicit `KNOWN_GAPS` list, not
+/// equality: closing a gap shrinks the set safely, opening a new one fails, and
+/// a deliberate asymmetry has to be written down with the reason.
+///
+/// NOT covered by this, and not claimed: shapes S1 (two dispatch seams — a
+/// TYPE, `provenance_seam::Unstamped`), S2 (registry drift — enumeration),
+/// S4 (argument-contract drift — the clap/schema cross-check, nw-217b),
+/// S5 (guard call-site parity) and S6 (semantic divergence, which needs a
+/// fixture that can tell two behaviours apart and is the parity harness, one
+/// test at a time).
+#[test]
+fn no_cli_command_discloses_more_than_its_mcp_twin() {
+    /// A gap is `(tool, key path)` with the finding that owns it. EMPTY is the
+    /// goal; an entry is a promise, not a permission.
+    const KNOWN_GAPS: &[(&str, &str)] = &[];
+
+    // Rows are (CLI argv, MCP tool, MCP arguments). Arguments must be the
+    // SAME question on both sides or the diff is about the question, not the
+    // route.
+    let rows: Vec<(Vec<&str>, &str, serde_json::Value)> = vec![
+        (
+            vec!["stale-check", "--json"],
+            "stale_check",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["hubs", "--json", "--top", "3"],
+            "hub_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["bridges", "--json", "--top", "3"],
+            "bridge_nodes",
+            serde_json::json!({ "top_n": 3 }),
+        ),
+        (
+            vec!["brain", "search", "mainA", "--json"],
+            "brain_search",
+            serde_json::json!({ "query": "mainA" }),
+        ),
+        (
+            vec!["dead-code", "--json"],
+            "dead_code",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["flow-trace", "mainA", "--json"],
+            "flow_trace",
+            serde_json::json!({ "symbol": "mainA" }),
+        ),
+        (
+            vec!["blast-radius", "--files", "src/a.js", "--json"],
+            "blast_radius",
+            serde_json::json!({ "changed_files": ["src/a.js"] }),
+        ),
+    ];
+
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (argv, tool, args) in rows {
+        let label = argv.join(" ");
+        let cli = run_direct(db, &argv);
+        assert!(
+            cli.status.success(),
+            "{label} (direct) failed:\n{}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let cli_json = parse_stdout(&label, &cli);
+        let mcp_json = run_via_mcp(db, tool, args);
+
+        let mcp_keys = json_key_paths(&mcp_json);
+        let missing: Vec<String> = json_key_paths(&cli_json)
+            .into_iter()
+            .filter(|key| !mcp_keys.contains(key))
+            .filter(|key| !KNOWN_GAPS.contains(&(tool, key.as_str())))
+            .collect();
+        if !missing.is_empty() {
+            failures.push(format!(
+                "`{label}` -> `{tool}`: {missing:?}\n  CLI: {cli_json}\n  MCP: {mcp_json}"
+            ));
+        }
+    }
+
+    // `project_context` needs a project, which is why this row could not exist
+    // before nw-218 — `setup_fixture` creates none, so both routes answered
+    // NOT_FOUND and any comparison passed on two identical failures.
+    let project = setup_project_fixture();
+    let argv = ["project-context", "demo", "--json", "--token-budget", "400"];
+    let cli = run_direct(&project.db_path, &argv);
+    assert!(
+        cli.status.success(),
+        "project-context (direct) failed:\n{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json = parse_stdout("project-context", &cli);
+    let mcp_json = run_via_mcp(
+        &project.db_path,
+        "project_context",
+        serde_json::json!({ "project": "demo", "token_budget": 400 }),
+    );
+    let mcp_keys = json_key_paths(&mcp_json);
+    let missing: Vec<String> = json_key_paths(&cli_json)
+        .into_iter()
+        .filter(|key| !mcp_keys.contains(key))
+        .filter(|key| !KNOWN_GAPS.contains(&("project_context", key.as_str())))
+        .collect();
+    if !missing.is_empty() {
+        failures.push(format!(
+            "`project-context` -> `project_context`: {missing:?}\n  CLI: {cli_json}\n  MCP: {mcp_json}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "these fields reach a CLI caller and not an MCP one, and they are not in \
+         the list of gaps this workspace knowingly left open:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// The structural guard: for a tool with a CLI twin, any key the CLI emits and
 /// MCP does not is a field an agent cannot see. The known gaps are listed
 /// explicitly with the finding that owns them, and the assertion is
 /// CONTAINMENT — closing one shrinks the set safely, opening a new one fails.
+///
+/// Kept alongside `no_cli_command_discloses_more_than_its_mcp_twin` rather than
+/// folded into it: this one names `stale_check` in its failure message, which
+/// is the row nw-315 closed, and its docstring records why the `._meta*`
+/// entries that used to sit in `KNOWN_GAPS` were INERT.
 #[test]
 fn the_mcp_route_does_not_grow_new_disclosure_gaps() {
     /// EMPTY, and that is the point. nw-315 owned every entry that used to be
