@@ -4180,9 +4180,33 @@ fn tool_brain_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // nw-353. `budgeted_cut` returns a slice index and nothing else;
+    // `result.connected.len()` — the pre-cap total — is in scope on the line
+    // above the `.take(cut)` and was dropped, so a capped answer was
+    // byte-identical to a complete one on the only route an agent can read.
+    // The CLI's HUMAN renderer has printed `Connected (N of M, ...)` all
+    // along (`print_brain_context_text`), which makes this nw-259(a)'s shape
+    // exactly: the human is told and the agent is not. The spellings are
+    // `Bounded::merge_into`'s and `code_context`'s; no sixth one is invented.
+    let total = result.connected.len();
+    let returned = connected_json.len();
+    let truncated = returned < total;
+    // `token_budget` is this tool's only cap on `connected`, so only the
+    // budget branch of `resolve` is reachable here. Called anyway, exactly as
+    // `code_context` does: the precedence rule lives in ONE place even where
+    // one branch of it cannot fire, because a second copy is how the human and
+    // machine routes came to disagree in the first place.
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(truncated, false);
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
+        "returned": returned,
+        "total": total,
+        "truncated": truncated,
+        // Emitted even when null, matching `code_context`: a caller parsing a
+        // fixed shape should not have to tell "absent because complete" from
+        // "absent because this producer is old".
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "tokens_used": used_tokens,
         "token_budget": token_budget,
         "semantic_applied": result.semantic_applied,

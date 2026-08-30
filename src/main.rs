@@ -11628,7 +11628,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
-                                print_brain_context_json(&result, cut)?;
+                                print_brain_context_json(&result, cut, token_budget)?;
                             } else {
                                 print_brain_context_text(&result, cut, token_budget);
                             }
@@ -22544,7 +22544,7 @@ fn run_brain(
                         None => limit.min(result.connected.len()),
                     };
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_brain_context_json(&result, cut, token_budget)?;
                     } else {
                         print_brain_context_text(&result, cut, token_budget);
                     }
@@ -22839,7 +22839,7 @@ fn run_brain(
                     };
                     let node_count = result.seeds.len() + cut;
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_brain_context_json(&result, cut, token_budget)?;
                     } else {
                         print_brain_context_text(&result, cut, token_budget);
                     }
@@ -25591,16 +25591,51 @@ fn render_project_context_daemon_response(
     println!("Tokens used: {used} / budget: {token_budget}");
 }
 
-fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
-    let resp = brain_context_json_value(result, limit);
+fn print_brain_context_json(
+    result: &BrainContextResult,
+    limit: usize,
+    token_budget: Option<usize>,
+) -> anyhow::Result<()> {
+    let resp = brain_context_json_value(result, limit, token_budget);
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 
-fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_json::Value {
+/// nw-353. `limit` is the cut the caller already computed; `result.connected`
+/// is the PRE-cut list, so the total is right here behind the `.take()` and
+/// used to be thrown away. `print_brain_context_text` one function over has
+/// printed `Connected (N of M, ...)` all along, so the machine route was the
+/// only audience that could not tell a capped answer from a complete one.
+///
+/// `token_budget` is a parameter rather than re-derived because this function
+/// could not name a cause without it — and naming the wrong cap sends the
+/// caller to a knob that cannot help, which is the whole of nw-259.
+fn brain_context_json_value(
+    result: &BrainContextResult,
+    limit: usize,
+    token_budget: Option<usize>,
+) -> serde_json::Value {
+    let total = result.connected.len();
+    let returned = limit.min(total);
+    let truncated = returned < total;
+    // The two CLI caps are mutually exclusive at every call site: the `cut`
+    // above is `token_budgeted_truncate(..)` when `--token-budget` is set and
+    // `limit.min(len)` otherwise — "token_budget takes precedence over the
+    // count-based limit". `resolve` still decides which to blame so the CLI
+    // and `tool_brain_context` cannot drift on the precedence rule.
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(
+        truncated && token_budget.is_some(),
+        truncated && token_budget.is_none(),
+    );
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
         "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "returned": returned,
+        "total": total,
+        "truncated": truncated,
+        // Emitted even when null, matching the MCP twin: one shape parses
+        // both routes.
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "semantic_applied": result.semantic_applied,
         "degraded_components": result.degraded_components,
     });
@@ -25637,7 +25672,7 @@ mod context_json_renderer_tests {
 
     #[test]
     fn direct_brain_context_never_drops_semantic_honesty() {
-        let value = brain_context_json_value(&degraded_context(), 30);
+        let value = brain_context_json_value(&degraded_context(), 30, None);
         assert_eq!(value["semantic_applied"], false);
         assert_eq!(
             value["degraded_components"],

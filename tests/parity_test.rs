@@ -2656,3 +2656,139 @@ fn summary_names_which_cap_cut_on_both_routes() {
         "{payload}"
     );
 }
+
+/// nw-353. `brain context` is the most-called retrieval surface in the
+/// catalogue and its MACHINE routes cannot say they were cut. `budgeted_cut`
+/// computes the cut count, the caller keeps only the slice index, and
+/// `result.connected.len()` — the pre-cap total, in scope on the line above —
+/// is dropped. A capped answer is then byte-indistinguishable from a complete
+/// one.
+///
+/// The HUMAN route already discloses: `print_brain_context_text` prints
+/// `Connected (N of M, ...)`. So this is nw-259(a)'s shape exactly — the
+/// human sees the cap and the agent does not — and the fix has a local model
+/// to copy rather than a design to invent.
+///
+/// The counterweight is the last block: an UNCAPPED call must report
+/// `truncated: false` with `returned == total` and blame no cap, or a fix
+/// that flags unconditionally passes.
+#[test]
+fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let assert_bounded = |route: &str, payload: &serde_json::Value, cut: bool| {
+        for key in ["returned", "total", "truncated"] {
+            assert!(
+                payload.get(key).is_some(),
+                "{route}: `{key}` absent — a capped answer is byte-identical to a \
+                 complete one: {payload}"
+            );
+        }
+        let returned = payload["returned"].as_u64().unwrap();
+        let total = payload["total"].as_u64().unwrap();
+        assert_eq!(
+            returned,
+            payload["connected"].as_array().unwrap().len() as u64,
+            "{route}: `returned` must be the length of the list actually returned: {payload}"
+        );
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(returned < total),
+            "{route}: `truncated` must agree with the counts beside it: {payload}"
+        );
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(cut),
+            "{route}: expected truncated={cut}: {payload}"
+        );
+    };
+
+    // ── CLI direct, cut by --limit ──
+    let capped = run_direct(db, &["brain", "context", "mainA", "--json", "--limit", "1"]);
+    assert!(capped.status.success(), "{}", flatten_miette(&capped.stderr));
+    let capped = parse_stdout("brain context (direct, limit 1)", &capped);
+    assert_bounded("direct --limit 1", &capped, true);
+    assert_eq!(
+        capped.get("truncated_by").and_then(|v| v.as_str()),
+        Some("limit"),
+        "a consumer that cannot tell WHICH cap cut raises the wrong knob: {capped}"
+    );
+
+    // ── CLI direct, cut by --token-budget; the budget takes precedence ──
+    let by_budget = run_direct(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "1",
+            "--token-budget",
+            "1",
+        ],
+    );
+    assert!(
+        by_budget.status.success(),
+        "{}",
+        flatten_miette(&by_budget.stderr)
+    );
+    let by_budget = parse_stdout("brain context (direct, both caps)", &by_budget);
+    assert_bounded("direct --limit 1 --token-budget 1", &by_budget, true);
+    assert_eq!(
+        by_budget.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the budget is applied INSTEAD of --limit here, so naming --limit is the \
+         wrong remedy: {by_budget}"
+    );
+
+    // ── MCP ──
+    let mcp = run_via_mcp(
+        db,
+        "brain_context",
+        serde_json::json!({ "seeds": ["mainA"], "token_budget": 1 }),
+    );
+    assert_bounded("mcp token_budget=1", &mcp, true);
+    assert_eq!(
+        mcp.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the MCP route has exactly one cap and must still name it: {mcp}"
+    );
+
+    // ── COUNTERWEIGHT: nothing cut, nothing claimed ──
+    let roomy = run_direct(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "5000",
+            "--token-budget",
+            "16000",
+        ],
+    );
+    assert!(roomy.status.success(), "{}", flatten_miette(&roomy.stderr));
+    let roomy = parse_stdout("brain context (roomy)", &roomy);
+    assert_bounded("direct roomy", &roomy, false);
+    assert!(
+        roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {roomy}"
+    );
+    let mcp_roomy = run_via_mcp(
+        db,
+        "brain_context",
+        serde_json::json!({ "seeds": ["mainA"], "token_budget": 16000 }),
+    );
+    assert_bounded("mcp roomy", &mcp_roomy, false);
+    assert!(
+        mcp_roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {mcp_roomy}"
+    );
+}
