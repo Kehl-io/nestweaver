@@ -5276,6 +5276,12 @@ impl NestWeaverDaemon for DaemonService {
                             {
                                 tracing::warn!("save git activity sidecar failed: {e}");
                             } else {
+                                // nw-258(a). The daemon loads this sidecar ONCE
+                                // at boot and is also its only writer, so
+                                // without this the message below announced work
+                                // that changed nothing for the rest of the
+                                // daemon's life.
+                                refresh_git_activity(&state.store, &ga_path);
                                 let _ = tx.blocking_send(Ok(IndexProgress {
                                     message: format!(
                                         "Git activity sidecar written ({} files scored).",
@@ -10135,6 +10141,40 @@ fn reconcile_index_publication_before_ppr_warm(store: &GraphStore, read_only: bo
             );
         }
         Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+    }
+}
+
+/// nw-258(a). Make a freshly written git-activity sidecar visible to the
+/// RUNNING daemon.
+///
+/// The daemon loads this sidecar once, in `serve()`, and is also its only
+/// writer — so `index --with-git-activity` printed "N files scored" and changed
+/// nothing until the next restart. A flag that costs time at index and affects
+/// nothing at query is a success message for work with no effect.
+///
+/// `clear_git_activity_cache` has existed on the store since nw-233 with ZERO
+/// callers: the invalidator was written and never wired. This is that wiring.
+///
+/// Deliberately NOT the `RwLock<SearchRuntime>` shape that `40dececa` used for
+/// the same class of boot-frozen state. That precedent applies in DIAGNOSIS and
+/// not in machinery: opening a Tantivy index is expensive, can fail, and can be
+/// repaired EXTERNALLY while the daemon runs, so it needed a retry policy. None
+/// of that holds here — the cache already has interior mutability, the file is
+/// small JSON, a bad file degrades to neutral by construction, and the writer is
+/// the daemon itself, so there is nothing to poll for. Mirror
+/// `invalidate_pagerank`'s placement, not `SearchRuntime`'s machinery.
+///
+/// Clear THEN load, in that order: a load that fails must leave the cache
+/// neutral rather than serving scores mined from a graph state that no longer
+/// exists.
+fn refresh_git_activity(store: &GraphStore, ga_path: &Path) {
+    store.clear_git_activity_cache();
+    if let Err(error) = store.load_git_activity_sidecar(ga_path) {
+        tracing::debug!(
+            error = %error,
+            path = %ga_path.display(),
+            "git-activity sidecar could not be re-read after a write; ranking stays neutral"
+        );
     }
 }
 
@@ -17400,6 +17440,71 @@ mod startup_helper_tests {
         assert_eq!(resp.error, "port_in_use");
         assert_eq!(resp.port, 0);
         drop(blocker);
+    }
+
+    /// nw-258(a). The daemon writes this sidecar and never reloaded it, so
+    /// `--with-git-activity` printed "N files scored" and changed nothing for
+    /// the rest of that daemon's life. `clear_git_activity_cache` existed on the
+    /// store with ZERO callers — the invalidator was written and never wired.
+    ///
+    /// This test can FAIL when the property is broken: delete the
+    /// `refresh_git_activity` call in the index handler (or the body of the
+    /// helper) and the score below stays `None`.
+    #[test]
+    fn writing_the_git_activity_sidecar_makes_it_visible_to_the_running_daemon() {
+        let state = test_state_with_writer();
+        assert!(
+            !state.store.has_git_activity(),
+            "precondition: nothing loaded"
+        );
+
+        let ga_path = nestweaver_engine::sidecar_path(&state.db_path, ".gitactivity.json");
+        nestweaver_engine::git_activity::save_git_activity_for_repo(
+            "repo:x",
+            &std::collections::HashMap::from([("src/main.rs".to_string(), 0.9)]),
+            &ga_path,
+        )
+        .unwrap();
+
+        // Boot-frozen: the write alone is invisible to the running process.
+        assert_eq!(
+            state.store.git_activity_score("repo:x", "src/main.rs"),
+            None
+        );
+
+        super::refresh_git_activity(&state.store, &ga_path);
+
+        assert_eq!(
+            state.store.git_activity_score("repo:x", "src/main.rs"),
+            Some(0.9),
+            "a flag that costs time at index and affects nothing at query is a \
+             success message for work with no effect"
+        );
+    }
+
+    /// The other half: a refresh whose sidecar has gone away must leave ranking
+    /// NEUTRAL, not serving scores mined from a graph state that no longer
+    /// exists. This is why the helper clears before it loads.
+    #[test]
+    fn refreshing_from_a_vanished_sidecar_restores_neutral_ranking() {
+        let state = test_state_with_writer();
+        let ga_path = nestweaver_engine::sidecar_path(&state.db_path, ".gitactivity.json");
+        nestweaver_engine::git_activity::save_git_activity_for_repo(
+            "repo:x",
+            &std::collections::HashMap::from([("src/main.rs".to_string(), 0.9)]),
+            &ga_path,
+        )
+        .unwrap();
+        super::refresh_git_activity(&state.store, &ga_path);
+        assert!(state.store.has_git_activity());
+
+        std::fs::remove_file(&ga_path).unwrap();
+        super::refresh_git_activity(&state.store, &ga_path);
+
+        assert!(
+            !state.store.has_git_activity(),
+            "a refresh must not leave the previous slice loaded"
+        );
     }
 
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for

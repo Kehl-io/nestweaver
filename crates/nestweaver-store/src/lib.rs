@@ -21,7 +21,9 @@ pub use db::{
     EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
     EmbeddingSnapshotState, GraphStore, IndexPublicationLease, PublicationIdentity,
 };
-pub use error::{CancelReason, StoreError};
+pub use error::{
+    CancelReason, CorruptionKind, EngineCorruption, StoreError, classify_engine_corruption,
+};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
 /// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants
@@ -49,6 +51,7 @@ pub use search::{
 pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K,
     SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, SearchLogicalIdentity, TantivyError, TantivyIndex,
+    reindex_lock_path,
 };
 pub use traverse::{
     DEFAULT_IMPACT_THRESHOLD, IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult,
