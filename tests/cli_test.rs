@@ -5288,6 +5288,113 @@ fn ui_watch_refuses_a_wholly_inferred_write_and_can_be_corrected() {
         .stdout(contains("--repo"));
 }
 
+/// nw-312. The documented exit-code contract is 0 ok / 1 error / 2 not-found /
+/// 64 usage, and 8.0.0 specifically split usage errors out so a caller could
+/// tell "you asked wrongly" from "it went wrong". An invalid enum value is a
+/// usage error, and `--format`/`--scope` were bare `String`s with the legal
+/// values enumerated only in prose — so validation happened in the handler and
+/// arrived as a generic error, exit 1.
+///
+/// The internal inconsistency is both the evidence and the counterweight:
+/// `--top` on the SAME command is a `usize`, so clap's own parse rejects a bad
+/// value and the binary already answers 64. The classification exists; these
+/// two arguments took a different route to it.
+#[test]
+fn export_rejects_an_invalid_enum_as_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "export function greet(n) { return n; }",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // `--top 0` is the control: a bad value on this same command, already 64.
+    for argv in [
+        vec!["export", "--format", "bogus"],
+        vec!["export", "--scope", "bogus"],
+        vec!["export", "--top", "not-a-number"],
+    ] {
+        let output = nestweaver_cmd()
+            .args(&argv)
+            .args(["--db", &db_path.display().to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{argv:?} exited {:?}; `--top not-a-number` on this same command \
+             exits 64, so the classification exists and this path bypassed it.\
+             \nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Counterweight: every documented value must still be ACCEPTED, or a
+    // `value_parser` built from the wrong list would satisfy the above.
+    for (format, scope) in [
+        ("cypher", "code"),
+        ("graphml", "all"),
+        ("graphml", "vault"),
+        ("mermaid", "code"),
+    ] {
+        nestweaver_cmd()
+            .args([
+                "export",
+                "--format",
+                format,
+                "--scope",
+                scope,
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .assert()
+            .success();
+    }
+
+    // And `msgpack` must still reach its handler, which refuses `--scope vault`
+    // as a SEMANTIC combination rather than an unknown value — a distinction a
+    // `PossibleValuesParser` must not flatten.
+    let output = nestweaver_cmd()
+        .args([
+            "export",
+            "--format",
+            "msgpack",
+            "--scope",
+            "vault",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "msgpack cannot represent the vault subgraph and must say so"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(64),
+        "`--scope vault` is a LEGAL value that this format cannot satisfy; \
+         reporting it as a usage error would tell the caller to fix the \
+         spelling of a word that is spelled correctly.\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
 /// later widening of the guard cannot quietly break plain `nestweaver ui`.
 #[test]

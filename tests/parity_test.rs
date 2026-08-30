@@ -1248,11 +1248,17 @@ fn parity_msgpack_scope_direct_vs_daemon() {
     );
     // An INVALID scope must fail on both, not slip through whichever route
     // happens to dispatch on format first.
+    //
+    // nw-312 moved this refusal from the handler to the PARSER, so the reason
+    // changed from `unknown export scope` (an `anyhow` chain, exit 1) to clap's
+    // usage error, which enumerates the legal values and exits 64. The parity
+    // is now structural rather than asserted: clap runs before either route
+    // dispatches, so the two cannot disagree about what a bad `--scope` is.
     check_parity_of_refusal(
         &fixture.db_path,
         "export msgpack --scope nonsense",
         &["export", "--format", "msgpack", "--scope", "nonsense"],
-        "unknown export scope",
+        "possible values: all, code, vault",
     );
 }
 

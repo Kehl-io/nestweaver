@@ -4162,9 +4162,18 @@ enum Commands {
         after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30\n  nestweaver export --format msgpack --output graph.msgpack"
     )]
     Export {
+        // nw-312: `value_parser`, not a bare `String` validated downstream. The
+        // legal values were enumerated in the help text and enforced in the
+        // handler, so an invalid one arrived as a generic error and exited 1
+        // where the documented contract says 64 — while `--top`, three
+        // arguments below, is a `usize` and already exits 64 because clap's own
+        // parse rejects it. `PossibleValuesParser` keeps the field a `String`,
+        // so the `format == "msgpack"` comparisons and the wire value the
+        // daemon receives are unchanged.
         #[arg(
             long,
             default_value = "cypher",
+            value_parser = clap::builder::PossibleValuesParser::new(["cypher", "graphml", "mermaid", "msgpack"]),
             help = "Output format: cypher, graphml, mermaid, msgpack"
         )]
         format: String,
@@ -4173,7 +4182,8 @@ enum Commands {
         #[arg(
             long,
             default_value = "all",
-            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file"
+            value_parser = clap::builder::PossibleValuesParser::new(["all", "code", "vault"]),
+            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file; msgpack is code-only and refuses --scope vault outright"
         )]
         scope: String,
         #[arg(
@@ -13217,15 +13227,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
-            // Unknown formats keep their friendly listing and EXIT_ERROR
-            // rather than becoming a generic error chain.
-            if !matches!(format.as_str(), "cypher" | "graphml" | "mermaid") {
-                eprintln!(
-                    "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
-                    format
-                );
-                return Ok((EXIT_ERROR, None));
-            }
+            // nw-312: the runtime listing that used to stand here is gone,
+            // not merely bypassed. `--format` now carries a
+            // `PossibleValuesParser`, so an unknown value is refused by clap
+            // before this arm runs on EITHER route, and keeping the branch
+            // would leave a third copy of the legal-value list to drift.
             // One shared implementation with the daemon's `export_graph`, so
             // the two cannot drift on scope again.
             if let Some(notice) =
