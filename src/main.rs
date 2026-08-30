@@ -24112,7 +24112,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            9,
+            10,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );
