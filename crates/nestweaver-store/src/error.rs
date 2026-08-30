@@ -92,7 +92,19 @@ impl std::fmt::Display for CorruptionKind {
 /// replay" is how the crash-restart loop starts.
 pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     let lower = message.to_lowercase();
-    if lower.contains("corrupted wal") {
+    // The engine has at least TWO phrasings for an unreadable log and they do
+    // not share a word order:
+    //
+    //   "Corrupted wal file. Read out invalid WAL record type."
+    //   "Storage exception: Checksum verification failed, the WAL file is corrupted."
+    //
+    // The first came from the nw-332 outage. The SECOND was found by executing
+    // the recovery runbook on a temp database — write garbage to `<db>.wal`
+    // with no `<db>.shadow` beside it and every open reports it, no crash
+    // required. A phrase list captured from one incident is a phrase list that
+    // has seen one incident; this is the whole reason the classification lives
+    // in one function with `Unclassified` underneath it.
+    if lower.contains("corrupted wal") || (lower.contains("wal") && lower.contains("corrupt")) {
         return Some(CorruptionKind::WalUnreadable);
     }
     if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
@@ -342,6 +354,14 @@ mod corruption_classification_tests {
         for (phrase, expected) in [
             (
                 "Corrupted wal file. Read out invalid WAL record type.",
+                CorruptionKind::WalUnreadable,
+            ),
+            // Reproduced deterministically on a temp database (garbage `.wal`,
+            // no `.shadow`), captured verbatim from the engine. The first
+            // phrasing does not match it and neither did the classifier until
+            // the runbook was actually executed.
+            (
+                "Storage exception: Checksum verification failed, the WAL file is corrupted.",
                 CorruptionKind::WalUnreadable,
             ),
             (

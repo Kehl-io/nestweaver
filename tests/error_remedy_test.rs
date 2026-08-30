@@ -605,3 +605,195 @@ fn no_source_file_hand_writes_a_placeholder_consolidation_command() {
          at every one of these sites: {offenders:?}"
     );
 }
+
+/// The five artifacts the WAL-corruption runbook names, in the order it names
+/// them.
+const WAL_RUNBOOK_ARTIFACTS: &[&str] = &[
+    ".wal",
+    ".wal.checkpoint",
+    ".shadow",
+    ".checkpoint.apply.lock",
+    ".checkpoint.intent.lock",
+];
+
+/// Make `db` report an unreadable write-ahead log.
+///
+/// nw-332 said the corrupt-WAL state could not be reproduced without lbug-001,
+/// which nobody can trigger. That is true of the SIGSEGV that produced it in
+/// production; it is NOT true of the state it leaves behind. Garbage in
+/// `<db>.wal` with no `<db>.shadow` beside it reproduces the unreadable-log open
+/// failure deterministically, in milliseconds, with no crash — the engine
+/// reports `Storage exception: Checksum verification failed, the WAL file is
+/// corrupted.`
+///
+/// This shape must NOT be confused with the orphaned-WAL one the store already
+/// recovers: `quarantine_orphaned_wal` fires on `.wal` present + `.shadow`
+/// absent, but only when the engine's message names the missing shadow file,
+/// which it does not here.
+fn corrupt_the_wal(db: &std::path::Path) {
+    let wal = std::path::PathBuf::from(format!("{}.wal", db.display()));
+    let shadow = std::path::PathBuf::from(format!("{}.shadow", db.display()));
+    let _ = std::fs::remove_file(&shadow);
+    std::fs::write(&wal, vec![0xA5u8; 4096]).unwrap();
+}
+
+/// nw-332. ONE condition, ONE remedy — and the remedy is EXECUTED here, not
+/// merely printed.
+///
+/// This condition used to reach the operator through three code paths that gave
+/// three different answers, two of which made recovery harder: "start the
+/// daemon" (which against this state is the crash-restart loop), "delete this
+/// database and re-index" (which discards a graph five files restore), and
+/// "another process holds the write lock" (naming a process that does not
+/// exist). The recovery that worked was named by none of them.
+#[test]
+fn a_corrupt_wal_prints_a_runbook_that_actually_recovers_the_database() {
+    let (dir, db) = indexed_fixture();
+    let repo = dir.path().join("repo");
+    corrupt_the_wal(&db);
+
+    let output = direct()
+        .args(["search", "a", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // miette hard-wraps and indents `help` text, so a path long enough to wrap
+    // is split across lines mid-token. Compare on the unwrapped form: temp
+    // paths contain no whitespace, so removing all of it is lossless here and
+    // asserting on the wrapped text would silently weaken every check below.
+    let unwrapped: String = stderr.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        stderr.contains("nestweaver::db_wal_corrupt"),
+        "an unreadable log is neither an unreplayed one nor a damaged FILE, and \
+         both of those diagnostics give it the wrong remedy:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("delete this database"),
+        "the database file is intact here — the runbook below recovers it — so \
+         prescribing deletion destroys a recoverable graph:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("daemon --db") || !stderr.contains("start"),
+        "starting a writer against a log that cannot be read IS the \
+         crash-restart loop:\n{stderr}"
+    );
+    for artifact in WAL_RUNBOOK_ARTIFACTS {
+        assert!(
+            unwrapped.contains(&format!("{}{artifact}", db.display())),
+            "the runbook is five artifacts and it must NAME them, against the \
+             right database: {artifact} missing from:\n{stderr}"
+        );
+    }
+    assert_no_transient_advice(&stderr, "an unreadable write-ahead log");
+
+    // NOW RUN IT. A remedy nobody executed is the exact defect class this file
+    // exists to close, and last round's fix for it introduced a new instance.
+    let aside = dir.path().join("aside");
+    std::fs::create_dir_all(&aside).unwrap();
+    let mut moved = 0;
+    for artifact in WAL_RUNBOOK_ARTIFACTS {
+        let from = std::path::PathBuf::from(format!("{}{artifact}", db.display()));
+        if from.exists() {
+            std::fs::rename(&from, aside.join(artifact.trim_start_matches('.'))).unwrap();
+            moved += 1;
+        }
+    }
+    assert!(moved > 0, "step 2 must have something to move");
+
+    // Step 3: reopen.
+    let reopened = direct()
+        .args(["search", "a", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        reopened.status.success(),
+        "the runbook this product prints must actually recover the \
+         database:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&reopened.stdout),
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+
+    // Step 4: the full re-index the runbook says is REQUIRED, not optional.
+    direct()
+        .args(["index", "--db"])
+        .arg(&db)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+    let after = direct()
+        .args(["search", "a", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("a "),
+        "the graph must be readable after the runbook: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+    drop(dir);
+}
+
+/// nw-333. `repair` attributed EVERY read-write open failure to lock
+/// contention. This fixture holds no lock at all — the write-ahead log is
+/// unreadable — so the message named a process that does not exist and
+/// prescribed a daemon restart, which against a damaged database is what
+/// produces the crash-restart loop. Its error was also a bare `eprintln!`, so
+/// the `CliDiagnostic` inventory could not see it.
+#[test]
+fn repair_does_not_blame_a_lock_nobody_holds() {
+    let (dir, db) = indexed_fixture();
+
+    // A dirty publication marker with a writer that is provably gone, so
+    // `repair` gets past its CLEAN early return and reaches the open.
+    let marker = std::path::PathBuf::from(format!("{}.index-dirty", db.display()));
+    std::fs::write(&marker, r#"{"writer_pid":999999,"reason":"index"}"#).unwrap();
+    corrupt_the_wal(&db);
+
+    let output = direct().args(["repair", "--db"]).arg(&db).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Another process holds the write lock"),
+        "no process holds this database; the open failed because the LOG is \
+         unreadable, and the message said so in its own parenthetical before \
+         ignoring it:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("then start"),
+        "restarting the daemon against a damaged database is what produces the \
+         crash-restart loop — the one remedy in this class that makes recovery \
+         HARDER rather than merely wasting time:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("nestweaver::db_wal_corrupt"),
+        "the open failure must reach the operator as a classified diagnostic, \
+         not a bare eprintln the CliDiagnostic inventory cannot see:\n{stderr}"
+    );
+    assert_no_transient_advice(&stderr, "repair on a damaged database");
+    drop(dir);
+}
+
+/// The other half, and what keeps the first from over-correcting: a repair
+/// blocked by a REAL lock must still say so. Without this, "delete the
+/// sentence" passes.
+#[test]
+fn repair_still_names_a_lock_that_is_genuinely_held() {
+    let (dir, db) = indexed_fixture();
+    let marker = std::path::PathBuf::from(format!("{}.index-dirty", db.display()));
+    std::fs::write(&marker, r#"{"writer_pid":999999,"reason":"index"}"#).unwrap();
+
+    let _holder =
+        nestweaver_store::GraphStore::open(&db).expect("a healthy fixture must open read-write");
+
+    let output = direct().args(["repair", "--db"]).arg(&db).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("write lock"),
+        "a genuinely held lock must still be reported as one: {stderr}"
+    );
+    drop(dir);
+}
