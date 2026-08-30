@@ -37,7 +37,17 @@ use std::path::Path;
 ///     an imported file. nw-323/nw-324: TS/JS `.js`-to-`.ts` specifiers,
 ///     `"./src/*"` tsconfig targets, `export … from` re-exports and
 ///     `new X()` all produced no edge at all. Both change edge SHAPE.
-pub const RESOLVER_GENERATION: u32 = 2;
+/// 3 — nw-349/nw-330/nw-340: functions in cpp, dart, cobol, svelte, vue and
+///     astro recorded `end_line == start_line`, so `find_enclosing_symbol`
+///     could not place a call inside the function containing it and the
+///     degenerate-span fallback attributed it to the nearest preceding one-line
+///     symbol of any kind — including `Constant`/`Variable`/`Property` symbols
+///     that cannot be call sites. Both the spans and the fallback's kind
+///     restriction change which SOURCE an edge is written from, and Rust `impl`
+///     blocks changing from `Class` to `Extension` changes the UIDs those edges
+///     point at. None of it is observable on a repo already indexed: the edges
+///     are on disk with the old sources.
+pub const RESOLVER_GENERATION: u32 = 3;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

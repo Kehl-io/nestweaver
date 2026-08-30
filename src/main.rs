@@ -9776,11 +9776,40 @@ fn affected_tests_rpc_args(changed_files: &[String]) -> serde_json::Value {
     serde_json::json!({ "changed_files": changed_files })
 }
 
+/// The filesystem root a source-reading RPC must send to the daemon.
+///
+/// nw-340. Every daemon-side tool that reads source spans resolves repo-relative
+/// `file_path`s against a `root` argument, and every one of them falls back to
+/// `std::env::current_dir()` when the argument is absent. That fallback is the
+/// **daemon's** cwd — a long-lived process started wherever it was started,
+/// which is essentially never the caller's repo. So an omitted `root` does not
+/// mean "use a sensible default"; it means "read the wrong tree", and the
+/// symptom is a well-formed response with empty bodies.
+///
+/// The client's cwd is the only working directory that means anything to the
+/// caller, so an absent `--root` resolves here, on the client, rather than
+/// being left for the server to guess.
+fn client_source_root(root: Option<&std::path::Path>) -> String {
+    root.map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `read_symbols` reads `include_neighbors` (never `neighbors`, nw-088) and an
 /// optional integer `token_budget`. The budget key is OMITTED when unset — the
 /// tool's integer schema rejects an explicit null, which used to fail schema
 /// validation on every budget-less call and silently fall back to the direct
 /// path.
+///
+/// `root`, by contrast, is ALWAYS sent (nw-340). It used to be omitted when
+/// `--root` was not passed, and the daemon then filled it from its own
+/// `current_dir()`. The daemon is long-lived and started wherever it happened
+/// to be started, so every repo-relative `file_path` failed to resolve, every
+/// `read_span` returned `None`, and `read-symbols` printed a well-formed header
+/// with no body under it. Since `resolve_use_daemon` returns true by default,
+/// that was the normal path, not an edge case. The client's cwd is the only
+/// working directory that means anything to the caller, so it is the default.
 fn read_symbols_rpc_args(
     targets: &[String],
     neighbors: u8,
@@ -9794,9 +9823,7 @@ fn read_symbols_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
-    if let Some(r) = root {
-        args["root"] = serde_json::json!(r.to_string_lossy());
-    }
+    args["root"] = serde_json::json!(client_source_root(root));
     args
 }
 
@@ -16386,9 +16413,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref s) = scope {
                     args["scope"] = serde_json::json!(s);
                 }
-                if let Some(ref r) = root {
-                    args["root"] = serde_json::json!(r);
-                }
+                // nw-340: always send a root. An omitted `root` is filled by
+                // the DAEMON's cwd, not the caller's, so inline bodies come
+                // back empty from a response that otherwise looks fine.
+                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)?
                 {
                     if json {
@@ -16471,9 +16499,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bundle_id": bundle_id,
                     "targets": targets,
                 });
-                if let Some(ref r) = root {
-                    args["root"] = serde_json::json!(r);
-                }
+                // nw-340: always send a root. An omitted `root` is filled by
+                // the DAEMON's cwd, not the caller's, so inline bodies come
+                // back empty from a response that otherwise looks fine.
+                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
@@ -16542,9 +16571,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bundle_id": bundle_id,
                     "token_budget": token_budget,
                 });
-                if let Some(ref r) = root {
-                    args["root"] = serde_json::json!(r);
-                }
+                // nw-340: always send a root. An omitted `root` is filled by
+                // the DAEMON's cwd, not the caller's, so inline bodies come
+                // back empty from a response that otherwise looks fine.
+                args["root"] = serde_json::json!(client_source_root(root.as_deref()));
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
@@ -19771,6 +19801,34 @@ fn ensure_direct_store_fallback_allowed(
     }
 }
 
+/// The header-plus-body text for one symbol window.
+///
+/// Extracted from `render_read_symbols` so the `body_available` branch is
+/// testable without capturing stdout (nw-340).
+///
+/// The engine already distinguishes "this symbol is genuinely empty" from "I
+/// could not read the source" and says so in `body_available`. The MCP surface
+/// honours that field; this renderer used to drop it and print `w.body`
+/// unconditionally, so an unreadable span emitted a correct-looking header
+/// followed by one blank line. That is the nw-249/nw-212 honesty class:
+/// reporting success for work that did not happen.
+fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -> String {
+    let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+    let header = format!(
+        "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+        w.name, w.kind, w.path, w.start_line, w.end_line, tag
+    );
+    if w.body_available {
+        format!("{header}\n{}", w.body)
+    } else {
+        format!(
+            "{header}\n   source unavailable: {} could not be read for lines {}-{} \
+             — pass --root <repo> or run from the repo root",
+            w.path, w.start_line, w.end_line
+        )
+    }
+}
+
 /// Render a `read_symbols` result and compute its exit code.
 ///
 /// Shared by the daemon and direct paths so `--json` and the exit-code
@@ -19783,12 +19841,7 @@ fn render_read_symbols(
         println!("{}", serde_json::to_string_pretty(&res)?);
     } else {
         for w in &res.symbols {
-            let tag = if w.is_neighbor { " [neighbor]" } else { "" };
-            println!(
-                "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
-                w.name, w.kind, w.path, w.start_line, w.end_line, tag
-            );
-            println!("{}", w.body);
+            println!("{}", read_symbols_window_text(w));
             println!();
         }
         for nf in &res.not_found {
@@ -19825,6 +19878,14 @@ fn render_read_symbols(
         if !res.ambiguous.is_empty() {
             return Ok((EXIT_AMBIGUOUS, None));
         }
+        return Ok((EXIT_NOT_FOUND, None));
+    }
+    // nw-340: symbols resolved, but not ONE of them yielded readable source.
+    // `read-symbols` exists to return source; a run that returned none of it
+    // answered no part of the question asked, and exiting 0 made that
+    // indistinguishable from success. A partial answer still succeeds — the
+    // bodies that were read are real.
+    if !res.symbols.is_empty() && res.symbols.iter().all(|w| !w.body_available) {
         return Ok((EXIT_NOT_FOUND, None));
     }
     Ok((EXIT_SUCCESS, None))
@@ -22476,7 +22537,11 @@ fn run_brain(
                         "intent": intent.clone().unwrap_or_default(),
                         "include_seeds": true,
                         "include_bodies": inline_bodies,
-                        "root": root.clone().unwrap_or_default().to_string_lossy().to_string(),
+                        // nw-340: an absent `--root` used to be sent as `""`,
+                        // which the daemon joins onto a repo-relative path and
+                        // so resolves against its OWN cwd — the same wrong-tree
+                        // read as omitting the key. Resolve it client-side.
+                        "root": client_source_root(root.as_deref()),
                         "prf": prf,
                         "rerank": rerank,
                         "weight_semantic": if no_embed { 0.0 } else { weight_semantic.unwrap_or(0.0) },
@@ -30400,13 +30465,16 @@ credential_method = "gh"
     #[test]
     fn read_symbols_rpc_args_omit_null_token_budget() {
         let args = read_symbols_rpc_args(&["main".to_string()], 0, None, None);
-        assert_eq!(
-            args,
-            serde_json::json!({ "targets": ["main"], "include_neighbors": 0 })
-        );
         assert!(args.get("token_budget").is_none());
-        assert!(args.get("root").is_none());
         assert!(args.get("neighbors").is_none());
+        // `root` is NOT omitted — see
+        // `read_symbols_rpc_args_always_sends_a_root` (nw-340).
+        assert_eq!(
+            args["targets"],
+            serde_json::json!(["main"]),
+            "targets and include_neighbors are the only other keys"
+        );
+        assert_eq!(args["include_neighbors"], serde_json::json!(0));
 
         let args = read_symbols_rpc_args(
             &["main".to_string()],
@@ -30423,6 +30491,123 @@ credential_method = "gh"
                 "root": "/repo",
             })
         );
+    }
+
+    /// nw-340. With no `--root` the CLI omitted `root`, so the DAEMON resolved
+    /// repo-relative file paths against ITS OWN cwd
+    /// (`nestweaver-mcp/src/tools.rs`, `unwrap_or_else(|| current_dir())`).
+    /// The daemon is long-lived and was started somewhere else, so EVERY body
+    /// came back empty and `read-symbols` printed headers with nothing under
+    /// them. `resolve_use_daemon` returns true by default, which is why this
+    /// looked universal rather than cwd-dependent.
+    #[test]
+    fn read_symbols_rpc_args_always_sends_a_root() {
+        let args = read_symbols_rpc_args(&["greet".to_string()], 0, None, None);
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .expect("root must always be sent: the daemon's cwd is not the caller's");
+        assert_eq!(
+            std::path::Path::new(root),
+            std::env::current_dir().unwrap().as_path(),
+            "root must default to the CLIENT's cwd"
+        );
+    }
+
+    /// nw-340, the honesty half. The engine already sets
+    /// `body_available: false` (`read_symbols.rs`, pinned by
+    /// `read_symbols_flags_unreadable_body`); `render_read_symbols` never
+    /// consulted it, so a failed read produced a well-formed header, one blank
+    /// line, and EXIT_SUCCESS.
+    #[test]
+    fn an_unreadable_body_is_reported_not_printed_as_a_blank_line() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 10,
+            end_line: 14,
+            body: String::new(),
+            body_available: false,
+            is_neighbor: false,
+        };
+        let out = read_symbols_window_text(&w);
+        assert!(
+            out.contains("source unavailable"),
+            "an unreadable body must say so rather than emitting nothing: {out:?}"
+        );
+        assert!(
+            out.contains("--root"),
+            "the remedy must be named, not implied: {out:?}"
+        );
+    }
+
+    /// nw-340's own pinning assertion, quoted from the item: "for a symbol
+    /// whose span is N lines, the emitted body must be N non-empty lines and
+    /// its first line must match the file's line at `start_line`."
+    #[test]
+    fn a_readable_body_emits_one_line_per_span_line() {
+        let w = nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "greet".into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 1,
+            end_line: 3,
+            body: "fn greet() {\n    hello();\n}".into(),
+            body_available: true,
+            is_neighbor: false,
+        };
+        let text = read_symbols_window_text(&w);
+        let body: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(
+            body.len(),
+            (w.end_line - w.start_line + 1) as usize,
+            "a 3-line span must emit 3 lines, got {body:?}"
+        );
+        assert_eq!(body[0], "fn greet() {");
+        assert!(body.iter().all(|l| !l.trim().is_empty()));
+    }
+
+    /// nw-340. A read where NO requested symbol had a readable body is a
+    /// failure the exit code must carry: the caller asked for source and
+    /// received none. Exit 2 ("not found") is the existing code for "the
+    /// question was not answered".
+    #[test]
+    fn a_read_where_no_body_was_readable_does_not_exit_success() {
+        let unreadable = |name: &str| nestweaver_engine::read_symbols::SymbolWindow {
+            uid: format!("sym:{name}"),
+            name: name.into(),
+            kind: "Function".into(),
+            path: "src/greet.rs".into(),
+            start_line: 10,
+            end_line: 14,
+            body: String::new(),
+            body_available: false,
+            is_neighbor: false,
+        };
+        let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![unreadable("greet")],
+            ..Default::default()
+        };
+        let (code, _) = render_read_symbols(&res, false).unwrap();
+        assert_eq!(
+            code, EXIT_NOT_FOUND,
+            "every requested body was unreadable; exiting 0 reports success for \
+             work that did not happen"
+        );
+
+        // One readable body is enough to succeed — the partial answer is real.
+        let mut ok = unreadable("other");
+        ok.body = "fn other() {}".into();
+        ok.body_available = true;
+        let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![unreadable("greet"), ok],
+            ..Default::default()
+        };
+        let (code, _) = render_read_symbols(&res, false).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
     }
 
     /// nw-108 (4): EVERY read-only open must produce the `db_not_found`

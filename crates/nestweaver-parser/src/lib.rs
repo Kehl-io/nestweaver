@@ -1,6 +1,7 @@
 // nestweaver-parser: language-aware source parsing via tree-sitter (code) and comrak (markdown)
 
 pub mod astro;
+pub(crate) mod block_span;
 pub mod canvas;
 pub mod cobol;
 pub mod dataview;

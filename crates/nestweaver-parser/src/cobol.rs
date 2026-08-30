@@ -199,10 +199,55 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
         }
     }
 
+    close_symbol_spans(&mut symbols, source);
+
     ParsedFile {
         path: path_str,
         symbols,
         references,
         type_bindings: Vec::new(),
+    }
+}
+
+/// Give every section and paragraph the span of its own body.
+///
+/// nw-349 span family. This scanner records a symbol when it sees the LABEL
+/// line and has no other line to point at, so it wrote `end_line: start_line`
+/// for all of them. Every COBOL paragraph was therefore ZERO-HEIGHT:
+/// `read-symbols` returned the bare label, and the resolver could not place a
+/// `PERFORM` inside the paragraph that issued it — it fell through to the
+/// degenerate fallback and was attributed to whichever one-line symbol happened
+/// to precede it.
+///
+/// COBOL has no closing delimiter for a paragraph: a paragraph runs until the
+/// next label or the end of the division. So the span is closed by the NEXT
+/// symbol's start rather than by a matching token, and trailing blank and
+/// comment lines are trimmed back so the span is the body rather than the gap
+/// after it.
+///
+/// `symbols` is pushed in ascending line order by construction (one pass over
+/// the source), which is what makes the pairwise walk correct.
+fn close_symbol_spans(symbols: &mut [RawSymbol], source: &str) {
+    let lines: Vec<&str> = source.lines().collect();
+
+    let is_body_line = |idx: usize| -> bool {
+        let line = lines[idx];
+        // Column 7 (0-indexed 6) carries the comment indicator.
+        let is_comment = line.len() > 6 && line.as_bytes()[6] == b'*';
+        !line.trim().is_empty() && !is_comment
+    };
+
+    for i in 0..symbols.len() {
+        let start = symbols[i].start_line;
+        let limit = match symbols.get(i + 1) {
+            Some(next) => next.start_line.saturating_sub(1),
+            None => lines.len() as u32,
+        };
+        // Walk back from the limit to the last line that is actually code.
+        let mut end = limit;
+        while end > start && !is_body_line((end - 1) as usize) {
+            end -= 1;
+        }
+        symbols[i].end_line = end.max(start);
     }
 }

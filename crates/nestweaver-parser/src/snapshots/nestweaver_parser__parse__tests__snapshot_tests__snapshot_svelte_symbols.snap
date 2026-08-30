@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6122
 expression: "parsed_symbols(\"simple.svelte\", &source)"
 ---
 - name: simple
   kind: Class
   start_line: 1
-  end_line: 1
+  end_line: 31
   signature: "<svelte:component name=\"simple\">"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -17,7 +18,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
 - name: greet
   kind: Function
   start_line: 5
-  end_line: 5
+  end_line: 7
   signature: "export function greet(name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,7 +42,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
 - name: handleClick
   kind: Function
   start_line: 11
-  end_line: 11
+  end_line: 14
   signature: "function handleClick() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

@@ -438,9 +438,19 @@ fn detect_dead_code_inner(
         .collect();
 
     // Find unreachable class UIDs so we can suppress their members.
+    //
+    // nw-330: `Extension` counts here too. A Rust `impl` block is a container of
+    // members exactly as a class is — it used to BE `SymbolKind::Class`, and the
+    // only reason it no longer is, is that it needed an identity distinct from
+    // the struct it implements. Leaving it out would have made this suppression
+    // silently narrower as a side effect of a modelling fix, reporting every
+    // method of a dead impl block alongside the block itself.
     let unreachable_class_uids: HashSet<&str> = all_symbols
         .iter()
-        .filter(|s| !strong_reachable.contains(&s.uid) && s.kind == SymbolKind::Class)
+        .filter(|s| {
+            !strong_reachable.contains(&s.uid)
+                && matches!(s.kind, SymbolKind::Class | SymbolKind::Extension)
+        })
         .map(|s| s.uid.as_str())
         .collect();
 
