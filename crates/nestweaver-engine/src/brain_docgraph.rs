@@ -43,6 +43,24 @@ pub struct BrokenLink {
     pub wikilink_text: String,
     pub confidence: f32,
     pub suggested_target_uids: Vec<String>,
+    /// nw-362(a). How many notes matched before `max_suggestions` cut.
+    ///
+    /// The cap applies INSIDE a row, so the row is where it has to be
+    /// disclosed — the top-level `returned`/`total`/`truncated` triple
+    /// (`ced4305b`) bounds a different list and cannot see this one. Equal to
+    /// `suggested_target_uids.len()` when nothing was cut, so a row that
+    /// genuinely had five matches is distinguishable from a row cut at five,
+    /// and `suggested_total > suggested_target_uids.len()` IS this row's
+    /// `truncated` — derivable, and therefore not a second field.
+    ///
+    /// No cause field: there is exactly one cap here, so naming it would name
+    /// the knob the caller already passed.
+    ///
+    /// `#[serde(default)]` for a reply from a daemon older than this field. It
+    /// then reads 0, which is below the list length and so is visibly not a
+    /// population count, rather than a confident wrong one.
+    #[serde(default)]
+    pub suggested_total: usize,
     /// The note this link actually points at, when it resolved. `None` means
     /// no target exists — the only case that is genuinely broken.
     pub resolved_target_uid: Option<String>,
@@ -76,13 +94,15 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
         // Never suggest the note the link is written in. A date-stamped log
         // linking to a date-stamped note matched itself on substring, so the
         // advice read "fix this broken link by linking to itself" (nw-100).
-        let suggestions = suggest_targets(&r.wikilink_text, &notes, max_suggestions, &r.source_uid);
+        let (suggestions, suggested_total) =
+            suggest_targets(&r.wikilink_text, &notes, max_suggestions, &r.source_uid);
         out.push(BrokenLink {
             source_uid: r.source_uid,
             source_path: r.source_path,
             wikilink_text: r.wikilink_text,
             confidence: r.confidence,
             suggested_target_uids: suggestions,
+            suggested_total,
             resolved_target_uid: if r.current_target_uid.is_empty() {
                 None
             } else {
@@ -141,10 +161,19 @@ fn note_stem(file_path: &str) -> String {
 /// backlog IDs that are YAML entries rather than notes, and notes since deleted.
 /// Fuzzy matching would manufacture a confident-looking suggestion for every one
 /// of them, which is worse than returning none.
-fn suggest_targets(text: &str, notes: &[NoteLite], max: usize, source_uid: &str) -> Vec<String> {
+/// Returns `(the kept uids, how many matched before `max` cut)` — the same
+/// shape `collect_tolerating_corrupt` uses for the same reason: a bare `Vec`
+/// has nowhere to say what it declined, and `scored.len()` was computed on the
+/// line above the `.take(max)` and dropped (nw-362(a)).
+fn suggest_targets(
+    text: &str,
+    notes: &[NoteLite],
+    max: usize,
+    source_uid: &str,
+) -> (Vec<String>, usize) {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
     let needle_norm = normalize_key(&needle);
 
@@ -184,11 +213,13 @@ fn suggest_targets(text: &str, notes: &[NoteLite], max: usize, source_uid: &str)
             .then_with(|| a.1.title.cmp(&b.1.title))
             .then_with(|| a.1.uid.cmp(&b.1.uid))
     });
-    scored
+    let matched_total = scored.len();
+    let kept: Vec<String> = scored
         .into_iter()
         .take(max)
         .map(|(_, n)| n.uid.clone())
-        .collect()
+        .collect();
+    (kept, matched_total)
 }
 
 // ── 2. orphan documents ──────────────────────────────────────────────────────
@@ -836,7 +867,7 @@ mod tests {
             note_lite("note:other", "Unrelated", "misc/unrelated.md"),
         ];
 
-        let got = suggest_targets("blast-radius-production-grade", &notes, 5, "note:src");
+        let (got, _) = suggest_targets("blast-radius-production-grade", &notes, 5, "note:src");
 
         assert!(got.contains(&"note:backlog".to_string()), "got: {got:?}");
         assert!(got.contains(&"note:prd".to_string()), "got: {got:?}");
@@ -855,7 +886,7 @@ mod tests {
             "Some Other Title",
             "notes/Phase B Execution Index.md",
         )];
-        let got = suggest_targets("phase-b-execution-index", &notes, 5, "note:src");
+        let (got, _) = suggest_targets("phase-b-execution-index", &notes, 5, "note:src");
         assert_eq!(got, vec!["note:a".to_string()], "got: {got:?}");
     }
 
@@ -875,12 +906,89 @@ mod tests {
             note_lite("note:b", "Release Process", "notes/release-process.md"),
         ];
         for absent in ["nw-092", "server-mode-phase1-transport", "zzz"] {
-            let got = suggest_targets(absent, &notes, 5, "note:src");
+            let (got, _) = suggest_targets(absent, &notes, 5, "note:src");
             assert!(
                 got.is_empty(),
                 "{absent:?} exists nowhere — a guess is worse than nothing, got: {got:?}"
             );
         }
+    }
+
+    /// nw-362(a). `max_suggestions` cuts INSIDE a row and the row could not
+    /// say so, so a row cut at N was byte-identical to a row that genuinely
+    /// had N. `scored.len()` — the pre-cap population — was computed on the
+    /// line above the `.take(max)` and dropped.
+    ///
+    /// COUNTERWEIGHT: a row whose matches all fit must report
+    /// `suggested_total == suggested_target_uids.len()`, or a fix that
+    /// reports the population unconditionally passes.
+    #[test]
+    fn a_row_whose_suggestions_were_cut_says_how_many_matched() {
+        // Three notes whose titles all contain the link text, so all three
+        // score and the cap is the only thing that can reduce them.
+        let notes = vec![
+            note_lite("note:a", "Daemon Architecture Alpha", "notes/a.md"),
+            note_lite("note:b", "Daemon Architecture Beta", "notes/b.md"),
+            note_lite("note:c", "Daemon Architecture Gamma", "notes/c.md"),
+        ];
+
+        let (cut, cut_total) = suggest_targets("Daemon Architecture", &notes, 1, "note:src");
+        assert_eq!(cut.len(), 1, "the cap must bite: {cut:?}");
+        assert_eq!(
+            cut_total, 3,
+            "the row cannot distinguish `cut at 1` from `only one note matched`, so a \
+             reviewer cannot tell whether raising --max-suggestions would help"
+        );
+
+        // COUNTERWEIGHT: nothing cut, nothing claimed.
+        let (whole, whole_total) = suggest_targets("Daemon Architecture", &notes, 50, "note:src");
+        assert_eq!(whole.len(), 3);
+        assert_eq!(
+            whole_total,
+            whole.len(),
+            "an uncut row must report its own length, or the field is unfalsifiable"
+        );
+    }
+
+    /// nw-362(a), end to end: the count has to reach the ROW, because the row
+    /// is what every route serialises. `BrokenLink` is `Serialize`, so proving
+    /// it here proves it for `brain broken-links --json`, the human renderer
+    /// and `brain_broken_links` over MCP at once.
+    #[test]
+    fn a_broken_link_row_carries_its_suggestion_population() {
+        let (_dir, root) = make_vault(&[
+            (
+                "src.md",
+                "# Src\n\nSee [[Daemon Architecture]].\n",
+            ),
+            ("a.md", "# Daemon Architecture Alpha\n\nhi\n"),
+            ("b.md", "# Daemon Architecture Beta\n\nhi\n"),
+            ("c.md", "# Daemon Architecture Gamma\n\nhi\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let cut = broken_links(&store, 1).unwrap();
+        let row = cut
+            .iter()
+            .find(|l| l.wikilink_text.eq_ignore_ascii_case("Daemon Architecture"))
+            .expect("the dangling link must be reported");
+        assert_eq!(row.suggested_target_uids.len(), 1, "the cap must bite: {row:?}");
+        assert!(
+            row.suggested_total > row.suggested_target_uids.len(),
+            "a row cut at 1 reports itself complete: {row:?}"
+        );
+
+        // COUNTERWEIGHT: uncapped, the row reports its own length.
+        let whole = broken_links(&store, 50).unwrap();
+        let row = whole
+            .iter()
+            .find(|l| l.wikilink_text.eq_ignore_ascii_case("Daemon Architecture"))
+            .expect("the dangling link must be reported");
+        assert_eq!(
+            row.suggested_total,
+            row.suggested_target_uids.len(),
+            "nothing was cut, so the row must not claim a larger population: {row:?}"
+        );
     }
 
     /// nw-100: never advise fixing a link by pointing it at its own source.
@@ -902,7 +1010,7 @@ mod tests {
                 pagerank_score: 0.0,
             },
         ];
-        let got = suggest_targets("Daily Log 2026-07-27", &notes, 5, "note:self");
+        let (got, _) = suggest_targets("Daily Log 2026-07-27", &notes, 5, "note:self");
         assert!(
             !got.contains(&"note:self".to_string()),
             "must not suggest the source note itself, got: {got:?}"

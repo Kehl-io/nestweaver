@@ -1576,6 +1576,31 @@ fn parse_unit_interval_f64(value: &str) -> Result<f64, String> {
 /// A sub-1.0 confidence means the link matched at a lower resolver tier, not
 /// that it is wrong. Printing only the number let a same-folder match (0.95)
 /// and a link pointing at nothing (0.0) read identically (nw-100).
+/// nw-362(a). Say when the suggestion list is a SAMPLE.
+///
+/// `max_suggestions` cuts inside the row, so without the population a row cut
+/// at N reads exactly like a row that genuinely had N and the reader cannot
+/// tell whether raising `--max-suggestions` would help. One helper, called by
+/// both the daemon-rendered and the direct-disk branch, because two copies of
+/// this line is how the routes came to print different things before.
+///
+/// `suggested_total` is 0 on a reply from a daemon older than the field; that
+/// is below the list length, so the sample form is simply not taken and the
+/// output is exactly what it was.
+fn print_link_suggestions(l: &nestweaver_engine::BrokenLink) {
+    let shown = l.suggested_target_uids.join(", ");
+    if l.suggested_total > l.suggested_target_uids.len() {
+        println!(
+            "    suggested ({} of {}): {}",
+            l.suggested_target_uids.len(),
+            l.suggested_total,
+            shown
+        );
+    } else {
+        println!("    suggested: {shown}");
+    }
+}
+
 fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
     match &link.resolved_target_uid {
         Some(uid) => format!("resolves to {uid}"),
@@ -22966,7 +22991,7 @@ fn run_brain(
                                 describe_link_resolution(l)
                             );
                             if !l.suggested_target_uids.is_empty() {
-                                println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                                print_link_suggestions(l);
                             }
                         }
                     }
@@ -23017,7 +23042,7 @@ fn run_brain(
                         describe_link_resolution(l)
                     );
                     if !l.suggested_target_uids.is_empty() {
-                        println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                        print_link_suggestions(l);
                     }
                 }
             }
