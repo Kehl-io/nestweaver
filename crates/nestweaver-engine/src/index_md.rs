@@ -1930,8 +1930,15 @@ where
     // must not be the default one, and the watcher route has no human reading
     // the exit code.
     if all_notes.is_empty() && vault_existed {
-        let existing = store
-            .list_notes(Some(&v_uid))
+        // The guard turns on "are there notes indexed?", so it can only be
+        // trusted if the answer is COMPLETE. nw-335 made this scan skip a row
+        // it cannot decode and disclose it in a log line, so a vault whose rows
+        // are all undecodable reads as "nothing indexed" — the guard stands
+        // down and the reindex deletes the vault it could not read. A count
+        // that could not be taken in full is not a count of zero, and this is
+        // the one place where reading it as zero is destructive.
+        let (existing, integrity) = store
+            .list_notes_with_integrity(Some(&v_uid))
             .context("count indexed notes before the stale-drop")?;
         if !existing.is_empty() {
             anyhow::bail!(
@@ -1940,6 +1947,15 @@ where
                  one of them. Check that the vault directory is readable and mounted; if it \
                  really is empty, drop it with `nestweaver brain remove`.",
                 existing.len()
+            );
+        }
+        if let Some(disclosure) = integrity.disclosure() {
+            anyhow::bail!(
+                "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
+                 note files, and the indexed note count could not be read in full, so \
+                 \"nothing is indexed\" is NOT established -- {disclosure} Committing this \
+                 could delete notes this process was unable to see. Repair the graph \
+                 (`nestweaver brain add --force`) before reindexing."
             );
         }
     }
@@ -3646,6 +3662,98 @@ mod tests {
             store.list_notes(None).unwrap().len(),
             2,
             "the previously indexed notes must survive the refusal"
+        );
+    }
+
+    /// nw-287's guard turns on "are there notes indexed?", and nw-335 made
+    /// that question answerable INCOMPLETELY: the scan now skips a row it
+    /// cannot decode and says so only in a log line. A vault whose rows are all
+    /// undecodable therefore reads as "nothing is indexed", the guard stands
+    /// down, and the refresh deletes the vault it was unable to read — the
+    /// exact data loss nw-287 exists to prevent, reached through the success
+    /// arm instead of the empty one. A count that could not be taken in full is
+    /// not a count of zero.
+    #[test]
+    fn refresh_refuses_when_the_indexed_note_count_could_not_be_read_in_full() {
+        let (_dir, root) = make_vault(&[("f1.md", "# F1\n\ncontent one\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        )
+        .unwrap();
+
+        // Replace the indexed row with one the reader cannot decode, so the
+        // vault holds exactly one note and the scan can see none of it.
+        let v_uid = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the index created a vault")
+            .uid;
+        for note in store.list_notes(None).unwrap() {
+            store.delete_note_cascade(&note.uid).unwrap();
+        }
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: format!("note:{v_uid}:poisoned"),
+                vault_uid: v_uid.clone(),
+                file_path: "f1.md".to_string(),
+                title: "Poi\u{0}soned".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        assert!(
+            store.list_notes(None).unwrap().is_empty(),
+            "precondition: the scan reads this vault as empty ..."
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            1,
+            "... even though the vault holds exactly one note"
+        );
+
+        // The mount goes away.
+        std::fs::remove_file(root.join("f1.md")).unwrap();
+
+        let observed = index_markdown_directory_with_store_and_deletion_count(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "v",
+            &[],
+        );
+        let Err(error) = observed else {
+            panic!(
+                "an empty scan over a vault whose note count could not be read \
+                 must fail closed, not commit a whole-vault deletion"
+            );
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not be read in full"),
+            "the refusal must name WHY the count is not trustworthy, so an \
+             operator can repair it rather than retry: {message}"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            1,
+            "the row the reader could not decode must survive the refusal"
         );
     }
 

@@ -6271,9 +6271,22 @@ fn tool_brain_status(
 ///
 /// The returned bool is "this vault's count could not be read", which
 /// [`counts_disclosure`] folds into `unavailable`/`counts_complete`.
+///
+/// The read is handed in as `(rows, ScanIntegrity)` because a whole-corpus scan
+/// can now come back SHORT without coming back `Err` (nw-335 tolerates a row it
+/// cannot decode rather than losing the corpus). A short scan reported as a
+/// confident smaller number is the same CWE-390 defect nw-260 fixed, just
+/// arriving through `Ok` instead of `unwrap_or_default()` — so an incomplete
+/// read takes the identical null-and-disclose path as a failed one.
 fn vault_status_json<E: std::fmt::Display>(
     vault: &nestweaver_schema::Vault,
-    notes: Result<Vec<nestweaver_schema::Note>, E>,
+    notes: Result<
+        (
+            Vec<nestweaver_schema::Note>,
+            nestweaver_store::ScanIntegrity,
+        ),
+        E,
+    >,
     ext_ts: Option<String>,
 ) -> (Value, bool) {
     // `unwrap_or_default()` turned a failed read into a vault holding zero
@@ -6282,9 +6295,21 @@ fn vault_status_json<E: std::fmt::Display>(
     // the most misleading of the set (CWE-390) — and this tool's own
     // description tells the caller to re-index on a zero.
     let (notes, note_count, read_failed) = match notes {
-        Ok(notes) => {
+        Ok((notes, integrity)) if integrity.is_complete() => {
             let count = notes.len();
             (notes, json!(count), false)
+        }
+        Ok((_, integrity)) => {
+            // Read, but not all of it. A number derived from part of a vault
+            // is not that vault's note count, and this tool tells the caller
+            // to re-index on a low one — so it is `null` plus a disclosure,
+            // exactly as a failed read is.
+            tracing::warn!(
+                vault = %vault.uid,
+                "brain_status: per-vault note count incomplete: {}",
+                integrity.disclosure().unwrap_or_default()
+            );
+            (Vec::new(), Value::Null, true)
         }
         Err(error) => {
             tracing::warn!(
@@ -6439,7 +6464,8 @@ pub fn brain_status_json(
                     "no extension-store timestamp; falling back to max(modified_at)"
                 );
             }
-            let (row, failed) = vault_status_json(v, store.list_notes(Some(&v.uid)), ext_ts);
+            let (row, failed) =
+                vault_status_json(v, store.list_notes_with_integrity(Some(&v.uid)), ext_ts);
             if failed {
                 vault_count_failures += 1;
             }
@@ -9855,6 +9881,13 @@ fn tool_dead_code(
         "truncated": matching_count > filtered.len(),
         "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
+        // Coverage contract: the counts above are a completeness claim over the
+        // whole symbol corpus. The store's whole-corpus scan TOLERATES a row it
+        // cannot decode (nw-335) rather than losing the corpus, so `coverage`
+        // says whether it actually saw everything — without it, "N of M" over a
+        // silently-shortened corpus reads as exact.
+        "coverage": if result.coverage_is_complete() { "complete" } else { "degraded" },
+        "undecodable_symbols": result.undecodable_symbols,
         "min_confidence": min_conf_str,
         "unreachable_symbols": filtered,
     }))
@@ -13461,6 +13494,24 @@ mod cache_dispatch_tests {
         assert!(resolved.is_none());
     }
 
+    fn note_fixture(uid: &str) -> nestweaver_schema::Note {
+        nestweaver_schema::Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: format!("{uid}.md"),
+            title: uid.to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: Some("2026-01-01T00:00:00Z".to_string()),
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
     fn vault_fixture() -> nestweaver_schema::Vault {
         nestweaver_schema::Vault {
             uid: "vlt:test".to_string(),
@@ -13484,7 +13535,13 @@ mod cache_dispatch_tests {
         let vault = vault_fixture();
         let (row, failed) = vault_status_json(
             &vault,
-            Err::<Vec<nestweaver_schema::Note>, _>(nestweaver_store::StoreError::Query(
+            Err::<
+                (
+                    Vec<nestweaver_schema::Note>,
+                    nestweaver_store::ScanIntegrity,
+                ),
+                _,
+            >(nestweaver_store::StoreError::Query(
                 "execute: injected".to_string(),
             )),
             None,
@@ -13514,7 +13571,10 @@ mod cache_dispatch_tests {
         // source, so the disclosure cannot be satisfied by nulling everything.
         let (healthy, failed) = vault_status_json(
             &vault,
-            Ok::<_, nestweaver_store::StoreError>(Vec::new()),
+            Ok::<_, nestweaver_store::StoreError>((
+                Vec::new(),
+                nestweaver_store::ScanIntegrity::default(),
+            )),
             None,
         );
         assert!(!failed);
@@ -13523,6 +13583,45 @@ mod cache_dispatch_tests {
             healthy["last_indexed_source"],
             json!("none"),
             "an empty vault we DID read has genuinely no timestamp: {healthy}"
+        );
+    }
+
+    /// nw-335 made `list_notes` tolerate a row it cannot decode, so the read
+    /// nw-260 hardened can now return `Ok` with FEWER notes than the vault
+    /// holds. That routes a short count straight past the null-and-disclose
+    /// path and republishes it as a confident number — the same CWE-390 defect
+    /// nw-260 fixed, arriving through the success arm. A count over part of a
+    /// vault is not that vault's count.
+    #[test]
+    fn a_vault_whose_notes_were_only_partly_read_reports_null_and_says_so() {
+        let vault = vault_fixture();
+        let degraded = nestweaver_store::ScanIntegrity {
+            returned: 2,
+            skipped_corrupt: 1,
+            first_reason: Some("column 1: embedded NUL byte".to_string()),
+        };
+        let (row, failed) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![note_fixture("note:a"), note_fixture("note:b")],
+                degraded,
+            )),
+            None,
+        );
+
+        assert!(
+            failed,
+            "an incomplete read must be counted exactly as a failed one, or              `counts_complete` claims completeness over a short scan"
+        );
+        assert_eq!(
+            row["note_count"],
+            Value::Null,
+            "2 of 3 notes is not this vault's note count, and the tool's own              description tells the caller to re-index on a low number: {row}"
+        );
+        assert_ne!(
+            row["last_indexed_source"],
+            json!("none"),
+            "we did not see the whole vault, so we cannot claim we looked and              found no timestamp: {row}"
         );
     }
 

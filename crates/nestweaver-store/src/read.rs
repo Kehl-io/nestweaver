@@ -229,6 +229,63 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// What a whole-corpus scan actually covered.
+///
+/// nw-335 made the whole-corpus scans TOLERATE a corrupt row instead of losing
+/// the corpus to it, and disclosed the skip with a `tracing::warn!`. A log line
+/// is legible to a human tailing logs and invisible to the caller — so a caller
+/// that makes a COMPLETENESS claim ("N of M symbols unreachable") or a SAFETY
+/// claim ("these are the tests you need to run") could state it over a
+/// knowingly-incomplete corpus and still read as usable. That is nw-324
+/// verbatim: `affected-tests` selecting zero tests and reporting
+/// `selection-usable` while a green build shipped a regression.
+///
+/// So the skip is a RETURN VALUE, not just a log. Callers that claim
+/// completeness or safety take the `*_with_integrity` sibling of their scan and
+/// degrade on [`ScanIntegrity::is_degraded`]; callers that claim nothing keep
+/// the plain scan. Modelled on `blast_radius::Coverage`, which exists for the
+/// same reason on the traversal side: it lets a consumer tell "no impact" from
+/// "incomplete coverage".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScanIntegrity {
+    /// Rows decoded and returned to the caller.
+    pub returned: usize,
+    /// Rows the scan reached but could not decode, and therefore DROPPED. Any
+    /// total computed over `returned` is a floor while this is non-zero.
+    pub skipped_corrupt: usize,
+    /// The first corruption encountered, for disclosure to an operator.
+    pub first_reason: Option<String>,
+}
+
+impl ScanIntegrity {
+    /// The scan saw the whole corpus: every row it reached, it returned.
+    pub fn is_complete(&self) -> bool {
+        self.skipped_corrupt == 0
+    }
+
+    /// Rows were dropped — any count over this scan is a floor, and any
+    /// safety decision taken on it is taken on a partial graph.
+    pub fn is_degraded(&self) -> bool {
+        self.skipped_corrupt > 0
+    }
+
+    /// A one-line disclosure for a caller that has to tell a user why its
+    /// numbers are a floor. `None` when the scan was complete, so that
+    /// `if let Some(..)` is the whole disclosure path.
+    pub fn disclosure(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        Some(format!(
+            "coverage DEGRADED: {} corrupt row(s) skipped, {} kept; first: {}. \
+             Counts are a floor. Re-index to repair (`nestweaver brain add --force`).",
+            self.skipped_corrupt,
+            self.returned,
+            self.first_reason.as_deref().unwrap_or("unknown")
+        ))
+    }
+}
+
 /// Collect a whole-corpus scan, degrading on a corrupt row rather than losing
 /// the corpus to it.
 ///
@@ -250,10 +307,13 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
 /// canary fires on a NAVIGATIONAL key, where a NUL genuinely cannot be
 /// legitimate; `text_content` and `title` are CONTENT, where it merely should
 /// not be -- and is now stripped at ingest so that it is not.
+/// Returns the rows AND a [`ScanIntegrity`]. The integrity value is the point:
+/// the `tracing::warn!` below discloses the skip to an operator, and only the
+/// return value discloses it to the caller.
 pub(crate) fn collect_tolerating_corrupt<T>(
     rows: impl Iterator<Item = Result<T, StoreError>>,
     what: &str,
-) -> Result<Vec<T>, StoreError> {
+) -> Result<(Vec<T>, ScanIntegrity), StoreError> {
     let mut out = Vec::new();
     let mut skipped = 0usize;
     let mut first_reason: Option<String> = None;
@@ -269,17 +329,18 @@ pub(crate) fn collect_tolerating_corrupt<T>(
             Err(other) => return Err(other),
         }
     }
-    if skipped > 0 {
+    let integrity = ScanIntegrity {
+        returned: out.len(),
+        skipped_corrupt: skipped,
+        first_reason,
+    };
+    if let Some(disclosure) = integrity.disclosure() {
         // Disclose, do not swallow: the caller's coverage is DEGRADED and an
-        // operator reading "search found nothing" needs to know why.
-        tracing::warn!(
-            "{what}: coverage DEGRADED -- skipped {skipped} corrupt row(s), \
-             kept {}; first: {}. Re-index to repair (`nestweaver brain add --force`).",
-            out.len(),
-            first_reason.as_deref().unwrap_or("unknown")
-        );
+        // operator reading "search found nothing" needs to know why. The
+        // caller learns the same fact from `integrity`.
+        tracing::warn!("{what}: {disclosure}");
     }
-    Ok(out)
+    Ok((out, integrity))
 }
 
 fn extract_opt_string(row: &[Value], idx: usize) -> Result<Option<String>, StoreError> {
@@ -1427,7 +1488,20 @@ impl GraphStore {
     }
 
     /// List all Note nodes, optionally filtered by vault UID.
+    ///
+    /// Corrupt rows are skipped (nw-335). A caller that states a TOTAL over
+    /// notes, or claims to have covered every note, must use
+    /// [`Self::list_notes_with_integrity`] instead — this signature cannot tell
+    /// it that rows were dropped.
     pub fn list_notes(&self, vault_uid: Option<&str>) -> Result<Vec<Note>, StoreError> {
+        Ok(self.list_notes_with_integrity(vault_uid)?.0)
+    }
+
+    /// [`Self::list_notes`] plus what the scan actually covered.
+    pub fn list_notes_with_integrity(
+        &self,
+        vault_uid: Option<&str>,
+    ) -> Result<(Vec<Note>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let result = if let Some(vid) = vault_uid {
             let q = format!("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN {NOTE_COLUMNS}");
@@ -1530,7 +1604,18 @@ impl GraphStore {
     /// List all Heading nodes across all vaults/notes.
     /// Used by the brain_search substring fallback to extend title-only search
     /// to heading text.
+    ///
+    /// Corrupt rows are skipped (nw-335); see
+    /// [`Self::list_all_headings_with_integrity`] for callers that claim
+    /// completeness.
     pub fn list_all_headings(&self) -> Result<Vec<Heading>, StoreError> {
+        Ok(self.list_all_headings_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_headings`] plus what the scan actually covered.
+    pub fn list_all_headings_with_integrity(
+        &self,
+    ) -> Result<(Vec<Heading>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (h:Heading) RETURN {HEADING_COLUMNS}");
         let result = conn
@@ -1541,7 +1626,18 @@ impl GraphStore {
 
     /// List all Section nodes across all vaults/notes (includes `text_content`).
     /// Used by the brain_search substring fallback to search section bodies.
+    ///
+    /// Corrupt rows are skipped (nw-335); see
+    /// [`Self::list_all_sections_with_integrity`] for callers that claim
+    /// completeness.
     pub fn list_all_sections(&self) -> Result<Vec<Section>, StoreError> {
+        Ok(self.list_all_sections_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_sections`] plus what the scan actually covered.
+    pub fn list_all_sections_with_integrity(
+        &self,
+    ) -> Result<(Vec<Section>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (s:Section) RETURN {SECTION_COLUMNS}");
         let result = conn
@@ -1929,7 +2025,20 @@ impl GraphStore {
 
     /// All symbols with full details including the embedding field.
     /// Used by vector KNN search to load embeddings for cosine similarity.
+    ///
+    /// Corrupt rows are skipped (nw-335). `dead_code` and `affected_tests` —
+    /// the two callers that respectively state "N of M symbols unreachable" and
+    /// decide which tests may be skipped — take
+    /// [`Self::list_all_symbols_with_integrity`], because neither claim is
+    /// truthful over a corpus that silently lost rows.
     pub fn list_all_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        Ok(self.list_all_symbols_with_integrity()?.0)
+    }
+
+    /// [`Self::list_all_symbols`] plus what the scan actually covered.
+    pub fn list_all_symbols_with_integrity(
+        &self,
+    ) -> Result<(Vec<nestweaver_schema::Symbol>, ScanIntegrity), StoreError> {
         let conn = self.conn()?;
         let q = format!("MATCH (s:Symbol) RETURN {}", SYMBOL_COLUMNS);
         let result = conn
@@ -3829,6 +3938,86 @@ mod corrupt_row_tolerance_tests {
             .expect("nw-335: symbols scan degrades");
         assert!(symbols.iter().any(|s| s.uid == "sym:clean"));
         assert!(!symbols.iter().any(|s| s.uid == "sym:dirty"));
+    }
+
+    /// nw-335 tolerance made the scans survive a corrupt row; it disclosed the
+    /// skip only via `tracing::warn!`, which no caller can read. A caller that
+    /// claims completeness ("N of M symbols") or safety ("these are the tests
+    /// to run") therefore stated it over a corpus it did not know was partial
+    /// — nw-324's exact failure mode. Every tolerant scan must hand the caller
+    /// a VALUE it can branch on.
+    #[test]
+    fn every_tolerant_scan_hands_the_caller_an_observable_integrity() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store.insert_note(&note("note:clean", "Clean")).unwrap();
+        store
+            .insert_note(&note("note:dirty", "Ti\u{0}tle"))
+            .unwrap();
+        store.insert_heading(&heading("h:clean", "Clean")).unwrap();
+        store
+            .insert_heading(&heading("h:dirty", "He\u{0}ad"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:clean", "loadbearing text"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:dirty", "before\u{0}after"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:dirty", "fn b\u{0}ad()"))
+            .unwrap();
+
+        let scans: Vec<(&str, ScanIntegrity)> = vec![
+            (
+                "list_notes",
+                store.list_notes_with_integrity(None).unwrap().1,
+            ),
+            (
+                "list_all_headings",
+                store.list_all_headings_with_integrity().unwrap().1,
+            ),
+            (
+                "list_all_sections",
+                store.list_all_sections_with_integrity().unwrap().1,
+            ),
+            (
+                "list_all_symbols",
+                store.list_all_symbols_with_integrity().unwrap().1,
+            ),
+        ];
+
+        for (what, integrity) in scans {
+            assert_eq!(integrity.skipped_corrupt, 1, "{what} must COUNT the skip");
+            assert_eq!(integrity.returned, 1, "{what} must keep the clean row");
+            assert!(integrity.is_degraded(), "{what} must read as degraded");
+            assert!(!integrity.is_complete(), "{what} is not complete");
+            assert!(
+                integrity
+                    .disclosure()
+                    .is_some_and(|d| d.contains("DEGRADED")),
+                "{what} must offer the caller a disclosure string"
+            );
+        }
+    }
+
+    /// The other half of the same contract: a CLEAN scan must report itself
+    /// complete, or a caller that degrades on `is_degraded()` would degrade
+    /// always and the signal would be worthless.
+    #[test]
+    fn a_clean_scan_reports_itself_complete() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        let (symbols, integrity) = store.list_all_symbols_with_integrity().unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert!(integrity.is_complete());
+        assert_eq!(integrity.skipped_corrupt, 0);
+        assert_eq!(integrity.disclosure(), None);
     }
 
     /// nw-335: degrading is scoped to CORRUPTION. A genuine query defect -- a

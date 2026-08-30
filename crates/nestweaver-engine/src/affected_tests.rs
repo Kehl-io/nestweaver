@@ -232,11 +232,33 @@ fn affected_tests_within(
     // (nw-085). The per-symbol walk below is the identical confidence-weighted
     // max-product reverse BFS (same edge set, depth cap, confidence + threshold
     // pruning), just over the in-memory adjacency.
-    let symbols = match store.list_all_symbols() {
-        Ok(symbols) => symbols
-            .into_iter()
-            .filter(|symbol| allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid)))
-            .collect(),
+    //
+    // The scan TOLERATES a corrupt row (nw-335) rather than losing the whole
+    // corpus to it, so `Ok` no longer means "complete". Take the integrity with
+    // the rows: a test selection is a SAFETY claim ("you may skip everything
+    // else"), and a partial graph cannot justify a partial selection. nw-324
+    // was exactly this — `affected-tests` reporting `selection-usable` over a
+    // graph it could not fully read, and a regression shipping green.
+    let symbols = match store.list_all_symbols_with_integrity() {
+        Ok((symbols, integrity)) => {
+            if let Some(disclosure) = integrity.disclosure() {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!(
+                        "the symbol graph could not be read completely, so this \
+                         selection is not safe to trust: {disclosure}"
+                    ),
+                    descriptor: "store.list-symbols-incomplete".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+            }
+            symbols
+                .into_iter()
+                .filter(|symbol| {
+                    allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid))
+                })
+                .collect()
+        }
         Err(e) => {
             notifications.push(Notification {
                 level: NotificationLevel::Error,
@@ -675,9 +697,22 @@ mod tests {
                 .len(),
             1
         );
+        // nw-335 made the global scan TOLERATE the corrupt row instead of
+        // aborting the corpus, so it no longer returns `Err` — it returns a
+        // shorter list. The safety guarantee below only survives if that
+        // shortfall is a VALUE the caller can read, not a log line: assert the
+        // scan is degraded and that the corrupt row really is missing.
+        let (symbols, integrity) = store
+            .list_all_symbols_with_integrity()
+            .expect("the scan tolerates the corrupt row rather than aborting");
         assert!(
-            store.list_all_symbols().is_err(),
-            "global enumeration must encounter the unrelated corruption canary"
+            integrity.is_degraded(),
+            "global enumeration must OBSERVE the unrelated corruption canary, \
+             not merely log it: {integrity:?}"
+        );
+        assert!(
+            !symbols.iter().any(|s| s.uid == "sym:corrupt"),
+            "the corrupt row is genuinely absent from the graph this analysis walks"
         );
 
         let result =
@@ -685,10 +720,15 @@ mod tests {
 
         assert_eq!(result.status, AnalysisStatus::Degraded);
         assert_eq!(result.recommendation, "run-full-suite");
-        assert!(result.notifications.iter().any(|notification| {
-            notification.level == NotificationLevel::Error
-                && notification.descriptor == "store.list-symbols-failed"
-        }));
+        assert!(
+            result.notifications.iter().any(|notification| {
+                notification.level == NotificationLevel::Error
+                    && notification.descriptor == "store.list-symbols-incomplete"
+            }),
+            "an incomplete symbol graph must be disclosed as an error-level \
+             notification, not inferred: {:?}",
+            result.notifications
+        );
     }
 
     #[test]

@@ -2134,6 +2134,22 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         }
     };
 
+    // The counts below are a completeness claim over the whole corpus. Say so
+    // FIRST when the scan could not read all of it, so nobody acts on
+    // "N of M unreachable" believing M is the total. Printed on both branches
+    // — "No dead code detected" over a short corpus is the worse of the two.
+    let undecodable = num("undecodable_symbols");
+    let coverage_note = || {
+        if undecodable > 0 {
+            println!(
+                "Coverage DEGRADED: {undecodable} symbol(s) could not be read and are missing \
+                 from this analysis. Every count below is a FLOOR. Re-index to repair \
+                 (`nestweaver index --force`).\n"
+            );
+        }
+    };
+    coverage_note();
+
     if matching == 0 {
         println!("No dead code detected ({total} symbols, all reachable from entry points).");
         excluded_note();
@@ -13362,6 +13378,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 truncated: bool,
                 excluded_count: usize,
                 dead_percentage: f64,
+                /// "complete" | "degraded". Every count above is a claim over
+                /// the WHOLE symbol corpus, and the store's whole-corpus scan
+                /// tolerates a row it cannot decode (nw-335) instead of
+                /// failing — so a caller cannot tell an exact total from a
+                /// floor unless the scan says which it produced.
+                coverage: &'static str,
+                undecodable_symbols: usize,
                 min_confidence: String,
                 unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
             }
@@ -13382,6 +13405,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 truncated,
                 excluded_count: result.excluded_count,
                 dead_percentage: result.dead_percentage,
+                coverage: if result.coverage_is_complete() {
+                    "complete"
+                } else {
+                    "degraded"
+                },
+                undecodable_symbols: result.undecodable_symbols,
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;
@@ -20189,6 +20218,9 @@ fn regex_truncation_label(
         Some(RegexTruncationReason::ResultLimit) => "result limit reached",
         Some(RegexTruncationReason::Deadline) => "time budget reached",
         Some(RegexTruncationReason::CandidateCap) => "candidate safety cap reached",
+        Some(RegexTruncationReason::UndecodableRows) => {
+            "corpus rows could not be read and were skipped — re-index to repair"
+        }
         Some(RegexTruncationReason::Unknown) | None => "search budget reached",
     }
 }
