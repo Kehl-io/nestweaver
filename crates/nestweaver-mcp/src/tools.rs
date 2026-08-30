@@ -3059,28 +3059,41 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         1,
         RESULT_LIMIT_MAX,
     )?;
+    // nw-341: the ONLY axis that unblocks verification. The rows sort
+    // unresolved-first then by ascending confidence, so the 0.92
+    // nearest-ancestor and 0.95 same-folder tiers are the tail -- exactly what
+    // a cap removes and exactly what a reviewer of the tier ladder has to see.
+    // Reversing the sort is not an option: it would regress nw-297's
+    // `genuinely_broken_links_sort_before_lower_tier_resolutions`.
+    let offset = read_limit(&args, "offset", 0, 0, RESULT_LIMIT_MAX)?;
     let all_links = broken_links(store, max_suggestions)?;
-    let total = all_links.len();
-    // nw-297: classify over the POPULATION, before the truncation. The page is
+    // nw-297: classify over the POPULATION, before the window. The page is
     // a sample, and a caller that reads the page's own composition as the
     // vault's composition gets the wrong answer at every limit — which is
     // exactly what the CLI's summary line did.
     let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = total - unresolved;
-    let links: Vec<_> = all_links.into_iter().take(limit).collect();
-    Ok(json!({
-        "broken_links": serde_json::to_value(&links)?,
-        "total": total,
-        "returned": links.len(),
+    let low_confidence = all_links.len() - unresolved;
+    let rows: Vec<Value> = all_links
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, serde_json::Error>>()?;
+    // nw-341: through `Bounded`, not hand-rolled. This was the last bounded
+    // list in the catalogue still building its own (total, returned) pair, so
+    // it was also the only one that never emitted `truncated` -- a caller could
+    // not tell a complete page from a cut one without comparing two numbers.
+    let mut out = json!({
         "unresolved": unresolved,
         "low_confidence": low_confidence,
-    }))
+        "offset": offset,
+    });
+    Bounded::window(rows, offset, limit).merge_into(&mut out, "broken_links");
+    Ok(out)
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `total` and `returned` describe the page. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `returned` and `truncated` describe the page and `total` is the pre-offset population. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe — and the HIGHEST-confidence tiers are the tail, reachable only via `offset`\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -3093,7 +3106,10 @@ fn tool_schema_brain_broken_links() -> Value {
                     "Max suggested target UIDs per broken link (1-50, default 5).", 5, 1, 50),
                 "limit": limit_schema(
                     "Max broken links to return (1-1000, default 50). The total count is always reported.",
-                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX),
+                "offset": bounded_integer_schema(
+                    "Skip this many rows before the page (default 0). Rows sort unresolved-first then by ASCENDING confidence, so the high-confidence tiers (0.90/0.92/0.95) are the TAIL — offset is how you reach them. `total` stays the PRE-offset population.",
+                    0, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -10686,9 +10702,27 @@ impl<T> Bounded<T> {
     /// `limit == 0` means unlimited, matching the CLI's documented
     /// `--limit 0 = all` convention. A tool that does not offer that escape
     /// hatch declares `minimum: 1` and never passes 0 here.
-    fn take(mut items: Vec<T>, limit: usize) -> Self {
+    fn take(items: Vec<T>, limit: usize) -> Self {
+        Self::window(items, 0, limit)
+    }
+
+    /// Cut `items` to the window `[offset, offset + limit)`, capturing the
+    /// PRE-WINDOW total.
+    ///
+    /// nw-341: `take` can only ever return the HEAD of a list. When the
+    /// ordering deliberately puts the rows a reviewer must inspect at the TAIL
+    /// -- as `broken_wikilinks` does, sorting unresolved-first then by
+    /// ASCENDING confidence so the most severe rows come first (nw-297) -- the
+    /// head is precisely the wrong page and there is no second one. A health
+    /// tool that cannot be used to verify its own fixes.
+    ///
+    /// `total` stays PRE-offset for the same reason it stays pre-cap: it
+    /// answers "how many matched", not "how many are left". Reporting the
+    /// remainder would make a caller's page arithmetic drift with every step.
+    fn window(mut items: Vec<T>, offset: usize, limit: usize) -> Self {
         let total = items.len();
-        if limit != 0 && total > limit {
+        items.drain(..offset.min(total));
+        if limit != 0 && items.len() > limit {
             items.truncate(limit);
         }
         Self { items, total }

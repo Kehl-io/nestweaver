@@ -5334,6 +5334,15 @@ enum BrainCommands {
             help = "Max broken links to return (default: 50, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
+        /// nw-341: rows sort unresolved-first then by ASCENDING confidence, so
+        /// the 0.90/0.92/0.95 tiers are the TAIL. Without this the tiers a
+        /// reviewer must inspect are exactly the ones a limit removes.
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Skip this many rows before the page. The high-confidence tiers sort LAST, so this is how you reach them"
+        )]
+        offset: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -22619,6 +22628,7 @@ fn run_brain(
         BrainCommands::BrokenLinks {
             max_suggestions,
             limit,
+            offset,
             json,
             db,
             config,
@@ -22632,7 +22642,11 @@ fn run_brain(
                 &db_path,
                 config.as_deref(),
                 "brain_broken_links",
-                serde_json::json!({ "max_suggestions": max_suggestions, "limit": limit }),
+                serde_json::json!({
+                    "max_suggestions": max_suggestions,
+                    "limit": limit,
+                    "offset": offset,
+                }),
             )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -22693,7 +22707,8 @@ fn run_brain(
             // is grouped by category, not ranked by severity (nw-297).
             let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
             let low_confidence = total - unresolved;
-            let links: Vec<_> = all_links.into_iter().take(limit).collect();
+            // nw-341: `total` stays the PRE-offset population on both routes.
+            let links: Vec<_> = all_links.into_iter().skip(offset).take(limit).collect();
             if json {
                 println!(
                     "{}",
@@ -22701,6 +22716,8 @@ fn run_brain(
                         "broken_links": links,
                         "total": total,
                         "returned": links.len(),
+                        "truncated": links.len() < total,
+                        "offset": offset,
                         "unresolved": unresolved,
                         "low_confidence": low_confidence,
                     }))?
@@ -22708,7 +22725,14 @@ fn run_brain(
             } else if links.is_empty() {
                 println!("No broken or ambiguous wikilinks found.");
             } else {
-                println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                if offset > 0 {
+                    println!(
+                        "Broken / ambiguous wikilinks ({} of {total}, from offset {offset}):",
+                        links.len()
+                    );
+                } else {
+                    println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                }
                 print_link_classification(unresolved, low_confidence);
                 for l in &links {
                     println!(
