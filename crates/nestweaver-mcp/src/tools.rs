@@ -10434,8 +10434,8 @@ fn generate_summaries_reporting_cap(
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::summaries::load_summaries_with_cap;
     use nestweaver_engine::merge_and_save_summaries;
+    use nestweaver_engine::summaries::load_summaries_with_cap;
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;

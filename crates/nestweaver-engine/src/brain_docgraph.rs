@@ -957,10 +957,7 @@ mod tests {
     #[test]
     fn a_broken_link_row_carries_its_suggestion_population() {
         let (_dir, root) = make_vault(&[
-            (
-                "src.md",
-                "# Src\n\nSee [[Daemon Architecture]].\n",
-            ),
+            ("src.md", "# Src\n\nSee [[Daemon Architecture]].\n"),
             ("a.md", "# Daemon Architecture Alpha\n\nhi\n"),
             ("b.md", "# Daemon Architecture Beta\n\nhi\n"),
             ("c.md", "# Daemon Architecture Gamma\n\nhi\n"),
@@ -972,7 +969,11 @@ mod tests {
             .iter()
             .find(|l| l.wikilink_text.eq_ignore_ascii_case("Daemon Architecture"))
             .expect("the dangling link must be reported");
-        assert_eq!(row.suggested_target_uids.len(), 1, "the cap must bite: {row:?}");
+        assert_eq!(
+            row.suggested_target_uids.len(),
+            1,
+            "the cap must bite: {row:?}"
+        );
         assert!(
             row.suggested_total > row.suggested_target_uids.len(),
             "a row cut at 1 reports itself complete: {row:?}"

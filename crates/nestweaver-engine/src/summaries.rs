@@ -99,8 +99,18 @@ pub struct SummaryStore {
     /// absence is the absence of a statement. [`load_summaries_with_cap`] is
     /// where that distinction is enforced.
     #[serde(default)]
-    pub cap_dropped: Option<std::collections::BTreeMap<String, usize>>,
+    pub cap_dropped: Option<CapDropped>,
 }
+
+/// How many rows the generator dropped, per level, keyed by
+/// [`SummaryLevel`]'s `Display` form.
+pub type CapDropped = std::collections::BTreeMap<String, usize>;
+
+/// `(the stored summaries, what the generator dropped when they were written)`.
+///
+/// Named because the pair is the whole point of nw-361 — the rows and their
+/// provenance travel together or the reader has to guess.
+pub type SummariesWithCap = (Vec<Summary>, CapDropped);
 
 /// Build the one-level provenance map a writer that regenerated exactly one
 /// level should persist.
@@ -109,11 +119,8 @@ pub struct SummaryStore {
 /// spelling (`SummaryLevel`'s `Display`) is decided once — a second spelling
 /// is how the writer and the reader would come to disagree about which level
 /// a count belongs to.
-pub fn cap_provenance(
-    level: SummaryLevel,
-    dropped: usize,
-) -> std::collections::BTreeMap<String, usize> {
-    let mut map = std::collections::BTreeMap::new();
+pub fn cap_provenance(level: SummaryLevel, dropped: usize) -> CapDropped {
+    let mut map = CapDropped::new();
     map.insert(level.to_string(), dropped);
     map
 }
@@ -595,7 +602,7 @@ pub fn save_summaries(
     db_path: &Path,
     graph_generation: u64,
     summaries: &[Summary],
-    cap_dropped: &std::collections::BTreeMap<String, usize>,
+    cap_dropped: &CapDropped,
 ) -> Result<()> {
     let path = sidecar_path(db_path);
     let store = SummaryStore {
@@ -693,7 +700,7 @@ fn load_summary_store(db_path: &Path, expected_generation: u64) -> Result<Option
 pub fn load_summaries_with_cap(
     db_path: &Path,
     expected_generation: u64,
-) -> Result<Option<(Vec<Summary>, std::collections::BTreeMap<String, usize>)>> {
+) -> Result<Option<SummariesWithCap>> {
     let Some(store) = load_summary_store(db_path, expected_generation)? else {
         return Ok(None);
     };

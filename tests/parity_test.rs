@@ -2706,7 +2706,11 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
 
     // ── CLI direct, cut by --limit ──
     let capped = run_direct(db, &["brain", "context", "mainA", "--json", "--limit", "1"]);
-    assert!(capped.status.success(), "{}", flatten_miette(&capped.stderr));
+    assert!(
+        capped.status.success(),
+        "{}",
+        flatten_miette(&capped.stderr)
+    );
     let capped = parse_stdout("brain context (direct, limit 1)", &capped);
     assert_bounded("direct --limit 1", &capped, true);
     assert_eq!(
@@ -2819,7 +2823,9 @@ fn setup_hub_capped_fixture() -> Fixture {
                 next = i + 1
             ));
         } else {
-            body.push_str(&format!("export function fn_{i}(x) {{ return x + {i}; }}\n"));
+            body.push_str(&format!(
+                "export function fn_{i}(x) {{ return x + {i}; }}\n"
+            ));
         }
     }
     write_repo_files(&repo_dir, &[("src/chain.js", body.as_str())]);
@@ -3021,7 +3027,9 @@ fn impact_applies_the_same_result_set_cap_on_both_routes() {
     }
 
     // COUNTERWEIGHT: a limit the set fits must report no cap on either route.
-    let roomy = &["impact", "fn_39", "--json", "--limit", "1000", "--depth", "15"];
+    let roomy = &[
+        "impact", "fn_39", "--json", "--limit", "1000", "--depth", "15",
+    ];
     let roomy_direct = parse_stdout("impact (direct, roomy)", &run_direct(db, roomy));
     let roomy_daemon = parse_stdout("impact (daemon, roomy)", &run_via_daemon(db, roomy));
     for (label, payload) in [("direct", &roomy_direct), ("daemon", &roomy_daemon)] {

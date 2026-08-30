@@ -1574,9 +1574,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");
         fs::create_dir_all(&vault).unwrap();
-        let links: String = (0..NOTES)
-            .map(|i| format!("- [[Leaf {i:02}]]\n"))
-            .collect();
+        let links: String = (0..NOTES).map(|i| format!("- [[Leaf {i:02}]]\n")).collect();
         fs::write(
             vault.join("Hub.md"),
             format!("# Hub\n\nThe hub note.\n\n{links}"),
