@@ -1470,6 +1470,52 @@ use anyhow::Context;
 mod tests {
     use super::*;
 
+    /// nw-263, the CROSS-CRATE half — and the one no single reviewer could see,
+    /// because the two halves live in different crates.
+    ///
+    /// `validate_slot_contents` refuses ANY file the manifest does not describe,
+    /// unconditionally (the digest check is gated on `ArtifactBytes::Verified`;
+    /// the reverse inventory is not), with a `PermanentPublicationFailure` — so
+    /// retries are refused too. The rollback route passes `ArtifactBytes::Live`
+    /// and hits it. A slot's described set is sealed by `WalkDir` at seal time,
+    /// so anything created afterwards is undescribed BY CONSTRUCTION.
+    ///
+    /// The Tantivy recovery lock used to be written to the index directory's
+    /// parent, which for a slot-resident sidecar
+    /// (`<root>/slots/<uuid>/<name>.lbug.tantivy`) is the slot root. Tantivy
+    /// never removes a lock file, so one interrupted schema migration wedged
+    /// rollback of that slot forever.
+    ///
+    /// Asserted as a PATH composition rather than by running a migration: the
+    /// invariant is where the lock RESOLVES, and that is decidable without
+    /// touching a filesystem. Do NOT "fix" this by exempting the lock's name
+    /// from the inventory — that punches a permanent hole in a sealed-slot
+    /// invariant to paper over a layout bug.
+    #[test]
+    fn the_tantivy_recovery_lock_never_resolves_inside_a_publication_slot() {
+        let publication_root = std::path::Path::new("/var/nestweaver/publications");
+        let slot = slot_path(publication_root, "11111111-2222-3333-4444-555555555555").unwrap();
+        // Exactly the layout `tantivy_sidecar_path_for` produces: an OsString
+        // push onto the database path, so the sidecar is a SIBLING of the
+        // database file and its parent is the slot root.
+        let sidecar = slot.join("brain.lbug.tantivy");
+
+        let lock = nestweaver_store::reindex_lock_path(&sidecar);
+
+        assert!(
+            !lock.starts_with(&slot),
+            "the recovery lock resolves inside a sealed publication slot, where \
+             `validate_slot_contents` refuses it permanently: {}",
+            lock.display()
+        );
+        assert!(
+            !lock.starts_with(publication_root),
+            "the lock must not be anywhere under the publication root either — \
+             a future sweep or manifest could describe that tree too: {}",
+            lock.display()
+        );
+    }
+
     fn descriptor_fixture() -> (ArtifactExpectation, ArtifactDescriptor) {
         let identity = nestweaver_store::PublicationIdentity::new_brain();
         let descriptor = ArtifactDescriptor {

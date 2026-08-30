@@ -1466,22 +1466,83 @@ fn reindex_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
+/// Where recovery locks live: ONE per-user root, never inside an index and
+/// never inside a publication slot.
+///
+/// nw-263. The lock used to live in the index directory's PARENT. That
+/// reasoning was locally correct — the migration renames `path` ->
+/// `path.reindexing`, so a lock inside `path` travels with the rename and stops
+/// excluding anything, which is also why Tantivy's own `INDEX_WRITER_LOCK`
+/// cannot be reused here — but the parent is the wrong parent in one
+/// configuration, and it is a configuration this product ships:
+///
+///   * the Tantivy sidecar is a SIBLING of the database file
+///     (`<db>.lbug` -> `<db>.lbug.tantivy`), and
+///   * with a publication `CURRENT` pointer the database is
+///     `<root>/slots/<uuid>/<name>.lbug`, so
+///   * the sidecar's parent is `<root>/slots/<uuid>` — the SLOT ROOT, and
+///   * `validate_slot_contents` refuses ANY file the slot manifest does not
+///     describe, with a `PermanentPublicationFailure` (retries refused too).
+///
+/// Tantivy never removes a lock file (`ReleaseLockFile::drop` only logs), so one
+/// interrupted schema migration left an undescribed file in a sealed slot and
+/// wedged rollback of that slot forever.
+///
+/// The lock's real requirement is only "a stable path both processes compute
+/// identically, that the rename does not move". The parent directory satisfied
+/// that accidentally, not necessarily. A per-user state root satisfies it
+/// deliberately.
+///
+/// `$XDG_STATE_HOME` is honoured on EVERY platform, mirroring
+/// `nestweaver-daemon::lifecycle`, so a test harness that redirects the state
+/// root gets this too. NOT `std::env::temp_dir()`: `$TMPDIR` differs between a
+/// launchd-spawned daemon and an interactive shell, so two processes would
+/// compute different roots and the lock would exclude nothing — the exact
+/// failure nw-254 exists to prevent.
+fn reindex_lock_root() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(xdg).join("nestweaver").join("index-locks");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("nestweaver")
+            .join("index-locks");
+    }
+    // No HOME at all (a minimal container). A shared temp root is worse than a
+    // state root but better than a slot.
+    std::env::temp_dir().join("nestweaver-index-locks")
+}
+
 /// Name of the exclusive lock that serialises destructive index recovery
 /// against an in-flight schema migration.
 ///
-/// It deliberately lives in the index directory's **parent**. The migration
-/// renames the index directory itself (`path` -> `path.reindexing`), so a lock
-/// file stored inside `path` would travel with that rename and a second
-/// process would end up locking a different inode — which is precisely why
-/// Tantivy's `INDEX_WRITER_LOCK` cannot be reused here.
+/// Keyed by a digest of the index's ABSOLUTE path, so two indexes with the same
+/// directory name cannot collide inside the one shared lock root. The readable
+/// suffix is for the operator who finds the file; the digest is what makes it
+/// unique.
 fn reindex_lock_file_name(path: &Path) -> std::ffi::OsString {
-    let mut name = std::ffi::OsString::from(".");
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let digest = blake3::hash(absolute.as_os_str().as_encoded_bytes()).to_hex();
+    let mut name = std::ffi::OsString::from(&digest.as_str()[..32]);
+    name.push("-");
     name.push(
         path.file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("tantivy")),
     );
     name.push(".reindex.lock");
     name
+}
+
+/// The full path of the recovery lock for `index_path`.
+///
+/// Public so the PUBLICATION layer can assert the cross-crate property that
+/// nw-263 is about: this path must never be inside a slot. That composition
+/// spans two crates and no single reviewer saw both halves, which is how the
+/// defect was introduced.
+pub fn reindex_lock_path(index_path: &Path) -> PathBuf {
+    reindex_lock_root().join(reindex_lock_file_name(index_path))
 }
 
 /// Try to take the recovery lock for `path`.
@@ -1492,15 +1553,23 @@ fn reindex_lock_file_name(path: &Path) -> std::ffi::OsString {
 /// index-open path, and a daemon that died holding a blocking lock would
 /// otherwise wedge every subsequent opener.
 fn try_acquire_reindex_lock(path: &Path) -> Result<Option<DirectoryLock>, TantivyError> {
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    std::fs::create_dir_all(parent)?;
-    let directory = MmapDirectory::open(parent).map_err(|error| {
+    try_acquire_reindex_lock_in(&reindex_lock_root(), path)
+}
+
+/// The `_in` seam the repo already uses for sweeps and fallback roots
+/// (`gc_orphaned_daemon_dirs_in`, `NESTWEAVER_SOCK_FALLBACK_DIR`), so a test can
+/// assert PLACEMENT on a scratch root instead of the operator's state
+/// directory.
+fn try_acquire_reindex_lock_in(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<DirectoryLock>, TantivyError> {
+    std::fs::create_dir_all(root)?;
+    let directory = MmapDirectory::open(root).map_err(|error| {
         TantivyError::Io(format!(
-            "open index parent {} for recovery lock: {error}",
-            parent.display()
+            "open recovery lock root {} for {}: {error}",
+            root.display(),
+            path.display()
         ))
     })?;
     let lock = Lock {
@@ -2514,6 +2583,164 @@ mod tests {
         );
         assert_eq!(legacy.search("payment", 10).unwrap().len(), 1);
         drop(held);
+    }
+
+    /// nw-263 + nw-255, one assertion. The lock must NOT be a sibling of the
+    /// index directory — that is the SLOT ROOT when the sidecar is
+    /// slot-resident, and `validate_slot_contents` refuses any undescribed file
+    /// there with a `PermanentPublicationFailure`, so one interrupted migration
+    /// wedged rollback of that slot forever. And it must not be in the CWD
+    /// either, which is what the `with false` mutation on the old
+    /// `!parent.as_os_str().is_empty()` guard produced.
+    ///
+    /// nw-255 is the reason this test exists at all: the two pre-existing lock
+    /// tests hold their lock IN-PROCESS under one working directory, so under
+    /// `with false` both the holder and the acquirer resolved `parent` to `.`,
+    /// locked the same file, and still saw "already in progress". They proved
+    /// the lock EXCLUDES; they proved nothing about where it IS. A daemon and a
+    /// CLI have different working directories, so that mutation is a silent,
+    /// total loss of mutual exclusion in a lock guarding a directory rename.
+    ///
+    /// This test CAN fail when the property is broken: point
+    /// `try_acquire_reindex_lock_in` at `index_path.parent()` and the first
+    /// assertion fires; point it at `Path::new(".")` and the second does.
+    #[test]
+    fn the_recovery_lock_is_placed_outside_the_index_and_outside_the_cwd() {
+        let root = tempdir().unwrap();
+        let lock_root = tempdir().unwrap();
+        let index_path = root.path().join("graph.lbug.tantivy");
+        std::fs::create_dir_all(&index_path).unwrap();
+
+        let held = try_acquire_reindex_lock_in(lock_root.path(), &index_path)
+            .unwrap()
+            .expect("lock free");
+
+        let siblings: Vec<String> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("reindex.lock"))
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "the lock landed beside the index; for a slot-resident sidecar that \
+             directory is a SEALED publication slot: {siblings:?}"
+        );
+
+        let inside: Vec<String> = std::fs::read_dir(&index_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("reindex.lock"))
+            .collect();
+        assert!(
+            inside.is_empty(),
+            "a lock inside the index travels with the migration's rename and \
+             stops excluding anything: {inside:?}"
+        );
+
+        assert!(
+            !std::path::Path::new(".")
+                .join(reindex_lock_file_name(&index_path))
+                .exists(),
+            "the lock landed in the CWD — a daemon and a CLI with different \
+             working directories would lock different files and exclude nothing"
+        );
+
+        assert!(
+            lock_root
+                .path()
+                .join(reindex_lock_file_name(&index_path))
+                .exists(),
+            "the lock must exist SOMEWHERE; a test that only asserts absences \
+             passes when the lock is never taken"
+        );
+        drop(held);
+    }
+
+    /// The property the relocation has to preserve: it must still EXCLUDE, and
+    /// it must still be per-index. Two different indexes with the SAME
+    /// directory name now share one lock root, so a name collision there would
+    /// serialise unrelated migrations — or, worse, a digest that ignored the
+    /// path would make them the same lock.
+    #[test]
+    fn the_recovery_lock_still_excludes_and_two_indexes_do_not_collide() {
+        let lock_root = tempdir().unwrap();
+        let one = tempdir().unwrap();
+        let two = tempdir().unwrap();
+        let index_one = one.path().join("graph.lbug.tantivy");
+        let index_two = two.path().join("graph.lbug.tantivy");
+        std::fs::create_dir_all(&index_one).unwrap();
+        std::fs::create_dir_all(&index_two).unwrap();
+
+        assert_ne!(
+            reindex_lock_file_name(&index_one),
+            reindex_lock_file_name(&index_two),
+            "same directory name, different index: the lock must be keyed by \
+             the ABSOLUTE path or one migration blocks an unrelated one"
+        );
+
+        let held = try_acquire_reindex_lock_in(lock_root.path(), &index_one)
+            .unwrap()
+            .expect("lock free");
+        assert!(
+            try_acquire_reindex_lock_in(lock_root.path(), &index_one)
+                .unwrap()
+                .is_none(),
+            "the relocated lock must still exclude a second holder"
+        );
+        assert!(
+            try_acquire_reindex_lock_in(lock_root.path(), &index_two)
+                .unwrap()
+                .is_some(),
+            "an unrelated index must not be blocked by this lock"
+        );
+        drop(held);
+    }
+
+    /// nw-255's other surviving mutant. The old guard existed to handle
+    /// `Path::new("idx").parent() == Some("")`, which `MmapDirectory::open`
+    /// cannot use — and its fallback was `.`, the CWD. There is no guard to
+    /// mutate any more, and the CWD is no longer reachable: a bare relative
+    /// name resolves against the process CWD to a stable ABSOLUTE key, and the
+    /// lock file still lands in the lock root.
+    #[test]
+    fn a_bare_relative_index_name_still_takes_a_usable_lock_outside_the_cwd() {
+        assert_eq!(
+            std::path::Path::new("idx").parent().unwrap().as_os_str(),
+            ""
+        );
+        let lock_root = tempdir().unwrap();
+        let held = try_acquire_reindex_lock_in(lock_root.path(), std::path::Path::new("idx"))
+            .unwrap()
+            .expect("a bare relative name must still take a usable lock");
+        assert!(
+            !std::path::Path::new(".")
+                .join(reindex_lock_file_name(std::path::Path::new("idx")))
+                .exists(),
+            "a bare relative name must not put the lock in the CWD"
+        );
+        drop(held);
+    }
+
+    /// The default root, asserted as a PATH so no test writes to the operator's
+    /// state directory. It must never be the index's parent, which is the slot
+    /// root for a slot-resident sidecar.
+    #[test]
+    fn the_default_lock_root_is_never_the_directory_holding_the_index() {
+        let slot = std::path::Path::new("/publications/slots/abc-123");
+        let index_path = slot.join("brain.lbug.tantivy");
+        let lock = super::reindex_lock_path(&index_path);
+        assert!(
+            !lock.starts_with(slot),
+            "the recovery lock resolves inside the publication slot: {}",
+            lock.display()
+        );
+        assert!(
+            !lock.starts_with(&index_path),
+            "the recovery lock resolves inside the index it guards: {}",
+            lock.display()
+        );
     }
 
     /// Build an index at `index_path` whose schema predates the stored
