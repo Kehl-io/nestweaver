@@ -844,6 +844,13 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_DB",
         role: EnvRole::Configures,
     },
+    // nw-261. Pins miette's wrap column so a test harness can make wrap
+    // position a controlled input instead of an ambient one. Unset is today's
+    // behaviour (terminal detection), so it is a tuning knob, not a gate.
+    EnvVar {
+        name: "NESTWEAVER_DIAGNOSTIC_WIDTH",
+        role: EnvRole::Configures,
+    },
     EnvVar {
         name: "NESTWEAVER_DRAIN_TIMEOUT_SECS",
         role: EnvRole::Configures,
@@ -9647,11 +9654,41 @@ fn daemon_status_error(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 
+/// The render width miette wraps diagnostics at, when it is pinned.
+///
+/// nw-261. miette hard-wraps its message body and prefixes continuations with
+/// `│`, so a phrase the code emits contiguously — "the daemon has not been shut
+/// down" — can reach a test as "shut\n  │ down". A `stderr.contains(...)`
+/// assertion then fails for a RENDERING reason while the message is exactly
+/// right, which reads as a product bug and is not one. It fired once on CI
+/// (`flatten_diagnostic_recovers_a_phrase_miette_wrapped`) and the audit found
+/// five more assertions with the same exposure.
+///
+/// Flattening the assertion is the local fix and it only protects the
+/// assertions someone remembered to flatten. Pinning the width removes wrap
+/// position as an AMBIENT input to the whole suite — including for assertions
+/// nobody has audited — and, just as importantly, makes the property testable:
+/// a test can now force a narrow render and prove that flattening recovers the
+/// phrase, which was previously impossible to reproduce on demand.
+///
+/// Unset means today's behaviour exactly (miette detects the terminal width),
+/// so this changes nothing for a user.
+fn diagnostic_width() -> Option<usize> {
+    std::env::var("NESTWEAVER_DIAGNOSTIC_WIDTH")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|width| *width > 0)
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
     miette::set_hook(Box::new(|_| {
-        Box::new(miette::MietteHandlerOpts::new().build())
+        let mut opts = miette::MietteHandlerOpts::new();
+        if let Some(width) = diagnostic_width() {
+            opts = opts.width(width);
+        }
+        Box::new(opts.build())
     }))
     .ok();
 

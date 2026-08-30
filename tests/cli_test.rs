@@ -6572,3 +6572,70 @@ fn service_summary_text_warns_about_ambiguity_and_lists_entry_points() {
          a different command:\n{stdout}"
     );
 }
+
+/// nw-261. Wrap position must not be an ambient input to the suite.
+///
+/// The failure this closes is real and has fired: a phrase the code emits
+/// contiguously arrives at a `stderr.contains(...)` assertion split across
+/// miette's box-drawing gutter, so the assertion fails for a RENDERING reason
+/// while the message is exactly right. The audit found nine more assertions
+/// with the same exposure in `tests/daemon_test.rs`, all inside one
+/// Linux-gated test nobody can reproduce locally.
+///
+/// Flattening each assertion is the local fix and it only protects the
+/// assertions someone remembered to flatten. `NESTWEAVER_DIAGNOSTIC_WIDTH`
+/// pins the wrap column instead, which does two things flattening cannot:
+/// it covers assertions nobody has audited, and it makes the property
+/// TESTABLE — a wrap that previously depended on the tempdir path and the
+/// terminal can now be forced.
+///
+/// The first assertion is the vacuity guard, and it is the same one
+/// `flatten_diagnostic_recovers_a_phrase_miette_wrapped` uses: if the fixture
+/// does not actually reproduce the wrap, the test below it proves nothing.
+#[test]
+fn a_diagnostic_phrase_survives_a_narrow_render() {
+    // Chosen because width 40 wraps between `--repo` and `<path>`, which is
+    // what makes the vacuity guard below meaningful.
+    const PHRASE: &str = "index --repo <path>";
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.lbug");
+
+    let narrow = nestweaver_cmd()
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "40")
+        .args(["hubs", "--db"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let raw = String::from_utf8_lossy(&narrow.stderr).to_string();
+
+    assert!(
+        raw.contains("nestweaver index"),
+        "the fixture must reach the diagnostic at all: {raw}"
+    );
+    assert!(
+        !raw.contains(PHRASE),
+        "the fixture must reproduce the WRAP at width 40, or this test proves \
+         nothing — `NESTWEAVER_DIAGNOSTIC_WIDTH` is not being honoured and the \
+         render used the ambient width: {raw}"
+    );
+    assert!(
+        flatten_miette(&narrow.stderr).contains(PHRASE),
+        "flattening must recover a phrase miette wrapped, which is the whole \
+         reason a width-dependent assertion is a false failure: {raw}"
+    );
+
+    // Counterweight: unset must be TODAY's behaviour exactly. A knob that
+    // changed the default would be a user-visible rendering change shipped to
+    // make a test convenient.
+    let ambient = nestweaver_cmd()
+        .env_remove("NESTWEAVER_DIAGNOSTIC_WIDTH")
+        .args(["hubs", "--db"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(
+        flatten_miette(&ambient.stderr).contains(PHRASE),
+        "{}",
+        String::from_utf8_lossy(&ambient.stderr)
+    );
+}
