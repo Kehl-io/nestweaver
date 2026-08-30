@@ -21,7 +21,9 @@ pub use db::{
     EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
     EmbeddingSnapshotState, GraphStore, IndexPublicationLease, PublicationIdentity,
 };
-pub use error::{CancelReason, StoreError};
+pub use error::{
+    CancelReason, CorruptionKind, EngineCorruption, StoreError, classify_engine_corruption,
+};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
 /// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants

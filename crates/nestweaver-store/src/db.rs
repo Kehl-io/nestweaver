@@ -709,7 +709,8 @@ fn open_lbug_with_recovery(
                      .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
                     path.display()
                 );
-                return Ok(lbug::Database::new(path, make_config())?);
+                return lbug::Database::new(path, make_config())
+                    .map_err(|e| StoreError::from(e).with_db_path(path));
             }
             if read_write
                 && is_orphaned_wal_error(&msg)
@@ -723,9 +724,13 @@ fn open_lbug_with_recovery(
                     path.display(),
                     quarantined.display()
                 );
-                return Ok(lbug::Database::new(path, make_config())?);
+                return lbug::Database::new(path, make_config())
+                    .map_err(|e| StoreError::from(e).with_db_path(path));
             }
-            Err(e.into())
+            // nw-346. This is the frame that knows WHICH database failed; the
+            // engine's message names no path, so attaching it here is what
+            // retires the caller's need to guess one.
+            Err(StoreError::from(e).with_db_path(path))
         }
     }
 }
