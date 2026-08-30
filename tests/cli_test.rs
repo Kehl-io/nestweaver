@@ -6843,3 +6843,141 @@ fn a_context_budget_cut_names_the_budget_and_a_limit_cut_names_the_limit() {
          satisfy the assertions above: {stderr}"
     );
 }
+
+/// nw-366. `frontmatter_raw` is an additive column populated by
+/// `ALTER TABLE ... DEFAULT ''`, which fills the COLUMN and not the DATA. Every
+/// note indexed by 8.0.0 therefore reads back empty, both regex collectors
+/// `continue` past it, and an upgrader who does not re-index keeps nw-298's
+/// symptom on a binary that contains the fix — silently.
+///
+/// Two halves, and the second is the one this project keeps getting wrong:
+///
+///  1. `brain status` must DISCLOSE the deficit, and
+///  2. the remedy it prints must be EXECUTED here, not asserted as a string.
+///
+/// The ticket proposed `brain add --force`. There is no `--force` on `Add` or
+/// on `Refresh` — shipping that string would have reintroduced the exact class
+/// of defect (nw-328, nw-318, nw-259a) this fix is disclosing. `brain refresh
+/// <root>` is run below and its effect is measured.
+#[test]
+fn a_pre_column_note_is_disclosed_and_the_printed_remedy_actually_fixes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("note.md"),
+        "---\nstatus: loadbearingtoken\n---\n\n# A note\n\nBody text.\n",
+    )
+    .unwrap();
+    let db = dir.path().join("scratch.lbug");
+
+    // A real index, so the row shape is the product's own and not a fixture's.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Now reproduce the pre-column state exactly: the Note row keeps its parsed
+    // `frontmatter` (8.0.0 wrote that) and loses `frontmatter_raw` (the column
+    // did not exist). `content_hash` is PRESERVED — so this also tests the
+    // claim the remedy rests on, that the vault path has no unchanged-file
+    // short-circuit. If `brain refresh` skipped the file, the assertions below
+    // would fail and the remedy would be wrong.
+    {
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1, "precondition: one indexed note");
+        for note in notes {
+            assert!(
+                note.frontmatter_raw.is_some(),
+                "precondition: this binary DOES write frontmatter_raw"
+            );
+            store.delete_note_cascade(&note.uid).unwrap();
+            let mut legacy = note.clone();
+            legacy.frontmatter_raw = None;
+            store.insert_note(&legacy).unwrap();
+        }
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            1,
+            "precondition: the deficit is present"
+        );
+    }
+
+    // Half 1 — the deficit is DISCLOSED, and the disclosure names the vault the
+    // remedy has to be pointed at.
+    let status = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        rendered.contains("brain refresh"),
+        "a deficit nobody can see is the defect itself: {rendered}"
+    );
+    assert!(
+        rendered.contains(vault.to_str().unwrap()),
+        "and the remedy must name WHICH vault to refresh: {rendered}"
+    );
+    assert!(
+        !rendered.contains("--force"),
+        "there is no --force on `brain add` or `brain refresh`; printing one \
+         would be the very defect being disclosed: {rendered}"
+    );
+
+    // Half 2 — RUN the remedy that was printed, then measure.
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    {
+        let store = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            0,
+            "the printed remedy must actually clear the deficit"
+        );
+        let hits = store
+            .regex_search("loadbearingtoken", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert!(
+            hits.results.iter().any(|r| r.kind == "Frontmatter"),
+            "and the SYMPTOM must be gone: frontmatter text that is in the file \
+             must be findable again, which is what the count stands in for: {:?}",
+            hits.results
+        );
+    }
+
+    // The counterweight: the disclosure must not fire on a healthy vault, or it
+    // becomes noise that trains the operator to ignore it.
+    let clean = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let clean_rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&clean.stdout),
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(
+        !clean_rendered.contains("brain refresh"),
+        "a healthy vault must produce no backfill warning: {clean_rendered}"
+    );
+}

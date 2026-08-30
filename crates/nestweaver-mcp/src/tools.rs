@@ -6357,6 +6357,28 @@ fn vault_status_json<E: std::fmt::Display>(
             (None, "none")
         }
     };
+    // nw-366. `frontmatter_raw` was added by `ALTER TABLE ... DEFAULT ''`,
+    // which populates the COLUMN and not the DATA: every note indexed by 8.0.0
+    // reads back empty and both regex collectors `continue` past it, so the
+    // upgrader keeps nw-298's symptom on a binary that contains the fix.
+    //
+    // Counted from the notes already read — no second query — and `null` on the
+    // same failure path as `note_count`, for the same reason: a deficit derived
+    // from a scan that came back short is not a deficit, and a confident `0`
+    // here would say "you have nothing to repair" about a vault nobody read.
+    // The remedy is per-VAULT, which is why this is a per-vault row.
+    let frontmatter_deficit = if read_failed {
+        Value::Null
+    } else {
+        json!(
+            notes
+                .iter()
+                .filter(|note| {
+                    nestweaver_store::GraphStore::note_predates_frontmatter_indexing(note)
+                })
+                .count()
+        )
+    };
     let row = json!({
         // `uid` + `instance_id` let callers disambiguate rows that share a
         // name/root_path (collision state) and target precise operations like
@@ -6366,6 +6388,7 @@ fn vault_status_json<E: std::fmt::Display>(
         "name": vault.name,
         "root_path": vault.root_path,
         "note_count": note_count,
+        "notes_predating_frontmatter_indexing": frontmatter_deficit,
         "last_indexed": last_indexed,
         "last_indexed_source": last_indexed_source,
     });
@@ -13674,6 +13697,79 @@ mod cache_dispatch_tests {
             row["last_indexed_source"],
             json!("none"),
             "we did not see the whole vault, so we cannot claim we looked and              found no timestamp: {row}"
+        );
+    }
+
+    /// nw-366. The per-vault row must carry the frontmatter-backfill deficit,
+    /// because the remedy (`brain refresh <root>`) is per-VAULT and the row is
+    /// the only place a caller learns which root to point it at.
+    ///
+    /// Three cases, and the last two are the ones that keep the field
+    /// meaningful: a `null` on an unreadable vault (a confident `0` there would
+    /// say "nothing to repair" about notes nobody read), and a `0` on a healthy
+    /// vault (a field that fires always is noise).
+    #[test]
+    fn the_per_vault_row_discloses_notes_predating_frontmatter_indexing() {
+        let vault = vault_fixture();
+
+        let mut legacy = note_fixture("note:legacy");
+        legacy.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        legacy.frontmatter_raw = None;
+        let mut current = note_fixture("note:current");
+        current.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        current.frontmatter_raw = Some("status: open\n".to_string());
+        // A plain note: no frontmatter at all, and therefore no deficit.
+        let plain = note_fixture("note:plain");
+
+        let (row, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![legacy, current.clone(), plain.clone()],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            row["notes_predating_frontmatter_indexing"],
+            json!(1),
+            "exactly the pre-column note is a deficit: {row}"
+        );
+
+        let (healthy, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![current, plain],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            healthy["notes_predating_frontmatter_indexing"],
+            json!(0),
+            "a healthy vault must report ZERO, not be silent — a field that \
+             only ever appears when set cannot be distinguished from a field \
+             that was dropped: {healthy}"
+        );
+
+        let (unread, _) = vault_status_json(
+            &vault,
+            Err::<
+                (
+                    Vec<nestweaver_schema::Note>,
+                    nestweaver_store::ScanIntegrity,
+                ),
+                _,
+            >(nestweaver_store::StoreError::Query(
+                "execute: injected".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(
+            unread["notes_predating_frontmatter_indexing"],
+            Value::Null,
+            "a deficit derived from a read that failed is not a deficit, and a \
+             confident 0 would tell the operator there is nothing to repair \
+             about notes nobody read: {unread}"
         );
     }
 

@@ -10541,6 +10541,35 @@ fn require_exclusive_store_access(
     }
 }
 
+/// nw-366. ONE sentence for the frontmatter-backfill deficit, rendered by both
+/// `brain status` routes.
+///
+/// `frontmatter_raw` was added by `ALTER TABLE ... ADD ... DEFAULT ''`, which
+/// populates the COLUMN and not the DATA. Every note indexed by 8.0.0 reads
+/// back empty, both regex collectors `continue` past it, and the upgrader keeps
+/// nw-298's symptom on a binary that contains the fix. Nothing said so.
+///
+/// THE REMEDY WAS EXECUTED BEFORE IT SHIPPED. The item proposed
+/// `brain add --force`; there is no `--force` on `Add` or on `Refresh`, so
+/// printing it would have been this project's signature defect appearing inside
+/// the fix for it. `brain refresh <root>` drops and re-indexes every note in
+/// the vault — there is no unchanged-file short-circuit on the vault path — and
+/// `a_pre_column_note_is_disclosed_and_the_printed_remedy_actually_fixes_it`
+/// runs it and measures the count falling to zero.
+///
+/// Shared rather than restated: the daemon-served route renders a JSON row and
+/// the direct route renders a `Vault`, and two spellings of one remedy is
+/// exactly how a remedy drifts out of date on one route only.
+fn frontmatter_backfill_warning(root_path: &str, count: u64) -> String {
+    let notes = if count == 1 { "note" } else { "notes" };
+    format!(
+        "      ! {count} {notes} predate frontmatter indexing: their frontmatter \
+         text is NOT searchable (`regex-search` cannot match it, and \
+         `brain search` will not surface it). Re-index this vault to repair it: \
+         `nestweaver brain refresh {root_path}`"
+    )
+}
+
 /// Render a count that may be UNKNOWN.
 ///
 /// nw-269: `unwrap_or(0)` on a count the producer deliberately nulled turns "I
@@ -20756,6 +20785,23 @@ fn run_brain(
                                     "    - {name} ({note_count} notes, last indexed: {last_indexed})"
                                 );
                             }
+                            // nw-366. Only on a POSITIVE count. `null` means
+                            // the note scan came back short, and a deficit
+                            // derived from a partial read is not a deficit —
+                            // that is `note_count`'s own rule one line above.
+                            if let Some(deficit) = v
+                                .get("notes_predating_frontmatter_indexing")
+                                .and_then(|value| value.as_u64())
+                                .filter(|count| *count > 0)
+                            {
+                                println!(
+                                    "{}",
+                                    frontmatter_backfill_warning(
+                                        v["root_path"].as_str().unwrap_or("<this vault>"),
+                                        deficit,
+                                    )
+                                );
+                            }
                         }
                     }
                     // nw-249(a): `unwrap_or(0)` collapsed a DELIBERATE null.
@@ -20978,16 +21024,31 @@ fn run_brain(
                     // it becomes an empty Vec and then a confident `0`. The
                     // MCP route logs the failure and emits null; this route
                     // silently agreed that the vault was empty.
-                    let vault_note_count = match store.list_notes(Some(&v.uid)) {
-                        Ok(notes) => notes.len().to_string(),
-                        Err(error) => {
-                            tracing::warn!(
-                                vault = %v.uid,
-                                "per-vault note count unavailable: {error}"
-                            );
-                            render_optional_count(Some(&serde_json::Value::Null))
-                        }
-                    };
+                    // nw-366. The backfill deficit is counted from the notes
+                    // this read already returned rather than by a second query,
+                    // and it is `None` on the failure path for the same reason
+                    // the count is `unavailable` there: a deficit derived from
+                    // a read that failed is not a deficit.
+                    let (vault_note_count, frontmatter_deficit) =
+                        match store.list_notes(Some(&v.uid)) {
+                            Ok(notes) => {
+                                let deficit = notes
+                                    .iter()
+                                    .filter(|note| {
+                                        nestweaver_store::GraphStore::
+                                            note_predates_frontmatter_indexing(note)
+                                    })
+                                    .count() as u64;
+                                (notes.len().to_string(), Some(deficit))
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    vault = %v.uid,
+                                    "per-vault note count unavailable: {error}"
+                                );
+                                (render_optional_count(Some(&serde_json::Value::Null)), None)
+                            }
+                        };
                     let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
                     let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
@@ -21007,6 +21068,9 @@ fn run_brain(
                             "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
                             v.name
                         );
+                    }
+                    if let Some(deficit) = frontmatter_deficit.filter(|count| *count > 0) {
+                        println!("{}", frontmatter_backfill_warning(&v.root_path, deficit));
                     }
                 }
                 println!("  Notes:     {note_count}");

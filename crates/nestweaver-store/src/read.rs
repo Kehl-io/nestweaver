@@ -1518,6 +1518,64 @@ impl GraphStore {
         collect_tolerating_corrupt(result.map(|row| row_to_note(&row)), "list_notes")
     }
 
+    /// nw-366. Does this note predate frontmatter indexing?
+    ///
+    /// `frontmatter_raw` was added by `ALTER TABLE ... ADD ... DEFAULT ''`
+    /// (`db.rs`, the `ColumnMigration` for `Note.frontmatter_raw`), which
+    /// populates the COLUMN and not the DATA. Every note indexed by 8.0.0
+    /// therefore reads back empty, and BOTH regex collectors `continue` past
+    /// it (`regex.rs`, the corpus-wide and dirty-scope Frontmatter arms) — so
+    /// an upgrader who does not re-index keeps nw-298's symptom on a binary
+    /// that contains the fix, with nothing anywhere saying so.
+    ///
+    /// The pair below is a PROOF, not a heuristic. This binary writes
+    /// `frontmatter` only from a parsed map, and the map is parsed FROM
+    /// `frontmatter_raw`, so non-empty JSON with empty raw cannot be produced
+    /// by any current write path. The three non-instances all fall out of the
+    /// same predicate and are pinned by test:
+    ///
+    /// * a note with genuinely no frontmatter has BOTH empty and is not a
+    ///   deficit — otherwise this fires on every plain note and means nothing;
+    /// * a note written by this binary has both and is not counted;
+    /// * unparseable YAML sets `raw` and leaves `frontmatter` `None`, which is
+    ///   the REVERSE pair and also not counted.
+    ///
+    /// Shared rather than restated: `brain status` renders this on two routes
+    /// (daemon-served JSON and the direct read) and the MCP payload emits it.
+    /// Three restatements of one predicate is how the twin class recurs.
+    pub fn note_predates_frontmatter_indexing(note: &Note) -> bool {
+        note.frontmatter.as_deref().is_some_and(|fm| !fm.is_empty())
+            && note
+                .frontmatter_raw
+                .as_deref()
+                .is_none_or(|raw| raw.is_empty())
+    }
+
+    /// How many notes in this vault (or the whole graph) predate frontmatter
+    /// indexing — see [`Self::note_predates_frontmatter_indexing`].
+    ///
+    /// Deliberately built on [`Self::list_notes_with_integrity`] rather than a
+    /// second Cypher predicate: a count derived from a scan that came back
+    /// SHORT is not a count, and the `Err` is the honest answer. A caller that
+    /// swallowed it would report `0` — "you have no deficit" — over a corpus it
+    /// could not read, which is the CWE-390 shape this file exists to refuse.
+    pub fn count_notes_predating_frontmatter_indexing(
+        &self,
+        vault_uid: Option<&str>,
+    ) -> Result<usize, StoreError> {
+        let (notes, integrity) = self.list_notes_with_integrity(vault_uid)?;
+        if let Some(disclosure) = integrity.disclosure() {
+            return Err(StoreError::Query(format!(
+                "frontmatter-backfill deficit is not countable over an incomplete \
+                 note scan: {disclosure}"
+            )));
+        }
+        Ok(notes
+            .iter()
+            .filter(|note| Self::note_predates_frontmatter_indexing(note))
+            .count())
+    }
+
     /// Count of all Note nodes (cheap for status output — no body load).
     pub fn count_notes(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
@@ -4030,5 +4088,114 @@ mod corrupt_row_tolerance_tests {
             collect_tolerating_corrupt(std::iter::once(extract_string(&row, 0)), "test"),
             Err(StoreError::Query(_))
         ));
+    }
+}
+
+/// nw-366. `frontmatter_raw` is an additive column with no backfill, so every
+/// note indexed by 8.0.0 reads back empty and BOTH regex collectors `continue`
+/// past it. An upgrader who does not re-index keeps nw-298's exact symptom on a
+/// binary that contains the fix — and nothing anywhere says so. These pin the
+/// DISCLOSURE, which is the half that must exist whether or not a backfill
+/// ever does.
+#[cfg(test)]
+mod frontmatter_backfill_tests {
+    use super::*;
+
+    fn note(uid: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: "vault:v".to_string(),
+            file_path: format!("{uid}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn a_note_predating_frontmatter_indexing_is_counted_and_disclosed() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // The pre-column row: parsed frontmatter present (8.0.0 wrote it), raw
+        // empty (the column did not exist).
+        let mut legacy = note("note:legacy", "Legacy");
+        legacy.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        legacy.frontmatter_raw = None;
+        store.insert_note(&legacy).unwrap();
+
+        // Written by THIS binary: both present. Must not be counted.
+        let mut current = note("note:current", "Current");
+        current.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        current.frontmatter_raw = Some("status: open\n".to_string());
+        store.insert_note(&current).unwrap();
+
+        // No frontmatter at all: both empty. Must NOT be counted — otherwise
+        // the disclosure fires on every plain note and means nothing.
+        store.insert_note(&note("note:plain", "Plain")).unwrap();
+
+        // Unparseable YAML: raw set, parsed map absent. The REVERSE pair, and
+        // also not a deficit — the raw text is there and searchable.
+        let mut unparseable = note("note:bad-yaml", "Bad YAML");
+        unparseable.frontmatter = None;
+        unparseable.frontmatter_raw = Some("status: [unclosed\n".to_string());
+        store.insert_note(&unparseable).unwrap();
+
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            1,
+            "exactly the pre-column row is counted"
+        );
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(Some("vault:v"))
+                .unwrap(),
+            1,
+            "and the per-vault count agrees, because the remedy is per-vault"
+        );
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(Some("vault:other"))
+                .unwrap(),
+            0,
+            "a vault with no notes has no deficit"
+        );
+    }
+
+    /// The symptom the count stands in for: the corpus-wide collector emits no
+    /// Frontmatter candidate for the pre-column note, so `regex_search` cannot
+    /// find text that IS in the file. This is nw-298's symptom surviving the
+    /// fix for nw-298, which is the whole item.
+    #[test]
+    fn frontmatter_text_is_unreachable_on_a_pre_column_note() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut legacy = note("note:legacy", "Legacy");
+        legacy.frontmatter = Some(r#"{"status":"loadbearing"}"#.to_string());
+        legacy.frontmatter_raw = None;
+        store.insert_note(&legacy).unwrap();
+
+        let hits = store
+            .regex_search("loadbearing", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert!(
+            hits.results.is_empty(),
+            "precondition: the symptom is real — the text is unreachable"
+        );
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            1,
+            "and the deficit that explains the empty result is COUNTABLE, \
+             which is what makes the silence fixable"
+        );
     }
 }
