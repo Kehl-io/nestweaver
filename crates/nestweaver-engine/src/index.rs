@@ -3317,6 +3317,7 @@ where
                                 name: raw_sym.name.clone(),
                                 signature: raw_sym.signature.clone(),
                                 start_line: raw_sym.start_line,
+                                kind: raw_sym.kind,
                             },
                         ));
                     }
@@ -4620,6 +4621,7 @@ fn collect_contract_derivation_inputs(
                         name: symbol.name.clone(),
                         signature: symbol.signature.clone(),
                         start_line: symbol.start_line,
+                        kind: symbol.kind,
                     },
                 )
             })
