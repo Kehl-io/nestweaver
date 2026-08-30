@@ -103,9 +103,9 @@ use nestweaver_engine::{
     generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
     index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
-    load_alias_sidecar, load_clusters, load_extensions, lookup_symbol, record_last_indexed_at,
-    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at, render_text,
+    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
+    truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -992,6 +992,13 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_DB",
         role: EnvRole::Configures,
     },
+    // nw-261. Pins miette's wrap column so a test harness can make wrap
+    // position a controlled input instead of an ambient one. Unset is today's
+    // behaviour (terminal detection), so it is a tuning knob, not a gate.
+    EnvVar {
+        name: "NESTWEAVER_DIAGNOSTIC_WIDTH",
+        role: EnvRole::Configures,
+    },
     EnvVar {
         name: "NESTWEAVER_DRAIN_TIMEOUT_SECS",
         role: EnvRole::Configures,
@@ -1594,19 +1601,47 @@ fn print_link_classification(total_unresolved: usize, total_low_confidence: usiz
     );
 }
 
-/// Provenance for a result computed WITHOUT the daemon.
+/// Stamp local-scope provenance onto a `--json` payload, unless a layer that
+/// knows more already stamped it.
 ///
-/// The federation layer attaches `_meta` (scope, sources, stale_repos) on the
-/// daemon path only, so `--json` returned a different SHAPE depending on whether
-/// a daemon happened to be running. The direct path is genuinely local scope, so
-/// it can state the same thing truthfully rather than omitting the field
-/// (nw-117).
-fn local_result_meta() -> serde_json::Value {
-    serde_json::json!({
-        "scope": "local",
-        "sources": ["local"],
-        "stale_repos": [],
-    })
+/// # Why this exists at all
+///
+/// `_meta` answers three questions a caller cannot answer any other way: what
+/// scope the answer covers, which sources contributed, and which repos were
+/// stale. `nestweaver_schema::provenance` is the one spelling of that answer and
+/// `nestweaver_mcp::tools` carries it on both dispatch seams (nw-315,
+/// `provenance_seam::Unstamped`). This file used to be the FOURTH and FIFTH
+/// authors of the same three keys — `local_result_meta` and `attach_local_meta`
+/// open-coded `provenance::provenance` and `provenance::ensure` byte for byte —
+/// while three other `--json` emitters (`print_ranking_json` for `hubs`/`bridges`
+/// and `render_brain_search_response`) emitted no `_meta` at all. Five authors
+/// is why the three that were missing went unnoticed (nw-347).
+///
+/// `ensure`, not `set`: the daemon envelope and the federation client both know
+/// strictly more than this layer does, so their richer verdict must survive.
+fn json_payload_with_provenance(mut payload: serde_json::Value) -> serde_json::Value {
+    nestweaver_schema::provenance::ensure(
+        &mut payload,
+        nestweaver_schema::provenance::SCOPE_LOCAL,
+        &[nestweaver_schema::provenance::SOURCE_LOCAL],
+        &[],
+    );
+    payload
+}
+
+/// Print a `--json` OBJECT payload. The only emitter that should exist.
+///
+/// Routing every `--json` object print through one function is what makes
+/// "every route discloses its provenance" a property of the code rather than of
+/// whoever wrote the most recent renderer. The enforcement is behavioural, not
+/// syntactic: `tests/parity_test.rs` compares each command's `--json` key paths
+/// against its MCP twin's, so a new emitter that forgets `_meta` fails there.
+fn print_json_payload(payload: &serde_json::Value) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_payload_with_provenance(payload.clone()))?
+    );
+    Ok(())
 }
 
 /// The single JSON shape `impact` emits, for every outcome.
@@ -1786,20 +1821,28 @@ impl ResolverStaleness {
 
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
 /// the bare array that had nowhere to put it (nw-308).
+///
+/// `daemon_meta` is the `_meta` of the daemon envelope this payload was decoded
+/// from, or `None` on the direct route. It is a parameter because the daemon
+/// route DECODES through `strip_hybrid_meta` — the stripper exists so a typed
+/// `serde_json::from_value` sees the same shape the direct store produces — and
+/// stripping for the decode used to mean the printer had nothing to put back.
+/// Strip for the decode, carry the provenance to the print (nw-347).
 fn print_ranking_json<T: serde::Serialize>(
     key: &str,
     rows: &T,
     staleness: &ResolverStaleness,
+    daemon_meta: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            key: rows,
-            "rankings_stale": staleness.rankings_stale,
-            "stale_repos": staleness.stale_repos,
-        }))?
-    );
-    Ok(())
+    let mut payload = serde_json::json!({
+        key: rows,
+        "rankings_stale": staleness.rankings_stale,
+        "stale_repos": staleness.stale_repos,
+    });
+    if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
+        obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+    }
+    print_json_payload(&payload)
 }
 
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
@@ -1960,24 +2003,6 @@ fn render_investigate_text(payload: &serde_json::Value) {
         "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
         text(payload, "bundle_id")
     );
-}
-
-/// Attach the local-scope provenance the federation layer adds on the daemon
-/// path, so `--json` has ONE shape regardless of whether a daemon is running.
-///
-/// Same divergence as nw-117: `_meta` is added by federation, which only runs in
-/// daemon mode, so a direct result was a different shape rather than a different
-/// value. The direct path is genuinely local scope and can say so truthfully.
-fn attach_local_meta(payload: &mut serde_json::Value) {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.entry("_meta").or_insert_with(|| {
-            serde_json::json!({
-                "scope": "local",
-                "sources": ["local"],
-                "stale_repos": [],
-            })
-        });
-    }
 }
 
 /// Render a `blast-radius` result as text from its JSON payload.
@@ -3488,12 +3513,30 @@ enum Commands {
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
         )]
         intent: Option<String>,
-        #[arg(long, help = "Maximum number of connected nodes to return")]
+        // nw-259(b). `--token-budget`, declared immediately below, carries
+        // `range(1..=16000)` to match its schema. This carried nothing, while
+        // `code_context`'s schema says `"minimum": 1, "maximum": 5000` — with
+        // a comment explaining that the tool asks for `limit + 1` and an
+        // unbounded value overflows it — and the daemon proxy validates
+        // against that schema. So `context --limit 6000` was ACCEPTED without
+        // a daemon and REJECTED with one: the bound was a property of the
+        // transport rather than of the contract. The bound here is the
+        // schema's; it is not a new one.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5000),
+            help = "Maximum connected nodes to return (1-5000, matching the code_context schema; default 500). Applied BEFORE --token-budget, not instead of it"
+        )]
         limit: Option<usize>,
+        // nw-259(c): the help used to say `--token-budget` "takes precedence
+        // over --limit". It does not. `--limit` caps the walk FIRST and
+        // `--token-budget` then cuts the already-capped list, so
+        // `--limit 5 --token-budget 16000` returns 5 — the opposite of what
+        // the caller was told. They compose; neither overrides.
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
-            help = "Approximate token budget for output (1-16000; takes precedence over --limit; matches the MCP brain_context schema)"
+            help = "Approximate token budget for output (1-16000; matches the MCP brain_context schema). Applied AFTER --limit, to whatever --limit left"
         )]
         token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -4303,9 +4346,18 @@ enum Commands {
         after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30\n  nestweaver export --format msgpack --output graph.msgpack"
     )]
     Export {
+        // nw-312: `value_parser`, not a bare `String` validated downstream. The
+        // legal values were enumerated in the help text and enforced in the
+        // handler, so an invalid one arrived as a generic error and exited 1
+        // where the documented contract says 64 — while `--top`, three
+        // arguments below, is a `usize` and already exits 64 because clap's own
+        // parse rejects it. `PossibleValuesParser` keeps the field a `String`,
+        // so the `format == "msgpack"` comparisons and the wire value the
+        // daemon receives are unchanged.
         #[arg(
             long,
             default_value = "cypher",
+            value_parser = clap::builder::PossibleValuesParser::new(["cypher", "graphml", "mermaid", "msgpack"]),
             help = "Output format: cypher, graphml, mermaid, msgpack"
         )]
         format: String,
@@ -4314,7 +4366,8 @@ enum Commands {
         #[arg(
             long,
             default_value = "all",
-            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file"
+            value_parser = clap::builder::PossibleValuesParser::new(["all", "code", "vault"]),
+            help = "Subgraph to export: all (default), code, or vault. graphml honours all three; cypher and mermaid are code-only and will refuse a vault scope rather than emit an empty file; msgpack is code-only and refuses --scope vault outright"
         )]
         scope: String,
         #[arg(
@@ -9902,11 +9955,41 @@ fn daemon_status_error(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
 
+/// The render width miette wraps diagnostics at, when it is pinned.
+///
+/// nw-261. miette hard-wraps its message body and prefixes continuations with
+/// `│`, so a phrase the code emits contiguously — "the daemon has not been shut
+/// down" — can reach a test as "shut\n  │ down". A `stderr.contains(...)`
+/// assertion then fails for a RENDERING reason while the message is exactly
+/// right, which reads as a product bug and is not one. It fired once on CI
+/// (`flatten_diagnostic_recovers_a_phrase_miette_wrapped`) and the audit found
+/// five more assertions with the same exposure.
+///
+/// Flattening the assertion is the local fix and it only protects the
+/// assertions someone remembered to flatten. Pinning the width removes wrap
+/// position as an AMBIENT input to the whole suite — including for assertions
+/// nobody has audited — and, just as importantly, makes the property testable:
+/// a test can now force a narrow render and prove that flattening recovers the
+/// phrase, which was previously impossible to reproduce on demand.
+///
+/// Unset means today's behaviour exactly (miette detects the terminal width),
+/// so this changes nothing for a user.
+fn diagnostic_width() -> Option<usize> {
+    std::env::var("NESTWEAVER_DIAGNOSTIC_WIDTH")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|width| *width > 0)
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
     miette::set_hook(Box::new(|_| {
-        Box::new(miette::MietteHandlerOpts::new().build())
+        let mut opts = miette::MietteHandlerOpts::new();
+        if let Some(width) = diagnostic_width() {
+            opts = opts.width(width);
+        }
+        Box::new(opts.build())
     }))
     .ok();
 
@@ -11173,19 +11256,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value = nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch(
                         &store,
                         None,
                         "cross_repo_contracts",
                         args,
                         None,
-                    )?;
-                    attach_local_meta(&mut value);
-                    value
+                    )?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Cross-repo contracts for {}: {} returned of {} ({})",
@@ -11238,14 +11319,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Backlinks to {} ({}):",
@@ -11616,8 +11694,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let mut context_result: Option<nestweaver_engine::ContextResult> = None;
             if use_daemon {
                 let mut code_args = serde_json::json!({ "seeds": seeds.clone() });
-                // Omit rather than default: absent `--limit` means "no cap" on
-                // the direct path, and the schema rejects a 0.
+                // Omit rather than default, so the TOOL's documented default
+                // governs — which is the same `CODE_CONTEXT_DEFAULT_LIMIT` the
+                // direct path applies below. nw-259(c): this comment used to
+                // claim absent `--limit` meant "no cap" on the direct path,
+                // contradicted twelve lines later by
+                // `limit.unwrap_or(CODE_CONTEXT_DEFAULT_LIMIT)`.
                 if let Some(limit) = limit {
                     code_args["limit"] = serde_json::json!(limit);
                 }
@@ -11679,19 +11761,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             match built {
                 Ok(mut result) => {
+                    // nw-259(a). This arm carries THREE caps — `--limit`,
+                    // `--token-budget` and `CODE_CONTEXT_DEFAULT_LIMIT` — and
+                    // had one `truncated` boolean and one `limit` field to
+                    // explain all of them. A token-budget cut set `truncated`
+                    // and left `limit` at whatever the earlier cap set (always
+                    // `Some` on the direct path), so the message named the
+                    // wrong cap and prescribed a flag that cannot change the
+                    // outcome: raising `--limit` after a BUDGET cut returns the
+                    // same rows. Same shape as `impact`'s three JSON outputs
+                    // before `impact_json_ok` gave it a discriminator.
+                    //
+                    // The limit cut is whatever the builder already recorded —
+                    // on either route. The budget cut happens here.
+                    let cut_by_limit = result.truncated == Some(true);
+                    let mut cut_by_budget: Option<usize> = None;
                     if let Some(budget) = token_budget {
                         let cut = context_token_budgeted_truncate(&result.connected, budget);
                         if cut < result.connected.len() {
                             result.truncated = Some(true);
+                            cut_by_budget = Some(budget);
                         }
                         result.connected.truncate(cut);
                     }
-                    // Say so. A capped result that renders identically to a
-                    // complete one is the whole defect this reports on: the
-                    // caller cannot tell "this is the answer" from "this is
-                    // the first N of the answer".
-                    let truncation = match (result.truncated, result.limit) {
-                        (Some(true), Some(limit)) => {
+                    // Say so, and say WHICH. A capped result that renders
+                    // identically to a complete one is the defect this reports
+                    // on; a capped result that blames the wrong cap is the same
+                    // defect wearing a disclosure.
+                    //
+                    // The budget wins when both fired, because it cut LAST:
+                    // raising `--limit` alone cannot get past a budget that is
+                    // already full.
+                    let truncation = match (cut_by_budget, cut_by_limit, result.limit) {
+                        (Some(budget), _, _) => {
+                            format!(", TRUNCATED by --token-budget {budget} — raise it for more")
+                        }
+                        (None, true, Some(limit)) => {
                             format!(", TRUNCATED at limit {limit} — pass --limit for more")
                         }
                         _ => String::new(),
@@ -12145,11 +12250,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .context("decode hub nodes from the daemon")?,
                     None => Vec::new(),
                 };
+                // nw-347: the daemon knows more about provenance than this
+                // layer can (upstreams, a background staleness verdict), so its
+                // stamp is carried to the printer rather than discarded and
+                // re-invented.
+                let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
                 if json {
                     // nw-308: the daemon route is the DEFAULT route, so the
                     // payload disclosure has to be here as well as on the
                     // direct path below.
-                    print_ranking_json("hubs", &hubs, &ResolverStaleness::from_sidecar(&db_path))?;
+                    print_ranking_json(
+                        "hubs",
+                        &hubs,
+                        &ResolverStaleness::from_sidecar(&db_path),
+                        daemon_meta,
+                    )?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
@@ -12207,6 +12322,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "hubs",
                     &hubs,
                     &ResolverStaleness::from_store(&store, &db_path),
+                    None,
                 )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
@@ -12256,6 +12372,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // became an empty list and rendered as "graph may be
                     // empty". A `null` (no `bridges` key at all) is still an
                     // honest empty result and stays one.
+                    // nw-347: `strip_hybrid_meta` exists so the typed decode
+                    // below sees the shape the direct store produces. Stripping
+                    // for the decode used to mean the PRINTER had nothing to put
+                    // back, so the daemon's own stamp was discarded on a route
+                    // where it is strictly richer than anything this layer knows.
+                    let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
                     let bridges: Vec<nestweaver_engine::BridgeNode> =
                         match strip_hybrid_meta(value).get("bridges").cloned() {
                             Some(serde_json::Value::Null) | None => Vec::new(),
@@ -12269,6 +12391,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "bridges",
                             &bridges,
                             &ResolverStaleness::from_sidecar(&db_path),
+                            daemon_meta,
                         )?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
@@ -12324,6 +12447,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bridges",
                     &bridges,
                     &ResolverStaleness::from_store(&store, &db_path),
+                    None,
                 )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
@@ -13061,15 +13185,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?
                 }
             };
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_blast_radius_text(&payload);
             }
@@ -13106,19 +13227,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
-                    let mut value = nestweaver_mcp::tools::dispatch(
-                        &store,
-                        None,
-                        "detect_changes",
-                        args,
-                        None,
-                    )?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 println!(
                     "Change impact: risk={}, status={}, gate={}",
@@ -13172,15 +13285,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    let mut value =
-                        nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?;
-                    attach_local_meta(&mut value);
-                    value
+                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?
                 }
             };
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_flow_trace_text(&payload);
             }
@@ -13263,7 +13373,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Built unconditionally so the text path renders from the SAME
             // payload the JSON path prints, and from the same payload the
             // daemon returns (nw-108).
-            let mut payload = serde_json::to_value(DeadCodeJson {
+            let payload = serde_json::to_value(DeadCodeJson {
                 total_symbols: result.total_symbols,
                 reachable_symbols: result.reachable_symbols,
                 unreachable_count: result.unreachable_symbols.len(),
@@ -13275,14 +13385,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;
-            // Match the daemon's envelope so `--json` has one shape regardless
-            // of whether a daemon is running (nw-117).
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("_meta".to_string(), local_result_meta());
-            }
-
             if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_json_payload(&payload)?;
             } else {
                 render_dead_code_text(&payload);
             }
@@ -13435,15 +13539,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
-            // Unknown formats keep their friendly listing and EXIT_ERROR
-            // rather than becoming a generic error chain.
-            if !matches!(format.as_str(), "cypher" | "graphml" | "mermaid") {
-                eprintln!(
-                    "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
-                    format
-                );
-                return Ok((EXIT_ERROR, None));
-            }
+            // nw-312: the runtime listing that used to stand here is gone,
+            // not merely bypassed. `--format` now carries a
+            // `PossibleValuesParser`, so an unknown value is refused by clap
+            // before this arm runs on EITHER route, and keeping the branch
+            // would leave a third copy of the legal-value list to drift.
             // One shared implementation with the daemon's `export_graph`, so
             // the two cannot drift on scope again.
             if let Some(notice) =
@@ -16066,6 +16166,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(include_components) = include_components {
                 project_args["include_components"] = serde_json::json!(include_components);
             }
+            // Both routes send the SAME arguments. The direct leg used to
+            // build its own set from the same clap fields, which is how
+            // `include_components` came to differ between them (nw-316 leg 2).
+            let direct_args = project_args.clone();
             let daemon_result = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
@@ -16093,6 +16197,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
+            // nw-316. This route used to be a hand-written SECOND
+            // implementation of `tool_project_context`: ~295 lines of member
+            // collection, PPR seeding, promotion/dedup/boost/sort, recency and
+            // budgeting, ending in a renderer that omitted `truncated`,
+            // `more_available` and `seed_tokens_charged` — so a `--no-daemon`
+            // caller could not tell a complete answer from the first N of one.
+            // It also cut with `token_budgeted_truncate` and then measured the
+            // finished object AFTER THE FACT, where the tool runs a
+            // serialized-size probe loop and re-cuts; this route could report
+            // `budget_exceeded: true` and still emit an over-budget payload.
+            //
+            // It now calls the tool, exactly as `BrainCommands::Search`'s direct
+            // leg does and as `context` was changed to do in 8.0.0. That closes
+            // the three missing fields and the probe-loop gap in one change
+            // instead of three, and it is why the alias/UID-substring resolution
+            // deleted here is not lost: the tool carries the identical
+            // resolution, extension-sidecar alias match included.
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -16100,294 +16221,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 tracing::info!("Tantivy index unavailable — BM25 search disabled for this query");
             }
 
-            // Resolve the project: name -> alias -> UID substring.
-            let project = if name.starts_with("proj:") {
-                let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
-                all.into_iter()
-                    .find(|p| p.uid == name || p.uid.contains(&name))
-                    .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?
-            } else {
-                match store
-                    .lookup_project_by_name(&name)
-                    .map_err(|e| anyhow::anyhow!(e))?
-                {
-                    Some(p) => p,
-                    None => {
-                        // Try alias match via extension sidecar, then UID substring.
-                        let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
-                        let ext_store = load_extensions(&db_path);
-                        let needle = name.to_lowercase();
-                        let alias_match = all.iter().find(|p| {
-                            if let Some(serde_json::Value::Array(aliases)) =
-                                ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
-                            {
-                                aliases
-                                    .iter()
-                                    .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
-                            } else {
-                                false
-                            }
-                        });
-                        if let Some(p) = alias_match {
-                            p.clone()
-                        } else {
-                            match all.into_iter().find(|p| p.uid.contains(&name)) {
-                                Some(p) => p,
-                                None => {
-                                    eprintln!(
-                                        "Project '{}' not found. Try: nestweaver list-projects",
-                                        name
-                                    );
-                                    return Ok((EXIT_NOT_FOUND, None));
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Collect member UIDs for the post-PPR boost. These are the
-            // notes and symbols declared as belonging to this project.
-            // Member note UIDs are tracked separately: they get seeded into
-            // PPR and surfaced into `connected` (Bug #12).
-            let mut member_uids: Vec<String> = Vec::new();
-            let mut member_note_uids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let note_uids = store
-                .list_project_note_uids(&project.uid)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_note_uids.extend(note_uids.iter().cloned());
-            member_uids.extend(note_uids);
-            let sym_uids = store
-                .list_project_symbol_uids(&project.uid)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_uids.extend(sym_uids);
-
-            // nw-316: the same documented default the tool applies
-            // (`unwrap_or(true)` in `tool_project_context`). Both routes now
-            // land on the schema's `default: true` rather than one of them on
-            // clap's.
-            let comp_uids = if include_components.unwrap_or(true) {
-                store
-                    .list_project_component_uids(&project.uid)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            } else {
-                vec![]
-            };
-            for comp_uid in &comp_uids {
-                let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
-                member_note_uids.extend(comp_notes.iter().cloned());
-                member_uids.extend(comp_notes);
-                member_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
-            }
-
-            // Deduplicate members.
-            let mut seen = std::collections::HashSet::new();
-            member_uids.retain(|u| seen.insert(u.clone()));
-
-            if member_uids.is_empty() {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "project": project.name,
-                            "seeds": [],
-                            "connected": [],
-                            "note": "No notes or symbols associated with this project.",
-                        }))?
-                    );
-                } else {
-                    println!(
-                        "Project '{}' has no associated notes or symbols.",
-                        project.name
-                    );
-                }
-                return Ok((EXIT_SUCCESS, None));
-            }
-
-            // Seed PPR from the project node, its components, and the
-            // project's member notes (Bug #12). Seeding the notes guarantees
-            // they survive the `min_score` filter in PPR — when a project
-            // declares repos, the project node's mass is split across tens of
-            // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
-            // below threshold so it never reaches `connected`.
-            //
-            // Member symbols suffer the identical fan-out, so seed the
-            // top-K of them by PageRank as well. Without this, a project
-            // that declares any repo returns notes-only context even after
-            // `materialize-projects` writes hundreds of thousands of
-            // PROJECT_INCLUDES_SYMBOL edges (Bug #18 / wave-5 regression).
-            const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
-            let mut member_symbol_uids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let top_symbols = store
-                .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            member_symbol_uids.extend(top_symbols.iter().cloned());
-            for comp_uid in &comp_uids {
-                let comp_top = store
-                    .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
-                    .unwrap_or_default();
-                member_symbol_uids.extend(comp_top);
-            }
-
-            let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
-            ppr_seeds.extend(comp_uids);
-            ppr_seeds.extend(member_note_uids.iter().cloned());
-            ppr_seeds.extend(member_symbol_uids.iter().cloned());
-
-            let defaults = HybridSearchConfig::default();
-            let search_config = if no_embed {
-                HybridSearchConfig {
-                    weight_semantic: 0.0,
-                    ..defaults
-                }
-            } else {
-                defaults
-            };
-            let aliases = load_alias_sidecar(&db_path);
-            match build_brain_context_hybrid_with_aliases(
+            nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+            nestweaver_mcp::tools::set_current_instance_config(
+                load_instance_config_opt(config.as_deref()).map(std::sync::Arc::new),
+            );
+            let response = nestweaver_mcp::tools::dispatch(
                 &store,
-                &ppr_seeds,
                 tantivy.as_ref(),
-                &search_config,
-                &aliases,
-                Some(&db_path),
-                Some(nestweaver_store::QueryIntent::ProjectContext),
+                "project_context",
+                direct_args,
                 None,
-                None,
-            ) {
-                Ok(mut result) => {
-                    // Surface the project's curated member notes into
-                    // `connected` (Bug #12). Seeded notes land in `seeds`,
-                    // which print_brain_context_json does not render.
-                    nestweaver_engine::promote_member_notes_into_connected(
-                        &mut result,
-                        &member_note_uids,
-                    );
-                    // Surface the seeded member symbols into `connected`
-                    // for the same reason (companion to the notes promotion).
-                    nestweaver_engine::promote_member_symbols_into_connected(
-                        &mut result,
-                        &member_symbol_uids,
-                    );
-                    // Drop Heading/Section duplicates: notes-heavy projects
-                    // would otherwise spend ~25% of a 2000-token budget on
-                    // pairs that share `(file, title)` and add no information.
-                    nestweaver_engine::dedup_heading_section_pairs(&mut result);
+            );
+            nestweaver_mcp::tools::set_current_instance_config(None);
 
-                    // Post-PPR scope boost: multiply relevance for nodes that
-                    // belong to the project so declared content ranks highest.
-                    let member_set: std::collections::HashSet<&str> =
-                        member_uids.iter().map(|s| s.as_str()).collect();
-                    for node in &mut result.connected {
-                        if member_set.contains(node.uid.as_str()) {
-                            node.relevance *= 5.0;
-                        }
-                    }
-                    result.connected.sort_by(|a, b| {
-                        b.relevance
-                            .partial_cmp(&a.relevance)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    // since filter: hard filter Note/Section nodes by modified_at.
-                    if let Some(ref since_ts) = since {
-                        let recent_notes = store
-                            .list_note_uids_modified_since(since_ts)
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        let recent_sections = store
-                            .list_section_uids_modified_since(since_ts)
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-                            nodes.retain(|item| {
-                                if item.kind.to_lowercase().contains("symbol") {
-                                    return true;
-                                }
-                                recent_notes.contains(&item.uid)
-                                    || recent_sections.contains(&item.uid)
-                            });
-                        };
-                        filter_since(&mut result.seeds);
-                        filter_since(&mut result.connected);
-                    }
-
-                    // recency bias: soft boost based on note modified_at age.
-                    if recency_weight > 0.0 {
-                        apply_recency_bias_cli(
-                            &store,
-                            &mut result.connected,
-                            recency_weight,
-                            recency_half_life_days,
-                        );
-                        apply_recency_bias_cli(
-                            &store,
-                            &mut result.seeds,
-                            recency_weight,
-                            recency_half_life_days,
-                        );
-                    }
-
-                    // Compute seed token cost and allocate the remainder to
-                    // connected. Don't double-count items the promotion helpers
-                    // copied from `seeds` into `connected` — those tokens belong
-                    // to the connected budget, not the seed overhead.
-                    let connected_uids: std::collections::HashSet<&str> =
-                        result.connected.iter().map(|n| n.uid.as_str()).collect();
-                    // nw-316: the SAME flag the renderer below is handed
-                    // (`!detailed`). Charging the detailed rate for a concise
-                    // response is what made this route return fewer items than
-                    // the daemon for an identical budget.
-                    let concise = !detailed;
-                    let seed_tokens: usize = result
-                        .seeds
-                        .iter()
-                        .filter(|n| !connected_uids.contains(n.uid.as_str()))
-                        .map(|n| render_cost_tokens(n, concise))
-                        .sum();
-                    let remaining_budget = token_budget.saturating_sub(seed_tokens);
-                    let cut = token_budgeted_truncate(&result.connected, remaining_budget, concise);
-                    let connected_tokens: usize = result
-                        .connected
-                        .iter()
-                        .take(cut)
-                        .map(|n| render_cost_tokens(n, concise))
-                        .sum();
-                    let used_tokens = seed_tokens + connected_tokens;
-                    // Load external_refs from the extension sidecar so the
-                    // local (--no-daemon) path matches the daemon/MCP wrapper
-                    // shape — agents rely on this for Workfront / wiki PRD
-                    // surfacing.
-                    let ext_store = nestweaver_engine::load_extensions(&db_path);
-                    let external_refs =
-                        nestweaver_engine::get_all_properties(&ext_store, &project.uid)
-                            .get("external_refs")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                    if json {
-                        print_project_context_json(
-                            &project,
-                            &result,
-                            cut,
-                            used_tokens,
-                            token_budget,
-                            &external_refs,
-                            !detailed,
-                        )?;
-                    } else {
-                        println!("Project: {}  ({})", project.name, project.uid);
-                        if let Some(ref summary) = project.summary {
-                            println!("  {summary}");
-                        }
-                        println!();
-                        print_brain_context_text(&result, cut, Some(token_budget));
-                    }
-                    Ok((EXIT_SUCCESS, None))
+            // The same NOT_FOUND classification the daemon leg above applies,
+            // for the same reason: a script must be able to tell "no such
+            // project" from "the query failed", and which one it is told must
+            // not depend on which transport answered.
+            let value = match response {
+                Ok(value) => value,
+                Err(error) if format!("{error:#}").contains("not found") => {
+                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+                    return Ok((EXIT_NOT_FOUND, None));
                 }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    Ok((EXIT_ERROR, None))
-                }
-            }
+                Err(error) => return Err(error),
+            };
+            render_project_context_daemon_response(&value, json, token_budget);
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Investigate {
@@ -22467,7 +22327,7 @@ fn run_brain(
             let response = response?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&response)?);
+                print_json_payload(&response)?;
             } else {
                 render_brain_search_json(&response)?;
             }
@@ -23983,7 +23843,7 @@ fn render_brain_search_response(
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
         }
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        print_json_payload(&payload)?;
         return Ok(());
     }
 
@@ -24043,6 +23903,219 @@ fn render_brain_search_response(
 #[cfg(test)]
 mod cli_help_contract_tests {
     use super::*;
+
+    // ── nw-334. The ONE exhaustive inventory of `CliDiagnostic` ─────────────
+    //
+    // Three separate tiers ask three different questions of the same nine
+    // variants, and before this they asked them of three different lists: T3c
+    // destructured all nine, T3b hand-listed ONE while calling itself explicit,
+    // and the "is this remedy followable at all" question was asked by a
+    // five-phrase denylist in `tests/error_remedy_test.rs` that no variant had
+    // to answer. A new diagnostic therefore joined one check by failing to
+    // compile and escaped the other two in silence — the nw-217 shape, inside
+    // the fix for nw-334.
+    //
+    // One inventory, three axes, and `classify_is_total` below makes adding a
+    // variant a compile error until it is classified on all three.
+
+    /// Can this condition clear without the operator doing anything?
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum Clears {
+        /// Another process is doing something that will finish.
+        OnItsOwn,
+        /// Nothing that runs later changes this file or this fact.
+        Never,
+    }
+
+    /// May this diagnostic's remedy name a command that WRITES?
+    ///
+    /// nw-329: the audience for "I found nothing" is by definition someone
+    /// whose targeting is already wrong, and a query that returned no rows has
+    /// not established that the database is empty — so sending them to `index`
+    /// is how a lookup miss becomes a production write.
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum WriteRemedy {
+        /// The condition proves nothing about what the database holds, so a
+        /// write could destroy data this error knows nothing about.
+        Barred,
+        /// The condition itself establishes that there is nothing to lose — no
+        /// database at all, or one with no schema — so a write is the correct
+        /// remedy and naming it is safe.
+        Allowed,
+    }
+
+    /// What FORM does the remedy take? nw-334/G1.
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum Remedy {
+        /// The help names a command to RUN, which
+        /// `backtick_quoted_remedies_still_name_a_real_subcommand` then checks
+        /// against the live clap tree.
+        Invocation,
+        /// The help says what to DO and no command can express it. The string
+        /// is the reason, recorded rather than assumed.
+        Instruction(&'static str),
+        /// The remedy is not static at all — it travels in the wrapped message.
+        /// No variant-level tier can see it; this is nw-334/G3, the
+        /// acknowledged residue, named here so it is a known hole rather than
+        /// an unnoticed one.
+        InMessage(&'static str),
+    }
+
+    /// Destructures every variant, so a new one cannot be added without
+    /// touching this match. The inventory's completeness is then the arm count.
+    fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
+        match diagnostic {
+            CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
+            CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
+            CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
+            CliDiagnostic::EmptyDatabase => "empty_db",
+            CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
+            CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
+            CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+            CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
+            CliDiagnostic::General { .. } => "error",
+        }
+    }
+
+    fn diagnostic_inventory() -> Vec<(CliDiagnostic, Clears, WriteRemedy, Remedy)> {
+        let sample = |name: &str| name.to_string();
+        vec![
+            // No database exists at this path, so `index` cannot write over
+            // anything — the one case where prescribing a write is honest.
+            (
+                CliDiagnostic::DatabaseNotFound { path: sample("d") },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::RepoPathNotFound { path: sample("r") },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "which path the caller meant is information this error does \
+                     not have; only the caller can supply it",
+                ),
+            ),
+            (
+                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "the fix is to pass a different argument, which is a change \
+                     to the invocation the caller is already writing",
+                ),
+            ),
+            // nw-329: a query that returned no rows has NOT established that
+            // the database is empty.
+            (
+                CliDiagnostic::EmptyDatabase,
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            // The one genuinely transient case: a live holder of the write lock
+            // releases it. Its help says to stop that process rather than to
+            // wait, which is stronger, but waiting is not a lie here.
+            (
+                CliDiagnostic::DatabaseUnavailable {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::OnItsOwn,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::DatabaseWalUnreplayed {
+                    path: sample("d"),
+                    wal: sample("w"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            (
+                // nw-332/nw-333, added by the store lane after this inventory was
+                // written. A corrupt WAL never clears on its own -- the operator
+                // must move the five artifacts aside -- and the remedy is the
+                // runbook the message carries, which was executed before shipping.
+                CliDiagnostic::DatabaseWalCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                    runbook: sample("runbook"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction("the runbook moves files aside; it is steps, not one command"),
+            ),
+            (
+                CliDiagnostic::DatabaseCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            // A file with no schema demonstrably holds no data, so `index`
+            // cannot destroy anything here. Documented on the variant itself.
+            (
+                CliDiagnostic::DatabaseNoSchema {
+                    path: sample("d"),
+                    detail: sample("0 bytes"),
+                },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
+            // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
+            // said, so no static tier can check it — nw-334/G3.
+            (
+                CliDiagnostic::General {
+                    message: sample("m"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::InMessage(
+                    "the remedy is carried by the wrapped error, which is \
+                     composed at the call site; the end-to-end table in \
+                     tests/error_remedy_test.rs is the only thing that can see \
+                     it, one row per bug",
+                ),
+            ),
+        ]
+    }
+
+    /// nw-334/G2. The inventory must name every variant EXACTLY once, on every
+    /// axis. Without this, `read_path_diagnostics_never_prescribe_a_write` and
+    /// `every_diagnostic_declares_whether_its_remedy_is_runnable` would both
+    /// pass vacuously on a variant nobody added — which is precisely how T3b
+    /// spent a release checking one diagnostic out of nine.
+    #[test]
+    fn every_diagnostic_is_classified_on_every_axis() {
+        let inventory = diagnostic_inventory();
+        let covered: std::collections::HashSet<&str> = inventory
+            .iter()
+            .map(|(diagnostic, _, _, _)| classify_is_total(diagnostic))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            inventory.len(),
+            "the inventory must name every variant exactly once: {covered:?}"
+        );
+        // The arm count is what makes the above a COMPLETENESS claim rather
+        // than a uniqueness one: `classify_is_total` destructures every
+        // variant, so a new one cannot compile until it is added there, and
+        // this equality is what then forces it into the inventory too.
+        assert_eq!(
+            inventory.len(),
+            9,
+            "a `CliDiagnostic` variant was added or removed without \
+             classifying it here"
+        );
+    }
 
     /// Stack size for the CLI-tree tests.
     ///
@@ -24471,6 +24544,51 @@ mod cli_help_contract_tests {
         );
     }
 
+    /// nw-347, the counterweight. A stamp that is always
+    /// `{scope:"local", stale_repos:[]}` is not provenance, it is a constant —
+    /// and a fix that made every `--json` payload carry one unconditionally
+    /// would satisfy "every route has `_meta`" while telling a federated caller
+    /// its answer was local. The daemon route knows strictly more (upstreams, a
+    /// background staleness verdict this process cannot compute without I/O),
+    /// so its richer verdict must survive: the emitter calls
+    /// `provenance::ensure` (`entry().or_insert_with`), never `set`.
+    #[test]
+    fn the_cli_stamp_does_not_clobber_a_richer_verdict() {
+        let daemon_answer = serde_json::json!({
+            "hubs": [],
+            "_meta": {
+                "scope": "federated",
+                "sources": ["local", "upstream-a"],
+                "stale_repos": ["repo-a"],
+            },
+        });
+        let printed = json_payload_with_provenance(daemon_answer);
+        assert_eq!(
+            printed["_meta"]["scope"],
+            serde_json::json!("federated"),
+            "the CLI emitter overwrote a verdict it does not have the \
+             information to make: {printed}"
+        );
+        assert_eq!(
+            printed["_meta"]["stale_repos"],
+            serde_json::json!(["repo-a"]),
+            "a caller that was told which repos are stale must not have that \
+             replaced by an empty list: {printed}"
+        );
+
+        // And the direct route, which genuinely IS local scope, says so rather
+        // than omitting the field — the nw-347 defect in the other direction.
+        let direct_answer = json_payload_with_provenance(serde_json::json!({ "hubs": [] }));
+        for leg in ["scope", "sources", "stale_repos"] {
+            assert!(
+                direct_answer["_meta"].get(leg).is_some(),
+                "partial provenance is how a caller learns the wrong thing \
+                 confidently: {direct_answer}"
+            );
+        }
+        assert_eq!(direct_answer["_meta"]["scope"], serde_json::json!("local"));
+    }
+
     /// S1/T3b — THE CHECK THAT CATCHES nw-329.
     ///
     /// The audience for an "I found nothing" error is by definition someone
@@ -24499,11 +24617,17 @@ mod cli_help_contract_tests {
             "publication rollback",
         ];
 
-        // Explicit inventory, not a scan: a new diagnostic must be classified
-        // by a human, and the classification is the point.
-        let read_diagnostics = [CliDiagnostic::EmptyDatabase];
-
-        for diagnostic in read_diagnostics {
+        // nw-334/G2. This used to read `let read_diagnostics =
+        // [CliDiagnostic::EmptyDatabase];` under a comment calling itself an
+        // "explicit inventory" — a hand-maintained list of ONE, twenty lines
+        // from a neighbour that destructures all nine, so a new variant joined
+        // that neighbour by failing to compile and escaped THIS check in
+        // silence. The class this item exists to close, occurring inside the
+        // fix for it. Both tiers now read the same exhaustive inventory.
+        for (diagnostic, _, write_remedy, remedy) in diagnostic_inventory() {
+            if write_remedy != WriteRemedy::Barred {
+                continue;
+            }
             let help = diagnostic
                 .help()
                 .map(|help| help.to_string())
@@ -24515,17 +24639,82 @@ mod cli_help_contract_tests {
             for command in WRITE_COMMANDS {
                 assert!(
                     !help.contains(&format!("nestweaver {command}")),
-                    "`{code}` is a read-path diagnostic but its help prescribes \
-                     `nestweaver {command}`. A query that returned no rows has not \
-                     established that the database is empty, so it cannot know that \
-                     writing is safe. Help: {help}"
+                    "`{code}` is barred from prescribing a write but its help \
+                     prescribes `nestweaver {command}`. A query that returned no \
+                     rows has not established that the database is empty, so it \
+                     cannot know that writing is safe. Help: {help}"
                 );
             }
             assert!(
-                !help.is_empty(),
+                !help.is_empty() || matches!(remedy, Remedy::InMessage(_)),
                 "`{code}` must still offer something followable — the rule is \
                  'no writes', not 'no help'"
             );
+        }
+    }
+
+    /// nw-334/G1. A remedy is either something to RUN or something to DO, and
+    /// the shipped harness could only see the first: `suggested_command`
+    /// (`tests/error_remedy_test.rs`) returns `None` for anything that does not
+    /// contain the literal `nestweaver `, and the second form was a FIVE-PHRASE
+    /// DENYLIST (`TRANSIENT_ADVICE`). A denylist cannot enumerate the ways a
+    /// remedy can be unfollowable — "ask your administrator", "wait for the
+    /// index to settle", "the file may be locked by another tool" all pass it.
+    ///
+    /// Inverting it: every diagnostic declares WHICH FORM its remedy takes, on
+    /// the exhaustive inventory, so an instruction-shaped remedy is a decision
+    /// on the record rather than a silent no-op in the check built to catch
+    /// exactly that.
+    #[test]
+    fn every_diagnostic_declares_whether_its_remedy_is_runnable() {
+        use miette::Diagnostic;
+
+        for (diagnostic, _, _, remedy) in diagnostic_inventory() {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            match remedy {
+                Remedy::Invocation => assert!(
+                    help.contains("nestweaver "),
+                    "`{code}` is declared runnable but its help names no \
+                     command, so `backtick_quoted_remedies_still_name_a_real_\
+                     subcommand` has nothing to parse and the remedy is \
+                     unchecked: {help}"
+                ),
+                Remedy::Instruction(why) => {
+                    assert!(
+                        !why.is_empty(),
+                        "`{code}` offers an instruction rather than a command; \
+                         say why no command can express it, or the harness \
+                         cannot see the remedy at all (nw-285)"
+                    );
+                    assert!(
+                        !help.is_empty(),
+                        "`{code}` is declared to carry an instruction and \
+                         carries nothing"
+                    );
+                    assert!(
+                        !help.contains("nestweaver "),
+                        "`{code}` names a command but is tagged \
+                         `Instruction`, so T1 never checks that the command is \
+                         real. Tag it `Invocation`: {help}"
+                    );
+                }
+                Remedy::InMessage(why) => {
+                    assert!(!why.is_empty());
+                    assert!(
+                        help.is_empty(),
+                        "`{code}` is declared to carry its remedy in the \
+                         wrapped message, but it also has static help — one of \
+                         the two is unchecked: {help}"
+                    );
+                }
+            }
         }
     }
 
@@ -24550,109 +24739,9 @@ mod cli_help_contract_tests {
     fn no_permanent_diagnostic_advises_waiting_it_out() {
         use miette::Diagnostic;
 
-        /// Can this condition clear without the operator doing anything?
-        #[derive(PartialEq, Debug)]
-        enum Clears {
-            /// Another process is doing something that will finish.
-            OnItsOwn,
-            /// Nothing that runs later changes this file or this fact.
-            Never,
-        }
+        let inventory = diagnostic_inventory();
 
-        let sample = |name: &str| name.to_string();
-        let inventory: Vec<(CliDiagnostic, Clears)> = vec![
-            (
-                CliDiagnostic::DatabaseNotFound { path: sample("d") },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::RepoPathNotFound { path: sample("r") },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
-                Clears::Never,
-            ),
-            (CliDiagnostic::EmptyDatabase, Clears::Never),
-            // The one genuinely transient case: a live holder of the write lock
-            // releases it. Its help says to stop that process rather than to
-            // wait, which is stronger, but waiting is not a lie here.
-            (
-                CliDiagnostic::DatabaseUnavailable {
-                    path: sample("d"),
-                    cause: sample("c"),
-                },
-                Clears::OnItsOwn,
-            ),
-            (
-                CliDiagnostic::DatabaseWalUnreplayed {
-                    path: sample("d"),
-                    wal: sample("w"),
-                    cause: sample("c"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::DatabaseCorrupt {
-                    path: sample("d"),
-                    cause: sample("c"),
-                },
-                Clears::Never,
-            ),
-            // nw-332. An unreadable write-ahead log is deterministic: no
-            // amount of waiting makes its records parse, and starting a
-            // writer against it is the crash-restart loop.
-            (
-                CliDiagnostic::DatabaseWalCorrupt {
-                    path: sample("d"),
-                    cause: sample("c"),
-                    runbook: wal_corruption_runbook("d"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::DatabaseNoSchema {
-                    path: sample("d"),
-                    detail: sample("0 bytes"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::General {
-                    message: sample("m"),
-                },
-                Clears::Never,
-            ),
-        ];
-
-        // Compile-time completeness: destructuring every variant means a new
-        // one cannot be added without touching this match, and the arm count
-        // must equal the inventory length.
-        fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
-            match diagnostic {
-                CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
-                CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
-                CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
-                CliDiagnostic::EmptyDatabase => "empty_db",
-                CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
-                CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
-                CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
-                CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
-                CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
-                CliDiagnostic::General { .. } => "error",
-            }
-        }
-        let covered: std::collections::HashSet<&str> = inventory
-            .iter()
-            .map(|(diagnostic, _)| classify_is_total(diagnostic))
-            .collect();
-        assert_eq!(
-            covered.len(),
-            inventory.len(),
-            "the inventory must name every variant exactly once"
-        );
-
-        for (diagnostic, clears) in &inventory {
+        for (diagnostic, clears, _, _) in &inventory {
             let help = diagnostic
                 .help()
                 .map(|help| help.to_string())
@@ -25402,94 +25491,6 @@ fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_
     resp
 }
 
-/// Render the `project-context` JSON for the local (--no-daemon) path with
-/// the same wrapper shape the daemon / MCP `project_context` tool emits:
-/// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
-/// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
-/// depend on these fields, so the local and daemon paths must stay aligned.
-#[allow(clippy::too_many_arguments)]
-fn print_project_context_json(
-    project: &nestweaver_schema::Project,
-    result: &BrainContextResult,
-    limit: usize,
-    tokens_used: usize,
-    token_budget: usize,
-    external_refs: &serde_json::Value,
-    concise: bool,
-) -> anyhow::Result<()> {
-    let resp = project_context_json_value(
-        project,
-        result,
-        limit,
-        tokens_used,
-        token_budget,
-        external_refs,
-        concise,
-    );
-    println!("{}", serde_json::to_string_pretty(&resp)?);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn project_context_json_value(
-    project: &nestweaver_schema::Project,
-    result: &BrainContextResult,
-    limit: usize,
-    tokens_used: usize,
-    token_budget: usize,
-    external_refs: &serde_json::Value,
-    concise: bool,
-) -> serde_json::Value {
-    // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
-    // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
-    // emitted full nodes regardless of response_format, diverging from the daemon path.
-    let render = |n: &nestweaver_engine::BrainNode| -> serde_json::Value {
-        if concise {
-            serde_json::json!({ "kind": n.kind, "title": n.title, "location": n.location })
-        } else {
-            serde_json::json!({
-                "uid": n.uid,
-                "kind": n.kind,
-                "title": n.title,
-                "location": n.location,
-                "relevance": n.relevance,
-            })
-        }
-    };
-    let connected: Vec<serde_json::Value> =
-        result.connected.iter().take(limit).map(render).collect();
-    let mut resp = serde_json::json!({
-        "project": project.name,
-        "project_uid": project.uid,
-        "seeds_expanded": result.seeds.len(),
-        "connected": connected,
-        "tokens_used": tokens_used,
-        "token_budget": token_budget,
-        "semantic_applied": result.semantic_applied,
-        "degraded_components": result.degraded_components,
-    });
-    if !result.unresolved_seeds.is_empty() {
-        resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
-    }
-    if result.semantic_seed_count > 0 {
-        resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
-    }
-    if !result.expansion_terms.is_empty() {
-        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
-    }
-    if !external_refs.is_null() {
-        resp["external_refs"] = external_refs.clone();
-    }
-    // Measured on the FINISHED object, so every optional field above is
-    // counted. Same 4-bytes-per-token rule the daemon path uses.
-    let actual_tokens = serde_json::to_string(&resp)
-        .map(|serialized| serialized.len().div_ceil(4))
-        .unwrap_or(0);
-    resp["tokens_used"] = serde_json::json!(actual_tokens);
-    resp["budget_exceeded"] = serde_json::json!(actual_tokens > token_budget);
-    resp
-}
-
 #[cfg(test)]
 mod context_json_renderer_tests {
     use super::*;
@@ -25515,31 +25516,6 @@ mod context_json_renderer_tests {
             serde_json::json!(["semantic"])
         );
         assert_eq!(value["unresolved_seeds"], serde_json::json!(["missing"]));
-    }
-
-    #[test]
-    fn direct_project_context_never_drops_semantic_honesty() {
-        let project = nestweaver_schema::Project {
-            uid: "project:test".to_string(),
-            name: "test".to_string(),
-            summary: None,
-            instance_id: "default".to_string(),
-        };
-        let value = project_context_json_value(
-            &project,
-            &degraded_context(),
-            30,
-            0,
-            1_000,
-            &serde_json::Value::Null,
-            false,
-        );
-        assert_eq!(value["semantic_applied"], false);
-        assert_eq!(
-            value["degraded_components"],
-            serde_json::json!(["semantic"])
-        );
-        assert_eq!(value["project_uid"], "project:test");
     }
 }
 
@@ -26571,13 +26547,12 @@ fn run_contracts(
                 cfg.as_ref(),
                 nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
             );
-            let mut value = nestweaver_engine::contracts::drift_envelope(report, limit);
-            // nw-117: `_meta` is added by the federation layer, which only runs
-            // on the daemon path. This result is genuinely local scope and can
-            // say so, keeping ONE shape in both modes.
-            attach_local_meta(&mut value);
+            let value = nestweaver_engine::contracts::drift_envelope(report, limit);
             if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                // nw-117/nw-347: `_meta` is added by the federation layer, which
+                // only runs on the daemon path. This result is genuinely local
+                // scope and the emitter says so, keeping ONE shape in both modes.
+                print_json_payload(&value)?;
             } else {
                 render_contract_drift_human(&value);
             }

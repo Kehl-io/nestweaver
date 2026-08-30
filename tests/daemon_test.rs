@@ -2344,7 +2344,7 @@ credential_method = "gh"
         ])
         .assert()
         .failure()
-        .stderr(contains("restart --config"));
+        .stderr(says("restart --config"));
     assert_eq!(read_pid(), pid_a);
     assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
     assert_eq!(list_vaults(), vaults_before_mismatch);
@@ -2384,7 +2384,7 @@ credential_method = "gh"
         ])
         .assert()
         .failure()
-        .stderr(contains("restart --config"));
+        .stderr(says("restart --config"));
     assert_eq!(read_pid(), pid_a);
     assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
     assert_eq!(list_vaults(), vaults_before_mismatch);
@@ -2401,7 +2401,7 @@ credential_method = "gh"
         ])
         .assert()
         .failure()
-        .stderr(contains("restart --config"));
+        .stderr(says("restart --config"));
     assert_eq!(read_pid(), pid_a);
     assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
     assert_eq!(list_vaults(), vaults_before_mismatch);
@@ -2461,13 +2461,13 @@ credential_method = "gh"
         .arg(&config_a)
         .assert()
         .failure()
-        .stderr(contains("effective config is unknown"));
+        .stderr(says("effective config is unknown"));
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
     daemon_action_cmd(&db_path, "restart")
         .assert()
         .failure()
-        .stderr(contains("daemon has not been shut down"));
+        .stderr(says("daemon has not been shut down"));
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
     assert!(status().contains(&format!("Config: {}", canonical_a.display())));
@@ -2486,7 +2486,7 @@ credential_method = "gh"
     daemon_action_cmd(&db_path, "restart")
         .assert()
         .failure()
-        .stderr(contains("daemon has not been shut down"));
+        .stderr(says("daemon has not been shut down"));
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
 
@@ -2499,7 +2499,7 @@ credential_method = "gh"
         .arg(&config_b)
         .assert()
         .failure()
-        .stderr(contains("ownership could not be verified"));
+        .stderr(says("ownership could not be verified"));
     assert_eq!(read_pid(), pid_preserved);
     assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
 
@@ -2530,7 +2530,7 @@ credential_method = "gh"
         .arg(&missing)
         .assert()
         .failure()
-        .stderr(contains("daemon has not been shut down"));
+        .stderr(says("daemon has not been shut down"));
     assert_eq!(read_pid(), pid_overridden);
     assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
 
@@ -2541,7 +2541,7 @@ credential_method = "gh"
         .arg(&malformed)
         .assert()
         .failure()
-        .stderr(contains("daemon has not been shut down"));
+        .stderr(says("daemon has not been shut down"));
     assert_eq!(read_pid(), pid_overridden);
     assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
 
@@ -5738,16 +5738,31 @@ fn flatten_diagnostic(stderr: &str) -> String {
 // once, not at the boot ceiling.
 // ---------------------------------------------------------------------------
 
-/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
-/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
-/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
-/// nothing to observe: "will never boot" and "still booting" are the same
-/// observation, and the caller waits out the whole ceiling.
+/// `contains`, but against the FLATTENED diagnostic — so an assertion tests
+/// what the message SAYS rather than how wide the terminal was.
 ///
-/// Staged with an unwritable state directory, so the daemon cannot create its
-/// runtime directory and exits in milliseconds without ever writing a pidfile.
-/// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
-/// this without touching the operator's real state tree.
+/// nw-261. `flatten_diagnostic` reached this file and not its assertions: six
+/// `.stderr(contains(...))` calls in
+/// `daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown`
+/// still read the raw bytes, and every phrase they assert is rendered INSIDE a
+/// miette diagnostic (the message is built in `nestweaver-client` and reaches
+/// the user through `into_diagnostic`). Unlike the CI failure that fired, the
+/// interpolated paths in that message come AFTER the asserted phrases, so the
+/// wrap position is a function of the phrase text and the render width alone —
+/// deterministic, and therefore latent rather than flaky. A width change flips
+/// all six at once.
+///
+/// One predicate, so the next site is cheap. Deliberately NOT loosened to
+/// single words: `contains("Permission")` passes on a message that lost
+/// `denied`.
+#[cfg(target_os = "linux")]
+fn says(phrase: &'static str) -> impl predicates::Predicate<[u8]> {
+    predicates::function::function(move |bytes: &[u8]| {
+        flatten_diagnostic(&String::from_utf8_lossy(bytes)).contains(phrase)
+    })
+    .fn_name("flattened diagnostic contains")
+}
+
 /// The wrapped form this helper exists for, captured verbatim from the CI run
 /// that failed on 2026-08-29 while the same test passed locally. Asserting on
 /// the raw string here would fail, which is what makes this test non-vacuous:
@@ -5764,6 +5779,16 @@ fn flatten_diagnostic_recovers_a_phrase_miette_wrapped() {
     assert!(flatten_diagnostic(as_ci_rendered).contains("create log dir"));
 }
 
+/// `spawn_daemon` used to drop the spawned `Child` with all three streams sent
+/// to `/dev/null`, and the readiness loop's only early abort reads the PIDFILE.
+/// A daemon that dies BEFORE writing a pidfile therefore leaves the loop
+/// nothing to observe: "will never boot" and "still booting" are the same
+/// observation, and the caller waits out the whole ceiling.
+///
+/// Staged with an unwritable state directory, so the daemon cannot create its
+/// runtime directory and exits in milliseconds without ever writing a pidfile.
+/// `XDG_STATE_HOME` is honoured on every platform precisely so a test can do
+/// this without touching the operator's real state tree.
 #[test]
 fn a_daemon_that_cannot_boot_is_reported_without_waiting_out_the_ceiling() {
     use std::os::unix::fs::PermissionsExt;
