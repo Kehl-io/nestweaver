@@ -17218,3 +17218,118 @@ mod broken_links_window_tests {
         );
     }
 }
+
+/// nw-354. The end-to-end half: the engine's disclosure is worthless unless it
+/// reaches the consumer. `detect_changes` is the ONE non-test caller of
+/// `detect_changes_impact`, and its `gate_state` is what an agent or CI reads
+/// to decide whether a change is safe. Assert the PAYLOAD, not the struct.
+#[cfg(test)]
+mod detect_changes_gate_disclosure_tests {
+    use super::*;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    fn sym(uid: &str, name: &str, file: &str, sig: &str, entry: bool) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: sig.to_string(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn calls(src: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: "sym:target".to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 0.9,
+            link_type: None,
+            evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn a_dropped_symbol_row_cannot_reach_the_caller_as_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        for s in [
+            sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ),
+            sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true),
+            sym("sym:e1", "e1", "src/e1.rs", "fn e1()", true),
+            sym("sym:e2", "e2", "src/e2.rs", "fn e2()", true),
+            // The undecodable row: an embedded NUL in `signature`.
+            sym("sym:e3", "e3", "src/e3.rs", "fn e\u{0}3()", true),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        for src in ["sym:e0", "sym:e1", "sym:e2", "sym:e3"] {
+            store.insert_edge(&calls(src)).unwrap();
+        }
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+
+        assert_ne!(
+            payload["gate_state"],
+            json!("ok"),
+            "the gate field an agent reads must not say `ok` over a scan that \
+             dropped a row: {payload}"
+        );
+        assert_eq!(payload["status"], json!("degraded"), "{payload}");
+        let descriptors: Vec<&str> = payload["notifications"]
+            .as_array()
+            .expect("notifications array")
+            .iter()
+            .filter_map(|n| n["descriptor"].as_str())
+            .collect();
+        assert!(
+            descriptors.contains(&"store.list-symbols-incomplete"),
+            "and the reason must travel with it: {payload}"
+        );
+    }
+
+    /// The counterweight: a clean corpus must still serialise a clean gate, or
+    /// the field means nothing.
+    #[test]
+    fn a_clean_corpus_still_serialises_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true))
+            .unwrap();
+        store
+            .insert_symbol(&sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ))
+            .unwrap();
+        store.insert_edge(&calls("sym:e0")).unwrap();
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+        assert_eq!(payload["gate_state"], json!("ok"), "{payload}");
+        assert_eq!(payload["status"], json!("complete"), "{payload}");
+        assert_eq!(payload["notifications"], json!([]), "{payload}");
+    }
+}

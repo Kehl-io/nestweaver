@@ -416,9 +416,36 @@ pub fn detect_changes_impact(
     // reverse and forward walks run in memory, so cost is O(edges) and constant
     // in the number of processes — instead of the old O(entry-points × BFS) with
     // a DB round-trip per visited node, which hung on a large store.
-    let symbols = store
-        .list_all_symbols()
-        .context("list_all_symbols for change impact")?;
+    //
+    // nw-354. The scan TOLERATES an undecodable row (nw-335) rather than losing
+    // the whole corpus to it, so `Ok` does not mean "complete". Take the
+    // integrity with the rows: a dropped symbol row removes an entry point,
+    // which shrinks `affected_processes`, which lowers `RiskLevel` — and
+    // `derive_gate_state` then reports `GateState::Ok`. A row nobody could read
+    // must never make a change look SAFER. `74f82da0` wired the six callers
+    // that make a completeness claim and named this one as the follow-up; this
+    // is that follow-up, reusing its descriptor rather than minting a second
+    // string for one condition.
+    let symbols = match store.list_all_symbols_with_integrity() {
+        Ok((symbols, integrity)) => {
+            if let Some(disclosure) = integrity.disclosure() {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!(
+                        "the symbol graph could not be read completely, so this \
+                         blast radius is a FLOOR and cannot justify a merge: {disclosure}"
+                    ),
+                    descriptor: "store.list-symbols-incomplete".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+            }
+            symbols
+        }
+        // Unchanged behaviour: a scan that FAILED still fails the analysis.
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("list_all_symbols for change impact"));
+        }
+    };
     let sym_by_uid: std::collections::HashMap<String, &nestweaver_schema::Symbol> =
         symbols.iter().map(|s| (s.uid.clone(), s)).collect();
 
@@ -752,6 +779,146 @@ mod tests {
                 .iter()
                 .all(|p| !p.name.contains("entryB")),
             "unrelated entryB process must not be reported"
+        );
+    }
+
+    /// nw-354. `74f82da0` gave the whole-corpus scans a `ScanIntegrity` and
+    /// wired every caller that makes a completeness or safety claim.
+    /// `detect_changes_impact` was audited and left. It is the one that feeds a
+    /// GATE: an undecodable symbol row is invisible to `list_all_symbols`, so
+    /// an entry point disappears, the affected-process count falls, the
+    /// `RiskLevel` falls with it, and `derive_gate_state` reports `Ok`. A row
+    /// nobody could read must never make a change look safer.
+    #[test]
+    fn a_degraded_symbol_scan_cannot_report_a_clean_gate() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str, sig: &str, entry: bool| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: sig.to_string(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        // Four entry points, all reaching the changed file. entry3's signature
+        // carries the embedded NUL that `extract_string` treats as
+        // storage-engine partial-scan corruption, so the scan drops its row.
+        for s in [
+            mk(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ),
+            mk("sym:e0", "e0", "src/e0.rs", "fn e0()", true),
+            mk("sym:e1", "e1", "src/e1.rs", "fn e1()", true),
+            mk("sym:e2", "e2", "src/e2.rs", "fn e2()", true),
+            mk("sym:e3", "e3", "src/e3.rs", "fn e\u{0}3()", true),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        for src in ["sym:e0", "sym:e1", "sym:e2", "sym:e3"] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: "sym:target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+            .expect("detect_changes_impact");
+
+        assert_ne!(
+            impact.gate_state,
+            GateState::Ok,
+            "a scan that dropped a row reported a CLEAN gate — a degraded \
+             corpus made the change look safer"
+        );
+        assert_eq!(impact.status, AnalysisStatus::Degraded);
+        assert!(
+            impact
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "store.list-symbols-incomplete"),
+            "the caller must be TOLD, not just the log: {:?}",
+            impact.notifications
+        );
+    }
+
+    /// The counterweight `74f82da0` demanded for every wiring: a CLEAN scan
+    /// must not degrade, or the signal would fire always and be worthless.
+    #[test]
+    fn a_clean_symbol_scan_still_reports_a_clean_gate() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str, entry: bool| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&mk("sym:e0", "e0", "src/e0.rs", true))
+            .unwrap();
+        store
+            .insert_symbol(&mk("sym:target", "target", "src/target.rs", false))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:e0".to_string(),
+                target_uid: "sym:target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+            .expect("detect_changes_impact");
+        assert_eq!(impact.status, AnalysisStatus::Complete);
+        assert_eq!(impact.gate_state, GateState::Ok);
+        assert!(
+            !impact
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "store.list-symbols-incomplete")
         );
     }
 }
