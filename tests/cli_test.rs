@@ -7227,3 +7227,108 @@ fn repair_still_reports_a_clean_publication_on_a_healthy_database() {
     assert_eq!(payload["after"]["dirty"], serde_json::json!(false));
     assert_eq!(payload["error"], serde_json::Value::Null);
 }
+
+/// nw-359 leg (1). The product ships a runbook whose FIRST instruction is to
+/// stop everything that opens this database, because starting a daemon against
+/// a log whose records do not parse IS the crash-restart loop that took a graph
+/// down for seven hours (nw-332). The product then auto-started one against
+/// exactly that state, and what the operator saw was "daemon process exited
+/// before becoming healthy" — a message about the spawn, describing a problem
+/// in the database.
+///
+/// Autostart was a TRANSPORT decision made with no knowledge of STORAGE state:
+/// not one frame in `ensure_daemon_impl` opened, stat'd or classified the
+/// database. The guard is not new machinery — the store already classifies this
+/// as `CorruptionKind::WalUnreadable` at the FFI boundary.
+#[test]
+fn a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    // No NESTWEAVER_NO_DAEMON here: this is the DEFAULT route, the one that
+    // auto-starts, which is the whole point of the item.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !combined.contains("did not become healthy")
+            && !combined.contains("exited before becoming healthy"),
+        "the refusal must name the DATABASE state, not report a spawn that was \
+         never allowed to happen: {combined}"
+    );
+    assert!(
+        combined.contains("db_wal_corrupt"),
+        "and it must carry the corrupt-WAL classification so the CLI renders \
+         the runbook rather than a transport error: {combined}"
+    );
+}
+
+/// The counterweight, and it is the half that makes the guard honest: a
+/// database that is merely UNREPLAYED, or carrying nw-367's checkpoint debris,
+/// must still be allowed to start a daemon — a read-write open is the CORRECT
+/// remedy for both, and for the debris it is the remedy this release prints. A
+/// guard that refused there would be nw-333's unconditional attribution
+/// pointing the other way.
+#[test]
+fn the_autostart_guard_only_refuses_a_log_no_open_can_replay() {
+    use nestweaver_daemon::lifecycle::db_wal_unreadable;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A database that does not exist yet: a cold start creating one.
+    assert!(db_wal_unreadable(&dir.path().join("absent.lbug")).is_none());
+
+    // A healthy database.
+    let healthy = dir.path().join("healthy.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&healthy).unwrap();
+    }
+    assert!(db_wal_unreadable(&healthy).is_none());
+
+    // nw-367's checkpoint debris: a read-only open is refused, and starting a
+    // read-write daemon is the PUBLISHED remedy. Refusing here would break the
+    // instruction shipped in the same release.
+    let debris = dir.path().join("debris.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&debris).unwrap();
+    }
+    std::fs::write(dir.path().join("debris.lbug.wal.checkpoint"), b"").unwrap();
+    assert!(
+        nestweaver_store::GraphStore::open_read_only(&debris).is_err(),
+        "precondition: the read-only open really is refused"
+    );
+    assert!(
+        db_wal_unreadable(&debris).is_none(),
+        "checkpoint debris must still be allowed to start a daemon — that IS \
+         its remedy"
+    );
+
+    // And the one state it does refuse.
+    let corrupt = dir.path().join("corrupt.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&corrupt).unwrap();
+    }
+    std::fs::write(dir.path().join("corrupt.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    assert!(db_wal_unreadable(&corrupt).is_some());
+}

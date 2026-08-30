@@ -508,6 +508,32 @@ fn ensure_daemon_with_spawn_lock_impl(
     // spawn.
     let stale_pid = read_pid(&pidfile);
 
+    // nw-359 leg (1). The LAST moment before a process is created, and the
+    // first one at which nothing else holds this database — the warm paths
+    // returned long ago and the concurrent-starter re-check just above passed,
+    // so this costs nothing except on a genuine cold start.
+    //
+    // Autostart was, until here, a TRANSPORT decision made with no knowledge of
+    // STORAGE state: not one frame in `ensure_daemon_impl` opened, stat'd or
+    // classified the database. Meanwhile the product's own recovery runbook for
+    // an unreadable log opens with "Stop everything that opens this database
+    // (daemon, watcher, UI)", and starting a daemon against that state is what
+    // produces the crash-restart loop the operator then sees as "daemon process
+    // exited before becoming healthy" — a message about the spawn, describing a
+    // problem in the database.
+    //
+    // The probe is deliberately narrow and fails OPEN: it refuses only for a
+    // log no open can replay. An unreplayed WAL, nw-367's checkpoint debris, a
+    // database that does not exist yet, and a probe that fails for any other
+    // reason all still spawn. See `db_wal_unreadable` for why each exclusion is
+    // load-bearing rather than an oversight.
+    if let Some(error) = nestweaver_daemon::lifecycle::db_wal_unreadable(db_path) {
+        return Err(anyhow::Error::new(error).context(format!(
+            "refusing to start a daemon against the database at {}",
+            db_path.display()
+        )));
+    }
+
     // Spawn the daemon as a detached child.
     let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock)?;
 

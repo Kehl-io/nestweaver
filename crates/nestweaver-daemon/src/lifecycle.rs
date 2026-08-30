@@ -906,6 +906,42 @@ pub enum CheckpointArtifacts {
     Debris { artifacts: Vec<PathBuf> },
 }
 
+/// nw-359 leg (1). Is this database's write-ahead log unreadable?
+///
+/// `Some(error)` means, and means ONLY, that a probe open classified the log as
+/// [`nestweaver_store::CorruptionKind::WalUnreadable`]. Every other answer —
+/// including a probe that itself failed for an unrelated reason — is `None`,
+/// because a transient probe error must not become an outage.
+///
+/// # The narrowness is the point, and the excluded cases are not oversights
+///
+/// * `WalUnreplayed` must still spawn. It is precisely the state where starting
+///   a READ-WRITE daemon is the correct remedy: the daemon replays the log. A
+///   guard that refused there would be nw-333's unconditional attribution
+///   pointing the other way, and `corruption_diagnostic` says so in its own
+///   words — "readable and merely owed a replay. Not a damaged file."
+/// * nw-367's checkpoint debris must still spawn, for the same reason and more
+///   strongly: a read-write open is the PUBLISHED REMEDY for it, so refusing
+///   here would break the instruction this release just shipped.
+/// * A database that does not exist yet must still spawn — that is a cold start
+///   creating one.
+///
+/// An unreadable log is different in kind: no open replays it, read-only or
+/// read-write, however often it is retried. Starting a daemon against it is
+/// what produces the crash-restart loop, and step 1 of the runbook the product
+/// prints for this state is "stop everything that opens this database".
+pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError> {
+    if !db_path.exists() {
+        return None;
+    }
+    match nestweaver_store::GraphStore::open_read_only(db_path) {
+        Ok(_) => None,
+        Err(error) => (error.corruption_kind()
+            == Some(nestweaver_store::CorruptionKind::WalUnreadable))
+        .then(|| error.with_db_path(db_path)),
+    }
+}
+
 /// nw-367. Distinguish a LIVE checkpoint from the debris a crashed one leaves.
 ///
 /// The engine raises one message —
