@@ -611,7 +611,44 @@ fn bounded_system_config() -> lbug::SystemConfig {
         // clean runs are needed to put a false pass under 1%. If it only
         // REDUCES the rate rather than eliminating it, that is a different
         // finding and the bar has to be recomputed from the new rate.
-        .max_num_threads(env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1))
+        .max_num_threads(engine_max_threads())
+}
+
+/// The engine thread bound, read from the environment ONCE per process.
+///
+/// nw-265. Since nw-240 EVERY store open in the binary routes through
+/// `bounded_system_config`, so this key is read by `open_read_only` and
+/// `in_memory` too — 46 and 374 call sites. Re-reading a process-global on
+/// every open means any writer anywhere in the process can hand the parallel
+/// scan pool that nw-240 exists to REMOVE to every store opened after it. A
+/// unit test did exactly that: it set the key to `4` mid-run under cargo's
+/// multithreaded harness, and a sibling test opening 64 stores concurrently sat
+/// in that window.
+///
+/// Latching also removes the read side of a documented data race. Rust 2024
+/// marks `set_var` unsafe because concurrent `setenv`/`getenv` is UB, not
+/// merely untidy.
+///
+/// This is configuration: its value is fixed for the process lifetime in every
+/// real deployment. Reading it as if it were dynamic bought nothing and cost
+/// the mitigation. NOTE the default of `1` lives HERE, in code — NOT in
+/// `.cargo/config.toml`, whose `[env]` block sets only `LBUG_BUILD_FROM_SOURCE`
+/// and `NESTWEAVER_LBUG_MAX_DB_SIZE`.
+fn engine_max_threads() -> u64 {
+    static LATCHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LATCHED.get_or_init(|| {
+        parse_max_threads(std::env::var("NESTWEAVER_LBUG_MAX_THREADS").ok().as_deref())
+    })
+}
+
+/// Parse the thread bound out of an override, defaulting to the value that
+/// closes the nw-073 eviction-vs-read race.
+///
+/// Split out so the parse paths are testable WITHOUT mutating a global that
+/// every store open in the binary reads. That is the whole property the test
+/// this replaces was reaching for.
+fn parse_max_threads(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
 }
 
 fn hardened_system_config() -> lbug::SystemConfig {
@@ -4572,35 +4609,53 @@ mod tests {
 
 #[cfg(test)]
 mod hardened_config_tests {
+    /// nw-265. The test this replaces set `NESTWEAVER_LBUG_MAX_THREADS=4`
+    /// mid-run and asserted only "no panic" — buying weak coverage at the cost
+    /// of disarming a crash mitigation process-wide, because since nw-240 every
+    /// store open in the binary reads that key. The bound must be latched at
+    /// first read so a later mutation cannot reach an open.
+    ///
+    /// This test can FAIL when the property is broken: revert
+    /// `bounded_system_config` to `env_u64("NESTWEAVER_LBUG_MAX_THREADS")` and
+    /// the two reads below differ.
     #[test]
-    fn env_overrides_are_honored_and_default_bounds_threads() {
-        // Serialize the env mutation; other tests don't touch these keys.
-        // Default (no env): threads bounded to 1 to remove the eviction race.
-        // SAFETY: single-threaded test section; we set then clear.
-        unsafe {
-            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
-            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
-            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
-        }
-        // We can't read private SystemConfig fields, but we can prove the
-        // helper runs without panic under each override shape (parse paths).
+    fn the_thread_bound_is_latched_and_a_later_mutation_cannot_reach_an_open() {
+        let first = super::engine_max_threads();
+        // SAFETY: the value is latched, so this cannot reach an open — which is
+        // precisely what the assertion below proves. The key is restored
+        // immediately either way.
+        unsafe { std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "64") };
+        let after = super::engine_max_threads();
+        unsafe { std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS") };
+
+        assert_eq!(
+            first, after,
+            "the engine thread bound was re-read after the process started; any \
+             store opened after that mutation runs the parallel scan pool the \
+             nw-240 crash mitigation removes"
+        );
+    }
+
+    /// The property the old test was reaching for, without mutating a global:
+    /// the parse helper tolerates every override shape. No env, no race, no UB.
+    #[test]
+    fn a_malformed_thread_bound_falls_back_to_the_default_rather_than_panicking() {
+        assert_eq!(super::parse_max_threads(None), 1);
+        assert_eq!(super::parse_max_threads(Some("not-a-number")), 1);
+        assert_eq!(super::parse_max_threads(Some("")), 1);
+        assert_eq!(super::parse_max_threads(Some(" 4 ")), 4);
+        assert_eq!(super::parse_max_threads(Some("4")), 4);
+    }
+
+    /// The remaining two keys are read in `hardened_system_config` only, which
+    /// `open_read_only` and `in_memory` do not call — so their blast radius is
+    /// the write path, not every open. Proving the helper survives each
+    /// override shape needs no env mutation at all now that the one key that
+    /// DID leak is latched.
+    #[test]
+    fn the_hardened_config_builds_under_every_override_shape() {
         let _default = super::hardened_system_config();
-        unsafe {
-            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "4");
-            std::env::set_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES", "1073741824");
-            std::env::set_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT", "false");
-        }
-        let _overridden = super::hardened_system_config();
-        // Malformed values must not panic (fall back to default/auto).
-        unsafe {
-            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "not-a-number");
-        }
-        let _tolerant = super::hardened_system_config();
-        unsafe {
-            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
-            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
-            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
-        }
+        let _bounded = super::bounded_system_config();
     }
 }
 
