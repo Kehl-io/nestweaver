@@ -2936,6 +2936,323 @@ mod tests {
         (dir, root)
     }
 
+    /// nw-344: the double condition that makes silent link loss DETECTABLE.
+    /// A link that is neither an edge nor a broken row is invisible on BOTH
+    /// surfaces at once -- a health tool reporting nothing wrong because it
+    /// never saw the link. A test asserting only (a) would still permit that.
+    ///
+    /// LINK COUNT IN == EDGES OUT PLUS BROKEN ROWS.
+    ///
+    /// On the ticket's stated cause, honestly: `ad946989`'s nearest-ancestor
+    /// tier cannot be what repaired this shape. `nearest_ancestor_stem` compares
+    /// folder components element-wise SPECIFICALLY to reject
+    /// `Workspaces/Cortina` as an ancestor of `Workspaces/Cortina Precision/...`
+    /// -- that pair is the verbatim counter-example in its own doc comment. The
+    /// invariant below is still the right one; the narrative was not.
+    #[test]
+    fn every_link_becomes_an_edge_or_a_broken_row() {
+        // The Cortina Precision shape: a workspace hub whose links are
+        // path-qualified relative to its own folder, plus a sibling workspace
+        // sharing the `_Overview` stem so no tier can resolve by global
+        // uniqueness.
+        let (_dir, root) = make_vault(&[
+            (
+                "Workspaces/Cortina Precision/_Overview.md",
+                "# Cortina Precision\n\n\
+                 - [[plans/rollout]]\n\
+                 - [[notes/2026-08/research/recon]]\n\
+                 - [[brand-proposal-sprint/README]]\n\
+                 - [[Sibling Hub]]\n\
+                 - [[plans/does-not-exist]]\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/plans/rollout.md",
+                "# Rollout\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/notes/2026-08/research/recon.md",
+                "# Recon\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/brand-proposal-sprint/README.md",
+                "# Runbook\n",
+            ),
+            (
+                "Workspaces/Cortina Precision/Sibling Hub.md",
+                "# Sibling Hub\n",
+            ),
+            // Shares the `_Overview` stem so global-uniqueness tiers cannot
+            // fire, and is NOT a component-wise ancestor of the source folder.
+            ("Workspaces/Cortina/_Overview.md", "# Cortina\n"),
+        ]);
+        const LINKS_IN: usize = 5;
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        // (a) Nothing vanishes between the parser and the counters. The seam
+        //     that could: the `section_idx` bounds check below in this file,
+        //     which incremented no counter and recorded nothing.
+        assert_eq!(
+            result.wikilinks_resolved + result.wikilinks_unresolved,
+            LINKS_IN,
+            "nw-344: a link that is neither resolved nor unresolved has been \
+             SILENTLY DROPPED"
+        );
+        assert_eq!(result.wikilinks_resolved, LINKS_IN - 1);
+        assert_eq!(result.wikilinks_unresolved, 1);
+
+        // (b) The condition a per-tier test cannot see: a link that did NOT
+        //     resolve must be REPORTABLE. Without this half, an absent guard
+        //     and a passing guard are indistinguishable.
+        let rows = store.broken_wikilinks().unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.wikilink_text == "plans/does-not-exist"
+                    && r.current_target_uid.is_empty()),
+            "nw-344: the unresolved link must appear in broken_wikilinks, got {rows:?}"
+        );
+
+        // The resolved four are edges, and the hub is not left at 1.
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(
+            edges.len(),
+            LINKS_IN - 1,
+            "nw-344: 1 edge against 5 links is the exact failure this pins"
+        );
+    }
+
+    /// nw-344, the counterpart that keeps the conservation law honest under
+    /// tier REORDERING (nw-343 changes exactly these tiers): the totals must
+    /// hold regardless of which tier each link lands on, so this fixture is
+    /// written so several tiers fire at once.
+    ///
+    /// `note_wikilink_edges` drops self-edges and returns one row per resolved
+    /// CANDIDATE, and `broken_wikilinks` dedupes by (source note, link text) --
+    /// so the fixture deliberately holds no self-links, no ambiguous targets
+    /// and no repeated link text.
+    #[test]
+    fn conservation_holds_across_every_resolver_tier() {
+        let (_dir, root) = make_vault(&[
+            (
+                "f/src.md",
+                "# Src\n\n\
+                 - [[sibling]]\n\
+                 - [[hub]]\n\
+                 - [[globally-unique]]\n\
+                 - [[An Only Title]]\n\
+                 - [[the-alias]]\n\
+                 - [[deep/globally-unique]]\n\
+                 - [[nowhere at all]]\n",
+            ),
+            ("hub.md", "# Root Hub\n"),
+            ("f/sibling.md", "# Not The Same Title\n"),
+            ("z/globally-unique.md", "# Unique Stem\n"),
+            ("z/titled.md", "# An Only Title\n"),
+            (
+                "z/aliased.md",
+                "---\naliases: [the-alias]\n---\n# Aliased\n",
+            ),
+        ]);
+        const LINKS_IN: usize = 7;
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.wikilinks_resolved + result.wikilinks_unresolved,
+            LINKS_IN,
+            "nw-344: conservation must survive any reordering of the tier ladder"
+        );
+
+        let edges = store.note_wikilink_edges().unwrap();
+        let broken = store
+            .broken_wikilinks()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.current_target_uid.is_empty())
+            .count();
+        assert_eq!(
+            edges.len() + broken,
+            LINKS_IN,
+            "nw-344: EDGES OUT PLUS BROKEN ROWS must equal LINKS IN"
+        );
+    }
+
+    /// nw-343, the LOSS case: a path-qualified key whose basename is not
+    /// globally unique matches NEITHER fallback branch (both require
+    /// `uids.len() == 1`) and dies -- while the BARE form of the same link,
+    /// from the same folder, resolves at 0.92 via the nearest-ancestor tier,
+    /// which tolerates global ambiguity by design. Writing MORE of the path
+    /// makes the link resolve LESS often. Not hypothetical: the reference vault
+    /// holds 21 files named `_Overview.md`.
+    #[test]
+    fn a_path_qualified_key_re_enters_the_proximity_ladder() {
+        let (_dir, root) = make_vault(&[
+            ("Workspaces/Cortina/_Overview.md", "# Cortina — Overview\n"),
+            ("Workspaces/Other/_Overview.md", "# Other — Overview\n"),
+            (
+                "Workspaces/Cortina/plans/astro.md",
+                "# Astro\n\nUp: [[Cortina/_Overview]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.wikilinks_unresolved, 0,
+            "nw-343: `[[Cortina/_Overview]]` from Workspaces/Cortina/plans must not \
+             be DEAD when the bare `[[_Overview]]` from the same folder resolves \
+             at 0.92"
+        );
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let cortina = notes
+            .iter()
+            .find(|n| n.file_path.contains("Workspaces/Cortina/_Overview.md"))
+            .map(|n| n.uid.clone())
+            .unwrap();
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].1, cortina,
+            "the nearest ancestor must win, not a global guess"
+        );
+    }
+
+    /// nw-343, the CONFIDENCE case: a path-qualified key whose basename has a
+    /// same-folder match must score the same-folder tier (0.95), not the global
+    /// path-qualified fallback (0.85). Proximity must never DECREASE confidence
+    /// -- the principle `ad946989` established one tier over.
+    #[test]
+    fn a_path_qualified_key_scores_the_tier_its_basename_earns() {
+        let (_dir, root) = make_vault(&[
+            ("f/x.md", "# X\n\nSee [[sub/target]].\n"),
+            ("f/target.md", "# Alpha\n"),
+            ("g/target.md", "# Beta\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let rows = store.broken_wikilinks().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("sub/target"))
+            .expect("the path-qualified link must be present as a sub-1.0 row");
+        assert!(
+            (row.confidence - 0.95).abs() < 1e-6,
+            "nw-343: same-folder basename evidence scores 0.95; the global \
+             path-qualified fallback's 0.85 understates it (got {})",
+            row.confidence
+        );
+    }
+
+    /// nw-343: the re-entry must WIDEN the ladder, not start inventing matches.
+    /// `a_path_qualified_link_to_nowhere_stays_unresolved` already pins the
+    /// ABSENT target; this pins the AMBIGUOUS one, which is the case a careless
+    /// re-entry breaks first. `target` exists twice, in two folders neither of
+    /// which is the source's folder nor an ancestor of it -- so P2 (same
+    /// folder), P3 (nearest ancestor) and P4 (global uniqueness) must all
+    /// decline. Guessing here is nw-290.
+    #[test]
+    fn the_ladder_re_entry_declines_rather_than_guesses() {
+        let (_dir, root) = make_vault(&[
+            ("f/x.md", "# X\n\nSee [[sub/target]].\n"),
+            ("g/target.md", "# Alpha\n"),
+            ("h/target.md", "# Beta\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.wikilinks_unresolved, 1);
+    }
+
+    /// nw-342 end-to-end: the `\|` escape Obsidian REQUIRES inside a markdown
+    /// table must resolve at the tier its bare stem earns. `resolve` normalises
+    /// `\` to `/` (Windows path forms), so the unstripped escape produced the
+    /// key `backlog/` -- routed straight into nw-343's path-qualified fallback
+    /// and scored 0.85. One character of parsing; the count grows with table
+    /// usage, not with vault size.
+    #[test]
+    fn an_escaped_pipe_link_in_a_table_resolves_at_the_same_folder_tier() {
+        let (_dir, root) = make_vault(&[
+            (
+                "f/x.md",
+                "# X\n\n| col |\n| --- |\n| [[Backlog\\|the backlog]] |\n",
+            ),
+            ("f/Backlog.md", "# Not The Same Title\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_unresolved, 0);
+        let rows = store.broken_wikilinks().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.wikilink_text.eq_ignore_ascii_case("backlog"))
+            .unwrap_or_else(|| panic!("the target must be stored as `Backlog`, got {rows:?}"));
+        assert!(
+            (row.confidence - 0.95).abs() < 1e-6,
+            "nw-342: the same-folder tier, not the path-qualified fallback (got {})",
+            row.confidence
+        );
+    }
+
+    /// nw-335: one raw NUL in one note aborted the ENTIRE Tantivy + trigram
+    /// build via `list_all_sections`' `collect::<Result<Vec<_>, _>>`, leaving
+    /// `docs=0` brain-wide while `brain status` reported a healthy graph. The
+    /// canary at `read::string_is_corrupt` is a LadybugDB #678 detector whose
+    /// stated premise is "note bodies ... none contain NUL"; a pasted NUL
+    /// falsifies the premise, so the store blames engine corruption for a byte
+    /// it recorded faithfully. The observed file carried its NUL at offset
+    /// 47,354 -- past the 8 KiB window the reader's binary sniff looks at.
+    #[test]
+    fn a_nul_byte_in_one_note_does_not_kill_the_whole_index() {
+        // The NUL must sit PAST the reader's 8 KiB binary-sniff window, or the
+        // file is (correctly) refused as binary and never reaches the graph at
+        // all -- which is a different, already-handled outcome. The reported
+        // file carried its NUL at offset 47,354, and that is what makes it a
+        // note the reader accepts and the store then refuses to read back.
+        let mut dirty = String::from("# Dirty\n\n");
+        dirty.push_str(&"filler line of ordinary vault prose.\n".repeat(400));
+        dirty.push_str("before\u{0}after\n");
+        assert!(dirty.len() > 8192, "the NUL must be past the sniff window");
+        let (_dir, root) = make_vault(&[
+            (
+                "clean.md",
+                "# Clean\n\nthe unique token loadbearing lives here.\n",
+            ),
+            ("dirty.md", dirty.as_str()),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.notes_count, 2,
+            "both notes must reach the graph; skipped: {:?}",
+            result.skipped
+        );
+
+        // The abort seam itself: one bad row must not empty the vector.
+        let sections = store
+            .list_all_sections()
+            .expect("a NUL in one note body must not fail the whole section scan");
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.text_content.contains("loadbearing")),
+            "the CLEAN note's body must survive a sibling note's NUL"
+        );
+
+        // And the exact-match surface must still be alive brain-wide.
+        let hits = store
+            .regex_search("loadbearing", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !hits.results.is_empty(),
+            "nw-335: search must not go globally dark because one note holds a NUL"
+        );
+
+        // The poisoned note is not silently emptied either: the byte is dropped,
+        // the text around it survives, and the note stays searchable.
+        let dirty_hits = store
+            .regex_search("beforeafter", None, None, Some(100), Some(5_000))
+            .unwrap();
+        assert!(
+            !dirty_hits.results.is_empty(),
+            "nw-335: sanitising the NUL must keep the rest of that note indexed"
+        );
+    }
+
     /// True when the current process bypasses filesystem permission bits.
     #[cfg(unix)]
     fn running_as_root() -> bool {

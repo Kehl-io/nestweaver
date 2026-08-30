@@ -298,6 +298,20 @@ impl ContentReader for FilesystemReader {
             .into());
         }
         let source = String::from_utf8_lossy(&raw).into_owned();
+        // nw-335: the binary sniff above is WINDOWED -- the leading 8 KiB, which
+        // is what ripgrep, git and grep all look at. A NUL PAST that window is
+        // never seen, so a mostly-text file carrying one is (correctly) accepted
+        // as text and (incorrectly) carries the byte into the graph, where the
+        // store's WHOLE-string corruption canary then refuses the row and one
+        // bad row empties a whole-corpus scan. The reported file had its NUL at
+        // offset 47,354. Widening the sniff would reclassify such files as
+        // binary and lose them entirely; dropping the byte keeps the file.
+        //
+        // This covers the CODE pipeline (symbol signatures and summaries are
+        // content columns too). The markdown pipeline is covered independently
+        // at `parse_markdown`, because the watcher reads notes with
+        // `fs::read_to_string` and never passes through here.
+        let source = nestweaver_parser::strip_nul_bytes(&source).into_owned();
         if source.len() as u64 > self.limits.max_source_file_bytes() {
             return Err(SourceTooLarge {
                 path: rel_path.display().to_string(),
@@ -1868,6 +1882,46 @@ mod non_utf8_tests {
         assert!(
             source.contains('\u{FFFD}'),
             "invalid bytes should become the replacement character"
+        );
+    }
+
+    /// nw-335, the "where else": the binary sniff above is WINDOWED -- the
+    /// leading 8 KiB, as ripgrep, git and grep all do. A NUL PAST that window is
+    /// therefore not seen, and the file is decoded as text with the byte intact.
+    /// The reported file carried its NUL at offset 47,354, six times past the
+    /// window, which is exactly why it reached the graph. The store's canary
+    /// (`read::string_is_corrupt`) then scans the WHOLE string, so the reader
+    /// and the store disagree about what "contains a NUL" means and the gap is
+    /// bytes 8,193..EOF. Every content column both the markdown and the code
+    /// pipelines write flows through this one function.
+    #[test]
+    fn a_nul_past_the_binary_sniff_window_is_stripped_not_smuggled_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.js");
+        let mut bytes = b"// leading text\nfunction ok() { return 1; }\n".to_vec();
+        bytes.resize(20_000, b' ');
+        bytes.extend_from_slice(b"\nfunction late");
+        bytes.push(0);
+        bytes.extend_from_slice(b"r() { return 2; }\n");
+        assert!(bytes.len() > 8192, "the NUL must sit past the sniff window");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let reader = FilesystemReader::new(dir.path());
+        let source = reader
+            .read_file(Path::new("late.js"))
+            .expect("a mostly-text file with one late NUL is text, not binary");
+        assert!(
+            !source.contains('\0'),
+            "nw-335: a NUL must never leave the reader -- it poisons every \
+             whole-corpus scan that later reads the row back"
+        );
+        assert!(
+            source.contains("function ok()") && source.contains("function later()"),
+            "the surrounding source must survive: dropping the byte is not \
+             dropping the file"
         );
     }
 

@@ -229,6 +229,59 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// Collect a whole-corpus scan, degrading on a corrupt row rather than losing
+/// the corpus to it.
+///
+/// nw-335: `extract_string`'s NUL canary is a LadybugDB #678 detector, and
+/// `rows.map(row_to_x).collect::<Result<Vec<_>, _>>()` short-circuits on the
+/// first `Err` -- so ONE unreadable row emptied the entire vector. Both global
+/// derived indexes are built by consuming exactly these vectors (Tantivy's
+/// `write_full_corpus_with_fields` reads notes + headings + sections; the regex
+/// trigram corpus reads notes + sections + symbols), so a single note holding a
+/// pasted NUL took search to `docs=0` brain-wide while `brain status` still
+/// reported a healthy graph. A row the reader will not return is ONE lost row.
+///
+/// Only `CorruptValue` degrades. A type mismatch or an out-of-bounds column is a
+/// real query defect and still aborts: this is a corruption-tolerance seam, not
+/// a blanket `ok()`.
+///
+/// The precedent is `traverse.rs`, which skips a garbled caller uid and keeps
+/// walking. What that site got right and `extract_string` got wrong is that the
+/// canary fires on a NAVIGATIONAL key, where a NUL genuinely cannot be
+/// legitimate; `text_content` and `title` are CONTENT, where it merely should
+/// not be -- and is now stripped at ingest so that it is not.
+pub(crate) fn collect_tolerating_corrupt<T>(
+    rows: impl Iterator<Item = Result<T, StoreError>>,
+    what: &str,
+) -> Result<Vec<T>, StoreError> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_reason: Option<String> = None;
+    for row in rows {
+        match row {
+            Ok(value) => out.push(value),
+            Err(StoreError::CorruptValue { column, reason }) => {
+                skipped += 1;
+                if first_reason.is_none() {
+                    first_reason = Some(format!("column {column}: {reason}"));
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if skipped > 0 {
+        // Disclose, do not swallow: the caller's coverage is DEGRADED and an
+        // operator reading "search found nothing" needs to know why.
+        tracing::warn!(
+            "{what}: coverage DEGRADED -- skipped {skipped} corrupt row(s), \
+             kept {}; first: {}. Re-index to repair (`nestweaver brain add --force`).",
+            out.len(),
+            first_reason.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(out)
+}
+
 fn extract_opt_string(row: &[Value], idx: usize) -> Result<Option<String>, StoreError> {
     let val = row
         .get(idx)
@@ -1388,7 +1441,7 @@ impl GraphStore {
             conn.query(&q)
                 .map_err(|e| StoreError::Query(e.to_string()))?
         };
-        result.map(|row| row_to_note(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_note(&row)), "list_notes")
     }
 
     /// Count of all Note nodes (cheap for status output — no body load).
@@ -1483,7 +1536,7 @@ impl GraphStore {
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_heading(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_heading(&row)), "list_all_headings")
     }
 
     /// List all Section nodes across all vaults/notes (includes `text_content`).
@@ -1494,7 +1547,7 @@ impl GraphStore {
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_section(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_section(&row)), "list_all_sections")
     }
 
     /// List all Heading nodes belonging to notes in the given vault.
@@ -1882,7 +1935,7 @@ impl GraphStore {
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        result.map(|row| row_to_symbol(&row)).collect()
+        collect_tolerating_corrupt(result.map(|row| row_to_symbol(&row)), "list_all_symbols")
     }
 
     /// All symbols' (uid, name, kind_string). Lightweight — no signature
@@ -3603,5 +3656,165 @@ mod repo_has_content_tests {
                 .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod corrupt_row_tolerance_tests {
+    use super::*;
+
+    fn section(uid: &str, text: &str) -> Section {
+        Section {
+            uid: uid.to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 2,
+            text_hash: "h".to_string(),
+            text_content: text.to_string(),
+            word_count: 1,
+            pagerank_score: None,
+        }
+    }
+
+    fn note(uid: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: "vault:v".to_string(),
+            file_path: format!("{uid}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn heading(uid: &str, text: &str) -> Heading {
+        Heading {
+            uid: uid.to_string(),
+            note_uid: "note:clean".to_string(),
+            level: 1,
+            text: text.to_string(),
+            slug: "s".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "h".to_string(),
+            embedding: None,
+        }
+    }
+
+    fn symbol(uid: &str, signature: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: "s".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:r".to_string(),
+            file_path: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: signature.to_string(),
+            summary: None,
+            content_hash: "h".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// nw-335: a graph that ALREADY holds a NUL must stay readable without a
+    /// re-parse. `list_all_sections` collected into `Result<Vec<_>, _>`, which
+    /// short-circuits, so one unreadable row emptied the whole vector -- and
+    /// both global derived-index builds (Tantivy BM25 at
+    /// `tantivy_index.rs:1243`, the regex trigram corpus at `regex.rs:799`)
+    /// consume exactly that vector. One poisoned note therefore took search
+    /// brain-wide to `docs=0` while `brain status` still reported health.
+    ///
+    /// This is `traverse.rs:1089`'s precedent applied to the scan side: skip
+    /// the row, say so, keep the corpus.
+    #[test]
+    fn one_corrupt_row_degrades_the_scan_instead_of_emptying_it() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_section(&section("sec:clean", "loadbearing text"))
+            .unwrap();
+        store
+            .insert_section(&section("sec:dirty", "before\u{0}after"))
+            .unwrap();
+
+        let sections = store
+            .list_all_sections()
+            .expect("nw-335: one corrupt row must not fail the whole section scan");
+        assert!(
+            sections.iter().any(|s| s.uid == "sec:clean"),
+            "the clean row must survive its neighbour's NUL: {sections:?}"
+        );
+        assert!(
+            !sections.iter().any(|s| s.uid == "sec:dirty"),
+            "the corrupt row is DROPPED, not silently repaired -- the canary is \
+             still a #678 detector on a graph the reader did not write"
+        );
+    }
+
+    /// nw-335, the "where else" half: the same short-circuit sits under EVERY
+    /// whole-corpus scan the global index builds walk, not just sections.
+    /// `write_full_corpus_with_fields` reads notes, headings and sections; the
+    /// trigram corpus additionally reads symbols. A fix scoped to
+    /// `list_all_sections` would leave three identical cliffs standing.
+    #[test]
+    fn every_whole_corpus_scan_tolerates_a_corrupt_row() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store.insert_note(&note("note:clean", "Clean")).unwrap();
+        store
+            .insert_note(&note("note:dirty", "Ti\u{0}tle"))
+            .unwrap();
+        let notes = store.list_notes(None).expect("nw-335: notes scan degrades");
+        assert!(notes.iter().any(|n| n.uid == "note:clean"));
+        assert!(!notes.iter().any(|n| n.uid == "note:dirty"));
+
+        store.insert_heading(&heading("h:clean", "Clean")).unwrap();
+        store
+            .insert_heading(&heading("h:dirty", "He\u{0}ad"))
+            .unwrap();
+        let headings = store
+            .list_all_headings()
+            .expect("nw-335: headings scan degrades");
+        assert!(headings.iter().any(|h| h.uid == "h:clean"));
+        assert!(!headings.iter().any(|h| h.uid == "h:dirty"));
+
+        store
+            .insert_symbol(&symbol("sym:clean", "fn ok()"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol("sym:dirty", "fn b\u{0}ad()"))
+            .unwrap();
+        let symbols = store
+            .list_all_symbols()
+            .expect("nw-335: symbols scan degrades");
+        assert!(symbols.iter().any(|s| s.uid == "sym:clean"));
+        assert!(!symbols.iter().any(|s| s.uid == "sym:dirty"));
+    }
+
+    /// nw-335: degrading is scoped to CORRUPTION. A genuine query defect -- a
+    /// column that is not a String at all -- must still abort loudly, or the
+    /// tolerance seam turns into a blanket `ok()` that hides real bugs.
+    #[test]
+    fn a_type_mismatch_still_aborts_the_scan() {
+        let row = vec![Value::Int64(7)];
+        assert!(matches!(
+            collect_tolerating_corrupt(std::iter::once(extract_string(&row, 0)), "test"),
+            Err(StoreError::Query(_))
+        ));
     }
 }

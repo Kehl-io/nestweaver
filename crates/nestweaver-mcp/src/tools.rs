@@ -16631,3 +16631,114 @@ mod cluster_flag_forwarding_precondition_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod broken_links_window_tests {
+    use super::*;
+    use nestweaver_engine::index_markdown_directory_in_memory;
+    use std::fs;
+
+    fn make_vault(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        for (rel, content) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+        }
+        (dir, root)
+    }
+
+    /// nw-341: the ascending-confidence sort puts the same-folder (0.95) and
+    /// nearest-ancestor (0.92) tiers at the TAIL -- deliberately, so the most
+    /// severe rows come first (nw-297). With a cap and no offset, the tiers a
+    /// reviewer must inspect are exactly the ones that fall off the end: a
+    /// health tool that cannot be used to verify its own fixes.
+    ///
+    /// Note what this does NOT claim. The cap is not silent -- `read_limit`
+    /// REJECTS an out-of-range limit with an explicit error and `total` is
+    /// always in the envelope. The residual defects are the missing window and
+    /// the missing `truncated` flag, because `tool_brain_broken_links`
+    /// hand-rolls its disclosure instead of using the `Bounded` seam.
+    #[test]
+    fn the_high_confidence_tail_is_reachable_by_offset() {
+        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row.
+        let (_dir, root) = make_vault(&[
+            (
+                "f/a.md",
+                "# A\n\nSee [[Sibling]], [[al-one]], [[al-two]], [[al-three]].\n",
+            ),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("g/one.md", "---\naliases: [al-one]\n---\n# One\n"),
+            ("g/two.md", "---\naliases: [al-two]\n---\n# Two\n"),
+            ("g/three.md", "---\naliases: [al-three]\n---\n# Three\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "limit": 3 })).unwrap();
+        assert_eq!(page["total"], 4, "envelope: {page}");
+        assert_eq!(
+            page["truncated"],
+            json!(true),
+            "nw-341: a truncated page must SAY it is truncated, through the same \
+             (returned, total, truncated) seam every other bounded list uses: {page}"
+        );
+        let head: Vec<&str> = page["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            !head.contains(&"Sibling"),
+            "precondition: the 0.95 row must be the one the cap removes, got {head:?}"
+        );
+
+        let tail = tool_brain_broken_links(&store, json!({ "limit": 3, "offset": 3 })).unwrap();
+        let tail_texts: Vec<&str> = tail["broken_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["wikilink_text"].as_str().unwrap())
+            .collect();
+        assert!(
+            tail_texts.contains(&"Sibling"),
+            "nw-341: the 0.95 same-folder tier must be REACHABLE -- it is precisely \
+             what a reviewer of the wikilink tier ladder has to inspect, got {tail_texts:?}"
+        );
+        assert_eq!(
+            tail["total"], 4,
+            "total must stay the PRE-offset population: {tail}"
+        );
+        assert_eq!(
+            tail["offset"], 3,
+            "the window's origin must be echoed, or a caller paging through \
+             cannot tell which page it is holding: {tail}"
+        );
+    }
+
+    /// nw-341: an offset past the end is an empty page, not an error and not a
+    /// wrapped-around page. It must still report the true population.
+    #[test]
+    fn an_offset_past_the_population_is_an_honest_empty_page() {
+        let (_dir, root) = make_vault(&[
+            ("f/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("f/Sibling.md", "# Different Title Entirely\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let page = tool_brain_broken_links(&store, json!({ "offset": 500 })).unwrap();
+        assert_eq!(page["returned"], json!(0));
+        assert_eq!(page["total"], json!(1), "population, not remainder: {page}");
+        assert_eq!(page["truncated"], json!(true));
+        assert_eq!(
+            page["unresolved"].as_u64().unwrap() + page["low_confidence"].as_u64().unwrap(),
+            1,
+            "nw-297: classification is over the POPULATION, so it survives any \
+             window: {page}"
+        );
+    }
+}

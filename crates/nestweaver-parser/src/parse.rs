@@ -179,6 +179,33 @@ pub struct ParsedFile {
     pub type_bindings: Vec<AstTypeBinding>,
 }
 
+/// Remove raw NUL bytes from decoded source text.
+///
+/// nw-335: a NUL is not text, but it is also not necessarily corruption -- a
+/// user can paste one into a note. `nestweaver-store`'s corruption canary
+/// (`read::string_is_corrupt`) is a LadybugDB #678 partial-scan detector whose
+/// stated premise is that no column NestWeaver stores contains a NUL, and it is
+/// applied to CONTENT columns as well as navigational ones. One pasted byte
+/// therefore made the store refuse a row it had recorded faithfully, which
+/// emptied every whole-corpus scan and took Tantivy and the regex trigram
+/// corpus to `docs=0` brain-wide.
+///
+/// Stripping here makes that premise TRUE again, rather than weakening a canary
+/// that is doing real work on uids and paths. It is deliberately at the parser,
+/// the one seam every ingest path crosses: the filesystem reader's binary sniff
+/// is WINDOWED to the leading 8 KiB (the ripgrep/git/grep heuristic), and the
+/// watcher's incremental path uses `fs::read_to_string` and has no sniff at all.
+///
+/// Borrows when there is nothing to strip, so the overwhelmingly common path
+/// costs one scan and no allocation -- the same shape as nw-190's lossy decode.
+pub fn strip_nul_bytes(source: &str) -> std::borrow::Cow<'_, str> {
+    if source.contains('\0') {
+        std::borrow::Cow::Owned(source.replace('\0', ""))
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReasonCode {

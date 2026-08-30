@@ -27,6 +27,6 @@ pub use markdown::{
 pub use mermaid::{MermaidDiagram, MermaidEdge, MermaidNode, parse_mermaid};
 pub use parse::{
     AstBindingKind, AstTypeBinding, ParseError, ParseResult, ParsedFile, RawReference, RawSymbol,
-    ReferenceKind, SkipReasonCode, SkippedFile, parse_batch, parse_source,
+    ReferenceKind, SkipReasonCode, SkippedFile, parse_batch, parse_source, strip_nul_bytes,
 };
 pub use registry::{LanguageParser, ParserRegistry};
