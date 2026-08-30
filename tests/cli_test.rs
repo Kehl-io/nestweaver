@@ -7254,11 +7254,15 @@ fn a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_databa
     let runtime = tempfile::tempdir().unwrap();
     let sock = tempfile::tempdir().unwrap();
 
-    // No NESTWEAVER_NO_DAEMON here: this is the DEFAULT route, the one that
-    // auto-starts, which is the whole point of the item.
+    // The DEFAULT route, the one that auto-starts — which is the whole point of
+    // the item. `env_remove` rather than absence: an inherited
+    // NESTWEAVER_NO_DAEMON would silently move this test off the path it exists
+    // to cover, and `every_cli_invocation_pins_its_daemon_routing` requires the
+    // choice to be explicit for exactly that reason.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["brain", "status", "--db"])
         .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
@@ -7435,6 +7439,7 @@ fn instance_merge_still_routes_through_the_daemon_without_a_granted_bypass() {
         .args(["daemon", "--db"])
         .arg(&db)
         .arg("stop")
+        .env_remove("NESTWEAVER_NO_DAEMON")
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
@@ -7519,6 +7524,7 @@ fn both_export_routes_refuse_the_pair_identically() {
     let routed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
         .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
