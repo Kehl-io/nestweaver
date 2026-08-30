@@ -1994,10 +1994,43 @@ fn render_investigate_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    let more_available = payload
-        .get("more_available")
+    // nw-362(b). `more_available` counts the token-budget loop and nothing
+    // else, so a map cut by `DEFAULT_RETRIEVAL_BREADTH` printed a bare entry
+    // count with no clause at all — the same silence the machine route had,
+    // on the route a human reads. Drive the disclosure off the triple, and
+    // name each cap separately: the breadth bound is INTERNAL and cannot be
+    // raised, so telling the reader to raise `--token-budget` for it is the
+    // wrong remedy.
+    let returned = entries.len() as u64;
+    let total = payload
+        .get("total")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        .unwrap_or(returned)
+        .max(returned);
+    let dropped_notes: Vec<String> = payload
+        .get("dropped_reasons")
+        .and_then(|v| v.as_object())
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|(reason, count)| {
+                    let n = count.as_u64()?;
+                    Some(match reason.as_str() {
+                        "token_budget" => format!(
+                            "{n} entr{} dropped by the token budget — raise --token-budget",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                        "retrieval_breadth" => format!(
+                            "{n} entr{} dropped by the retrieval-breadth bound, which is \
+                             internal and cannot be raised — narrow the query or pass --scope",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                        other => format!("{n} dropped ({other})"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     println!(
         "Bundle: {}  (query: {:?})",
@@ -2009,12 +2042,15 @@ fn render_investigate_text(payload: &serde_json::Value) {
         domains.len(),
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" },
-        if more_available > 0 {
-            format!(" ({more_available} more available — raise --token-budget)")
+        if total > returned {
+            format!(" of {total}")
         } else {
             String::new()
         }
     );
+    for note in &dropped_notes {
+        println!("  note: {note}");
+    }
     // nw-120: the daemon ranks with its warm embedding model; the direct path
     // has none, so the SAME query returns a different ordering. Say which one
     // produced this map rather than letting the ranking imply a quality it did

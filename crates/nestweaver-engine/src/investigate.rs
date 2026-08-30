@@ -161,8 +161,58 @@ pub struct InvestigateResult {
     pub domains: Vec<Domain>,
     pub entries: Vec<BundleEntry>,
     /// Number of additional connected nodes dropped due to the token budget.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    ///
+    /// Unchanged in MEANING — it has always counted only the budget loop, and
+    /// its doc comment always said so while its NAME did not. What changed
+    /// (nw-362(b)) is that `skip_serializing_if` is gone: the field vanished
+    /// when it was 0, which is exactly the case a `DEFAULT_RETRIEVAL_BREADTH`
+    /// truncation produces, so the one cap that fired was invisible AND the
+    /// field that would have shown a different cap was absent. An absent key
+    /// must not be readable as "nothing was dropped" (`e09e4a80`).
+    #[serde(default)]
     pub more_available: usize,
+    /// How many entries this map is actually carrying. Equal to
+    /// `entries.len()`; present so the triple can be read without counting the
+    /// array.
+    #[serde(default)]
+    pub returned: usize,
+    /// How many connected nodes retrieval produced BEFORE any of this
+    /// function's caps.
+    ///
+    /// nw-362(b). `investigate` has five caps and `more_available` counted
+    /// ONE. `DEFAULT_RETRIEVAL_BREADTH` truncates before the token-budget loop
+    /// and incremented nothing, so an undercount was presented as a count and
+    /// a query whose neighbourhood exceeded 30 reported itself complete.
+    /// Captured at the `truncate` site, which is the only place the pre-cap
+    /// population still exists.
+    #[serde(default)]
+    pub total: usize,
+    /// `returned < total`. The standard spelling, beside the standard pair.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Why entries were dropped, counted by reason — so "retrieval breadth"
+    /// (a hard internal bound; raising the budget cannot recover a node it
+    /// threw away) is distinguishable from "token budget exhausted" (retry
+    /// with more budget).
+    ///
+    /// Keyed rather than a single `truncated_by` scalar because these caps do
+    /// NOT compose in an order: both remedies stay independently useful when
+    /// both fire. This is `HydrateResult::skipped_reasons`' shape, and it
+    /// carries the same invariant — the values sum to `total - returned`.
+    ///
+    /// The inline-body cap is deliberately NOT in here: it drops a BODY, not
+    /// an entry, so counting it would break that invariant. See
+    /// [`InvestigateResult::inline_bodies_dropped`].
+    #[serde(default)]
+    pub dropped_reasons: std::collections::BTreeMap<String, usize>,
+    /// Entries whose inline body was removed by `MAX_INLINE_BODIES`.
+    ///
+    /// A separate scalar, not a `dropped_reasons` key: the entry is present
+    /// and only its body is not, so it is not a row drop and must not be
+    /// summed with them. `investigate_expand` / `investigate_hydrate` recover
+    /// these; nothing recovers a row the breadth bound cut.
+    #[serde(default)]
+    pub inline_bodies_dropped: usize,
     /// Whether semantic retrieval contributed to this map.
     ///
     /// nw-120: the daemon passes its warm embedding model here while the CLI's
@@ -228,10 +278,6 @@ pub struct HydrateResult {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub skipped_reasons: std::collections::BTreeMap<String, usize>,
     pub entries: Vec<BundleEntry>,
-}
-
-fn is_zero(n: &usize) -> bool {
-    *n == 0
 }
 
 // ── Sidecar persistence ────────────────────────────────────────────────────
@@ -537,6 +583,12 @@ pub fn investigate(
     if let Some(ref filter) = scope_filter {
         connected.retain(|n| node_in_scope(store, n, filter));
     }
+    // nw-362(b). The pre-cap population exists ONLY here — one line later it
+    // is gone and no downstream field could recover it, which is why
+    // `more_available` (the token-budget loop's counter, three caps further
+    // down) was the only number this function ever reported.
+    let total = connected.len();
+    let dropped_by_breadth = total.saturating_sub(DEFAULT_RETRIEVAL_BREADTH);
     connected.truncate(DEFAULT_RETRIEVAL_BREADTH);
 
     // Graceful empty handling: still persist an empty bundle so the id is valid.
@@ -554,11 +606,13 @@ pub fn investigate(
     );
     // Cap the number of inlined bodies (populate_inline_bodies has no count cap).
     let mut inlined = 0usize;
+    let mut inline_bodies_dropped = 0usize;
     for node in connected.iter_mut() {
         if node.inline_body.is_some() {
             inlined += 1;
             if inlined > MAX_INLINE_BODIES {
                 node.inline_body = None;
+                inline_bodies_dropped += 1;
             }
         }
     }
@@ -622,12 +676,35 @@ pub fn investigate(
     }
 
     let semantic_applied = embed_model.is_some();
+    // nw-362(b). The keyed map, built HERE from the two counters that were
+    // already in scope. `retrieval_breadth` is a hard internal bound the
+    // caller never stated and cannot raise, which is precisely why it must be
+    // named separately from the budget it was being silently folded into.
+    let mut dropped_reasons: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    if dropped_by_breadth > 0 {
+        dropped_reasons.insert("retrieval_breadth".to_string(), dropped_by_breadth);
+    }
+    if more_available > 0 {
+        dropped_reasons.insert("token_budget".to_string(), more_available);
+    }
+    debug_assert_eq!(
+        dropped_reasons.values().sum::<usize>(),
+        total.saturating_sub(entries.len()),
+        "the reason map must account for every row between `total` and `returned`"
+    );
+
     Ok(InvestigateResult {
         bundle_id,
         query: query.to_string(),
         scope: scope.to_string(),
         scope_filtered: scope_filter.is_some(),
         domains,
+        returned: entries.len(),
+        total,
+        truncated: entries.len() < total,
+        dropped_reasons,
+        inline_bodies_dropped,
         entries,
         more_available,
         semantic_applied,
@@ -1484,6 +1561,144 @@ mod tests {
             crate::index_md::index_markdown_directory_in_memory(&vault, "test", "testvault")
                 .unwrap();
         (dir, vault, store)
+    }
+
+    /// A vault with strictly more than `DEFAULT_RETRIEVAL_BREADTH` notes
+    /// reachable from one hub, so the breadth bound actually BITES.
+    ///
+    /// `make_vault_store`'s one-note vault is under every cap in this file, so
+    /// a disclosure test written against it passes vacuously — the same trap
+    /// this cluster keeps hitting.
+    fn make_wide_vault_store() -> (tempfile::TempDir, GraphStore) {
+        const NOTES: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let links: String = (0..NOTES)
+            .map(|i| format!("- [[Leaf {i:02}]]\n"))
+            .collect();
+        fs::write(
+            vault.join("Hub.md"),
+            format!("# Hub\n\nThe hub note.\n\n{links}"),
+        )
+        .unwrap();
+        for i in 0..NOTES {
+            fs::write(
+                vault.join(format!("Leaf {i:02}.md")),
+                format!("# Leaf {i:02}\n\nA leaf of [[Hub]].\n"),
+            )
+            .unwrap();
+        }
+        let (_result, store) =
+            crate::index_md::index_markdown_directory_in_memory(&vault, "test", "testvault")
+                .unwrap();
+        (dir, store)
+    }
+
+    /// nw-362(b). `investigate` has five caps and `more_available` counted
+    /// ONE. `DEFAULT_RETRIEVAL_BREADTH` cuts BEFORE the token-budget loop and
+    /// incremented nothing, so an undercount was presented as a count — and
+    /// `#[serde(skip_serializing_if = "is_zero")]` made the field VANISH in
+    /// exactly the case a breadth truncation produces.
+    ///
+    /// COUNTERWEIGHT: a query whose neighbourhood fits under the bound must
+    /// report `truncated: false` with `returned == total` and an EMPTY reason
+    /// map, or a fix that reports a drop unconditionally passes.
+    #[test]
+    fn investigate_discloses_the_retrieval_bound_not_only_the_token_budget() {
+        let (dir, store) = make_wide_vault_store();
+        let root = dir.path();
+
+        // A budget roomy enough that the token-budget loop cannot be what cut,
+        // so any truncation reported here is attributable to the breadth bound.
+        let result = investigate(
+            &store,
+            None,
+            None,
+            root,
+            "Hub",
+            "all",
+            Some(MAX_TOKEN_BUDGET),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.total > result.returned,
+            "the retrieval bound cut and the result reports itself complete: \
+             returned={} total={} more_available={}",
+            result.returned,
+            result.total,
+            result.more_available
+        );
+        assert_eq!(result.returned, result.entries.len());
+        assert!(result.truncated, "a cut map must say so: {result:?}");
+        assert_eq!(
+            result.more_available, 0,
+            "the BUDGET did not cut here — `more_available` must stay honest \
+             about its own scope rather than absorb the other caps: {result:?}"
+        );
+        assert_eq!(
+            result.dropped_reasons.get("retrieval_breadth").copied(),
+            Some(result.total - result.returned),
+            "the caller cannot tell WHICH cap cut, and the remedies differ: \
+             raising the budget cannot recover a node the breadth bound threw \
+             away: {:?}",
+            result.dropped_reasons
+        );
+        assert_eq!(
+            result.dropped_reasons.values().sum::<usize>(),
+            result.total - result.returned,
+            "the reason map must account for every dropped row, exactly as \
+             `HydrateResult::skipped_reasons` does: {:?}",
+            result.dropped_reasons
+        );
+
+        // COUNTERWEIGHT: a small neighbourhood must claim nothing.
+        let (small_dir, _vault, small_store) = make_vault_store();
+        let small = investigate(
+            &small_store,
+            None,
+            None,
+            small_dir.path(),
+            "Deployment",
+            "all",
+            Some(MAX_TOKEN_BUDGET),
+            None,
+        )
+        .unwrap();
+        assert_eq!(small.returned, small.total, "{small:?}");
+        assert!(!small.truncated, "nothing was cut: {small:?}");
+        assert!(small.dropped_reasons.is_empty(), "{small:?}");
+    }
+
+    /// nw-362(b), the serde half. `more_available` carried
+    /// `skip_serializing_if = "is_zero"`, so it vanished when it was 0 — which
+    /// is exactly what a breadth truncation produces. An absent key cannot be
+    /// read as "not truncated" (`e09e4a80`), and every route serialises this
+    /// struct wholesale, so the presence rule has to be on the struct.
+    #[test]
+    fn the_disclosure_fields_are_present_even_when_nothing_was_dropped() {
+        let (dir, _vault, store) = make_vault_store();
+        let result = investigate(
+            &store,
+            None,
+            None,
+            dir.path(),
+            "Deployment",
+            "all",
+            Some(MAX_TOKEN_BUDGET),
+            None,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&result).unwrap();
+        for key in ["returned", "total", "truncated", "more_available"] {
+            assert!(
+                value.get(key).is_some(),
+                "`{key}` vanished from a complete answer, so a consumer cannot \
+                 tell it apart from an old producer that never had it: {value}"
+            );
+        }
     }
 
     fn bundle_of(db_path: &Path, entries: Vec<BundleEntry>) -> String {
