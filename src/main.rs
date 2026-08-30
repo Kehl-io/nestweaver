@@ -9532,6 +9532,37 @@ fn repair_open_failure(db_path: &Path, error: nestweaver_store::StoreError) -> a
     ))
 }
 
+/// nw-359 leg (2). The failure of `repair`'s READ-ONLY health probe.
+///
+/// Separate from [`repair_open_failure`], whose three answers are all about a
+/// read-write open that `repair` needed in order to WRITE. This probe writes
+/// nothing; it exists so `repair` cannot exit 0 over a database it never
+/// opened. Reusing the other function's prose would have told the operator that
+/// a read-write open failed when none was attempted.
+///
+/// Two things are load-bearing and neither is decoration:
+///
+///   * `with_db_path` — so a typed `StoreError::Corruption` names THIS database
+///     in the runbook rather than leaving `into_diagnostic` to guess a path out
+///     of prose (`daemon_held_store_error` records what guessing cost).
+///   * the phrase `database at {path}` — the shape `extract_db_path` parses, so
+///     an UNTYPED refusal (nw-367's checkpoint debris carries no
+///     `CorruptionKind`, deliberately: it is debris, not corruption) still
+///     reaches its classifier with the right path to probe.
+fn repair_probe_failure(db_path: &Path, error: nestweaver_store::StoreError) -> anyhow::Error {
+    // The path goes LAST in this sentence on purpose. `extract_db_path` takes
+    // everything between "database at " and the next `:`, and anyhow's `{:#}`
+    // joins context to source with ": " — so a path in the middle of a clause
+    // captures the rest of the clause with it, and the classifier then probes a
+    // directory that does not exist. Ending on the path makes the join itself
+    // the delimiter.
+    anyhow::Error::new(error.with_db_path(db_path)).context(format!(
+        "the index publication marker is clean, but `repair` cannot report that \
+         there is nothing to repair: it could not open the database at {}",
+        db_path.display()
+    ))
+}
+
 fn run_repair_index_publication(
     db_path: &std::path::Path,
     json: bool,
@@ -9559,7 +9590,36 @@ fn run_repair_index_publication(
 
     let recovered = outcome.as_ref().is_some_and(|o| o.recovered());
     let after = pubstat::status(db_path);
-    let exit = if !after.dirty {
+
+    // nw-359 leg (2). If we never opened the database, we have not established
+    // anything about it — and `exit` below is about to say `EXIT_SUCCESS`.
+    //
+    // A corrupt-WAL database whose publication marker happens to be CLEAN never
+    // enters the block above, so `open_error` stays `None` and `repair` printed
+    // three true sentences and exited 0. Every sentence WAS true; the exit code
+    // was the lie, and exit 0 is the one answer an unattended caller acts on.
+    //
+    // Deliberately READ-ONLY. `repair`'s subject is a sidecar marker, so it
+    // must not take the writer lock away from a live daemon merely to answer a
+    // question.
+    //
+    // Lock contention is deliberately NOT a failure here: another process
+    // holding the write lock says nothing about the database's health, and
+    // failing `repair` for it would refuse a healthy database whenever the
+    // daemon is up. Everything else IS: an unreadable log, a truncated file, an
+    // engine assertion, and nw-367's checkpoint debris all reach the classifier
+    // through the funnel below with their own remedy. This is why nw-367 had to
+    // land first — without its discriminator, a frozen WAL would arrive here
+    // with no classification at all.
+    if open_error.is_none()
+        && outcome.is_none()
+        && let Err(error) = nestweaver_store::GraphStore::open_read_only(db_path)
+        && !error.is_lock_contention()
+    {
+        open_error = Some(repair_probe_failure(db_path, error));
+    }
+
+    let exit = if !after.dirty && open_error.is_none() {
         EXIT_SUCCESS
     } else {
         EXIT_ERROR
@@ -9593,6 +9653,20 @@ fn run_repair_index_publication(
 
     println!("Database: {}", db_path.display());
     println!("Marker:   {}", status.marker_path);
+    // nw-359 leg (2). Before declaring anything clean, surrender to the probe
+    // above. "The marker is clean" is true and is not the same claim as "there
+    // is nothing to repair", which is what exit 0 conveys.
+    //
+    // nw-333 (fourth defect). This is a `return Err`, not an `eprintln!`,
+    // because a bare print never becomes a `CliDiagnostic` and never passes
+    // through `into_diagnostic` — which made
+    // `no_permanent_diagnostic_advises_waiting_it_out`, the exhaustive
+    // inventory built for exactly this class of remedy, STRUCTURALLY BLIND to
+    // it. Returning the error puts it on the one funnel every other CLI failure
+    // uses, so it is classified, redacted and covered.
+    if let Some(error) = open_error {
+        return Err(error);
+    }
     if !status.dirty {
         println!("Index publication is CLEAN — nothing to repair.");
         return Ok(exit);
@@ -9620,16 +9694,6 @@ fn run_repair_index_publication(
     if dry_run {
         println!("--dry-run: nothing was changed.");
         return Ok(exit);
-    }
-    if let Some(error) = open_error {
-        // nw-333 (fourth defect). This used to be a bare `eprintln!`, so the
-        // message never became a `CliDiagnostic` and never passed through
-        // `into_diagnostic` — which means
-        // `no_permanent_diagnostic_advises_waiting_it_out`, the exhaustive
-        // inventory built for exactly this class of remedy, was STRUCTURALLY
-        // BLIND to it. Returning the error puts it on the one funnel every
-        // other CLI failure uses, so it is classified, redacted and covered.
-        return Err(error);
     }
     if let Some(outcome) = outcome {
         println!("{}", outcome.describe());

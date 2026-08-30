@@ -7115,3 +7115,115 @@ fn a_genuinely_held_checkpoint_lock_stays_transient() {
     );
     drop(apply);
 }
+
+/// nw-359 leg (2). `repair` never opens the database when the publication
+/// marker is clean, so on a database that cannot be opened at all it prints
+/// three true sentences — Database, Marker, "Index publication is CLEAN —
+/// nothing to repair" — and exits 0.
+///
+/// (The item said it "prints nothing". It does not; the code prints three
+/// lines. The precise version is the one with a fix: every sentence it prints
+/// is TRUE and the EXIT CODE is the lie, and exit 0 is the one answer an
+/// unattended caller acts on.)
+#[test]
+fn repair_does_not_report_success_over_a_database_it_cannot_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    // The nw-332 state, built without a crash: garbage in the WAL with no
+    // `.shadow` beside it makes every open report an unreadable log.
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "exit 0 declares a repair that did not happen, on a database that \
+         cannot be opened: {combined}"
+    );
+    assert!(
+        combined.contains("MOVE ASIDE"),
+        "and it must reach the ONE runbook, not a second phrasing: {combined}"
+    );
+
+    // The same probe must ALSO see nw-367's state, which is why nw-367 had to
+    // land first: without its discriminator this arm would either miss the
+    // condition or send a frozen WAL to the move-aside runbook, which discards
+    // committed transactions.
+    let debris_dir = tempfile::tempdir().unwrap();
+    let debris_db = debris_dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&debris_db).unwrap();
+    }
+    std::fs::write(debris_dir.path().join("scratch.lbug.wal.checkpoint"), b"").unwrap();
+    let debris = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&debris_db)
+        .output()
+        .unwrap();
+    let debris_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&debris.stdout),
+        String::from_utf8_lossy(&debris.stderr)
+    );
+    assert_ne!(debris.status.code(), Some(0), "{debris_out}");
+    assert!(
+        debris_out.contains("db_checkpoint_debris"),
+        "and it must carry nw-367's classification, not the corrupt-WAL \
+         runbook: {debris_out}"
+    );
+}
+
+/// The counterweight, and it is what keeps the probe from being a blanket
+/// refusal: a HEALTHY database with a clean publication marker must still
+/// report clean and still exit 0. Without this, `repair` could satisfy the
+/// test above by failing always.
+#[test]
+fn repair_still_reports_a_clean_publication_on_a_healthy_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "{combined}");
+    assert!(
+        combined.contains("CLEAN"),
+        "a healthy database is still reported clean: {combined}"
+    );
+
+    // And the JSON route must agree on BOTH facts, or the two routes disagree
+    // about whether a repair happened — the class this repo keeps re-finding.
+    let json = nestweaver_cmd()
+        .args(["repair", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(0));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("repair --json emits JSON");
+    assert_eq!(payload["after"]["dirty"], serde_json::json!(false));
+    assert_eq!(payload["error"], serde_json::Value::Null);
+}
