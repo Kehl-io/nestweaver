@@ -23710,6 +23710,205 @@ fn render_brain_search_response(
 mod cli_help_contract_tests {
     use super::*;
 
+    // ── nw-334. The ONE exhaustive inventory of `CliDiagnostic` ─────────────
+    //
+    // Three separate tiers ask three different questions of the same nine
+    // variants, and before this they asked them of three different lists: T3c
+    // destructured all nine, T3b hand-listed ONE while calling itself explicit,
+    // and the "is this remedy followable at all" question was asked by a
+    // five-phrase denylist in `tests/error_remedy_test.rs` that no variant had
+    // to answer. A new diagnostic therefore joined one check by failing to
+    // compile and escaped the other two in silence — the nw-217 shape, inside
+    // the fix for nw-334.
+    //
+    // One inventory, three axes, and `classify_is_total` below makes adding a
+    // variant a compile error until it is classified on all three.
+
+    /// Can this condition clear without the operator doing anything?
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum Clears {
+        /// Another process is doing something that will finish.
+        OnItsOwn,
+        /// Nothing that runs later changes this file or this fact.
+        Never,
+    }
+
+    /// May this diagnostic's remedy name a command that WRITES?
+    ///
+    /// nw-329: the audience for "I found nothing" is by definition someone
+    /// whose targeting is already wrong, and a query that returned no rows has
+    /// not established that the database is empty — so sending them to `index`
+    /// is how a lookup miss becomes a production write.
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum WriteRemedy {
+        /// The condition proves nothing about what the database holds, so a
+        /// write could destroy data this error knows nothing about.
+        Barred,
+        /// The condition itself establishes that there is nothing to lose — no
+        /// database at all, or one with no schema — so a write is the correct
+        /// remedy and naming it is safe.
+        Allowed,
+    }
+
+    /// What FORM does the remedy take? nw-334/G1.
+    #[derive(PartialEq, Debug, Clone, Copy)]
+    enum Remedy {
+        /// The help names a command to RUN, which
+        /// `backtick_quoted_remedies_still_name_a_real_subcommand` then checks
+        /// against the live clap tree.
+        Invocation,
+        /// The help says what to DO and no command can express it. The string
+        /// is the reason, recorded rather than assumed.
+        Instruction(&'static str),
+        /// The remedy is not static at all — it travels in the wrapped message.
+        /// No variant-level tier can see it; this is nw-334/G3, the
+        /// acknowledged residue, named here so it is a known hole rather than
+        /// an unnoticed one.
+        InMessage(&'static str),
+    }
+
+    /// Destructures every variant, so a new one cannot be added without
+    /// touching this match. The inventory's completeness is then the arm count.
+    fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
+        match diagnostic {
+            CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
+            CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
+            CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
+            CliDiagnostic::EmptyDatabase => "empty_db",
+            CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
+            CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
+            CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+            CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
+            CliDiagnostic::General { .. } => "error",
+        }
+    }
+
+    fn diagnostic_inventory() -> Vec<(CliDiagnostic, Clears, WriteRemedy, Remedy)> {
+        let sample = |name: &str| name.to_string();
+        vec![
+            // No database exists at this path, so `index` cannot write over
+            // anything — the one case where prescribing a write is honest.
+            (
+                CliDiagnostic::DatabaseNotFound { path: sample("d") },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::RepoPathNotFound { path: sample("r") },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "which path the caller meant is information this error does \
+                     not have; only the caller can supply it",
+                ),
+            ),
+            (
+                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "the fix is to pass a different argument, which is a change \
+                     to the invocation the caller is already writing",
+                ),
+            ),
+            // nw-329: a query that returned no rows has NOT established that
+            // the database is empty.
+            (
+                CliDiagnostic::EmptyDatabase,
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            // The one genuinely transient case: a live holder of the write lock
+            // releases it. Its help says to stop that process rather than to
+            // wait, which is stronger, but waiting is not a lie here.
+            (
+                CliDiagnostic::DatabaseUnavailable {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::OnItsOwn,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::DatabaseWalUnreplayed {
+                    path: sample("d"),
+                    wal: sample("w"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::DatabaseCorrupt {
+                    path: sample("d"),
+                    cause: sample("c"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            // A file with no schema demonstrably holds no data, so `index`
+            // cannot destroy anything here. Documented on the variant itself.
+            (
+                CliDiagnostic::DatabaseNoSchema {
+                    path: sample("d"),
+                    detail: sample("0 bytes"),
+                },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
+            // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
+            // said, so no static tier can check it — nw-334/G3.
+            (
+                CliDiagnostic::General {
+                    message: sample("m"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::InMessage(
+                    "the remedy is carried by the wrapped error, which is \
+                     composed at the call site; the end-to-end table in \
+                     tests/error_remedy_test.rs is the only thing that can see \
+                     it, one row per bug",
+                ),
+            ),
+        ]
+    }
+
+    /// nw-334/G2. The inventory must name every variant EXACTLY once, on every
+    /// axis. Without this, `read_path_diagnostics_never_prescribe_a_write` and
+    /// `every_diagnostic_declares_whether_its_remedy_is_runnable` would both
+    /// pass vacuously on a variant nobody added — which is precisely how T3b
+    /// spent a release checking one diagnostic out of nine.
+    #[test]
+    fn every_diagnostic_is_classified_on_every_axis() {
+        let inventory = diagnostic_inventory();
+        let covered: std::collections::HashSet<&str> = inventory
+            .iter()
+            .map(|(diagnostic, _, _, _)| classify_is_total(diagnostic))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            inventory.len(),
+            "the inventory must name every variant exactly once: {covered:?}"
+        );
+        // The arm count is what makes the above a COMPLETENESS claim rather
+        // than a uniqueness one: `classify_is_total` destructures every
+        // variant, so a new one cannot compile until it is added there, and
+        // this equality is what then forces it into the inventory too.
+        assert_eq!(
+            inventory.len(),
+            9,
+            "a `CliDiagnostic` variant was added or removed without \
+             classifying it here"
+        );
+    }
+
     /// Stack size for the CLI-tree tests.
     ///
     /// `Cli::command()` alone overflows a test thread's default 2 MiB stack:
@@ -24165,11 +24364,17 @@ mod cli_help_contract_tests {
             "publication rollback",
         ];
 
-        // Explicit inventory, not a scan: a new diagnostic must be classified
-        // by a human, and the classification is the point.
-        let read_diagnostics = [CliDiagnostic::EmptyDatabase];
-
-        for diagnostic in read_diagnostics {
+        // nw-334/G2. This used to read `let read_diagnostics =
+        // [CliDiagnostic::EmptyDatabase];` under a comment calling itself an
+        // "explicit inventory" — a hand-maintained list of ONE, twenty lines
+        // from a neighbour that destructures all nine, so a new variant joined
+        // that neighbour by failing to compile and escaped THIS check in
+        // silence. The class this item exists to close, occurring inside the
+        // fix for it. Both tiers now read the same exhaustive inventory.
+        for (diagnostic, _, write_remedy, remedy) in diagnostic_inventory() {
+            if write_remedy != WriteRemedy::Barred {
+                continue;
+            }
             let help = diagnostic
                 .help()
                 .map(|help| help.to_string())
@@ -24181,17 +24386,82 @@ mod cli_help_contract_tests {
             for command in WRITE_COMMANDS {
                 assert!(
                     !help.contains(&format!("nestweaver {command}")),
-                    "`{code}` is a read-path diagnostic but its help prescribes \
-                     `nestweaver {command}`. A query that returned no rows has not \
-                     established that the database is empty, so it cannot know that \
-                     writing is safe. Help: {help}"
+                    "`{code}` is barred from prescribing a write but its help \
+                     prescribes `nestweaver {command}`. A query that returned no \
+                     rows has not established that the database is empty, so it \
+                     cannot know that writing is safe. Help: {help}"
                 );
             }
             assert!(
-                !help.is_empty(),
+                !help.is_empty() || matches!(remedy, Remedy::InMessage(_)),
                 "`{code}` must still offer something followable — the rule is \
                  'no writes', not 'no help'"
             );
+        }
+    }
+
+    /// nw-334/G1. A remedy is either something to RUN or something to DO, and
+    /// the shipped harness could only see the first: `suggested_command`
+    /// (`tests/error_remedy_test.rs`) returns `None` for anything that does not
+    /// contain the literal `nestweaver `, and the second form was a FIVE-PHRASE
+    /// DENYLIST (`TRANSIENT_ADVICE`). A denylist cannot enumerate the ways a
+    /// remedy can be unfollowable — "ask your administrator", "wait for the
+    /// index to settle", "the file may be locked by another tool" all pass it.
+    ///
+    /// Inverting it: every diagnostic declares WHICH FORM its remedy takes, on
+    /// the exhaustive inventory, so an instruction-shaped remedy is a decision
+    /// on the record rather than a silent no-op in the check built to catch
+    /// exactly that.
+    #[test]
+    fn every_diagnostic_declares_whether_its_remedy_is_runnable() {
+        use miette::Diagnostic;
+
+        for (diagnostic, _, _, remedy) in diagnostic_inventory() {
+            let help = diagnostic
+                .help()
+                .map(|help| help.to_string())
+                .unwrap_or_default();
+            let code = diagnostic
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            match remedy {
+                Remedy::Invocation => assert!(
+                    help.contains("nestweaver "),
+                    "`{code}` is declared runnable but its help names no \
+                     command, so `backtick_quoted_remedies_still_name_a_real_\
+                     subcommand` has nothing to parse and the remedy is \
+                     unchecked: {help}"
+                ),
+                Remedy::Instruction(why) => {
+                    assert!(
+                        !why.is_empty(),
+                        "`{code}` offers an instruction rather than a command; \
+                         say why no command can express it, or the harness \
+                         cannot see the remedy at all (nw-285)"
+                    );
+                    assert!(
+                        !help.is_empty(),
+                        "`{code}` is declared to carry an instruction and \
+                         carries nothing"
+                    );
+                    assert!(
+                        !help.contains("nestweaver "),
+                        "`{code}` names a command but is tagged \
+                         `Instruction`, so T1 never checks that the command is \
+                         real. Tag it `Invocation`: {help}"
+                    );
+                }
+                Remedy::InMessage(why) => {
+                    assert!(!why.is_empty());
+                    assert!(
+                        help.is_empty(),
+                        "`{code}` is declared to carry its remedy in the \
+                         wrapped message, but it also has static help — one of \
+                         the two is unchecked: {help}"
+                    );
+                }
+            }
         }
     }
 
@@ -24216,97 +24486,9 @@ mod cli_help_contract_tests {
     fn no_permanent_diagnostic_advises_waiting_it_out() {
         use miette::Diagnostic;
 
-        /// Can this condition clear without the operator doing anything?
-        #[derive(PartialEq, Debug)]
-        enum Clears {
-            /// Another process is doing something that will finish.
-            OnItsOwn,
-            /// Nothing that runs later changes this file or this fact.
-            Never,
-        }
+        let inventory = diagnostic_inventory();
 
-        let sample = |name: &str| name.to_string();
-        let inventory: Vec<(CliDiagnostic, Clears)> = vec![
-            (
-                CliDiagnostic::DatabaseNotFound { path: sample("d") },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::RepoPathNotFound { path: sample("r") },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::RepoPathNotADirectory { path: sample("r") },
-                Clears::Never,
-            ),
-            (CliDiagnostic::EmptyDatabase, Clears::Never),
-            // The one genuinely transient case: a live holder of the write lock
-            // releases it. Its help says to stop that process rather than to
-            // wait, which is stronger, but waiting is not a lie here.
-            (
-                CliDiagnostic::DatabaseUnavailable {
-                    path: sample("d"),
-                    cause: sample("c"),
-                },
-                Clears::OnItsOwn,
-            ),
-            (
-                CliDiagnostic::DatabaseWalUnreplayed {
-                    path: sample("d"),
-                    wal: sample("w"),
-                    cause: sample("c"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::DatabaseCorrupt {
-                    path: sample("d"),
-                    cause: sample("c"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::DatabaseNoSchema {
-                    path: sample("d"),
-                    detail: sample("0 bytes"),
-                },
-                Clears::Never,
-            ),
-            (
-                CliDiagnostic::General {
-                    message: sample("m"),
-                },
-                Clears::Never,
-            ),
-        ];
-
-        // Compile-time completeness: destructuring every variant means a new
-        // one cannot be added without touching this match, and the arm count
-        // must equal the inventory length.
-        fn classify_is_total(diagnostic: &CliDiagnostic) -> &'static str {
-            match diagnostic {
-                CliDiagnostic::DatabaseNotFound { .. } => "db_not_found",
-                CliDiagnostic::RepoPathNotFound { .. } => "repo_not_found",
-                CliDiagnostic::RepoPathNotADirectory { .. } => "repo_not_a_directory",
-                CliDiagnostic::EmptyDatabase => "empty_db",
-                CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
-                CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
-                CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
-                CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
-                CliDiagnostic::General { .. } => "error",
-            }
-        }
-        let covered: std::collections::HashSet<&str> = inventory
-            .iter()
-            .map(|(diagnostic, _)| classify_is_total(diagnostic))
-            .collect();
-        assert_eq!(
-            covered.len(),
-            inventory.len(),
-            "the inventory must name every variant exactly once"
-        );
-
-        for (diagnostic, clears) in &inventory {
+        for (diagnostic, clears, _, _) in &inventory {
             let help = diagnostic
                 .help()
                 .map(|help| help.to_string())
