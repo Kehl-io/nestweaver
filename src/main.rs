@@ -1828,8 +1828,44 @@ impl ResolverStaleness {
         }
     }
 
-    /// Sidecar-only answer, for the daemon path — which has no store handle and
-    /// must not open one, since the daemon owns the write lock.
+    /// The daemon's OWN answer, decoded out of the response it already sent.
+    ///
+    /// nw-358. `attach_ranking_staleness` puts `rankings_stale` and
+    /// `stale_repos` on every `hub_nodes` / `bridge_nodes` reply, computed by
+    /// `ranking_stale_repos` from `store.list_repos` — the EXACT enumeration.
+    /// The CLI decoded the rows and the `_meta` out of that same value and
+    /// then called [`Self::from_sidecar`] anyway, recomputing client-side, from
+    /// a weaker source, an answer it was already holding. That is what made
+    /// `hubs --json` via daemon, `hubs --json --no-daemon` and MCP `hub_nodes`
+    /// three answers for one database.
+    ///
+    /// Reading what you were sent is the same rule as nw-347's `_meta`: strip
+    /// for the decode, carry the provenance to the print.
+    ///
+    /// Falls back to the sidecar when the keys are absent, which is a daemon
+    /// older than `attach_ranking_staleness` — an under-approximation, but
+    /// never a false alarm, and strictly better than claiming nothing.
+    fn from_daemon_response(value: &serde_json::Value, db_path: &std::path::Path) -> Self {
+        match (
+            value.get("rankings_stale").and_then(|v| v.as_bool()),
+            value.get("stale_repos").and_then(|v| v.as_array()),
+        ) {
+            (Some(rankings_stale), Some(repos)) => Self {
+                rankings_stale,
+                stale_repos: repos
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            },
+            _ => Self::from_sidecar(db_path),
+        }
+    }
+
+    /// Sidecar-only answer. The FALLBACK for a daemon that did not send its
+    /// own (see [`Self::from_daemon_response`]), and nothing else uses it.
+    ///
+    /// It has no store handle and must not open one, since the daemon owns
+    /// the write lock.
     ///
     /// This is an UNDER-approximation and deliberately so. It catches the two
     /// cases the sidecar can prove: no record at all (every repo predates the
@@ -12359,7 +12395,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     print_ranking_json(
                         "hubs",
                         &hubs,
-                        &ResolverStaleness::from_sidecar(&db_path),
+                        // nw-358: read the answer the daemon already sent.
+                        &ResolverStaleness::from_daemon_response(&value, &db_path),
                         daemon_meta,
                     )?;
                 } else if hubs.is_empty() {
@@ -12475,6 +12512,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // back, so the daemon's own stamp was discarded on a route
                     // where it is strictly richer than anything this layer knows.
                     let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
+                    // nw-358: captured BEFORE `strip_hybrid_meta` consumes
+                    // `value`, for the same reason `daemon_meta` is — the
+                    // daemon already computed this from `store.list_repos` and
+                    // this layer cannot do better.
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     let bridges: Vec<nestweaver_engine::BridgeNode> =
                         match strip_hybrid_meta(value).get("bridges").cloned() {
                             Some(serde_json::Value::Null) | None => Vec::new(),
@@ -12484,12 +12526,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         // nw-308: same disclosure as `hubs`; bridges are
                         // downstream of the same edges.
-                        print_ranking_json(
-                            "bridges",
-                            &bridges,
-                            &ResolverStaleness::from_sidecar(&db_path),
-                            daemon_meta,
-                        )?;
+                        print_ranking_json("bridges", &bridges, &staleness, daemon_meta)?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
                     } else {

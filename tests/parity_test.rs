@@ -3042,3 +3042,107 @@ fn impact_applies_the_same_result_set_cap_on_both_routes() {
          of this test are the same measurement: {roomy_direct}"
     );
 }
+
+/// nw-358. `stale_repos` is produced by two different functions reading two
+/// different universes, so `hubs --json` answers differently depending on
+/// whether a daemon happens to be running — in ORDER, and (when the sidecar is
+/// incomplete) in CONTENT.
+///
+/// TWO CORRECTIONS to the finding, both load-bearing:
+///   - NEITHER route sorts. It is `ResolverGenerations::repos`, a `BTreeMap`,
+///     whose `.keys()` are lexicographic INCIDENTALLY, against
+///     `GraphStore::list_repos`, which issues `MATCH (r:Repo) RETURN` with no
+///     `ORDER BY`. No `.sort()` exists on either path.
+///   - it does NOT need 43 repos and is NOT invisible to fixtures. It needs
+///     TWO, inserted so the store's scan order is not lexicographic.
+///
+/// And a THIRD divergence the finding does not name: the daemon ALREADY ships
+/// the exact answer (`attach_ranking_staleness`, computed from
+/// `store.list_repos`) and the CLI discards it to recompute a weaker
+/// sidecar-only one whose own docstring admits it under-approximates.
+#[test]
+fn stale_repos_is_the_same_list_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(db).unwrap();
+        // REVERSE lexicographic insertion, so the graph's scan order is not
+        // sorted and the two producers are distinguishable with two repos.
+        for uid in ["repo:zeta", "repo:alpha"] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: format!("file:///tmp/{uid}"),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+    }
+    // Drop the generation record. Every repo then reads generation 0 and is
+    // stale, so both routes select the same SET — and it is also what exposes
+    // the third divergence, because the sidecar route enumerates the
+    // SIDECAR's repos (now none) while the store route enumerates the GRAPH's.
+    std::fs::remove_file(nestweaver_engine::sidecar_path(
+        db,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    ))
+    .ok();
+
+    let args = &["hubs", "--json", "--top", "3"];
+    let direct = parse_stdout("hubs (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(db, "hub_nodes", serde_json::json!({ "top_n": 3 }));
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("hubs (daemon)", &run_via_daemon(db, args));
+
+    // The set must be non-empty on the route that can see it, or all three
+    // agree vacuously.
+    assert!(
+        direct["stale_repos"].as_array().unwrap().len() >= 3,
+        "no repo read as stale, so this proves nothing: {direct}"
+    );
+    assert_eq!(
+        direct["stale_repos"], daemon["stale_repos"],
+        "one command, two answers, selected by whether a daemon happens to be \
+         running\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        direct["stale_repos"], mcp["stale_repos"],
+        "the agent-facing route disagrees with the CLI it is supposed to \
+         mirror\ncli: {direct}\nmcp: {mcp}"
+    );
+    assert_eq!(
+        direct["rankings_stale"], daemon["rankings_stale"],
+        "the boolean derived from the list must agree too\ndirect: {direct}\ndaemon: {daemon}"
+    );
+
+    // And it must be SORTED, so the answer is stable across databases and not
+    // merely across routes on this one. The repos above were inserted in
+    // reverse order, so scan order alone cannot satisfy this.
+    let listed: Vec<&str> = direct["stale_repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        listed, sorted,
+        "ordering must be a property of the SET, not of whichever container \
+         the caller happened to enumerate: {direct}"
+    );
+
+    // `bridges` is downstream of the same edges and the same two producers.
+    let bridge_args = &["bridges", "--json", "--top", "3"];
+    let bridges_direct = parse_stdout("bridges (direct)", &run_via_daemon(db, bridge_args));
+    assert_eq!(
+        bridges_direct["stale_repos"], direct["stale_repos"],
+        "`bridges` recomputes the same answer through the same pair of \
+         functions and must not be left behind: {bridges_direct}"
+    );
+}
