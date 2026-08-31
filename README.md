@@ -199,6 +199,25 @@ behind). It is a different population from the top-level `stale_repos` on
 `hub_nodes` / `repo_map`, which is resolver-generation staleness, and from
 `stale_repos` on `stale_check`, which is behind-HEAD.
 
+### `NESTWEAVER_ALLOW_NO_DAEMON` is the only thing that permits a daemon bypass
+
+**This will break CI jobs that relied on `--no-daemon` for isolation.**
+
+`--no-daemon` and `NESTWEAVER_NO_DAEMON=1` now only *request* the bypass.
+`NESTWEAVER_ALLOW_NO_DAEMON` is the only variable that *permits* it. `CI` and
+`GITHUB_ACTIONS` confer nothing — they used to, and an ambient `CI=true`
+deciding writer exclusivity was the defect.
+
+A requested-but-unpermitted bypass is **not an error**: the command prints a
+warning on stderr and routes through an autostarted daemon anyway. So a job that
+passes `--no-daemon` expecting an isolated direct store now silently gets a
+daemon, and its exit code does not change. Set `NESTWEAVER_ALLOW_NO_DAEMON=1`
+explicitly if a bypass is what you want.
+
+```sh
+NESTWEAVER_NO_DAEMON=1 NESTWEAVER_ALLOW_NO_DAEMON=1 nestweaver stale-check --db ./nw.lbug
+```
+
 Note that `hubs --json` carries two different `stale_repos`: the **top-level**
 one is resolver-generation staleness, and `_meta.stale_repos` is federation
 staleness (repos where the *local* index is behind an upstream server). They
