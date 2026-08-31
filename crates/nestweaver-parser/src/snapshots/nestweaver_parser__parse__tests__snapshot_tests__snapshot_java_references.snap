@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6381
 expression: "parsed_references(\"Simple.java\", &source)"
 ---
 - name: java.util.List
@@ -10,12 +11,12 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: java.util.ArrayList
   kind: Import
   start_line: 2
-  context: import java.util.List;
+  context: import java.util.ArrayList;
   receiver: ~
 - name: String
   kind: TypeRef
   start_line: 5
-  context: "{"
+  context: String greet(String name);
   receiver: ~
 - name: String
   kind: TypeRef
@@ -25,7 +26,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: String
   kind: TypeRef
   start_line: 6
-  context: "{"
+  context: String farewell(String name);
   receiver: ~
 - name: String
   kind: TypeRef
@@ -40,7 +41,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: String
   kind: TypeRef
   start_line: 10
-  context: "{"
+  context: private String prefix;
   receiver: ~
 - name: String
   kind: TypeRef
@@ -60,7 +61,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: String
   kind: TypeRef
   start_line: 16
-  context: "{"
+  context: "@Override"
   receiver: ~
 - name: String
   kind: TypeRef
@@ -75,7 +76,7 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: String
   kind: TypeRef
   start_line: 21
-  context: "{"
+  context: "@Override"
   receiver: ~
 - name: String
   kind: TypeRef
@@ -85,12 +86,12 @@ expression: "parsed_references(\"Simple.java\", &source)"
 - name: SimpleGreeter
   kind: TypeRef
   start_line: 27
-  context: "{"
+  context: "SimpleGreeter greeter = new SimpleGreeter(\">>>\");"
   receiver: ~
 - name: String
   kind: TypeRef
   start_line: 28
-  context: "{"
+  context: "String result = greeter.greet(\"world\");"
   receiver: ~
 - name: greet
   kind: Call

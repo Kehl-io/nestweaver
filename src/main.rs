@@ -2139,12 +2139,26 @@ fn render_dead_code_text(payload: &serde_json::Value) {
     // "N of M unreachable" believing M is the total. Printed on both branches
     // — "No dead code detected" over a short corpus is the worse of the two.
     let undecodable = num("undecodable_symbols");
+    let entry_points = num("entry_points");
     let coverage_note = || {
         if undecodable > 0 {
             println!(
                 "Coverage DEGRADED: {undecodable} symbol(s) could not be read and are missing \
                  from this analysis. Every count below is a FLOOR. Re-index to repair \
                  (`nestweaver index --force`).\n"
+            );
+        }
+        // nw-351: with no seed the reachability walk visits nothing and EVERY
+        // symbol falls out unreachable. That is the absence of a finding, not
+        // a finding, and it has to be said before the numbers rather than
+        // after them.
+        if entry_points == 0 && total > 0 {
+            println!(
+                "Coverage DEGRADED: no entry point was found, so the reachability walk had \
+                 no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \
+                 evidence that any of them is dead. Common causes: a library-shaped corpus \
+                 with no `main`, or a language whose entry-point conventions are not yet \
+                 recognised.\n"
             );
         }
     };
@@ -13431,6 +13445,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 /// floor unless the scan says which it produced.
                 coverage: &'static str,
                 undecodable_symbols: usize,
+                /// How many symbols SEEDED the reachability walk. Zero means
+                /// the BFS never started, so "N of M unreachable" is the
+                /// absence of a finding rather than one (nw-351).
+                entry_points: usize,
                 min_confidence: String,
                 unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
             }
@@ -13457,6 +13475,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "degraded"
                 },
                 undecodable_symbols: result.undecodable_symbols,
+                entry_points: result.entry_points,
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;

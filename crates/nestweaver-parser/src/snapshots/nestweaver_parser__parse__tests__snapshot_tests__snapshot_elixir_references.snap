@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4059
+assertion_line: 6507
 expression: "parsed_references(\"simple.ex\", &source)"
 ---
 - name: moduledoc
@@ -11,17 +11,17 @@ expression: "parsed_references(\"simple.ex\", &source)"
 - name: GenServer
   kind: Uses
   start_line: 4
-  context: do
+  context: use GenServer
   receiver: ~
 - name: Enum
   kind: Import
   start_line: 5
-  context: do
+  context: import Enum
   receiver: ~
 - name: Greeter.Formatter
   kind: Import
   start_line: 6
-  context: do
+  context: alias Greeter.Formatter
   receiver: ~
 - name: greet
   kind: Call
@@ -41,7 +41,7 @@ expression: "parsed_references(\"simple.ex\", &source)"
 - name: capitalize
   kind: Call
   start_line: 13
-  context: do
+  context: String.capitalize(name)
   receiver: ~
 - name: greeting_macro
   kind: Call
@@ -56,5 +56,5 @@ expression: "parsed_references(\"simple.ex\", &source)"
 - name: trim
   kind: Call
   start_line: 25
-  context: do
+  context: String.trim(text)
   receiver: ~

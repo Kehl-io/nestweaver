@@ -613,8 +613,59 @@ fn parse_cmake(reader: &dyn ContentReader) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
-        entry_files: vec![],
+        entry_files: cmake_executable_sources(&content),
     })
+}
+
+/// Collect the source files named by every `add_executable(...)` in a
+/// CMakeLists.txt.
+///
+/// nw-351: `parse_cmake` returned `entry_files: vec![]` while `Cargo.toml` and
+/// `package.json` both contribute entry files, so a CMake project fed NOTHING
+/// to `dead_code`'s manifest-driven seeding (`dead_code.rs:388`). Combined with
+/// `detect_cpp` recognising only `main` and a handful of test macros, that is
+/// how a real C++ corpus reached zero entry points and was reported 100% dead.
+///
+/// `add_executable` and not `add_library`, deliberately: a library's surface is
+/// called from outside the corpus and is not modelled as an entry point today,
+/// while an executable's sources genuinely are the program's roots.
+///
+/// The scan is over the whole file rather than line-by-line because the call is
+/// conventionally wrapped across lines. Tokens that are CMake keywords, that
+/// carry a `$` (an unresolved variable or generator expression), or that have
+/// no file extension are dropped; the first token is the target NAME, never a
+/// source.
+fn cmake_executable_sources(content: &str) -> Vec<String> {
+    const KEYWORDS: [&str; 4] = ["WIN32", "MACOSX_BUNDLE", "EXCLUDE_FROM_ALL", "IMPORTED"];
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(at) = rest.find("add_executable(") {
+        rest = &rest[at + "add_executable(".len()..];
+        let Some(close) = rest.find(')') else { break };
+        let (args, tail) = rest.split_at(close);
+        rest = tail;
+        for (index, token) in args.split_whitespace().enumerate() {
+            let token = token.trim_matches('"');
+            // The first token is the target name.
+            if index == 0 || token.is_empty() {
+                continue;
+            }
+            if KEYWORDS.contains(&token) || token.contains('$') {
+                continue;
+            }
+            if Path::new(token)
+                .extension()
+                .is_none_or(|ext| ext.is_empty())
+            {
+                continue;
+            }
+            let token = token.to_string();
+            if !out.contains(&token) {
+                out.push(token);
+            }
+        }
+    }
+    out
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -623,6 +674,37 @@ fn parse_cmake(reader: &dyn ContentReader) -> Option<ManifestInfo> {
 mod tests {
     use super::*;
     use crate::content_reader::FilesystemReader;
+
+    /// nw-351: a CMake project contributed no entry files at all, while
+    /// `Cargo.toml` and `package.json` both do — so `dead_code`'s
+    /// manifest-driven seeding had nothing to work with on any C++ corpus.
+    #[test]
+    fn parse_cmake_extracts_executable_sources_as_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "project(demo)\n\
+             find_package(Threads REQUIRED)\n\
+             add_executable(demo_cli\n\
+             \x20   src/main.cpp\n\
+             \x20   src/cli.cpp)\n\
+             add_executable(tool WIN32 tools/tool.cpp ${GENERATED_SRC})\n\
+             add_library(demo_core src/core.cpp)\n",
+        )
+        .unwrap();
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
+        assert_eq!(info.package_name.as_deref(), Some("demo"));
+        assert_eq!(
+            info.entry_files,
+            vec![
+                "src/main.cpp".to_string(),
+                "src/cli.cpp".to_string(),
+                "tools/tool.cpp".to_string(),
+            ],
+            "the target NAME, CMake keywords, unresolved `${{...}}` variables \
+             and every add_library source must all stay out"
+        );
+    }
 
     #[test]
     fn parse_package_json_extracts_name_and_deps() {

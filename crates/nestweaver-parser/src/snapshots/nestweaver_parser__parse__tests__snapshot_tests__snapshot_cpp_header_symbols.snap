@@ -1,0 +1,77 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6236
+expression: "parsed_symbols(\"inline.h\", &source)"
+---
+- name: SensorRegistry
+  kind: Class
+  start_line: 4
+  end_line: 9
+  signature: "class SensorRegistry {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: demo
+- name: add
+  kind: Method
+  start_line: 6
+  end_line: 6
+  signature: void add(int id);
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: SensorRegistry
+  scope_chain: "demo::SensorRegistry"
+- name: count_
+  kind: Property
+  start_line: 8
+  end_line: 8
+  signature: int count_;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: SensorRegistry
+  scope_chain: "demo::SensorRegistry"
+- name: SensorSlot
+  kind: Class
+  start_line: 11
+  end_line: 16
+  signature: "struct SensorSlot {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: demo
+- name: pin
+  kind: Property
+  start_line: 12
+  end_line: 12
+  signature: int pin;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: SensorSlot
+  scope_chain: "demo::SensorSlot"
+- name: reset
+  kind: Method
+  start_line: 13
+  end_line: 15
+  signature: "void reset() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: SensorSlot
+  scope_chain: "demo::SensorSlot"

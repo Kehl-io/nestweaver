@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6206
 expression: "parsed_symbols(\"simple.c\", &source)"
 ---
 - name: SensorConfig
@@ -96,7 +97,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SensorManager
   scope_chain: SensorManager
 - name: SensorManager
   kind: Class

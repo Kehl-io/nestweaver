@@ -1,17 +1,17 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4140
+assertion_line: 6323
 expression: "parsed_references(\"simple.cpp\", &source)"
 ---
 - name: iostream
-  kind: Import
+  kind: Includes
   start_line: 1
   context: "#include <iostream>"
   receiver: ~
 - name: sensor.h
-  kind: Import
+  kind: Includes
   start_line: 2
-  context: "#include <iostream>"
+  context: "#include \"sensor.h\""
   receiver: ~
 - name: calibrate
   kind: Call

@@ -52,6 +52,12 @@
   name: (type_identifier) @name
   body: (_)) @definition.class
 
+; Union definitions (mapped to class) -- parity with queries/c.scm:15-16.
+; `.h` is dispatched here since nw-352, so a genuine C header's unions must
+; still extract or the dispatch move silently loses them.
+(union_specifier
+  name: (type_identifier) @name) @definition.class
+
 ; Enum definitions
 (enum_specifier
   name: (type_identifier) @name) @definition.enum
@@ -96,9 +102,18 @@
   function: (qualified_identifier
     name: (identifier) @name)) @reference.call
 
-; #include directives
+; #include directives.
+;
+; `@reference.includes`, not `@reference.import`: `#include` is ONE construct
+; and `queries/c.scm:48-49` already models it as `@reference.includes`
+; (-> EdgeType::Includes / INCLUDES_SYM). Two adjacent languages emitting two
+; different reference kinds for the same directive is a graph-shape accident,
+; and since nw-352 routed `.h` here it would also have flipped every genuine C
+; header's include edges from INCLUDES_SYM to IMPORTS. Both kinds are resolved
+; identically by `build_import_graph` (imports.rs:132), so this costs no
+; resolution.
 (preproc_include
-  path: (string_literal) @name) @reference.import
+  path: (string_literal) @name) @reference.includes
 
 (preproc_include
-  path: (system_lib_string) @name) @reference.import
+  path: (system_lib_string) @name) @reference.includes

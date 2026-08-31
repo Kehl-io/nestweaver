@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4017
+assertion_line: 6465
 expression: "parsed_references(\"simple.lua\", &source)"
 ---
 - name: require
@@ -36,7 +36,7 @@ expression: "parsed_references(\"simple.lua\", &source)"
 - name: print
   kind: Call
   start_line: 29
-  context: "local json = require(\"json\")"
+  context: "print(g:greet())"
   receiver: ~
 - name: format_name
   kind: Call
@@ -46,5 +46,5 @@ expression: "parsed_references(\"simple.lua\", &source)"
 - name: print
   kind: Call
   start_line: 30
-  context: "local json = require(\"json\")"
+  context: "print(format_name(\"test\"))"
   receiver: ~

@@ -1,12 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4031
+assertion_line: 6479
 expression: "parsed_references(\"simple.sh\", &source)"
 ---
 - name: source
   kind: Call
   start_line: 3
-  context: "#!/bin/bash"
+  context: source ./utils.sh
   receiver: ~
 - name: source
   kind: Import
@@ -16,7 +16,7 @@ expression: "parsed_references(\"simple.sh\", &source)"
 - name: echo
   kind: Call
   start_line: 8
-  context: "{"
+  context: "echo \"Hello, ${name}!\""
   receiver: ~
 - name: echo
   kind: Call
@@ -36,10 +36,10 @@ expression: "parsed_references(\"simple.sh\", &source)"
 - name: greet
   kind: Call
   start_line: 20
-  context: "{"
+  context: "greet \"$formatted\""
   receiver: ~
 - name: main
   kind: Call
   start_line: 23
-  context: "#!/bin/bash"
+  context: "main \"$@\""
   receiver: ~

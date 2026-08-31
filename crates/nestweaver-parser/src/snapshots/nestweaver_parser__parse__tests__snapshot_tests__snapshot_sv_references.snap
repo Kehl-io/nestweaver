@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6689
 expression: "parsed_references(\"simple.sv\", &source)"
 ---
 - name: common_defs.svh
@@ -10,25 +11,25 @@ expression: "parsed_references(\"simple.sv\", &source)"
 - name: uvm_pkg
   kind: Import
   start_line: 3
-  context: "`include \"common_defs.svh\""
+  context: "import uvm_pkg::*;"
   receiver: ~
 - name: BusTransaction
   kind: Import
   start_line: 4
-  context: "`include \"common_defs.svh\""
+  context: "import bus_pkg::BusTransaction;"
   receiver: ~
 - name: bus_pkg
   kind: Import
   start_line: 4
-  context: "`include \"common_defs.svh\""
+  context: "import bus_pkg::BusTransaction;"
   receiver: ~
 - name: sub_module
   kind: Call
   start_line: 25
-  context: "module top_module #("
+  context: "sub_module #(.WIDTH(WIDTH)) u_sub ("
   receiver: ~
 - name: base_packet
   kind: Extends
   start_line: 45
-  context: "`include \"common_defs.svh\""
+  context: class packet extends base_packet;
   receiver: ~

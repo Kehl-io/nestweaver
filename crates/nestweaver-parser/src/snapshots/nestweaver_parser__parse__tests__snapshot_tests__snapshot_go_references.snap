@@ -1,16 +1,17 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6295
 expression: "parsed_references(\"simple.go\", &source)"
 ---
 - name: fmt
   kind: Import
   start_line: 4
-  context: (
+  context: "\"fmt\""
   receiver: ~
 - name: strings
   kind: Import
   start_line: 5
-  context: (
+  context: "\"strings\""
   receiver: ~
 - name: string
   kind: TypeRef
@@ -25,7 +26,7 @@ expression: "parsed_references(\"simple.go\", &source)"
 - name: string
   kind: TypeRef
   start_line: 14
-  context: "{"
+  context: Prefix string
   receiver: ~
 - name: ConsoleGreeter
   kind: TypeRef
@@ -40,7 +41,7 @@ expression: "parsed_references(\"simple.go\", &source)"
 - name: string
   kind: TypeRef
   start_line: 17
-  context: package main
+  context: "func (g *ConsoleGreeter) Greet(name string) string {"
   receiver: ~
 - name: Prefix
   kind: ReadAccess
@@ -70,7 +71,7 @@ expression: "parsed_references(\"simple.go\", &source)"
 - name: string
   kind: TypeRef
   start_line: 21
-  context: package main
+  context: "func (g *ConsoleGreeter) Farewell(name string) string {"
   receiver: ~
 - name: Prefix
   kind: ReadAccess
@@ -90,7 +91,7 @@ expression: "parsed_references(\"simple.go\", &source)"
 - name: Greeter
   kind: TypeRef
   start_line: 25
-  context: package main
+  context: "func NewGreeter(prefix string) Greeter {"
   receiver: ~
 - name: string
   kind: TypeRef
