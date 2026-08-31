@@ -14,6 +14,28 @@ file for your platform. Release archive names follow this pattern:
 | macOS Intel | `x86_64-apple-darwin` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 
+### Platform baselines
+
+These are the floors the release archives are built against, and they are
+enforced in CI against the artifact itself rather than assumed from the build
+host.
+
+| Platform | Baseline | Covers |
+| --- | --- | --- |
+| Linux (both architectures) | **glibc 2.35** | Ubuntu 22.04 LTS and newer, Debian 12, RHEL/Rocky 9 |
+| macOS | **13.3** | LadybugDB uses floating-point `std::format` |
+
+Check your glibc with `ldd --version`. If it is older than 2.35 — RHEL 8,
+Ubuntu 20.04, Debian 11 — the GNU archives will not start, and the failure is
+a loader error naming a missing `GLIBC_` symbol rather than anything from
+NestWeaver. Build from source on those systems.
+
+Releases through v8.0.0 were built on `ubuntu-latest`, which moved to 24.04 and
+raised the shipped floor to glibc 2.39 without anyone declaring it, so those
+archives do not start on any of the distributions listed above. If you are on
+v8.0.0 and hit a `GLIBC_` loader error, that is this defect; upgrade to 9.0.0
+or later.
+
 For the selected release tag and target, download
 `nestweaver-<tag>-<target>.tar.gz` and
 `nestweaver-<tag>-<target>.tar.gz.sha256`. Do not substitute a version number

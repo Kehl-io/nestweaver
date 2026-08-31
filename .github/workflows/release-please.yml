@@ -63,11 +63,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux GNU archives are built on the OLDEST supported runner on
+          # purpose. glibc is backward compatible, not forward: a binary built
+          # against 2.39 will not start on 2.35, so the build host's glibc IS
+          # the compatibility floor shipped to users. `ubuntu-latest` moved to
+          # 24.04 and silently raised that floor to 2.39, which is why the
+          # public v8.0.0 GNU archive cannot start on Ubuntu 22.04 (2.35),
+          # Debian 12 (2.36) or RHEL 9 (2.34). Pinning 22.04 covers all three.
+          # The `Verify release binary` step enforces the floor rather than
+          # trusting this pin.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             features: ""
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             features: ""
           - target: x86_64-apple-darwin
             os: macos-15-intel
@@ -227,6 +236,27 @@ jobs:
             readelf -d "$BIN" | tee linked-libraries.txt
             if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' linked-libraries.txt; then
               echo "release binary has a dynamic OpenSSL dependency" >&2
+              exit 1
+            fi
+
+            # Enforce the declared glibc baseline. The runner pin above sets
+            # this floor, but a pin is a claim about the build host; this reads
+            # the requirement back off the ARTIFACT WE ARE ABOUT TO SHIP, which
+            # is the only thing users run. Without it, a future runner-image
+            # bump raises the floor silently again -- exactly how the v8.0.0
+            # archive shipped requiring GLIBC_2.39.
+            GLIBC_BASELINE=2.35
+            MAX_GLIBC="$(readelf -V "$BIN" 2>/dev/null \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+            echo "max glibc required by artifact: ${MAX_GLIBC:-none}"
+            if [ -z "$MAX_GLIBC" ]; then
+              echo "::error::could not read glibc requirements from $BIN; refusing to ship an unverified floor" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$GLIBC_BASELINE" | sort -V | tail -1)" != "$GLIBC_BASELINE" ]; then
+              echo "::error::artifact requires GLIBC_$MAX_GLIBC, above the declared baseline of $GLIBC_BASELINE." >&2
+              echo "It will not start on Ubuntu 22.04 (2.35), Debian 12 (2.36) or RHEL 9 (2.34)." >&2
+              echo "Either build on an older runner or raise the baseline deliberately and document it in INSTALL.md." >&2
               exit 1
             fi
           fi
