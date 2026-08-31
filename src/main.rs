@@ -3102,12 +3102,16 @@ mod daemon_status_renderer_tests {
 enum Commands {
     /// Read the custom annotations agents write via the `set_extension` MCP tool.
     ///
-    /// nw-229: `set_extension` and `query_extensions` were BOTH agent-only, so
-    /// an agent could write key/value annotations that influence a human's
-    /// results — the CLI consumes the sidecar internally for alias matching and
-    /// `external_refs` — with no command to read them back. Write-only-for-
-    /// agents is a defensible design; write-AND-read-only-for-agents makes a
-    /// persistent store that affects output unauditable by its owner.
+    /// These annotations are not inert: the CLI consumes the sidecar
+    /// internally for alias matching and `external_refs`, so they influence
+    /// the results you get from other commands.
+    //
+    // nw-229. `set_extension` and `query_extensions` were BOTH agent-only, so
+    // an agent could write annotations that steer a human's results with no
+    // command to read them back. Write-only-for-agents is a defensible design;
+    // write-AND-read-only-for-agents makes a persistent store that affects
+    // output unauditable by its owner. That is the RATIONALE for the command
+    // existing, which is not what someone running `--help` is asking.
     #[command(
         after_help = "Examples:\n  nestweaver extensions list\n  nestweaver extensions list --uid sym:repo:abc\n  nestweaver extensions list --key owner --value platform-team\n  nestweaver extensions list --json"
     )]
@@ -3168,9 +3172,9 @@ enum Commands {
     /// vector that was never tombstoned is still SCORED, and one outranking a
     /// live result silently consumes a top-k slot in semantic search.
     ///
-    /// Ongoing tombstoning is automatic (nw-204); this exists for brains that
-    /// already accumulated orphans, and as an explicit way to force the
-    /// reclaim rather than waiting for the ratio threshold.
+    /// Ongoing tombstoning is automatic; this exists for brains that already
+    /// accumulated orphans, and as an explicit way to force the reclaim rather
+    /// than waiting for the ratio threshold.
     ///
     /// Runs through the daemon, which holds the same write gate for this that
     /// it holds for indexing — so it cannot race an in-flight index or watcher
@@ -3243,8 +3247,12 @@ enum Commands {
     ///
     /// Gate CI on 2, never on 1: those two demand opposite responses, and a
     /// gate that treats them alike either re-indexes on a crash or passes on
-    /// real drift. This said "exits 1 when any repo is stale" while the code
-    /// exited 2, which inverted both.
+    /// real drift.
+    //
+    // This help once said "exits 1 when any repo is stale" while the code
+    // exited 2, which inverted both. What the text USED to claim is history,
+    // not an instruction — a reader of `--help` needs the current ladder and
+    // nothing else.
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
@@ -3257,8 +3265,8 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
-    /// Measure affected-tests selection quality against full-suite outcomes
-    /// (nw-037): record ground truth from CI, report rolling recall.
+    /// Measure affected-tests selection quality against full-suite outcomes:
+    /// record ground truth from CI, report rolling recall.
     RtsEval {
         #[command(subcommand)]
         command: RtsEvalCommands,
@@ -3985,12 +3993,13 @@ enum Commands {
 
         /// Repository to watch under `--watch`. Defaults to the repository
         /// root detected from the current directory.
-        ///
-        /// nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
-        /// mutates the graph continuously and previously had no way to state
-        /// its source at all, so a guard that refuses a wholly-inferred write
-        /// would have left `ui --watch` unusable rather than correctable.
-        /// Additive and non-breaking.
+        //
+        // nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
+        // mutates the graph continuously and previously had no way to state
+        // its source at all, so a guard that refuses a wholly-inferred write
+        // would have left `ui --watch` unusable rather than correctable.
+        // Additive and non-breaking. Deliberately `//`: that is why the flag
+        // EXISTS, not what it does, and clap would print it as `--help`.
         #[arg(
             long,
             help = "Repository to watch (with --watch); defaults to the detected repo root"
@@ -4272,20 +4281,28 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
-        /// nw-316: `Option<bool>`, because a bare clap `bool` cannot express
-        /// "unset" and the tool's documented default is TRUE. Sending clap's
-        /// `false` unconditionally made that default UNREACHABLE on this
-        /// route, and `component_uids` feeds both the PPR seed set and the x5
-        /// membership boost — so the daemon and direct routes ranked the same
-        /// request differently, and neither said so.
-        ///
-        /// `--include-components` bare still means true; `--include-components
-        /// false` is how you opt out.
+        // nw-316: `Option<bool>`, because a bare clap `bool` cannot express
+        // "unset" and the tool's documented default is TRUE. Sending clap's
+        // `false` unconditionally made that default UNREACHABLE on this route,
+        // and `component_uids` feeds both the PPR seed set and the x5
+        // membership boost — so the daemon and direct routes ranked the same
+        // request differently, and neither said so.
+        //
+        // Deliberately `//`, and the user-facing half is an explicit
+        // `long_help =` rather than a `///`: that rationale WAS the entire
+        // `--help` entry for this flag, and a doc comment sitting beside a
+        // `help =` is silently DISCARDED by clap-derive unless it runs to two
+        // paragraphs — which is how the three states would have vanished while
+        // looking like they had been written down.
         #[arg(
             long,
             num_args = 0..=1,
             default_missing_value = "true",
-            help = "Also include notes/symbols from component sub-projects (default: true)"
+            help = "Also include notes/symbols from component sub-projects (default: true)",
+            long_help = "Also include notes/symbols from component sub-projects.\n\n\
+                         Three-state: passing neither form leaves the default (true) in \
+                         place, `--include-components` bare means true, and \
+                         `--include-components false` is how you opt out."
         )]
         include_components: Option<bool>,
         #[arg(long, help = "Output as JSON")]
@@ -4297,18 +4314,25 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
-        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
-        /// Symbol nodes are always kept.
+        /// Hard filter: only Note/Section nodes modified after this ISO 8601
+        /// timestamp. Symbol nodes are always kept.
         ///
-        /// nw-295: validated AND normalised at the clap boundary, not at the
-        /// filter. `modified_at` is a String column, so the downstream
-        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
-        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
-        /// `'2'` (0x32), which made an unparseable value byte-identical to
-        /// `2099-12-31`: it matched no note and silently dropped every Note and
-        /// Section from the answer while exiting 0. Parsing here is the only
-        /// layer that runs before BOTH the daemon and direct routes, so neither
-        /// can be reached with a value the other would have rejected.
+        /// Accepts a date (`2026-01-31`) or a full timestamp
+        /// (`2026-01-31T00:00:00Z`); anything else is refused at parse time.
+        //
+        // nw-295: validated AND normalised at the clap boundary, not at the
+        // filter. `modified_at` is a String column, so the downstream
+        // `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        // `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        // `'2'` (0x32), which made an unparseable value byte-identical to
+        // `2099-12-31`: it matched no note and silently dropped every Note and
+        // Section from the answer while exiting 0. Parsing here is the only
+        // layer that runs before BOTH the daemon and direct routes, so neither
+        // can be reached with a value the other would have rejected.
+        //
+        // Deliberately `//`: this was the ENTIRE `--help` entry for `--since`,
+        // so the long form described the String column while only `-h` named
+        // the two accepted spellings. The `///` above now carries both.
         #[arg(
             long = "since",
             value_parser = |s: &str| nestweaver_engine::parse_since(s),
@@ -4729,7 +4753,7 @@ enum Commands {
         files: Option<String>,
         #[arg(
             long,
-            help = "Diff against this ref (e.g. the merge-base) instead of the working tree"
+            help = "Diff against this ref instead of the working tree alone. Runs `git diff --name-only <ref>`, so uncommitted edits are still included; pass a merge-base sha for branch-only changes"
         )]
         base: Option<String>,
         #[arg(
@@ -4777,9 +4801,16 @@ enum Commands {
             conflicts_with = "base_ref"
         )]
         files: Option<String>,
+        // This said "uses git diff --name-only base...HEAD". It runs
+        // `git diff --name-only <ref>` — two dots, against the WORKING TREE.
+        // The two are different selections on any branch whose base has moved
+        // on: three-dot is the merge-base diff and excludes uncommitted edits,
+        // two-dot includes them and also reports files the base changed. For a
+        // command whose whole output is "which tests must run", describing the
+        // wrong one of those is a wrong CI gate.
         #[arg(
             long = "base-ref",
-            help = "Git ref to diff against (e.g. main); uses git diff --name-only base...HEAD"
+            help = "Git ref to diff against (e.g. main). Runs `git diff --name-only <ref>`: that compares the ref to your WORKING TREE, so uncommitted edits are included and this is NOT the merge-base (`<ref>...HEAD`) diff — pass a merge-base sha if that is what you want"
         )]
         base_ref: Option<String>,
         #[arg(long, help = "Output as JSON")]
@@ -4819,7 +4850,12 @@ enum Commands {
     /// supported source files. Changes are debounced into 2-second windows
     /// and each batch triggers an incremental re-index. Ctrl-C stops cleanly.
     #[command(
-        after_help = "Examples:\n  nestweaver watch\n  nestweaver watch --repo ./my-project\n  nestweaver watch --repo ./my-project --db ./custom.lbug"
+        // The repo is POSITIONAL here (`[REPO]`), unlike `index --repo`. These
+        // examples spelled it `--repo`, so two of the three documented
+        // invocations exited 64 with "unexpected argument '--repo' found" —
+        // from the command that had just recommended them. Pinned by
+        // `every_help_example_parses`.
+        after_help = "Examples:\n  nestweaver watch\n  nestweaver watch ./my-project\n  nestweaver watch ./my-project --db ./custom.lbug"
     )]
     Watch {
         /// Path to the repository to watch (auto-detects if omitted)
@@ -5093,7 +5129,7 @@ enum DaemonAction {
     /// daemon is STILL draining then, this command does NOT kill it: it reports
     /// what is in flight and exits non-zero, leaving the daemon serving reads.
     /// Nothing in the process can abort a `spawn_blocking` write, and the graph
-    /// store is not crash-safe (nw-126), so abandoning one is an explicit
+    /// store is not crash-safe, so abandoning one is an explicit
     /// operator decision — `--force`, or `kill -9`.
     ///
     /// NOTE: under a process supervisor (systemd `TimeoutStopSec`, default 90s;
@@ -5109,7 +5145,7 @@ enum DaemonAction {
         /// SIGTERM, abandoning any in-flight write.
         ///
         /// This is the known-unsafe act: a SIGKILLed daemon has left a stale
-        /// WAL that made a live 5.6 GB database look absent (nw-126). It exists
+        /// WAL that made a live 5.6 GB database look absent. It exists
         /// so an operator who has decided to accept that can say so explicitly,
         /// rather than having the tool decide it for them on a timer.
         #[arg(long)]
@@ -5405,9 +5441,13 @@ enum ExtensionCommands {
     },
     /// Remove one extension property from one node.
     ///
-    /// `set_extension` requires `value`, so not even a null-set was
-    /// expressible, and the only existing delete removes ALL of a uid's
-    /// properties and is reachable solely from daemon reindex paths (nw-281b).
+    /// Removes exactly the named key. Every other property on that node, and
+    /// every other node, is left untouched.
+    //
+    // nw-281b. `set_extension` requires `value`, so not even a null-set was
+    // expressible, and the only existing delete removes ALL of a uid's
+    // properties and is reachable solely from daemon reindex paths. That is
+    // why the command exists; it is not what it does.
     Unset {
         /// Node UID.
         uid: String,
@@ -5489,8 +5529,12 @@ enum BrainCommands {
     ///
     /// Gate CI on 2, never on 1: those two demand opposite responses, and a
     /// gate that treats them alike either re-indexes on a crash or passes on
-    /// real drift. This said "exits 1 when any repo is stale" while the code
-    /// exited 2, which inverted both.
+    /// real drift.
+    //
+    // This help once said "exits 1 when any repo is stale" while the code
+    // exited 2, which inverted both. What the text USED to claim is history,
+    // not an instruction — a reader of `--help` needs the current ladder and
+    // nothing else.
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
@@ -5721,36 +5765,52 @@ enum BrainCommands {
             help = "Exclude note/section nodes tagged with any of these tags"
         )]
         exclude_tags: Vec<String>,
-        /// PPR ranking weight for hybrid RRF fusion (default 0.7).
+        // The three stated defaults were 0.7 / 0.3 / 0.0. The real ones are
+        // `HybridSearchConfig::default()` — 0.40 / 0.25 / 0.35 — on the direct
+        // route, and `[embedding]`'s identically-valued defaults on the daemon
+        // route. The semantic figure was the damaging one: help said the
+        // embedding leg is OFF unless asked for, while it carries the second
+        // largest weight in the fusion by default, so a user reasoning about
+        // whether embeddings touched their results was reading the opposite of
+        // the truth. Same class as `dead-code --limit`'s "default: all".
+        /// PPR ranking weight for hybrid RRF fusion (default 0.40).
         #[arg(
             long = "weight-ppr",
-            help = "PPR weight for hybrid retrieval (default 0.7)"
+            help = "PPR weight for hybrid retrieval (default 0.40)"
         )]
         weight_ppr: Option<f64>,
-        /// BM25 text search weight for hybrid RRF fusion (default 0.3).
+        /// BM25 text search weight for hybrid RRF fusion (default 0.25).
         #[arg(
             long = "weight-bm25",
-            help = "BM25 weight for hybrid retrieval (default 0.3)"
+            help = "BM25 weight for hybrid retrieval (default 0.25)"
         )]
         weight_bm25: Option<f64>,
-        /// Semantic embedding weight for hybrid RRF fusion (default 0.0).
+        /// Semantic embedding weight for hybrid RRF fusion (default 0.35 — the
+        /// embedding leg is ON by default; `--no-embed` turns it off).
         #[arg(
             long = "weight-semantic",
-            help = "Semantic embedding weight for hybrid retrieval (default 0.0)"
+            help = "Semantic embedding weight for hybrid retrieval (default 0.35; --no-embed forces 0)"
         )]
         weight_semantic: Option<f64>,
-        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
-        /// Symbol nodes are always kept.
+        /// Hard filter: only Note/Section nodes modified after this ISO 8601
+        /// timestamp. Symbol nodes are always kept.
         ///
-        /// nw-295: validated AND normalised at the clap boundary, not at the
-        /// filter. `modified_at` is a String column, so the downstream
-        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
-        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
-        /// `'2'` (0x32), which made an unparseable value byte-identical to
-        /// `2099-12-31`: it matched no note and silently dropped every Note and
-        /// Section from the answer while exiting 0. Parsing here is the only
-        /// layer that runs before BOTH the daemon and direct routes, so neither
-        /// can be reached with a value the other would have rejected.
+        /// Accepts a date (`2026-01-31`) or a full timestamp
+        /// (`2026-01-31T00:00:00Z`); anything else is refused at parse time.
+        //
+        // nw-295: validated AND normalised at the clap boundary, not at the
+        // filter. `modified_at` is a String column, so the downstream
+        // `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        // `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        // `'2'` (0x32), which made an unparseable value byte-identical to
+        // `2099-12-31`: it matched no note and silently dropped every Note and
+        // Section from the answer while exiting 0. Parsing here is the only
+        // layer that runs before BOTH the daemon and direct routes, so neither
+        // can be reached with a value the other would have rejected.
+        //
+        // Deliberately `//`: this was the ENTIRE `--help` entry for `--since`,
+        // so the long form described the String column while only `-h` named
+        // the two accepted spellings. The `///` above now carries both.
         #[arg(
             long = "since",
             value_parser = |s: &str| nestweaver_engine::parse_since(s),
@@ -5837,9 +5897,11 @@ enum BrainCommands {
     /// Suggestions are offered WHERE CANDIDATES EXIST, which is not every entry:
     /// a link whose target exists nowhere in the vault — a deleted note, or an ID
     /// that is a backlog entry rather than a note — has nothing to suggest, and
-    /// an empty list is the honest answer. The old wording promised "suggested
-    /// target notes for each" and so read as a defect whenever the list was
-    /// empty (nw-100).
+    /// an empty suggestion list is the honest answer, not a failure.
+    //
+    // nw-100. The old wording promised "suggested target notes for each" and so
+    // read as a defect whenever the list was empty. What that wording USED to
+    // say belongs to the history, not to `--help`.
     ///
     /// Check `resolved_target_uid` to tell a link that RESOLVED at a lower tier
     /// from one that points at nothing.
@@ -6449,9 +6511,13 @@ enum InteractionCommands {
     },
     /// Forget one node's interaction memory, leaving the rest intact.
     ///
-    /// `clear` is all-or-nothing. A single poisoned entry — a phantom key from
-    /// a pre-nw-296 binary, or an oversized caller-supplied seed — could only
-    /// be removed by destroying every accumulated ranking signal (nw-313).
+    /// The selective counterpart to `clear`, which is all-or-nothing. Use it
+    /// to drop a single poisoned entry — a phantom key left by an older
+    /// binary, or an oversized caller-supplied seed — without destroying every
+    /// accumulated ranking signal.
+    //
+    // nw-313, and the phantom keys are the pre-nw-296 shape. Ticket ids are
+    // for whoever reads this file, not for whoever runs `--help`.
     Forget {
         /// Node UID to forget.
         uid: String,
@@ -12946,13 +13012,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // mode — for --json fall through to the direct path, whose bare
             // Vec<Summary> output the daemon shape cannot reproduce.
             if use_daemon && !json {
-                let mut args = serde_json::json!({ "level": level });
-                if token_budget > 0 {
-                    args["token_budget"] = serde_json::json!(token_budget);
-                }
-                if let Some(ref t) = target {
-                    args["target"] = serde_json::json!(t);
-                }
+                let args = summary_tool_args(&level, token_budget, target.as_deref());
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
@@ -13840,13 +13900,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .filter(|s| s.confidence >= min_conf)
                 .collect();
             let filtered_count = filtered.len();
-            // Optional cap (default: show all). `filtered_count` stays the true
-            // total; `shown` is the capped view rendered/serialized.
-            let truncated = limit.is_some_and(|n| n < filtered_count);
-            let shown: Vec<_> = match limit {
-                Some(n) => filtered.into_iter().take(n).collect(),
-                None => filtered,
-            };
+            let (shown, truncated) = dead_code_cut(filtered, limit);
 
             #[derive(serde::Serialize)]
             struct DeadCodeJson<'a> {
@@ -24305,6 +24359,59 @@ fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> 
     args
 }
 
+/// Apply `dead-code`'s result cut on the direct route, and its DEFAULT cut.
+///
+/// Returns `(shown, truncated)`; the caller keeps the pre-cut count as the
+/// reported total.
+///
+/// Round 3 rewrote this flag's help from "default: all" to "default 50",
+/// because 50 is what the `dead_code` TOOL applies, and stopped there. The
+/// direct arm still read `match limit { None => everything }`, so the two
+/// routes answered the same bare `dead-code` differently: 50 rows and
+/// `truncated: true` with a daemon up, every row and `truncated: false` when
+/// the daemon was unreachable and the fallback ran. Help that is true on only
+/// one transport is the nw-357 shape, one command over — and `truncated` was
+/// the field that existed to disclose it.
+///
+/// `DEFAULT_RESULT_LIMIT` rather than [`resolve_limit`]: `dead-code` takes no
+/// `--config`, so there is no instance config to consult on this side. An
+/// operator's `[limits].default_result_limit` still applies on the daemon
+/// route, where the daemon reads its own — which is what the help's "or
+/// [limits].default_result_limit from config" clause names, and why a value is
+/// NOT synthesised here and sent, which would override it.
+fn dead_code_cut<T>(rows: Vec<T>, limit: Option<usize>) -> (Vec<T>, bool) {
+    let total = rows.len();
+    let effective = limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT);
+    (
+        rows.into_iter().take(effective).collect(),
+        effective < total,
+    )
+}
+
+/// Build the `get_summary` tool arguments for `summary`'s daemon route.
+///
+/// `token_budget` is sent UNCONDITIONALLY, including `0`.
+///
+/// `--token-budget` documents "0 = unlimited" and the direct path honours it.
+/// The daemon route used to omit the key when the budget was 0, and the tool's
+/// default for an ABSENT key is `SUMMARY_DEFAULT_TOKEN_BUDGET` (20000) — so on
+/// the route that serves text output by default, asking for unlimited silently
+/// got the TIGHTEST bound instead of none, and `--help` said the opposite. The
+/// tool's schema is `minimum: 0` and its own comment already reads "`0` still
+/// means unlimited on both"; the CLI simply never sent the value that would
+/// have made that true.
+///
+/// A function rather than an inline `json!`, for the same reason
+/// [`clusters_tool_args`] is one: the omission is only assertable if the
+/// arguments can be built without a daemon.
+fn summary_tool_args(level: &str, token_budget: usize, target: Option<&str>) -> serde_json::Value {
+    let mut args = serde_json::json!({ "level": level, "token_budget": token_budget });
+    if let Some(t) = target {
+        args["target"] = serde_json::json!(t);
+    }
+    args
+}
+
 fn print_clusters_output_with_total(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
@@ -25969,6 +26076,396 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             "these backtick-quoted remedies name a subcommand the CLI does not \
              have, so a user who pastes them gets a clap parse error instead of \
              a fix: {unknown:#?}"
+        );
+    }
+
+    /// Render every command's help exactly as a user sees it.
+    ///
+    /// Returns `(path, long_help, short_help)` for the whole tree. BOTH forms,
+    /// because the pair is where nw-357 hid: clap promotes a `///` doc comment
+    /// to `long_help`, so `--help` answered with a changelog while `-h` showed
+    /// the correct one-liner — a divergence that is invisible to anyone who
+    /// only checks one of them.
+    fn rendered_help_tree() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let root = Cli::command();
+        let mut queue: Vec<(clap::Command, String)> = vec![(root, String::new())];
+        while let Some((cmd, parent)) = queue.pop() {
+            let path = if parent.is_empty() {
+                cmd.get_name().to_string()
+            } else {
+                format!("{parent} {}", cmd.get_name())
+            };
+            for sub in cmd.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                queue.push((sub.clone(), path.clone()));
+            }
+            let mut long = cmd.clone();
+            let mut short = cmd.clone();
+            out.push((
+                path,
+                long.render_long_help().to_string(),
+                short.render_help().to_string(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    /// No internal ticket reference may reach `--help`.
+    ///
+    /// nw-357's `impact --limit` shipped a whole changelog as its `long_help`
+    /// because a `///` rationale sat where a `help =` string belonged, and it
+    /// survived review precisely because `-h` looked fine. A ticket id is the
+    /// one token that can only have come from a rationale, so it is the
+    /// cheapest exhaustive detector for the class: rationale is for whoever
+    /// reads the source (`//`), not for whoever runs the command (`help =`).
+    ///
+    /// This does NOT claim the remaining help text is free of implementation
+    /// notes — a note that never names a ticket still gets past it. It claims
+    /// the strongest single signal is now checked on every command, on both
+    /// help forms, rather than found by accident on two of them.
+    #[test]
+    fn rendered_help_never_names_an_internal_ticket() {
+        fn ticket_at(text: &str) -> Option<String> {
+            let bytes = text.as_bytes();
+            let mut at = 0usize;
+            while let Some(found) = text[at..].find("nw-") {
+                let start = at + found;
+                let digits = start + 3;
+                if bytes.get(digits).is_some_and(u8::is_ascii_digit) {
+                    let end = text[digits..]
+                        .find(|c: char| !c.is_ascii_digit())
+                        .map_or(text.len(), |n| digits + n);
+                    return Some(text[start..end].to_string());
+                }
+                at = start + 3;
+            }
+            None
+        }
+
+        let leaks = on_big_stack(|| {
+            let mut leaks: Vec<String> = Vec::new();
+            for (path, long, short) in rendered_help_tree() {
+                if let Some(ticket) = ticket_at(&long) {
+                    leaks.push(format!("`{path} --help` names {ticket}"));
+                }
+                if let Some(ticket) = ticket_at(&short) {
+                    leaks.push(format!("`{path} -h` names {ticket}"));
+                }
+            }
+            leaks
+        });
+
+        assert!(
+            leaks.is_empty(),
+            "{} help screen(s) print an internal ticket id, so a user asking \
+             what a flag does gets a changelog instead. Move the rationale to a \
+             `//` comment and leave the user-facing sentence in `help =`:\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
+    }
+
+    /// Split one help example into argv the way a shell would.
+    ///
+    /// Honours single and double quotes and stops at the first shell operator,
+    /// because `completions bash > file` is a redirect the CLI never sees.
+    /// Returns `None` for a line with nothing left to parse.
+    fn example_argv(line: &str) -> Option<Vec<String>> {
+        let line = line.trim();
+        // Trailing `# …` annotations are prose, not arguments.
+        let line = match line.find(" #") {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        let mut argv: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        for ch in line.chars() {
+            match (quote, ch) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => current.push(c),
+                (None, '\'') | (None, '"') => quote = Some(ch),
+                // A redirect or pipe ends the part the CLI parses.
+                (None, '>') | (None, '<') | (None, '|') => break,
+                (None, c) if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        argv.push(std::mem::take(&mut current));
+                    }
+                }
+                (None, c) => current.push(c),
+            }
+        }
+        if !current.is_empty() {
+            argv.push(current);
+        }
+        (!argv.is_empty()).then_some(argv)
+    }
+
+    /// Every `--limit`-class default the help STATES must be the one the code
+    /// APPLIES.
+    ///
+    /// These defaults are applied in the handler, not by clap, so `--help`
+    /// prints whatever the `help =` string claims and nothing checks it. That
+    /// is exactly how `dead-code --limit` shipped "(1-1000, default: all)"
+    /// against a real default of 50 with `--limit 0` rejected, so no value
+    /// could ever have reached "all".
+    ///
+    /// Explicit inventory, in this module's idiom: one entry per argument
+    /// whose default lives in code, naming the constant or literal the handler
+    /// passes. A new bounded argument does not join automatically — it is
+    /// added here with the number it actually applies, or it is not covered
+    /// and the omission is visible.
+    ///
+    /// The check is on the STATED number only. It cannot prove the handler
+    /// still calls `resolve_limit` with that value; `dead_code_cut_applies_
+    /// the_default_the_help_states` covers the one route where the two had
+    /// already come apart.
+    #[test]
+    fn stated_limit_defaults_match_the_values_the_code_applies() {
+        const RESULT: usize = nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
+        // (command path, argument, the default the handler applies)
+        let inventory: Vec<(&str, &str, usize)> = vec![
+            // `resolve_limit(limit, cfg, 500)` — CODE_CONTEXT_DEFAULT_LIMIT.
+            (
+                "nestweaver context",
+                "limit",
+                nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT,
+            ),
+            // `dead_code_cut`, and the dead_code tool's own schema default.
+            ("nestweaver dead-code", "limit", RESULT),
+            ("nestweaver detect-changes", "limit", RESULT),
+            ("nestweaver impact", "limit", RESULT),
+            ("nestweaver search", "limit", 10),
+            ("nestweaver brain search", "limit", 20),
+            ("nestweaver brain context", "limit", 30),
+            ("nestweaver brain broken-links", "limit", 50),
+            ("nestweaver brain orphans", "limit", 50),
+            ("nestweaver brain topic-clusters", "limit", 50),
+            ("nestweaver brain tag-graph", "limit", 50),
+        ];
+
+        let helps = on_big_stack(|| {
+            rendered_help_tree()
+                .into_iter()
+                .map(|(path, long, _)| (path, long))
+                .collect::<Vec<_>>()
+        });
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (path, arg, expected) in inventory {
+            let Some((_, help)) = helps.iter().find(|(p, _)| p == path) else {
+                wrong.push(format!("`{path}` is no longer a command"));
+                continue;
+            };
+            // The rendered block for this argument, so a number belonging to a
+            // NEIGHBOURING flag cannot satisfy the assertion.
+            let flag = format!("--{arg} <");
+            let Some(start) = help.find(&flag) else {
+                wrong.push(format!("`{path}` no longer has `--{arg}`"));
+                continue;
+            };
+            let block = &help[start..];
+            let end = block[flag.len()..]
+                .find("\n\n      -")
+                .map_or(block.len(), |n| n + flag.len());
+            let block = &block[..end];
+            let stated = [
+                format!("default: {expected}"),
+                format!("default {expected}"),
+                format!("[default: {expected}]"),
+            ];
+            if !stated.iter().any(|claim| block.contains(claim.as_str())) {
+                wrong.push(format!(
+                    "`{path} --{arg}` help does not state its real default of \
+                     {expected}:\n{}",
+                    block.trim_end()
+                ));
+            }
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "{} stated default(s) do not match the code:\n{}",
+            wrong.len(),
+            wrong.join("\n\n")
+        );
+    }
+
+    /// `brain context`'s retrieval weights must state the fusion's real
+    /// defaults.
+    ///
+    /// These said 0.7 / 0.3 / 0.0 against a real
+    /// `HybridSearchConfig::default()` of 0.40 / 0.25 / 0.35. The semantic
+    /// figure was the damaging one: help declared the embedding leg OFF unless
+    /// asked for, while it carries the second largest weight in the fusion by
+    /// default — so a user deciding whether embeddings had touched their
+    /// results read the opposite of the truth.
+    ///
+    /// Asserted against the struct rather than against a literal, so a future
+    /// re-weighting cannot leave the help behind again.
+    #[test]
+    fn brain_context_weight_help_states_the_real_fusion_defaults() {
+        let defaults = nestweaver_engine::HybridSearchConfig::default();
+        let help = on_big_stack(|| {
+            rendered_help_tree()
+                .into_iter()
+                .find(|(path, _, _)| path == "nestweaver brain context")
+                .map(|(_, long, _)| long)
+                .expect("`brain context` must still exist")
+        });
+
+        for (flag, value) in [
+            ("--weight-ppr", defaults.weight_ppr),
+            ("--weight-bm25", defaults.weight_bm25),
+            ("--weight-semantic", defaults.weight_semantic),
+        ] {
+            let claim = format!("default {value:.2}");
+            let start = help
+                .find(&format!("{flag} <"))
+                .unwrap_or_else(|| panic!("`brain context` no longer has `{flag}`"));
+            let block = &help[start..];
+            let end = block.find("\n\n").unwrap_or(block.len());
+            let block = &block[..end];
+            assert!(
+                block.contains(&claim),
+                "`brain context {flag}` help does not state its real default \
+                 ({claim}):\n{block}"
+            );
+        }
+    }
+
+    /// `dead-code`'s direct route applies the default its help states.
+    ///
+    /// The help was corrected to "default 50" while this arm still returned
+    /// every row, so a bare `dead-code` answered differently depending on
+    /// whether a daemon happened to be reachable — and `truncated` said
+    /// `false` on the route that had, in fact, not truncated only because it
+    /// had no bound at all.
+    #[test]
+    fn dead_code_cut_applies_the_default_the_help_states() {
+        let rows: Vec<usize> = (0..200).collect();
+
+        let (shown, truncated) = dead_code_cut(rows.clone(), None);
+        assert_eq!(
+            shown.len(),
+            nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+            "an omitted --limit must apply the documented default, not 'all'"
+        );
+        assert!(truncated, "a cut that dropped 150 rows must disclose it");
+
+        let (shown, truncated) = dead_code_cut(rows.clone(), Some(3));
+        assert_eq!(shown.len(), 3);
+        assert!(truncated);
+
+        // A limit at or above the population is not a truncation.
+        let (shown, truncated) = dead_code_cut(rows, Some(1000));
+        assert_eq!(shown.len(), 200);
+        assert!(
+            !truncated,
+            "`truncated` must describe the cut, not the flag"
+        );
+    }
+
+    /// `summary --token-budget 0` must reach the daemon as `0`.
+    ///
+    /// "0 = unlimited" is what `--help` says and what the direct path does.
+    /// The daemon route omitted the key for 0, and an ABSENT `token_budget`
+    /// makes `get_summary` fall back to `SUMMARY_DEFAULT_TOKEN_BUDGET` — so on
+    /// the route that serves text output by default, asking for no bound got
+    /// the tightest one. Omission and zero are not the same request.
+    #[test]
+    fn summary_sends_an_unlimited_token_budget_rather_than_omitting_it() {
+        let args = summary_tool_args("file", 0, None);
+        assert_eq!(
+            args.get("token_budget").and_then(|v| v.as_u64()),
+            Some(0),
+            "a zero budget must be SENT; omitting it means the tool's default \
+             (SUMMARY_DEFAULT_TOKEN_BUDGET), which is the opposite of unlimited"
+        );
+        assert!(
+            args.get("target").is_none(),
+            "an absent --target is genuinely absent, unlike a zero budget"
+        );
+
+        let args = summary_tool_args("cluster", 2000, Some("auth"));
+        assert_eq!(
+            args.get("token_budget").and_then(|v| v.as_u64()),
+            Some(2000)
+        );
+        assert_eq!(args.get("level").and_then(|v| v.as_str()), Some("cluster"));
+        assert_eq!(args.get("target").and_then(|v| v.as_str()), Some("auth"));
+    }
+
+    /// Every example printed in `--help` must actually parse.
+    ///
+    /// An example is the most literally actionable thing help text contains —
+    /// it is there to be pasted. `watch --help` shipped two of three examples
+    /// using `--repo` for what is a POSITIONAL argument, so a user who pasted
+    /// the documented invocation got `error: unexpected argument '--repo'`
+    /// (exit 64) from the command that had just recommended it.
+    ///
+    /// Parse-only on purpose: this asserts the invocation is well-formed, not
+    /// that it succeeds against a graph. Running them would need a corpus and
+    /// would start a daemon, and neither is what a stale flag name breaks.
+    #[test]
+    fn every_help_example_parses() {
+        let failures = on_big_stack(|| {
+            let mut failures: Vec<String> = Vec::new();
+            let mut examples: Vec<(String, String)> = Vec::new();
+            for (path, long, short) in rendered_help_tree() {
+                for text in [&long, &short] {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.starts_with("nestweaver ") {
+                            examples.push((path.clone(), line.to_string()));
+                        }
+                    }
+                }
+            }
+            examples.sort();
+            examples.dedup();
+
+            // A vacuous harvest would report zero failures and read exactly
+            // like a clean bill of health.
+            assert!(
+                examples.len() > 60,
+                "only {} help example(s) harvested — the sweep is not reading \
+                 the help tree",
+                examples.len()
+            );
+
+            for (path, line) in examples {
+                let Some(argv) = example_argv(&line) else {
+                    continue;
+                };
+                if let Err(error) = Cli::command()
+                    .no_binary_name(true)
+                    .try_get_matches_from(&argv[1..])
+                {
+                    let first = error
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    failures.push(format!("`{path}` example `{line}` → {first}"));
+                }
+            }
+            failures.sort();
+            failures.dedup();
+            failures
+        });
+
+        assert!(
+            failures.is_empty(),
+            "{} help example(s) do not parse, so pasting them yields a usage \
+             error from the command that printed them:\n{}",
+            failures.len(),
+            failures.join("\n")
         );
     }
 }
