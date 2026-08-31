@@ -93,13 +93,34 @@ pub struct DeadCodeResult {
     /// only logged the skip; a number nobody can read is not a disclosure, so
     /// it is carried here and rendered by both the CLI and the MCP tool.
     pub undecodable_symbols: usize,
+    /// Number of symbols that SEEDED the reachability walk.
+    ///
+    /// nw-351. Reachability is a BFS, so with zero seeds it visits nothing and
+    /// every symbol falls out unreachable — `reachable_symbols: 0`,
+    /// `dead_percentage: 100`, every symbol offered as a deletion candidate.
+    /// That is not a finding, it is the absence of one, and the payload had no
+    /// way to say so: `coverage` covered only the STORE half (rows that failed
+    /// to decode) and read "complete" over a graph that was never walked.
+    /// Measured on a real C++ corpus: 0 of 11,730 reachable, 1,523 called dead
+    /// at medium confidence, `coverage: "complete"`.
+    pub entry_points: usize,
 }
 
 impl DeadCodeResult {
-    /// Whether the analysis saw the whole symbol corpus. False means the
-    /// counts above are floors — see [`Self::undecodable_symbols`].
+    /// Whether this analysis is a completeness claim at all.
+    ///
+    /// False means the counts above prove nothing on their own — either the
+    /// store could not decode part of the corpus (see
+    /// [`Self::undecodable_symbols`], in which case they are FLOORS), or the
+    /// walk had no seed (see [`Self::entry_points`], in which case they are
+    /// vacuous). Both are disclosed rather than folded into one flag, because
+    /// the repairs differ: re-index for the first, an entry-point surface for
+    /// the second.
     pub fn coverage_is_complete(&self) -> bool {
-        self.undecodable_symbols == 0
+        // `total_symbols == 0` is the one honest zero-seed case: there was
+        // nothing to walk to, so nothing was concluded and nothing is offered
+        // for deletion. Every other zero-seed run reports 100% dead.
+        self.undecodable_symbols == 0 && (self.entry_points > 0 || self.total_symbols == 0)
     }
 }
 
@@ -336,6 +357,7 @@ fn detect_dead_code_inner(
             // most misleading output this pass can produce, so the empty case
             // discloses too.
             undecodable_symbols,
+            entry_points: 0,
         });
     }
 
@@ -500,9 +522,49 @@ fn detect_dead_code_inner(
     // "the first N alphabetically by path" — 726 of 1000 reported rows came
     // from a single repo, stopping mid-`r`. PageRank is already loaded onto
     // every symbol; it was simply never consulted.
+    // nw-349, cause 4. A CONFIGURATION TWIN is not dead code.
+    //
+    // `symbol_uid` embeds the line, so two `#[cfg]`-gated definitions of one
+    // name in one file are two distinct nodes; and Priority 1 in the resolver
+    // takes the FIRST same-file candidate and returns, with `symbol_map` built
+    // in file-then-symbol order. So a same-file reference deterministically
+    // binds to the EARLIER definition and the later twin has in-degree 0
+    // forever — no call site anywhere can reach it.
+    //
+    // Measured in-tree: 12 files carry 2-3 such twins, ~15 symbols. Verified by
+    // hand on `index_publication.rs::process_is_alive` (lines 47 and 60, with a
+    // real call at :207): one reference, two symbols, and the `:60` row is
+    // unreachable by construction.
+    //
+    // THE HONEST LIMIT OF THIS FIX, stated rather than left to be discovered.
+    // This suppresses the false positive HERE and nowhere else. `in_degree`,
+    // `impact`, `blast_radius`, `hubs` and `bridges` have the identical defect
+    // and are untouched — the later twin still reads as having no callers
+    // there. Fixing it at the resolver instead (fan out to every same-file
+    // candidate) would double the in-degree of every cfg-duplicated symbol on
+    // every ranking surface, which is precisely the count-poisoning nw-150 /
+    // nw-308 / nw-327 exist to prevent, and it would need a distinct
+    // `MatchType` at lower confidence before it could be done safely. Modelling
+    // the `#[cfg]` predicate so the two rows are configurations of ONE symbol
+    // is the only option that makes "which build is this?" answerable, and that
+    // belongs to the identity model (nw-330), not here.
+    //
+    // The suppression is deliberately narrow: same file, same name, same kind,
+    // and the twin must itself be STRONGLY reachable. A file with two dead
+    // twins still reports both.
+    let mut reachable_twins: HashSet<(&str, &str, SymbolKind)> = HashSet::new();
+    for sym in &all_symbols {
+        if strong_reachable.contains(&sym.uid) {
+            reachable_twins.insert((sym.file_path.as_str(), sym.name.as_str(), sym.kind));
+        }
+    }
+
     let mut ranked: Vec<(f64, UnreachableSymbol)> = Vec::new();
     for sym in &all_symbols {
         if strong_reachable.contains(&sym.uid) {
+            continue;
+        }
+        if reachable_twins.contains(&(sym.file_path.as_str(), sym.name.as_str(), sym.kind)) {
             continue;
         }
         // Suppress methods of dead classes — the class itself is reported.
@@ -567,6 +629,7 @@ fn detect_dead_code_inner(
         dead_percentage,
         excluded_count,
         undecodable_symbols,
+        entry_points: entry_point_uids.len(),
     })
 }
 
@@ -782,6 +845,51 @@ mod tests {
         // Untripped flag: byte-for-byte the original behavior.
         let untripped = Arc::new(AtomicBool::new(false));
         assert!(detect_dead_code_cancellable(&store, Some(&untripped)).is_ok());
+    }
+
+    /// nw-351: with zero entry points the BFS has no seed, so every symbol
+    /// reports unreachable and `dead_percentage` reads 100 — a confident
+    /// answer with no evidence behind it. `coverage` covered only the STORE
+    /// half (rows that failed to decode) and said "complete" over a graph that
+    /// was never walked. Measured on a real C++ corpus: 0 of 11,730 reachable,
+    /// 1,523 called dead at medium confidence, `coverage: "complete"`.
+    #[test]
+    fn zero_entry_points_is_not_a_complete_coverage_claim() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("a", "fn_a", false))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b", "fn_b", false))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.entry_points, 0);
+        assert_eq!(result.reachable_symbols, 0);
+        assert_eq!(result.dead_percentage, 100.0);
+        assert!(
+            !result.coverage_is_complete(),
+            "no entry point means the walk proved nothing; coverage must not \
+             read complete"
+        );
+    }
+
+    /// The counterweight: a corpus that DOES have a seed and no undecodable
+    /// rows must still read `complete`, or the new condition would make every
+    /// answer degraded and say nothing.
+    #[test]
+    fn one_entry_point_and_no_undecodable_rows_is_complete_coverage() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("a", "fn_a", false))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.entry_points, 1);
+        assert!(result.coverage_is_complete());
     }
 
     #[test]
@@ -1825,5 +1933,144 @@ mod tests {
         let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
         assert_eq!(result.reachable_symbols, 1);
         assert!(result.unreachable_symbols.is_empty());
+    }
+
+    /// nw-349, cause 4. `symbol_uid` embeds the LINE, so two `#[cfg]`-gated
+    /// definitions of one name in one file are two distinct nodes; and
+    /// Priority 1 in the resolver takes the FIRST same-file candidate and
+    /// returns. So a same-file reference deterministically binds to the earlier
+    /// definition and the later twin has in-degree 0 FOREVER — no call site
+    /// anywhere can reach it, on any platform.
+    ///
+    /// Measured in-tree: 12 files carry 2-3 such twins. Hand-verified on
+    /// `index_publication.rs::process_is_alive` (lines 47 and 60, real call at
+    /// :207), which is the shape reproduced here.
+    #[test]
+    fn a_cfg_gated_twin_of_a_reachable_symbol_is_not_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut main = make_symbol("sym:main", "main", true);
+        main.start_line = 200;
+        main.end_line = 210;
+        // `#[cfg(unix)]` at line 47 — the one the resolver binds to.
+        let mut unix_twin = make_symbol("sym:alive:47", "process_is_alive", false);
+        unix_twin.start_line = 47;
+        unix_twin.end_line = 52;
+        // `#[cfg(not(unix))]` at line 60 — same file, same name, same kind,
+        // and unreachable by construction.
+        let mut other_twin = make_symbol("sym:alive:60", "process_is_alive", false);
+        other_twin.start_line = 60;
+        other_twin.end_line = 65;
+
+        for sym in [&main, &unix_twin, &other_twin] {
+            store.insert_symbol(sym).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:main".to_string(),
+                target_uid: "sym:alive:47".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result =
+            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        assert!(
+            result
+                .unreachable_symbols
+                .iter()
+                .all(|s| s.name != "process_is_alive"),
+            "the `#[cfg(not(unix))]` twin of a symbol that IS called is a \
+             configuration of live code, not dead code: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// THE COUNTERWEIGHT, and it is what stops the suppression becoming
+    /// "same-name symbols are never dead". A file with two twins that are BOTH
+    /// unreachable must still report both — otherwise the fix hides real dead
+    /// code, which is worse than the false positive it removes.
+    #[test]
+    fn two_unreachable_twins_are_both_still_reported() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("sym:main", "main", true))
+            .unwrap();
+        let mut a = make_symbol("sym:orphan:10", "orphan", false);
+        a.start_line = 10;
+        a.end_line = 12;
+        let mut b = make_symbol("sym:orphan:20", "orphan", false);
+        b.start_line = 20;
+        b.end_line = 22;
+        store.insert_symbol(&a).unwrap();
+        store.insert_symbol(&b).unwrap();
+
+        let result =
+            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        assert_eq!(
+            result
+                .unreachable_symbols
+                .iter()
+                .filter(|s| s.name == "orphan")
+                .count(),
+            2,
+            "neither twin is reachable, so both are genuinely dead: {:?}",
+            result.unreachable_symbols
+        );
+    }
+
+    /// And the suppression must not cross FILES. Two same-named functions in
+    /// different files are ordinary distinct symbols — one being live says
+    /// nothing about the other, and suppressing on name alone would silence
+    /// every `new`, `default` and `run` in the corpus.
+    #[test]
+    fn a_same_named_symbol_in_another_file_is_not_a_twin() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("sym:main", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:live",
+                "helper",
+                SymbolKind::Function,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "sym:dead",
+                "helper",
+                SymbolKind::Function,
+                "src/other.rs",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:main".to_string(),
+                target_uid: "sym:live".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result =
+            detect_dead_code_inner(&store, 0.3, &HashMap::new(), None).expect("detect_dead_code");
+        assert!(
+            result
+                .unreachable_symbols
+                .iter()
+                .any(|s| s.name == "helper" && s.file_path == "src/other.rs"),
+            "a same-named function in a DIFFERENT file is a different symbol \
+             and its deadness is its own: {:?}",
+            result.unreachable_symbols
+        );
     }
 }

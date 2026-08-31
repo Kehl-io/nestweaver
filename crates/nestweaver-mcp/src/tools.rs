@@ -4180,9 +4180,33 @@ fn tool_brain_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // nw-353. `budgeted_cut` returns a slice index and nothing else;
+    // `result.connected.len()` — the pre-cap total — is in scope on the line
+    // above the `.take(cut)` and was dropped, so a capped answer was
+    // byte-identical to a complete one on the only route an agent can read.
+    // The CLI's HUMAN renderer has printed `Connected (N of M, ...)` all
+    // along (`print_brain_context_text`), which makes this nw-259(a)'s shape
+    // exactly: the human is told and the agent is not. The spellings are
+    // `Bounded::merge_into`'s and `code_context`'s; no sixth one is invented.
+    let total = result.connected.len();
+    let returned = connected_json.len();
+    let truncated = returned < total;
+    // `token_budget` is this tool's only cap on `connected`, so only the
+    // budget branch of `resolve` is reachable here. Called anyway, exactly as
+    // `code_context` does: the precedence rule lives in ONE place even where
+    // one branch of it cannot fire, because a second copy is how the human and
+    // machine routes came to disagree in the first place.
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(truncated, false);
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
+        "returned": returned,
+        "total": total,
+        "truncated": truncated,
+        // Emitted even when null, matching `code_context`: a caller parsing a
+        // fixed shape should not have to tell "absent because complete" from
+        // "absent because this producer is old".
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "tokens_used": used_tokens,
         "token_budget": token_budget,
         "semantic_applied": result.semantic_applied,
@@ -6357,6 +6381,28 @@ fn vault_status_json<E: std::fmt::Display>(
             (None, "none")
         }
     };
+    // nw-366. `frontmatter_raw` was added by `ALTER TABLE ... DEFAULT ''`,
+    // which populates the COLUMN and not the DATA: every note indexed by 8.0.0
+    // reads back empty and both regex collectors `continue` past it, so the
+    // upgrader keeps nw-298's symptom on a binary that contains the fix.
+    //
+    // Counted from the notes already read — no second query — and `null` on the
+    // same failure path as `note_count`, for the same reason: a deficit derived
+    // from a scan that came back short is not a deficit, and a confident `0`
+    // here would say "you have nothing to repair" about a vault nobody read.
+    // The remedy is per-VAULT, which is why this is a per-vault row.
+    let frontmatter_deficit = if read_failed {
+        Value::Null
+    } else {
+        json!(
+            notes
+                .iter()
+                .filter(|note| {
+                    nestweaver_store::GraphStore::note_predates_frontmatter_indexing(note)
+                })
+                .count()
+        )
+    };
     let row = json!({
         // `uid` + `instance_id` let callers disambiguate rows that share a
         // name/root_path (collision state) and target precise operations like
@@ -6366,6 +6412,7 @@ fn vault_status_json<E: std::fmt::Display>(
         "name": vault.name,
         "root_path": vault.root_path,
         "note_count": note_count,
+        "notes_predating_frontmatter_indexing": frontmatter_deficit,
         "last_indexed": last_indexed,
         "last_indexed_source": last_indexed_source,
     });
@@ -7824,6 +7871,13 @@ fn tool_brain_impact(
         // caller could not detect truncation here at all. Same "confident
         // answer to a partial read" family as nw-320, one field over.
         "truncated": truncated_by_threshold || truncated_by_depth || rows.len() < total,
+        // nw-357 step 2. The result-set cap had no flag beside the two
+        // traversal ones on EITHER route, so `truncated` was the only signal
+        // and it cannot say which of three independent remedies applies.
+        // Independent boolean, not a `truncated_by` scalar: raising `--depth`,
+        // lowering `--min-score` and raising `limit` do not compose in an
+        // order, so blaming exactly one would discard two live remedies.
+        "truncated_by_limit": rows.len() < total,
         "note": note,
     }))
 }
@@ -9801,7 +9855,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9905,6 +9959,12 @@ fn tool_dead_code(
         // silently-shortened corpus reads as exact.
         "coverage": if result.coverage_is_complete() { "complete" } else { "degraded" },
         "undecodable_symbols": result.undecodable_symbols,
+        // nw-351: a reachability BFS with no seed visits nothing, so every
+        // symbol falls out unreachable and `dead_percentage` reads 100. That
+        // is the absence of a finding, not a finding — and `coverage` alone
+        // cannot say which of the two degradations happened, so the count is
+        // carried alongside `undecodable_symbols` exactly as that one is.
+        "entry_points": result.entry_points,
         "min_confidence": min_conf_str,
         "unreachable_symbols": filtered,
     }))
@@ -10403,7 +10463,8 @@ fn generate_summaries_reporting_cap(
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::{load_summaries, merge_and_save_summaries};
+    use nestweaver_engine::merge_and_save_summaries;
+    use nestweaver_engine::summaries::load_summaries_with_cap;
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
@@ -10533,9 +10594,18 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // 71,184-community graph and `truncated` computes to false. The honesty
     // machinery existed and was wired for `SummaryLevel::Symbol` only.
     let mut cap_dropped: usize = 0;
+    // nw-361. `load_summaries_with_cap`, not `load_summaries`: this payload
+    // publishes `truncated` and `truncated_by_cap`, so it needs the count the
+    // GENERATOR recorded when the set was written. Reading the plain sibling
+    // left `cap_dropped` at 0 on every cache hit, which reported a capped set
+    // as complete — correct on the cold path, wrong on the warm one, i.e.
+    // wrong on every path except the one a verifier would use.
+    //
+    // A sidecar with no recorded provenance comes back as `None` here, so this
+    // regenerates rather than republishing a claim its writer never made.
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && !bypass
-        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
+        && let Ok(Some((cached, drops))) = load_summaries_with_cap(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
@@ -10547,6 +10617,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
             (fresh, false)
         } else {
+            cap_dropped = drops.get(&level.to_string()).copied().unwrap_or(0);
             (level_filtered, true)
         }
     } else {
@@ -10555,9 +10626,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
 
     // Persist freshly generated summaries so subsequent calls hit the cache,
-    // preserving cached entries at other levels (shared invariant).
+    // preserving cached entries at other levels (shared invariant) — and, now,
+    // what the generator dropped, so the next reader can say it.
     if !from_cache && let Some(ref db) = db_path {
-        merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
+        merge_and_save_summaries(db, store.graph_generation(), level, &summaries, cap_dropped);
     }
 
     // Build the display list: filter by target, then truncate by budget.
@@ -10615,12 +10687,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // `target`. Independent booleans, per the symbol-level rationale
         // above — both remedies stay useful when both caps fire.
         //
-        // `truncated_by_cap` is `cap_dropped > 0`, which is FALSE on a sidecar
-        // cache hit even when the cached set was itself capped, because the
-        // generator did not run and nothing recorded what it dropped. That is
-        // a pre-existing hole in `truncated` itself, not one this field adds;
-        // it is called out here so the next reader does not mistake the field
-        // for a guarantee.
+        // nw-361 closed the hole this comment used to describe: `cap_dropped`
+        // was FALSE on a sidecar cache hit even for a set that was capped when
+        // it was written, because the generator did not run. The count now
+        // travels WITH the stored set (`SummaryStore::cap_dropped`), and a
+        // sidecar that recorded none is treated as a miss rather than as a
+        // claim of completeness.
         "truncated_by_budget": display.len() < after_filter_len,
         "truncated_by_cap": cap_dropped > 0,
         "cached": from_cache,
@@ -12094,7 +12166,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- more_available counts entries dropped by token budget — raise token_budget to see them\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -13674,6 +13746,79 @@ mod cache_dispatch_tests {
             row["last_indexed_source"],
             json!("none"),
             "we did not see the whole vault, so we cannot claim we looked and              found no timestamp: {row}"
+        );
+    }
+
+    /// nw-366. The per-vault row must carry the frontmatter-backfill deficit,
+    /// because the remedy (`brain refresh <root>`) is per-VAULT and the row is
+    /// the only place a caller learns which root to point it at.
+    ///
+    /// Three cases, and the last two are the ones that keep the field
+    /// meaningful: a `null` on an unreadable vault (a confident `0` there would
+    /// say "nothing to repair" about notes nobody read), and a `0` on a healthy
+    /// vault (a field that fires always is noise).
+    #[test]
+    fn the_per_vault_row_discloses_notes_predating_frontmatter_indexing() {
+        let vault = vault_fixture();
+
+        let mut legacy = note_fixture("note:legacy");
+        legacy.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        legacy.frontmatter_raw = None;
+        let mut current = note_fixture("note:current");
+        current.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        current.frontmatter_raw = Some("status: open\n".to_string());
+        // A plain note: no frontmatter at all, and therefore no deficit.
+        let plain = note_fixture("note:plain");
+
+        let (row, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![legacy, current.clone(), plain.clone()],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            row["notes_predating_frontmatter_indexing"],
+            json!(1),
+            "exactly the pre-column note is a deficit: {row}"
+        );
+
+        let (healthy, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![current, plain],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            healthy["notes_predating_frontmatter_indexing"],
+            json!(0),
+            "a healthy vault must report ZERO, not be silent — a field that \
+             only ever appears when set cannot be distinguished from a field \
+             that was dropped: {healthy}"
+        );
+
+        let (unread, _) = vault_status_json(
+            &vault,
+            Err::<
+                (
+                    Vec<nestweaver_schema::Note>,
+                    nestweaver_store::ScanIntegrity,
+                ),
+                _,
+            >(nestweaver_store::StoreError::Query(
+                "execute: injected".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(
+            unread["notes_predating_frontmatter_indexing"],
+            Value::Null,
+            "a deficit derived from a read that failed is not a deficit, and a \
+             confident 0 would tell the operator there is nothing to repair \
+             about notes nobody read: {unread}"
         );
     }
 
@@ -17216,5 +17361,120 @@ mod broken_links_window_tests {
             "nw-297: classification is over the POPULATION, so it survives any \
              window: {page}"
         );
+    }
+}
+
+/// nw-354. The end-to-end half: the engine's disclosure is worthless unless it
+/// reaches the consumer. `detect_changes` is the ONE non-test caller of
+/// `detect_changes_impact`, and its `gate_state` is what an agent or CI reads
+/// to decide whether a change is safe. Assert the PAYLOAD, not the struct.
+#[cfg(test)]
+mod detect_changes_gate_disclosure_tests {
+    use super::*;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    fn sym(uid: &str, name: &str, file: &str, sig: &str, entry: bool) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: sig.to_string(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn calls(src: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: "sym:target".to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 0.9,
+            link_type: None,
+            evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn a_dropped_symbol_row_cannot_reach_the_caller_as_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        for s in [
+            sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ),
+            sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true),
+            sym("sym:e1", "e1", "src/e1.rs", "fn e1()", true),
+            sym("sym:e2", "e2", "src/e2.rs", "fn e2()", true),
+            // The undecodable row: an embedded NUL in `signature`.
+            sym("sym:e3", "e3", "src/e3.rs", "fn e\u{0}3()", true),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        for src in ["sym:e0", "sym:e1", "sym:e2", "sym:e3"] {
+            store.insert_edge(&calls(src)).unwrap();
+        }
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+
+        assert_ne!(
+            payload["gate_state"],
+            json!("ok"),
+            "the gate field an agent reads must not say `ok` over a scan that \
+             dropped a row: {payload}"
+        );
+        assert_eq!(payload["status"], json!("degraded"), "{payload}");
+        let descriptors: Vec<&str> = payload["notifications"]
+            .as_array()
+            .expect("notifications array")
+            .iter()
+            .filter_map(|n| n["descriptor"].as_str())
+            .collect();
+        assert!(
+            descriptors.contains(&"store.list-symbols-incomplete"),
+            "and the reason must travel with it: {payload}"
+        );
+    }
+
+    /// The counterweight: a clean corpus must still serialise a clean gate, or
+    /// the field means nothing.
+    #[test]
+    fn a_clean_corpus_still_serialises_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true))
+            .unwrap();
+        store
+            .insert_symbol(&sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ))
+            .unwrap();
+        store.insert_edge(&calls("sym:e0")).unwrap();
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+        assert_eq!(payload["gate_state"], json!("ok"), "{payload}");
+        assert_eq!(payload["status"], json!("complete"), "{payload}");
+        assert_eq!(payload["notifications"], json!([]), "{payload}");
     }
 }

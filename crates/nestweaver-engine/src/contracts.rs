@@ -626,6 +626,12 @@ pub struct HandlerSymbol {
     /// source lines immediately *above* the declaration for a route decorator
     /// / annotation, which the parser does not fold into `signature`.
     pub start_line: u32,
+    /// What the symbol IS. nw-365: the candidate list is every raw symbol in
+    /// the file (`index.rs:3316`, `:4619`), controller CLASS included, and
+    /// nothing downstream could tell a class from a method — so a class-level
+    /// `@RequestMapping("/v1/items")` base path was minted as a route with the
+    /// controller as its implementer.
+    pub kind: nestweaver_schema::SymbolKind,
 }
 
 /// Extract the controller's class-level base path from raw source.
@@ -1185,6 +1191,38 @@ fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
 
     let mut out = Vec::new();
     for (idx, sym) in symbols.iter().enumerate() {
+        // nw-365. A route is served by a CALLABLE. The candidate list is every
+        // raw symbol in the file (`index.rs:3316`, `:4619` — nothing filters to
+        // methods), so the controller CLASS was a candidate for every rule
+        // below, and a class-level `@RequestMapping("/v1/items")` — which is
+        // the controller's BASE PATH, and which `extract_base_path` already
+        // reads as such — was minted as `ANY /v1/items` with the controller as
+        // its implementer, at confidence 1.0 (a sub-path was found, so the 0.8
+        // base-path-inferred tier never applied), path-identical to the base
+        // and indistinguishable in `cross-repo-contracts` from a real route.
+        //
+        // Filed as latent on the belief that `signature_line` masks it. It does
+        // not: `signature_line` (`parse.rs:335-349`) keeps the FIRST folded
+        // annotation, so the mask holds only while `@RestController` happens to
+        // be written above `@RequestMapping`. With the two lines swapped the
+        // phantom fires today. Every existing spring fixture is
+        // `@RestController`-first, which is why no test could see it.
+        //
+        // The guard is in MINTING rather than in signature handling on purpose:
+        // the mask is an ordering accident, `contracts.rs:633` and
+        // `index.rs:4878` already document the first-only append as a known
+        // loss they route around by re-reading raw source, and making that
+        // accident load-bearing would mean any future annotation-visibility
+        // widening silently reintroduces the phantom.
+        //
+        // Stated once here rather than only on the `@RequestMapping` fallback,
+        // because the same reasoning holds for the verb-specific rules:
+        // `preceding_decorator_block` collects every non-brace line above a
+        // declaration, so a comment mentioning `@GetMapping` above a class is
+        // enough to mint a phantom route for the class as well.
+        if !is_callable_kind(sym.kind) {
+            continue;
+        }
         // The route annotation may be on the declaration line *or* on the
         // lines directly above it. Scan both: signature first, then the
         // preceding-line block.
@@ -1198,7 +1236,8 @@ fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
                 break;
             }
         }
-        // @RequestMapping(method = RequestMethod.POST, path = "...")
+        // @RequestMapping(method = RequestMethod.POST, path = "...").
+        // This is the rule nw-365 fires through; see the kind guard above.
         if matched.is_none()
             && let Some(at) = scan.find("@RequestMapping")
         {
@@ -1232,6 +1271,18 @@ fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
         }
     }
     out
+}
+
+/// True for symbol kinds that can actually SERVE a route.
+///
+/// nw-365. Stated positively rather than as "not a class": minting a contract
+/// is an assertion, so it should need positive evidence. A kind added to
+/// `SymbolKind` later is then excluded by default and has to be admitted
+/// deliberately, which is the safe direction — the failure this guards was a
+/// phantom contract minted for a symbol nobody had checked was callable.
+fn is_callable_kind(kind: nestweaver_schema::SymbolKind) -> bool {
+    use nestweaver_schema::SymbolKind;
+    matches!(kind, SymbolKind::Function | SymbolKind::Method)
 }
 
 fn request_mapping_verb(s: &str) -> Option<&'static str> {
@@ -2507,6 +2558,75 @@ type Query {
         assert!(parse_spec_file("x.proto", "this is not proto").is_empty());
     }
 
+    /// nw-365: a class-level `@RequestMapping("/v1/items")` is the
+    /// controller's BASE PATH, not an endpoint. The controller CLASS is in the
+    /// candidate list alongside its methods (`index.rs:3316`, `:4619` — nothing
+    /// filtered to methods), so the `@RequestMapping` fallback minted
+    /// `ANY /v1/items` with the controller as implementer at confidence 1.0,
+    /// path-identical to the controller's base.
+    ///
+    /// Filed as latent because `signature_line` keeps only the FIRST folded
+    /// annotation. That mask is an ORDERING ACCIDENT: it holds while
+    /// `@RestController` is written first and fails the moment
+    /// `@RequestMapping` is. This fixture puts `@RequestMapping` first, which
+    /// is why it reproduces today — every existing spring fixture is
+    /// `@RestController`-first and structurally cannot see it.
+    #[test]
+    fn class_level_request_mapping_is_a_base_path_not_a_route() {
+        let source = "\
+@RequestMapping(\"/v1/items\")
+@RestController
+public class ItemsController {
+  @GetMapping
+  public void list() {}
+}
+";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "ItemsController".into(),
+                signature: "@RequestMapping(\"/v1/items\") public class ItemsController {".into(),
+                start_line: 1,
+                kind: nestweaver_schema::SymbolKind::Class,
+            },
+            HandlerSymbol {
+                name: "list".into(),
+                signature: "@GetMapping public void list() {}".into(),
+                start_line: 5,
+                kind: nestweaver_schema::SymbolKind::Method,
+            },
+        ];
+        let matches = detect_handlers("spring", source, &symbols);
+        assert!(
+            !matches.iter().any(|m| m.symbol_index == 0),
+            "the controller class must not implement a route: {matches:#?}"
+        );
+        assert!(
+            matches.iter().any(|m| m.symbol_index == 1
+                && m.contract.verb.as_deref() == Some("GET")
+                && m.contract.path.as_deref() == Some("/v1/items")),
+            "the real endpoint must survive: {matches:#?}"
+        );
+    }
+
+    /// The counterweight: a METHOD-level `@RequestMapping` with an explicit
+    /// verb is a real endpoint and must keep minting. The guard is about the
+    /// symbol's kind, not about the annotation.
+    #[test]
+    fn method_level_request_mapping_still_mints() {
+        let source = "@RestController\npublic class ItemsController {}\n";
+        let symbols = vec![HandlerSymbol {
+            name: "create".into(),
+            signature: "@RequestMapping(method = RequestMethod.POST, path = \"/items\") public void create()"
+                .into(),
+            start_line: 3,
+            kind: nestweaver_schema::SymbolKind::Method,
+        }];
+        let matches = detect_handlers("spring", source, &symbols);
+        assert_eq!(matches.len(), 1, "{matches:#?}");
+        assert_eq!(matches[0].contract.verb.as_deref(), Some("POST"));
+        assert_eq!(matches[0].contract.path.as_deref(), Some("/items"));
+    }
+
     #[test]
     fn spring_handler_exact_match() {
         let class_sig =
@@ -2516,11 +2636,13 @@ type Query {
                 name: "create".into(),
                 signature: "@PostMapping public void create()".into(),
                 start_line: 0,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
             HandlerSymbol {
                 name: "get".into(),
                 signature: "@GetMapping(\"/{id}\") public Approval get(String id)".into(),
                 start_line: 0,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
         ];
         let matches = detect_handlers("spring", class_sig, &symbols);
@@ -2568,11 +2690,13 @@ admin.get('/gyms', requireAdmin, listGyms);
                 name: "registerRoutes".into(),
                 signature: "export function registerRoutes(fastify)".into(),
                 start_line: 1,
+                kind: nestweaver_schema::SymbolKind::Function,
             },
             HandlerSymbol {
                 name: "admin".into(),
                 signature: "const admin = express.Router()".into(),
                 start_line: 12,
+                kind: nestweaver_schema::SymbolKind::Variable,
             },
         ];
 
@@ -2617,6 +2741,7 @@ export async function createReport(body) {
             name: "createReport".into(),
             signature: "export async function createReport(body)".into(),
             start_line: 1,
+            kind: nestweaver_schema::SymbolKind::Function,
         }];
         let found = detect_handlers("express", source, &symbols);
         assert!(
@@ -2643,11 +2768,13 @@ export function registerAdmin(admin) {
                 name: "build".into(),
                 signature: "export function build(app)".into(),
                 start_line: 1,
+                kind: nestweaver_schema::SymbolKind::Function,
             },
             HandlerSymbol {
                 name: "registerAdmin".into(),
                 signature: "export function registerAdmin(admin)".into(),
                 start_line: 4,
+                kind: nestweaver_schema::SymbolKind::Function,
             },
         ];
         let found: Vec<String> = detect_handlers("express", source, &symbols)
@@ -2710,11 +2837,13 @@ export function unrelated() {
                 name: "registerRoutes".into(),
                 signature: "export function registerRoutes()".into(),
                 start_line: 1,
+                kind: nestweaver_schema::SymbolKind::Function,
             },
             HandlerSymbol {
                 name: "unrelated".into(),
                 signature: "export function unrelated()".into(),
                 start_line: 6,
+                kind: nestweaver_schema::SymbolKind::Function,
             },
         ];
 
@@ -2755,6 +2884,7 @@ export function unrelated() {
             name: "findOne".into(),
             signature: "@Get(':id') findOne(@Param('id') id: string)".into(),
             start_line: 0,
+            kind: nestweaver_schema::SymbolKind::Method,
         }];
         let matches = detect_handlers("nestjs", class_sig, &symbols);
         assert_eq!(matches.len(), 1);
@@ -2780,6 +2910,7 @@ export function unrelated() {
             name: "createApproval".into(),
             signature: "createApproval() { return {}; }".into(),
             start_line: 4, // 1-based line of the declaration.
+            kind: nestweaver_schema::SymbolKind::Method,
         }];
         let matches = detect_handlers("nestjs", source, &symbols);
         assert_eq!(matches.len(), 1, "matches: {matches:?}");
@@ -2807,11 +2938,13 @@ export function unrelated() {
                 name: "health".into(),
                 signature: "health() { return {}; }".into(),
                 start_line: 4,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
             HandlerSymbol {
                 name: "createUser".into(),
                 signature: "createUser() { return {}; }".into(),
                 start_line: 6,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
         ];
         let matches = detect_handlers("nestjs", source, &symbols);
@@ -2848,11 +2981,13 @@ export function unrelated() {
                 name: "health".into(),
                 signature: "public Object health() { return null; }".into(),
                 start_line: 5,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
             HandlerSymbol {
                 name: "createUser".into(),
                 signature: "public Object createUser() { return null; }".into(),
                 start_line: 7,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
         ];
         let matches = detect_handlers("spring", source, &symbols);
@@ -2880,6 +3015,7 @@ export function unrelated() {
             name: "submit".into(),
             signature: "public void submit() {}".into(),
             start_line: 5,
+            kind: nestweaver_schema::SymbolKind::Method,
         }];
         let matches = detect_handlers("spring", source, &symbols);
         assert_eq!(matches.len(), 1, "matches: {matches:?}");
@@ -2905,11 +3041,13 @@ export function unrelated() {
                 name: "a".into(),
                 signature: "a() { return {}; }".into(),
                 start_line: 4,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
             HandlerSymbol {
                 name: "b".into(),
                 signature: "b() { return {}; }".into(),
                 start_line: 5,
+                kind: nestweaver_schema::SymbolKind::Method,
             },
         ];
         let matches = detect_handlers("nestjs", source, &symbols);
@@ -2924,6 +3062,7 @@ export function unrelated() {
             name: "helper".into(),
             signature: "public void helper()".into(),
             start_line: 0,
+            kind: nestweaver_schema::SymbolKind::Method,
         }];
         assert!(detect_handlers("none", "class Helper", &symbols).is_empty());
     }
@@ -2946,6 +3085,7 @@ paths:
             name: "get".into(),
             signature: "@GetMapping(\"/:id\") Approval get(String id)".into(),
             start_line: 0,
+            kind: nestweaver_schema::SymbolKind::Method,
         }];
         let handlers = detect_handlers("spring", class_sig, &handler_syms);
         assert_eq!(declared.len(), 1);

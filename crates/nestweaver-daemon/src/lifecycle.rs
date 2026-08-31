@@ -839,8 +839,6 @@ pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
 /// hypothetical: the earlier version of this test failed 2 runs in 60 at
 /// `--test-threads=8`, in CI's main job.
 fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
-    use std::os::unix::io::AsRawFd;
-
     if local_store_held {
         // Probing from here would close a descriptor to this database and take
         // this process's own POSIX record locks down with it, silently
@@ -854,11 +852,28 @@ fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
         return DbWriteLock::Unknown;
     }
 
-    let path = canonical_db_path(db_path);
+    fcntl_write_lock_state(&canonical_db_path(db_path))
+}
+
+/// `F_GETLK` for a whole-file write lock on one path.
+///
+/// Factored out of [`db_write_lock_probe`] so [`checkpoint_artifacts`] asks the
+/// kernel the same question in the same way rather than restating the `flock`
+/// setup — a restated predicate is how the twin class recurs, and this one has
+/// three fields that all have to be zeroed correctly to mean anything.
+///
+/// A path that does not exist is `Free`: there is nothing to hold.
+///
+/// The same caveat as [`db_write_lock_probe`] applies and is the caller's to
+/// respect — this opens and closes a descriptor, which drops every POSIX record
+/// lock THIS process holds on that file.
+fn fcntl_write_lock_state(path: &Path) -> DbWriteLock {
+    use std::os::unix::io::AsRawFd;
+
     if !path.exists() {
         return DbWriteLock::Free;
     }
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return DbWriteLock::Unknown;
     };
     let mut probe: libc::flock = unsafe { std::mem::zeroed() };
@@ -875,6 +890,130 @@ fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
     DbWriteLock::Held {
         pid: (probe.l_pid > 0).then_some(probe.l_pid),
     }
+}
+
+/// nw-367. Why a read-only open is refusing this database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointArtifacts {
+    /// Neither `<db>.wal.checkpoint` nor `<db>.shadow` is present, so nothing
+    /// here blocks a read-only open.
+    Absent,
+    /// Artifacts are present and something is, or may be, holding a checkpoint.
+    /// Fail closed — see the type-level note on why `Unknown` lands here.
+    LiveOrUnknown,
+    /// Artifacts are present and NOTHING holds either checkpoint lock or the
+    /// database write lock. Debris from a crash during a checkpoint.
+    Debris { artifacts: Vec<PathBuf> },
+}
+
+/// nw-359 leg (1). Is this database's write-ahead log unreadable?
+///
+/// `Some(error)` means, and means ONLY, that a probe open classified the log as
+/// [`nestweaver_store::CorruptionKind::WalUnreadable`]. Every other answer —
+/// including a probe that itself failed for an unrelated reason — is `None`,
+/// because a transient probe error must not become an outage.
+///
+/// # The narrowness is the point, and the excluded cases are not oversights
+///
+/// * `WalUnreplayed` must still spawn. It is precisely the state where starting
+///   a READ-WRITE daemon is the correct remedy: the daemon replays the log. A
+///   guard that refused there would be nw-333's unconditional attribution
+///   pointing the other way, and `corruption_diagnostic` says so in its own
+///   words — "readable and merely owed a replay. Not a damaged file."
+/// * nw-367's checkpoint debris must still spawn, for the same reason and more
+///   strongly: a read-write open is the PUBLISHED REMEDY for it, so refusing
+///   here would break the instruction this release just shipped.
+/// * A database that does not exist yet must still spawn — that is a cold start
+///   creating one.
+///
+/// An unreadable log is different in kind: no open replays it, read-only or
+/// read-write, however often it is retried. Starting a daemon against it is
+/// what produces the crash-restart loop, and step 1 of the runbook the product
+/// prints for this state is "stop everything that opens this database".
+pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError> {
+    if !db_path.exists() {
+        return None;
+    }
+    match nestweaver_store::GraphStore::open_read_only(db_path) {
+        Ok(_) => None,
+        Err(error) => (error.corruption_kind()
+            == Some(nestweaver_store::CorruptionKind::WalUnreadable))
+        .then(|| error.with_db_path(db_path)),
+    }
+}
+
+/// nw-367. Distinguish a LIVE checkpoint from the debris a crashed one leaves.
+///
+/// The engine raises one message —
+/// *"Cannot open database in read-only mode while checkpoint is in progress.
+/// Please retry later."* — from two sites with opposite remedies
+/// (`wal_replayer.cpp`):
+///
+/// * `tryAcquireReadOnlyCheckpointLock` throws only when a `READ_LOCK` on an
+///   EXISTING lock file fails, i.e. a writer genuinely holds it. A lock file
+///   that merely exists returns early and is harmless — so the two
+///   `.checkpoint.*.lock` files are NOT causal, which is where the item's own
+///   description was wrong.
+/// * `throwIfReadOnlyCheckpointState` throws on pure FILE EXISTENCE of
+///   `<db>.wal.checkpoint` or `<db>.shadow`, consulting no process at all.
+///   This is the site an operator actually meets.
+///
+/// Three properties make the two decidable from outside, and all three are
+/// needed:
+///
+/// 1. The checkpointer takes `F_WRLCK` POSIX record locks
+///    (`checkpointer.cpp`, `acquireCheckpointLocks`). **The kernel releases
+///    those when the holder dies**, so they cannot go stale: a held write lock
+///    PROVES a live checkpointer.
+/// 2. `releaseCheckpointLocks` runs LAST — after `clearFrozenWAL()` and
+///    `shadowFile.reset()`. So while the locks are held the artifacts may
+///    exist, and once the locks are released the artifacts are already gone.
+///    There is no benign window in which "no lock held AND artifacts present"
+///    describes a healthy checkpoint.
+/// 3. Belt and braces for the one window that could not be decided from the
+///    engine source — whether any path writes `<db>.wal.checkpoint` BEFORE
+///    acquiring the locks — the database write lock must ALSO be provably
+///    free. A checkpoint only ever happens inside a process holding that lock,
+///    so a free one means no checkpointer exists, full stop.
+///
+/// `Unknown` on any probe means `LiveOrUnknown`, per the standing rule on
+/// [`DbWriteLock`]: callers must treat it as "possibly owned", never as free.
+/// Calling a live checkpoint "debris" would be an unconditional attribution
+/// pointing the other way, which is the error this whole class exists to avoid.
+///
+/// # Do not call this from a process holding the store open
+///
+/// [`db_write_lock`]'s hazard applies verbatim: the probe opens and closes
+/// descriptors and would drop this process's own record locks. The guard in
+/// [`db_write_lock_probe`] covers the database file, and the answer it returns
+/// there (`Unknown`) makes this function fail closed for free.
+pub fn checkpoint_artifacts(db_path: &Path) -> CheckpointArtifacts {
+    let canonical = canonical_db_path(db_path);
+    let sidecar = |suffix: &str| {
+        let mut name = canonical.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+
+    let artifacts: Vec<PathBuf> = [".wal.checkpoint", ".shadow"]
+        .iter()
+        .map(|suffix| sidecar(suffix))
+        .filter(|path| path.exists())
+        .collect();
+    if artifacts.is_empty() {
+        return CheckpointArtifacts::Absent;
+    }
+
+    for suffix in [".checkpoint.intent.lock", ".checkpoint.apply.lock"] {
+        if fcntl_write_lock_state(&sidecar(suffix)) != DbWriteLock::Free {
+            return CheckpointArtifacts::LiveOrUnknown;
+        }
+    }
+    if !db_write_lock(db_path).is_provably_free() {
+        return CheckpointArtifacts::LiveOrUnknown;
+    }
+
+    CheckpointArtifacts::Debris { artifacts }
 }
 
 /// Path of the dedicated write-lease file for a database.

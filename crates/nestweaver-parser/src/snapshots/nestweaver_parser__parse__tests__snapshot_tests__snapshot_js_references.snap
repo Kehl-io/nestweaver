@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6239
 expression: "parsed_references(\"simple.js\", &source)"
 ---
 - name: fs
@@ -15,7 +16,7 @@ expression: "parsed_references(\"simple.js\", &source)"
 - name: events
   kind: Import
   start_line: 3
-  context: "const fs = require('fs');"
+  context: "import { EventEmitter } from 'events';"
   receiver: ~
 - name: name
   kind: ReadAccess

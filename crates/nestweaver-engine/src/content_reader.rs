@@ -1925,8 +1925,15 @@ mod non_utf8_tests {
         );
     }
 
-    /// Binary content would mint garbage symbols, so it is refused -- but with a
-    /// typed error the caller skips, never a repo-fatal one.
+    /// Binary content would mint garbage symbols, so it is refused -- with a
+    /// TYPED error, so a caller can tell it apart from a genuine read failure.
+    ///
+    /// nw-355: this test used to assert that the type "is downcastable so the
+    /// caller can skip it", and no caller on either index path skipped it --
+    /// a claim about someone else's behaviour, checked nowhere. It now claims
+    /// only what it proves. That the index actually skips is proved where the
+    /// index runs: `index::tests::one_binary_file_does_not_void_the_whole_index`
+    /// and `index::tests::incremental_binary_file_is_skipped_not_fatal`.
     #[test]
     fn binary_content_is_refused_with_a_typed_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1942,7 +1949,7 @@ mod non_utf8_tests {
             .expect_err("binary must be refused");
         assert!(
             error.downcast_ref::<BinarySource>().is_some(),
-            "must be a typed BinarySource so the caller can skip it: {error}"
+            "must be a typed BinarySource, distinguishable from an I/O failure: {error}"
         );
     }
 

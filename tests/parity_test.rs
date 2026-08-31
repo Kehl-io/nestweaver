@@ -32,6 +32,11 @@ use tempfile::TempDir;
 /// `NESTWEAVER_NO_DAEMON`. This exercises the daemon path.
 fn daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    // nw-261: pin miette's render width so a diagnostic phrase cannot be split
+    // mid-assertion by the runner's terminal geometry. A test asserting WHAT a
+    // message says must not depend on HOW WIDE the terminal was. Tests that
+    // exercise wrapping itself override or remove this deliberately.
+    cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000");
     cmd.env_remove("NESTWEAVER_NO_DAEMON");
     cmd.env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
     #[cfg(not(target_os = "macos"))]
@@ -43,6 +48,11 @@ fn daemon_cmd() -> Command {
 /// (no daemon) execution.
 fn no_daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    // nw-261: pin miette's render width so a diagnostic phrase cannot be split
+    // mid-assertion by the runner's terminal geometry. A test asserting WHAT a
+    // message says must not depend on HOW WIDE the terminal was. Tests that
+    // exercise wrapping itself override or remove this deliberately.
+    cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000");
     cmd.env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
@@ -2654,5 +2664,889 @@ fn summary_names_which_cap_cut_on_both_routes() {
         payload["truncated_by_cap"],
         serde_json::json!(false),
         "{payload}"
+    );
+}
+
+/// nw-353. `brain context` is the most-called retrieval surface in the
+/// catalogue and its MACHINE routes cannot say they were cut. `budgeted_cut`
+/// computes the cut count, the caller keeps only the slice index, and
+/// `result.connected.len()` — the pre-cap total, in scope on the line above —
+/// is dropped. A capped answer is then byte-indistinguishable from a complete
+/// one.
+///
+/// The HUMAN route already discloses: `print_brain_context_text` prints
+/// `Connected (N of M, ...)`. So this is nw-259(a)'s shape exactly — the
+/// human sees the cap and the agent does not — and the fix has a local model
+/// to copy rather than a design to invent.
+///
+/// The counterweight is the last block: an UNCAPPED call must report
+/// `truncated: false` with `returned == total` and blame no cap, or a fix
+/// that flags unconditionally passes.
+#[test]
+fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let assert_bounded = |route: &str, payload: &serde_json::Value, cut: bool| {
+        for key in ["returned", "total", "truncated"] {
+            assert!(
+                payload.get(key).is_some(),
+                "{route}: `{key}` absent — a capped answer is byte-identical to a \
+                 complete one: {payload}"
+            );
+        }
+        let returned = payload["returned"].as_u64().unwrap();
+        let total = payload["total"].as_u64().unwrap();
+        assert_eq!(
+            returned,
+            payload["connected"].as_array().unwrap().len() as u64,
+            "{route}: `returned` must be the length of the list actually returned: {payload}"
+        );
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(returned < total),
+            "{route}: `truncated` must agree with the counts beside it: {payload}"
+        );
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(cut),
+            "{route}: expected truncated={cut}: {payload}"
+        );
+    };
+
+    // ── CLI direct, cut by --limit ──
+    let capped = run_direct(db, &["brain", "context", "mainA", "--json", "--limit", "1"]);
+    assert!(
+        capped.status.success(),
+        "{}",
+        flatten_miette(&capped.stderr)
+    );
+    let capped = parse_stdout("brain context (direct, limit 1)", &capped);
+    assert_bounded("direct --limit 1", &capped, true);
+    assert_eq!(
+        capped.get("truncated_by").and_then(|v| v.as_str()),
+        Some("limit"),
+        "a consumer that cannot tell WHICH cap cut raises the wrong knob: {capped}"
+    );
+
+    // ── CLI direct, cut by --token-budget; the budget takes precedence ──
+    let by_budget = run_direct(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "1",
+            "--token-budget",
+            "1",
+        ],
+    );
+    assert!(
+        by_budget.status.success(),
+        "{}",
+        flatten_miette(&by_budget.stderr)
+    );
+    let by_budget = parse_stdout("brain context (direct, both caps)", &by_budget);
+    assert_bounded("direct --limit 1 --token-budget 1", &by_budget, true);
+    assert_eq!(
+        by_budget.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the budget is applied INSTEAD of --limit here, so naming --limit is the \
+         wrong remedy: {by_budget}"
+    );
+
+    // ── MCP ──
+    let mcp = run_via_mcp(
+        db,
+        "brain_context",
+        serde_json::json!({ "seeds": ["mainA"], "token_budget": 1 }),
+    );
+    assert_bounded("mcp token_budget=1", &mcp, true);
+    assert_eq!(
+        mcp.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the MCP route has exactly one cap and must still name it: {mcp}"
+    );
+
+    // ── CLI via daemon — the route this test's NAME already claimed ──
+    //
+    // nw-353 fixed `tool_brain_context` and the CLI's DIRECT arm and stopped.
+    // This test asserted `run_direct` and `run_via_mcp` while calling itself
+    // "every machine route", so the third leg was never run — the same
+    // unasserted-route shape the gap it was written to close.
+    //
+    // The daemon runs the very `tool_brain_context` the MCP leg above proves
+    // correct, so `total` is already on the wire; `BrainContextResult` has no
+    // field for it, so `serde_json::from_value` dropped it and the renderer
+    // re-derived `total` from the rows that SURVIVED the daemon's cut. That
+    // makes `returned < total` structurally unreachable here — the answer
+    // measured against itself always looks complete.
+    let via_daemon = run_via_daemon(
+        db,
+        &["brain", "context", "mainA", "--json", "--token-budget", "1"],
+    );
+    assert!(
+        via_daemon.status.success(),
+        "{}",
+        flatten_miette(&via_daemon.stderr)
+    );
+    let via_daemon = parse_stdout("brain context (daemon, token_budget 1)", &via_daemon);
+    assert_bounded("daemon --token-budget 1", &via_daemon, true);
+    assert_eq!(
+        via_daemon.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the daemon route must name the cap the direct and MCP routes name: {via_daemon}"
+    );
+
+    // The three routes must agree on how many rows MATCHED, not merely each be
+    // self-consistent. Re-deriving `total` post-cut satisfies every
+    // single-route invariant above while still disagreeing with the other two.
+    assert_eq!(
+        via_daemon["total"], mcp["total"],
+        "daemon and MCP run the same tool over the same DB and must report the \
+         same pre-cut total: daemon={via_daemon} mcp={mcp}"
+    );
+
+    // ── COUNTERWEIGHT: nothing cut, nothing claimed ──
+    let roomy = run_direct(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "5000",
+            "--token-budget",
+            "16000",
+        ],
+    );
+    assert!(roomy.status.success(), "{}", flatten_miette(&roomy.stderr));
+    let roomy = parse_stdout("brain context (roomy)", &roomy);
+    assert_bounded("direct roomy", &roomy, false);
+    assert!(
+        roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {roomy}"
+    );
+    let mcp_roomy = run_via_mcp(
+        db,
+        "brain_context",
+        serde_json::json!({ "seeds": ["mainA"], "token_budget": 16000 }),
+    );
+    assert_bounded("mcp roomy", &mcp_roomy, false);
+    assert!(
+        mcp_roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {mcp_roomy}"
+    );
+    // The daemon leg needs its own counterweight: carrying an upstream `total`
+    // through must not make an UNCUT answer claim it was cut.
+    let daemon_roomy = run_via_daemon(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "5000",
+            "--token-budget",
+            "16000",
+        ],
+    );
+    assert!(
+        daemon_roomy.status.success(),
+        "{}",
+        flatten_miette(&daemon_roomy.stderr)
+    );
+    let daemon_roomy = parse_stdout("brain context (daemon, roomy)", &daemon_roomy);
+    assert_bounded("daemon roomy", &daemon_roomy, false);
+    assert!(
+        daemon_roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {daemon_roomy}"
+    );
+}
+
+/// A fixture with more edge-bearing symbols than `generate_hub_summaries_bounded`'s
+/// internal `HUB_COUNT` of 30, so that cap actually BITES.
+///
+/// `setup_fixture` indexes four `.js` files and produces ~8 edge-bearing
+/// symbols, which is under every summary cap in the tree — so a cap-disclosure
+/// test written against it passes VACUOUSLY with `truncated_by_cap: false` on
+/// both sides. That trap is the reason this exists rather than a comment
+/// saying the fixture is too small.
+fn setup_hub_capped_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // A 40-link call chain: every function has at least one edge, so
+    // `candidate_total` is 40 against a `HUB_COUNT` of 30 and the generator
+    // drops exactly 10.
+    const CHAIN: usize = 40;
+    let mut body = String::new();
+    for i in 0..CHAIN {
+        if i + 1 < CHAIN {
+            body.push_str(&format!(
+                "export function fn_{i}(x) {{ return fn_{next}(x) + {i}; }}\n",
+                next = i + 1
+            ));
+        } else {
+            body.push_str(&format!(
+                "export function fn_{i}(x) {{ return x + {i}; }}\n"
+            ));
+        }
+    }
+    write_repo_files(&repo_dir, &[("src/chain.js", body.as_str())]);
+    create_db(&repo_dir, &db_path);
+
+    Fixture {
+        _dir: dir,
+        db_path,
+        repo_dir,
+    }
+}
+
+/// nw-361. The cap is a property of the SET, not of the code path that
+/// produced it. On a sidecar cache hit the generator does not run, so
+/// `cap_dropped` stays 0 and a set that WAS capped when it was written reports
+/// `truncated_by_cap: false` when it is read back.
+///
+/// Worse than a plain omission because it is correct on the COLD path, which
+/// is the path anyone verifying it will use — and because the CLI is the
+/// WRITER: `nestweaver summary --level hub` persists the already-capped set
+/// that `get_summary` later reads back and calls complete.
+///
+/// TWO counterweights, both required:
+///   - warm must EQUAL cold, not merely be non-false;
+///   - a level with no generator cap must report false on both, or a fix that
+///     flags unconditionally passes.
+#[test]
+fn a_cached_summary_still_reports_the_cap_that_produced_it() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+
+    // Cold read. `no_cache` bypasses the F16 RESPONSE cache — without it the
+    // second call below replays this very payload byte for byte and the
+    // sidecar is never consulted at all, which is how a cold/warm pair written
+    // the obvious way passes while proving nothing. It does NOT stop the
+    // generated set being written to the summary sidecar.
+    let cold = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "hub", "no_cache": true }),
+    );
+    assert_eq!(
+        cold["cached"],
+        serde_json::json!(false),
+        "the first call must be a MISS or this test proves nothing: {cold}"
+    );
+    assert_eq!(
+        cold["truncated_by_cap"],
+        serde_json::json!(true),
+        "the generator's HUB_COUNT must actually bite on this fixture, or every \
+         assertion below passes vacuously: {cold}"
+    );
+
+    // Warm read: the same question, served from `<db>.summaries.json`.
+    let warm = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "hub" }));
+    assert_eq!(
+        warm["cached"],
+        serde_json::json!(true),
+        "the second call must HIT the sidecar or this test proves nothing: {warm}"
+    );
+    for field in ["truncated", "truncated_by_cap", "total", "total_available"] {
+        assert_eq!(
+            cold[field], warm[field],
+            "`{field}` changed between a cold and a warm read of the SAME set, so \
+             how much was dropped depends on whether the cache happened to be \
+             warm\ncold: {cold}\nwarm: {warm}"
+        );
+    }
+
+    // COUNTERWEIGHT: `file` level has no generator cap, so both reads must
+    // report false — otherwise flagging unconditionally satisfies the above.
+    let cold_file = run_via_mcp(
+        db,
+        "get_summary",
+        serde_json::json!({ "level": "file", "no_cache": true }),
+    );
+    let warm_file = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "file" }));
+    for (label, payload) in [("cold", &cold_file), ("warm", &warm_file)] {
+        assert_eq!(
+            payload["truncated_by_cap"],
+            serde_json::json!(false),
+            "{label}: `file` has no generator cap; blaming one sends the caller \
+             to `--target`, which cannot help: {payload}"
+        );
+    }
+}
+
+/// nw-361, the real-world sequence and the half the finding does not name:
+/// the CLI is the WRITER. `Commands::Summary` never calls `load_summaries` —
+/// it always regenerates, so its own `truncated_by_cap` is accurate — and it
+/// persists the already-capped set that MCP then reads back. So the two routes
+/// disagree about the SAME bytes on disk.
+#[test]
+fn the_cli_writes_a_capped_summary_set_that_mcp_must_still_call_capped() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+
+    let cli = run_direct(
+        db,
+        &["summary", "--level", "hub", "--json", "--token-budget", "0"],
+    );
+    assert!(cli.status.success(), "{}", flatten_miette(&cli.stderr));
+    let cli = parse_stdout("summary (direct)", &cli);
+    assert_eq!(
+        cli["truncated_by_cap"],
+        serde_json::json!(true),
+        "the CLI regenerates and so knows the cap fired; if it does not, this \
+         fixture is too small and the test below proves nothing: {cli}"
+    );
+
+    let mcp = run_via_mcp(db, "get_summary", serde_json::json!({ "level": "hub" }));
+    assert_eq!(
+        mcp["cached"],
+        serde_json::json!(true),
+        "the CLI must have written the sidecar MCP reads back, or the routes \
+         are not looking at the same set: {mcp}"
+    );
+    assert_eq!(
+        cli["truncated_by_cap"], mcp["truncated_by_cap"],
+        "the CLI wrote this set and knows it was capped; MCP reads the same set \
+         back and does not\ncli: {cli}\nmcp: {mcp}"
+    );
+    assert_eq!(
+        cli["total"], mcp["total"],
+        "and the population disagrees too, because `total_available` is built \
+         from the same dropped count\ncli: {cli}\nmcp: {mcp}"
+    );
+}
+
+/// nw-357. `impact`'s result-set cap is a property of the TRANSPORT: the
+/// daemon route defaults `limit` to 50 from the `brain_impact` schema, and the
+/// CLI had no `--limit` at all — it neither declared one nor sent one, so the
+/// direct route capped nothing. `returned < total`, the documented way to
+/// detect the cap, was therefore structurally impossible on the direct route,
+/// and the two routes returned DIFFERENT ROW COUNTS for the same command.
+///
+/// That is worse than the field-meaning divergence it was filed as. It is
+/// nw-259(b)'s shape verbatim — the bound is a property of the transport, not
+/// of the contract — which also makes it an nw-217b instance.
+///
+/// The counterweight is the second half: a limit the result set FITS must
+/// report `returned == total` on both routes, or a fix that always reports a
+/// cap passes.
+#[test]
+fn impact_applies_the_same_result_set_cap_on_both_routes() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+    // The 40-link chain gives `fn_39` far more than one transitive dependent,
+    // so a `--limit 1` genuinely cuts on a route that applies one.
+    let args = &["impact", "fn_39", "--json", "--limit", "1", "--depth", "15"];
+
+    let direct = run_direct(db, args);
+    assert!(
+        direct.status.success(),
+        "impact (direct) failed:\n{}",
+        flatten_miette(&direct.stderr)
+    );
+    let direct = parse_stdout("impact (direct)", &direct);
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = run_via_daemon(db, args);
+    assert!(
+        daemon.status.success(),
+        "impact (daemon) failed:\n{}",
+        flatten_miette(&daemon.stderr)
+    );
+    let daemon = parse_stdout("impact (daemon)", &daemon);
+
+    assert_eq!(
+        direct["returned"], daemon["returned"],
+        "the same --limit returns a different number of rows depending on \
+         whether a daemon is running\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        direct["total"], daemon["total"],
+        "`total` means two things\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    for (label, payload) in [("direct", &direct), ("daemon", &daemon)] {
+        assert_eq!(
+            payload["truncated"],
+            serde_json::json!(true),
+            "{label}: the cap must actually bite or this proves nothing: {payload}"
+        );
+        assert!(
+            payload["returned"].as_u64().unwrap() < payload["total"].as_u64().unwrap(),
+            "{label}: `returned < total` is the documented cap signal and it is \
+             structurally unreachable here: {payload}"
+        );
+        // nw-357 step 2. `truncated` alone cannot say WHICH of the three caps
+        // fired, and the three remedies are independent: raise `--depth`,
+        // lower `--min-score`, raise `--limit`.
+        assert_eq!(
+            payload["truncated_by_limit"],
+            serde_json::json!(true),
+            "{label}: the result-set cap has no flag beside the depth and \
+             threshold ones, so a caller reads `truncated` and raises the wrong \
+             knob: {payload}"
+        );
+    }
+
+    // COUNTERWEIGHT: a limit the set fits must report no cap on either route.
+    let roomy = &[
+        "impact", "fn_39", "--json", "--limit", "1000", "--depth", "15",
+    ];
+    let roomy_direct = parse_stdout("impact (direct, roomy)", &run_direct(db, roomy));
+    let roomy_daemon = parse_stdout("impact (daemon, roomy)", &run_via_daemon(db, roomy));
+    for (label, payload) in [("direct", &roomy_direct), ("daemon", &roomy_daemon)] {
+        assert_eq!(
+            payload["returned"], payload["total"],
+            "{label}: nothing was capped: {payload}"
+        );
+        assert_eq!(
+            payload["truncated_by_limit"],
+            serde_json::json!(false),
+            "{label}: a complete answer must not blame the limit: {payload}"
+        );
+    }
+    assert_eq!(roomy_direct["returned"], roomy_daemon["returned"]);
+    assert!(
+        roomy_direct["returned"].as_u64().unwrap() > 1,
+        "the roomy leg must return more than the capped leg, or the two halves \
+         of this test are the same measurement: {roomy_direct}"
+    );
+}
+
+/// nw-358. `stale_repos` is produced by two different functions reading two
+/// different universes, so `hubs --json` answers differently depending on
+/// whether a daemon happens to be running — in ORDER, and (when the sidecar is
+/// incomplete) in CONTENT.
+///
+/// TWO CORRECTIONS to the finding, both load-bearing:
+///   - NEITHER route sorts. It is `ResolverGenerations::repos`, a `BTreeMap`,
+///     whose `.keys()` are lexicographic INCIDENTALLY, against
+///     `GraphStore::list_repos`, which issues `MATCH (r:Repo) RETURN` with no
+///     `ORDER BY`. No `.sort()` exists on either path.
+///   - it does NOT need 43 repos and is NOT invisible to fixtures. It needs
+///     TWO, inserted so the store's scan order is not lexicographic.
+///
+/// And a THIRD divergence the finding does not name: the daemon ALREADY ships
+/// the exact answer (`attach_ranking_staleness`, computed from
+/// `store.list_repos`) and the CLI discards it to recompute a weaker
+/// sidecar-only one whose own docstring admits it under-approximates.
+#[test]
+fn stale_repos_is_the_same_list_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+    {
+        let store = nestweaver_store::GraphStore::open_or_create(db).unwrap();
+        // REVERSE lexicographic insertion, so the graph's scan order is not
+        // sorted and the two producers are distinguishable with two repos.
+        for uid in ["repo:zeta", "repo:alpha"] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: format!("file:///tmp/{uid}"),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+    }
+    // Drop the generation record. Every repo then reads generation 0 and is
+    // stale, so both routes select the same SET — and it is also what exposes
+    // the third divergence, because the sidecar route enumerates the
+    // SIDECAR's repos (now none) while the store route enumerates the GRAPH's.
+    std::fs::remove_file(nestweaver_engine::sidecar_path(
+        db,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    ))
+    .ok();
+
+    let args = &["hubs", "--json", "--top", "3"];
+    let direct = parse_stdout("hubs (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(db, "hub_nodes", serde_json::json!({ "top_n": 3 }));
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("hubs (daemon)", &run_via_daemon(db, args));
+
+    // The set must be non-empty on the route that can see it, or all three
+    // agree vacuously.
+    assert!(
+        direct["stale_repos"].as_array().unwrap().len() >= 3,
+        "no repo read as stale, so this proves nothing: {direct}"
+    );
+    assert_eq!(
+        direct["stale_repos"], daemon["stale_repos"],
+        "one command, two answers, selected by whether a daemon happens to be \
+         running\ndirect: {direct}\ndaemon: {daemon}"
+    );
+    assert_eq!(
+        direct["stale_repos"], mcp["stale_repos"],
+        "the agent-facing route disagrees with the CLI it is supposed to \
+         mirror\ncli: {direct}\nmcp: {mcp}"
+    );
+    assert_eq!(
+        direct["rankings_stale"], daemon["rankings_stale"],
+        "the boolean derived from the list must agree too\ndirect: {direct}\ndaemon: {daemon}"
+    );
+
+    // And it must be SORTED, so the answer is stable across databases and not
+    // merely across routes on this one. The repos above were inserted in
+    // reverse order, so scan order alone cannot satisfy this.
+    let listed: Vec<&str> = direct["stale_repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        listed, sorted,
+        "ordering must be a property of the SET, not of whichever container \
+         the caller happened to enumerate: {direct}"
+    );
+
+    // `bridges` is downstream of the same edges and the same two producers.
+    let bridge_args = &["bridges", "--json", "--top", "3"];
+    let bridges_direct = parse_stdout("bridges (direct)", &run_via_daemon(db, bridge_args));
+    assert_eq!(
+        bridges_direct["stale_repos"], direct["stale_repos"],
+        "`bridges` recomputes the same answer through the same pair of \
+         functions and must not be left behind: {bridges_direct}"
+    );
+}
+
+/// nw-365. Ranking staleness must be disclosed on ALL THREE routes, and this
+/// test asserts all three in one body ON PURPOSE.
+///
+/// The defect it pins existed because two of the three were covered. `hubs
+/// --json` (either route) carried `rankings_stale` / `stale_repos`, and
+/// `--no-daemon` plain text got `warn_stale_resolver_rankings`. The DEFAULT
+/// plain-text route — the one users actually run — emitted zero bytes on
+/// stderr, because non-JSON hybrid output never reaches `print_ranking_json`
+/// and its stderr counterpart tested the sidecar's PRESENCE rather than its
+/// VALUE:
+///
+/// ```ignore
+/// let sidecar = sidecar_path(db_path, RESOLVER_GENERATION_SIDECAR);
+/// if sidecar.exists() { return; }
+/// ```
+///
+/// That early return was correct for the only case that existed when it was
+/// written — a pre-nw-103 graph with no sidecar at all. Bumping
+/// `RESOLVER_GENERATION` 3 → 4 makes the sidecar EXIST and record a superseded
+/// generation on every pre-existing database, so the early return now swallows
+/// the common upgrade case rather than a rare one.
+///
+/// THE FIXTURE DOWNGRADES THE SIDECAR RATHER THAN DELETING IT, and that is the
+/// whole point. `forget_resolver_generation`-style deletion exercises the case
+/// the old code already caught, and would pass against the bug.
+#[test]
+fn stale_rankings_are_disclosed_on_all_three_routes_including_default_text() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let recorded = downgrade_resolver_generation(db);
+    assert!(
+        recorded > 0,
+        "the fixture must have recorded at least one repo, or every leg below \
+         passes vacuously"
+    );
+
+    // Direct legs first: a running daemon holds the write lease.
+    let direct_json = parse_stdout(
+        "hubs --json (direct)",
+        &run_direct(db, &["hubs", "--json", "--top", "3"]),
+    );
+    let direct_text = run_direct(db, &["hubs", "--top", "3"]);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon_json = parse_stdout(
+        "hubs --json (daemon)",
+        &run_via_daemon(db, &["hubs", "--json", "--top", "3"]),
+    );
+    let daemon_text = run_via_daemon(db, &["hubs", "--top", "3"]);
+
+    // ── Route 1: `--json`, both legs. Already worked; asserted so a fix to
+    // route 3 cannot silently cost route 1.
+    for (label, payload) in [("direct", &direct_json), ("daemon", &daemon_json)] {
+        assert_eq!(
+            payload["rankings_stale"],
+            serde_json::json!(true),
+            "{label} --json: a sidecar recording a superseded generation is \
+             stale: {payload}"
+        );
+        assert!(
+            payload["stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty()),
+            "{label} --json: the payload must name which repos to re-index: {payload}"
+        );
+    }
+
+    // ── Routes 2 and 3: plain text, where the disclosure is stderr-only.
+    for (label, output) in [
+        ("--no-daemon text", &direct_text),
+        ("default text", &daemon_text),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: command failed: {stderr}");
+        assert!(
+            stderr.contains("indexed by an older resolver"),
+            "{label}: the user is shown a confidently stale ranking and told \
+             NOTHING. This is the route users actually run.\nstderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("nestweaver index --repo"),
+            "{label}: a disclosure without the remedy leaves the user stuck: \
+             {stderr:?}"
+        );
+    }
+
+    // ── `bridges` is downstream of the same edges, on the same default route.
+    let bridges_text = run_via_daemon(db, &["bridges", "--top", "3"]);
+    let bridges_stderr = String::from_utf8_lossy(&bridges_text.stderr);
+    assert!(
+        bridges_stderr.contains("indexed by an older resolver"),
+        "bridges (default text): fixing only `hubs` repeats the scoping error \
+         this test exists for: {bridges_stderr:?}"
+    );
+
+    // ── And the count must be the daemon's OWN answer, not a client-side
+    // re-derivation. `stale_repos` is the sole computation; the text route
+    // must agree with the payload route on the same database.
+    let stale_count = daemon_json["stale_repos"].as_array().unwrap().len();
+    let daemon_stderr = String::from_utf8_lossy(&daemon_text.stderr);
+    assert!(
+        daemon_stderr.contains(&format!("{stale_count} repo")),
+        "default text must report the same count the daemon put on its own \
+         payload ({stale_count}), not a weaker client-side recount: \
+         {daemon_stderr:?}"
+    );
+}
+
+/// Rewrite the generation sidecar so every recorded repo reads as the
+/// PREVIOUS generation, and return how many repos were downgraded.
+///
+/// This is how the upgrade case actually looks on a user's machine after
+/// `RESOLVER_GENERATION` is bumped: the file is present and well-formed, and
+/// every entry in it is behind. Removing the file instead produces a different
+/// state that the pre-fix code already handled, which is why the existing
+/// coverage did not catch this.
+fn downgrade_resolver_generation(db: &Path) -> usize {
+    let path = nestweaver_engine::sidecar_path(
+        db,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    );
+    let mut generations = nestweaver_engine::resolver_generation::load(db);
+    assert!(
+        !generations.repos.is_empty(),
+        "the fixture indexed nothing, so there is no sidecar to downgrade: {}",
+        path.display()
+    );
+    let stale = nestweaver_engine::resolver_generation::RESOLVER_GENERATION - 1;
+    for generation in generations.repos.values_mut() {
+        *generation = stale;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&generations).unwrap()).unwrap();
+    generations.repos.len()
+}
+
+// ─── nw-218: the three-route VALUE comparator ────────────────────────────────
+
+/// Compare the VALUES of named fields across all three routes.
+///
+/// `assert_same_key_sets` answers "can this route SEE the field", which is the
+/// nw-217(a) question, and both containment tables in this file compare key
+/// PATHS in ONE direction (CLI subset of MCP). That is exactly right for the
+/// defect they were built for and it cannot express this cluster's: a field
+/// present on every route whose VALUE differs. nw-316 (`more_available`
+/// differing by route) and nw-358 (`stale_repos` differing by route) are both
+/// instances, and neither was assertable here before.
+///
+/// `legitimate` names the fields ALLOWED to differ, WITH the reason, in code.
+/// Two reasons for that: a suite that goes red for a known-benign reason stops
+/// being read, and — more importantly — a difference that is written down can
+/// be RE-EXAMINED when it turns out to be the defect. nw-316's residual may BE
+/// `semantic_applied`, which this list currently excuses; keeping the excuse in
+/// prose on a ticket is how it stayed unexamined for two rounds.
+fn assert_routes_agree_on(
+    command: &str,
+    fields: &[&str],
+    legitimate: &[(&str, &str)],
+    direct: &serde_json::Value,
+    daemon: &serde_json::Value,
+    mcp: &serde_json::Value,
+) {
+    for field in fields {
+        if let Some((_, reason)) = legitimate.iter().find(|(name, _)| name == field) {
+            // Not asserted — but RECORDED, so a run's log says what was
+            // excused and why rather than silently omitting it.
+            println!(
+                "{command}: `{field}` excused: {reason}\n  direct={} daemon={} mcp={}",
+                direct[*field], daemon[*field], mcp[*field]
+            );
+            continue;
+        }
+        assert_eq!(
+            direct[*field], daemon[*field],
+            "{command}: `{field}` differs between the DIRECT and DAEMON routes, so \
+             the answer depends on whether a daemon happens to be \
+             running\ndirect: {direct}\ndaemon: {daemon}"
+        );
+        assert_eq!(
+            direct[*field], mcp[*field],
+            "{command}: `{field}` differs between the CLI and the MCP tool it is \
+             supposed to mirror\ncli: {direct}\nmcp: {mcp}"
+        );
+    }
+}
+
+/// nw-316 / nw-218. `project-context` answered from THREE routes, with every
+/// field the experiment specified recorded rather than sampled.
+///
+/// The residual has TWO ambient inputs, not one:
+///   1. the instance config (six ranking parameters read from
+///      `current_instance_config()`), which is the CLI's `--config` on the
+///      direct route and the DAEMON's boot config on the other two;
+///   2. the embedding model — the direct route passes `None` and the daemon
+///      passes its warm model — which changes which retrieval LEGS ran at all
+///      and is therefore a bigger lever on the result set than the config.
+///
+/// The restored `parity_project_context_direct_vs_daemon` excuses
+/// `semantic_applied` as a benign difference while asserting that
+/// `more_available` — which moves when the semantic leg moves — must agree.
+/// If input 2 is the residual, that pair of claims cannot both hold. This test
+/// exists to make that visible in code rather than in a ticket.
+#[test]
+fn project_context_answers_the_same_on_all_three_routes() {
+    let fixture = setup_project_fixture();
+    let db = &fixture.db_path;
+    let args = &["project-context", "demo", "--json", "--token-budget", "400"];
+
+    let direct = parse_stdout("project-context (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(
+        db,
+        "project_context",
+        // The SAME arguments the CLI sends. `response_format` defaults to
+        // "concise" on the CLI and "detailed" in the schema, so omitting it
+        // here would manufacture a difference that has nothing to do with the
+        // two ambient inputs under test.
+        serde_json::json!({
+            "project": "demo",
+            "token_budget": 400,
+            "response_format": "concise",
+        }),
+    );
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("project-context (daemon)", &run_via_daemon(db, args));
+
+    // The full record the experiment asks for, printed on every run so a
+    // failure is diagnosable without re-running it.
+    println!("nw-316 record\n  direct: {direct}\n  daemon: {daemon}\n  mcp:    {mcp}");
+
+    assert_routes_agree_on(
+        "project-context",
+        &[
+            "truncated",
+            "more_available",
+            "seed_tokens_charged",
+            "seeds_expanded",
+            "tokens_used",
+            "budget_exceeded",
+            "semantic_applied",
+            "degraded_components",
+        ],
+        &[
+            // The ONLY two entries, and both are on notice. `tools.rs` reads
+            // the embedding model from whoever dispatched, so the direct route
+            // has none; that is nw-120's declined tradeoff, not a fact about
+            // the project. If it ever differs while `more_available` also
+            // differs, this list is wrong and nw-316's option (ii) or (iii) is
+            // the fix — not a wider exclusion list.
+            (
+                "semantic_applied",
+                "the direct route passes `embed_model: None` (main.rs) and the daemon                  passes its warm model (server.rs) — nw-120's declined tradeoff",
+            ),
+            (
+                "degraded_components",
+                "derived from `semantic_applied`; excusing one and asserting the other                  would be incoherent",
+            ),
+        ],
+        &direct,
+        &daemon,
+        &mcp,
+    );
+}
+
+/// nw-218 step 2, row 3 (nw-357). `impact`'s counts are now comparable across
+/// all THREE routes, which they could not be before `--limit` existed: the
+/// direct route capped nothing, so `total` and `returned` were the same
+/// number there and a different pair everywhere else.
+///
+/// Deliberately NOT a row in `no_cli_command_discloses_more_than_its_mcp_twin`:
+/// that table compares key PATHS, and `impact`'s two envelopes name the same
+/// list `nodes` and `impact_nodes` and the same subject `symbol` and `target`.
+/// Adding it there would go red for a naming divergence that has nothing to do
+/// with this item, and a `KNOWN_GAPS` entry to silence it would be a promise
+/// nobody made. The VALUES are what nw-357 is about, so this is the table it
+/// belongs in.
+#[test]
+fn impact_counts_agree_across_all_three_routes() {
+    let fixture = setup_hub_capped_fixture();
+    let db = &fixture.db_path;
+    let args = &["impact", "fn_39", "--json", "--limit", "5", "--depth", "15"];
+
+    let direct = parse_stdout("impact (direct)", &run_direct(db, args));
+    let mcp = run_via_mcp(
+        db,
+        "brain_impact",
+        serde_json::json!({ "symbol": "fn_39", "limit": 5, "depth": 15 }),
+    );
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon = parse_stdout("impact (daemon)", &run_via_daemon(db, args));
+
+    println!("nw-357 record\n  direct: {direct}\n  daemon: {daemon}\n  mcp:    {mcp}");
+
+    assert_routes_agree_on(
+        "impact",
+        &[
+            "total",
+            "returned",
+            "truncated",
+            "truncated_by_limit",
+            "truncated_by_depth",
+            "truncated_by_threshold",
+        ],
+        // EMPTY. There is no legitimate reason for any of these six to differ:
+        // they are counts of the same traversal under the same three caps.
+        &[],
+        &direct,
+        &daemon,
+        &mcp,
+    );
+    assert_eq!(
+        direct["truncated_by_limit"],
+        serde_json::json!(true),
+        "the cap must bite or the agreement above is vacuous: {direct}"
     );
 }

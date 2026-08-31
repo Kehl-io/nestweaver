@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4045
+assertion_line: 6493
 expression: "parsed_references(\"Simple.scala\", &source)"
 ---
 - name: scala
@@ -11,7 +11,7 @@ expression: "parsed_references(\"Simple.scala\", &source)"
 - name: Greeter
   kind: Extends
   start_line: 7
-  context: import scala.collection.mutable.ListBuffer
+  context: "class SimpleGreeter extends Greeter {"
   receiver: ~
 - name: createGreeter
   kind: Call
@@ -26,5 +26,5 @@ expression: "parsed_references(\"Simple.scala\", &source)"
 - name: println
   kind: Call
   start_line: 27
-  context: "{"
+  context: "println(greeter.greet(\"World\"))"
   receiver: ~

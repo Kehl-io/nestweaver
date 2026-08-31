@@ -769,11 +769,57 @@ fn detect_cpp(
     {
         return Some(EntryPointKind::Main);
     }
-    if name == "TEST" || name == "TEST_F" || name == "TEST_P" {
+    if CPP_TEST_RUNNER_MACROS.contains(&name) {
         return Some(EntryPointKind::TestEntry);
     }
     None
 }
+
+/// C++ test runner macros that tree-sitter-cpp reads as a `function_definition`
+/// — `MACRO(ident, ident) { body }` is syntactically a function definition, so
+/// the MACRO NAME becomes the symbol name, exactly as it already was for
+/// `TEST_F`.
+///
+/// nw-351: `main`, `int main(` and googletest's three macros were the ENTIRE
+/// C++ entry-point surface. A library-shaped C++ corpus has none of the five —
+/// measured on lbug's 11,730 symbols, zero files contain `int main(` outside
+/// `third_party/` and zero contain a line-initial `TEST(`/`TEST_F(`. With an
+/// empty seed set the reachability BFS visits nothing and `dead-code` reports
+/// 100% dead at `coverage: "complete"`.
+///
+/// Every entry was VERIFIED to reach this function as a symbol name by parsing
+/// the macro's real source form; the following were tried and REMOVED because
+/// they never produce a symbol at all and so could only ever be dead entries
+/// in this list:
+///
+///   * Catch2 / doctest `TEST_CASE("name")`, `TEST_CASE_METHOD`, `SCENARIO`,
+///     `TEMPLATE_TEST_CASE` — a string-literal argument is not a parameter
+///     declaration, so the macro parses as an `expression_statement` holding a
+///     `call_expression` with the block as a separate sibling. It is captured
+///     as a CALL, never a definition.
+///   * Google Benchmark `BENCHMARK_F(Fix, Name)(benchmark::State&)` — the
+///     doubled argument list nests one `function_declarator` inside another,
+///     and `queries/cpp.scm`'s rule requires the inner declarator to be an
+///     `identifier`.
+///
+/// Both are real extraction gaps in `queries/cpp.scm`, not entry-point gaps,
+/// and are recorded rather than guessed at.
+///
+/// Matched EXACTLY, never as a prefix or substring: a seed set of everything
+/// reports nothing dead, which is the same failure as a seed set of nothing
+/// reporting everything dead.
+const CPP_TEST_RUNNER_MACROS: &[&str] = &[
+    // googletest
+    "TEST",
+    "TEST_F",
+    "TEST_P",
+    "TYPED_TEST",
+    "TYPED_TEST_P",
+    // Boost.Test
+    "BOOST_AUTO_TEST_CASE",
+    "BOOST_FIXTURE_TEST_CASE",
+    "BOOST_DATA_TEST_CASE",
+];
 
 fn detect_lua(
     name: &str,
@@ -916,6 +962,59 @@ fn detect_powershell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── nw-351: the C++ entry-point surface ─────────────────────────────
+
+    /// nw-351: `detect_cpp` knew `main`, `int main(` and googletest's three
+    /// macros — that was the ENTIRE C++ entry-point surface. A real C++ corpus
+    /// (lbug, 11,730 symbols) has none of the five, so `entry_point_uids` was
+    /// empty, the reachability BFS had no seed, and `dead-code` reported 100%
+    /// dead at `coverage: "complete"`. Catch2 / doctest / Boost.Test / Google
+    /// Benchmark are the runners such corpora actually use, and every one of
+    /// them is written in the `MACRO(args) { body }` shape tree-sitter-cpp
+    /// already reads as a `function_definition` — so the macro name IS the
+    /// symbol name, exactly as it is for `TEST_F`.
+    #[test]
+    fn detects_cpp_non_gtest_test_runners() {
+        for macro_name in [
+            "TYPED_TEST",
+            "TYPED_TEST_P",
+            "BOOST_AUTO_TEST_CASE",
+            "BOOST_FIXTURE_TEST_CASE",
+            "BOOST_DATA_TEST_CASE",
+        ] {
+            assert_eq!(
+                detect_entry_point(macro_name, "test/foo.cpp", "function", None, "cpp"),
+                Some(EntryPointKind::TestEntry),
+                "{macro_name} names a test entry point"
+            );
+        }
+    }
+
+    /// The counterweight: an ordinary internal function must NOT become an
+    /// entry point. A seed set of everything reports nothing dead, which is
+    /// the same failure as a seed set of nothing reporting everything dead.
+    #[test]
+    fn plain_cpp_function_is_not_an_entry_point() {
+        assert_eq!(
+            detect_entry_point(
+                "computeHash",
+                "src/common/hash.cpp",
+                "function",
+                Some("static uint64_t computeHash(const std::string& s) {"),
+                "cpp",
+            ),
+            None
+        );
+        // Near-misses on the runner list must not fire either.
+        for name in ["TESTING", "MY_TEST_F", "BOOST_AUTO_TEST_SUITE"] {
+            assert_eq!(
+                detect_entry_point(name, "src/a.cpp", "function", None, "cpp"),
+                None,
+                "{name} is not a runner macro"
+            );
+        }
+    }
 
     #[test]
     fn detects_js_main() {

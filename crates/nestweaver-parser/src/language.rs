@@ -16,14 +16,14 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "java" => Some(Language::Java),
         "go" => Some(Language::Go),
         "py" => Some(Language::Python),
-        "cpp" | "cc" | "cxx" | "hpp" => Some(Language::Cpp),
+        "cpp" | "cc" | "cxx" | "hpp" | "h" => Some(Language::Cpp),
         "rs" => Some(Language::Rust),
         "kt" | "kts" => Some(Language::Kotlin),
         "cs" => Some(Language::CSharp),
         "php" => Some(Language::Php),
         "rb" | "rake" => Some(Language::Ruby),
         "swift" => Some(Language::Swift),
-        "c" | "h" => Some(Language::C),
+        "c" => Some(Language::C),
         "dart" => Some(Language::Dart),
         "cbl" | "cob" | "cpy" => Some(Language::Cobol),
         "lua" => Some(Language::Lua),
@@ -211,9 +211,23 @@ mod tests {
         assert_eq!(detect_language(Path::new("main.c")), Some(Language::C));
     }
 
+    /// nw-352 / nw-356: `.h` is the canonical C++ header extension — lbug,
+    /// LLVM, Chromium and Boost all use it — and routing it to the C grammar
+    /// meant `queries/c.scm` decided what a C++ header contains. Measured on
+    /// 874 real `.h` files: 0 of 820 `class` definitions extracted, 870 files
+    /// with parse errors (99.5%), 58% of all header symbols lost. Genuine C
+    /// headers do not regress: tree-sitter-cpp is a superset of C, and on 60
+    /// pure-C brotli headers it extracted MORE definitions at the same error
+    /// rate.
     #[test]
-    fn detect_language_c_header() {
-        assert_eq!(detect_language(Path::new("header.h")), Some(Language::C));
+    fn detect_language_c_header_is_cpp() {
+        assert_eq!(detect_language(Path::new("header.h")), Some(Language::Cpp));
+    }
+
+    /// The counterweight: `.c` must stay C. Only the ambiguous extension moved.
+    #[test]
+    fn detect_language_dot_c_stays_c() {
+        assert_eq!(detect_language(Path::new("sensor.c")), Some(Language::C));
     }
 
     #[test]

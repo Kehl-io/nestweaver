@@ -1,17 +1,17 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4241
+assertion_line: 6409
 expression: "parsed_references(\"simple.php\", &source)"
 ---
 - name: "App\\Contracts\\Greeter"
   kind: Uses
   start_line: 5
-  context: "<?php"
+  context: "use App\\Contracts\\Greeter;"
   receiver: ~
 - name: "App\\Services\\Logger"
   kind: Uses
   start_line: 6
-  context: "<?php"
+  context: "use App\\Services\\Logger;"
   receiver: ~
 - name: GreeterInterface
   kind: Implements

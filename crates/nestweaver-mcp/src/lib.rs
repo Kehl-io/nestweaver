@@ -314,7 +314,7 @@ pub fn run_stdio_server(
             if !responses.is_empty() {
                 let serialized = serde_json::to_string(&responses)?;
                 if closed_stdout_ends_session(
-                    write_stdout_frame(&mut stdout, serialized.as_bytes()).map_err(Into::into),
+                    write_stdout_frame(&mut stdout, &serialized).map_err(Into::into),
                     tracker.as_ref(),
                 )? {
                     return Ok(());
@@ -479,7 +479,7 @@ pub fn run_stdio_server_daemon(
             if !responses.is_empty() {
                 let serialized = serde_json::to_string(&responses)?;
                 if closed_stdout_ends_session(
-                    write_stdout_frame(&mut stdout, serialized.as_bytes()).map_err(Into::into),
+                    write_stdout_frame(&mut stdout, &serialized).map_err(Into::into),
                     tracker.as_ref(),
                 )? {
                     return Ok(());
@@ -634,8 +634,44 @@ impl std::error::Error for StdoutWriteError {
     }
 }
 
-fn write_stdout_frame(out: &mut impl Write, serialized: &[u8]) -> Result<(), StdoutWriteError> {
-    out.write_all(serialized).map_err(StdoutWriteError)?;
+/// nw-363. Every outbound JSON-RPC frame passes through here, and it is the
+/// only place that can hold this property.
+///
+/// U+2028 and U+2029 are STRICTLY LEGAL in RFC 8259 and `serde_json` does not
+/// escape them, so the raw bytes `E2 80 A8` land on stdout. "Legal" is not the
+/// relevant bar for this surface: the framing below is newline-delimited, and a
+/// consumer that frames by splitting on LINE SEPARATORS rather than by parsing
+/// will cut a message in half — and a pre-ES2019 JS engine cannot put either
+/// codepoint in a string literal at all. That is exactly the population of
+/// naive clients an MCP stdio surface attracts. The reference vault carries two
+/// U+2028 occurrences in one note today.
+///
+/// The escape is safe by construction, not by hope. It runs on ALREADY
+/// SERIALISED JSON, where neither codepoint is structural: it can only appear
+/// as a literal content character inside a string, and an occurrence that
+/// `serde_json` had already escaped is six ASCII bytes containing no `E2 80 A8`.
+/// So a blind replace cannot break syntax and cannot double-escape. It DOES
+/// change the byte length, which is why the newline framing matters — under a
+/// `Content-Length` transport the header would have to be computed after this,
+/// and there is no header here.
+///
+/// The counterweight is the load-bearing half and is pinned by test: this is a
+/// REPRESENTATION change and must never be a CONTENT change. A real parser must
+/// get the original codepoints back, byte for byte.
+///
+/// Scope, stated so the next round does not discover it: the CLI's `--json`
+/// output and the daemon's gRPC JSON are SEPARATE surfaces and are not covered.
+/// Widening is a decision, not an oversight.
+fn write_stdout_frame(out: &mut impl Write, serialized: &str) -> Result<(), StdoutWriteError> {
+    let escaped = if serialized.contains('\u{2028}') || serialized.contains('\u{2029}') {
+        serialized
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029")
+    } else {
+        serialized.to_string()
+    };
+    out.write_all(escaped.as_bytes())
+        .map_err(StdoutWriteError)?;
     out.write_all(b"\n").map_err(StdoutWriteError)?;
     out.flush().map_err(StdoutWriteError)
 }
@@ -669,7 +705,7 @@ fn write_response(out: &mut impl Write, frame: &Frame) -> Result<(), anyhow::Err
         Frame::Success(r) => serde_json::to_string(r)?,
         Frame::Error(e) => serde_json::to_string(e)?,
     };
-    write_stdout_frame(out, serialized.as_bytes())?;
+    write_stdout_frame(out, &serialized)?;
     Ok(())
 }
 
@@ -1524,4 +1560,86 @@ fn direct_stdio_store_coexists_with_a_live_writer_without_taking_its_lock() {
 
     drop(reader);
     drop(writer);
+}
+
+/// nw-363. U+2028 is STRICTLY LEGAL in RFC 8259 and still a hazard on a
+/// newline-framed stdio transport: a consumer that frames JSON-RPC by splitting
+/// on LINE SEPARATORS rather than by parsing will split a message in half, and
+/// a pre-ES2019 JS engine cannot put it in a string literal at all — which is
+/// exactly the population of naive clients an MCP surface attracts. One note in
+/// the reference vault carries two of them.
+#[cfg(test)]
+mod line_separator_framing_tests {
+    use super::*;
+
+    #[test]
+    fn line_separators_are_escaped_on_the_wire() {
+        let frame = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "text": "before\u{2028}after\u{2029}end" },
+        }))
+        .unwrap();
+        assert!(
+            frame.contains('\u{2028}'),
+            "precondition: serde_json does NOT escape these, which is the whole \
+             item — if this ever changes the fix below becomes a no-op and this \
+             assertion is what says so"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        write_stdout_frame(&mut out, &frame).unwrap();
+
+        assert!(
+            !out.windows(3).any(|w| w == [0xE2, 0x80, 0xA8]),
+            "raw U+2028 on the wire splits a naive line-framer's message in half"
+        );
+        assert!(!out.windows(3).any(|w| w == [0xE2, 0x80, 0xA9]));
+
+        // The frame is still exactly ONE line: the escape must not itself
+        // introduce a boundary, which would be the same bug wearing the fix.
+        assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
+        assert_eq!(out.last(), Some(&b'\n'));
+    }
+
+    /// The counterweight, and the one that matters: the escape is a
+    /// REPRESENTATION change and must never be a CONTENT change. A real parser
+    /// must see the original codepoints back, byte for byte.
+    #[test]
+    fn escaping_line_separators_is_byte_preserving_through_a_real_parser() {
+        let original = "before\u{2028}after\u{2029}end";
+        let frame = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "text": original },
+        }))
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        write_stdout_frame(&mut out, &frame).unwrap();
+
+        let line = std::str::from_utf8(&out).unwrap().trim_end_matches('\n');
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            parsed["result"]["text"].as_str().unwrap(),
+            original,
+            "the escape must round-trip identically — a content change here \
+             would be a worse bug than the one being fixed"
+        );
+    }
+
+    /// And an already-escaped occurrence must not be escaped twice. The safety
+    /// argument rests on this: the six ASCII characters of a `\u2028` escape
+    /// contain no `E2 80 A8`, so the replace cannot see them.
+    #[test]
+    fn an_already_escaped_sequence_is_not_double_escaped() {
+        // The literal six characters, as they would appear if some other
+        // producer had escaped them itself.
+        let frame = r#"{"jsonrpc":"2.0","id":1,"result":{"text":"a\u2028b"}}"#;
+        let mut out: Vec<u8> = Vec::new();
+        write_stdout_frame(&mut out, frame).unwrap();
+
+        let line = std::str::from_utf8(&out).unwrap().trim_end_matches('\n');
+        assert_eq!(line, frame, "an escaped sequence is left exactly as it was");
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["result"]["text"].as_str().unwrap(), "a\u{2028}b");
+    }
 }

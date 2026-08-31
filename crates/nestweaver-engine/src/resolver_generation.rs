@@ -47,7 +47,32 @@ use std::path::Path;
 ///     blocks changing from `Class` to `Extension` changes the UIDs those edges
 ///     point at. None of it is observable on a repo already indexed: the edges
 ///     are on disk with the old sources.
-pub const RESOLVER_GENERATION: u32 = 3;
+/// 4 — nw-352/nw-356: `.h` was dispatched to the C grammar, so every C++ header
+///     was read by `queries/c.scm`. Measured on 874 real headers, moving it to
+///     C++ takes them from 7,166 symbols to 17,872 and from 0 `class`
+///     definitions to 1,373. Symbol UIDs are `(repo, path, name, start_line)`,
+///     so both the symbol set and every edge endpoint in every header change,
+///     and `#include` moves from `@reference.import` to `@reference.includes`.
+///     nw-351: `find_parent_name` learned the C-family container node kinds, so
+///     C and C++ members now mint MEMBER_OF edges that did not exist at all
+///     before — a new edge family, invisible on a repo already indexed.
+///     nw-349 (cross-lane): C++ `#include` now resolves instead of being
+///     discarded, which is a new IMPORTS edge family for every C++ repo.
+///     nw-364: julia call sites are no longer minted as definitions (UIDs
+///     removed) while two previously-unreachable julia definitions appear (UIDs
+///     added); every reference's persisted `context` changes; and svelte/vue/
+///     astro named exports change `SymbolKind`, which the degenerate-span
+///     fallback gates on. All of it is on-disk shape.
+///     nw-349 cause 3: `queries/rust.scm` had no attribute capture of any
+///     kind, so `#[serde(default = "f")]` — 97 sites and 31 distinct named
+///     functions in this repo alone — produced NO reference and the named
+///     function had in-degree 0. Adding edges that did not exist changes edge
+///     shape, and nothing on an already-indexed repo can acquire them: the
+///     edge set is on disk without them. Without this bump the fix is
+///     invisible to every existing graph, which is the trap this module exists
+///     for and which this codebase has now sprung twice (nw-103, and again in
+///     round 3).
+pub const RESOLVER_GENERATION: u32 = 4;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
@@ -71,13 +96,30 @@ impl ResolverGenerations {
         self.repos.get(repo_uid).copied().unwrap_or(0)
     }
 
-    /// Repo uids whose edges predate [`RESOLVER_GENERATION`].
+    /// Repo uids whose edges predate [`RESOLVER_GENERATION`], SORTED.
+    ///
+    /// nw-358. This is the sole computation behind every route's
+    /// `stale_repos` — the CLI's two staleness constructors, `hub_nodes` /
+    /// `bridge_nodes` over MCP, and `staleness_note` — and it used to preserve
+    /// its caller's order. The callers enumerate different containers: a
+    /// `BTreeMap`'s keys on one side (lexicographic INCIDENTALLY, with nothing
+    /// stating the intent) and `MATCH (r:Repo) RETURN` with no `ORDER BY` on
+    /// the other. So the same database answered in two byte-shapes depending
+    /// on which one asked.
+    ///
+    /// Sorting HERE rather than in a printer is the point: a sort in
+    /// `print_ranking_json` would fix the CLI's two legs and leave MCP
+    /// unsorted, converting a three-way divergence into a two-way one. Here it
+    /// also makes the answer stable across databases, not merely across
+    /// routes on one.
     pub fn stale_repos<'a, I: IntoIterator<Item = &'a str>>(&self, known: I) -> Vec<String> {
-        known
+        let mut stale: Vec<String> = known
             .into_iter()
             .filter(|uid| self.generation_for(uid) < RESOLVER_GENERATION)
             .map(|uid| uid.to_string())
-            .collect()
+            .collect();
+        stale.sort_unstable();
+        stale
     }
 }
 
@@ -115,16 +157,39 @@ pub fn record(db_path: &Path, repo_uid: &str) -> Result<(), anyhow::Error> {
 pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
     let gens = load(db_path);
     let stale = gens.stale_repos(repo_uids.iter().map(|s| s.as_str()));
+    staleness_note_for(&stale, Some(repo_uids.len()))
+}
+
+/// The same caveat, rendered from an ALREADY-COMPUTED stale set.
+///
+/// nw-365. The daemon path holds no store handle and cannot enumerate repos,
+/// so it cannot supply the `of M` denominator — but it is NOT reduced to
+/// guessing, because `attach_ranking_staleness` already ships the exact
+/// `stale_repos` on every `hub_nodes` / `bridge_nodes` reply. Splitting the
+/// renderer from the computation lets that route print the same sentence from
+/// the answer it was sent, instead of a fourth hand-written one that would
+/// drift from this one the first time either is edited.
+///
+/// `total` is `None` where the population is genuinely unknown. It is rendered
+/// as a floor ("N repo(s) are known to have been") rather than by inventing a
+/// denominator, because on that route `stale_repos` can UNDER-count: the
+/// sidecar fallback for a pre-`attach_ranking_staleness` daemon sees only the
+/// repos the sidecar records, and a repo present in the graph but absent from
+/// the sidecar is stale and invisible to it. Claiming "N of N" there would be
+/// a number this code cannot support.
+pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<String> {
     if stale.is_empty() {
         return None;
     }
+    let scope = match total {
+        Some(total) => format!("{} of {total} repo(s) were", stale.len()),
+        None => format!("{} repo(s) are known to have been", stale.len()),
+    };
     Some(format!(
-        "{} of {} repo(s) were indexed by an older resolver, so their edges predate \
+        "{scope} indexed by an older resolver, so their edges predate \
          the nw-103 import-fan-out fix — hub, bridge and PageRank rankings for those \
          repos are NOT corrected by upgrading alone. Re-index them \
-         (`nestweaver index --repo <path>`) to get accurate rankings.",
-        stale.len(),
-        repo_uids.len()
+         (`nestweaver index --repo <path>`) to get accurate rankings."
     ))
 }
 

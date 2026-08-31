@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6619
 expression: "parsed_references(\"simple.f90\", &source)"
 ---
 - name: sqrt
@@ -10,7 +11,7 @@ expression: "parsed_references(\"simple.f90\", &source)"
 - name: math_utils
   kind: Import
   start_line: 32
-  context: program main
+  context: use math_utils
   receiver: ~
 - name: Vector3D
   kind: Call
@@ -30,5 +31,5 @@ expression: "parsed_references(\"simple.f90\", &source)"
 - name: normalize
   kind: Call
   start_line: 41
-  context: program main
+  context: call normalize(c)
   receiver: ~

@@ -212,6 +212,11 @@ pub enum SkipReasonCode {
     Ignored,
     Unsupported,
     Oversized,
+    /// The file is binary: it holds a NUL byte inside the leading 8 KiB the
+    /// reader sniffs. nw-355 — this is a POLICY skip like `Oversized`, not a
+    /// defect. It was the only typed read fault the index treated as fatal,
+    /// and one such file in a 98-file repo aborted publication for all 98.
+    Binary,
     ReadError,
     ParseError,
     Cancelled,
@@ -256,6 +261,16 @@ impl SkippedFile {
         }
     }
 
+    /// nw-355. A file the user did not write, holding one byte they did not
+    /// type, is a policy skip — not a reason to publish nothing.
+    pub fn binary(path: impl Into<String>) -> Self {
+        Self::new(
+            path,
+            SkipReasonCode::Binary,
+            "binary content (NUL byte in the leading 8 KiB)",
+        )
+    }
+
     pub fn oversized(path: impl Into<String>, observed_bytes: u64, limit_bytes: u64) -> Self {
         Self {
             path: path.into(),
@@ -281,6 +296,31 @@ pub(crate) fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Map a JS declaration keyword to the [`SymbolKind`] it declares.
+///
+/// nw-364(3). The three regex-parsed SFC formats — Svelte, Vue and Astro —
+/// each matched `export (?:function|const|let|var|class) NAME` with a
+/// NON-capturing keyword group, so the keyword was matched and then thrown
+/// away and every named export was minted `SymbolKind::Function`. A mis-kinded
+/// `Function` is eligible to be chosen as a fabricated reference source under
+/// `87e800c5`'s code-bearing-kinds fallback, so this is not cosmetic.
+///
+/// `const` maps to `Constant` to agree with the tree-sitter JS/TS path, where
+/// `queries/javascript.scm:56-62` kinds `export const` as `@definition.const`.
+/// A Svelte `export let` IS a component prop, so `Property` is defensible —
+/// but prop-ness is a framework-semantic fact a line regex cannot establish
+/// (an `export let` in a `context="module"` script is not a prop), and kinding
+/// it `Property` would assert something not observed. The keyword is what was
+/// observed, so the keyword is what is recorded.
+pub(crate) fn export_declaration_kind(keyword: &str) -> SymbolKind {
+    match keyword {
+        "function" => SymbolKind::Function,
+        "class" => SymbolKind::Class,
+        "const" => SymbolKind::Constant,
+        _ => SymbolKind::Variable,
+    }
 }
 
 /// Extract the first line of a node's text as its signature.
@@ -999,6 +1039,33 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| s.to_string());
             }
+            // nw-351. C/C++: class/struct/union Name { ... }.
+            //
+            // MEMBER_OF is minted only for symbols carrying `parent_name`
+            // (`index.rs:4019`), and none of the arms above is a C-family node
+            // kind — so C and C++ produced NO member edges at all, whether or
+            // not the container extracted. The control is the struct half of
+            // nw-352: 1,092 structs extracted at 91%, all of them
+            // `SymbolKind::Class` and therefore in `container_map`, and they
+            // produced zero MEMBER_OF edges between them.
+            //
+            // Unlike the arms above this one does not give up when the
+            // container is anonymous (`struct { ... } x;`): it keeps walking
+            // outward, so a member of an anonymous inner struct binds to the
+            // named container that encloses it rather than to nothing.
+            // `enum_specifier` is deliberately absent: an enumerator is
+            // `SymbolKind::Constant`, and the call site only asks for a parent
+            // name when the kind is `Method` or `Property` (`parse.rs:1253`),
+            // so the arm would be unreachable. Widening THAT gate is a
+            // cross-language decision, not part of this one.
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name) = parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    return Some(name.to_string());
+                }
+            }
             _ => {}
         }
         current = parent.parent();
@@ -1270,13 +1337,31 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     _ => continue,
                 };
 
-                let context = node
-                    .parent()
-                    .map(|p| {
-                        let parent_text = p.utf8_text(source_bytes).unwrap_or("");
-                        first_line(parent_text)
-                    })
-                    .unwrap_or_default();
+                // nw-364(2). `context` is the EVIDENCE for this reference, so
+                // the line it names must be a line the reference actually sits
+                // on. "The parent's first line" satisfies that only when the
+                // parent begins on the reference's own row — which is true for
+                // the small leaf captures most rules use (an identifier inside
+                // a call) and false whenever the capture is a whole
+                // statement-sized item.
+                //
+                // The instance was `queries/rust.scm:77-78`, which captures
+                // `@reference.extends` on the entire `impl_item`: for a
+                // top-level impl the parent is the root node, so a CORRECT
+                // `Extends` fact at simple.rs:18 carried
+                // `use std::collections::HashMap;` — line 1 of the file — as
+                // its evidence. Wrong evidence is worse than none for anyone
+                // auditing an edge. The same held for every `#include` in
+                // every C and C++ file, and for every other top-level capture
+                // in all 49 grammars, which is why the rule is stated over
+                // rows rather than special-cased to `impl_item`.
+                let context_node = match node.parent() {
+                    Some(parent) if parent.start_position().row == node.start_position().row => {
+                        parent
+                    }
+                    _ => node,
+                };
+                let context = first_line(context_node.utf8_text(source_bytes).unwrap_or(""));
 
                 let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
@@ -2732,15 +2817,17 @@ class Config:
         let source = fixture("cpp/simple.cpp");
         let parsed = parse_source(Path::new("simple.cpp"), &source).unwrap();
 
-        let imports: Vec<_> = parsed
+        // nw-352: `#include` is `ReferenceKind::Includes` in C++ as it has
+        // always been in C -- one construct, one kind.
+        let includes: Vec<_> = parsed
             .references
             .iter()
-            .filter(|r| r.kind == ReferenceKind::Import)
+            .filter(|r| r.kind == ReferenceKind::Includes)
             .collect();
         assert!(
-            imports.iter().any(|r| r.name.contains("sensor.h")),
+            includes.iter().any(|r| r.name.contains("sensor.h")),
             "should find #include sensor.h; got: {:?}",
-            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+            includes.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
 
         let calls: Vec<_> = parsed
@@ -2754,6 +2841,103 @@ class Config:
                 .any(|r| r.name == "calibrate" || r.name == "logValue"),
             "should find function calls; got: {:?}",
             calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── C++ header (.h) tests — nw-352 / nw-356 ─────────────────────────
+
+    /// nw-352: `.h` is the canonical C++ header extension (lbug, LLVM,
+    /// Chromium, Boost). Dispatching it to the C grammar meant `queries/c.scm`
+    /// — which has no `class_specifier` rule and rides a grammar with no
+    /// `class` keyword — decided what a C++ header contains. Measured on the
+    /// 874 `.h` files of a real C++ corpus: 0 of 820 `class` definitions
+    /// extracted, 870 files with parse errors, 58% of all header symbols lost.
+    /// No fixture could see it: `testdata/` had no `.h` file at all.
+    #[test]
+    fn cpp_class_in_a_dot_h_header_is_extracted() {
+        let source = fixture("cpp/inline.h");
+        let parsed = parse_source(Path::new("inline.h"), &source).unwrap();
+        let symbols = parsed.symbols;
+        let registry = symbols
+            .iter()
+            .find(|s| s.name == "SensorRegistry")
+            .unwrap_or_else(|| panic!("no SensorRegistry in {symbols:#?}"));
+        assert_eq!(registry.kind, SymbolKind::Class);
+        assert_eq!((registry.start_line, registry.end_line), (4, 9));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "SensorSlot" && s.kind == SymbolKind::Class),
+            "the struct rule must survive the move: {symbols:#?}"
+        );
+    }
+
+    /// nw-356: under the C grammar an in-class member function with a body is
+    /// unparseable, and error recovery reads `struct S { … } f(…) { … }` as a
+    /// function returning `struct S`. The recorded span then begins at the
+    /// struct keyword: `maskMultiTable` is `semi_masker.h:19-22` and indexed
+    /// 14-22. A start line that precedes the function makes
+    /// `find_enclosing_symbol` return the wrong symbol for every reference
+    /// between the two.
+    #[test]
+    fn header_member_function_span_starts_at_its_own_line_not_the_struct() {
+        let source = fixture("cpp/inline.h");
+        let parsed = parse_source(Path::new("inline.h"), &source).unwrap();
+        let reset = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "reset")
+            .unwrap_or_else(|| panic!("no reset in {:#?}", parsed.symbols));
+        assert_eq!(
+            (reset.start_line, reset.end_line),
+            (13, 15),
+            "span must not start at the enclosing struct: {reset:#?}"
+        );
+    }
+
+    /// nw-352 parity: `queries/c.scm` has a `union_specifier` rule and
+    /// `queries/cpp.scm` did not. Moving `.h` to the C++ grammar without
+    /// closing that gap would silently drop every union in every C header.
+    #[test]
+    fn cpp_union_is_extracted() {
+        let source = "union Packet {\n    int i;\n    float f;\n};\n";
+        let parsed = parse_source(Path::new("packet.h"), source).unwrap();
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.name == "Packet" && s.kind == SymbolKind::Class),
+            "union must extract under the C++ grammar too: {:#?}",
+            parsed.symbols
+        );
+    }
+
+    /// nw-352 parity: `#include` is one construct and must have one
+    /// `ReferenceKind`. `queries/c.scm` emits `@reference.includes`;
+    /// `queries/cpp.scm` emitted `@reference.import`, so moving `.h` to C++
+    /// would have flipped every C header's include edges from `INCLUDES_SYM`
+    /// to `IMPORTS`. `cpp.scm` is aligned to `c.scm` instead.
+    #[test]
+    fn cpp_include_is_an_includes_reference_like_c() {
+        let parsed = parse_source(
+            Path::new("a.cpp"),
+            "#include \"sensor.h\"\n#include <vector>\n",
+        )
+        .unwrap();
+        let includes: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Includes)
+            .collect();
+        assert!(
+            includes.iter().any(|r| r.name.contains("sensor.h")),
+            "C++ #include must use the same kind C does: {:#?}",
+            parsed.references
+        );
+        assert!(
+            includes.iter().any(|r| r.name.contains("vector")),
+            "{:#?}",
+            parsed.references
         );
     }
 
@@ -5788,6 +5972,278 @@ function formatTitle(title) {
         assert_eq!(span_of("a.astro", source, "formatTitle"), (8, 10));
     }
 
+    // ── round 3: nw-351 / nw-364 ────────────────────────────────────────
+
+    /// nw-351: `detect_cpp`'s macro list is only worth anything if those
+    /// macros actually reach it as SYMBOL NAMES. `MACRO(ident, ident) { body }`
+    /// is syntactically a function definition, so tree-sitter-cpp reads it as
+    /// one and `queries/cpp.scm`'s free-function rule mints a symbol named
+    /// after the macro. This asserts the whole path — parse, name, entry-point
+    /// flag — rather than the lookup table in isolation, which is how the
+    /// Catch2 and Google Benchmark entries were caught as unreachable and
+    /// removed from that list.
+    #[test]
+    fn cpp_typed_and_boost_test_macros_are_entry_points() {
+        let source = "\
+TYPED_TEST(SuiteName, CaseName) {
+    check();
+}
+
+BOOST_AUTO_TEST_CASE(sanity) {
+    check();
+}
+";
+        let parsed = parse_source(Path::new("test/suite.cpp"), source).unwrap();
+        for expected in ["TYPED_TEST", "BOOST_AUTO_TEST_CASE"] {
+            let sym = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == expected)
+                .unwrap_or_else(|| panic!("no {expected} in {:#?}", parsed.symbols));
+            assert!(
+                sym.is_entry_point,
+                "{expected} must seed the reachability walk: {sym:#?}"
+            );
+            assert_eq!(sym.entry_point_kind, Some(EntryPointKind::TestEntry));
+        }
+    }
+
+    /// nw-351: MEMBER_OF is minted only when a symbol carries `parent_name`
+    /// (`index.rs:4019`), and `find_parent_name` knew `impl_item`,
+    /// `class_declaration`, `class_definition`, `interface_declaration` and
+    /// `trait_item` — Rust / Java / TS / Python kinds only. C and C++ use
+    /// `class_specifier` / `struct_specifier` / `union_specifier`, so a C++
+    /// method never bound to its class even when the class itself extracted
+    /// correctly: 1,092 structs extracted at 91% on a real corpus and produced
+    /// zero member edges.
+    #[test]
+    fn cpp_method_carries_its_enclosing_class_as_parent_name() {
+        let source = "class Sensor {\npublic:\n    void read() { poll(); }\n};\n";
+        let parsed = parse_source(Path::new("sensor.cpp"), source).unwrap();
+        let read = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "read")
+            .unwrap_or_else(|| panic!("no read in {:#?}", parsed.symbols));
+        assert_eq!(read.parent_name.as_deref(), Some("Sensor"));
+    }
+
+    /// nw-351: the same property must hold for a `struct` container and for
+    /// plain C, which shares `find_parent_name` — a C struct field belongs to
+    /// its struct exactly as a C++ method belongs to its class.
+    #[test]
+    fn c_struct_field_carries_its_struct_as_parent_name() {
+        let source = "struct Reading {\n    int value;\n};\n";
+        let parsed = parse_source(Path::new("reading.c"), source).unwrap();
+        let value = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "value")
+            .unwrap_or_else(|| panic!("no value in {:#?}", parsed.symbols));
+        assert_eq!(value.parent_name.as_deref(), Some("Reading"));
+    }
+
+    /// nw-364(1): tree-sitter-julia's `assignment` node has no lhs/rhs FIELDS,
+    /// so the short-form pattern's unanchored `(call_expression …)` matched the
+    /// RIGHT side too. `greeting = greet(animal.name)` minted `greet` as a
+    /// DEFINITION at line 35 — a bodiless symbol that can then be picked as an
+    /// enclosing scope for a reference it does not contain.
+    #[test]
+    fn julia_rhs_call_is_not_a_definition() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+        let symbols = parsed.symbols;
+        // Both names ARE legitimate definitions elsewhere in the file
+        // (`struct Animal` at 7, `function greet` at 16), so the assertion has
+        // to be per-line: it is the CALL SITE that must not mint. Neither real
+        // definition was extracted before this change either -- the phantoms
+        // were standing in for them in the symbol table, which is exactly why
+        // two further query gaps went unnoticed.
+        for (forbidden, call_site) in [("Animal", 34u32), ("greet", 35u32)] {
+            assert!(
+                !symbols
+                    .iter()
+                    .any(|s| s.name == forbidden && s.start_line == call_site),
+                "{forbidden} at simple.jl:{call_site} is a call site, not a \
+                 definition: {symbols:#?}"
+            );
+        }
+        // The real definitions must be present -- `function greet(x)::String`
+        // at 16 (return-type annotation) and `struct Animal <: LivingThing` at
+        // 7 (supertype clause), neither of which the query could reach before.
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "greet" && s.start_line == 16 && s.kind == SymbolKind::Function),
+            "{symbols:#?}"
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Animal" && s.start_line == 7 && s.kind == SymbolKind::Class),
+            "{symbols:#?}"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "double"),
+            "the short-form definition `double(x) = x * 2` must still mint: \
+             {symbols:#?}"
+        );
+        assert!(symbols.iter().any(|s| s.name == "main"), "{symbols:#?}");
+    }
+
+    /// nw-364(2): `@reference.extends` is captured on the whole `impl_item`,
+    /// and `context` was "the parent's FIRST LINE". For a top-level item the
+    /// parent is the root node, so the evidence attached to a CORRECT fact was
+    /// line 1 of the file — `use std::collections::HashMap;` for an `Extends`
+    /// at `simple.rs:18`. Wrong evidence is worse than none for anyone
+    /// auditing the edge.
+    #[test]
+    fn rust_extends_context_is_the_impl_line() {
+        let source = fixture("rust/simple.rs");
+        let parsed = parse_source(Path::new("simple.rs"), &source).unwrap();
+        let extends = parsed
+            .references
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Extends)
+            .unwrap_or_else(|| panic!("no Extends in {:#?}", parsed.references));
+        assert!(
+            extends.context.contains("impl"),
+            "context must be the impl line, not the file's first line: \
+             {extends:#?}"
+        );
+    }
+
+    /// nw-364(2), the property rather than the instance: a reference's
+    /// `context` is EVIDENCE for that reference, so the line it names must be
+    /// a line the reference actually sits on. `first_line(parent)` satisfies
+    /// that only when the parent begins on the reference's own line.
+    #[test]
+    fn reference_context_always_contains_the_reference_line() {
+        // Every fixture that has a `*_references` snapshot, so the property
+        // is guarded across all 49 grammars rather than in the one language
+        // the defect was reported in.
+        let cases = [
+            ("simple.js", "js/simple.js"),
+            ("simple.ts", "ts/simple.ts"),
+            ("simple.py", "python/simple.py"),
+            ("simple.rs", "rust/simple.rs"),
+            ("simple.go", "go/simple.go"),
+            ("simple.c", "c/simple.c"),
+            ("simple.cpp", "cpp/simple.cpp"),
+            ("inline.h", "cpp/inline.h"),
+            ("Simple.cs", "csharp/Simple.cs"),
+            ("simple.dart", "dart/simple.dart"),
+            ("Simple.java", "java/Simple.java"),
+            ("Simple.kt", "kotlin/Simple.kt"),
+            ("simple.php", "php/simple.php"),
+            ("simple.rb", "ruby/simple.rb"),
+            ("simple.swift", "swift/simple.swift"),
+            ("simple.cbl", "cobol/simple.cbl"),
+            ("simple.lua", "lua/simple.lua"),
+            ("simple.sh", "bash/simple.sh"),
+            ("Simple.scala", "scala/Simple.scala"),
+            ("simple.ex", "elixir/simple.ex"),
+            ("simple.zig", "zig/simple.zig"),
+            ("simple.m", "objc/simple.m"),
+            ("simple.groovy", "groovy/simple.groovy"),
+            ("simple.ps1", "powershell/simple.ps1"),
+            ("simple.jl", "julia/simple.jl"),
+            ("simple.sql", "sql/simple.sql"),
+            ("simple.tf", "hcl/simple.tf"),
+            ("simple.f90", "fortran/simple.f90"),
+            ("simple.pas", "pascal/simple.pas"),
+            ("simple.vue", "vue/simple.vue"),
+            ("simple.svelte", "svelte/simple.svelte"),
+            ("simple.astro", "astro/simple.astro"),
+            ("simple.sv", "systemverilog/simple.sv"),
+        ];
+        for (name, rel) in cases {
+            let source = fixture(rel);
+            let parsed = parse_source(Path::new(name), &source).unwrap();
+            let lines: Vec<&str> = source.lines().collect();
+            for reference in &parsed.references {
+                if reference.context.is_empty() {
+                    continue;
+                }
+                let own_line = lines
+                    .get(reference.start_line as usize - 1)
+                    .unwrap_or(&"")
+                    .trim();
+                assert!(
+                    own_line.starts_with(reference.context.as_str())
+                        || reference.context.starts_with(own_line)
+                        || own_line.contains(reference.context.as_str()),
+                    "{name}: reference {} at line {} carries context {:?}, \
+                     which is not its own line {:?}",
+                    reference.name,
+                    reference.start_line,
+                    reference.context,
+                    own_line
+                );
+            }
+        }
+    }
+
+    /// nw-364(3): the keyword alternation in `RE_EXPORT_NAMED` is a
+    /// NON-capturing group, so the declaration keyword is matched and then
+    /// thrown away — every `export let` / `export const` / `export var` /
+    /// `export class` was minted `Function`. `904a2dc4` fixed this exact
+    /// declaration's SPAN and left the KIND. A mis-kinded `Function` is
+    /// eligible to be a fabricated reference source under the
+    /// code-bearing-kinds fallback.
+    #[test]
+    fn svelte_export_let_is_not_a_function() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+        let count = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "count")
+            .unwrap_or_else(|| panic!("no count in {:#?}", parsed.symbols));
+        assert_eq!(count.kind, SymbolKind::Variable, "{count:#?}");
+        let greet = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .unwrap_or_else(|| panic!("no greet in {:#?}", parsed.symbols));
+        assert_eq!(
+            greet.kind,
+            SymbolKind::Function,
+            "`export function` must stay a Function: {greet:#?}"
+        );
+    }
+
+    /// nw-364(3) "where else": every keyword the regex accepts must map to the
+    /// kind it declares, not just the one the fixture happens to use — and the
+    /// SAME regex, with the same non-capturing group and the same hardcoded
+    /// `SymbolKind::Function`, was in `vue.rs:27` and `astro.rs:11` too. One
+    /// defect, three copies.
+    #[test]
+    fn sfc_export_kinds_follow_the_declaration_keyword() {
+        let script = "  export function f() {}\n  export class C {}\n  \
+                      export const K = 1\n  export let l = 2\n  export var v = 3\n";
+        let cases = [
+            ("Kinds.svelte", format!("<script>\n{script}</script>\n")),
+            ("Kinds.vue", format!("<script>\n{script}</script>\n")),
+            ("Kinds.astro", format!("---\n{script}---\n<div />\n")),
+        ];
+        for (name, source) in cases {
+            let parsed = parse_source(Path::new(name), &source).unwrap();
+            let kind_of = |sym: &str| {
+                parsed
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == sym)
+                    .unwrap_or_else(|| panic!("no {sym} in {name}: {:#?}", parsed.symbols))
+                    .kind
+            };
+            assert_eq!(kind_of("f"), SymbolKind::Function, "{name}");
+            assert_eq!(kind_of("C"), SymbolKind::Class, "{name}");
+            assert_eq!(kind_of("K"), SymbolKind::Constant, "{name}");
+            assert_eq!(kind_of("l"), SymbolKind::Variable, "{name}");
+            assert_eq!(kind_of("v"), SymbolKind::Variable, "{name}");
+        }
+    }
     // ── Snapshot tests ────────────────────────────────────────────────────
 
     mod snapshot_tests {
@@ -5910,6 +6366,22 @@ function formatTitle(title) {
         fn snapshot_cpp_references() {
             let source = fixture("cpp/simple.cpp");
             assert_yaml_snapshot!(parsed_references("simple.cpp", &source));
+        }
+
+        // nw-352: `.h` is a C++ header. There was no `.h` fixture anywhere in
+        // `testdata/`, which is exactly why the one wrong dispatch decision was
+        // the one no snapshot could see.
+
+        #[test]
+        fn snapshot_cpp_header_symbols() {
+            let source = fixture("cpp/inline.h");
+            assert_yaml_snapshot!(parsed_symbols("inline.h", &source));
+        }
+
+        #[test]
+        fn snapshot_cpp_header_references() {
+            let source = fixture("cpp/inline.h");
+            assert_yaml_snapshot!(parsed_references("inline.h", &source));
         }
 
         // ── C# ──────────────────────────────────────────────────────────
@@ -7302,5 +7774,111 @@ mod reachability_recovery_tests {
         );
         let parsed = parse("benchmarks/charts.py", src);
         assert_eq!(reads(&parsed), vec!["REPO_ORDER"]);
+    }
+}
+
+/// nw-349, cause 3. `queries/rust.scm` had no attribute capture of any kind —
+/// no `attribute_item`, no `attribute`, no `token_tree`, no `string_literal` —
+/// so `#[serde(default = "f")]` produced NO reference and `f` had in-degree 0.
+///
+/// Measured over this repository's own tracked `.rs` files before the rule:
+/// 97 serde attribute sites naming a function as a string, 31 distinct
+/// user-defined names inside them, and 12 of those 31 with no ordinary call
+/// site anywhere in the workspace. Twelve guaranteed `dead-code` false
+/// positives on NestWeaver's own source, from this one gap.
+#[cfg(test)]
+mod attribute_string_reference_tests {
+    use super::*;
+
+    fn calls(source: &str) -> Vec<String> {
+        let parsed = parse_source(Path::new("t.rs"), source).expect("parse");
+        let mut names: Vec<String> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_function_named_only_by_a_serde_attribute_is_still_referenced() {
+        // `default` is the dominant spelling and is a CONTEXTUAL KEYWORD, so
+        // tree-sitter tokenises it as an anonymous node rather than an
+        // `identifier`. A rule that matched only identifiers would have closed
+        // almost nothing while appearing to work — all twelve measured false
+        // positives are `default = "..."`.
+        assert_eq!(
+            calls(
+                r#"
+                struct Config {
+                    #[serde(default = "default_limit")]
+                    limit: usize,
+                    #[serde(skip_serializing_if = "is_empty")]
+                    tags: Vec<String>,
+                    #[serde(deserialize_with = "de_duration", serialize_with = "ser_duration")]
+                    timeout: u64,
+                }
+                "#
+            ),
+            vec!["de_duration", "default_limit", "is_empty", "ser_duration"],
+        );
+    }
+
+    /// THE COUNTERWEIGHT, and without it this rule fabricates edges rather than
+    /// finding them. Every one of these carries a string literal inside an
+    /// attribute, and not one of them names a symbol. A blanket
+    /// `(string_literal) @reference.call` inside any attribute — the obvious
+    /// form of this fix — would mint a reference for all of them, and a
+    /// fabricated edge is worse than a missing one because a caller cannot tell
+    /// it from a real one.
+    #[test]
+    fn attribute_strings_that_name_nothing_mint_no_reference() {
+        let names = calls(
+            r#"
+            #[derive(Debug, thiserror::Error, Diagnostic)]
+            enum E {
+                #[error("Database not found: {path}")]
+                #[diagnostic(code(nestweaver::db_not_found), help("Run `nestweaver index`"))]
+                NotFound { path: String },
+            }
+
+            #[serde(rename_all = "camelCase")]
+            struct Wire {
+                #[serde(rename = "camelCase")]
+                snake_case: String,
+            }
+
+            struct Args {
+                #[arg(long, help = "Path to the database file", default_value = "3600")]
+                idle_timeout: u64,
+            }
+            "#,
+        );
+        assert!(
+            names.is_empty(),
+            "an attribute string that names no symbol must mint no edge — \
+             `rename`, `rename_all`, `help`, `default_value`, an `#[error]` \
+             message and a `#[diagnostic]` code are all strings that name \
+             nothing: {names:?}"
+        );
+    }
+
+    /// `default_value` and `default` are one character apart and mean opposite
+    /// things: `default_value` is a clap LITERAL, `default` is a serde
+    /// FUNCTION PATH. Pinned separately because an allow-list matched with a
+    /// prefix rather than an anchored alternation would silently swallow it,
+    /// and the assertion above would still pass on the other rows.
+    #[test]
+    fn default_value_is_a_literal_and_default_is_a_path() {
+        assert_eq!(
+            calls(r#"struct A { #[arg(default_value = "3600")] t: u64 }"#),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            calls(r#"struct A { #[serde(default = "default_timeout")] t: u64 }"#),
+            vec!["default_timeout"],
+        );
     }
 }

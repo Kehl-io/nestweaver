@@ -14,9 +14,16 @@ static RE_SCRIPT_OPEN: LazyLock<Regex> =
 static RE_SCRIPT_CLOSE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)</script\s*>").unwrap());
 
-/// Matches `export function name(` or `export const name =`.
+/// Matches `export <keyword> name`, capturing BOTH the keyword and the name.
+///
+/// nw-364(3): the keyword alternation used to be a NON-capturing group, so the
+/// declaration keyword was matched and then thrown away — the kind literally
+/// could not be discriminated and every named export was minted
+/// `SymbolKind::Function`. `904a2dc4` fixed this exact declaration's SPAN and
+/// left the KIND, and a mis-kinded `Function` is eligible to be chosen as a
+/// fabricated reference source under `87e800c5`'s code-bearing-kinds fallback.
 static RE_EXPORT_NAMED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"export\s+(?:function|const|let|var|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap()
+    Regex::new(r"export\s+(function|const|let|var|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap()
 });
 
 /// Matches `function name(` (named function declarations).
@@ -75,7 +82,9 @@ const CALL_EXCLUDE: &[&str] = &[
 /// Parse a Svelte Single-File Component (`.svelte`) using regex-based extraction.
 ///
 /// Extracts the `<script>` block content and scans it for:
-/// - Exported functions/constants → [`SymbolKind::Function`]
+/// - Named exports → the kind their declaration keyword names
+///   (`function` → `Function`, `class` → `Class`, `const` → `Constant`,
+///   `let`/`var` → `Variable`)
 /// - Component name (from filename) → [`SymbolKind::Class`]
 /// - `import` statements → [`ReferenceKind::Import`]
 /// - Function calls → [`ReferenceKind::Call`]
@@ -146,10 +155,11 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
 
             // Named exports (export function/const/let)
             if let Some(cap) = RE_EXPORT_NAMED.captures(trimmed) {
-                let name = cap[1].to_string();
+                let kind = crate::parse::export_declaration_kind(&cap[1]);
+                let name = cap[2].to_string();
                 symbols.push(RawSymbol {
                     name,
-                    kind: SymbolKind::Function,
+                    kind,
                     start_line: line_no,
                     end_line,
                     signature: trimmed.to_string(),

@@ -37,4 +37,6 @@ function main()
     @log_call process([1, 2, 3])
 end
 
+double(x) = x * 2
+
 end # module

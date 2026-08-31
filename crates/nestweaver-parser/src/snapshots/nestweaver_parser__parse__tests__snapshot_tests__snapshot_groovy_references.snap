@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4381
+assertion_line: 6549
 expression: "parsed_references(\"simple.groovy\", &source)"
 ---
 - name: groovy.transform.CompileStatic
@@ -11,12 +11,12 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: java.util.logging.Logger
   kind: Import
   start_line: 2
-  context: import groovy.transform.CompileStatic
+  context: import java.util.logging.Logger
   receiver: ~
 - name: String
   kind: TypeRef
   start_line: 5
-  context: "{"
+  context: String greet(String name)
   receiver: ~
 - name: String
   kind: TypeRef
@@ -41,7 +41,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: String
   kind: TypeRef
   start_line: 15
-  context: "{"
+  context: String prefix
   receiver: ~
 - name: String
   kind: TypeRef
@@ -51,7 +51,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: String
   kind: TypeRef
   start_line: 21
-  context: "{"
+  context: "String greet(String name) {"
   receiver: ~
 - name: String
   kind: TypeRef
@@ -61,7 +61,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: String
   kind: TypeRef
   start_line: 22
-  context: "{"
+  context: String formatted = formatName(name)
   receiver: ~
 - name: formatName
   kind: Call
@@ -71,7 +71,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: String
   kind: TypeRef
   start_line: 26
-  context: "{"
+  context: "private String formatName(String name) {"
   receiver: ~
 - name: String
   kind: TypeRef
