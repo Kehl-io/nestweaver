@@ -7479,6 +7479,17 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
+            // nw-366: `CURRENT_DB_PATH` is a THREAD-LOCAL, and this closure runs
+            // on a `spawn_blocking` worker, not the thread that accepted the
+            // RPC. Both MCP dispatch paths in this file set it inside their own
+            // `spawn_blocking` for exactly this reason; the engine-level RPCs
+            // never needed it until `attach_ranking_staleness` below, which
+            // reads the db path through it to find the generation sidecar.
+            //
+            // Measured before this line existed: `repo-map` via daemon replied
+            // `rankings_stale: false` on a generation-3 database while `hubs`
+            // on the SAME daemon replied `true`.
+            nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             let token_budget = args
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
@@ -7486,11 +7497,27 @@ impl NestWeaverDaemon for DaemonService {
             let map = nestweaver_engine::generate_repo_map(&state.store, token_budget)
                 .map_err(|e| Status::internal(format!("generate_repo_map failed: {e:#}")))?;
             let token_count = map.len().div_ceil(4);
-            serde_json::to_string(&serde_json::json!({
+            let mut resp = serde_json::json!({
                 "map": map,
                 "token_count": token_count,
-            }))
-            .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            });
+            // nw-366: `repo-map`'s entire output ORDERING is PageRank order
+            // (`generate_repo_map` -> `symbols_by_pagerank`), so on a graph
+            // whose edges predate the running resolver the map is wrong in the
+            // one dimension it exists to convey — and it disclosed nothing on
+            // either route.
+            //
+            // The DAEMON answers because only the daemon holds the store: the
+            // CLI cannot enumerate repos on this route without taking a lock
+            // the daemon owns. `attach_ranking_staleness` is the same attacher
+            // `hub_nodes` / `bridge_nodes` use, over
+            // `ResolverGenerations::stale_repos` — the sole computation
+            // (nw-358) — so the CLI can read this with
+            // `ResolverStaleness::from_daemon_response` instead of deriving a
+            // weaker client-side answer.
+            nestweaver_mcp::tools::attach_ranking_staleness(&mut resp, &state.store);
+            serde_json::to_string(&resp)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;

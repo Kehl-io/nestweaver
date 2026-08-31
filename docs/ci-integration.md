@@ -435,13 +435,25 @@ Collapsing "found drift" into the error code is how a gate ends up unable to
 distinguish a stale graph from a crashed check — the two need opposite
 responses.
 
-Three conditions produce exit `2`, all fixed the same way:
+Four conditions produce exit `2`, all fixed the same way:
 
 | `status` | Meaning |
 |----------|---------|
 | `stale` | indexed SHA is behind git HEAD |
 | `incomplete` | the SHA was recorded but the content never landed (interrupted index) — the repo compares equal to HEAD while serving an empty graph |
 | `missing` | the working tree has been deleted |
+| `outdated_resolver` | the repo is at HEAD and fully indexed, but its edges were written by an older resolver generation (**new in 9.0.0**) |
+
+`outdated_resolver` is the only one no git comparison can find: such a repo sits
+exactly *at* HEAD with every file unchanged. It reuses exit `2` deliberately —
+the remedy is identical, and every gate already written against `2` therefore
+catches a resolver-generation upgrade with no edit. The independent
+`resolver_stale` boolean on each row carries the fact even when `status` reports
+a git reason instead, and `resolver_stale_repos` lists the URLs.
+
+**Re-index with `--force`.** `nestweaver index --repo <path>` is incremental and
+is a no-op on an `outdated_resolver` repo — it reports `0 modified`, writes
+nothing, and leaves the old generation recorded. Only `--force` clears it.
 
 **Gate on `any_needs_reindex`** (or on exit `2`). `any_stale` and `is_stale`
 mean *behind HEAD* specifically, so a repo that is at HEAD but incompletely
@@ -449,7 +461,11 @@ indexed reports `is_stale: false` with `needs_reindex: true`. The JSON also
 carries two arrays so a job can name what to act on: `needs_reindex_repos` is
 the actionable set matching the exit code, and `stale_repos` is the
 behind-HEAD subset. Gate on `needs_reindex_repos` — `stale_repos` will not
-name an `incomplete` or `missing` repo.
+name an `incomplete`, `missing` or `outdated_resolver` repo. A third array,
+`resolver_stale_repos`, names the generation-stale subset. Note that
+`stale_repos` means *behind HEAD* on this command and *generation-stale repo
+UIDs* on `hub_nodes`/`bridge_nodes` — different populations under one name,
+which is why the new list did not reuse it.
 
 ```yaml
 - name: Fail if the NestWeaver index needs re-indexing
@@ -471,36 +487,40 @@ Read/lookup commands against a non-existent database also fail (exit 1,
 job pointed at the wrong `--db` path fails loudly rather than passing on an
 empty graph.
 
-### What this gate does NOT catch: a resolver-generation upgrade
+### The resolver-generation upgrade, and what this gate used to miss
 
-`stale-check` derives `status` from three conditions only — `missing`,
-`incomplete`, and indexed-SHA-behind-`HEAD` (`src/main.rs`). **It never consults
-`<db>.resolver_generation.json.`** So when a NestWeaver upgrade bumps
-`RESOLVER_GENERATION`, every repo in an existing graph reports `ok` and this gate
-exits `0` while the graph's edges are the ones the *old* resolver wrote.
+Through 8.x, `stale-check` derived `status` from three conditions only —
+`missing`, `incomplete`, and indexed-SHA-behind-`HEAD`. **It never consulted
+`<db>.resolver_generation.json`**, so when a NestWeaver upgrade bumped
+`RESOLVER_GENERATION` every repo in an existing graph reported `ok` and the gate
+exited `0` while the graph's edges were the ones the *old* resolver wrote.
+Verified against a generation-3 sidecar on the 8.x binary: `up to date`, exit 0.
 
-9.0.0 bumps `RESOLVER_GENERATION` **3 → 4**. Verified against a generation-3
-sidecar: `stale-check` prints `up to date` and exits 0. Until each repo is
-re-indexed, its rankings are computed over stale edges, C and C++ `MEMBER_OF`
-edges do not exist at all, and C++ `IMPORTS` edges are missing.
+**9.0.0 bumps `RESOLVER_GENERATION` 3 → 4 and adds the fourth rung.** A
+generation-stale repo now reports `status: "outdated_resolver"` with
+`resolver_stale: true` and `needs_reindex: true`, and the command exits `2`. The
+gate recipe above needs no change — `any_needs_reindex` and exit `2` already
+cover it. **This is a behaviour change to a CI-facing exit code:** a job pointed
+at a graph built by 8.x will start failing on the first run after the upgrade,
+which is the intended signal.
 
-Pin the generation in CI alongside the freshness gate:
+Until each repo is re-indexed, its rankings are computed over stale edges, C and
+C++ `MEMBER_OF` edges do not exist at all, and C++ `IMPORTS` edges are missing.
+
+To name the generation-stale subset specifically:
 
 ```yaml
-- name: Fail if the graph predates the current resolver generation
+- name: Report which repos predate the current resolver generation
   run: |
-    # hub_nodes / bridge_nodes are the only surfaces that disclose this.
-    stale=$(nestweaver hubs --json --db nestweaver.lbug | jq -r '.rankings_stale')
-    if [ "$stale" = "true" ]; then
-      echo "::error::graph was built by an older resolver — re-index before trusting rankings"
-      nestweaver hubs --json --db nestweaver.lbug | jq -r '.stale_repos[]'
-      exit 1
-    fi
+    nestweaver stale-check --json --db nestweaver.lbug \
+      | jq -r '.resolver_stale_repos[]'
 ```
 
-Roughly a dozen other ranking-derived commands — `repo-map` most sharply, since
-its entire output *ordering* is PageRank order — disclose nothing. Do not read
-the absence of a warning on those as evidence of freshness.
+`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
+disclose it (`rankings_stale` / `stale_repos` on `--json`, a stderr warning
+otherwise). `clusters`, `blast-radius`, `generate-guide`, PPR-backed `context`
+and the web UI do not. Do not read the absence of a warning on those as evidence
+of freshness.
 
 ### Exit `2` is overloaded across commands
 

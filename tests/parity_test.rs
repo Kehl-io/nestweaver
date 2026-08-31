@@ -3342,6 +3342,410 @@ fn stale_rankings_are_disclosed_on_all_three_routes_including_default_text() {
     );
 }
 
+/// nw-366. `stale-check` is the command a user runs to answer "do I need to
+/// re-index?", and it could not see the one thing 9.0.0 makes true of every
+/// pre-existing database.
+///
+/// Its ladder was `missing` / `incomplete` / indexed-SHA-behind-`HEAD` — three
+/// questions of the form "is the input newer than the index?". A
+/// generation-stale repo answers `no` to all three: it sits exactly AT HEAD
+/// with every file unchanged and every symbol present. Measured on a
+/// generation-3 sidecar before this change, on all four legs below:
+/// `Stale check: 1 repo(s), up to date`, `status: "ok"`, exit **0**.
+///
+/// THE FIXTURE DOWNGRADES THE SIDECAR RATHER THAN DELETING IT. Deleting it
+/// produces a state the old code also called `ok`, so it would not have
+/// distinguished the fix from the bug — but more importantly it is not the
+/// upgrade case. After `RESOLVER_GENERATION` 3 → 4 the file is PRESENT and
+/// well-formed with every entry behind, which is what a real user has.
+///
+/// ALL FOUR CLI LEGS PLUS MCP ARE ASSERTED IN ONE BODY, on purpose. The `hubs`
+/// gap this file already pins (nw-365) existed because `--json` and
+/// `--no-daemon` were covered and the default text route was not.
+///
+/// The last section EXECUTES the remedy this command prints. A disclosure
+/// whose remedy does not clear the condition is worse than silence, and the
+/// un-forced `nestweaver index --repo <path>` that shipped for two releases is
+/// exactly that: incremental detection reports `0 modified` on a repo already
+/// at HEAD and never rewrites the sidecar.
+#[test]
+fn stale_check_detects_a_generation_stale_graph_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // COUNTERWEIGHT FIRST: a freshly indexed graph must be clean on this
+    // ladder. Without it every assertion below passes against a command that
+    // simply always says "re-index".
+    let clean = run_direct(db, &["stale-check", "--json"]);
+    let clean_json = parse_stdout("stale-check (clean)", &clean);
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "a just-indexed graph must exit 0, or the fourth rung is a false alarm \
+         rather than a detection: {clean_json}"
+    );
+    assert_eq!(
+        clean_json["repos"][0]["status"],
+        serde_json::json!("ok"),
+        "{clean_json}"
+    );
+    assert_eq!(
+        clean_json["repos"][0]["resolver_stale"],
+        serde_json::json!(false),
+        "{clean_json}"
+    );
+
+    let recorded = downgrade_resolver_generation(db);
+    assert!(
+        recorded > 0,
+        "the fixture recorded no repo, so every leg below passes vacuously"
+    );
+
+    // ── Direct legs first: a running daemon holds the write lease.
+    let direct_json_out = run_direct(db, &["stale-check", "--json"]);
+    let direct_json = parse_stdout("stale-check --json (direct)", &direct_json_out);
+    let direct_text = run_direct(db, &["stale-check"]);
+    let mcp = run_via_mcp(db, "stale_check", serde_json::json!({}));
+
+    // ── Daemon legs.
+    let (daemon_json_out, daemon_text) = {
+        let _guard = DaemonGuard::new(db);
+        start_daemon(db);
+        (
+            run_via_daemon(db, &["stale-check", "--json"]),
+            run_via_daemon(db, &["stale-check"]),
+        )
+    };
+    stop_daemon(db);
+    let daemon_json = parse_stdout("stale-check --json (daemon)", &daemon_json_out);
+
+    // ── The payload contract, on all three payload-bearing routes.
+    for (label, payload) in [
+        ("direct --json", &direct_json),
+        ("daemon --json", &daemon_json),
+        ("mcp stale_check", &mcp),
+    ] {
+        let repo = &payload["repos"][0];
+        assert_eq!(
+            repo["status"],
+            serde_json::json!("outdated_resolver"),
+            "{label}: a repo at HEAD whose edges predate the running resolver is \
+             not `ok` — that reading is what let the 9.0.0 migration pass a CI \
+             gate: {payload}"
+        );
+        assert_eq!(
+            repo["resolver_stale"],
+            serde_json::json!(true),
+            "{label}: the fact must survive independently of `status`, which a \
+             concurrent git reason would otherwise mask: {payload}"
+        );
+        assert_eq!(
+            repo["needs_reindex"],
+            serde_json::json!(true),
+            "{label}: `needs_reindex` is the documented actionable union and the \
+             thing CI gates on: {payload}"
+        );
+        assert_eq!(
+            payload["any_needs_reindex"],
+            serde_json::json!(true),
+            "{label}: {payload}"
+        );
+        assert!(
+            payload["resolver_stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty()),
+            "{label}: the payload must NAME what to re-index, not merely that \
+             something needs it: {payload}"
+        );
+        // `is_stale` stays behind-HEAD and nothing else (nw-163). Widening it
+        // here would re-create the self-contradictory row that fix removed:
+        // this repo is exactly AT HEAD.
+        assert_eq!(
+            payload["any_stale"],
+            serde_json::json!(false),
+            "{label}: `is_stale` means BEHIND HEAD; this repo is at HEAD: {payload}"
+        );
+        assert_eq!(
+            payload["stale_repos"],
+            serde_json::json!([]),
+            "{label}: `stale_repos` is the behind-HEAD subset on this tool and \
+             must not be quietly repurposed — the same key means \
+             generation-stale repo UIDs on `hub_nodes`: {payload}"
+        );
+    }
+
+    // ── The exit code, on all four CLI legs. This is the CI contract.
+    for (label, output) in [
+        ("direct --json", &direct_json_out),
+        ("direct text", &direct_text),
+        ("daemon --json", &daemon_json_out),
+        ("daemon text", &daemon_text),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{label}: generation staleness reuses EXIT_NEEDS_REINDEX so every \
+             gate already written against `2` catches the migration for free. \
+             Exiting 0 here is the whole defect.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // ── The human rendering, on both text legs.
+    for (label, output) in [("direct text", &direct_text), ("daemon text", &daemon_text)] {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("NEEDS REINDEX"),
+            "{label}: a banner reading `up to date` above exit 2 is the exact \
+             dishonesty this command's contract exists to remove:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("OLD-RESOLVER"),
+            "{label}: the row must say WHICH repo. `indexed=` and `HEAD=` are \
+             equal on this row, so without a marker it reads as healthy:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("indexed by an older resolver"),
+            "{label}: the marker alone does not say what is wrong:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("nestweaver index --repo <path> --force"),
+            "{label}: `--force` is load-bearing — see the remedy execution \
+             below:\n{stderr}"
+        );
+    }
+
+    // ── EXECUTE THE REMEDY. Not "assert the string is present": run it.
+    //
+    // The un-forced form is run FIRST and asserted to change nothing, because
+    // that is what shipped and a test that only ran `--force` would have
+    // called the broken remedy correct.
+    let repo_arg = fixture.repo_dir.display().to_string();
+    let unforced = run_direct(db, &["index", "--repo", &repo_arg]);
+    assert!(
+        unforced.status.success(),
+        "the un-forced index must SUCCEED — that is why it was mistaken for a \
+         working remedy: {}",
+        String::from_utf8_lossy(&unforced.stderr)
+    );
+    let after_unforced = run_direct(db, &["stale-check", "--json"]);
+    assert_eq!(
+        after_unforced.status.code(),
+        Some(2),
+        "`nestweaver index --repo <path>` is a no-op on a repo already at HEAD: \
+         it reports `0 modified`, writes nothing, and leaves the sidecar on the \
+         old generation. This is the remedy that shipped.\nstdout: {}",
+        String::from_utf8_lossy(&after_unforced.stdout)
+    );
+
+    let forced = run_direct(db, &["index", "--repo", &repo_arg, "--force"]);
+    assert!(
+        forced.status.success(),
+        "the printed remedy must RUN: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let after = run_direct(db, &["stale-check", "--json"]);
+    let after_json = parse_stdout("stale-check (after remedy)", &after);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "the remedy this command prints must CLEAR the condition it reports, or \
+         the user runs it, sees success, and re-reads the same warning \
+         forever:\n{after_json}"
+    );
+    assert_eq!(
+        after_json["repos"][0]["resolver_stale"],
+        serde_json::json!(false),
+        "{after_json}"
+    );
+    assert_eq!(
+        after_json["resolver_stale_repos"],
+        serde_json::json!([]),
+        "{after_json}"
+    );
+}
+
+/// nw-366. `repo-map` is the sharpest of the silent ranking surfaces:
+/// `generate_repo_map` orders its entire output by `symbols_by_pagerank`, so on
+/// a generation-stale graph the ORDER — which is the whole content of the
+/// command — is computed over the edges an older resolver wrote. `hubs` at
+/// least prints scores a reader can discount; this prints only a ranking.
+///
+/// It had both routes silent AND a `--json` branch that hand-rolled its own
+/// struct, bypassing `print_json_payload`, so it carried no `_meta` either.
+///
+/// `ranking rank` and `summary --level hub` are asserted in the same body
+/// because they are the same property on neighbouring surfaces: the first
+/// prints a raw `base_pagerank` to eight decimal places, which reads as
+/// authoritative, with no caveat at all; the second SELECTS which thirty
+/// symbols to describe using the same degree/PageRank.
+///
+/// `summary --level file` is asserted to stay SILENT. Gating matters as much as
+/// disclosing: a flag that appears on every level distinguishes nothing, and
+/// `file` level is not ranking-derived, so claiming its output is stale would
+/// be a new false statement rather than a fixed omission.
+///
+/// The daemon leg is not decoration. Writing this test found a REAL second
+/// defect: `attach_ranking_staleness` resolves the db path through the
+/// `CURRENT_DB_PATH` THREAD-LOCAL, and the daemon's `repo_map_json` does its
+/// work on a `spawn_blocking` worker where it was unset — so the daemon replied
+/// `rankings_stale: false` on a generation-3 database while `hubs` on the SAME
+/// daemon replied `true`. A direct-only test would have shipped that.
+#[test]
+fn repo_map_and_ranking_rank_disclose_stale_rankings_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // COUNTERWEIGHT: a current graph must disclose NOTHING, on every leg. A
+    // command that always warns has not detected anything.
+    let clean_text = run_direct(db, &["repo-map"]);
+    let clean_stderr = String::from_utf8_lossy(&clean_text.stderr);
+    assert!(
+        !clean_stderr.contains("older resolver"),
+        "a freshly indexed graph must not be accused of staleness: {clean_stderr}"
+    );
+    let clean_json = parse_stdout(
+        "repo-map --json (clean)",
+        &run_direct(db, &["repo-map", "--json"]),
+    );
+    assert_eq!(
+        clean_json["rankings_stale"],
+        serde_json::json!(false),
+        "{clean_json}"
+    );
+
+    let recorded = downgrade_resolver_generation(db);
+    assert!(
+        recorded > 0,
+        "nothing recorded — every leg below is vacuous"
+    );
+
+    // ── Direct legs first: a running daemon holds the write lease.
+    let direct_text = run_direct(db, &["repo-map"]);
+    let direct_json = parse_stdout(
+        "repo-map --json (direct)",
+        &run_direct(db, &["repo-map", "--json"]),
+    );
+    let rank_text = run_direct(db, &["ranking", "rank", "mainA"]);
+    let rank_json = parse_stdout(
+        "ranking rank --json (direct)",
+        &run_direct(db, &["ranking", "rank", "mainA", "--json"]),
+    );
+
+    let hub_text = run_direct(db, &["summary", "--level", "hub"]);
+    let file_text = run_direct(db, &["summary", "--level", "file"]);
+    let hub_json = parse_stdout(
+        "summary --level hub --json (direct)",
+        &run_direct(db, &["summary", "--level", "hub", "--json"]),
+    );
+    let file_json = parse_stdout(
+        "summary --level file --json (direct)",
+        &run_direct(db, &["summary", "--level", "file", "--json"]),
+    );
+
+    // ── Daemon legs.
+    let (daemon_text, daemon_json_out, daemon_hub_text, daemon_file_text) = {
+        let _guard = DaemonGuard::new(db);
+        start_daemon(db);
+        (
+            run_via_daemon(db, &["repo-map"]),
+            run_via_daemon(db, &["repo-map", "--json"]),
+            run_via_daemon(db, &["summary", "--level", "hub"]),
+            run_via_daemon(db, &["summary", "--level", "file"]),
+        )
+    };
+    let daemon_json = parse_stdout("repo-map --json (daemon)", &daemon_json_out);
+
+    // ── The payload contract. Both keys, always — an absent key cannot be read
+    // as `false` (nw-308).
+    for (label, payload) in [
+        ("repo-map direct", &direct_json),
+        ("repo-map daemon", &daemon_json),
+        ("ranking rank direct", &rank_json),
+        ("summary --level hub direct", &hub_json),
+    ] {
+        assert_eq!(
+            payload["rankings_stale"],
+            serde_json::json!(true),
+            "{label}: an agent parsing stdout is the consumer most likely to ACT \
+             on a stale ranking and the one least able to see a stderr \
+             warning: {payload}"
+        );
+        assert!(
+            payload["stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty()),
+            "{label}: naming the repos is the difference between a caveat and a \
+             remedy: {payload}"
+        );
+    }
+
+    // `repo-map --json` hand-rolled its payload and so had no provenance at
+    // all. Routing it through `print_json_payload` is what fixes that, and the
+    // stamp is the observable proof it now does.
+    for (label, payload) in [
+        ("repo-map direct", &direct_json),
+        ("repo-map daemon", &daemon_json),
+    ] {
+        assert!(
+            payload.get("_meta").is_some(),
+            "{label}: this branch bypassed `print_json_payload`, so it was the \
+             one payload on either route with no `_meta`: {payload}"
+        );
+        assert!(
+            payload["map"].as_str().is_some_and(|m| !m.is_empty()),
+            "{label}: the map itself must survive the reshaping: {payload}"
+        );
+    }
+    assert_eq!(
+        direct_json["map"], daemon_json["map"],
+        "the two routes must still return the same map"
+    );
+
+    // ── The stderr contract, on every plain-text leg. This is the route users
+    // actually run, and the one nw-365 found uncovered on `hubs`.
+    for (label, output) in [
+        ("repo-map direct text", &direct_text),
+        ("repo-map DAEMON text", &daemon_text),
+        ("ranking rank direct text", &rank_text),
+        ("summary --level hub direct text", &hub_text),
+        ("summary --level hub DAEMON text", &daemon_hub_text),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: command failed: {stderr}");
+        assert!(
+            stderr.contains("indexed by an older resolver"),
+            "{label}: the user is shown a confidently stale ranking and told \
+             NOTHING:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("nestweaver index --repo <path> --force"),
+            "{label}: a disclosure without a WORKING remedy leaves the user \
+             stuck — plain `index` is a no-op on a repo already at \
+             HEAD:\n{stderr}"
+        );
+    }
+
+    // ── The GATE. `file` level is not ranking-derived, so it must stay silent
+    // on the same stale database that made every leg above fire. Without this,
+    // the assertions above are satisfied by a disclosure attached to
+    // everything, which is indistinguishable from no detection at all.
+    assert!(
+        file_json.get("rankings_stale").is_none(),
+        "summary --level file is not ranking-derived; claiming its output is \
+         stale is a new false statement, not a fixed omission: {file_json}"
+    );
+    for (label, output) in [
+        ("summary --level file direct text", &file_text),
+        ("summary --level file DAEMON text", &daemon_file_text),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("older resolver"), "{label}: {stderr}");
+    }
+}
+
 /// Rewrite the generation sidecar so every recorded repo reads as the
 /// PREVIOUS generation, and return how many repos were downgraded.
 ///

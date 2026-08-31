@@ -764,14 +764,16 @@ immediately in normal operation.
 > `#include` resolved to `IMPORTS`. Re-index every repo — `nestweaver index
 > --repo <path> --force` — before trusting any ranking on this server.
 >
-> **`stale-check` will not tell you.** Its status ladder is
-> `missing`/`incomplete`/SHA-behind-HEAD only; it never reads
-> `<db>.resolver_generation.json`, so a generation-3 graph reports `ok` and exits
-> 0. `hub_nodes` and `bridge_nodes` are the only surfaces that disclose it, via
-> the `rankings_stale` boolean and a top-level `stale_repos` array (distinct from
-> `_meta.stale_repos`, which is federation staleness). Roughly a dozen other
-> ranking-derived surfaces — `repo-map` most sharply, since its entire output
-> *ordering* is PageRank order — disclose nothing at all.
+> **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports
+> `status: "outdated_resolver"` with `resolver_stale: true` and
+> `needs_reindex: true`, and the command exits 2. Through 8.x it did not: the
+> ladder was `missing`/`incomplete`/SHA-behind-HEAD only and never read
+> `<db>.resolver_generation.json`, so a generation-3 graph reported `ok` and
+> exited 0. `hub_nodes`, `bridge_nodes`, `repo_map`, `ranking rank` and
+> `get_summary` at hub level also disclose it, via the `rankings_stale` boolean
+> and a top-level `stale_repos` array (distinct from `_meta.stale_repos`, which
+> is federation staleness). `clusters`, `blast_radius`, `generate-guide`,
+> PPR-backed context and the web UI still disclose nothing.
 
 - **Computed at index time.** A full re-index (`index --force`) and every
   incremental update compute PageRank and persist it to `<db>.pagerank.json`.
@@ -1091,16 +1093,17 @@ nestweaver brain reindex-search
 
 ```bash
 # Check which repos are behind HEAD.
-# Exit: 0 = all fresh · 2 = at least one needs a re-index · 1 = the check itself
-# failed · 64 = bad usage. Gate on 2, never on 1 — those demand opposite
+# Exit: 0 = all fresh · 2 = at least one needs a re-index (behind HEAD,
+# incomplete, missing, OR built by an older resolver generation) · 1 = the check
+# itself failed · 64 = bad usage. Gate on 2, never on 1 — those demand opposite
 # responses.
 nestweaver brain stale-check
 
-# stale-check compares indexed SHA against git HEAD and NOTHING else. It does
-# not read <db>.resolver_generation.json, so a graph built by an older
-# NestWeaver reports `ok` and exits 0 while its edges are stale. After a
-# NestWeaver upgrade, check this instead:
-nestweaver hubs --json | jq '{rankings_stale, stale_repos}'
+# As of 9.0.0 stale-check also reads <db>.resolver_generation.json: a graph
+# built by an older NestWeaver reports status "outdated_resolver" and exits 2.
+# To name just that subset (the remedy needs --force; plain `index` is
+# incremental and a no-op on a repo already at HEAD):
+nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
 
 # Force reindex a specific repo (use UID from GET /admin/api/repos)
 REPO_UID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \

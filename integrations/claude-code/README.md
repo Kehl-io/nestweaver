@@ -70,7 +70,7 @@ tools listed under *Admin* below). `--lite` advertises **6**.
 - **contract_drift** — API contract drift detection across repos
 
 **Graph Structure:**
-- **hub_nodes** / **bridge_nodes** — Centrality analysis (PageRank, betweenness). The **only** tools that disclose stale rankings (`rankings_stale`, `stale_repos`)
+- **hub_nodes** / **bridge_nodes** — Centrality analysis (PageRank, betweenness). Disclose stale rankings (`rankings_stale`, `stale_repos`), as do `repo_map`, `ranking rank` and hub-level `get_summary`; `stale_check` reports the same condition as `status: "outdated_resolver"`
 - **clusters** — Community detection (Louvain-style local moving, single-level)
 - **cross_repo_contracts** — Cross-repository symbol relationships
 

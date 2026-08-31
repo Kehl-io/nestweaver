@@ -8727,7 +8727,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Check whether the graph index is current by comparing each repo's indexed git SHA against HEAD. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- If stale, re-index with brain_add_source or CLI nestweaver index\n\nLimitations:\n- Only checks git repos, not vault/note freshness\n- For viewing what actually changed, use brain_diff",
+        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -8740,6 +8740,24 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let repos = store
         .list_repos(None)
         .map_err(|e| anyhow!("list_repos: {e}"))?;
+
+    // nw-366: the FOURTH rung of the ladder. `missing` / `incomplete` /
+    // behind-HEAD all ask "is the input newer than the index?"; this one asks
+    // "was the index built by the resolver we are running?" — a question no
+    // git SHA can answer, because a generation-stale repo sits exactly AT HEAD
+    // with every file unchanged.
+    //
+    // This is the command a user runs to decide whether to re-index, and until
+    // now it answered "up to date" and exited 0 on a graph whose every edge
+    // predates the running binary. `RESOLVER_GENERATION` 3 → 4 in 9.0.0 makes
+    // that the state of EVERY pre-existing database.
+    //
+    // `ranking_stale_repos` is the same accessor `hub_nodes` / `bridge_nodes`
+    // use, over `ResolverGenerations::stale_repos` — the sole computation
+    // (nw-358). No second decider is introduced here; this reads the same
+    // answer and joins it to the rows by uid.
+    let resolver_stale: std::collections::HashSet<String> =
+        ranking_stale_repos(store).into_iter().collect();
 
     let mut results = Vec::new();
     let mut any_stale = false;
@@ -8806,17 +8824,30 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
 
+        // nw-366: `outdated_resolver` sits BELOW the three git-derived states
+        // deliberately. A repo that is `missing`, `incomplete` or behind HEAD
+        // is also generation-stale in almost every case, and the git answer is
+        // the more specific and more urgent one; `resolver_stale` remains a
+        // separate boolean on the row so the fact is never hidden by that
+        // precedence.
+        let repo_resolver_stale = resolver_stale.contains(&repo.uid);
         let status = if local_missing {
             "missing"
         } else if content_missing {
             "incomplete"
         } else if is_stale {
             "stale"
+        } else if repo_resolver_stale {
+            "outdated_resolver"
         } else {
             "ok"
         };
         // The ACTIONABLE union, and the only thing a CI gate should key on:
-        // every non-`ok` status is fixed by re-indexing.
+        // every non-`ok` status is fixed by re-indexing. nw-366: this line is
+        // unchanged and now covers the fourth rung too, which is the point of
+        // adding the rung to `status` rather than beside it — an existing CI
+        // gate on `any_needs_reindex` (or on exit 2) catches the 9.0.0
+        // migration with no edit.
         let needs_reindex = status != "ok";
 
         if is_stale {
@@ -8831,6 +8862,12 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
+            // nw-366. Named separately from `is_stale` for the same reason
+            // nw-163 narrowed `is_stale` to behind-HEAD: one flag meaning three
+            // unrelated things is what made the row self-contradictory. This
+            // one is INDEPENDENT of `is_stale` and stays readable even when the
+            // `status` precedence above reports the git reason instead.
+            "resolver_stale": repo_resolver_stale,
             "needs_reindex": needs_reindex,
             "staleness_commits_behind": commits_behind,
             "status": status,
@@ -8858,6 +8895,13 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     };
     let stale_repos = urls_where("is_stale");
     let needs_reindex_repos = urls_where("needs_reindex");
+    // nw-366: deliberately NOT called `stale_repos`. That key already exists on
+    // this tool and means behind-HEAD URLs; on `hub_nodes` / `bridge_nodes` the
+    // same key means generation-stale repo UIDs. Reusing it here would make
+    // `ResolverStaleness::from_daemon_response` — which keys on
+    // `rankings_stale` + `stale_repos` — silently decode a list of git URLs as
+    // a list of repo UIDs the moment anyone pointed it at this payload.
+    let resolver_stale_repos = urls_where("resolver_stale");
 
     Ok(json!({
         "repo_count": repos.len(),
@@ -8869,6 +8913,9 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         "stale_repos": stale_repos,
         // The ACTIONABLE set, matching `any_needs_reindex`/`needs_reindex`.
         "needs_reindex_repos": needs_reindex_repos,
+        // nw-366: the generation-stale subset, by URL so it lines up with the
+        // other two lists rather than making a caller join uids to urls.
+        "resolver_stale_repos": resolver_stale_repos,
         "repos": results,
     }))
 }
@@ -10666,7 +10713,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
     let text = render_text(&display);
 
-    Ok(json!({
+    let mut resp = json!({
         "level": level_str,
         "target": target,
         // See the symbol-level payload above: `returned`/`total` is the one
@@ -10698,7 +10745,17 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "cached": from_cache,
         "summaries": display,
         "summaries_text": text,
-    }))
+    });
+    // nw-366: hub level ONLY. `generate_hub_summaries_bounded` selects and
+    // orders by the same degree/PageRank the import fan-out corrupted, so on a
+    // generation-stale graph it summarises the wrong thirty symbols. File and
+    // Cluster level reach this same return: File is not ranking-derived at all,
+    // and attaching the disclosure to it would make the flag unfalsifiable —
+    // present on everything means it distinguishes nothing.
+    if level == SummaryLevel::Hub {
+        attach_ranking_staleness(&mut resp, store);
+    }
+    Ok(resp)
 }
 
 /// Shallow check: does the directory contain any `.md` file in its tree?
@@ -12356,7 +12413,51 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 
 /// Attach the ranking-staleness disclosure to a result, in the shape the CLI
 /// has emitted since nw-308: both keys, always.
-fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+///
+/// nw-366: `pub` so the daemon's engine-level RPCs can use it. `repo_map_json`
+/// is a gRPC handler in `nestweaver-daemon`, not an entry in either of this
+/// file's dispatch tables, so it could not reach this — and `repo-map`'s entire
+/// output ORDERING is PageRank order (`generate_repo_map` →
+/// `symbols_by_pagerank`), which makes it the sharpest ranking-derived surface
+/// there is. Exporting the one attacher is what stops the daemon growing a
+/// second, drifting spelling of the same disclosure.
+pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+    // nw-366: fail CLOSED when the answer cannot be computed.
+    //
+    // `ranking_stale_repos` and `ranking_staleness_note` both `.ok()?` their
+    // way out of a missing `CURRENT_DB_PATH` or a failing `list_repos`, and the
+    // two lines below then turned that into `rankings_stale: false` — a
+    // confident "your rankings are current" produced by an inability to look.
+    // That is the same defect this very field exists to remove: this file's own
+    // doc for it says "an absent key cannot be read as `false`", and a
+    // FABRICATED `false` is strictly worse than an absent one.
+    //
+    // It is not hypothetical. It fired on the first new caller: the daemon's
+    // `repo_map_json` runs its work on a `spawn_blocking` worker where the
+    // thread-local was unset, so `repo-map` via daemon replied "not stale" on a
+    // generation-3 database while `hubs` on the same daemon replied "stale".
+    // The call site is fixed; this makes the next one loud instead of silent.
+    let unavailable = match (current_db_path(store), store.list_repos(None)) {
+        (Err(error), _) => Some(format!(
+            "the database path is not set on this server ({error})"
+        )),
+        (Ok(_), Err(error)) => Some(format!("the repo list could not be read ({error})")),
+        (Ok(_), Ok(_)) => None,
+    };
+    if let Some(reason) = unavailable {
+        resp["rankings_stale"] = json!(true);
+        // Empty, not absent: nothing can be PROVEN stale here, and naming a
+        // repo we did not check would be the same invention in the other
+        // direction.
+        resp["stale_repos"] = json!([]);
+        attach_note(
+            resp,
+            format!(
+                "resolver-generation staleness could not be determined because {reason};                  these rankings are UNVERIFIED, not verified-current. Check                  `nestweaver stale-check` before trusting them."
+            ),
+        );
+        return;
+    }
     let note = ranking_staleness_note(store);
     resp["rankings_stale"] = json!(note.is_some());
     resp["stale_repos"] = json!(ranking_stale_repos(store));
@@ -13912,47 +14013,80 @@ mod cache_dispatch_tests {
     /// Asserted on the RESULT, which is what becomes structuredContent. A
     /// disclosure in `_meta` would not count: `_meta` is client/UI-facing and
     /// is typically hidden from the model.
+    /// nw-366: BOTH aged shapes are exercised. This test used to DELETE the
+    /// sidecar, which is the pre-nw-103 state — a graph so old it has no record
+    /// at all. That is no longer the common case: bumping `RESOLVER_GENERATION`
+    /// 3 -> 4 makes the sidecar PRESENT and every entry in it BEHIND on every
+    /// pre-existing database, and the delete-only fixture is what let the
+    /// equivalent `hubs` gap (nw-365) survive its own test.
     #[test]
     fn stale_rankings_are_disclosed_to_the_agent_in_the_result() {
-        for tool in ["hub_nodes", "bridge_nodes"] {
-            let (_dir, db_path) = index_on_disk();
-            set_current_db_path(db_path.clone());
-            let store = GraphStore::open(&db_path).unwrap();
+        // "absent" — the pre-nw-103 graph, no record at all.
+        // "downgraded" — the 9.0.0 upgrade case: present, well-formed, behind.
+        for aged in ["absent", "downgraded"] {
+            for tool in ["hub_nodes", "bridge_nodes"] {
+                let (_dir, db_path) = index_on_disk();
+                set_current_db_path(db_path.clone());
+                let store = GraphStore::open(&db_path).unwrap();
 
-            // Age the fixture: `index_directory` records a CURRENT generation,
-            // so the sidecar has to go for the repo to look pre-fix — which is
-            // exactly the on-disk state of any graph indexed before nw-103.
-            let sidecar = nestweaver_engine::sidecar_path(
-                &db_path,
-                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
-            );
-            fs::remove_file(&sidecar).unwrap();
+                let sidecar = nestweaver_engine::sidecar_path(
+                    &db_path,
+                    nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+                );
+                if aged == "absent" {
+                    fs::remove_file(&sidecar).unwrap();
+                } else {
+                    let mut generations = nestweaver_engine::resolver_generation::load(&db_path);
+                    assert!(
+                        !generations.repos.is_empty(),
+                        "the fixture recorded nothing, so the downgrade leg is vacuous"
+                    );
+                    let behind = nestweaver_engine::resolver_generation::RESOLVER_GENERATION - 1;
+                    for generation in generations.repos.values_mut() {
+                        *generation = behind;
+                    }
+                    fs::write(
+                        &sidecar,
+                        serde_json::to_string_pretty(&generations).unwrap(),
+                    )
+                    .unwrap();
+                }
 
-            let value = dispatch(&store, None, tool, json!({}), None).unwrap();
+                let value = dispatch(&store, None, tool, json!({}), None).unwrap();
 
-            assert_eq!(
-                value.get("rankings_stale").and_then(Value::as_bool),
-                Some(true),
-                "{tool} must flag stale rankings"
-            );
-            // nw-217a: WHICH, not merely that some are. The human has had this
-            // list since nw-308; the agent was given a count and told to go
-            // find out — the same defect nw-315 closed for `stale_check`.
-            assert!(
-                value["stale_repos"]
-                    .as_array()
-                    .is_some_and(|repos| !repos.is_empty()),
-                "{tool} must name the stale repos: {value}"
-            );
-            let note = value
-                .get("note")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            assert!(
-                note.contains("nw-103") && note.contains("index"),
-                "{tool} note must say what is wrong AND how to fix it, got: {note}"
-            );
+                assert_eq!(
+                    value.get("rankings_stale").and_then(Value::as_bool),
+                    Some(true),
+                    "{tool} ({aged}) must flag stale rankings"
+                );
+                // nw-217a: WHICH, not merely that some are. The human has had this
+                // list since nw-308; the agent was given a count and told to go
+                // find out — the same defect nw-315 closed for `stale_check`.
+                assert!(
+                    value["stale_repos"]
+                        .as_array()
+                        .is_some_and(|repos| !repos.is_empty()),
+                    "{tool} ({aged}) must name the stale repos: {value}"
+                );
+                let note = value
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    note.contains("indexed by an older resolver"),
+                    "{tool} ({aged}) note must say WHAT is wrong, got: {note}"
+                );
+                // nw-366: the remedy must be the one that WORKS. Plain
+                // `nestweaver index --repo <path>` is incremental and a no-op on
+                // a repo already at HEAD, which is exactly the shape of a
+                // generation-stale repo — so asserting only `contains("index")`
+                // passed against a remedy that could not clear the condition.
+                assert!(
+                    note.contains("nestweaver index --repo <path> --force"),
+                    "{tool} ({aged}) note must give a remedy that RUNS, got: {note}"
+                );
+            }
         }
     }
 

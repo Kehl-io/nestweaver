@@ -1932,9 +1932,11 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
         // there are no recorded repos to list. Every repo predates the record.
         None => eprintln!(
             "warning: no resolver generation is recorded for this database, so every repo \
-             was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
-             rankings are NOT corrected by upgrading alone. Re-index each repo \
-             (`nestweaver index --repo <path>`) to get accurate rankings."
+             was indexed before the record existed — rankings are computed over the edges \
+             that resolver wrote, and edge families added since (C/C++ MEMBER_OF, C++ \
+             IMPORTS) are absent entirely. Upgrading the binary does not repair data \
+             already on disk. Re-index each repo with \
+             `nestweaver index --repo <path> --force`."
         ),
     }
 }
@@ -2056,6 +2058,42 @@ fn print_ranking_json<T: serde::Serialize>(
 ) -> anyhow::Result<()> {
     let mut payload = serde_json::json!({
         key: rows,
+        "rankings_stale": staleness.rankings_stale,
+        "stale_repos": staleness.stale_repos,
+    });
+    if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
+        obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+    }
+    print_json_payload(&payload)
+}
+
+/// `repo-map --json`, as ONE shape for both routes.
+///
+/// nw-366. Two things were wrong with the branch this replaces, and they had
+/// the same cause — the payload was assembled inline, twice:
+///
+///  * it hand-rolled a `RepoMapJson` struct and `println!`d it, bypassing
+///    [`print_json_payload`], so this was the one `--json` payload on either
+///    route carrying no `_meta` provenance at all; and
+///  * it had nowhere to put the staleness disclosure, which is the same reason
+///    `hubs --json` had none before nw-308 — a payload with no object to hang a
+///    field on cannot disclose, so it does not.
+///
+/// `token_count` stays derived from `map` here rather than read off the daemon
+/// reply, so the two routes cannot disagree about a number neither of them
+/// needs a daemon to compute.
+fn print_repo_map_json(
+    map: &str,
+    staleness: &ResolverStaleness,
+    daemon_meta: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let mut payload = serde_json::json!({
+        "map": map,
+        "token_count": map.len().div_ceil(4),
+        // The same two keys `print_ranking_json` emits, unconditionally. An
+        // absent key cannot be read as `false`: "not stale" and "this command
+        // does not say" are the same observation to an agent, and only one of
+        // them is a reason to trust the ordering.
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
     });
@@ -2610,6 +2648,59 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
 /// `warning` text, plus the `action` when present — because the previous
 /// renderer matched only that one kind and silently dropped everything else,
 /// which is how a wedged index publication produced no text output at all.
+/// Render ONE `stale-check` row, for BOTH routes.
+///
+/// This match existed twice — once in the daemon branch and once in the direct
+/// branch of `BrainCommands::StaleCheck` — as byte-identical copies. That
+/// function pair has now diverged three times for exactly this reason: nw-163
+/// (`is_stale`), nw-256 (`commits_behind`) and nw-266 (`current_head`), each
+/// fix leaving a comment saying the routes must not drift and the next
+/// divergence appearing underneath it. nw-366 adds a fourth state to the
+/// ladder, which is one more thing to copy wrong, so the copy is deleted
+/// instead of extended.
+///
+/// Takes the row as JSON because that is what BOTH routes hold: the daemon
+/// route decodes the daemon's `repos` array and the direct route builds the
+/// same shape. Anything typed here would have to be built twice again.
+fn stale_check_row_line(r: &serde_json::Value) -> String {
+    let url = r["url"].as_str().unwrap_or("?");
+    let stale = r["is_stale"].as_bool().unwrap_or(false);
+    let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
+    let indexed = &indexed_full[..8.min(indexed_full.len())];
+    let head = r["current_head"]
+        .as_str()
+        .map(|h| &h[..8.min(h.len())])
+        .unwrap_or("unknown");
+    // nw-256: `null` means the distance could not be counted, and
+    // `unwrap_or(0)` made that print identically to a real zero — undoing the
+    // fix one layer down. Rendered as three distinct states.
+    let behind = r["staleness_commits_behind"].as_u64();
+    let marker = match r["status"].as_str() {
+        Some("missing") => "missing",
+        Some("incomplete") => "incomplete",
+        Some("outdated_resolver") => "OLD-RESOLVER",
+        _ if stale => "STALE",
+        _ => "ok",
+    };
+    // nw-366: an `outdated_resolver` row has `indexed == HEAD`, so without a
+    // reason the line reads exactly like an `[ok]` one with a louder marker.
+    // Say WHY, on the row, because that is where the user is looking.
+    let reason = if r["status"].as_str() == Some("outdated_resolver") {
+        "  (edges built by an older resolver — re-index)"
+    } else {
+        ""
+    };
+    match behind {
+        Some(behind) if stale && behind > 0 => {
+            format!("  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)")
+        }
+        None if stale => format!(
+            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+        ),
+        _ => format!("  [{marker}] {url}  indexed={indexed}  HEAD={head}{reason}"),
+    }
+}
+
 fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for w in warnings {
@@ -11664,40 +11755,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
+                    // nw-366: read the daemon's own verdict, the same way
+                    // `hubs`/`bridges` do. Hoisted out of `if json` on purpose
+                    // — that is precisely the mistake nw-365 fixed on `hubs`,
+                    // where the verdict was built inside the JSON branch and
+                    // the plain-text route (the one users run) had nothing to
+                    // print.
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     if json {
-                        // Match the direct path's {map, token_count} shape — the daemon tool
-                        // returns only {map}, so compute token_count the same way here.
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "map": map,
-                                "token_count": map.len().div_ceil(4),
-                            }))?
-                        );
+                        // nw-366: through `print_json_payload`, which stamps
+                        // `_meta`. This branch hand-rolled a struct and printed
+                        // it directly, so `repo-map --json` was the one payload
+                        // on this route with no provenance at all.
+                        print_repo_map_json(
+                            map,
+                            &staleness,
+                            value.get(nestweaver_schema::provenance::META_KEY).cloned(),
+                        )?;
                     } else {
                         print!("{map}");
                     }
+                    warn_stale_resolver_rankings_no_store(&staleness);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
 
             let store = open_store(db.as_deref())?;
+            let db_path = db.clone().unwrap_or_else(default_db_path);
             let map = generate_repo_map(&store, token_budget)?;
-            let token_count = map.len().div_ceil(4);
+
+            // nw-366: `generate_repo_map` orders by `symbols_by_pagerank`, so
+            // on a generation-stale graph the ORDERING — the whole content of
+            // this command — is computed over the edges an older resolver
+            // wrote. Same disclosure as `hubs`, for a stronger reason: `hubs`
+            // prints scores a reader can discount, this prints only an order.
+            warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                #[derive(serde::Serialize)]
-                struct RepoMapJson<'a> {
-                    map: &'a str,
-                    token_count: usize,
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&RepoMapJson {
-                        map: &map,
-                        token_count,
-                    })?
-                );
+                print_repo_map_json(&map, &ResolverStaleness::from_store(&store, &db_path), None)?;
             } else {
                 print!("{map}");
             }
@@ -13016,6 +13111,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
+                    // nw-366: `get_summary` attaches the verdict on hub level,
+                    // so this route reads the daemon's own answer rather than
+                    // deriving a weaker one. On any other level the keys are
+                    // absent and `from_daemon_response` would fall back to the
+                    // sidecar — which would disclose on `--level file`, where
+                    // the claim is not true — so the gate is here as well as
+                    // there.
+                    if parsed_level == SummaryLevel::Hub {
+                        warn_stale_resolver_rankings_no_store(
+                            &ResolverStaleness::from_daemon_response(&value, &db_path),
+                        );
+                    }
                     if text.is_empty() {
                         println!("No summaries generated (graph may be empty).");
                     } else {
@@ -13193,21 +13300,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let truncated_by_cap = cap_dropped > 0;
             let truncated = truncated_by_budget || truncated_by_cap;
 
+            // nw-366: hub level ONLY. `generate_hub_summaries_bounded` selects
+            // and orders by the same degree/PageRank nw-103's import fan-out
+            // corrupted, so on a generation-stale graph it summarises the wrong
+            // thirty symbols. The other three levels are deliberately excluded:
+            // File is not ranking-derived at all, and a flag present on every
+            // level distinguishes nothing.
+            let hub_staleness = (parsed_level == SummaryLevel::Hub)
+                .then(|| ResolverStaleness::from_store(&store, &db_path));
+            if hub_staleness.is_some() {
+                // The store-holding variant, so this route prints the exact
+                // `N of M` denominator rather than the daemon route's floor.
+                warn_stale_resolver_rankings(&store, &db_path);
+            }
+
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "summaries": display,
-                        // `total` now counts what MATCHED, not what survived
-                        // the cap — otherwise `returned == total` beside
-                        // `truncated: true` is a contradiction.
-                        "total": total + cap_dropped,
-                        "returned": display.len(),
-                        "truncated": truncated,
-                        "truncated_by_budget": truncated_by_budget,
-                        "truncated_by_cap": truncated_by_cap,
-                    }))?
-                );
+                let mut payload = serde_json::json!({
+                    "summaries": display,
+                    // `total` now counts what MATCHED, not what survived
+                    // the cap — otherwise `returned == total` beside
+                    // `truncated: true` is a contradiction.
+                    "total": total + cap_dropped,
+                    "returned": display.len(),
+                    "truncated": truncated,
+                    "truncated_by_budget": truncated_by_budget,
+                    "truncated_by_cap": truncated_by_cap,
+                });
+                // Both keys, always — but only on the level they describe.
+                if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
+                    obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
+                    obj.insert("stale_repos".into(), staleness.stale_repos.clone().into());
+                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if display.is_empty() {
                 println!("No summaries generated (graph may be empty).");
             } else {
@@ -20062,6 +20186,19 @@ fn run_ranking(
             let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
             let final_rank = base_pagerank * multiplier;
 
+            // nw-366: this command prints a raw `base_pagerank` to eight
+            // decimal places and said nothing about where it came from. A
+            // number rendered that precisely reads as authoritative, and on a
+            // generation-stale graph it is PageRank over the edges an older
+            // resolver wrote — the exact quantity nw-103 corrupted. Same
+            // disclosure as `hubs`.
+            //
+            // There is no daemon route to mirror: `ranking rank` opens the
+            // store directly and has no `try_hybrid_json_rpc` guard, so the
+            // direct constructor is the only one reachable.
+            warn_stale_resolver_rankings(&store, &db_path);
+            let staleness = ResolverStaleness::from_store(&store, &db_path);
+
             if json {
                 println!(
                     "{}",
@@ -20073,6 +20210,11 @@ fn run_ranking(
                         "git_activity_weight": weight,
                         "multiplier": multiplier,
                         "final_rank": final_rank,
+                        // nw-308's contract: both keys, always. `base_pagerank`
+                        // is the whole answer here, so an agent reading it needs
+                        // to know whether the edges under it are current.
+                        "rankings_stale": staleness.rankings_stale,
+                        "stale_repos": staleness.stale_repos,
                     }))?
                 );
             } else {
@@ -21704,6 +21846,14 @@ fn run_brain(
                 // this array names. `needs_reindex_repos` is the actionable
                 // set; `stale_repos` stays behind-HEAD only.
                 let needs_reindex_urls = urls_where("needs_reindex");
+                // nw-366: read the daemon's OWN per-row verdict rather than
+                // recomputing one. The client refuses to talk to a
+                // version-mismatched daemon at all — it restarts it (see
+                // `NestweaverClient::connect`) — so the daemon serving this
+                // reply is always this binary's own `tool_stale_check`, and a
+                // client-side fallback here would be dead code pretending to
+                // be a safety net.
+                let resolver_stale_urls = urls_where("resolver_stale");
                 let any_stale = value
                     .get("any_stale")
                     .and_then(|v| v.as_bool())
@@ -21722,6 +21872,7 @@ fn run_brain(
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "needs_reindex_repos": needs_reindex_urls,
+                        "resolver_stale_repos": resolver_stale_urls,
                         "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
                     });
                     println!("{}", serde_json::to_string_pretty(&normalized)?);
@@ -21753,38 +21904,45 @@ fn run_brain(
                             }
                         );
                         for r in &repos {
-                            let url = r["url"].as_str().unwrap_or("?");
-                            let stale = r["is_stale"].as_bool().unwrap_or(false);
-                            let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
-                            let indexed = &indexed_full[..8.min(indexed_full.len())];
-                            let head = r["current_head"]
-                                .as_str()
-                                .map(|h| &h[..8.min(h.len())])
-                                .unwrap_or("unknown");
-                            // nw-256: `null` means the distance could not be
-                            // counted, and `unwrap_or(0)` made that print
-                            // identically to a real zero — undoing the fix one
-                            // layer down. Rendered as three distinct states.
-                            let behind = r["staleness_commits_behind"].as_u64();
-                            let marker = match r["status"].as_str() {
-                                Some("missing") => "missing",
-                                Some("incomplete") => "incomplete",
-                                _ if stale => "STALE",
-                                _ => "ok",
-                            };
-                            match behind {
-                                Some(behind) if stale && behind > 0 => println!(
-                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                                ),
-                                None if stale => println!(
-                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
-                                ),
-                                _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
-                            }
+                            println!("{}", stale_check_row_line(r));
                         }
                     }
                 }
+                // nw-366: the remedy, on stderr in BOTH modes — the same
+                // channel and the same renderer `hubs`/`bridges` use, so the
+                // migration instruction cannot drift between the command that
+                // detects the condition and the commands that suffer from it.
+                // A `--json` gate reads `resolver_stale_repos`; stdout stays
+                // pure JSON either way.
+                //
+                // This route knows the denominator (`repo_count` is on the
+                // payload), unlike the `hubs` daemon route, so it passes
+                // `Some` rather than printing a floor.
+                let resolver_stale_names: Vec<String> = resolver_stale_urls
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if let Some(note) = nestweaver_engine::resolver_generation::staleness_note_for(
+                    &resolver_stale_names,
+                    value
+                        .get("repo_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
+                ) {
+                    eprintln!("warning: {note}");
+                }
                 // Stale-check is a freshness gate — exit non-zero when stale.
+                //
+                // nw-366: generation staleness reuses EXIT_NEEDS_REINDEX (2)
+                // rather than taking a fifth code. `2` already means "at least
+                // one repo needs re-indexing", the remedy is identical, and
+                // `docs/ci-integration.md` plus the shipped pre-push hook
+                // already gate on it — so every existing CI gate catches the
+                // 9.0.0 migration with no edit. A new code would be silently
+                // ignored by exactly the gates that need to fire, which is the
+                // opposite of what a migration signal is for. Callers that
+                // must distinguish the states read `status` /
+                // `resolver_stale_repos`, which is what those fields are for.
                 return Ok((
                     if any_needs_reindex {
                         EXIT_NEEDS_REINDEX
@@ -21802,6 +21960,21 @@ fn run_brain(
             let repos = store
                 .list_repos(None)
                 .map_err(|error| anyhow::anyhow!("list repos: {error}"))?;
+
+            // nw-366: the fourth rung. See `tool_stale_check` — the two
+            // routes must answer identically, so this is the same decision
+            // made from the same computation.
+            //
+            // `ResolverStaleness::from_store` is the existing direct-route
+            // constructor (`hubs`, `bridges`), which wraps
+            // `ResolverGenerations::stale_repos`, the sole computation
+            // (nw-358). No fourth decider is added here; this reads the same
+            // verdict and joins it to the rows by uid.
+            let resolver_stale: std::collections::HashSet<String> =
+                ResolverStaleness::from_store(&store, &db_path)
+                    .stale_repos
+                    .into_iter()
+                    .collect();
 
             let mut any_stale = false;
             let mut any_needs_reindex = false;
@@ -21882,12 +22055,20 @@ fn run_brain(
                 // nw-163: `is_stale` means BEHIND HEAD and nothing else; the
                 // actionable union lives in `needs_reindex`. Mirrors
                 // `tool_stale_check` exactly — the two paths must not drift.
+                //
+                // nw-366: `outdated_resolver` sits BELOW the three git-derived
+                // states, matching `tool_stale_check`. `resolver_stale` on the
+                // row keeps the fact visible when that precedence reports a git
+                // reason instead.
+                let repo_resolver_stale = resolver_stale.contains(&repo.uid);
                 let status = if local_missing {
                     "missing"
                 } else if content_missing {
                     "incomplete"
                 } else if is_stale {
                     "stale"
+                } else if repo_resolver_stale {
+                    "outdated_resolver"
                 } else {
                     "ok"
                 };
@@ -21904,6 +22085,9 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
+                    // nw-366: independent of `is_stale`, matching
+                    // `tool_stale_check`.
+                    "resolver_stale": repo_resolver_stale,
                     "needs_reindex": needs_reindex,
                     "staleness_commits_behind": commits_behind,
                     "status": status,
@@ -21922,6 +22106,11 @@ fn run_brain(
                 };
                 let stale_urls = urls_where("is_stale");
                 let needs_reindex_urls = urls_where("needs_reindex");
+                // nw-366: NOT folded into `stale_repos` — that key means
+                // behind-HEAD here and generation-stale on `hub_nodes`, and
+                // merging the two populations under one name is how those
+                // surfaces would start contradicting each other.
+                let resolver_stale_urls = urls_where("resolver_stale");
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -21930,6 +22119,7 @@ fn run_brain(
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "needs_reindex_repos": needs_reindex_urls,
+                        "resolver_stale_repos": resolver_stale_urls,
                         "repos": results,
                     }))?
                 );
@@ -21950,37 +22140,26 @@ fn run_brain(
                     }
                 );
                 for r in &results {
-                    let url = r["url"].as_str().unwrap_or("?");
-                    let stale = r["is_stale"].as_bool().unwrap_or(false);
-                    let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
-                    let indexed = &indexed_full[..8.min(indexed_full.len())];
-                    let head = r["current_head"]
-                        .as_str()
-                        .map(|h| &h[..8.min(h.len())])
-                        .unwrap_or("unknown");
-                    // nw-256: `null` means the distance could not be counted,
-                    // and `unwrap_or(0)` made that print identically to a real
-                    // zero — undoing the fix one layer down. Rendered as three
-                    // distinct states.
-                    let behind = r["staleness_commits_behind"].as_u64();
-                    let marker = match r["status"].as_str() {
-                        Some("missing") => "missing",
-                        Some("incomplete") => "incomplete",
-                        _ if stale => "STALE",
-                        _ => "ok",
-                    };
-                    match behind {
-                        Some(behind) if stale && behind > 0 => println!(
-                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                        ),
-                        None if stale => println!(
-                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
-                        ),
-                        _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
-                    }
+                    println!("{}", stale_check_row_line(r));
                 }
             }
+            // nw-366: same note, same renderer, same stream as the daemon
+            // route above. This route holds the store, so the denominator is
+            // exact.
+            let resolver_stale_names: Vec<String> = results
+                .iter()
+                .filter(|r| r["resolver_stale"].as_bool().unwrap_or(false))
+                .filter_map(|r| r["url"].as_str().map(String::from))
+                .collect();
+            if let Some(note) = nestweaver_engine::resolver_generation::staleness_note_for(
+                &resolver_stale_names,
+                Some(repos.len()),
+            ) {
+                eprintln!("warning: {note}");
+            }
             // Stale-check is a freshness gate — exit non-zero when stale.
+            // nw-366: see the daemon route for why generation staleness reuses
+            // EXIT_NEEDS_REINDEX rather than taking a code of its own.
             Ok((
                 if any_needs_reindex {
                     EXIT_NEEDS_REINDEX

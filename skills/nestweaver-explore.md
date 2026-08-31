@@ -27,8 +27,10 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 
 NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
 earlier release is ranked over stale edges** until it is re-indexed
-(`nestweaver index --repo <path> --force`). `stale_check` will not tell you —
-it compares indexed SHA against git HEAD only. `hub_nodes` and `bridge_nodes`
-are the **only** tools that disclose it, via `rankings_stale` / `stale_repos`;
-roughly a dozen other ranking-derived surfaces disclose nothing, so the absence
-of a staleness field is not evidence of freshness.
+(`nestweaver index --repo <path> --force` — plain `index` is incremental and a
+no-op on a repo already at HEAD). `stale_check` reports it as
+`status: "outdated_resolver"` with `resolver_stale: true`. `hub_nodes`,
+`bridge_nodes`, `repo_map`, `ranking rank` and `get_summary` at hub level
+disclose it via `rankings_stale` / `stale_repos`; `clusters`, `blast_radius`,
+`generate-guide`, PPR-backed context and the web UI disclose nothing, so on
+those the absence of a staleness field is not evidence of freshness.

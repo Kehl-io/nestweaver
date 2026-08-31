@@ -379,7 +379,9 @@ pub fn generate_guide_with_tools(
         "| \"Orient on unfamiliar topic\" | MCP `investigate` | One-call map with summaries |\n",
     );
     out.push_str("| \"Find text by regex\" | MCP `regex_search` | Searches indexed text — NOT `grep`/`rg` |\n");
-    out.push_str("| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA comparison |\n");
+    out.push_str(
+        "| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA-vs-HEAD **and** resolver generation |\n",
+    );
     out.push_str("| Batch/scripted queries | CLI `nestweaver context/search/impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
     out.push_str("| Subagent code exploration | CLI `nestweaver context <seed> --json` | CLI is cheaper for focused lookups |\n");
     out.push_str("| Known-path file read | `Read` tool | Graph can't beat a direct file read |\n");
@@ -796,7 +798,9 @@ fn render_legacy_tool_tables(out: &mut String) {
          in-flight embedding pass) and write-lock liveness (`write_queue_depth`, \
          `write_holder`), which is how you tell \"stuck\" apart from \"still working\". |\n",
     );
-    out.push_str("| `stale_check` | Compare indexed SHA to current git HEAD. Shows if re-indexing is needed. |\n");
+    out.push_str(
+        "| `stale_check` | Compare indexed SHA to current git HEAD, and check whether the edges were built by the current resolver generation (`status: \"outdated_resolver\"`). Shows if re-indexing is needed — re-index with `--force`, which is required for the generation case. |\n",
+    );
     out.push_str("| `brain_diff` | Files and symbols changed since a given SHA. Useful before code review. |\n");
     out.push_str(
         "| `brain_guide` | Auto-generated architecture overview of the indexed codebase. |\n",

@@ -18,17 +18,21 @@ DB="${NESTWEAVER_DB:-./nestweaver.lbug}"
 # which reported "? commit(s) behind" for any repo whose indexed_sha is not a
 # real SHA (e.g. the literal "local" for an untracked tree).
 set +e
-nestweaver stale-check --db "$DB" >/dev/null 2>&1
+REPORT=$(nestweaver stale-check --db "$DB" --json 2>/dev/null)
 RC=$?
 set -e
 
 if [ "$RC" -eq 2 ]; then
-  echo "NestWeaver index needs a re-index. Run: nestweaver index --repo . --db $DB" >&2
+  # As of 9.0.0 exit 2 also covers `status: "outdated_resolver"` — a repo at
+  # HEAD whose edges were written by an older resolver generation. The remedy
+  # differs: incremental indexing is a NO-OP on such a repo (nothing changed),
+  # so only `--force` clears it. Printing the wrong one sends the user round a
+  # loop where the command succeeds and the warning returns.
+  if [ -n "$(echo "${REPORT:-}" | jq -r '.resolver_stale_repos // [] | .[]' 2>/dev/null)" ]; then
+    echo "NestWeaver graph was built by an older resolver generation." >&2
+    echo "  Run: nestweaver index --repo . --db $DB --force   (--force is required)" >&2
+  else
+    echo "NestWeaver index needs a re-index. Run: nestweaver index --repo . --db $DB" >&2
+  fi
   echo "  (details: nestweaver stale-check --db $DB --json)" >&2
 fi
-
-# stale-check compares indexed SHA against git HEAD only. It does NOT detect a
-# resolver-generation upgrade, so it exits 0 on a graph built by an older
-# NestWeaver whose edges — and therefore every PageRank-ordered answer — are
-# stale. After upgrading NestWeaver, re-index once regardless of what this says.
-# `nestweaver hubs --json` reports `rankings_stale` / `stale_repos`.

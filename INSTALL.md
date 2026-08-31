@@ -107,23 +107,27 @@ files carry symbols extracted by the C grammar rather than C++.
 
 ```sh
 nestweaver index --repo <path> --force   # per repo — a full index, not incremental
-nestweaver brain refresh                 # re-index every registered vault
 ```
 
-**`nestweaver stale-check` will not tell you this is needed.** It compares each
-repo's indexed SHA against git HEAD and nothing else, so a graph built by an
-older resolver reports `ok` and exits 0. To check:
+**`--force` is not optional.** A generation-stale repo is at HEAD with every
+file unchanged, so plain `nestweaver index --repo <path>` reports `0 modified`,
+writes nothing, and leaves the old edges — and the old generation — in place.
+Vaults carry no resolver generation and do not need refreshing for this.
+
+**`nestweaver stale-check` detects it as of 9.0.0** (in 8.x it did not — its
+ladder was SHA-vs-HEAD only, so a generation-3 graph exited 0):
 
 ```sh
-nestweaver hubs --json | jq '{rankings_stale, stale_repos}'
+nestweaver stale-check                 # status: outdated_resolver, exit 2
+nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
 # or read the sidecar directly — any repo below 4 needs a re-index:
 cat <db>.resolver_generation.json
 ```
 
-Only `hubs` and `bridges` disclose ranking staleness; roughly a dozen other
-ranking-derived commands (including `repo-map`, whose entire output *ordering*
-is PageRank order) say nothing. Treat the absence of a warning as no evidence
-either way.
+`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
+disclose it. `clusters`, `blast-radius`, `generate-guide`, PPR-backed `context`
+and the web UI still do not — on those, treat the absence of a warning as no
+evidence either way.
 
 ## Configure for your AI tool
 

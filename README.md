@@ -138,30 +138,37 @@ earlier release must be re-indexed.** Until you do:
 
 ```sh
 nestweaver index --repo <path> --force   # per repo — a full index, not incremental
-nestweaver brain refresh                 # re-index every registered vault
 ```
 
-**`stale-check` will NOT tell you.** It compares each repo's indexed SHA against
-git HEAD and nothing else (`src/main.rs`, the `status` ladder is
-`missing`/`incomplete`/`stale`/`ok`); a graph built by resolver generation 3
-reports `ok` and exits **0**. Verified against a generation-3 sidecar. If your
-CI gates on `stale-check`, that gate passes cleanly across this upgrade while
-your rankings are wrong.
+**`--force` is required.** A generation-stale repo is sitting exactly at git
+HEAD with every file unchanged, so plain `nestweaver index --repo <path>` takes
+the incremental path, reports `0 added, 0 modified, 0 deleted`, writes nothing,
+and leaves the repo on the old generation. Only a full re-index rewrites the
+edges.
 
-What *does* disclose it:
+Vaults are unaffected: they are not `Repo` nodes and carry no resolver
+generation, so `brain refresh` is not part of this upgrade.
+
+**`stale-check` detects this as of 9.0.0.** A repo whose edges predate the
+running resolver reports `status: "outdated_resolver"`, `needs_reindex: true`,
+and the command exits **2** — the same code it already used for
+`stale`/`incomplete`/`missing`, so an existing CI gate catches the upgrade with
+no edit:
 
 ```sh
-nestweaver hubs                     # prints a warning naming the repos and the remedy
-nestweaver hubs --json              # "rankings_stale": true, "stale_repos": [...]
-cat <db>.resolver_generation.json   # per-repo generation; anything below 4 is stale
+nestweaver stale-check                    # [OLD-RESOLVER] rows + the remedy, exit 2
+nestweaver stale-check --json             # "resolver_stale_repos": [...], per-repo "resolver_stale"
+cat <db>.resolver_generation.json         # per-repo generation; anything below 4 is stale
 ```
 
-**Only `hubs` and `bridges` disclose stale rankings today.** A sweep of the CLI
-and MCP surfaces found roughly a dozen other ranking-derived commands that
-report nothing — `repo-map` is the sharpest case, since its entire output
-*ordering* is PageRank order and it says so nowhere (confirmed: `repo-map`
-against a generation-3 graph prints no warning). Do not read the absence of a
-staleness warning as evidence of freshness.
+In 8.x it did not: the status ladder was `missing`/`incomplete`/SHA-behind-HEAD
+only, so a generation-3 graph reported `ok` and exited 0.
+
+`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
+disclose it (`rankings_stale` / `stale_repos` on `--json`, a warning on stderr
+otherwise). Other ranking-derived surfaces still do not — `clusters`,
+`blast-radius`, `generate-guide`, PPR-backed `context`, and the whole web UI —
+so on those, absence of a warning is not evidence of freshness.
 
 Note that `hubs --json` carries two different `stale_repos`: the **top-level**
 one is resolver-generation staleness, and `_meta.stale_repos` is federation

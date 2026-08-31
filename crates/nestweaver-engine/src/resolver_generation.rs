@@ -149,11 +149,13 @@ pub fn record(db_path: &Path, repo_uid: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Operator-facing caveat for ranking output, or `None` when every repo is
-/// current.
+/// Operator-facing caveat for a graph whose edges predate the current
+/// resolver, or `None` when every repo is current.
 ///
-/// Ranking commands (`hubs`, `bridges`, and anything built on PageRank) are
-/// the surfaces nw-103 corrupted, so they are where the disclosure belongs.
+/// Ranking commands (`hubs`, `bridges`, `repo-map`, `ranking rank` — anything
+/// built on PageRank) are the surfaces nw-103 corrupted, and `stale-check` is
+/// the command a user runs to ask "do I need to re-index?", so they are where
+/// the disclosure belongs.
 pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
     let gens = load(db_path);
     let stale = gens.stale_repos(repo_uids.iter().map(|s| s.as_str()));
@@ -177,6 +179,16 @@ pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
 /// repos the sidecar records, and a repo present in the graph but absent from
 /// the sidecar is stale and invisible to it. Claiming "N of N" there would be
 /// a number this code cannot support.
+///
+/// `--force` in the remedy is LOAD-BEARING, not a flourish. This note used to
+/// print `nestweaver index --repo <path>`, and that command is a no-op on the
+/// exact state the note describes: a generation-stale repo is at HEAD with
+/// every file unchanged, so incremental detection reports `0 added, 0
+/// modified, 0 deleted`, writes nothing, and leaves the sidecar recording the
+/// OLD generation. Measured on a generation-downgraded scratch DB: the sidecar
+/// read `3` before and `3` after; only `--force` took it to `4`. A disclosure
+/// whose remedy cannot clear the condition it discloses is worse than silence,
+/// because the user runs it, sees success, and re-reads the same warning.
 pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<String> {
     if stale.is_empty() {
         return None;
@@ -186,10 +198,11 @@ pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<Stri
         None => format!("{} repo(s) are known to have been", stale.len()),
     };
     Some(format!(
-        "{scope} indexed by an older resolver, so their edges predate \
-         the nw-103 import-fan-out fix — hub, bridge and PageRank rankings for those \
-         repos are NOT corrected by upgrading alone. Re-index them \
-         (`nestweaver index --repo <path>`) to get accurate rankings."
+        "{scope} indexed by an older resolver, so their edges are the ones that \
+         resolver wrote: rankings over them are wrong, and edge families added since \
+         (C/C++ MEMBER_OF, C++ IMPORTS) are absent entirely. Upgrading the binary does \
+         not repair data already on disk. Re-index each one with \
+         `nestweaver index --repo <path> --force`."
     ))
 }
 
@@ -236,6 +249,24 @@ mod tests {
         let note = staleness_note(&db, &["repo:a".to_string(), "repo:b".to_string()])
             .expect("a stale repo must produce a caveat");
         assert!(note.contains("1 of 2"), "{note}");
-        assert!(note.contains("nw-103"), "{note}");
+        assert!(note.contains("indexed by an older resolver"), "{note}");
+    }
+
+    /// The remedy must carry `--force`.
+    ///
+    /// Without it the command is a no-op on a generation-stale repo: it is at
+    /// HEAD with nothing modified, so incremental detection skips the write and
+    /// the sidecar keeps recording the old generation. The un-forced form
+    /// shipped for two releases; `tests/parity_test.rs` executes the remedy
+    /// end-to-end so this assertion cannot pass on a string alone.
+    #[test]
+    fn the_remedy_forces_a_full_reindex_because_incremental_cannot_clear_this() {
+        let note = staleness_note_for(&["repo:a".to_string()], Some(1))
+            .expect("a stale repo must produce a caveat");
+        assert!(
+            note.contains("nestweaver index --repo <path> --force"),
+            "plain `index` reports `0 modified` on a repo already at HEAD and \
+             leaves the old edges — and the old generation — in place: {note}"
+        );
     }
 }
