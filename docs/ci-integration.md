@@ -518,17 +518,41 @@ To name the generation-stale subset specifically:
 
 `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
 disclose it (`rankings_stale` / `stale_repos` on `--json`, a stderr warning
-otherwise). `clusters`, `blast-radius`, `generate-guide`, PPR-backed `context`
-and the web UI do not. Do not read the absence of a warning on those as evidence
-of freshness.
+otherwise). `clusters`, `blast-radius`, `affected-tests`, `generate-guide`,
+PPR-backed `context` and the web UI do not. Do not read the absence of a warning
+on those as evidence of freshness.
+
+**`dead-code` does not disclose — it refuses**, and it exits `2` doing so. Its
+output is a list of symbols to *delete*, computed by walking forward from entry
+points, so a missing edge can only fail to reach a live symbol: the error is
+one-directional and points at deleting live code. On a generation-stale graph
+every route (CLI direct, CLI via daemon, `--json`, MCP `dead_code`) returns
+`refused: true` with `reason: "outdated_resolver"`, `resolver_stale_repos`, and
+a `remedies` array whose `command` is a ready-to-run
+`nestweaver index --repo <path> --force`. There is **no `unreachable_symbols`
+key** on a refusal and no override flag: re-index and re-run.
+
+```yaml
+- name: Dead-code review candidates
+  run: |
+    rc=0
+    nestweaver dead-code --json --db nestweaver.lbug > dead-code.json || rc=$?
+    case $rc in
+      0) ;;
+      2) echo "::error::dead-code refused — re-index first"
+         jq -r '.remedies[].command' dead-code.json; exit 1 ;;
+      *) echo "::error::dead-code could not run"; exit 1 ;;
+    esac
+```
 
 ### Exit `2` is overloaded across commands
 
-`stale-check` uses `2` for "needs re-index"; `pr-impact --strict` uses `2`
-(`EXIT_STRICT_BLOCK`) for "blocked on a contract-verified breaking change"; most
-other commands use `2` for "not found". A shared `case $rc in 2) ... esac`
-helper reused across two of these does the wrong thing. Interpret `2`
-per-command.
+`stale-check` uses `2` for "needs re-index"; `dead-code` uses `2` for "refused,
+re-index first" (the same `EXIT_NEEDS_REINDEX`, **new in 9.0.0** — it exited `0`
+with a list through 8.x); `pr-impact --strict` uses `2` (`EXIT_STRICT_BLOCK`)
+for "blocked on a contract-verified breaking change"; most other commands use
+`2` for "not found". A shared `case $rc in 2) ... esac` helper reused across
+two of these does the wrong thing. Interpret `2` per-command.
 
 ## Networking
 

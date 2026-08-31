@@ -19,6 +19,7 @@
 //! existed has no entry — which is exactly the "predates the fix" answer we
 //! want, at zero migration cost.
 
+use nestweaver_schema::Repo;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -206,9 +207,234 @@ pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<Stri
     ))
 }
 
+/// Why `dead-code` REFUSES on a generation-stale graph instead of warning.
+///
+/// nw-367. Every other resolver-generation surface discloses and then prints
+/// anyway, and that is right for them: their output is a RANKING, and a reader
+/// told the order is suspect can discount the order. `dead-code`'s output is a
+/// list of symbols to DELETE.
+///
+/// It is computed by a reachability BFS that walks FORWARD from entry points,
+/// and a symbol is reported when the walk never arrived. So a MISSING edge can
+/// only ever fail to reach a live symbol — the error is ONE-DIRECTIONAL and
+/// always points at "delete this". On a pre-generation-4 graph the missing
+/// edges are not a rounding error: C and C++ `MEMBER_OF` edges and C++
+/// `IMPORTS` edges are absent ENTIRELY, so every C++ member reachable only
+/// through its container falls out of the walk.
+///
+/// The costs are asymmetric and that settles it. Refusing costs one error
+/// message and a re-index the user needs anyway. Printing costs a user
+/// deleting live code, which the tool's output cannot undo — and this tool
+/// already measures 0/15 top-15 precision on Rust with a CURRENT graph. A
+/// warning printed above a deletion list is a pattern that has already failed
+/// in this repository: the docs audit found a shipped skill telling agents
+/// that unreachable code "may be safe to remove instead of fix".
+const WHY_DEAD_CODE_REFUSES: &str = "dead-code will not produce a list on this graph. Its output \
+     is a list of symbols to DELETE, computed by walking forward from entry points, so a MISSING \
+     edge cannot make the list safer — it can only fail to reach a live symbol and report it as \
+     dead. The error is one-directional and the deletion it invites is not recoverable.";
+
+/// One generation-stale repo, named the way the refusal names it.
+///
+/// `command` is a string the user can PASTE. `staleness_note_for` prints a
+/// TEMPLATE — `nestweaver index --repo <path> --force`, with a literal
+/// `<path>` — because that renderer is reached from routes holding no repo
+/// rows. This one is built where the [`Repo`] rows are in hand, so it
+/// substitutes the real path, and the parity test EXECUTES what it prints.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleRepoRemedy {
+    /// Repo UID — the same population `stale-check`'s `resolver_stale_repos`
+    /// carries, so a caller can join the two without decoding either.
+    pub uid: String,
+    /// The working tree to pass to `--repo`, when this machine has one.
+    pub path: Option<String>,
+    /// The exact command that clears THIS repo's staleness, or `None` when
+    /// there is no local working tree to name. Never a command that cannot
+    /// run: an unexecutable remedy is the defect nw-366 was fixing.
+    pub command: Option<String>,
+}
+
+impl StaleRepoRemedy {
+    fn new(uid: String, path: Option<String>) -> Self {
+        let command = path
+            .as_deref()
+            .map(|path| format!("nestweaver index --repo {path} --force"));
+        Self { uid, path, command }
+    }
+}
+
+/// The verdict `dead-code` refuses on, shared by every route.
+///
+/// One value renders the stderr paragraph and the machine-readable payload, so
+/// the CLI's direct route, the MCP tool the CLI's daemon route calls through,
+/// and the MCP tool an agent calls directly cannot say three different things
+/// about one database.
+#[derive(Debug, Clone)]
+pub enum DeadCodeRefusal {
+    /// These repos' edges predate [`RESOLVER_GENERATION`].
+    ///
+    /// One variant, because there turned out to be exactly one state. The
+    /// obvious second — "the verdict could not be computed, refuse anyway" —
+    /// was written and then deleted once the callers stopped depending on the
+    /// `CURRENT_DB_PATH` thread-local: `GraphStore::db_path` cannot be unset
+    /// by a worker thread, a store that cannot enumerate repos propagates its
+    /// own error, and an in-memory store has no disk for a stale sidecar to
+    /// live on. Refusing on an unanswerable question is the right default; not
+    /// having an unanswerable question is better.
+    OutdatedResolver {
+        repos: Vec<StaleRepoRemedy>,
+        /// How many repos exist, when the caller could count them — the `of M`
+        /// denominator in the note.
+        total: Option<usize>,
+    },
+}
+
+impl DeadCodeRefusal {
+    /// The verdict for `repos` against the sidecar at `db_path`, or `None`
+    /// when every repo is current.
+    ///
+    /// The comparison is [`ResolverGenerations::stale_repos`] and nothing
+    /// else. nw-358 made that the sole computation behind every route's
+    /// staleness answer; a refusal that re-derived it would be the fourth
+    /// decider that fix exists to prevent.
+    pub fn for_repos(db_path: &Path, repos: &[Repo]) -> Option<Self> {
+        if repos.is_empty() {
+            return None;
+        }
+        let stale = load(db_path).stale_repos(repos.iter().map(|repo| repo.uid.as_str()));
+        if stale.is_empty() {
+            return None;
+        }
+        let repos_with_remedies = stale
+            .into_iter()
+            .map(|uid| {
+                let path = repos
+                    .iter()
+                    .find(|repo| repo.uid == uid)
+                    .and_then(|repo| repo.local_root())
+                    .map(str::to_string);
+                StaleRepoRemedy::new(uid, path)
+            })
+            .collect();
+        Some(Self::OutdatedResolver {
+            repos: repos_with_remedies,
+            total: Some(repos.len()),
+        })
+    }
+
+    /// Machine-readable cause. `outdated_resolver` is deliberately the SAME
+    /// token `stale-check` puts in a repo's `status`, so detection and refusal
+    /// share one vocabulary instead of growing two.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::OutdatedResolver { .. } => "outdated_resolver",
+        }
+    }
+
+    /// The paragraph a human sees, on stderr, on every route.
+    pub fn message(&self) -> String {
+        match self {
+            Self::OutdatedResolver { repos, total } => {
+                let uids: Vec<String> = repos.iter().map(|repo| repo.uid.clone()).collect();
+                let note = staleness_note_for(&uids, *total).unwrap_or_default();
+                let mut message = format!("{WHY_DEAD_CODE_REFUSES} {note}");
+                for repo in repos {
+                    match &repo.command {
+                        Some(command) => message.push_str(&format!("\n  {command}")),
+                        None => message.push_str(&format!(
+                            "\n  {} — indexed from a bare clone, so this machine has no \
+                             working tree to pass to `--repo`; re-index it where it lives",
+                            repo.uid
+                        )),
+                    }
+                }
+                message
+            }
+        }
+    }
+
+    /// The refusal a MACHINE reads.
+    ///
+    /// It carries NO `unreachable_symbols` key at all. An empty list would be
+    /// the same failure in a politer shape: a caller that keys off "did I get
+    /// rows" reads zero rows as "nothing is dead", which is the opposite of
+    /// what happened. `refused` is present and `true`, and `reason` says why.
+    pub fn payload(&self) -> serde_json::Value {
+        let Self::OutdatedResolver { repos, .. } = self;
+        serde_json::json!({
+            "refused": true,
+            "reason": self.reason(),
+            "resolver_stale": true,
+            "resolver_stale_repos": repos
+                .iter()
+                .map(|repo| repo.uid.clone())
+                .collect::<Vec<_>>(),
+            "remedies": repos,
+            // The same key `stale-check` gates CI on, so a caller that already
+            // reads it needs no edit to see this.
+            "needs_reindex": true,
+            "note": self.message(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-367. Two properties the route test cannot see from outside, because
+    /// its fixture's repo path is a tempdir and its assertions are structural:
+    ///
+    ///  * the refusal carries NO deletion list — not an empty one. An empty
+    ///    array is a claim, and it is the wrong one.
+    ///  * the printed command names a REAL path. `staleness_note_for` prints
+    ///    the `<path>` template, which is right for the routes that hold no
+    ///    repo rows and wrong here, where they are in hand.
+    #[test]
+    fn a_dead_code_refusal_carries_a_runnable_remedy_and_no_list() {
+        let repo = Repo {
+            uid: "repo:default:abc".into(),
+            url: "file:///tmp/demo".into(),
+            indexed_sha: "deadbeef".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some("/tmp/demo".into()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+
+        // Current: no refusal at all.
+        record(&db, &repo.uid).unwrap();
+        assert!(DeadCodeRefusal::for_repos(&db, std::slice::from_ref(&repo)).is_none());
+
+        // Behind: refuse, and name a command that has a real path in it.
+        let mut generations = load(&db);
+        generations
+            .repos
+            .insert(repo.uid.clone(), RESOLVER_GENERATION - 1);
+        std::fs::write(
+            crate::sidecar_path(&db, RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_string(&generations).unwrap(),
+        )
+        .unwrap();
+
+        let refusal = DeadCodeRefusal::for_repos(&db, std::slice::from_ref(&repo))
+            .expect("a repo behind the current generation must refuse");
+        let payload = refusal.payload();
+        assert_eq!(payload["refused"], serde_json::json!(true));
+        assert_eq!(payload["reason"], serde_json::json!("outdated_resolver"));
+        assert_eq!(payload["needs_reindex"], serde_json::json!(true));
+        assert!(
+            payload.get("unreachable_symbols").is_none(),
+            "an empty list is a claim, and it is the wrong one: {payload}"
+        );
+        assert_eq!(
+            payload["remedies"][0]["command"],
+            serde_json::json!("nestweaver index --repo /tmp/demo --force"),
+            "the remedy must be runnable as printed, not the `<path>` template: {payload}"
+        );
+    }
 
     #[test]
     fn missing_entry_reads_as_generation_zero() {

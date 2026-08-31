@@ -128,8 +128,9 @@ earlier release must be re-indexed.** Until you do:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
   PageRank-ordered result are computed over edges the old resolver wrote.
-- **`MEMBER_OF` edges are missing** for C and C++ members, so `dead-code`
-  reachability under-counts.
+- **`MEMBER_OF` edges are missing** for C and C++ members, so reachability
+  under-counts. `dead-code` **refuses to answer** on such a graph and exits `2`
+  rather than printing a deletion list built from missing edges.
 - **C++ `IMPORTS` edges are missing.** The resolver used to extract `#include`
   and then discard it.
 - **`.h` headers were parsed with the C grammar**, which has no `class` keyword.
@@ -423,7 +424,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | **A review aid, not a deletion list.** Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk had no usable seed set, so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
+| `dead-code` | **A review aid, not a deletion list**, and it **refuses to produce one at all on a resolver-generation-stale graph** — exit `2`, `refused: true` with `reason: "outdated_resolver"` and a runnable `remedies[].command` on `--json`, on every route including MCP. A missing edge can only fail to *reach* a live symbol, so an under-resolved graph moves live code onto a deletion list; re-index with `nestweaver index --repo <path> --force` and re-run. Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk had no usable seed set, so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
 | `rerank` | Lightweight result reranker (off-by-default heuristic) |
 | `info` | Show hardware and configuration information |
 | `contracts list` | List API contracts derived from spec files + framework handlers |

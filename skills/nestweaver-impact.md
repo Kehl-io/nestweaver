@@ -42,3 +42,8 @@ was **0/15**, and it remains poor on C++.
   absence of a finding, not a finding.
 - Never delete on its say-so, and never present its output to the user as a
   list of code that is safe to remove.
+- On a resolver-generation-stale graph it **refuses**: the response is
+  `refused: true` with `reason: "outdated_resolver"` and a `remedies` array, and
+  carries **no `unreachable_symbols` key at all**. Do not read that as "nothing
+  is dead" — nothing was computed. Run each `remedies[].command`
+  (`nestweaver index --repo <path> --force`) and call the tool again.

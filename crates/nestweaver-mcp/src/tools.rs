@@ -2209,6 +2209,72 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
     hasher.finish()
 }
 
+/// The response-cache key for one call, derived in ONE place.
+///
+/// nw-367. `maybe_cached` built this inline and
+/// `cancelled_follower_rejects_failed_leaders_degraded_result` built it AGAIN,
+/// to name the flight slot it expects to observe in `IN_FLIGHT`. Adding a
+/// fourth salt to one copy left the other naming a key nothing computes — and
+/// its `.expect("leader must publish the in-flight slot")` fires while holding
+/// the `IN_FLIGHT` mutex, so the copy did not merely fail: it POISONED a
+/// global and took two unrelated single-flight tests down with it. Same class
+/// as the byte-identical `stale-check` renderers nw-366 collapsed.
+fn response_cache_key(
+    name: &str,
+    args: &Value,
+    db_path: &Path,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> u64 {
+    // Fold the caller's repo-visibility in so a redacted blast_radius result is
+    // never served across identities (R9b). A `None`/`All` visibility (the
+    // unconfigured single-trust-domain default) contributes salt 0, so the key
+    // is byte-identical to before and existing entries still hit — zero
+    // behavior change when no `[authz]` policy is set. A restricting
+    // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
+    // visibility scope its own cache slot.
+    let key = mix_visibility_cache_key(
+        nestweaver_store::cache::ResponseCache::key(name, args),
+        visibility_cache_salt(visible),
+    );
+    let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
+    // nw-367: the rest of the key covers the GRAPH (`graph_generation`) and the
+    // FILES (`whole_db_scope_digest`), and the resolver-generation sidecar is
+    // neither. Downgrading it — exactly what bumping `RESOLVER_GENERATION` does
+    // to every existing database — changes the right answer for `dead_code`
+    // (refuse) and for every `rankings_stale` field without changing either
+    // input, so a hit would serve a pre-bump deletion list past the bump.
+    // Measured on a build without this salt: `refused` absent and
+    // `unreachable_count: 5` on a downgraded database, straight from cache.
+    mix_visibility_cache_key(key, resolver_generation_cache_salt(db_path))
+}
+
+/// Salt folded into every cacheable tool's key so a response cannot outlive
+/// the resolver generation it was computed under.
+///
+/// nw-367. `graph_generation` is bumped by indexing and `whole_db_scope_digest`
+/// tracks file content hashes; neither moves when `RESOLVER_GENERATION` is
+/// bumped in the BINARY, because that changes no byte of the database. The
+/// `RESPONSE_SHAPE_VERSION` namespace covers the real upgrade path, but not a
+/// sidecar edited under a running process — and `dead_code`'s answer flips
+/// from a list to a refusal on exactly that transition.
+fn resolver_generation_cache_salt(db_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let generations = nestweaver_engine::resolver_generation::load(db_path);
+    if generations.repos.is_empty() {
+        // No record at all is the pre-nw-124 state and the default the key
+        // already had; contribute nothing so existing entries still hit.
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `repos` is a BTreeMap, so this walk is ordered and the salt is stable.
+    for (uid, generation) in &generations.repos {
+        uid.hash(&mut hasher);
+        generation.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Semantic context is a function of both graph contents and the exact model
 /// instance available to this process. Include a versioned model namespace in
 /// its cache/single-flight key so a loading request cannot join or hit a ready
@@ -2411,18 +2477,10 @@ fn maybe_cached(
     }
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
-    // Fold the caller's repo-visibility into the cache key so a redacted
-    // blast_radius result is never served across identities (R9b). A `None`/`All`
-    // visibility (the unconfigured single-trust-domain default) contributes salt
-    // 0, so the key is byte-identical to before and existing entries still hit —
-    // zero behavior change when no `[authz]` policy is set. A restricting
-    // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
-    // visibility scope its own cache slot.
-    let key = mix_visibility_cache_key(
-        nestweaver_store::cache::ResponseCache::key(name, &args),
-        visibility_cache_salt(visible),
-    );
-    let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
+    // Every salt this key carries lives in `response_cache_key`, which the
+    // single-flight test also calls — see its doc for why that is not an
+    // aesthetic preference.
+    let key = response_cache_key(name, &args, &db_path, embed_model, visible);
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 
@@ -9902,7 +9960,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos` and a `remedies` array, and NO `unreachable_symbols` key at all — a missing edge can only fail to reach a LIVE symbol, so an under-resolved graph moves live code onto a deletion list. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required) and call again.\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9937,6 +9995,14 @@ fn tool_dead_code(
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
+    // nw-367: REFUSE before doing any work. Every other resolver-generation
+    // surface discloses and prints anyway; this one is a list of symbols to
+    // delete, and a missing edge can only move a LIVE symbol onto it. See
+    // `DeadCodeRefusal` for the full argument.
+    if let Some(refusal) = dead_code_refusal(store)? {
+        return Ok(refusal.payload());
+    }
+
     let min_conf_str = args
         .get("min_confidence")
         .and_then(|v| v.as_str())
@@ -12466,6 +12532,47 @@ pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
     }
 }
 
+/// `dead_code`'s refusal verdict for this database, or `None` when every repo
+/// is current.
+///
+/// nw-367. This is the MCP-side access path to `ResolverGenerations::stale_repos`
+/// — the sole computation (nw-358) — and it is the one the CLI's DAEMON route
+/// reaches too, since that route calls this tool over RPC and prints the
+/// refusal it is sent rather than re-deriving one client-side.
+///
+/// It does NOT reuse `ranking_stale_repos`, and the difference is the whole
+/// point: that helper `.ok()`s its way out of an unset `CURRENT_DB_PATH` or a
+/// failing `list_repos` and returns an empty vec, which reads as "nothing is
+/// stale". For a disclosure that is a missing sentence. For a deletion list it
+/// IS the deletion list.
+///
+/// THE THREAD-LOCAL IS A FALLBACK HERE, NOT THE SOURCE. `attach_ranking_staleness`
+/// resolves the db path through `CURRENT_DB_PATH` alone, which is why the
+/// daemon's `repo_map_json` answered `rankings_stale: false` on a
+/// generation-3 database: the value is unset on a `spawn_blocking` worker
+/// unless the call site remembers to set it. `GraphStore::db_path` cannot be
+/// unset by a worker thread, so reading it second REMOVES that hazard rather
+/// than merely refusing on it. `None` from both means the store has no
+/// database file at all — an in-memory store, which has no sidecar because it
+/// has no disk, and whose graph was necessarily built in-process by THIS
+/// binary. There is nothing there that can predate the running resolver.
+fn dead_code_refusal(
+    store: &GraphStore,
+) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
+    let db_path = match (current_db_path(store), store.db_path()) {
+        (Ok(path), _) => path,
+        (Err(_), Some(path)) => path.to_path_buf(),
+        (Err(_), None) => return Ok(None),
+    };
+    // A store that cannot list repos cannot serve a reachability walk either,
+    // so this PROPAGATES instead of refusing: the caller gets the store's own
+    // error (and, on the CLI, the diagnostic nw-285 built for a schema-less
+    // database) rather than a binder exception quoted inside a paragraph about
+    // resolver generations.
+    let repos = store.list_repos(None)?;
+    Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
+}
+
 /// Attach a disclosure to a tool result without dropping one already there.
 ///
 /// `note` is this surface's existing human-readable channel and some tools
@@ -14821,20 +14928,16 @@ mod cache_dispatch_tests {
             release: std::sync::Mutex::new(release_rx),
         });
 
-        let flight_key = {
-            let key = mix_visibility_cache_key(
-                nestweaver_store::cache::ResponseCache::key("brain_context", &args),
-                visibility_cache_salt(None),
-            );
-            let key =
-                mix_visibility_cache_key(key, semantic_cache_salt("brain_context", Some(&*model)));
-            (
-                db_path.clone(),
-                key,
-                store.graph_generation(),
-                whole_db_scope_digest(&db_path),
-            )
-        };
+        // The SAME derivation `maybe_cached` uses, not a copy of it — see
+        // `response_cache_key`. The copy this replaces named a key nothing
+        // computed the moment a salt was added, and panicked holding the
+        // `IN_FLIGHT` mutex.
+        let flight_key = (
+            db_path.clone(),
+            response_cache_key("brain_context", &args, &db_path, Some(&*model), None),
+            store.graph_generation(),
+            whole_db_scope_digest(&db_path),
+        );
 
         let leader_store = store.clone();
         let leader_path = db_path.clone();

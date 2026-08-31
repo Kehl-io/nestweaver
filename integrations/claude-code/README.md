@@ -66,7 +66,7 @@ tools listed under *Admin* below). `--lite` advertises **6**.
 - **flow_trace** — Forward execution flow from entry points
 - **detect_changes** — Map file changes to affected processes and risk
 - **affected_tests** — Test-impact analysis for regression test selection
-- **dead_code** — Unreachable-symbol detection. **A review aid, not a deletion list**: measured top-15 precision on Rust was 0/15 and it remains poor on C++. Treat every confidence tier as review candidates. `coverage: "degraded"` means the walk had no usable seed set, so every row is unreachable *by construction*
+- **dead_code** — Unreachable-symbol detection. **A review aid, not a deletion list**: measured top-15 precision on Rust was 0/15 and it remains poor on C++. Treat every confidence tier as review candidates. `coverage: "degraded"` means the walk had no usable seed set, so every row is unreachable *by construction*. **Refuses on a resolver-generation-stale graph** (`refused: true`, `reason: "outdated_resolver"`, no `unreachable_symbols` key) — re-index with `nestweaver index --repo <path> --force` and retry
 - **contract_drift** — API contract drift detection across repos
 
 **Graph Structure:**

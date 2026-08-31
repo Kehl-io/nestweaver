@@ -3746,6 +3746,284 @@ fn repo_map_and_ranking_rank_disclose_stale_rankings_on_every_route() {
     }
 }
 
+/// nw-367. `dead-code` REFUSES on a resolver-generation-stale graph — every
+/// route, exit `2` — where every other generation-aware surface discloses and
+/// prints anyway.
+///
+/// The difference is what the output IS. `hubs`, `bridges`, `repo-map` and
+/// `ranking rank` return an ORDER, and a reader told the order is suspect can
+/// discount it. `dead-code` returns a list of symbols to DELETE, computed by a
+/// reachability BFS walking FORWARD from entry points, so a MISSING edge can
+/// only ever fail to reach a live symbol. The error is one-directional and it
+/// points at deleting live code — and on a pre-generation-4 graph the missing
+/// edges are not marginal: C/C++ `MEMBER_OF` and C++ `IMPORTS` edges are
+/// absent ENTIRELY. Refusing costs one error message; printing costs a
+/// deletion the tool's output cannot undo, from a tool that measures 0/15
+/// top-15 precision on Rust with a CURRENT graph. A warning above a deletion
+/// list is also a pattern that has already failed here: the docs audit found a
+/// shipped skill telling agents unreachable code "may be safe to remove
+/// instead of fix".
+///
+/// THE CONTROL IS LOAD-BEARING and runs on all five routes before the
+/// downgrade. Without it every assertion below is satisfied by a `dead-code`
+/// that refuses unconditionally, which is a blanket outage wearing the
+/// signature of a detection.
+///
+/// THE FIXTURE DOWNGRADES THE SIDECAR RATHER THAN DELETING IT. A deleted
+/// sidecar reads as generation 0, which the pre-existing code already treated
+/// as stale, so it would pass against the bug. The upgrade case is a file that
+/// is PRESENT, well-formed, and behind — which is what every user has after
+/// `RESOLVER_GENERATION` 3 → 4.
+///
+/// The daemon legs run in ONE session that straddles the downgrade, so the
+/// same live daemon answers "here is your list" and then "no". That also pins
+/// the response cache: `maybe_cached` keys on `graph_generation` and file
+/// content hashes, and the sidecar is NEITHER, so before
+/// `resolver_generation_cache_salt` the daemon and the MCP server both served
+/// the pre-downgrade deletion list straight out of cache and the refusal never
+/// ran. Measured on a build with the salt removed: `refused` absent,
+/// `unreachable_count: 5`, on the downgraded database.
+///
+/// The last section EXECUTES the remedy the refusal prints, un-forced form
+/// first — the same discipline nw-366 established, because a test that only
+/// ran `--force` would call a broken remedy correct.
+#[test]
+fn dead_code_refuses_to_list_on_a_generation_stale_graph_on_every_route() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    // ── CONTROL, at generation 4: every route must still produce a LIST.
+    let clean_text = run_direct(db, &["dead-code"]);
+    let clean_json_out = run_direct(db, &["dead-code", "--json"]);
+    let clean_json = parse_stdout("dead-code --json (clean)", &clean_json_out);
+    let clean_mcp = run_via_mcp(db, "dead_code", serde_json::json!({}));
+
+    // ── Daemon legs, in one session that straddles the downgrade.
+    let (clean_daemon_text, clean_daemon_json_out, stale_daemon_text, stale_daemon_json_out) = {
+        let _guard = DaemonGuard::new(db);
+        start_daemon(db);
+        let clean_daemon_text = run_via_daemon(db, &["dead-code"]);
+        let clean_daemon_json_out = run_via_daemon(db, &["dead-code", "--json"]);
+
+        let recorded = downgrade_resolver_generation(db);
+        assert!(
+            recorded > 0,
+            "the fixture recorded no repo, so every leg below passes vacuously"
+        );
+
+        (
+            clean_daemon_text,
+            clean_daemon_json_out,
+            run_via_daemon(db, &["dead-code"]),
+            run_via_daemon(db, &["dead-code", "--json"]),
+        )
+    };
+    stop_daemon(db);
+
+    // ── Direct and MCP legs, now that the write lease is free.
+    let stale_text = run_direct(db, &["dead-code"]);
+    let stale_json_out = run_direct(db, &["dead-code", "--json"]);
+    let stale_json = parse_stdout("dead-code --json (direct, stale)", &stale_json_out);
+    let stale_daemon_json =
+        parse_stdout("dead-code --json (daemon, stale)", &stale_daemon_json_out);
+    let stale_mcp = run_via_mcp(db, "dead_code", serde_json::json!({}));
+
+    // ── The control's contract, on all five routes.
+    for (label, output) in [
+        ("direct text", &clean_text),
+        ("direct --json", &clean_json_out),
+        ("daemon text", &clean_daemon_text),
+        ("daemon --json", &clean_daemon_json_out),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label} (clean): a current graph must still ANSWER. Without this leg \
+             every refusal assertion below is satisfied by a command that always \
+             refuses.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (label, payload) in [
+        ("direct --json", &clean_json),
+        ("mcp dead_code", &clean_mcp),
+    ] {
+        assert!(
+            payload.get("refused").is_none(),
+            "{label} (clean): {payload}"
+        );
+        assert!(
+            payload["unreachable_symbols"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "{label} (clean): the control must carry real rows, or 'the list \
+             disappeared' is indistinguishable from 'the fixture had none': {payload}"
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&clean_text.stdout).contains("Dead code analysis"),
+        "direct text (clean): {}",
+        String::from_utf8_lossy(&clean_text.stdout)
+    );
+
+    // ── THE EXIT CODE, on all four CLI legs. This is the CI contract and the
+    // break: 8.x returned 0 here.
+    for (label, output) in [
+        ("direct text", &stale_text),
+        ("direct --json", &stale_json_out),
+        ("daemon text", &stale_daemon_text),
+        ("daemon --json", &stale_daemon_json_out),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{label}: a generation-stale graph must exit EXIT_NEEDS_REINDEX (2), \
+             reusing the code `stale-check` already uses so every gate written \
+             against `2` catches this for free.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // ── NO LIST. Not a shorter list, not an empty one: none.
+    for (label, payload) in [
+        ("direct --json", &stale_json),
+        ("daemon --json", &stale_daemon_json),
+        ("mcp dead_code", &stale_mcp),
+    ] {
+        assert_eq!(
+            payload["refused"],
+            serde_json::json!(true),
+            "{label}: a machine caller must be told it was REFUSED. A silently \
+             empty list reads as 'nothing is dead', which is the opposite of \
+             what happened: {payload}"
+        );
+        assert_eq!(
+            payload["reason"],
+            serde_json::json!("outdated_resolver"),
+            "{label}: the cause must be machine-readable, and in the SAME \
+             vocabulary `stale-check` uses for the same condition: {payload}"
+        );
+        assert!(
+            payload.get("unreachable_symbols").is_none(),
+            "{label}: the deletion list must be ABSENT, not empty — an empty \
+             array is a claim, and it is the wrong one: {payload}"
+        );
+        assert_eq!(
+            payload["needs_reindex"],
+            serde_json::json!(true),
+            "{label}: {payload}"
+        );
+        assert!(
+            payload["resolver_stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty()),
+            "{label}: the refusal must NAME what to re-index: {payload}"
+        );
+        let command = payload["remedies"][0]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: no remedy command: {payload}"));
+        assert!(
+            command.starts_with("nestweaver index --repo ")
+                && command.ends_with(" --force")
+                && !command.contains("<path>"),
+            "{label}: the remedy must name the REAL path, not the `<path>` \
+             template — it is executed below: {command}"
+        );
+    }
+    assert_eq!(
+        stale_json["remedies"], stale_daemon_json["remedies"],
+        "the direct and daemon routes must name the same repos and the same \
+         commands; the daemon route PRINTS what the tool computed rather than \
+         re-deriving it"
+    );
+
+    // ── The human rendering. stdout carries nothing that reads as a result.
+    for (label, output) in [
+        ("direct text", &stale_text),
+        ("daemon text", &stale_daemon_text),
+    ] {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.trim().is_empty(),
+            "{label}: a refusal that still prints rows is a warning, and a \
+             warning above a deletion list is the pattern this change \
+             replaces:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("list of symbols to DELETE"),
+            "{label}: the refusal must say WHY it is a refusal and not a \
+             caveat:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("indexed by an older resolver"),
+            "{label}: the shared renderer's sentence must survive, so every \
+             surface says the same thing about the same condition:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--force"),
+            "{label}: `--force` is load-bearing — plain `index` is a no-op on a \
+             repo already at HEAD, as the section below measures:\n{stderr}"
+        );
+    }
+
+    // ── EXECUTE THE REMEDY THE REFUSAL PRINTED. Un-forced first.
+    let remedy_path = stale_json["remedies"][0]["path"]
+        .as_str()
+        .expect("the refusal must carry a local path for this fixture")
+        .to_string();
+    assert_eq!(
+        stale_json["remedies"][0]["command"],
+        serde_json::json!(format!("nestweaver index --repo {remedy_path} --force")),
+        "the printed command must be exactly the one executed here"
+    );
+
+    let unforced = run_direct(db, &["index", "--repo", &remedy_path]);
+    assert!(
+        unforced.status.success(),
+        "the un-forced index must SUCCEED — that is precisely why it was \
+         mistaken for a working remedy: {}",
+        String::from_utf8_lossy(&unforced.stderr)
+    );
+    assert_eq!(
+        run_direct(db, &["dead-code"]).status.code(),
+        Some(2),
+        "`nestweaver index --repo <path>` is a no-op on a repo already at HEAD: \
+         it writes nothing and leaves the sidecar on the old generation. If the \
+         refusal printed THAT, the user would run it, see success, and be \
+         refused again."
+    );
+
+    let forced = run_direct(db, &["index", "--repo", &remedy_path, "--force"]);
+    assert!(
+        forced.status.success(),
+        "the printed remedy must RUN: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let after = run_direct(db, &["dead-code", "--json"]);
+    let after_json = parse_stdout("dead-code --json (after remedy)", &after);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "the remedy must CLEAR the condition, or the refusal is a dead end:\n{after_json}"
+    );
+    assert!(
+        after_json.get("refused").is_none()
+            && after_json["unreachable_symbols"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+        "the list must come BACK after the remedy: {after_json}"
+    );
+    let after_mcp = run_via_mcp(db, "dead_code", serde_json::json!({}));
+    assert!(
+        after_mcp.get("refused").is_none(),
+        "MCP must also stop refusing once the graph is current — and its \
+         response cache must not replay the refusal it stored a moment ago: \
+         {after_mcp}"
+    );
+}
+
 /// Rewrite the generation sidecar so every recorded repo reads as the
 /// PREVIOUS generation, and return how many repos were downgraded.
 ///

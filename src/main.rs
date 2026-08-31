@@ -2416,6 +2416,27 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
     }
 }
 
+/// The refusal paragraph out of a `dead_code` payload the DAEMON produced.
+///
+/// nw-367. The daemon route re-renders nothing: the tool that computed the
+/// refusal also wrote the sentence, so this reads `note` and prints it. The
+/// fallback exists only for a payload that says `refused` and carries no
+/// `note`, which this binary cannot produce — and it still names a remedy,
+/// because a refusal with no way forward is the failure mode nw-366 fixed.
+fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
+    payload
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            "dead-code refused: this graph's edges predate the running resolver, and a \
+             missing edge can only move a LIVE symbol onto a deletion list. Run \
+             `nestweaver stale-check` to list the repos, then re-index each one with \
+             `nestweaver index --repo <path> --force`."
+                .to_string()
+        })
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -4630,8 +4651,14 @@ enum Commands {
     /// deadness: the caveat is not scoped to Low. Confidence ranks how
     /// unaddressable a symbol is from outside its file, never how sure the
     /// reachability walk is.
+    ///
+    /// REFUSES on a resolver-generation-stale graph, exiting 2: on such a
+    /// graph C/C++ `MEMBER_OF` and C++ `IMPORTS` edges are absent entirely,
+    /// and a missing edge can only fail to REACH a live symbol — so the error
+    /// is one-directional and points at deleting live code. Re-index the repos
+    /// it names with `nestweaver index --repo <path> --force` and re-run.
     #[command(
-        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
+        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  a list was produced\n  2  REFUSED — the graph's edges predate the running resolver; re-index with\n     `nestweaver index --repo <path> --force` (each stale repo is named on stderr)"
     )]
     DeadCode {
         #[arg(
@@ -13991,6 +14018,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["limit"] = serde_json::json!(n);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
+                    // nw-367: the daemon PRINTS what it was sent. The refusal
+                    // is computed by the `dead_code` tool the daemon ran, from
+                    // `ResolverGenerations::stale_repos` — the sole
+                    // computation — so this route decides nothing and cannot
+                    // disagree with the tool about one database. That is the
+                    // same rule `ResolverStaleness::from_daemon_response`
+                    // follows, and the reason `hubs` had three answers before
+                    // nw-358 was that its daemon route re-derived instead.
+                    if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        }
+                        eprintln!("Error: {}", dead_code_refusal_note(&value));
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -14010,8 +14052,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 });
             let store = open_store(db.as_deref())?;
 
-            // Load manifest sidecar for manifest-driven entry points.
             let db_path = db.clone().unwrap_or_else(default_db_path);
+
+            // nw-367: REFUSE before the walk. `DeadCodeRefusal::for_repos`
+            // wraps `ResolverGenerations::stale_repos` — the sole computation
+            // — and returns `None` only when every repo is provably current.
+            //
+            // The enumeration PROPAGATES rather than becoming a refusal. A
+            // store that cannot list repos cannot serve a reachability walk
+            // either, and the CLI's error classifier turns that failure into
+            // the diagnostic it earned: a zero-length database reports
+            // `nestweaver::db_no_schema` with its size and a runnable
+            // `nestweaver index`, which nw-285 built and which a refusal here
+            // would have replaced with a binder exception quoted inside a
+            // paragraph about resolver generations.
+            let repos = store.list_repos(None)?;
+            if let Some(refusal) =
+                nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos)
+            {
+                // stdout stays pure JSON for a `--json` gate; the paragraph
+                // goes to stderr on BOTH modes, the same split `stale-check`
+                // and every ranking surface already use.
+                if json {
+                    print_json_payload(&refusal.payload())?;
+                }
+                eprintln!("Error: {}", refusal.message());
+                return Ok((EXIT_NEEDS_REINDEX, None));
+            }
+
+            // Load manifest sidecar for manifest-driven entry points.
             let manifests =
                 nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
 
