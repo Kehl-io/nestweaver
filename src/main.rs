@@ -134,6 +134,14 @@ const EXIT_AMBIGUOUS: i32 = 3;
 const EXIT_USAGE: i32 = 64;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
+/// Default `server init-tls --validity-days`.
+///
+/// Named rather than inlined so the clap default and the `--force` remedy
+/// `init_tls_force_command` prints cannot drift: the remedy omits the flag
+/// only when the caller took the default, and a drifted literal would print a
+/// command that rotates to a different validity than the one refused.
+const DEFAULT_TLS_VALIDITY_DAYS: u32 = 365;
+
 /// Explicit device policy for direct local embedding.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum CliEmbeddingAccelerator {
@@ -5117,7 +5125,7 @@ enum ServerAction {
     /// Generate TLS certificates for secure server communication
     #[command(
         name = "init-tls",
-        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90"
+        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90\n  nestweaver server init-tls --output-dir ./tls --client --force   # rotate an existing CA\n\nThis is key rotation, not idempotent initialization. A directory that already\nholds ANY of ca.pem, ca-key.pem, server.pem, server-key.pem, client.pem or\nclient-key.pem is left untouched and the command exits 64 unless --force is\npassed. With --force the whole bundle is replaced in one staged install and\nthe replaced bundle is kept in <output-dir>/.nestweaver-tls.backup/."
     )]
     InitTls {
         /// Directory to write certificate files
@@ -5127,11 +5135,22 @@ enum ServerAction {
         #[arg(long = "san")]
         sans: Vec<String>,
         /// Certificate validity in days (1-36500)
-        #[arg(long, default_value = "365", value_parser = clap::value_parser!(u32).range(1..=36500))]
+        #[arg(long, default_value_t = DEFAULT_TLS_VALIDITY_DAYS, value_parser = clap::value_parser!(u32).range(1..=36500))]
         validity_days: u32,
         /// Generate client certificate for mTLS
         #[arg(long)]
         client: bool,
+        /// Replace an existing CA, private key and signed bundle.
+        ///
+        /// DESTRUCTIVE. The existing CA private key is retired and the
+        /// certificates it signed stop verifying. The whole bundle is
+        /// replaced in one staged install, and any managed file the new
+        /// bundle does not provide is retired with it — a client
+        /// certificate cannot outlive the CA that signed it. The replaced
+        /// bundle is kept in `.nestweaver-tls.backup/` inside the output
+        /// directory.
+        #[arg(long)]
+        force: bool,
     },
     /// Backup and restore the NestWeaver database (alias for `nestweaver backup`)
     Backup {
@@ -6845,6 +6864,137 @@ enum DbSource {
 /// target is not refused — that target is derived from the source rather than
 /// from the ambient environment.
 ///
+/// Single-quote an argument for a shell only when it needs it.
+///
+/// The refusals below print a command the user is meant to paste. A path with
+/// a space in it that comes back unquoted is an unexecutable remedy, which is
+/// the failure mode this repository has shipped five times.
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-,".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+/// The exact `server init-tls` invocation that WOULD perform the replacement:
+/// the caller's own arguments with `--force` appended.
+///
+/// Reconstructed from the parsed arguments rather than templated, in the shape
+/// `dead-code`'s per-repo remedy established — a message naming a flag is only
+/// worth printing if running the string it prints does what it says.
+fn init_tls_force_command(
+    output_dir: &Path,
+    sans: &[String],
+    validity_days: u32,
+    client: bool,
+) -> String {
+    let mut cmd = format!(
+        "nestweaver server init-tls --output-dir {}",
+        shell_quote(&output_dir.display().to_string())
+    );
+    for san in sans {
+        cmd.push_str(&format!(" --san {}", shell_quote(san)));
+    }
+    if validity_days != DEFAULT_TLS_VALIDITY_DAYS {
+        cmd.push_str(&format!(" --validity-days {validity_days}"));
+    }
+    if client {
+        cmd.push_str(" --client");
+    }
+    cmd.push_str(" --force");
+    cmd
+}
+
+/// Why `server init-tls` will not overwrite a directory that already holds a
+/// bundle, and the exact command that performs the replacement.
+///
+/// The old behaviour printed this same fact as a WARNING and then performed
+/// the overwrite anyway, which in automation is advisory noise above an
+/// irrecoverable act: measured on 8.0.0, a second run replaced `ca.pem` and
+/// the CA private key, left `client.pem` untouched, and exited 0 over a
+/// directory whose client certificate no longer verified.
+///
+/// The trigger is ANY managed name, not `ca.pem` alone. A directory holding
+/// only `client.pem` and `client-key.pem` is a bundle whose root has already
+/// been lost, and overwriting it in silence is how it stayed lost.
+fn init_tls_replace_refusal(
+    output_dir: &Path,
+    state: &nestweaver_engine::tls::DirState,
+    sans: &[String],
+    validity_days: u32,
+    client: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let installing: Vec<&str> = nestweaver_engine::tls::MANAGED_FILES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| client || !name.starts_with("client"))
+        .collect();
+    let will_retire: Vec<&str> = state
+        .present
+        .iter()
+        .copied()
+        .filter(|name| !installing.contains(name))
+        .collect();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Error: refusing to replace the TLS bundle already in {}",
+        output_dir.display()
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  present: {}", state.present.join(", "));
+    if !state.symlinked.is_empty() {
+        let _ = writeln!(
+            out,
+            "  symlinks: {} (a replacement would retire the link itself, never write through it)",
+            state.symlinked.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "This is key rotation, not idempotent initialization. Re-running mints a NEW"
+    );
+    let _ = writeln!(
+        out,
+        "certificate authority and retires the old CA private key, so every certificate"
+    );
+    let _ = writeln!(out, "the old CA signed stops verifying.");
+    if !will_retire.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "A replacement would also retire {}, which the new CA cannot vouch for.",
+            will_retire.join(" and ")
+        );
+        let _ = writeln!(
+            out,
+            "Pass --client to reissue a client certificate under the new CA instead."
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Replace it (the bundle being replaced is kept in {}/{}/):",
+        output_dir.display(),
+        nestweaver_engine::tls::BACKUP_DIR
+    );
+    let _ = writeln!(
+        out,
+        "  {}",
+        init_tls_force_command(output_dir, sans, validity_days, client)
+    );
+    out
+}
+
 /// Returns the refusal text, or `None` when the caller may proceed.
 fn wholly_inferred_write_refusal(
     action: &str,
@@ -19501,22 +19651,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 sans,
                 validity_days,
                 client,
+                force,
             } => {
                 use nestweaver_engine::tls;
 
-                // Re-running init-tls silently replaces the CA, which
-                // invalidates every cert it signed — warn before doing so.
-                if output_dir.join("ca.pem").exists() {
+                // Take the exclusive install lock BEFORE deciding anything.
+                // `TlsDir::open` also rolls back an interrupted previous
+                // install, so the state inspected below is a settled bundle
+                // rather than a half-replaced one.
+                let dir = tls::TlsDir::open(&output_dir)?;
+                if !dir.recovered().is_empty() {
                     eprintln!(
-                        "warning: {} already contains a CA (ca.pem) — overwriting it \
-                         invalidates every certificate it signed",
-                        output_dir.display()
+                        "notice: rolled back an interrupted `server init-tls` install in {} \
+                         and restored {}",
+                        output_dir.display(),
+                        dir.recovered().join(", ")
                     );
                 }
 
-                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+                let state = dir.state()?;
+                if !state.present.is_empty() && !force {
+                    eprint!(
+                        "{}",
+                        init_tls_replace_refusal(&output_dir, &state, &sans, validity_days, client,)
+                    );
+                    return Ok((EXIT_USAGE, None));
+                }
 
-                tls::write_tls_bundle(&output_dir, &bundle)?;
+                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+                let report = dir.install(&bundle)?;
 
                 let dir_display = output_dir.display();
                 println!("Generated TLS certificates in {dir_display}/");
@@ -19528,6 +19691,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if client {
                     println!("  client.pem       Client certificate (mTLS)");
                     println!("  client-key.pem   Client private key (mTLS)");
+                }
+                if !report.removed.is_empty() {
+                    println!();
+                    println!(
+                        "Retired (signed by the CA this run replaced): {}",
+                        report.removed.join(", ")
+                    );
+                }
+                if let Some(backup) = report.backup_dir.as_ref() {
+                    println!();
+                    println!("Replaced bundle kept at {}/", backup.display());
                 }
                 println!();
                 println!("Start server with:");

@@ -283,8 +283,45 @@ nestweaver daemon --db ./brain.lbug run \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 ```
 
-Re-running `init-tls` over an existing CA warns that the new CA invalidates
-certificates signed by the old one — re-issue client/server certs afterwards.
+#### Re-running is key rotation, not initialization
+
+`init-tls` **refuses** to touch a directory that already holds any of `ca.pem`,
+`ca-key.pem`, `server.pem`, `server-key.pem`, `client.pem` or `client-key.pem`.
+It exits **64** (`EX_USAGE`) and prints the exact invocation that would perform
+the replacement. Nothing on disk changes.
+
+Through 8.x it printed a warning and overwrote anyway: the CA private key was
+gone, `client.pem` was left behind signed by the CA that no longer existed, and
+the command exited 0 over a directory whose client certificate failed with
+`unable to get local issuer certificate`.
+
+```bash
+# Rotate the CA and everything under it, in one staged install.
+nestweaver server init-tls --output-dir ./tls --san localhost --client --force
+```
+
+`--force`:
+
+- replaces the **whole** bundle. Any managed file the new bundle does not
+  provide is retired with the CA that signed it — dropping `--client` removes
+  `client.pem` and `client-key.pem` rather than leaving them unverifiable. The
+  refusal says so before you run it;
+- stages the complete new bundle (final modes, fsynced) before touching
+  anything, then installs by `rename` only. Files are retired leaf-first and
+  installed root-first, so at no instant does the directory hold a leaf
+  certificate signed by a CA other than the `ca.pem` beside it;
+- keeps the replaced bundle in `<output-dir>/.nestweaver-tls.backup/` (mode
+  0700), so a rotation you did not mean to perform is recoverable. Exactly one
+  generation is kept;
+- takes an exclusive lock on `<output-dir>/.nestweaver-tls.lock`. A second
+  concurrent `init-tls` stands down with an error rather than interleaving its
+  writes into a split bundle;
+- replaces a symlinked member with a regular file instead of writing through
+  it.
+
+An install interrupted part way through (a kill, a crash, a full disk) leaves a
+`.nestweaver-tls.journal`; the next `init-tls` rolls the directory back to the
+bundle that preceded it and says so on stderr.
 
 ### Manual certificate setup
 

@@ -7630,3 +7630,397 @@ fn a_supported_format_scope_pair_still_exports() {
         .assert()
         .success();
 }
+
+// ── `server init-tls` is key rotation, not initialization ─────────────────
+
+/// The six files `server init-tls` owns, mirroring
+/// `nestweaver_engine::tls::MANAGED_FILES`.
+const TLS_MANAGED: [&str; 6] = [
+    "ca.pem",
+    "ca-key.pem",
+    "server.pem",
+    "server-key.pem",
+    "client.pem",
+    "client-key.pem",
+];
+
+fn tls_snapshot(dir: &std::path::Path) -> Vec<(&'static str, Vec<u8>)> {
+    TLS_MANAGED
+        .iter()
+        .filter_map(|name| std::fs::read(dir.join(name)).ok().map(|b| (*name, b)))
+        .collect()
+}
+
+/// The reported defect, end to end, through the real binary.
+///
+/// Steps 1-4 of the filed reproduction: generate a bundle with a client cert,
+/// confirm the client verifies, re-run WITHOUT any destructive option, and
+/// look at what the directory holds. Measured on 8.0.0 that second run exited
+/// 0, replaced `ca.pem` and the CA private key, left `client.pem` byte
+/// identical, and produced a directory whose client certificate failed with
+/// `unable to get local issuer certificate`.
+///
+/// The refusal's remedy is then EXECUTED verbatim, because a message naming a
+/// flag is worth nothing until the string it prints has been run.
+#[test]
+fn init_tls_refuses_to_destroy_an_existing_ca_and_its_force_remedy_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--san",
+            "localhost",
+            "--client",
+        ])
+        .assert()
+        .success();
+    let before = tls_snapshot(&tls);
+    assert_eq!(before.len(), 6, "the first run writes the whole bundle");
+
+    // Step 3: the exact invocation that destroyed the CA on 8.0.0.
+    let refused = nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--san",
+            "localhost",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(64),
+        "a destructive replacement without --force must exit EXIT_USAGE"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "a refusal must not print a success report: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("refusing to replace the TLS bundle already in"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("would also retire client.pem and client-key.pem"),
+        "the refusal must disclose what a replacement costs: {stderr}"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        before,
+        "a refused run must not touch one byte, least of all the CA private key"
+    );
+
+    // The remedy, taken from the message and run as printed.
+    let remedy = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("nestweaver server init-tls"))
+        .unwrap_or_else(|| panic!("refusal must print a runnable command: {stderr}"))
+        .to_string();
+    assert_eq!(
+        remedy,
+        format!(
+            "nestweaver server init-tls --output-dir {} --san localhost --force",
+            tls.display()
+        ),
+        "the remedy must be the caller's own invocation plus --force"
+    );
+    let argv: Vec<&str> = remedy.split_whitespace().skip(1).collect();
+    let forced = nestweaver_cmd().args(&argv).output().unwrap();
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "the printed remedy must work: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+
+    // It did what the refusal said it would do, and nothing else.
+    let after = tls_snapshot(&tls);
+    assert_eq!(
+        after.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        ["ca.pem", "ca-key.pem", "server.pem", "server-key.pem"],
+        "the client certificate the destroyed CA signed must not survive it"
+    );
+    for (name, bytes) in &after {
+        let old = before.iter().find(|(n, _)| n == name).unwrap();
+        assert_ne!(&old.1, bytes, "{name} should have been replaced");
+    }
+    // And the destroyed CA is recoverable rather than gone.
+    let backup = tls.join(".nestweaver-tls.backup");
+    assert_eq!(tls_snapshot(&backup), before);
+}
+
+/// A PARTIAL directory is an existing bundle. `ca.pem` alone was the only
+/// thing checked on 8.0.0, so a directory missing exactly that file was
+/// overwritten with no warning printed at all.
+#[test]
+fn init_tls_refuses_on_partial_directories_in_both_directions() {
+    for missing in [
+        vec!["ca.pem", "ca-key.pem"],
+        vec!["client.pem", "client-key.pem"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        nestweaver_cmd()
+            .args([
+                "server",
+                "init-tls",
+                "--output-dir",
+                tls.to_str().unwrap(),
+                "--client",
+            ])
+            .assert()
+            .success();
+        for name in &missing {
+            std::fs::remove_file(tls.join(name)).unwrap();
+        }
+        let before = tls_snapshot(&tls);
+
+        let out = nestweaver_cmd()
+            .args(["server", "init-tls", "--output-dir", tls.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(64),
+            "a directory missing {missing:?} is still a bundle"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for (name, _) in &before {
+            assert!(
+                stderr.contains(name),
+                "the refusal must enumerate {name}: {stderr}"
+            );
+        }
+        assert_eq!(tls_snapshot(&tls), before);
+    }
+}
+
+/// An install interrupted part way through is rolled back by the next run,
+/// which says so — the directory never keeps a mix of two bundles.
+///
+/// The interrupt is DETERMINISTIC: the on-disk state a kill leaves is planted
+/// directly, using the same dot-file names `install` writes. Killing a real
+/// process instead would put the fatal signal inside a window microseconds
+/// wide and pass on unfixed code most of the time, which is not a test.
+/// `nestweaver_engine::tls`'s own suite walks every reachable interrupt point;
+/// this asserts the CLI surfaces the recovery rather than performing it in
+/// silence.
+#[test]
+fn init_tls_rolls_back_a_half_replaced_directory_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    let original = tls_snapshot(&tls);
+    assert_eq!(original.len(), 6);
+
+    // The state a crash between "old bundle moved aside" and "new bundle in
+    // place" leaves: three files retired, two of them already replaced by a
+    // different run's bundle.
+    let retired = tls.join(".nestweaver-tls.retired");
+    std::fs::create_dir(&retired).unwrap();
+    let interloper = dir.path().join("other");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            interloper.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    for name in TLS_MANAGED {
+        std::fs::rename(tls.join(name), retired.join(name)).unwrap();
+    }
+    for name in ["ca.pem", "ca-key.pem"] {
+        std::fs::copy(interloper.join(name), tls.join(name)).unwrap();
+    }
+    std::fs::write(
+        tls.join(".nestweaver-tls.journal"),
+        serde_json::json!({ "retiring": TLS_MANAGED, "installing": TLS_MANAGED }).to_string(),
+    )
+    .unwrap();
+    // As it stands the directory is a split bundle: a CA from one run beside
+    // nothing it signed.
+    assert_eq!(tls_snapshot(&tls).len(), 2);
+
+    let out = nestweaver_cmd()
+        .args(["server", "init-tls", "--output-dir", tls.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rolled back an interrupted `server init-tls` install"),
+        "a silent recovery is indistinguishable from nothing having gone wrong: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "the restored bundle is an existing bundle, so the run still refuses"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        original,
+        "the bundle that preceded the interrupted install must be restored whole"
+    );
+    for debris in [
+        ".nestweaver-tls.journal",
+        ".nestweaver-tls.retired",
+        ".nestweaver-tls.staging",
+    ] {
+        assert!(!tls.join(debris).exists(), "{debris} left behind");
+    }
+}
+
+/// Two simultaneous invocations must not interleave into a split bundle. On
+/// 8.0.0 both exited 0 and the directory was left with a `ca.pem` and a
+/// `ca-key.pem` from different processes — reproducible, but only sometimes,
+/// which is why the lock is asserted directly rather than raced for.
+#[cfg(unix)]
+#[test]
+fn init_tls_stands_down_while_another_install_holds_the_directory() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    let before = tls_snapshot(&tls);
+
+    // Stand in for an install in progress by holding the lock it holds.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tls.join(".nestweaver-tls.lock"))
+        .expect("an installed bundle leaves the lock file behind");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let blocked = nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "a contended directory is a transient runtime condition, not a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("already installing into"),
+        "the loser must say why it stood down: {stderr}"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        before,
+        "a run that stood down must not have written anything"
+    );
+
+    // Releasing the lock lets the same command through.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    // And under real contention the directory is still one coherent bundle.
+    let children: Vec<_> = (0..6)
+        .map(|_| {
+            StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+                .args([
+                    "server",
+                    "init-tls",
+                    "--output-dir",
+                    tls.to_str().unwrap(),
+                    "--client",
+                    "--force",
+                    "--validity-days",
+                    "3650",
+                ])
+                .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+                .env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert!(outputs.iter().any(|o| o.status.success()));
+    for out in outputs.iter().filter(|o| !o.status.success()) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("already installing into"), "{stderr}");
+    }
+    assert_eq!(
+        tls_snapshot(&tls)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>(),
+        TLS_MANAGED
+    );
+    // `openssl verify` is what the filed reproduction used; run it when the
+    // host has it so this asserts exactly what the bug report asserted.
+    if StdCommand::new("openssl").arg("version").output().is_ok() {
+        for leaf in ["server.pem", "client.pem"] {
+            let verify = StdCommand::new("openssl")
+                .args(["verify", "-CAfile"])
+                .arg(tls.join("ca.pem"))
+                .arg(tls.join(leaf))
+                .output()
+                .unwrap();
+            assert!(
+                verify.status.success(),
+                "{leaf} does not verify under the installed ca.pem: {}",
+                String::from_utf8_lossy(&verify.stderr)
+            );
+        }
+    }
+}
