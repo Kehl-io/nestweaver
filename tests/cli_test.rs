@@ -1130,6 +1130,15 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
     entries
 }
 
+/// The Linux entries pin an OLD runner deliberately: glibc is backward
+/// compatible but not forward, so the build host's glibc is the compatibility
+/// floor shipped to users. These were `ubuntu-latest`/`ubuntu-24.04-arm`, and
+/// when `ubuntu-latest` moved to 24.04 the shipped floor rose to GLIBC_2.39
+/// without any label changing -- which is why the public v8.0.0 GNU archive
+/// cannot start on Ubuntu 22.04, Debian 12 or RHEL 9. Do NOT "modernise" these
+/// back to `ubuntu-latest`. The floor is separately enforced against the built
+/// artifact in the workflow's `Verify release binary` step, because a runner
+/// pin is a claim about the build host and the artifact is what users run.
 #[test]
 fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1148,7 +1157,7 @@ fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
         ),
         (
             "aarch64-unknown-linux-gnu".to_string(),
-            (Some("ubuntu-24.04-arm".to_string()), Some(String::new())),
+            (Some("ubuntu-22.04-arm".to_string()), Some(String::new())),
         ),
         (
             "x86_64-apple-darwin".to_string(),
@@ -1159,7 +1168,7 @@ fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
         ),
         (
             "x86_64-unknown-linux-gnu".to_string(),
-            (Some("ubuntu-latest".to_string()), Some(String::new())),
+            (Some("ubuntu-22.04".to_string()), Some(String::new())),
         ),
     ]);
 
