@@ -8033,3 +8033,376 @@ fn init_tls_stands_down_while_another_install_holds_the_directory() {
         }
     }
 }
+
+// ── `admin install-hook` must never destroy content it did not write ────────
+//
+// The defect, reproduced by hand before any of this was written: a temp
+// directory holding `.claude/settings.local.json` with one `//` comment — JSONC,
+// which Claude Code itself accepts in this very file — and a live API key.
+// `nestweaver admin install-hook` exited 0, printed "Hook installed
+// (idempotent) to .claude/settings.local.json", and left the file containing
+// NOTHING but NestWeaver's hook. `MY_API_KEY` and the permission grants were
+// gone.
+//
+// Mechanism: the handler read the file, folded ANY `serde_json` failure into
+// `Value::Null`, merged its hook into that, and `fs::write`-truncated the
+// result over the user's settings.
+//
+// These run the real binary with its CWD inside a temp directory, because the
+// settings path is resolved RELATIVE TO THE CWD — that is exactly what makes
+// the command dangerous, so it is what the tests must exercise.
+
+/// The reproduction, verbatim.
+#[test]
+fn install_hook_does_not_eat_a_secret_out_of_a_commented_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    // Unknown keys ride along here rather than only in the well-formed-file
+    // test below, because THIS is the fixture on which preservation actually
+    // failed. On well-formed JSON the old merge already preserved everything.
+    let original = "{\n  // project-local overrides\n  \
+                    \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" },\n  \
+                    \"permissions\": { \"allow\": [\"Bash(git status:*)\"] },\n  \
+                    \"aKeyFromSomeFutureRelease\": { \"nested\": [1, 2] }\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "the settings file must be byte-for-byte what it was: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "exiting 0 is how this went unnoticed — the user was told the hook was \
+         installed while their key was being deleted: {stderr}"
+    );
+    // Honest about what it did and did not do, and about WHY comments are the
+    // problem rather than pretending the file is corrupt.
+    assert!(stderr.contains("contains JSON comments"), "{stderr}");
+    assert!(stderr.contains("changed nothing"), "{stderr}");
+    assert!(
+        stderr.contains("nestweaver admin install-hook --dry-run"),
+        "a refusal has to hand back something runnable: {stderr}"
+    );
+}
+
+/// The remedy the refusal above prints, executed. A message naming a command
+/// that cannot run on the file that triggered it is not a remedy.
+///
+/// The refusal is asserted here too, and deliberately: without it this test
+/// passes on the unfixed binary, because both remedies happen to work on code
+/// that never refuses. A remedy test whose precondition is not checked is a
+/// test of nothing.
+#[test]
+fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = "{\n  // project-local overrides\n  \
+                    \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" }\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    // The precondition: it refuses, and the refusal names the remedy below.
+    let refusal = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&refusal.stderr).to_string();
+    assert!(!refusal.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nestweaver admin install-hook --dry-run"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("remove the comments"),
+        "the second remedy has to be named too: {stderr}"
+    );
+
+    // Remedy 1: `--dry-run` prints the entry to add by hand.
+    let dry = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook", "--dry-run"])
+        .assert()
+        .success();
+    let printed = String::from_utf8_lossy(&dry.get_output().stdout).to_string();
+    let delta: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "the remedy must not write either"
+    );
+
+    // Remedy 2: remove the comments and run it again.
+    std::fs::write(
+        &settings,
+        "{\n  \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" }\n}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+}
+
+/// Well-formed JSON that NestWeaver does not own survives — in both shapes it
+/// comes in.
+///
+/// The first half (an object with keys from the future) is a FLOOR, not a
+/// reproduction: on a well-formed object the old merge already preserved
+/// everything, so that half passes on the unfixed binary. It is kept because
+/// the merge is what a future change would break, and the reproduction test
+/// above now carries an unknown key of its own so the property is covered by
+/// something that can fail.
+///
+/// The second half is the well-formed case the old code DID destroy. Valid JSON
+/// that is not an object — `[]`, `"text"`, `null` — parsed fine, and then
+/// `compute_claude_hook_patch` replaced anything non-object with `{}` and wrote
+/// the hook over it. Nothing here is unreadable; it is simply not this
+/// command's to replace.
+#[test]
+fn install_hook_preserves_every_key_it_does_not_own() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = serde_json::json!({
+        "env": { "MY_API_KEY": "sk-live-do-not-lose-me" },
+        "permissions": { "allow": ["Bash(git status:*)"], "deny": ["Bash(rm:*)"] },
+        "model": "opus",
+        "hooks": { "PreToolUse": [ { "matcher": "Edit", "hooks": [] } ] },
+        "aKeyFromSomeFutureRelease": { "nested": [1, 2, { "deep": true }] }
+    });
+    std::fs::write(&settings, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    for key in ["env", "permissions", "model", "aKeyFromSomeFutureRelease"] {
+        assert_eq!(after[key], original[key], "`{key}` must survive in value");
+    }
+    let matchers: Vec<&str> = after["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["matcher"].as_str())
+        .collect();
+    assert_eq!(
+        matchers,
+        vec!["Edit", "Task"],
+        "the user's own matcher is not NestWeaver's to move or drop"
+    );
+
+    // Well-formed, not an object, and not NestWeaver's to replace.
+    for content in ["[1, 2]", "\"just a string\"", "null"] {
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join(".claude")).unwrap();
+        let path = other.path().join(".claude/settings.local.json");
+        std::fs::write(&path, content).unwrap();
+
+        let output = nestweaver_cmd()
+            .current_dir(other.path())
+            .args(["admin", "install-hook"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(!output.status.success(), "on {content}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "valid JSON that is not an object was replaced wholesale: {stderr}"
+        );
+        assert!(
+            stderr.contains("not an object"),
+            "on {content}, say what it found: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn install_hook_run_twice_neither_duplicates_the_hook_nor_touches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    std::fs::write(&settings, "{\"env\": {\"MY_API_KEY\": \"sk-live\"}}").unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success()
+        .stderr(contains("Hook installed"));
+    let after_first = std::fs::read_to_string(&settings).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success()
+        .stderr(contains("already present").and(contains("nothing written")));
+
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        after_first,
+        "a second run has nothing to add, so it must not rewrite the file at all"
+    );
+    let after: serde_json::Value = serde_json::from_str(&after_first).unwrap();
+    assert_eq!(after["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live");
+}
+
+/// An interrupted write must leave the original intact.
+///
+/// A hard link is a second name for the SAME inode. `fs::write` opens that
+/// inode and TRUNCATES it before writing a byte, so the user's settings are
+/// destroyed first and a crash in between leaves an empty file. A temp file
+/// plus rename never touches the old inode — which is why the witness still
+/// holds the original bytes at every instant of the write, and why a crash is
+/// survivable.
+#[test]
+fn install_hook_replaces_the_settings_file_instead_of_truncating_it_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let witness = dir.path().join("witness.json");
+    let original = "{\"env\": {\"MY_API_KEY\": \"sk-live-do-not-lose-me\"}}";
+    std::fs::write(&settings, original).unwrap();
+    std::fs::hard_link(&settings, &witness).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(&witness).unwrap(),
+        original,
+        "the original inode was truncated in place — a crash mid-write would \
+         have left the user with nothing"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".claude"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "a failed or completed atomic write leaves no temp file: {leftovers:?}"
+    );
+}
+
+/// A symlinked settings file. `Path::exists` follows links, so the old code
+/// wrote THROUGH it into a file outside the directory the command was pointed
+/// at.
+#[cfg(unix)]
+#[test]
+fn install_hook_does_not_write_through_a_symlinked_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let outside = dir.path().join("elsewhere/real-settings.json");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+    let original = "{ \"env\": { \"SHARED_KEY\": \"sk-live-shared\" } }\n";
+    std::fs::write(&outside, original).unwrap();
+    let link = project.join(".claude/settings.local.json");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(&project)
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        original,
+        "a file outside the project must not be edited by a command pointed at \
+         the project: {stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself is content NestWeaver did not write"
+    );
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert!(stderr.contains("real-settings.json"), "name it: {stderr}");
+
+    // The remedy it prints, executed against the same symlink.
+    nestweaver_cmd()
+        .current_dir(&project)
+        .args(["admin", "install-hook", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("\"matcher\": \"Task\""));
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+}
+
+/// Unparseable input is a refusal, not an empty object.
+#[test]
+fn install_hook_refuses_unparseable_settings_and_names_the_position() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = "{\n  \"env\": { \"MY_API_KEY\": \"sk-live\" },\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+    assert!(stderr.contains("not valid JSON"), "{stderr}");
+    assert!(stderr.contains("settings.local.json"), "{stderr}");
+    assert!(
+        stderr.contains("line 3") && stderr.contains("column"),
+        "the parse position has to be in the message: {stderr}"
+    );
+
+    // The remedy: fix the syntax at that position and run it again.
+    std::fs::write(
+        &settings,
+        "{\n  \"env\": { \"MY_API_KEY\": \"sk-live\" }\n}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live");
+}
