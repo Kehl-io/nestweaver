@@ -11056,6 +11056,39 @@ fn require_exclusive_store_access(
     db_path: &std::path::Path,
     operation: &str,
 ) -> anyhow::Result<nestweaver_daemon::lifecycle::DbWriteLease> {
+    require_exclusive_store_access_with_remedy(
+        db_path,
+        operation,
+        ExclusivityRemedy::RouteThroughDaemon,
+    )
+}
+
+/// Which remedy an exclusivity refusal should print.
+///
+/// One primitive, two remedies. `backup restore` cannot take the
+/// daemon-routing advice — there is no `--no-daemon` on it and no RPC that
+/// performs a restore — so printing that line there would ship an
+/// unexecutable remedy inside the fix for a destructive-safety defect.
+#[derive(Debug, Clone, Copy)]
+enum ExclusivityRemedy {
+    /// The caller can route the work through the daemon instead.
+    RouteThroughDaemon,
+    /// The caller cannot; the holder has to stop.
+    StopTheHolder,
+}
+
+/// [`require_exclusive_store_access`] with the remedy chosen by the caller.
+///
+/// The proof is identical in both cases and is taken in exactly one place —
+/// this is a message split, not a second way to establish exclusivity.
+#[must_use = "the lease must be HELD for the duration of the write; dropping it \
+              immediately reduces this to a probe, which is the check-then-act \
+              race it exists to remove"]
+fn require_exclusive_store_access_with_remedy(
+    db_path: &std::path::Path,
+    operation: &str,
+    remedy: ExclusivityRemedy,
+) -> anyhow::Result<nestweaver_daemon::lifecycle::DbWriteLease> {
     use nestweaver_daemon::lifecycle::WriteLeaseError;
 
     match nestweaver_daemon::lifecycle::acquire_db_write_lease(db_path) {
@@ -11071,21 +11104,41 @@ fn require_exclusive_store_access(
                 }
                 _ => "another process".to_string(),
             };
-            anyhow::bail!(
-                "cannot {operation} directly: {holder} holds the write lease for {}.\n\
-                 Route through the daemon (drop --no-daemon), or stop the holder first with \
-                 `nestweaver daemon --db {} stop`.",
-                db_path.display(),
-                db_path.display()
-            )
+            match remedy {
+                ExclusivityRemedy::RouteThroughDaemon => anyhow::bail!(
+                    "cannot {operation} directly: {holder} holds the write lease for {}.\n\
+                     Route through the daemon (drop --no-daemon), or stop the holder first with \
+                     `nestweaver daemon --db {} stop`.",
+                    db_path.display(),
+                    db_path.display()
+                ),
+                ExclusivityRemedy::StopTheHolder => anyhow::bail!(
+                    "cannot {operation}: {holder} holds the write lease for {}.\n\
+                     This operation renames that data directory aside and deletes it, so it \
+                     cannot proceed while anything is still writing the database — the writer \
+                     would keep operating on unlinked files and the result would silently \
+                     diverge. Stop the holder and retry: `nestweaver daemon --db {} stop`.",
+                    db_path.display(),
+                    db_path.display()
+                ),
+            }
         }
-        Err(WriteLeaseError::Unavailable(error)) => anyhow::bail!(
-            "cannot {operation} directly: the write lease for {} could not be taken \
-             ({error}), so exclusivity is NOT established.\n\
-             Refusing rather than risking a second writer against a store that is not \
-             crash-safe.",
-            db_path.display()
-        ),
+        Err(WriteLeaseError::Unavailable(error)) => match remedy {
+            ExclusivityRemedy::RouteThroughDaemon => anyhow::bail!(
+                "cannot {operation} directly: the write lease for {} could not be taken \
+                 ({error}), so exclusivity is NOT established.\n\
+                 Refusing rather than risking a second writer against a store that is not \
+                 crash-safe.",
+                db_path.display()
+            ),
+            ExclusivityRemedy::StopTheHolder => anyhow::bail!(
+                "cannot {operation}: the write lease for {} could not be taken ({error}), so \
+                 exclusivity is NOT established.\n\
+                 Refusing rather than renaming a data directory aside and deleting it while an \
+                 unknown writer may still be using it.",
+                db_path.display()
+            ),
+        },
     }
 }
 
@@ -28835,7 +28888,17 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             // Refuse if a daemon is live on the target: restore renames the live
             // dir aside and deletes it, so a running daemon would keep writing to
             // unlinked inodes and the restored state would silently diverge.
+            //
+            // A pure read, run FIRST so that this refusal — the one that can
+            // name the daemon and its pid — mutates nothing whatsoever.
             ensure_no_live_daemon_for_restore(&data_dir)?;
+
+            // THE authorization, and it is held for the whole restore: through
+            // the rename-aside, the cutover, the recovery journal and the
+            // cleanup. The pidfile above permits absent, empty and stale
+            // states; none of those is evidence that nobody is writing, and
+            // this is what supplies that evidence.
+            let _restore_leases = require_exclusive_restore_access(&data_dir)?;
 
             let config = nestweaver_engine::RestoreConfig {
                 snapshot_path: path,
@@ -28940,7 +29003,73 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Every incumbent database a restore of `data_dir` is about to rename aside,
+/// copy over, or delete.
+///
+/// Both the live data directory AND a `<data>.restoring` left by an earlier
+/// interrupted restore, because the restore reconciles that directory too —
+/// and because a daemon whose data directory was already renamed aside still
+/// holds its lease on the inode that now lives under `.restoring`. Looking
+/// only at `data_dir` would create a brand-new, trivially-free lease file
+/// beside a partial copy and conclude that nobody was writing.
+fn restore_lease_targets(data_dir: &Path) -> Vec<PathBuf> {
+    [data_dir.to_path_buf(), data_dir.with_extension("restoring")]
+        .iter()
+        .filter_map(|dir| find_lbug_in_dir(dir))
+        .collect()
+}
+
+/// Hold the canonical database write lease over every database a restore is
+/// about to destroy, for as long as the restore runs.
+///
+/// This is the authorization `backup restore` never had. Its only guard was
+/// [`ensure_no_live_daemon_for_restore`], which reads a pidfile — advisory
+/// runtime metadata whose flock is held on an INODE, so unlinking `daemon.pid`
+/// silently defeats every path-based owner check — and which PERMITS absent,
+/// empty and stale pidfiles. None of those states says anything about whether
+/// a process is writing the database right now. Restore then renames the
+/// directory aside and `remove_dir_all`s it, so a daemon with a missing
+/// pidfile, a standalone watcher, or any direct writer kept operating on
+/// unlinked inodes while the directory was replaced underneath it: split
+/// brain, and the loss of the current data.
+///
+/// The lease is the same one `index`, `watch`, `embed`, `brain watch`, the
+/// vault commands, the Tantivy rebuild and the daemon itself take — an
+/// `flock` on `<db>.write.lock`, per-DESCRIPTOR so it survives the store's own
+/// open/close, released by the kernel on process exit so there is no stale
+/// state to reap. `snapshot build` already corroborates its pidfile check with
+/// the database write lock, for exactly this reason; restore did not.
+///
+/// A probe answers "was anyone holding this a moment ago". Only a HELD lease
+/// answers "is anyone holding this for as long as I am deleting their data",
+/// which is the question a check-then-destroy cannot ask.
+#[must_use = "the leases must be HELD for the whole restore — dropping them \
+              immediately reduces this to a probe, and the window that reopens \
+              is precisely the one in which the data directory is renamed aside \
+              and unlinked"]
+fn require_exclusive_restore_access(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<nestweaver_daemon::lifecycle::DbWriteLease>> {
+    restore_lease_targets(data_dir)
+        .iter()
+        .map(|db| {
+            require_exclusive_store_access_with_remedy(
+                db,
+                "restore a backup over this data directory",
+                ExclusivityRemedy::StopTheHolder,
+            )
+        })
+        .collect()
+}
+
 /// Refuse a restore while a live daemon serves the target data directory.
+///
+/// **This is not the authorization.** [`require_exclusive_restore_access`] is;
+/// this runs first only because it is a pure read that can name the daemon and
+/// its pid, which is a better message than "another process holds the lease",
+/// and because a refusal here mutates nothing at all — not even a lease file.
+/// Every permissive answer below is now backed by the write lease, so an
+/// absent, empty or stale pidfile can no longer authorize anything on its own.
 ///
 /// Restore renames the live data dir aside and `remove_dir_all`s it. If a
 /// daemon is actively serving that dir, it keeps writing to now-unlinked inodes
@@ -28966,6 +29095,11 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// refused the restore and told the operator to "remove the stale pidfile" —
 /// pushing them toward the `rm daemon.pid` that causes the runtime-ownership
 /// incident. Fail-closed on garbage is unchanged; empty is not garbage.
+///
+/// What that permission cost, before the write lease was required, is the
+/// whole of this guard's former job: "no PID is claimed here" and "nobody is
+/// writing" are different facts, and only the second one may authorize a
+/// destructive restore.
 fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
     let Some(db) = find_lbug_in_dir(data_dir) else {
         return Ok(());
@@ -31655,30 +31789,278 @@ mod restore_guard_tests {
         assert!(!data_dir.path().with_extension("restoring").exists());
     }
 
-    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
-    /// permit the restore. This is the state `retract_failed_start_pidfile`
-    /// leaves after a failed `daemon start`; refusing here blocked a
-    /// destructive-but-legitimate restore and told the operator to "remove the
-    /// stale pidfile", which is the action this branch exists to stop
-    /// provoking. Fail-closed on genuine garbage is unchanged.
+    /// Every file under `dir`, by relative path and exact bytes. Used to pin
+    /// "the refusal mutated NOTHING" rather than spot-checking two files.
+    fn dir_fingerprint(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    out.push((rel, std::fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The authorization, held. A writer that no pidfile can reveal — the
+    /// daemon whose advisory pidfile was unlinked, the standalone watcher, the
+    /// direct writer — holds the database write lease, and the restore must
+    /// refuse before any rename, copy, unlink or replacement.
     #[test]
-    fn restore_permits_an_empty_pidfile() {
+    fn restore_refuses_while_the_write_lease_is_held() {
         let rt = tempfile::tempdir().unwrap();
         let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, sidecar, pidfile) = fixture();
 
-        let (data_dir, _db, _sidecar, pidfile) = fixture();
+        let _held = require_exclusive_store_access(&db, "hold the fixture database")
+            .expect("nothing else holds this fixture");
+        assert!(
+            !pidfile.exists(),
+            "the point of this test is that NO pidfile names the writer"
+        );
 
-        std::fs::write(&pidfile, b"").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect("an empty pidfile claims nothing and must not block a restore");
+        let before = dir_fingerprint(data_dir.path());
+        let error = require_exclusive_restore_access(data_dir.path())
+            .expect_err("a held write lease must stop a destructive restore");
+        let rendered = error.to_string();
+        assert!(rendered.contains("write lease"), "err was: {rendered}");
 
-        std::fs::write(&pidfile, b"  \n").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect("a whitespace-only pidfile claims nothing either");
+        assert_eq!(
+            before,
+            dir_fingerprint(data_dir.path()),
+            "the refusal must not have mutated the target by one byte"
+        );
+        assert!(
+            !data_dir.path().with_extension("restoring").exists(),
+            "no rename-aside may have happened"
+        );
+        assert!(sidecar.exists(), "sidecar untouched");
+    }
 
-        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect_err("garbage must still fail closed");
+    /// The free-lock counterweight: with nothing holding the database, the
+    /// restore is authorized and the lease comes back HELD, not merely probed.
+    #[test]
+    fn restore_is_authorized_when_the_write_lease_is_free() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, _pidfile) = fixture();
+
+        let leases = require_exclusive_restore_access(data_dir.path())
+            .expect("a free lease must authorize the restore");
+        assert_eq!(leases.len(), 1, "the incumbent database must be leased");
+
+        require_exclusive_store_access(&db, "prove the restore lease is held")
+            .expect_err("the restore must still be HOLDING the lease, not have dropped it");
+    }
+
+    /// No pidfile state — absent, empty, whitespace-only or stale — may stand
+    /// in for lock proof, in either direction.
+    ///
+    /// This replaces `restore_permits_an_empty_pidfile`, which pinned the
+    /// opposite: it asserted that an EMPTY pidfile is sufficient permission for
+    /// a destructive restore, with nothing anywhere corroborating that no
+    /// process was writing. That test encoded the defect as intended
+    /// behaviour. The pidfile reading itself is unchanged and still permits
+    /// every state below — what changed is that permission from the pidfile is
+    /// no longer permission to restore.
+    #[test]
+    fn no_pidfile_state_can_substitute_for_the_write_lease() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, pidfile) = fixture();
+
+        let states: Vec<(&str, Option<Vec<u8>>)> = vec![
+            ("absent", None),
+            ("empty", Some(Vec::new())),
+            ("whitespace-only", Some(b"  \n".to_vec())),
+            ("stale pid", Some(i32::MAX.to_string().into_bytes())),
+        ];
+
+        for (label, contents) in states {
+            match &contents {
+                None => {
+                    let _ = std::fs::remove_file(&pidfile);
+                }
+                Some(bytes) => std::fs::write(&pidfile, bytes).unwrap(),
+            }
+
+            // The pidfile guard's own answer is unchanged: it permits.
+            ensure_no_live_daemon_for_restore(data_dir.path())
+                .unwrap_or_else(|error| panic!("{label}: pidfile guard changed: {error}"));
+
+            // And it decides nothing while the lease is held.
+            let held = require_exclusive_store_access(&db, "hold the fixture database")
+                .unwrap_or_else(|error| panic!("{label}: fixture already held: {error}"));
+            let before = dir_fingerprint(data_dir.path());
+            let error = require_exclusive_restore_access(data_dir.path()).expect_err(&format!(
+                "{label}: a pidfile that claims nothing must not authorize a destructive restore"
+            ));
+            assert!(
+                error.to_string().contains("write lease"),
+                "{label}: err was: {error}"
+            );
+            assert_eq!(
+                before,
+                dir_fingerprint(data_dir.path()),
+                "{label}: the refusal mutated the target"
+            );
+            assert!(
+                !data_dir.path().with_extension("restoring").exists(),
+                "{label}: no rename-aside may have happened"
+            );
+            drop(held);
+
+            // With the lease free, the same pidfile state is fine.
+            require_exclusive_restore_access(data_dir.path())
+                .unwrap_or_else(|error| panic!("{label}: a free lease must authorize: {error}"));
+        }
+    }
+
+    /// A daemon whose data directory was already renamed aside still holds its
+    /// lease on the inode now under `<data>.restoring`. Leasing only
+    /// `data_dir` would create a fresh, trivially-free lease file beside a
+    /// partial copy and conclude nobody was writing.
+    #[test]
+    fn a_writer_holding_the_aside_copy_also_refuses_the_restore() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, _db, _sidecar, _pidfile) = fixture();
+
+        let restoring = data_dir.path().with_extension("restoring");
+        std::fs::create_dir_all(&restoring).unwrap();
+        std::fs::write(restoring.join("graph.lbug"), b"aside").unwrap();
+        let _held = require_exclusive_store_access(
+            &restoring.join("graph.lbug"),
+            "hold the aside database",
+        )
+        .expect("nothing else holds it");
+
+        let error = require_exclusive_restore_access(data_dir.path())
+            .expect_err("a writer on the aside copy must stop the restore");
+        assert!(error.to_string().contains("write lease"), "err: {error}");
+
+        let _ = std::fs::remove_dir_all(&restoring);
+    }
+
+    /// The whole handler, not just the guard: with the lease held,
+    /// `run_backup` must refuse BEFORE it opens the archive. The archive named
+    /// here does not exist, so a "no such file" error would prove the guard
+    /// ran too late to protect anything.
+    #[test]
+    fn run_backup_restore_refuses_before_it_reads_the_archive() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, _pidfile) = fixture();
+
+        let _held = require_exclusive_store_access(&db, "hold the fixture database")
+            .expect("nothing else holds this fixture");
+
+        let archive = data_dir.path().parent().unwrap().join("no-such.nwsnap.zst");
+        let before = dir_fingerprint(data_dir.path());
+
+        let error = run_backup(BackupCommands::Restore {
+            path: archive.clone(),
+            data_dir: data_dir.path().to_path_buf(),
+            start: false,
+        })
+        .expect_err("run_backup must refuse while the write lease is held");
+        let rendered = error.to_string();
+        assert!(rendered.contains("write lease"), "err was: {rendered}");
+        assert!(
+            !rendered.contains("No such file"),
+            "the guard ran AFTER the archive was opened: {rendered}"
+        );
+
+        assert!(!archive.exists(), "the backup archive must not be created");
+        assert_eq!(
+            before,
+            dir_fingerprint(data_dir.path()),
+            "a refused restore must not mutate the target"
+        );
+        assert!(!data_dir.path().with_extension("restoring").exists());
+    }
+
+    /// `nestweaver backup restore` and `nestweaver server backup restore` are
+    /// two spellings of ONE handler, so the guard cannot be present on the
+    /// direct path and missing on the daemon-aware one.
+    ///
+    /// Parsed on a thread with a large stack: `Commands` is a very wide clap
+    /// enum and building its parser overflows libtest's default 2 MiB thread
+    /// stack, which is a property of the CLI surface and not of this test.
+    #[test]
+    fn both_backup_entry_paths_reach_the_same_restore_handler() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(both_backup_entry_paths_reach_the_same_restore_handler_body)
+            .expect("spawn a wide-stack thread")
+            .join()
+            .expect("the parse must not panic");
+    }
+
+    fn both_backup_entry_paths_reach_the_same_restore_handler_body() {
+        use clap::Parser;
+
+        fn restore_payload(command: BackupCommands) -> (PathBuf, PathBuf, bool) {
+            match command {
+                BackupCommands::Restore {
+                    path,
+                    data_dir,
+                    start,
+                } => (path, data_dir, start),
+                _ => panic!("expected a Restore subcommand"),
+            }
+        }
+
+        let direct = Cli::try_parse_from([
+            "nestweaver",
+            "backup",
+            "restore",
+            "/tmp/x.nwsnap.zst",
+            "--data-dir",
+            "/tmp/data",
+        ])
+        .expect("`nestweaver backup restore` must parse");
+        let daemon_aware = Cli::try_parse_from([
+            "nestweaver",
+            "server",
+            "backup",
+            "restore",
+            "/tmp/x.nwsnap.zst",
+            "--data-dir",
+            "/tmp/data",
+        ])
+        .expect("`nestweaver server backup restore` must parse");
+
+        let direct = match direct.command {
+            Commands::Backup { command } => restore_payload(command),
+            _ => panic!("expected Commands::Backup"),
+        };
+        let daemon_aware = match daemon_aware.command {
+            Commands::Server { action } => match action {
+                ServerAction::Backup { command } => restore_payload(command),
+                _ => panic!("expected ServerAction::Backup"),
+            },
+            _ => panic!("expected Commands::Server"),
+        };
+
+        assert_eq!(
+            direct, daemon_aware,
+            "both entry paths must hand the same Restore payload to run_backup"
+        );
     }
 }
 
