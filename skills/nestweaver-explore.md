@@ -12,7 +12,7 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 3. For deeper exploration, use `investigate` to build a focused investigation bundle, then `investigate_expand` to widen the scope
 4. Use `project_context` if exploring within a specific project boundary (filters to that project's repos and notes)
 5. Use `flow_trace` to follow execution from a specific entry point forward
-6. Use `hub_nodes` to find the most connected symbols in the area — replaces reading files to understand architecture
+6. Use `hub_nodes` to find the most connected symbols in the area — replaces reading files to understand architecture. Check its `rankings_stale` field before drawing conclusions (see below)
 7. Use `bridge_nodes` to identify architectural chokepoints
 8. Use `clusters` to see which functional grouping this code belongs to
 9. Use `read_symbols` to view the source code of specific symbols — replaces reading whole files when you only need one function
@@ -22,3 +22,13 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 **DO NOT** grep/rg/find across the repo to locate symbols — `brain_search` finds both code symbols and vault notes in one call.
 **DO NOT** read entire files to understand a function — `read_symbols` returns just the symbol body.
 **DO NOT** explore directory trees to understand architecture — `hub_nodes` and `clusters` give the structural picture.
+
+## Before you trust a ranking
+
+NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
+earlier release is ranked over stale edges** until it is re-indexed
+(`nestweaver index --repo <path> --force`). `stale_check` will not tell you —
+it compares indexed SHA against git HEAD only. `hub_nodes` and `bridge_nodes`
+are the **only** tools that disclose it, via `rankings_stale` / `stale_repos`;
+roughly a dozen other ranking-derived surfaces disclose nothing, so the absence
+of a staleness field is not evidence of freshness.

@@ -98,6 +98,33 @@ bash app/build.sh
 open target/release/NestWeaver.app
 ```
 
+## Upgrading from 8.x — re-index every graph
+
+**9.0.0 bumps `RESOLVER_GENERATION` from 3 to 4.** Installing the new binary
+does not repair edges already on disk. Until each repo is re-indexed, its
+rankings, C/C++ `MEMBER_OF` edges and C++ `IMPORTS` edges are wrong, and `.h`
+files carry symbols extracted by the C grammar rather than C++.
+
+```sh
+nestweaver index --repo <path> --force   # per repo — a full index, not incremental
+nestweaver brain refresh                 # re-index every registered vault
+```
+
+**`nestweaver stale-check` will not tell you this is needed.** It compares each
+repo's indexed SHA against git HEAD and nothing else, so a graph built by an
+older resolver reports `ok` and exits 0. To check:
+
+```sh
+nestweaver hubs --json | jq '{rankings_stale, stale_repos}'
+# or read the sidecar directly — any repo below 4 needs a re-index:
+cat <db>.resolver_generation.json
+```
+
+Only `hubs` and `bridges` disclose ranking staleness; roughly a dozen other
+ranking-derived commands (including `repo-map`, whose entire output *ordering*
+is PageRank order) say nothing. Treat the absence of a warning as no evidence
+either way.
+
 ## Configure for your AI tool
 
 ```sh
@@ -119,6 +146,12 @@ nestweaver mcp --db ./nestweaver.lbug
 
 The daemon owns the database exclusively. It auto-starts on first use and logs
 to `~/.local/state/nestweaver/<instance>/daemon.log`.
+
+In CI, `--no-daemon` / `NESTWEAVER_NO_DAEMON=1` only **request** a daemon
+bypass. `NESTWEAVER_ALLOW_NO_DAEMON=1` is the only thing that **permits** one —
+`CI=true` and `GITHUB_ACTIONS` confer nothing. Without the opt-in the flag is
+disclosed on stderr and the command autostarts a daemon anyway, which then holds
+the write lease for the rest of the job.
 
 ## Optional: Git history analysis
 

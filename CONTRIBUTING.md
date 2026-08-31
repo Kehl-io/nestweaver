@@ -48,20 +48,18 @@ Format: `<type>(<scope>): <description>`
 
 ### Scopes
 
-| Scope | Crate / Area |
-|-------|-------------|
-| `schema` | nestweaver-schema |
-| `parser` | nestweaver-parser |
-| `resolver` | nestweaver-resolver |
-| `store` | nestweaver-store |
-| `storage` | nestweaver-storage |
-| `engine` | nestweaver-engine |
-| `mcp` | nestweaver-mcp |
-| `cli` | Binary / CLI (src/main.rs) |
-| `ci` | CI/CD workflows |
-| `deps` | Dependency updates |
-| `docs` | Documentation only |
-| `release` | Release automation |
+The authoritative list is `rules.scope-enum` in
+[`.commitlintrc.yml`](.commitlintrc.yml) — read it there rather than from a copy
+here, which is how the list below fell out of date in the first place. At time of
+writing it holds: `schema`, `parser`, `resolver`, `store`, `storage`, `engine`,
+`mcp`, `cli`, `ci`, `deps`, `docs`, `release`.
+
+**The enum has drifted from practice.** History since `v8.0.0` contains commits
+scoped `daemon`, `client`, `federation`, `proto`, `brain`, `context`,
+`investigate`, `rankings`, `summaries` and `parity` — none of which are in the
+enum. Either the hook is not enforced on every path, or it was bypassed. Before
+adding a scope that is not in the enum, add it to `.commitlintrc.yml` in the same
+commit; do not rely on the gap staying open.
 
 ### Examples
 
@@ -117,9 +115,14 @@ Run all of these before submitting a PR:
 
 ```sh
 cargo test                                                  # all tests
-cargo clippy --all-targets --all-features -- -D warnings    # lint
+cargo clippy --workspace --all-targets -- -D warnings       # lint
 cargo fmt --all -- --check                                  # formatting
 ```
+
+The clippy line is `--workspace`, **not** `--all-features`: `--all-features`
+reaches `metal = ["candle-core/metal", …]`, which pulls `objc2` and does not
+compile on Linux — the same exemption the `just test-crate` section below
+describes. This is the invocation CI runs and the one PR bodies report clean.
 
 ### Useful commands
 

@@ -42,7 +42,7 @@
 <td width="50%" valign="top">
 
 **32 Languages**<br>
-Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more. Tracks CALLS, IMPORTS, USES, and ACCESSES edges. Resolves monorepo workspaces and tsconfig path aliases.
+Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more. Tracks CALLS, IMPORTS, USES, and ACCESSES edges. Resolves monorepo workspaces and tsconfig path aliases. As of 9.0.0 `.h` files are parsed with the **C++** grammar (they used to get C, which has no `class` keyword) and C++ `#include` resolves to real `IMPORTS` edges.
 
 </td>
 <td width="50%" valign="top">
@@ -120,6 +120,64 @@ nestweaver setup --force   # regenerate skill/guide files even if customized
 > always written to the repo root.
 
 Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
+
+## Upgrading to 9.0.0 — re-index before you trust a ranking
+
+**9.0.0 bumps `RESOLVER_GENERATION` from 3 to 4. Every graph indexed by an
+earlier release must be re-indexed.** Until you do:
+
+- **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
+  PageRank-ordered result are computed over edges the old resolver wrote.
+- **`MEMBER_OF` edges are missing** for C and C++ members, so `dead-code`
+  reachability under-counts.
+- **C++ `IMPORTS` edges are missing.** The resolver used to extract `#include`
+  and then discard it.
+- **`.h` headers were parsed with the C grammar**, which has no `class` keyword.
+  Re-indexing routes them to C++: on a real 874-header corpus, header symbols
+  went 7,166 → 17,872 and `class` definitions 0 → 1,373.
+
+```sh
+nestweaver index --repo <path> --force   # per repo — a full index, not incremental
+nestweaver brain refresh                 # re-index every registered vault
+```
+
+**`stale-check` will NOT tell you.** It compares each repo's indexed SHA against
+git HEAD and nothing else (`src/main.rs`, the `status` ladder is
+`missing`/`incomplete`/`stale`/`ok`); a graph built by resolver generation 3
+reports `ok` and exits **0**. Verified against a generation-3 sidecar. If your
+CI gates on `stale-check`, that gate passes cleanly across this upgrade while
+your rankings are wrong.
+
+What *does* disclose it:
+
+```sh
+nestweaver hubs                     # prints a warning naming the repos and the remedy
+nestweaver hubs --json              # "rankings_stale": true, "stale_repos": [...]
+cat <db>.resolver_generation.json   # per-repo generation; anything below 4 is stale
+```
+
+**Only `hubs` and `bridges` disclose stale rankings today.** A sweep of the CLI
+and MCP surfaces found roughly a dozen other ranking-derived commands that
+report nothing — `repo-map` is the sharpest case, since its entire output
+*ordering* is PageRank order and it says so nowhere (confirmed: `repo-map`
+against a generation-3 graph prints no warning). Do not read the absence of a
+staleness warning as evidence of freshness.
+
+Note that `hubs --json` carries two different `stale_repos`: the **top-level**
+one is resolver-generation staleness, and `_meta.stale_repos` is federation
+staleness (repos where the *local* index is behind an upstream server). They
+answer different questions and can disagree.
+
+Also changing behaviour in this release, in ways a script may notice:
+
+| Change | What to do |
+| --- | --- |
+| Invalid `export --format` / `--scope` now exits **64**, not 1 | Gate on 64 for usage errors; 1 still means the export itself failed |
+| `impact --no-daemon` now caps at 50 like the daemon route; `--limit` maxes at 1000 | Pass `--limit` explicitly if you relied on an uncapped direct route |
+| `project-context` without `--include-components` now **includes** component sub-projects | Pass `--include-components false` to keep the old behaviour |
+| `_meta` moved from the MCP envelope into the payload and lost its `nestweaver.io/` prefix | Raw HTTP MCP clients must read `payload._meta`, not `envelope["nestweaver.io/sources"]` |
+| `hubs --json` / `bridges --json` are objects, not bare arrays | Read `.hubs` / `.bridges`, not `.[0]` |
+| `NESTWEAVER_NO_DAEMON` alone no longer permits a daemon bypass | Set `NESTWEAVER_ALLOW_NO_DAEMON=1` as well; `CI` and `GITHUB_ACTIONS` confer nothing |
 
 ## Server Mode
 
@@ -239,7 +297,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
-| `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
+| `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; `--limit` 1–1000, default 50 on **both** routes — `--no-daemon` used to be uncapped and now matches the daemon, so a symbol with more than 1000 depth-1 dependents has rows unreachable at any limit; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
 | `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
 | `detect-changes` | Run the MCP-compatible changed-file impact contract directly from the CLI, including risk, gate state, status, and blind spots |
 | `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
@@ -310,7 +368,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | Detect unreachable symbols via entry point reachability (`unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; Rust `pub mod` Modules are never flagged; visibility isn't persisted, so all confidence scores are inferred/Medium) |
+| `dead-code` | **A review aid, not a deletion list.** Detects symbols no entry point *reaches*, which is not the same as "nothing references it" — a reference the parser does not capture is indistinguishable from no reference at all. Measured top-15 precision on Rust was **0/15**, and it remains poor on C++; treat *every* confidence tier as review candidates, never as proof. `unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; `--limit` is 1–1000, default 50 (there is no "all"); `coverage: "degraded"` means the walk had no usable seed set, so every row below is unreachable *by construction*. Rust `pub mod` Modules are never flagged |
 | `rerank` | Lightweight result reranker (off-by-default heuristic) |
 | `info` | Show hardware and configuration information |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
@@ -318,7 +376,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |
 | `ranking` | Inspect ranking priors |
 | `eval` | Offline retrieval-quality evaluation |
-| `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format (cypher/graphml/mermaid carry real PageRank scores; mermaid `--top N` ranks by PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout) |
+| `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format (cypher/graphml/mermaid carry real PageRank scores; mermaid `--top N` ranks by PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout). An invalid `--format` or `--scope` value now exits **64** (`EX_USAGE`), not 1 — an unsupported but valid *combination*, such as `--format cypher --scope vault`, still exits 1 |
 
 </details>
 
@@ -328,7 +386,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | Command | Description |
 |---------|-------------|
 | `list-projects` | List all projects defined in the instance config |
-| `project-context` | Get context scoped to a specific project |
+| `project-context` | Get context scoped to a specific project. `--include-components` is now three-state: **omitting it means `true`**, which is the documented default the schema always declared — pass `--include-components false` to exclude component sub-projects. Before 9.0.0 the CLI sent an unconditional `false`, so the documented default was unreachable on this route |
 | `materialize-projects` | Materialize declared projects, wiki sources, and cross-repo links from instance config |
 | `detect-implicit-projects` | Detect implicit projects from vault structure and code patterns |
 | `suggest-links` | Discover potential cross-repo links between symbols |
@@ -345,7 +403,7 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (42 tools, or 6 in lite mode; auto-starts daemon) |
+| `mcp` | Start the MCP server (42 tools; 36 in direct read-only mode; 6 with `--lite`; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
 | `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
 | `server` | Server management utilities (`init-tls`, `backup`, `status`) |
@@ -368,7 +426,8 @@ The regex-v3/embedding-v2 upgrade requires this one-time full rebuild. See the
 | `list-services` | List all detected services |
 | `service-summary` | Display a summary of a specific service |
 | `admin` | Subagent guidance instructions |
-| `interactions` | Manage interaction memory |
+| `interactions` | Manage interaction memory (`status`, `show`, `clear`, and `forget <uid>` to drop one node's memory while leaving the rest intact) |
+| `extensions` | Read back the annotations agents write via the `set_extension` MCP tool (`list`, and `unset` to remove one property from one node) |
 | `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`) |
 | `pre-push-impact` | Analyse local changes against the org-wide graph — what `hooks` runs, and runnable directly (alias `ppi`) |
 | `format-comment` | Format impact analysis results as a PR/MR comment, for CI to post |
@@ -645,19 +704,45 @@ CLI commands (`search`, `brain search`, `brain context`) also respect this setti
 
 ## MCP Server
 
-NestWeaver exposes 42 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes **42 tools** via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+
+> **Where that number comes from.** The registry is
+> `all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs`, and
+> `tool_doc_tests::all_tools_have_doc_categories` asserts the documented tool
+> table covers exactly `tool_list(false)["tools"].len()`. Do not restate the
+> count from memory — read it back off the wire with a `tools/list` call, or
+> count the registry.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --tools brain_context,brain_search,read_symbols --db ./nestweaver.lbug   # allowlist specific tools
-NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug   # read-only direct mode (CI/testing)
+
+# Read-only direct mode (CI/testing). NESTWEAVER_NO_DAEMON only *requests* the
+# bypass; NESTWEAVER_ALLOW_NO_DAEMON is the only thing that *permits* it. Without
+# the opt-in the flag is disclosed on stderr and the command routes through an
+# autostarted daemon anyway.
+NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug
 ```
 
-Direct mode advertises 35 read-only tools and rejects mutations before
-dispatch. Daemon-backed stdio exposes all 42 tools. `--tools` names are exact,
-case-sensitive registry names; unknown, duplicate, empty, or transport-
+Direct read-only mode advertises **36** tools — the registry minus the six names
+in `MUTATING_TOOLS` (`crates/nestweaver-mcp/src/http.rs`): `brain_add_source`,
+`brain_remove_source`, `brain_memory_consolidate`, `set_extension`,
+`prune_stale`, `compact_embeddings` — and rejects mutations before dispatch.
+Daemon-backed stdio exposes all 42. `--lite` exposes 6. `--tools` names are
+exact, case-sensitive registry names; unknown, duplicate, empty, or transport-
 unavailable names fail at startup instead of silently producing an empty tool
 surface.
+
+Every tool schema now carries MCP `annotations` (`readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint`), derived from the same
+`MUTATING_TOOLS` table, so a client can tell `prune_stale` from `brain_status`
+on the wire.
+
+**Wire change in 9.0.0:** result provenance (`_meta`) moved from the outer
+`tools/call` envelope into the **payload**, and lost its `nestweaver.io/`
+prefix. The shape is now `_meta: { scope, sources, stale_repos }` — see
+`crates/nestweaver-schema/src/provenance.rs`. Raw HTTP MCP clients that read
+`nestweaver.io/sources` off the envelope must be updated.
 
 The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.
 

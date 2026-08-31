@@ -247,6 +247,13 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }   # need the merge-base
       # ... install nestweaver and build/restore the index (nestweaver.lbug) ...
+      # Daemon note: `--no-daemon` / NESTWEAVER_NO_DAEMON no longer confer a
+      # bypass on their own, and `CI=true` / `GITHUB_ACTIONS` confer nothing.
+      # Set NESTWEAVER_ALLOW_NO_DAEMON=1 if you want daemon-free steps;
+      # otherwise the index step autostarts a daemon that holds the write
+      # lease for the rest of the job.
+      # After upgrading NestWeaver, re-index once: `stale-check` does not
+      # detect a resolver-generation bump. See "Index freshness gate".
       - name: Blast radius (SARIF)
         run: |
           base="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
@@ -463,6 +470,45 @@ Read/lookup commands against a non-existent database also fail (exit 1,
 `db_not_found`) instead of creating an empty DB and reporting success — a CI
 job pointed at the wrong `--db` path fails loudly rather than passing on an
 empty graph.
+
+### What this gate does NOT catch: a resolver-generation upgrade
+
+`stale-check` derives `status` from three conditions only — `missing`,
+`incomplete`, and indexed-SHA-behind-`HEAD` (`src/main.rs`). **It never consults
+`<db>.resolver_generation.json.`** So when a NestWeaver upgrade bumps
+`RESOLVER_GENERATION`, every repo in an existing graph reports `ok` and this gate
+exits `0` while the graph's edges are the ones the *old* resolver wrote.
+
+9.0.0 bumps `RESOLVER_GENERATION` **3 → 4**. Verified against a generation-3
+sidecar: `stale-check` prints `up to date` and exits 0. Until each repo is
+re-indexed, its rankings are computed over stale edges, C and C++ `MEMBER_OF`
+edges do not exist at all, and C++ `IMPORTS` edges are missing.
+
+Pin the generation in CI alongside the freshness gate:
+
+```yaml
+- name: Fail if the graph predates the current resolver generation
+  run: |
+    # hub_nodes / bridge_nodes are the only surfaces that disclose this.
+    stale=$(nestweaver hubs --json --db nestweaver.lbug | jq -r '.rankings_stale')
+    if [ "$stale" = "true" ]; then
+      echo "::error::graph was built by an older resolver — re-index before trusting rankings"
+      nestweaver hubs --json --db nestweaver.lbug | jq -r '.stale_repos[]'
+      exit 1
+    fi
+```
+
+Roughly a dozen other ranking-derived commands — `repo-map` most sharply, since
+its entire output *ordering* is PageRank order — disclose nothing. Do not read
+the absence of a warning on those as evidence of freshness.
+
+### Exit `2` is overloaded across commands
+
+`stale-check` uses `2` for "needs re-index"; `pr-impact --strict` uses `2`
+(`EXIT_STRICT_BLOCK`) for "blocked on a contract-verified breaking change"; most
+other commands use `2` for "not found". A shared `case $rc in 2) ... esac`
+helper reused across two of these does the wrong thing. Interpret `2`
+per-command.
 
 ## Networking
 
