@@ -317,8 +317,10 @@ pub fn read_runtime_settings(path: &Path) -> Result<crate::user_config::JsonConf
 /// * unparseable, or valid JSON that is not an object → refuse ([`read_runtime_settings`]);
 /// * hook already present → return without touching the file, so a second run
 ///   cannot reformat it, reorder it, or strip anything;
-/// * a symbolic link → refuse, because a rename replaces the link and a plain
-///   write modifies a file this command was never pointed at;
+/// * a symbolic link → RESOLVE it and edit the file it names, leaving the link
+///   a link. `.claude/settings.local.json` symlinked into a dotfiles repository
+///   is a deliberate workflow; a dangling link is still refused, because there
+///   is nothing there to merge into;
 /// * JSONC comments → refuse, because `serde_json` cannot carry them and
 ///   "supporting" JSONC in a serialize-and-replace writer means deleting them;
 /// * otherwise → merge and replace the file atomically.
@@ -332,15 +334,6 @@ pub fn install_hook(runtime: Runtime, path: &Path) -> Result<HookInstall, anyhow
         return Ok(HookInstall::AlreadyPresent);
     }
 
-    if settings.is_symlink {
-        return Err(crate::user_config::refuse_symlink(
-            path,
-            &format!(
-                "Run {DRY_RUN_COMMAND} to print the hook entry, then add it to the \
-                 file the link points at."
-            ),
-        ));
-    }
     if settings.has_comments {
         return Err(crate::user_config::refuse_comments(
             path,
@@ -354,7 +347,7 @@ pub fn install_hook(runtime: Runtime, path: &Path) -> Result<HookInstall, anyhow
     let patched = compute_hook_patch(runtime, &settings.value)?;
     let mut rendered = serde_json::to_string_pretty(&patched)?;
     rendered.push('\n');
-    crate::user_config::replace_file_atomically(path, &rendered)?;
+    crate::user_config::replace_file_atomically(path, &rendered, INSTALL_COMMAND)?;
     Ok(HookInstall::Installed)
 }
 
@@ -646,54 +639,63 @@ mod tests {
         );
     }
 
+    /// Symlinking `.claude/settings.local.json` into a dotfiles repository is a
+    /// deliberate workflow, so the hook goes into the file the link names, and
+    /// the link is still a link when the command is done. `abbde5d8` refused
+    /// this outright; that refusal was right for `server init-tls`, which was
+    /// writing a CA private key outside its `--output-dir`, and wrong here.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_settings_file_is_refused_and_its_target_is_untouched() {
+    fn a_symlinked_settings_file_is_resolved_and_the_link_survives() {
         let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("elsewhere.json");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("settings.local.json");
         let link = dir.path().join("settings.local.json");
-        let original = "{\"env\": {\"SHARED_KEY\": \"sk-live-shared\"}}";
-        std::fs::write(&outside, original).unwrap();
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-
-        let error = install_hook(Runtime::Claude, &link).unwrap_err();
-        let message = format!("{error:#}");
+        std::fs::write(&target, "{\"env\": {\"SHARED_KEY\": \"sk-live-shared\"}}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(&outside).unwrap(),
-            original,
-            "a file outside the directory the command was pointed at must not \
-             be edited by it"
+            install_hook(Runtime::Claude, &link).unwrap(),
+            HookInstall::Installed
+        );
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            after["env"]["SHARED_KEY"], "sk-live-shared",
+            "the user's key must survive the merge: {after}"
+        );
+        assert_eq!(
+            after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+            "and the hook must actually be installed: {after}"
         );
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "the link itself is content NestWeaver did not write"
+            "replacing the link with a regular file is a different data-loss \
+             bug wearing this fix's clothes"
         );
-        assert!(message.contains("symbolic link"), "{message}");
-        assert!(message.contains("elsewhere.json"), "name it: {message}");
-        assert!(message.contains("--dry-run"), "{message}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
     }
 
+    /// A dangling link has no target to merge into, and creating one would put
+    /// a settings file at a path the command was never pointed at.
+    #[cfg(unix)]
     #[test]
-    fn a_missing_settings_file_is_created_with_only_the_hook() {
+    fn a_dangling_symlinked_settings_file_is_still_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".claude/settings.local.json");
-        assert_eq!(
-            install_hook(Runtime::Claude, &path).unwrap(),
-            HookInstall::Installed
-        );
-        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
-    }
+        let missing = dir.path().join("elsewhere/gone.json");
+        let link = dir.path().join("settings.local.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
 
-    #[test]
-    fn presence_and_the_dry_run_delta_cannot_disagree() {
-        let empty = json!({});
-        assert!(!hook_already_present(Runtime::Claude, &empty).unwrap());
-        let installed = compute_hook_patch(Runtime::Claude, &empty).unwrap();
-        assert!(hook_already_present(Runtime::Claude, &installed).unwrap());
+        let error = install_hook(Runtime::Claude, &link).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("gone.json"), "name it: {message}");
+        assert!(message.contains("changed nothing"), "{message}");
+        assert!(!missing.exists(), "nothing may be created out there");
     }
 }

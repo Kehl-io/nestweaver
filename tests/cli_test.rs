@@ -8316,21 +8316,33 @@ fn install_hook_replaces_the_settings_file_instead_of_truncating_it_in_place() {
     );
 }
 
-/// A symlinked settings file. `Path::exists` follows links, so the old code
-/// wrote THROUGH it into a file outside the directory the command was pointed
-/// at.
+/// THE DOTFILES CASE, end to end through the real binary.
+///
+/// `.claude/settings.local.json` is a symbolic link into a dotfiles repository
+/// outside the project. `abbde5d8` refused it; that refusal was correct for
+/// `server init-tls`, which was writing a CA private key through a link and
+/// landing it outside `--output-dir`, and wrong for a user config the user
+/// deliberately linked. The hook goes into the file the link names, every other
+/// setting in it survives, and the link is still a link afterwards — a rename
+/// over the LINK would have replaced it with a regular file, which breaks the
+/// dotfiles checkout just as silently as the truncation this command started
+/// with.
 #[cfg(unix)]
 #[test]
-fn install_hook_does_not_write_through_a_symlinked_settings_file() {
+fn install_hook_follows_a_symlinked_settings_file_into_a_dotfiles_repo() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
-    let outside = dir.path().join("elsewhere/real-settings.json");
+    let dotfiles = dir.path().join("dotfiles");
     std::fs::create_dir_all(project.join(".claude")).unwrap();
-    std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
-    let original = "{ \"env\": { \"SHARED_KEY\": \"sk-live-shared\" } }\n";
-    std::fs::write(&outside, original).unwrap();
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("settings.local.json");
+    std::fs::write(
+        &target,
+        "{ \"env\": { \"SHARED_KEY\": \"sk-live-shared\" } }\n",
+    )
+    .unwrap();
     let link = project.join(".claude/settings.local.json");
-    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let output = nestweaver_cmd()
         .current_dir(&project)
@@ -8339,31 +8351,93 @@ fn install_hook_does_not_write_through_a_symlinked_settings_file() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    assert!(!output.status.success(), "{stderr}");
+    assert!(output.status.success(), "{stderr}");
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&outside).unwrap(),
-        original,
-        "a file outside the project must not be edited by a command pointed at \
-         the project: {stderr}"
+        after["env"]["SHARED_KEY"], "sk-live-shared",
+        "the user's key must survive the merge: {after}"
+    );
+    assert_eq!(
+        after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+        "the hook must land in the file the link names: {after}"
     );
     assert!(
         std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink(),
-        "the link itself is content NestWeaver did not write"
+        "the link itself is content NestWeaver did not write: {stderr}"
     );
-    assert!(stderr.contains("symbolic link"), "{stderr}");
-    assert!(stderr.contains("real-settings.json"), "name it: {stderr}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    // No temp file may be left beside the link: the replacement is staged in
+    // the RESOLVED target's directory, so the rename cannot cross a filesystem.
+    let beside: Vec<_> = std::fs::read_dir(project.join(".claude"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(beside.len(), 1, "{beside:?}");
 
-    // The remedy it prints, executed against the same symlink.
+    // Second run is idempotent and still does not disturb the link.
     nestweaver_cmd()
         .current_dir(&project)
-        .args(["admin", "install-hook", "--dry-run"])
+        .args(["admin", "install-hook"])
         .assert()
-        .success()
-        .stdout(contains("\"matcher\": \"Task\""));
-    assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+        .success();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// A DANGLING link is still refused: there is nothing to merge into, and
+/// creating the target would write settings to a path the command was never
+/// pointed at. The remedy it prints is executed here.
+#[cfg(unix)]
+#[test]
+fn install_hook_refuses_a_dangling_symlinked_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let missing = dir.path().join("elsewhere/gone.json");
+    let link = dir.path().join(".claude/settings.local.json");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("gone.json"), "name it: {stderr}");
+    // The CLI classifier rewrites any message containing "path" and "does not
+    // exist" into `repo_not_found` — which retitled the first draft of this
+    // refusal "Repository path does not exist" and dropped the sentence naming
+    // the link. Pin the two clauses that survive only if it does not fire.
+    assert!(stderr.contains("symbolic link"), "misclassified: {stderr}");
+    assert!(
+        stderr.contains("changed nothing"),
+        "misclassified: {stderr}"
+    );
+    assert!(
+        !missing.exists(),
+        "nothing may be created out there: {stderr}"
+    );
+
+    // The remedy it prints, executed verbatim against the same tree.
+    std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+    std::fs::write(&missing, "{}\n").unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
 }
 
 /// Unparseable input is a refusal, not an empty object.

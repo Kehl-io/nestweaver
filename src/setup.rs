@@ -12,27 +12,20 @@ const SETUP_COMMAND: &str = "`nestweaver setup`";
 /// Refuse to rewrite a config file NestWeaver cannot rewrite without loss.
 ///
 /// Every JSON config `setup` touches is a file the user owns and NestWeaver
-/// merely adds one entry to. Two shapes make a serialize-and-replace write
-/// destructive, and both are checked here so the sixteen per-tool writers share
-/// one rule instead of sixteen near-misses:
+/// merely adds one entry to. One shape makes a serialize-and-replace write
+/// destructive, and it is checked here so the sixteen per-tool writers share
+/// one rule instead of sixteen near-misses: **JSONC comments** — VS Code and
+/// Claude Code both accept them in these files, and `serde_json` cannot
+/// round-trip one.
 ///
-/// * a **symlink** — a rename replaces the link, a plain write modifies
-///   whatever it pointed at, and neither is a file `setup` was pointed at;
-/// * **JSONC comments** — VS Code and Claude Code both accept them in these
-///   files, and `serde_json` cannot round-trip one.
+/// A **symlink** used to be refused here too. It no longer is: symlinking
+/// `.mcp.json` or `.claude/settings.json` into a dotfiles repository is a
+/// deliberate workflow, and `user_config::resolve_for_write` follows the link
+/// so the write lands on the file it names and the link survives.
 fn guard_user_owned_write(
     path: &Path,
     config: &user_config::JsonConfig,
 ) -> Result<(), anyhow::Error> {
-    if config.is_symlink {
-        return Err(user_config::refuse_symlink(
-            path,
-            &format!(
-                "Add the `nestweaver` entry to the file the link points at, then \
-                 run {SETUP_COMMAND} again."
-            ),
-        ));
-    }
     if config.has_comments {
         return Err(user_config::refuse_comments(
             path,
@@ -401,9 +394,9 @@ fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyho
     // lines below in this file — already refuses and says why. This is that
     // behaviour, so the two agree.
     //
-    // The refusal, the JSONC read, the symlink check and the atomic write are
-    // now shared with `nestweaver admin install-hook` — which had this defect
-    // in its original form and destroyed a live API key with it — via
+    // The refusal, the JSONC read, the symlink RESOLUTION and the atomic write
+    // are now shared with `nestweaver admin install-hook` — which had this
+    // defect in its original form and destroyed a live API key with it — via
     // `nestweaver_engine::user_config`. Valid JSON that is NOT an object (`[]`,
     // `"text"`, `null`) used to reach `.as_object_mut().unwrap()` and panic;
     // that too is a refusal there now, for the same reason: whatever the file
@@ -500,7 +493,7 @@ fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyho
 
     std::fs::create_dir_all(base.join(".claude"))?;
     let formatted = serde_json::to_string_pretty(&settings)?;
-    user_config::replace_file_atomically(&settings_path, &formatted)?;
+    user_config::replace_file_atomically(&settings_path, &formatted, SETUP_COMMAND)?;
 
     Ok("hooks installed")
 }
@@ -947,11 +940,11 @@ fn merge_json_mcp(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         });
-    // `path.exists()` FOLLOWS SYMLINKS, so a symlinked `.mcp.json` was read
-    // and written through to wherever it pointed — and a DANGLING one read as
+    // `path.exists()` FOLLOWS SYMLINKS, so a DANGLING `.mcp.json` link read as
     // "absent", sending this straight to the create branch, which then created
     // the link's target outside the project. `read_json_config` judges
-    // existence with `symlink_metadata` and reports the link as a link.
+    // existence with `symlink_metadata`, and resolves a live link to the file
+    // it names so a dotfiles checkout is merged into rather than clobbered.
     let existing = user_config::read_json_config(path, SETUP_COMMAND)?;
     let mut root = existing.value.clone();
 
@@ -973,7 +966,7 @@ fn merge_json_mcp(
             // Drop borrow of root before serializing
             guard_user_owned_write(path, &existing)?;
             let json = serde_json::to_string_pretty(&root)?;
-            user_config::replace_file_atomically(path, &json)?;
+            user_config::replace_file_atomically(path, &json, SETUP_COMMAND)?;
             return Ok(true);
         }
     }
@@ -1018,7 +1011,7 @@ fn merge_json_mcp(
     if !stripped.is_empty() || !added.is_empty() {
         guard_user_owned_write(path, &existing)?;
         let json = serde_json::to_string_pretty(&root)?;
-        user_config::replace_file_atomically(path, &json)?;
+        user_config::replace_file_atomically(path, &json, SETUP_COMMAND)?;
         for flag in &stripped {
             eprintln!("  (stripped deprecated flag: {flag})");
         }
@@ -1056,20 +1049,17 @@ fn merge_codex_mcp(path: &Path, content: &str) -> Result<bool, anyhow::Error> {
     // truncated the user's `~/.codex/config.toml` in place.
     let probe = user_config::probe(path)?;
     if !probe.existed {
-        user_config::replace_file_atomically(path, content)?;
+        user_config::replace_file_atomically(path, content, SETUP_COMMAND)?;
         return Ok(true);
     }
-    if probe.is_symlink {
-        return Err(user_config::refuse_symlink(
-            path,
-            &format!(
-                "Add the `[mcp_servers.nestweaver]` section to the file the link \
-                 points at, then run {SETUP_COMMAND} again."
-            ),
-        ));
-    }
+    // A symlinked `~/.codex/config.toml` is a dotfiles checkout. Resolve it
+    // HERE as well as in the writer, so the section this function decides to
+    // append is decided from the same bytes the write will land on, and so a
+    // dangling link is reported as a dangling link rather than as a `NotFound`
+    // on a path that plainly exists.
+    let resolved = user_config::resolve_for_write(path, SETUP_COMMAND)?;
 
-    let existing = std::fs::read_to_string(path)?;
+    let existing = std::fs::read_to_string(&resolved)?;
     let mut document = existing
         .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("{} contains invalid TOML", path.display()))?;
@@ -1084,7 +1074,7 @@ fn merge_codex_mcp(path: &Path, content: &str) -> Result<bool, anyhow::Error> {
             appended.push('\n');
         }
         appended.push_str(content.trim_start_matches('\n'));
-        user_config::replace_file_atomically(path, &appended)?;
+        user_config::replace_file_atomically(path, &appended, SETUP_COMMAND)?;
         return Ok(true);
     }
 
@@ -1126,7 +1116,7 @@ fn merge_codex_mcp(path: &Path, content: &str) -> Result<bool, anyhow::Error> {
     // and multiline formatting remain owned by the user.
     args.push("--config");
     args.push(desired_config);
-    user_config::replace_file_atomically(path, &document.to_string())?;
+    user_config::replace_file_atomically(path, &document.to_string(), SETUP_COMMAND)?;
     eprintln!("  (added missing flag: --config)");
     Ok(true)
 }
@@ -1880,5 +1870,170 @@ mod settings_preservation_tests {
             serde_json::from_str(&std::fs::read_to_string(claude_settings(dir.path())).unwrap())
                 .unwrap();
         assert!(after["hooks"]["SessionStart"].is_array());
+    }
+}
+
+/// nw-QUICK-1: a symlinked user config is RESOLVED, not refused.
+///
+/// `abbde5d8` made every `setup` writer refuse a symbolic link. That was the
+/// right call for `server init-tls`, which was writing a CA private key
+/// through a dangling link and landing it outside `--output-dir`, and the
+/// wrong call here: symlinking `.mcp.json`, `.claude/settings.json` or
+/// `~/.codex/config.toml` into a dotfiles repository is a normal, deliberate
+/// workflow that the refusal broke.
+///
+/// Resolving is not "delete the check". `atomic_replace_file` renames a temp
+/// file over its destination, so applied to the LINK it replaces the link with
+/// a regular file — the target keeps its old contents and the dotfiles link is
+/// gone. Every test below therefore asserts BOTH halves: the target changed,
+/// and the link is still a link.
+#[cfg(all(test, unix))]
+mod symlinked_config_tests {
+    use super::*;
+
+    /// Build `project/` and `dotfiles/`, put `name` in the dotfiles repo with
+    /// `content`, and link `project/<link_name>` at it. Returns (project,
+    /// target, link).
+    fn dotfiles_link(
+        dir: &std::path::Path,
+        link_name: &str,
+        target_name: &str,
+        content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let project = dir.join("project");
+        let dotfiles = dir.join("dotfiles");
+        let link = project.join(link_name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join(target_name);
+        std::fs::write(&target, content).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        (project, target, link)
+    }
+
+    fn assert_still_a_link(link: &std::path::Path, target: &std::path::Path) {
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{} stopped being a symbolic link — the dotfiles checkout it \
+             belonged to is now broken",
+            link.display()
+        );
+        assert_eq!(std::fs::read_link(link).unwrap(), target);
+    }
+
+    #[test]
+    fn a_symlinked_mcp_json_is_merged_into_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_project, target, link) = dotfiles_link(
+            dir.path(),
+            ".mcp.json",
+            "mcp.json",
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+        );
+
+        let added = merge_json_mcp(
+            &link,
+            "nestweaver",
+            &serde_json::json!({"command": "nestweaver", "args": ["mcp"]}),
+        )
+        .expect("a symlinked .mcp.json is a dotfiles checkout, not an error");
+        assert!(added);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["nestweaver"]["command"], "nestweaver");
+        assert_eq!(
+            written["mcpServers"]["other"]["command"], "other",
+            "the user's other server must survive: {written}"
+        );
+        assert_still_a_link(&link, &target);
+    }
+
+    #[test]
+    fn a_symlinked_claude_settings_gains_the_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, target, link) = dotfiles_link(
+            dir.path(),
+            ".claude/settings.json",
+            "settings.json",
+            r#"{"model":"opus","permissions":{"allow":["Bash(ls:*)"]}}"#,
+        );
+
+        let status = install_claude_hooks("/tmp/x.lbug", &project)
+            .expect("a symlinked settings.json is a dotfiles checkout, not an error");
+        assert_eq!(status, "hooks installed");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["model"], "opus", "{written}");
+        assert!(written["hooks"]["SessionStart"].is_array(), "{written}");
+        assert_still_a_link(&link, &target);
+    }
+
+    #[test]
+    fn a_symlinked_codex_config_gains_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_project, target, link) = dotfiles_link(
+            dir.path(),
+            "config.toml",
+            "codex-config.toml",
+            "[history]\npersistence = \"none\"\n",
+        );
+
+        let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\", \"--config\", \"/cfg/instance.toml\"]\n";
+        assert!(
+            merge_codex_mcp(&link, desired)
+                .expect("a symlinked config.toml is a dotfiles checkout, not an error")
+        );
+
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            written.contains("[mcp_servers.nestweaver]"),
+            "the section must land in the target: {written}"
+        );
+        assert!(
+            written.contains("persistence = \"none\""),
+            "the user's own settings must survive: {written}"
+        );
+        assert_still_a_link(&link, &target);
+    }
+
+    /// A link to a file that is not there. There is nothing to merge into, and
+    /// creating the target would write a config to a path `setup` was never
+    /// pointed at — the `server init-tls` hijack, in a different file.
+    #[test]
+    fn a_dangling_symlinked_config_is_refused_by_every_writer() {
+        for name in [".mcp.json", "config.toml"] {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join(name);
+            let missing = dir.path().join("elsewhere/gone");
+            std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+            let error = if name == "config.toml" {
+                merge_codex_mcp(
+                    &link,
+                    "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\"]\n",
+                )
+                .unwrap_err()
+            } else {
+                merge_json_mcp(
+                    &link,
+                    "nestweaver",
+                    &serde_json::json!({"command": "nestweaver", "args": ["mcp"]}),
+                )
+                .unwrap_err()
+            };
+
+            let message = format!("{error:#}");
+            assert!(message.contains("gone"), "for {name}: {message}");
+            assert!(message.contains("changed nothing"), "for {name}: {message}");
+            assert!(
+                !missing.exists(),
+                "for {name}: nothing may be created there"
+            );
+        }
     }
 }

@@ -36,8 +36,24 @@
 //!    crash in between leaves nothing. [`replace_file_atomically`] writes a
 //!    temp file in the same directory, fsyncs it, and renames.
 //! 3. **`Path::exists` follows symlinks.** A symlinked settings file was
-//!    written through to whatever it pointed at, outside the project.
-//!    [`probe`] uses `symlink_metadata` and reports the link as a link.
+//!    written through to whatever it pointed at, and a DANGLING one read as
+//!    "absent" and got created out there. [`probe`] uses `symlink_metadata`
+//!    and reports the link as a link.
+//!
+//! ## Symlinks are RESOLVED, not refused
+//!
+//! Symlinking `.mcp.json` or `.claude/settings.local.json` into a dotfiles
+//! repository is a deliberate, ordinary workflow. The file at the end of the
+//! link is still the user's config, so [`resolve_for_write`] follows the link
+//! and the write lands on the file it names.
+//!
+//! That is more than deleting a check. [`replace_file_atomically`] renames a
+//! temp file over its destination, so aimed at the LINK it would replace the
+//! link with a regular file — the target would keep its old contents and the
+//! dotfiles link would be gone. Canonicalizing FIRST puts the temp file in the
+//! resolved target's directory, which is also what keeps the rename inside one
+//! filesystem: a link may cross a mount point and `rename(2)` across one fails
+//! with `EXDEV`.
 //!
 //! ## The JSONC decision, stated honestly
 //!
@@ -57,7 +73,7 @@
 //! space, every newline is kept — so a parse position reported against the
 //! stripped text names the same line and column in the file on disk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::Value;
@@ -175,7 +191,8 @@ pub fn strip_jsonc_comments(source: &str) -> String {
 pub struct JsonConfig {
     /// The path existed, judged with `symlink_metadata`.
     pub existed: bool,
-    /// The path is a symbolic link. Writers must refuse; readers need not.
+    /// The path is a symbolic link. Informational: writers RESOLVE it (see
+    /// [`resolve_for_write`]) rather than refusing it.
     pub is_symlink: bool,
     /// The bytes on disk contain JSONC comments, so a serialize-and-replace
     /// write would delete them.
@@ -204,10 +221,13 @@ pub fn read_json_config(path: &Path, remedy: &str) -> Result<JsonConfig, anyhow:
         });
     }
 
-    // Reading through a symlink is harmless and is what makes `--dry-run`
-    // useful on one. Only the WRITE path cares that this is a link.
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}. NestWeaver changed nothing.", path.display()))?;
+    // Resolve a link here rather than letting `read_to_string` follow it, so a
+    // dangling link or a cycle is reported by the one function that knows what
+    // those mean — instead of arriving as a bare `NotFound` on a path that
+    // plainly exists.
+    let source = resolve_for_write(path, remedy)?;
+    let raw = std::fs::read_to_string(&source)
+        .with_context(|| format!("read {}. NestWeaver changed nothing.", source.display()))?;
     let stripped = strip_jsonc_comments(&raw);
     let has_comments = stripped != raw;
 
@@ -251,20 +271,67 @@ pub fn read_json_config(path: &Path, remedy: &str) -> Result<JsonConfig, anyhow:
     })
 }
 
-/// Refuse to write through a symbolic link, naming where it points.
-///
-/// `remedy` completes the message with what the caller should do instead.
-pub fn refuse_symlink(path: &Path, remedy: &str) -> anyhow::Error {
-    let target = std::fs::read_link(path)
+/// What a symbolic link names, as text, for a message.
+fn link_target(path: &Path) -> String {
+    std::fs::read_link(path)
         .map(|target| target.display().to_string())
-        .unwrap_or_else(|_| "somewhere outside this directory".to_string());
-    anyhow::anyhow!(
-        "{} is a symbolic link to {target}. NestWeaver changed nothing: writing \
-         through the link would modify a file this command was never pointed \
-         at, and replacing the link with a regular file would discard the link \
-         itself. {remedy}",
-        path.display(),
-    )
+        .unwrap_or_else(|_| "somewhere outside this directory".to_string())
+}
+
+/// Resolve `path` to the file a write should actually land on.
+///
+/// A symbolic link is FOLLOWED. Symlinking a user config into a dotfiles
+/// repository is a deliberate workflow, and the file at the end of the link is
+/// still the user's config. What must NOT happen is a rename over the link
+/// itself, which replaces it with a regular file and leaves the target stale —
+/// so the canonical path is what every write is aimed at, and the temp file is
+/// created beside the target rather than beside the link.
+///
+/// The four shapes a link can take, decided:
+///
+/// * **a link to a path that does not exist** — REFUSED. There is nothing there
+///   to merge into, and creating it would put a config file at a path the
+///   command was never pointed at. That is exactly how `server init-tls` came
+///   to write a CA private key outside its `--output-dir`.
+/// * **a chain of links** — followed to the end; every hop survives.
+/// * **a link pointing outside the repository** — ALLOWED, and unremarkable.
+///   That is the dotfiles case, and it is the reason this resolves at all.
+/// * **a loop** — REFUSED. `canonicalize` returns `ELOOP` rather than spinning,
+///   and the message names the path so the cycle can be found.
+///
+/// `remedy` is the backtick-quoted command the caller wants re-run afterwards.
+pub fn resolve_for_write(path: &Path, remedy: &str) -> Result<PathBuf, anyhow::Error> {
+    if !probe(path)?.is_symlink {
+        return Ok(path.to_path_buf());
+    }
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let target = link_target(path);
+            // Deliberately NOT phrased "path ... does not exist": the CLI's
+            // error classifier rewrites any message containing both into
+            // `repo_not_found`, retitling this as "Repository path does not
+            // exist" and dropping the sentence that names the link. Measured
+            // on the first draft of this message.
+            Err(anyhow::anyhow!(
+                "{} is a symbolic link to {target}, which is not there. \
+                 NestWeaver changed nothing: there is nothing to merge into, \
+                 and creating {target} would write a config file where this \
+                 command was never pointed. Create {target} (an empty `{{}}` is \
+                 enough for a JSON config), or repoint the link, then run \
+                 {remedy} again.",
+                path.display(),
+            ))
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "{} is a symbolic link that cannot be resolved: {error}. NestWeaver \
+             changed nothing. It names {}, and a link that will not resolve is \
+             usually a cycle. Repoint it at a real file, then run {remedy} \
+             again.",
+            path.display(),
+            link_target(path),
+        )),
+    }
 }
 
 /// Refuse to rewrite a file whose comments the writer cannot carry.
@@ -288,23 +355,30 @@ pub fn refuse_comments(path: &Path, remedy: &str) -> anyhow::Error {
 /// treatment for the same reason — a crash must not be able to leave it
 /// truncated.
 ///
-/// The caller is responsible for having refused a symlinked `path` first: a
-/// rename REPLACES the link rather than following it, which is safe for the
-/// link's target but silently destroys the link.
-pub fn replace_file_atomically(path: &Path, contents: &str) -> Result<(), anyhow::Error> {
+/// A symlinked `path` is RESOLVED first, by [`resolve_for_write`], and the
+/// replacement is staged and renamed in the RESOLVED target's directory. That
+/// is load-bearing twice over: a rename onto the link would replace the link
+/// with a regular file and leave the target stale, and a temp file beside the
+/// link cannot be renamed onto a target on another filesystem.
+pub fn replace_file_atomically(
+    path: &Path,
+    contents: &str,
+    remedy: &str,
+) -> Result<(), anyhow::Error> {
     use std::io::Write;
 
-    if let Some(parent) = path
+    let destination = resolve_for_write(path, remedy)?;
+    if let Some(parent) = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create directory {}", parent.display()))?;
     }
-    nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| {
+    nestweaver_store::durable_sidecar::atomic_replace_file(&destination, |file| {
         file.write_all(contents.as_bytes())
     })
-    .with_context(|| format!("write {}", path.display()))?;
+    .with_context(|| format!("write {}", destination.display()))?;
     Ok(())
 }
 
@@ -445,7 +519,7 @@ mod tests {
         std::fs::write(&path, "{\"secret\": \"keep-me\"}").unwrap();
         std::fs::hard_link(&path, &witness).unwrap();
 
-        replace_file_atomically(&path, "{\"replaced\": true}").unwrap();
+        replace_file_atomically(&path, "{\"replaced\": true}", "`x`").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -463,7 +537,7 @@ mod tests {
     fn atomic_replace_leaves_no_temp_files_behind() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        replace_file_atomically(&path, "{}").unwrap();
+        replace_file_atomically(&path, "{}", "`x`").unwrap();
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -485,12 +559,179 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        replace_file_atomically(&path, "{\"a\": 1}").unwrap();
+        replace_file_atomically(&path, "{\"a\": 1}", "`x`").unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "a settings file the user locked down must not be widened by a rewrite"
         );
+    }
+
+    /// THE DOTFILES CASE. `.mcp.json` in the project is a symbolic link into a
+    /// checked-out dotfiles repository somewhere else entirely, which is a
+    /// deliberate, ordinary workflow. The write must land on the file the link
+    /// names AND the link must still be a link afterwards.
+    ///
+    /// A plain `atomic_replace_file` on the LINK path does neither: the rename
+    /// replaces the link with a regular file, so the target keeps its old
+    /// content and the dotfiles link is silently gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_resolved_and_the_link_survives_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("mcp.json");
+        let link = project.join(".mcp.json");
+        std::fs::write(&target, "{\"before\": true}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        replace_file_atomically(&link, "{\"after\": true}", "`x`").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"after\": true}",
+            "the resolved target is the file the user actually edits"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rename must not have replaced the link with a regular file — \
+             that breaks the dotfiles checkout the link belongs to"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            target,
+            "and it must still point where it pointed"
+        );
+        let beside_the_link: Vec<_> = std::fs::read_dir(&project)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            beside_the_link.len(),
+            1,
+            "the temp file belongs in the RESOLVED target's directory, not \
+             beside the link: a rename across a filesystem boundary fails with \
+             EXDEV, and this link may cross one: {beside_the_link:?}"
+        );
+    }
+
+    /// A RELATIVE link, and a CHAIN of them. `read_link` returns the relative
+    /// text, so anything that resolves by hand rather than by `canonicalize`
+    /// gets this wrong; every link in the chain has to survive.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_symlink_chain_resolves_to_its_final_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let final_target = dotfiles.join("mcp.json");
+        std::fs::write(&final_target, "{\"before\": true}").unwrap();
+        // middle -> ../dotfiles/mcp.json, link -> middle.json
+        let middle = project.join("middle.json");
+        std::os::unix::fs::symlink("../dotfiles/mcp.json", &middle).unwrap();
+        let link = project.join(".mcp.json");
+        std::os::unix::fs::symlink("middle.json", &link).unwrap();
+
+        replace_file_atomically(&link, "{\"after\": true}", "`x`").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&final_target).unwrap(),
+            "{\"after\": true}",
+            "a chain resolves to its end, not to its first hop"
+        );
+        for hop in [&link, &middle] {
+            assert!(
+                std::fs::symlink_metadata(hop)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{} stopped being a link",
+                hop.display()
+            );
+        }
+    }
+
+    /// A DANGLING link names a file that is not there. There is nothing to
+    /// merge into, and creating the target would put a file at a path the
+    /// command was never pointed at — which is exactly how `server init-tls`
+    /// wrote a CA private key outside its `--output-dir`. Refuse, and say what
+    /// to run.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_refused_and_nothing_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join(".mcp.json");
+        let missing = dir.path().join("elsewhere/gone.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        let error = replace_file_atomically(&link, "{}", "`nestweaver setup`").unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("gone.json"), "name the target: {message}");
+        assert!(message.contains("changed nothing"), "{message}");
+        assert!(!missing.exists(), "the target must not be created");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// A LOOP resolves to nothing at all. `canonicalize` returns ELOOP rather
+    /// than spinning, and the refusal has to name the path so the operator can
+    /// find the cycle.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_refused_rather_than_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.json");
+        let second = dir.path().join("b.json");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+
+        let error = replace_file_atomically(&first, "{}", "`nestweaver setup`").unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("a.json"), "name the path: {message}");
+        assert!(message.contains("changed nothing"), "{message}");
+    }
+
+    /// The resolved target's permissions are what a rewrite must carry — the
+    /// link's own mode is meaningless on most platforms and irrelevant here.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_write_keeps_the_targets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.json");
+        let link = dir.path().join("link.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        replace_file_atomically(&link, "{\"a\": 1}", "`x`").unwrap();
+
+        // The content assertion is what makes this test the DEFECT's: without
+        // it the test passes on the unfixed tree, where the rename replaced the
+        // link with a fresh regular file and left the target — with its 0600 —
+        // entirely alone.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"a\": 1}",
+            "the write must have landed on the target at all"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file the user locked down must stay locked");
     }
 }
