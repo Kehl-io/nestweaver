@@ -7,6 +7,11 @@ use std::process::Command as StdCommand;
 
 fn nestweaver_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    // nw-261: pin miette's render width so a diagnostic phrase cannot be split
+    // mid-assertion by the runner's terminal geometry. A test asserting WHAT a
+    // message says must not depend on HOW WIDE the terminal was. Tests that
+    // exercise wrapping itself override or remove this deliberately.
+    cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000");
     cmd.env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
@@ -7569,6 +7574,12 @@ fn both_export_routes_refuse_the_pair_identically() {
     let routed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
         .arg(&db)
+        // This route is built raw rather than through `nestweaver_cmd`, so it
+        // does not inherit the helper's width pin. Both sides must render at the
+        // same width or this compares GEOMETRY, not words -- which is what it
+        // was accidentally doing before, passing only because both routes
+        // happened to wrap at the same ambient terminal width.
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
         .env_remove("NESTWEAVER_NO_DAEMON")
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
