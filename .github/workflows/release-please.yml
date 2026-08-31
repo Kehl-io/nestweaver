@@ -279,16 +279,40 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       # The wrapper's postinstall downloads the matching release binary, so it
       # must publish only after the `build` job has uploaded the assets for
-      # this tag. No-ops with a clear message until NPM_TOKEN is configured,
-      # so releases stay green before the secret exists.
+      # this tag.
+      #
+      # This step FAILS rather than skips when the token is absent. It used to
+      # exit 0 with a "skipping" message so releases stayed green before the
+      # secret existed -- and the result was that every release since the
+      # wrapper was added reported success while publishing nothing, which is
+      # how the package reached 8.0.0 having never been published at all
+      # (nw-115). A release job that cannot publish must say so.
       - name: Publish to npm
         working-directory: npm
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN not set — skipping npm publish."
-            echo "Add the NPM_TOKEN repo secret to enable automatic publishing."
-            exit 0
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is not set, so the npm wrapper cannot be published." >&2
+            echo "Add the NPM_TOKEN repository secret. A release must not report" >&2
+            echo "success while silently dropping a distribution channel (nw-115)." >&2
+            exit 1
           fi
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
           npm publish --access public
+          # Read it back. `npm publish` exiting 0 is a claim, not evidence: a
+          # publish that is not resolvable from the registry did not happen, and
+          # trusting the exit code is the exact failure this step is here to
+          # stop. Retry only for registry propagation lag.
+          for attempt in 1 2 3 4 5; do
+            if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+              echo "Verified $NAME@$VERSION is resolvable from the registry."
+              exit 0
+            fi
+            echo "Registry has not caught up (attempt $attempt/5); retrying in 10s."
+            sleep 10
+          done
+          echo "::error::npm publish exited 0 but $NAME@$VERSION is not resolvable." >&2
+          exit 1
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
