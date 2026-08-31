@@ -185,15 +185,43 @@ fn claude_task_hook_entry() -> Value {
 /// `Task`-matcher PreToolUse hook to an existing settings document.
 ///
 /// `existing` is the current settings JSON (e.g. parsed
-/// `.claude/settings.local.json`); pass `Value::Null` or an empty object if
-/// there is none. The returned value is the settings document with the hook
-/// merged in idempotently — if a `Task` matcher already exists it is left
-/// untouched (no duplicates).
-pub fn compute_claude_hook_patch(existing: &Value) -> Value {
-    let mut settings = match existing {
-        Value::Object(_) => existing.clone(),
-        _ => json!({}),
+/// `.claude/settings.local.json`); pass an empty object if there is none. The
+/// returned value is the settings document with the hook merged in
+/// idempotently — if a `Task` matcher already exists it is left untouched (no
+/// duplicates).
+///
+/// ## Why this returns a `Result`
+///
+/// It used to map ANY non-object `Value` to `{}` and merge the hook into that,
+/// so a document it was handed came back as nothing but NestWeaver's hook. Its
+/// production caller is guarded by
+/// [`crate::user_config::read_json_config`], which refuses a non-object before
+/// this is reached — but the function is public, the discard was silent, and
+/// the next caller would have inherited it. A function that cannot discard its
+/// input does not depend on being called correctly, so the refusal moved here.
+///
+/// `Value::Null` is refused with the rest. It carries nothing to lose, but
+/// `read_json_config` already treats a settings file containing `null` as the
+/// user's and not this command's to replace, and one rule that holds
+/// everywhere beats two that nearly agree.
+pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Error> {
+    let Some(existing) = existing.as_object() else {
+        let kind = match existing {
+            Value::Array(_) => "an array",
+            Value::String(_) => "a string",
+            Value::Number(_) => "a number",
+            Value::Bool(_) => "a boolean",
+            Value::Null => "null",
+            Value::Object(_) => "an object",
+        };
+        anyhow::bail!(
+            "cannot merge the NestWeaver hook into {kind}: a settings document \
+             is a JSON object, and replacing whatever this is with one would \
+             discard it. Pass the parsed settings object, or an empty object \
+             when there are none."
+        );
     };
+    let mut settings = Value::Object(existing.clone());
 
     if let Some(obj) = settings.as_object_mut() {
         let hooks = obj
@@ -216,13 +244,13 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Value {
         }
     }
 
-    settings
+    Ok(settings)
 }
 
 /// Compute a hook patch for the given runtime.
 pub fn compute_hook_patch(runtime: Runtime, existing: &Value) -> Result<Value, anyhow::Error> {
     match runtime {
-        Runtime::Claude => Ok(compute_claude_hook_patch(existing)),
+        Runtime::Claude => compute_claude_hook_patch(existing),
     }
 }
 
@@ -317,8 +345,10 @@ pub fn read_runtime_settings(path: &Path) -> Result<crate::user_config::JsonConf
 /// * unparseable, or valid JSON that is not an object → refuse ([`read_runtime_settings`]);
 /// * hook already present → return without touching the file, so a second run
 ///   cannot reformat it, reorder it, or strip anything;
-/// * a symbolic link → refuse, because a rename replaces the link and a plain
-///   write modifies a file this command was never pointed at;
+/// * a symbolic link → RESOLVE it and edit the file it names, leaving the link
+///   a link. `.claude/settings.local.json` symlinked into a dotfiles repository
+///   is a deliberate workflow; a dangling link is still refused, because there
+///   is nothing there to merge into;
 /// * JSONC comments → refuse, because `serde_json` cannot carry them and
 ///   "supporting" JSONC in a serialize-and-replace writer means deleting them;
 /// * otherwise → merge and replace the file atomically.
@@ -332,15 +362,6 @@ pub fn install_hook(runtime: Runtime, path: &Path) -> Result<HookInstall, anyhow
         return Ok(HookInstall::AlreadyPresent);
     }
 
-    if settings.is_symlink {
-        return Err(crate::user_config::refuse_symlink(
-            path,
-            &format!(
-                "Run {DRY_RUN_COMMAND} to print the hook entry, then add it to the \
-                 file the link points at."
-            ),
-        ));
-    }
     if settings.has_comments {
         return Err(crate::user_config::refuse_comments(
             path,
@@ -354,7 +375,7 @@ pub fn install_hook(runtime: Runtime, path: &Path) -> Result<HookInstall, anyhow
     let patched = compute_hook_patch(runtime, &settings.value)?;
     let mut rendered = serde_json::to_string_pretty(&patched)?;
     rendered.push('\n');
-    crate::user_config::replace_file_atomically(path, &rendered)?;
+    crate::user_config::replace_file_atomically(path, &rendered, INSTALL_COMMAND)?;
     Ok(HookInstall::Installed)
 }
 
@@ -372,7 +393,7 @@ mod tests {
 
     #[test]
     fn hook_patch_contains_task_matcher_and_command() {
-        let patch = compute_claude_hook_patch(&json!({}));
+        let patch = compute_claude_hook_patch(&json!({})).unwrap();
         let arr = patch["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array");
@@ -384,8 +405,8 @@ mod tests {
 
     #[test]
     fn hook_patch_is_idempotent() {
-        let once = compute_claude_hook_patch(&json!({}));
-        let twice = compute_claude_hook_patch(&once);
+        let once = compute_claude_hook_patch(&json!({})).unwrap();
+        let twice = compute_claude_hook_patch(&once).unwrap();
         let arr = twice["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
             arr.len(),
@@ -400,7 +421,7 @@ mod tests {
             "permissions": { "allow": ["Bash"] },
             "hooks": { "PreToolUse": [ { "matcher": "Edit", "hooks": [] } ] }
         });
-        let patch = compute_claude_hook_patch(&existing);
+        let patch = compute_claude_hook_patch(&existing).unwrap();
         assert_eq!(patch["permissions"]["allow"][0], "Bash");
         let arr = patch["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "existing Edit matcher kept, Task added");
@@ -646,35 +667,89 @@ mod tests {
         );
     }
 
+    /// Symlinking `.claude/settings.local.json` into a dotfiles repository is a
+    /// deliberate workflow, so the hook goes into the file the link names, and
+    /// the link is still a link when the command is done. `abbde5d8` refused
+    /// this outright; that refusal was right for `server init-tls`, which was
+    /// writing a CA private key outside its `--output-dir`, and wrong here.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_settings_file_is_refused_and_its_target_is_untouched() {
+    fn a_symlinked_settings_file_is_resolved_and_the_link_survives() {
         let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("elsewhere.json");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("settings.local.json");
         let link = dir.path().join("settings.local.json");
-        let original = "{\"env\": {\"SHARED_KEY\": \"sk-live-shared\"}}";
-        std::fs::write(&outside, original).unwrap();
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-
-        let error = install_hook(Runtime::Claude, &link).unwrap_err();
-        let message = format!("{error:#}");
+        std::fs::write(&target, "{\"env\": {\"SHARED_KEY\": \"sk-live-shared\"}}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(&outside).unwrap(),
-            original,
-            "a file outside the directory the command was pointed at must not \
-             be edited by it"
+            install_hook(Runtime::Claude, &link).unwrap(),
+            HookInstall::Installed
+        );
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            after["env"]["SHARED_KEY"], "sk-live-shared",
+            "the user's key must survive the merge: {after}"
+        );
+        assert_eq!(
+            after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+            "and the hook must actually be installed: {after}"
         );
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "the link itself is content NestWeaver did not write"
+            "replacing the link with a regular file is a different data-loss \
+             bug wearing this fix's clothes"
         );
-        assert!(message.contains("symbolic link"), "{message}");
-        assert!(message.contains("elsewhere.json"), "name it: {message}");
-        assert!(message.contains("--dry-run"), "{message}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
+    /// A dangling link has no target to merge into, and creating one would put
+    /// a settings file at a path the command was never pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_settings_file_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("elsewhere/gone.json");
+        let link = dir.path().join("settings.local.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        let error = install_hook(Runtime::Claude, &link).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("gone.json"), "name it: {message}");
+        assert!(message.contains("changed nothing"), "{message}");
+        assert!(!missing.exists(), "nothing may be created out there");
+    }
+
+    /// nw-QUICK-2: `compute_claude_hook_patch` mapped any non-object `Value` to
+    /// `{}` and merged the hook into that, so a document it was handed was
+    /// discarded wholesale. Its production caller is guarded by
+    /// `read_json_config`, but the function is public and the next caller will
+    /// not be.
+    #[test]
+    fn a_non_object_document_is_refused_rather_than_replaced() {
+        for (existing, kind) in [
+            (json!(["keep", "me"]), "an array"),
+            (json!("keep me"), "a string"),
+            (json!(7), "a number"),
+            (json!(true), "a boolean"),
+            (Value::Null, "null"),
+        ] {
+            let error = compute_claude_hook_patch(&existing)
+                .expect_err("a non-object document is not this function's to replace");
+            let message = format!("{error:#}");
+            assert!(message.contains(kind), "name what it got: {message}");
+            assert!(
+                message.contains("discard"),
+                "say what refusing prevents: {message}"
+            );
+        }
     }
 
     #[test]
