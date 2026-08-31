@@ -3458,17 +3458,24 @@ enum Commands {
         instance: Option<String>,
         #[arg(long, help = "Filter to symbols in this repo")]
         repo: Option<String>,
-        /// nw-357. The `brain_impact` schema has carried a `limit` with a
-        /// default of 50 all along, and this command had none — it neither
-        /// declared one nor sent one, so with a daemon `impact X --json`
-        /// returned at most 50 rows and without one it returned every row.
-        /// The bound was a property of the TRANSPORT rather than of the
-        /// contract, which is nw-259(b)'s shape exactly, and it made
-        /// `returned < total` structurally unreachable on the direct route.
-        ///
-        /// The range is COPIED from the schema (`RESULT_LIMIT_MAX`), not
-        /// re-derived, exactly as `hubs --top` / `bridges --top` do after
-        /// nw-251.
+        // nw-357. The `brain_impact` schema has carried a `limit` with a
+        // default of 50 all along, and this command had none — it neither
+        // declared one nor sent one, so with a daemon `impact X --json`
+        // returned at most 50 rows and without one it returned every row.
+        // The bound was a property of the TRANSPORT rather than of the
+        // contract, which is nw-259(b)'s shape exactly, and it made
+        // `returned < total` structurally unreachable on the direct route.
+        //
+        // The range is COPIED from the schema (`RESULT_LIMIT_MAX`), not
+        // re-derived, exactly as `hubs --top` / `bridges --top` do after
+        // nw-251.
+        //
+        // Deliberately `//` and not `///`: clap promotes a doc comment to
+        // `long_help`, so this rationale WAS the entire `--help` entry for
+        // `--limit` — a user asking what the flag does got a changelog that
+        // never named the default or the range. The `help =` string below is
+        // the user-facing text and states both. Rationale belongs to whoever
+        // reads the source, not to whoever runs `--help`.
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
@@ -4500,7 +4507,13 @@ enum Commands {
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
-            help = "Max unreachable symbols to report (1-1000, default: all; matches the MCP dead_code schema). Large codebases can produce very large output; cap it here or via a pipe."
+            // The default is `configured_result_limit()` — DEFAULT_RESULT_LIMIT
+            // (50), or `[limits].default_result_limit` when the operator sets
+            // one. The help said "default: all", so a user who omitted `--limit`
+            // to get every row silently got 50 and a `truncated: true` they had
+            // been told could not happen. Help text is a claim a user acts on:
+            // this is nw-334's class in help rather than in an error message.
+            help = "Max unreachable symbols to report (1-1000; default 50, or [limits].default_result_limit from config; matches the MCP dead_code schema). Pass an explicit --limit to widen it — there is no 'all'."
         )]
         limit: Option<usize>,
         #[arg(

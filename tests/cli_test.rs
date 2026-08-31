@@ -2891,6 +2891,64 @@ fn cli_daemon_run_server_help() {
         .stdout(predicates::str::contains("--idle-timeout").not());
 }
 
+/// nw-334's class, in help text rather than in an error text: a string the
+/// user ACTS on that nobody verified against the code.
+///
+/// `dead-code --limit` advertised "(1-1000, default: all)". The default is
+/// `configured_result_limit()` — 50 — so omitting `--limit` to get every row
+/// returned 50 with `truncated: true`, a state the help said could not arise.
+/// There is no "all" to reach either: the parser rejects `0`, so no value of
+/// the flag disables the cap.
+///
+/// `impact --limit` was the mirror image. Its rationale was written as a `///`
+/// doc comment, which clap promotes to `long_help`, so `--help` answered "what
+/// does --limit do?" with "nw-357. The `brain_impact` schema has carried a
+/// `limit`…" and never named the default or the range at all.
+///
+/// Both are pinned here rather than only fixed, because a help string drifts
+/// from behaviour silently — nothing compiles against it.
+#[test]
+fn cli_limit_help_states_the_default_the_code_actually_applies() {
+    // The claim that replaced "default: all" must name the real default …
+    nestweaver_cmd()
+        .args(["dead-code", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("default 50"))
+        .stdout(contains("default: all").not());
+
+    // … and "there is no 'all'" must be true: the cap has no off switch.
+    nestweaver_cmd()
+        .args(["dead-code", "--limit", "0"])
+        .assert()
+        .failure()
+        .stderr(contains("0 is not in 1..=1000"));
+
+    // `--help` renders long_help, so a doc-comment narrative would surface
+    // here and not in `-h`. The flag must be described, not changelogged.
+    let long_help = nestweaver_cmd()
+        .args(["impact", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let long_help = String::from_utf8_lossy(&long_help);
+    let limit_help = long_help
+        .split("--limit <LIMIT>")
+        .nth(1)
+        .expect("impact --help must document --limit");
+    let limit_help = limit_help.split("--json").next().unwrap_or(limit_help);
+    assert!(
+        !limit_help.contains("nw-357"),
+        "`impact --limit` help is a ticket narrative, not user-facing help: {limit_help}"
+    );
+    assert!(
+        limit_help.contains("default 50") && limit_help.contains("1-1000"),
+        "`impact --limit` help must state its default and range: {limit_help}"
+    );
+}
+
 /// The help text used to advertise "orphaned daemon state directories" on
 /// every platform without saying WHICH root — reading as broader coverage
 /// than the sweep had (it touched only the persistent state root). It must
