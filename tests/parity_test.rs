@@ -2760,6 +2760,45 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
         "the MCP route has exactly one cap and must still name it: {mcp}"
     );
 
+    // ── CLI via daemon — the route this test's NAME already claimed ──
+    //
+    // nw-353 fixed `tool_brain_context` and the CLI's DIRECT arm and stopped.
+    // This test asserted `run_direct` and `run_via_mcp` while calling itself
+    // "every machine route", so the third leg was never run — the same
+    // unasserted-route shape the gap it was written to close.
+    //
+    // The daemon runs the very `tool_brain_context` the MCP leg above proves
+    // correct, so `total` is already on the wire; `BrainContextResult` has no
+    // field for it, so `serde_json::from_value` dropped it and the renderer
+    // re-derived `total` from the rows that SURVIVED the daemon's cut. That
+    // makes `returned < total` structurally unreachable here — the answer
+    // measured against itself always looks complete.
+    let via_daemon = run_via_daemon(
+        db,
+        &["brain", "context", "mainA", "--json", "--token-budget", "1"],
+    );
+    assert!(
+        via_daemon.status.success(),
+        "{}",
+        flatten_miette(&via_daemon.stderr)
+    );
+    let via_daemon = parse_stdout("brain context (daemon, token_budget 1)", &via_daemon);
+    assert_bounded("daemon --token-budget 1", &via_daemon, true);
+    assert_eq!(
+        via_daemon.get("truncated_by").and_then(|v| v.as_str()),
+        Some("token_budget"),
+        "the daemon route must name the cap the direct and MCP routes name: {via_daemon}"
+    );
+
+    // The three routes must agree on how many rows MATCHED, not merely each be
+    // self-consistent. Re-deriving `total` post-cut satisfies every
+    // single-route invariant above while still disagreeing with the other two.
+    assert_eq!(
+        via_daemon["total"], mcp["total"],
+        "daemon and MCP run the same tool over the same DB and must report the \
+         same pre-cut total: daemon={via_daemon} mcp={mcp}"
+    );
+
     // ── COUNTERWEIGHT: nothing cut, nothing claimed ──
     let roomy = run_direct(
         db,
@@ -2794,6 +2833,34 @@ fn brain_context_discloses_that_it_was_cut_on_every_machine_route() {
             .get("truncated_by")
             .is_none_or(serde_json::Value::is_null),
         "a complete answer must not blame a cap: {mcp_roomy}"
+    );
+    // The daemon leg needs its own counterweight: carrying an upstream `total`
+    // through must not make an UNCUT answer claim it was cut.
+    let daemon_roomy = run_via_daemon(
+        db,
+        &[
+            "brain",
+            "context",
+            "mainA",
+            "--json",
+            "--limit",
+            "5000",
+            "--token-budget",
+            "16000",
+        ],
+    );
+    assert!(
+        daemon_roomy.status.success(),
+        "{}",
+        flatten_miette(&daemon_roomy.stderr)
+    );
+    let daemon_roomy = parse_stdout("brain context (daemon, roomy)", &daemon_roomy);
+    assert_bounded("daemon roomy", &daemon_roomy, false);
+    assert!(
+        daemon_roomy
+            .get("truncated_by")
+            .is_none_or(serde_json::Value::is_null),
+        "a complete answer must not blame a cap: {daemon_roomy}"
     );
 }
 

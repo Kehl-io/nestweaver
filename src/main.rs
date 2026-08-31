@@ -11971,6 +11971,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "brain_context",
                             hybrid_args,
                         )? {
+                            // Same drop as `brain context`'s daemon arm: this
+                            // route calls the SAME `brain_context` tool and
+                            // narrowed away the `total` it answered with.
+                            let upstream = UpstreamContextDisclosure::from_wire(&result_json);
                             let result: nestweaver_engine::BrainContextResult =
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
@@ -11985,9 +11989,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
-                                print_brain_context_json(&result, cut, token_budget)?;
+                                print_brain_context_json(&result, cut, token_budget, &upstream)?;
                             } else {
-                                print_brain_context_text(&result, cut, token_budget);
+                                print_brain_context_text(&result, cut, token_budget, &upstream);
                             }
                             let stats = format!(
                                 "{} seeds, {} connected nodes in {} (via hybrid)",
@@ -23027,6 +23031,12 @@ fn run_brain(
                     context_params,
                 )? {
                     let source = hybrid_source_label(&result_json);
+                    // Read the daemon's disclosure BEFORE `from_value` narrows
+                    // the payload to the fields `BrainContextResult` declares —
+                    // `total`, `truncated`, `truncated_by` and `_meta` are not
+                    // among them, and dropping them here is what made a capped
+                    // answer on this route indistinguishable from a complete one.
+                    let upstream = UpstreamContextDisclosure::from_wire(&result_json);
                     let result: nestweaver_engine::BrainContextResult =
                         serde_json::from_value(result_json)?;
                     let cut = match token_budget {
@@ -23038,9 +23048,9 @@ fn run_brain(
                         None => limit.min(result.connected.len()),
                     };
                     if json {
-                        print_brain_context_json(&result, cut, token_budget)?;
+                        print_brain_context_json(&result, cut, token_budget, &upstream)?;
                     } else {
-                        print_brain_context_text(&result, cut, token_budget);
+                        print_brain_context_text(&result, cut, token_budget, &upstream);
                     }
                     let node_count = result.seeds.len() + cut;
                     let stats = format!(
@@ -23332,10 +23342,14 @@ fn run_brain(
                         None => limit.min(result.connected.len()),
                     };
                     let node_count = result.seeds.len() + cut;
+                    // Direct route: `result.connected` is the pre-cut list this
+                    // process built, so there is no upstream to defer to and the
+                    // local length IS the honest total.
+                    let upstream = UpstreamContextDisclosure::default();
                     if json {
-                        print_brain_context_json(&result, cut, token_budget)?;
+                        print_brain_context_json(&result, cut, token_budget, &upstream)?;
                     } else {
-                        print_brain_context_text(&result, cut, token_budget);
+                        print_brain_context_text(&result, cut, token_budget, &upstream);
                     }
                     let stats = format!("{} nodes in {}", node_count, format_elapsed(t0.elapsed()));
                     Ok((EXIT_SUCCESS, Some(stats)))
@@ -24289,7 +24303,12 @@ fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
     }
 }
 
-fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
+fn print_brain_context_text(
+    result: &BrainContextResult,
+    cut: usize,
+    token_budget: Option<usize>,
+    upstream: &UpstreamContextDisclosure,
+) {
     // Feature F7: show PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
@@ -24334,7 +24353,10 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
 
     if !result.connected.is_empty() {
         println!();
-        let total = result.connected.len();
+        // Same correction as the JSON twin: on the daemon route
+        // `result.connected` is post-cut, so `Connected (N of M)` printed
+        // `N of N` and the HUMAN route lost the disclosure it has had all along.
+        let total = upstream.total(result.connected.len(), cut);
         let used_tokens: usize = result
             .connected
             .iter()
@@ -26119,12 +26141,65 @@ fn render_project_context_daemon_response(
     println!("Tokens used: {used} / budget: {token_budget}");
 }
 
+/// What an upstream already decided about a `brain_context` answer.
+///
+/// nw-353 follow-up. The daemon serves this command by running the very
+/// `tool_brain_context` the MCP route runs, so its reply ALREADY carries the
+/// canonical `{returned, total, truncated, truncated_by}` — computed on the
+/// pre-cut list, which is the only place it can be computed correctly.
+/// `BrainContextResult` declares no field for any of it, so
+/// `serde_json::from_value` silently dropped it and both renderers re-derived
+/// `total` from the rows that SURVIVED the daemon's cut.
+///
+/// That is why `returned < total` was structurally unreachable on the daemon
+/// route while `--token-budget` swept 200..16000: the answer was being measured
+/// against itself. The fact was never missing — it was on the wire and thrown
+/// away at the boundary — so this carries it across rather than recomputing a
+/// fifth copy of the triple.
+///
+/// `Default` is the DIRECT route, which builds the full list locally and can
+/// still read its own pre-cut total off `result.connected`.
+#[derive(Default)]
+struct UpstreamContextDisclosure {
+    /// Rows that matched upstream, BEFORE the cut it already applied.
+    total: Option<usize>,
+    /// Federation provenance (`_meta`) the hybrid layer attached: which
+    /// sources answered, and whether any repo was stale. Dropping it told the
+    /// caller a merged multi-repo answer was a local one.
+    meta: Option<serde_json::Value>,
+}
+
+impl UpstreamContextDisclosure {
+    /// Read the disclosure off a hybrid/daemon payload before it is narrowed
+    /// into `BrainContextResult`.
+    fn from_wire(value: &serde_json::Value) -> Self {
+        Self {
+            total: value
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize),
+            meta: value.get("_meta").cloned(),
+        }
+    }
+
+    /// The pre-cut total, preferring the upstream's when it supplied one.
+    ///
+    /// Clamped to at least `returned`: a payload claiming fewer matches than
+    /// rows it just handed over is self-contradictory, and letting that through
+    /// would publish `returned > total` — a shape no consumer should have to
+    /// parse.
+    fn total(&self, local_total: usize, returned: usize) -> usize {
+        self.total.unwrap_or(local_total).max(returned)
+    }
+}
+
 fn print_brain_context_json(
     result: &BrainContextResult,
     limit: usize,
     token_budget: Option<usize>,
+    upstream: &UpstreamContextDisclosure,
 ) -> anyhow::Result<()> {
-    let resp = brain_context_json_value(result, limit, token_budget);
+    let resp = brain_context_json_value(result, limit, token_budget, upstream);
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
@@ -26142,9 +26217,13 @@ fn brain_context_json_value(
     result: &BrainContextResult,
     limit: usize,
     token_budget: Option<usize>,
+    upstream: &UpstreamContextDisclosure,
 ) -> serde_json::Value {
-    let total = result.connected.len();
-    let returned = limit.min(total);
+    let returned = limit.min(result.connected.len());
+    // On the direct route `result.connected` IS the pre-cut list, so its length
+    // is the total. On the daemon route it is what survived the daemon's cut,
+    // and the honest total came over the wire.
+    let total = upstream.total(result.connected.len(), returned);
     let truncated = returned < total;
     // The two CLI caps are mutually exclusive at every call site: the `cut`
     // above is `token_budgeted_truncate(..)` when `--token-budget` is set and
@@ -26179,6 +26258,13 @@ fn brain_context_json_value(
     if !result.expansion_terms.is_empty() {
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
+
+    // Federation provenance, passed through rather than regenerated — the CLI
+    // is not the layer that knows which upstreams answered. Absent on the
+    // direct route, which has exactly one source and never wrote a `_meta`.
+    if let Some(meta) = upstream.meta.as_ref() {
+        resp["_meta"] = meta.clone();
+    }
     resp
 }
 
@@ -26200,7 +26286,12 @@ mod context_json_renderer_tests {
 
     #[test]
     fn direct_brain_context_never_drops_semantic_honesty() {
-        let value = brain_context_json_value(&degraded_context(), 30, None);
+        let value = brain_context_json_value(
+            &degraded_context(),
+            30,
+            None,
+            &UpstreamContextDisclosure::default(),
+        );
         assert_eq!(value["semantic_applied"], false);
         assert_eq!(
             value["degraded_components"],
