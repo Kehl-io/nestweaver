@@ -185,15 +185,43 @@ fn claude_task_hook_entry() -> Value {
 /// `Task`-matcher PreToolUse hook to an existing settings document.
 ///
 /// `existing` is the current settings JSON (e.g. parsed
-/// `.claude/settings.local.json`); pass `Value::Null` or an empty object if
-/// there is none. The returned value is the settings document with the hook
-/// merged in idempotently — if a `Task` matcher already exists it is left
-/// untouched (no duplicates).
-pub fn compute_claude_hook_patch(existing: &Value) -> Value {
-    let mut settings = match existing {
-        Value::Object(_) => existing.clone(),
-        _ => json!({}),
+/// `.claude/settings.local.json`); pass an empty object if there is none. The
+/// returned value is the settings document with the hook merged in
+/// idempotently — if a `Task` matcher already exists it is left untouched (no
+/// duplicates).
+///
+/// ## Why this returns a `Result`
+///
+/// It used to map ANY non-object `Value` to `{}` and merge the hook into that,
+/// so a document it was handed came back as nothing but NestWeaver's hook. Its
+/// production caller is guarded by
+/// [`crate::user_config::read_json_config`], which refuses a non-object before
+/// this is reached — but the function is public, the discard was silent, and
+/// the next caller would have inherited it. A function that cannot discard its
+/// input does not depend on being called correctly, so the refusal moved here.
+///
+/// `Value::Null` is refused with the rest. It carries nothing to lose, but
+/// `read_json_config` already treats a settings file containing `null` as the
+/// user's and not this command's to replace, and one rule that holds
+/// everywhere beats two that nearly agree.
+pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Error> {
+    let Some(existing) = existing.as_object() else {
+        let kind = match existing {
+            Value::Array(_) => "an array",
+            Value::String(_) => "a string",
+            Value::Number(_) => "a number",
+            Value::Bool(_) => "a boolean",
+            Value::Null => "null",
+            Value::Object(_) => "an object",
+        };
+        anyhow::bail!(
+            "cannot merge the NestWeaver hook into {kind}: a settings document \
+             is a JSON object, and replacing whatever this is with one would \
+             discard it. Pass the parsed settings object, or an empty object \
+             when there are none."
+        );
     };
+    let mut settings = Value::Object(existing.clone());
 
     if let Some(obj) = settings.as_object_mut() {
         let hooks = obj
@@ -216,13 +244,13 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Value {
         }
     }
 
-    settings
+    Ok(settings)
 }
 
 /// Compute a hook patch for the given runtime.
 pub fn compute_hook_patch(runtime: Runtime, existing: &Value) -> Result<Value, anyhow::Error> {
     match runtime {
-        Runtime::Claude => Ok(compute_claude_hook_patch(existing)),
+        Runtime::Claude => compute_claude_hook_patch(existing),
     }
 }
 
@@ -365,7 +393,7 @@ mod tests {
 
     #[test]
     fn hook_patch_contains_task_matcher_and_command() {
-        let patch = compute_claude_hook_patch(&json!({}));
+        let patch = compute_claude_hook_patch(&json!({})).unwrap();
         let arr = patch["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array");
@@ -377,8 +405,8 @@ mod tests {
 
     #[test]
     fn hook_patch_is_idempotent() {
-        let once = compute_claude_hook_patch(&json!({}));
-        let twice = compute_claude_hook_patch(&once);
+        let once = compute_claude_hook_patch(&json!({})).unwrap();
+        let twice = compute_claude_hook_patch(&once).unwrap();
         let arr = twice["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
             arr.len(),
@@ -393,7 +421,7 @@ mod tests {
             "permissions": { "allow": ["Bash"] },
             "hooks": { "PreToolUse": [ { "matcher": "Edit", "hooks": [] } ] }
         });
-        let patch = compute_claude_hook_patch(&existing);
+        let patch = compute_claude_hook_patch(&existing).unwrap();
         assert_eq!(patch["permissions"]["allow"][0], "Bash");
         let arr = patch["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "existing Edit matcher kept, Task added");
@@ -697,5 +725,50 @@ mod tests {
         assert!(message.contains("gone.json"), "name it: {message}");
         assert!(message.contains("changed nothing"), "{message}");
         assert!(!missing.exists(), "nothing may be created out there");
+    }
+
+    /// nw-QUICK-2: `compute_claude_hook_patch` mapped any non-object `Value` to
+    /// `{}` and merged the hook into that, so a document it was handed was
+    /// discarded wholesale. Its production caller is guarded by
+    /// `read_json_config`, but the function is public and the next caller will
+    /// not be.
+    #[test]
+    fn a_non_object_document_is_refused_rather_than_replaced() {
+        for (existing, kind) in [
+            (json!(["keep", "me"]), "an array"),
+            (json!("keep me"), "a string"),
+            (json!(7), "a number"),
+            (json!(true), "a boolean"),
+            (Value::Null, "null"),
+        ] {
+            let error = compute_claude_hook_patch(&existing)
+                .expect_err("a non-object document is not this function's to replace");
+            let message = format!("{error:#}");
+            assert!(message.contains(kind), "name what it got: {message}");
+            assert!(
+                message.contains("discard"),
+                "say what refusing prevents: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_settings_file_is_created_with_only_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.local.json");
+        assert_eq!(
+            install_hook(Runtime::Claude, &path).unwrap(),
+            HookInstall::Installed
+        );
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    }
+
+    #[test]
+    fn presence_and_the_dry_run_delta_cannot_disagree() {
+        let empty = json!({});
+        assert!(!hook_already_present(Runtime::Claude, &empty).unwrap());
+        let installed = compute_hook_patch(Runtime::Claude, &empty).unwrap();
+        assert!(hook_already_present(Runtime::Claude, &installed).unwrap());
     }
 }
