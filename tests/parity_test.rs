@@ -3222,6 +3222,143 @@ fn stale_repos_is_the_same_list_on_every_route() {
     );
 }
 
+/// nw-365. Ranking staleness must be disclosed on ALL THREE routes, and this
+/// test asserts all three in one body ON PURPOSE.
+///
+/// The defect it pins existed because two of the three were covered. `hubs
+/// --json` (either route) carried `rankings_stale` / `stale_repos`, and
+/// `--no-daemon` plain text got `warn_stale_resolver_rankings`. The DEFAULT
+/// plain-text route — the one users actually run — emitted zero bytes on
+/// stderr, because non-JSON hybrid output never reaches `print_ranking_json`
+/// and its stderr counterpart tested the sidecar's PRESENCE rather than its
+/// VALUE:
+///
+/// ```ignore
+/// let sidecar = sidecar_path(db_path, RESOLVER_GENERATION_SIDECAR);
+/// if sidecar.exists() { return; }
+/// ```
+///
+/// That early return was correct for the only case that existed when it was
+/// written — a pre-nw-103 graph with no sidecar at all. Bumping
+/// `RESOLVER_GENERATION` 3 → 4 makes the sidecar EXIST and record a superseded
+/// generation on every pre-existing database, so the early return now swallows
+/// the common upgrade case rather than a rare one.
+///
+/// THE FIXTURE DOWNGRADES THE SIDECAR RATHER THAN DELETING IT, and that is the
+/// whole point. `forget_resolver_generation`-style deletion exercises the case
+/// the old code already caught, and would pass against the bug.
+#[test]
+fn stale_rankings_are_disclosed_on_all_three_routes_including_default_text() {
+    let fixture = setup_fixture();
+    let db = &fixture.db_path;
+
+    let recorded = downgrade_resolver_generation(db);
+    assert!(
+        recorded > 0,
+        "the fixture must have recorded at least one repo, or every leg below \
+         passes vacuously"
+    );
+
+    // Direct legs first: a running daemon holds the write lease.
+    let direct_json = parse_stdout(
+        "hubs --json (direct)",
+        &run_direct(db, &["hubs", "--json", "--top", "3"]),
+    );
+    let direct_text = run_direct(db, &["hubs", "--top", "3"]);
+
+    let _guard = DaemonGuard::new(db);
+    start_daemon(db);
+    let daemon_json = parse_stdout(
+        "hubs --json (daemon)",
+        &run_via_daemon(db, &["hubs", "--json", "--top", "3"]),
+    );
+    let daemon_text = run_via_daemon(db, &["hubs", "--top", "3"]);
+
+    // ── Route 1: `--json`, both legs. Already worked; asserted so a fix to
+    // route 3 cannot silently cost route 1.
+    for (label, payload) in [("direct", &direct_json), ("daemon", &daemon_json)] {
+        assert_eq!(
+            payload["rankings_stale"],
+            serde_json::json!(true),
+            "{label} --json: a sidecar recording a superseded generation is \
+             stale: {payload}"
+        );
+        assert!(
+            payload["stale_repos"]
+                .as_array()
+                .is_some_and(|repos| !repos.is_empty()),
+            "{label} --json: the payload must name which repos to re-index: {payload}"
+        );
+    }
+
+    // ── Routes 2 and 3: plain text, where the disclosure is stderr-only.
+    for (label, output) in [
+        ("--no-daemon text", &direct_text),
+        ("default text", &daemon_text),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: command failed: {stderr}");
+        assert!(
+            stderr.contains("indexed by an older resolver"),
+            "{label}: the user is shown a confidently stale ranking and told \
+             NOTHING. This is the route users actually run.\nstderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("nestweaver index --repo"),
+            "{label}: a disclosure without the remedy leaves the user stuck: \
+             {stderr:?}"
+        );
+    }
+
+    // ── `bridges` is downstream of the same edges, on the same default route.
+    let bridges_text = run_via_daemon(db, &["bridges", "--top", "3"]);
+    let bridges_stderr = String::from_utf8_lossy(&bridges_text.stderr);
+    assert!(
+        bridges_stderr.contains("indexed by an older resolver"),
+        "bridges (default text): fixing only `hubs` repeats the scoping error \
+         this test exists for: {bridges_stderr:?}"
+    );
+
+    // ── And the count must be the daemon's OWN answer, not a client-side
+    // re-derivation. `stale_repos` is the sole computation; the text route
+    // must agree with the payload route on the same database.
+    let stale_count = daemon_json["stale_repos"].as_array().unwrap().len();
+    let daemon_stderr = String::from_utf8_lossy(&daemon_text.stderr);
+    assert!(
+        daemon_stderr.contains(&format!("{stale_count} repo")),
+        "default text must report the same count the daemon put on its own \
+         payload ({stale_count}), not a weaker client-side recount: \
+         {daemon_stderr:?}"
+    );
+}
+
+/// Rewrite the generation sidecar so every recorded repo reads as the
+/// PREVIOUS generation, and return how many repos were downgraded.
+///
+/// This is how the upgrade case actually looks on a user's machine after
+/// `RESOLVER_GENERATION` is bumped: the file is present and well-formed, and
+/// every entry in it is behind. Removing the file instead produces a different
+/// state that the pre-fix code already handled, which is why the existing
+/// coverage did not catch this.
+fn downgrade_resolver_generation(db: &Path) -> usize {
+    let path = nestweaver_engine::sidecar_path(
+        db,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    );
+    let mut generations = nestweaver_engine::resolver_generation::load(db);
+    assert!(
+        !generations.repos.is_empty(),
+        "the fixture indexed nothing, so there is no sidecar to downgrade: {}",
+        path.display()
+    );
+    let stale = nestweaver_engine::resolver_generation::RESOLVER_GENERATION - 1;
+    for generation in generations.repos.values_mut() {
+        *generation = stale;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&generations).unwrap()).unwrap();
+    generations.repos.len()
+}
+
 // ─── nw-218: the three-route VALUE comparator ────────────────────────────────
 
 /// Compare the VALUES of named fields across all three routes.

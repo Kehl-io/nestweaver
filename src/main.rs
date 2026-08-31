@@ -1895,25 +1895,48 @@ fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &
 /// Daemon-path counterpart to [`warn_stale_resolver_rankings`].
 ///
 /// The daemon owns the store, so this path has no handle to enumerate repos
-/// and cannot report an exact stale count. It can still catch the case that
-/// matters most — and is the common one on upgrade — where the sidecar does not
-/// exist at all, meaning EVERY repo's edges predate the fix. Without this the
-/// warning would only ever appear on the direct path, which is the path users
-/// are told not to use.
-fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
-    let sidecar = nestweaver_engine::sidecar_path(
-        db_path,
-        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
-    );
-    if sidecar.exists() {
+/// and cannot supply the `of M` denominator the direct path prints. That is
+/// the ONLY thing it lacks: it takes the staleness verdict the caller already
+/// built, which on this route is [`ResolverStaleness::from_daemon_response`] —
+/// the daemon's own `stale_repos`, computed from `store.list_repos` (nw-358).
+///
+/// nw-365: this used to test the sidecar's PRESENCE and return early when the
+/// file existed:
+///
+/// ```ignore
+/// if sidecar.exists() { return; }
+/// ```
+///
+/// which was right while the only stale state was a pre-nw-103 graph with no
+/// sidecar at all. Bumping `RESOLVER_GENERATION` 3 → 4 makes the sidecar EXIST
+/// and record a superseded generation on EVERY pre-existing database, so the
+/// early return stopped catching a rare case and started swallowing the common
+/// one — silently, and only on non-JSON output, because hybrid text never
+/// reaches `print_ranking_json` where the real comparison lives. A user
+/// upgrading and running `nestweaver hubs` got confidently stale rankings and
+/// zero bytes on stderr.
+///
+/// Comparing the recorded generation is not re-implemented here.
+/// `ResolverGenerations::stale_repos` is the sole computation for every route
+/// and stays that way.
+fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
+    if !staleness.rankings_stale {
         return;
     }
-    eprintln!(
-        "warning: no resolver generation is recorded for this database, so every repo \
-         was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
-         rankings are NOT corrected by upgrading alone. Re-index each repo \
-         (`nestweaver index --repo <path>`) to get accurate rankings."
-    );
+    // `total: None` — see `staleness_note_for`. This route knows WHICH repos
+    // are stale but not how many exist, so it prints a floor rather than a
+    // denominator it cannot support.
+    match nestweaver_engine::resolver_generation::staleness_note_for(&staleness.stale_repos, None) {
+        Some(note) => eprintln!("warning: {note}"),
+        // Stale with nothing nameable: the sidecar is absent entirely, so
+        // there are no recorded repos to list. Every repo predates the record.
+        None => eprintln!(
+            "warning: no resolver generation is recorded for this database, so every repo \
+             was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
+             rankings are NOT corrected by upgrading alone. Re-index each repo \
+             (`nestweaver index --repo <path>`) to get accurate rankings."
+        ),
+    }
 }
 
 /// The ranking-staleness disclosure, as fields on a `--json` payload.
@@ -12674,17 +12697,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // stamp is carried to the printer rather than discarded and
                 // re-invented.
                 let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
+                // nw-358: read the answer the daemon already sent.
+                // nw-365: hoisted out of the `if json` branch. It used to be
+                // built inside it, which is precisely why the text route had
+                // no verdict to print and fell back to a sidecar-existence
+                // test that the generation bump made useless. ONE verdict,
+                // both renderings.
+                let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                 if json {
                     // nw-308: the daemon route is the DEFAULT route, so the
                     // payload disclosure has to be here as well as on the
                     // direct path below.
-                    print_ranking_json(
-                        "hubs",
-                        &hubs,
-                        // nw-358: read the answer the daemon already sent.
-                        &ResolverStaleness::from_daemon_response(&value, &db_path),
-                        daemon_meta,
-                    )?;
+                    print_ranking_json("hubs", &hubs, &staleness, daemon_meta)?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
@@ -12709,7 +12733,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // disclosure has to live here too — otherwise it
                 // only ever fires on the direct path users are
                 // told not to use.
-                warn_stale_resolver_rankings_no_store(&db_path);
+                warn_stale_resolver_rankings_no_store(&staleness);
                 let stats = format!(
                     "{} hubs in {} (via hybrid)",
                     value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -12841,7 +12865,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     // nw-124: bridges are downstream of the same import
                     // fan-out nw-103 fixed, so they carry the same staleness.
-                    warn_stale_resolver_rankings_no_store(&db_path);
+                    // nw-365: the same verdict the payload leg prints, so the
+                    // two renderings cannot disagree.
+                    warn_stale_resolver_rankings_no_store(&staleness);
                     let stats = format!(
                         "{} bridges in {} (via daemon)",
                         bridges.len(),

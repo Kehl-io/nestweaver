@@ -157,16 +157,39 @@ pub fn record(db_path: &Path, repo_uid: &str) -> Result<(), anyhow::Error> {
 pub fn staleness_note(db_path: &Path, repo_uids: &[String]) -> Option<String> {
     let gens = load(db_path);
     let stale = gens.stale_repos(repo_uids.iter().map(|s| s.as_str()));
+    staleness_note_for(&stale, Some(repo_uids.len()))
+}
+
+/// The same caveat, rendered from an ALREADY-COMPUTED stale set.
+///
+/// nw-365. The daemon path holds no store handle and cannot enumerate repos,
+/// so it cannot supply the `of M` denominator — but it is NOT reduced to
+/// guessing, because `attach_ranking_staleness` already ships the exact
+/// `stale_repos` on every `hub_nodes` / `bridge_nodes` reply. Splitting the
+/// renderer from the computation lets that route print the same sentence from
+/// the answer it was sent, instead of a fourth hand-written one that would
+/// drift from this one the first time either is edited.
+///
+/// `total` is `None` where the population is genuinely unknown. It is rendered
+/// as a floor ("N repo(s) are known to have been") rather than by inventing a
+/// denominator, because on that route `stale_repos` can UNDER-count: the
+/// sidecar fallback for a pre-`attach_ranking_staleness` daemon sees only the
+/// repos the sidecar records, and a repo present in the graph but absent from
+/// the sidecar is stale and invisible to it. Claiming "N of N" there would be
+/// a number this code cannot support.
+pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<String> {
     if stale.is_empty() {
         return None;
     }
+    let scope = match total {
+        Some(total) => format!("{} of {total} repo(s) were", stale.len()),
+        None => format!("{} repo(s) are known to have been", stale.len()),
+    };
     Some(format!(
-        "{} of {} repo(s) were indexed by an older resolver, so their edges predate \
+        "{scope} indexed by an older resolver, so their edges predate \
          the nw-103 import-fan-out fix — hub, bridge and PageRank rankings for those \
          repos are NOT corrected by upgrading alone. Re-index them \
-         (`nestweaver index --repo <path>`) to get accurate rankings.",
-        stale.len(),
-        repo_uids.len()
+         (`nestweaver index --repo <path>`) to get accurate rankings."
     ))
 }
 
