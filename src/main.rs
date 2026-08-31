@@ -486,6 +486,76 @@ enum CliDiagnostic {
         )
     )]
     DatabaseNoSchema { path: String, detail: String },
+    /// nw-367. A read-only open refused by checkpoint artifacts that no
+    /// process is holding.
+    ///
+    /// Round 2 deliberately declined to classify the engine's message, because
+    /// a checkpoint genuinely can be in progress and an unconditional
+    /// attribution is nw-333's error. It IS decidable — see
+    /// `nestweaver_daemon::lifecycle::checkpoint_artifacts`, which reads the
+    /// same POSIX record locks the engine takes and only says DEBRIS when both
+    /// checkpoint locks and the database write lock are PROVABLY free.
+    ///
+    /// This is deliberately NOT `DatabaseWalCorrupt`, and the difference is
+    /// data loss. That runbook moves `<db>.wal.checkpoint` and `<db>.shadow`
+    /// aside; a frozen WAL holds COMMITTED transactions not yet applied to the
+    /// data file, so moving it aside discards them and its step 4 then demands
+    /// a full re-index. A read-write open replays the frozen log and removes
+    /// the debris itself, losing nothing — the engine's own recovery path
+    /// (`replayFrozenWAL`), not a remedy composed here.
+    ///
+    /// The remedy was EXECUTED before it shipped, on a scratch database in the
+    /// reproduced state: a read-only open refused, one read-write open cleared
+    /// `<db>.wal.checkpoint`, and the read-only open then succeeded with the
+    /// graph intact and no re-index. If the frozen log is itself damaged the
+    /// read-write open reports `db_wal_corrupt` with the runbook — also
+    /// verified — so the instruction lands somewhere honest either way.
+    ///
+    /// It is also NOT `is_stale_checkpoint_error` (`db.rs`), whose predicate is
+    /// `"wal.checkpoint"` AND `"does not match"`. This message contains neither.
+    #[error("Read-only open of {path} is blocked by checkpoint artifacts that no process holds")]
+    #[diagnostic(
+        code(nestweaver::db_checkpoint_debris),
+        help(
+            "No process holds either checkpoint lock or the database write lock, \
+             so no checkpoint is in progress: {artifacts} is debris left by a \
+             crash during one, and it will not clear on its own. Open the \
+             database READ-WRITE once and the engine replays the frozen log and \
+             removes the debris itself: `nestweaver daemon --db {path} start`. \
+             Do NOT move these files aside — a frozen write-ahead log holds \
+             committed transactions, and discarding it loses them."
+        )
+    )]
+    DatabaseCheckpointDebris { path: String, artifacts: String },
+    /// nw-360. Two individually VALID enum values whose combination is not
+    /// supported.
+    ///
+    /// `PossibleValuesParser` is per-argument and cannot see the other one, so
+    /// clap — which closed the spelling half of nw-312 — structurally cannot
+    /// express this. Before this variant the refusal reached the user as
+    /// `export_graph RPC failed: Client specified an invalid argument`: the
+    /// daemon's own good sentence, wrapped in a transport error, in a
+    /// `CliDiagnostic::General` with no code and no help. The direct route
+    /// refused with a bare `anyhow::bail!`, which is invisible to
+    /// `diagnostic_inventory` for the same reason `repair`'s `eprintln!` was.
+    ///
+    /// Exit code stays 1, deliberately. `d565547f` decided one round ago, with
+    /// its rationale preserved in the item, that this is a SEMANTIC refusal
+    /// rather than a usage error; reversing that without new evidence would
+    /// leave two rounds of contradictory reasoning in the record. The defect
+    /// nw-360 names is the SHAPE of the refusal, and a named condition with a
+    /// followable remedy fixes exactly that.
+    #[error("`--format {format}` cannot represent `--scope {scope}`")]
+    #[diagnostic(
+        code(nestweaver::export_scope_unsupported),
+        help(
+            "Both values are valid; this pair is not: {format} is code-only and \
+             cannot represent the vault subgraph. Use `--format graphml` for \
+             `--scope vault`, or drop `--scope vault` to export the code \
+             subgraph with {format}."
+        )
+    )]
+    ExportScopeUnsupported { format: String, scope: String },
 
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
@@ -686,6 +756,30 @@ fn corruption_diagnostic(
 /// into a `miette::Report` with rich diagnostic information (help text, error
 /// code). Falls back to a plain `miette::Report` for unrecognised errors.
 fn into_diagnostic(err: anyhow::Error) -> miette::Report {
+    // nw-360. An error that ALREADY IS a `CliDiagnostic` passes through
+    // unchanged. A call site that knows exactly which condition it has should
+    // be able to say so rather than composing prose for the classifier to
+    // re-derive — which is the shrink-the-domain move nw-334/G3 asks for, and
+    // the only way a refusal raised BEFORE a route split can carry a code.
+    //
+    // Above the typed-store branch because it is more specific: this is the
+    // CLI's own verdict, not an inference about someone else's error.
+    if let Some(diagnostic) = err.downcast_ref::<CliDiagnostic>() {
+        return match diagnostic {
+            CliDiagnostic::ExportScopeUnsupported { format, scope } => {
+                CliDiagnostic::ExportScopeUnsupported {
+                    format: format.clone(),
+                    scope: scope.clone(),
+                }
+                .into()
+            }
+            // Every other variant is currently produced BY this function rather
+            // than raised as an error, so there is nothing to pass through.
+            // A variant that starts being raised directly adds its arm here.
+            _ => miette::Report::msg(redact_build_paths(&format!("{err:#}"))),
+        };
+    }
+
     // nw-346. Ask the TYPE before asking the prose. `StoreError::Corruption`
     // is classified once, at the FFI boundary, so an error that reached here
     // with its source chain intact already knows what it is. The text arms
@@ -787,6 +881,38 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
             cause: message,
         }
         .into();
+    }
+
+    // nw-367. ONE engine sentence — "Cannot open database in read-only mode
+    // while checkpoint is in progress. Please retry later." — is raised from
+    // two sites with opposite remedies. One requires a genuinely held `fcntl`
+    // write lock; the other fires on pure file existence of
+    // `<db>.wal.checkpoint` / `<db>.shadow` and consults no process at all.
+    //
+    // Round 2 refused to classify it, correctly, because attributing it
+    // unconditionally to debris would be nw-333's error pointing the other way.
+    // It IS decidable, so the classification is gated on EVIDENCE rather than
+    // on the substring: `checkpoint_artifacts` says `Debris` only when both
+    // checkpoint locks AND the database write lock are PROVABLY free, and
+    // `Unknown` on any probe keeps today's transient message. A live checkpoint
+    // therefore still reads as transient, which is the half that makes this
+    // honest.
+    //
+    // Note what this arm deliberately does NOT do: reach the corrupt-WAL
+    // runbook. That runbook moves the frozen WAL aside, which DISCARDS
+    // committed transactions; a read-write open replays it instead.
+    if lower.contains("checkpoint is in progress") {
+        let path = extract_db_path(&message);
+        if let nestweaver_daemon::lifecycle::CheckpointArtifacts::Debris { artifacts } =
+            nestweaver_daemon::lifecycle::checkpoint_artifacts(std::path::Path::new(&path))
+        {
+            let artifacts = artifacts
+                .iter()
+                .map(|artifact| redact_build_paths(&artifact.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return CliDiagnostic::DatabaseCheckpointDebris { path, artifacts }.into();
+        }
     }
 
     if lower.contains("database not found")
@@ -9597,6 +9723,37 @@ fn repair_open_failure(db_path: &Path, error: nestweaver_store::StoreError) -> a
     ))
 }
 
+/// nw-359 leg (2). The failure of `repair`'s READ-ONLY health probe.
+///
+/// Separate from [`repair_open_failure`], whose three answers are all about a
+/// read-write open that `repair` needed in order to WRITE. This probe writes
+/// nothing; it exists so `repair` cannot exit 0 over a database it never
+/// opened. Reusing the other function's prose would have told the operator that
+/// a read-write open failed when none was attempted.
+///
+/// Two things are load-bearing and neither is decoration:
+///
+///   * `with_db_path` — so a typed `StoreError::Corruption` names THIS database
+///     in the runbook rather than leaving `into_diagnostic` to guess a path out
+///     of prose (`daemon_held_store_error` records what guessing cost).
+///   * the phrase `database at {path}` — the shape `extract_db_path` parses, so
+///     an UNTYPED refusal (nw-367's checkpoint debris carries no
+///     `CorruptionKind`, deliberately: it is debris, not corruption) still
+///     reaches its classifier with the right path to probe.
+fn repair_probe_failure(db_path: &Path, error: nestweaver_store::StoreError) -> anyhow::Error {
+    // The path goes LAST in this sentence on purpose. `extract_db_path` takes
+    // everything between "database at " and the next `:`, and anyhow's `{:#}`
+    // joins context to source with ": " — so a path in the middle of a clause
+    // captures the rest of the clause with it, and the classifier then probes a
+    // directory that does not exist. Ending on the path makes the join itself
+    // the delimiter.
+    anyhow::Error::new(error.with_db_path(db_path)).context(format!(
+        "the index publication marker is clean, but `repair` cannot report that \
+         there is nothing to repair: it could not open the database at {}",
+        db_path.display()
+    ))
+}
+
 fn run_repair_index_publication(
     db_path: &std::path::Path,
     json: bool,
@@ -9624,7 +9781,36 @@ fn run_repair_index_publication(
 
     let recovered = outcome.as_ref().is_some_and(|o| o.recovered());
     let after = pubstat::status(db_path);
-    let exit = if !after.dirty {
+
+    // nw-359 leg (2). If we never opened the database, we have not established
+    // anything about it — and `exit` below is about to say `EXIT_SUCCESS`.
+    //
+    // A corrupt-WAL database whose publication marker happens to be CLEAN never
+    // enters the block above, so `open_error` stays `None` and `repair` printed
+    // three true sentences and exited 0. Every sentence WAS true; the exit code
+    // was the lie, and exit 0 is the one answer an unattended caller acts on.
+    //
+    // Deliberately READ-ONLY. `repair`'s subject is a sidecar marker, so it
+    // must not take the writer lock away from a live daemon merely to answer a
+    // question.
+    //
+    // Lock contention is deliberately NOT a failure here: another process
+    // holding the write lock says nothing about the database's health, and
+    // failing `repair` for it would refuse a healthy database whenever the
+    // daemon is up. Everything else IS: an unreadable log, a truncated file, an
+    // engine assertion, and nw-367's checkpoint debris all reach the classifier
+    // through the funnel below with their own remedy. This is why nw-367 had to
+    // land first — without its discriminator, a frozen WAL would arrive here
+    // with no classification at all.
+    if open_error.is_none()
+        && outcome.is_none()
+        && let Err(error) = nestweaver_store::GraphStore::open_read_only(db_path)
+        && !error.is_lock_contention()
+    {
+        open_error = Some(repair_probe_failure(db_path, error));
+    }
+
+    let exit = if !after.dirty && open_error.is_none() {
         EXIT_SUCCESS
     } else {
         EXIT_ERROR
@@ -9658,6 +9844,20 @@ fn run_repair_index_publication(
 
     println!("Database: {}", db_path.display());
     println!("Marker:   {}", status.marker_path);
+    // nw-359 leg (2). Before declaring anything clean, surrender to the probe
+    // above. "The marker is clean" is true and is not the same claim as "there
+    // is nothing to repair", which is what exit 0 conveys.
+    //
+    // nw-333 (fourth defect). This is a `return Err`, not an `eprintln!`,
+    // because a bare print never becomes a `CliDiagnostic` and never passes
+    // through `into_diagnostic` — which made
+    // `no_permanent_diagnostic_advises_waiting_it_out`, the exhaustive
+    // inventory built for exactly this class of remedy, STRUCTURALLY BLIND to
+    // it. Returning the error puts it on the one funnel every other CLI failure
+    // uses, so it is classified, redacted and covered.
+    if let Some(error) = open_error {
+        return Err(error);
+    }
     if !status.dirty {
         println!("Index publication is CLEAN — nothing to repair.");
         return Ok(exit);
@@ -9685,16 +9885,6 @@ fn run_repair_index_publication(
     if dry_run {
         println!("--dry-run: nothing was changed.");
         return Ok(exit);
-    }
-    if let Some(error) = open_error {
-        // nw-333 (fourth defect). This used to be a bare `eprintln!`, so the
-        // message never became a `CliDiagnostic` and never passed through
-        // `into_diagnostic` — which means
-        // `no_permanent_diagnostic_advises_waiting_it_out`, the exhaustive
-        // inventory built for exactly this class of remedy, was STRUCTURALLY
-        // BLIND to it. Returning the error puts it on the one funnel every
-        // other CLI failure uses, so it is classified, redacted and covered.
-        return Err(error);
     }
     if let Some(outcome) = outcome {
         println!("{}", outcome.describe());
@@ -10677,6 +10867,35 @@ fn require_exclusive_store_access(
             db_path.display()
         ),
     }
+}
+
+/// nw-366. ONE sentence for the frontmatter-backfill deficit, rendered by both
+/// `brain status` routes.
+///
+/// `frontmatter_raw` was added by `ALTER TABLE ... ADD ... DEFAULT ''`, which
+/// populates the COLUMN and not the DATA. Every note indexed by 8.0.0 reads
+/// back empty, both regex collectors `continue` past it, and the upgrader keeps
+/// nw-298's symptom on a binary that contains the fix. Nothing said so.
+///
+/// THE REMEDY WAS EXECUTED BEFORE IT SHIPPED. The item proposed
+/// `brain add --force`; there is no `--force` on `Add` or on `Refresh`, so
+/// printing it would have been this project's signature defect appearing inside
+/// the fix for it. `brain refresh <root>` drops and re-indexes every note in
+/// the vault — there is no unchanged-file short-circuit on the vault path — and
+/// `a_pre_column_note_is_disclosed_and_the_printed_remedy_actually_fixes_it`
+/// runs it and measures the count falling to zero.
+///
+/// Shared rather than restated: the daemon-served route renders a JSON row and
+/// the direct route renders a `Vault`, and two spellings of one remedy is
+/// exactly how a remedy drifts out of date on one route only.
+fn frontmatter_backfill_warning(root_path: &str, count: u64) -> String {
+    let notes = if count == 1 { "note" } else { "notes" };
+    format!(
+        "      ! {count} {notes} predate frontmatter indexing: their frontmatter \
+         text is NOT searchable (`regex-search` cannot match it, and \
+         `brain search` will not surface it). Re-index this vault to repair it: \
+         `nestweaver brain refresh {root_path}`"
+    )
 }
 
 /// Render a count that may be UNKNOWN.
@@ -13328,7 +13547,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Publication { command } => run_publication(command, no_embed).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
-        Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
+        // nw-359 leg (3). `use_daemon` is resolved ONCE, at the top of `run`,
+        // and this arm used to drop it — so every `instance` subcommand that
+        // connects did so unconditionally, including where the bypass had been
+        // granted.
+        Commands::Instance { command } => run_instance(command, use_daemon).map(|c| (c, None)),
         Commands::Config { command } => run_config(command),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::RtsEval { command } => run_rts_eval(command),
@@ -13658,6 +13881,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             require_existing_db(db_path)?;
+
+            // nw-360. ABOVE the route split, deliberately. This is the only
+            // placement where the daemon and direct routes cannot diverge, and
+            // they already diverged once on this exact argument — the daemon
+            // refused a vault scope while the direct path emitted a code-only
+            // file and reported success.
+            //
+            // It also means an argument-only refusal never starts a daemon to
+            // deliver itself, and the caller sees the CONDITION's words instead
+            // of the transport's.
+            //
+            // `scope.parse()` is not used here: an INVALID scope is clap's
+            // business and already exits 64 at parse time (`d565547f`), so
+            // matching the accepted string keeps this check about the
+            // combination and nothing else.
+            if format == "msgpack" && scope == "vault" {
+                return Err(anyhow::Error::new(CliDiagnostic::ExportScopeUnsupported {
+                    format: format.clone(),
+                    scope: scope.clone(),
+                }));
+            }
 
             // Route through daemon when available.
             if use_daemon {
@@ -20971,6 +21215,23 @@ fn run_brain(
                                     "    - {name} ({note_count} notes, last indexed: {last_indexed})"
                                 );
                             }
+                            // nw-366. Only on a POSITIVE count. `null` means
+                            // the note scan came back short, and a deficit
+                            // derived from a partial read is not a deficit —
+                            // that is `note_count`'s own rule one line above.
+                            if let Some(deficit) = v
+                                .get("notes_predating_frontmatter_indexing")
+                                .and_then(|value| value.as_u64())
+                                .filter(|count| *count > 0)
+                            {
+                                println!(
+                                    "{}",
+                                    frontmatter_backfill_warning(
+                                        v["root_path"].as_str().unwrap_or("<this vault>"),
+                                        deficit,
+                                    )
+                                );
+                            }
                         }
                     }
                     // nw-249(a): `unwrap_or(0)` collapsed a DELIBERATE null.
@@ -21193,16 +21454,31 @@ fn run_brain(
                     // it becomes an empty Vec and then a confident `0`. The
                     // MCP route logs the failure and emits null; this route
                     // silently agreed that the vault was empty.
-                    let vault_note_count = match store.list_notes(Some(&v.uid)) {
-                        Ok(notes) => notes.len().to_string(),
-                        Err(error) => {
-                            tracing::warn!(
-                                vault = %v.uid,
-                                "per-vault note count unavailable: {error}"
-                            );
-                            render_optional_count(Some(&serde_json::Value::Null))
-                        }
-                    };
+                    // nw-366. The backfill deficit is counted from the notes
+                    // this read already returned rather than by a second query,
+                    // and it is `None` on the failure path for the same reason
+                    // the count is `unavailable` there: a deficit derived from
+                    // a read that failed is not a deficit.
+                    let (vault_note_count, frontmatter_deficit) =
+                        match store.list_notes(Some(&v.uid)) {
+                            Ok(notes) => {
+                                let deficit = notes
+                                    .iter()
+                                    .filter(|note| {
+                                        nestweaver_store::GraphStore::
+                                            note_predates_frontmatter_indexing(note)
+                                    })
+                                    .count() as u64;
+                                (notes.len().to_string(), Some(deficit))
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    vault = %v.uid,
+                                    "per-vault note count unavailable: {error}"
+                                );
+                                (render_optional_count(Some(&serde_json::Value::Null)), None)
+                            }
+                        };
                     let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
                     let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
@@ -21222,6 +21498,9 @@ fn run_brain(
                             "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
                             v.name
                         );
+                    }
+                    if let Some(deficit) = frontmatter_deficit.filter(|count| *count > 0) {
+                        println!("{}", frontmatter_backfill_warning(&v.root_path, deficit));
                     }
                 }
                 println!("  Notes:     {note_count}");
@@ -24316,6 +24595,8 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
             CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
+            CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
+            CliDiagnostic::ExportScopeUnsupported { .. } => "export_scope_unsupported",
             CliDiagnostic::General { .. } => "error",
         }
     }
@@ -24413,6 +24694,38 @@ mod cli_help_contract_tests {
                 WriteRemedy::Allowed,
                 Remedy::Invocation,
             ),
+            (
+                // nw-367. Debris from a crashed checkpoint. `Clears::Never` is
+                // the whole point of the item: the engine's own message says
+                // "Please retry later" for a state that nothing later removes,
+                // and every retry gets the identical refusal. The remedy is one
+                // read-write open, which is an invocation, and it was run
+                // against the reproduced state before this row was written.
+                CliDiagnostic::DatabaseCheckpointDebris {
+                    path: sample("d"),
+                    artifacts: sample("d.wal.checkpoint"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Invocation,
+            ),
+            (
+                // nw-360. Argument-derived and permanent: the same invocation
+                // is refused forever, and no wait changes that. The remedy is a
+                // different argument, which is a change to the invocation the
+                // caller is already writing — the same reason
+                // `RepoPathNotADirectory` carries this string.
+                CliDiagnostic::ExportScopeUnsupported {
+                    format: sample("msgpack"),
+                    scope: sample("vault"),
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction(
+                    "the fix is to pass a different argument, which is a change \
+                     to the invocation the caller is already writing",
+                ),
+            ),
             // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
             // said, so no static tier can check it — nw-334/G3.
             (
@@ -24454,7 +24767,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            10,
+            12,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );
@@ -27025,7 +27338,68 @@ fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> 
     }
 }
 
-fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
+/// nw-359 leg (3). Disclose that a daemon-only operation cannot honour a
+/// GRANTED bypass, and name what that costs.
+///
+/// `instance merge` and `instance remove --purge-graph` exist only as daemon
+/// RPCs: the server side runs migration journals, extension-metadata
+/// preparation, search reconciliation and node-graph deletion finalisation
+/// around the store call. There is no direct implementation and there must not
+/// be one — a ~300-line CLI twin of that orchestration is the exact shape the
+/// twin rule forbids, and it would drift on the first change to either side.
+///
+/// # Why this WARNS instead of refusing, which is a reversal
+///
+/// Refusing was the first shape of this fix, and the end-to-end remedy harness
+/// disproved it in one run. `instance merge` is not merely a command a user may
+/// choose to run — it is a remedy this product PRINTS, from the multi-instance
+/// refusal, with the instance names substituted in.
+/// `multi_instance_refusal_emits_a_runnable_consolidation_command` runs exactly
+/// that printed string, under a granted bypass, and asserts that it works. A
+/// refusal would have made a shipped remedy un-runnable, which is a fresh
+/// instance of the class this lane exists to close (nw-334, nw-328). Trading
+/// one defect for a worse one is not a fix.
+///
+/// # What is disclosed, and the limit of it
+///
+/// The command proceeds and may auto-start a daemon. What changes is that this
+/// is no longer SILENT: the auto-started daemon holds the database write lease
+/// for its idle timeout (default 3600s), and that is what blocks the follow-up
+/// `index` which merge's own remedy (`merge_reindex_guidance`) prescribes. The
+/// same interaction is already worked around BY HAND in
+/// `tests/error_remedy_test.rs`, whose comment records the hour-long lease and
+/// stops the daemon itself — independent confirmation of the harm, written by
+/// someone who hit it. This message gives the operator what that test gave
+/// itself.
+///
+/// It does NOT release the lease, and that limit is stated rather than implied.
+/// The complete fix is to stop a daemon THIS command started, which needs a
+/// "did I start it?" answer `ensure_daemon` does not return, and a reusable
+/// stop path that exists today only as the body of the `daemon stop` arm.
+/// Reimplementing that here would be the twin this doc comment just argued
+/// against.
+///
+/// This does NOT fire on bare `NESTWEAVER_NO_DAEMON=1`. `resolve_use_daemon`
+/// grants the bypass only on `NESTWEAVER_ALLOW_NO_DAEMON`, so a request that
+/// policy refused still routes through the daemon, correctly — which is the
+/// half the item had backwards.
+fn warn_daemon_route_unavoidable(operation: &str, db_path: &Path, use_daemon: bool) {
+    if use_daemon {
+        return;
+    }
+    eprintln!(
+        "Warning: `{operation}` runs entirely inside the daemon — migration \
+         journal, extension metadata, search reconciliation — and has no direct \
+         implementation, so the daemon bypass you granted cannot be honoured \
+         here and a daemon may be started.\n  \
+         That daemon holds the database write lease for its idle timeout, which \
+         will block a following bypassed write against {0}. Release it with: \
+         `nestweaver daemon --db {0} stop`",
+        db_path.display()
+    );
+}
+
+fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         InstanceCommands::Identity { db, json } => {
             let db_path = db.unwrap_or_else(default_db_path);
@@ -27180,6 +27554,15 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 println!("Removed instance '{id}' from registry");
             }
             if let Some(db_path) = db_path {
+                // The same seam as `merge`: `purge_instance` is a server-side
+                // streaming RPC with no direct twin. Checked here rather than
+                // beside the `--purge-graph` parse because the registry removal
+                // above must still happen without a daemon.
+                warn_daemon_route_unavoidable(
+                    "instance remove --purge-graph",
+                    &db_path,
+                    use_daemon,
+                );
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt
                     .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
@@ -27238,6 +27621,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             // autostart a daemon that creates an empty DB and false-greens
             // ("No rows found").
             require_existing_db(&db_path)?;
+            warn_daemon_route_unavoidable("instance merge", &db_path, use_daemon);
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
                 .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))

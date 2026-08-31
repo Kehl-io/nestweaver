@@ -63,6 +63,15 @@ use std::path::Path;
 ///     added); every reference's persisted `context` changes; and svelte/vue/
 ///     astro named exports change `SymbolKind`, which the degenerate-span
 ///     fallback gates on. All of it is on-disk shape.
+///     nw-349 cause 3: `queries/rust.scm` had no attribute capture of any
+///     kind, so `#[serde(default = "f")]` — 97 sites and 31 distinct named
+///     functions in this repo alone — produced NO reference and the named
+///     function had in-degree 0. Adding edges that did not exist changes edge
+///     shape, and nothing on an already-indexed repo can acquire them: the
+///     edge set is on disk without them. Without this bump the fix is
+///     invisible to every existing graph, which is the trap this module exists
+///     for and which this codebase has now sprung twice (nw-103, and again in
+///     round 3).
 pub const RESOLVER_GENERATION: u32 = 4;
 
 /// An unrecorded repo reads as generation 0, so the current generation must

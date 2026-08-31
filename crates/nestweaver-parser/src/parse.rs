@@ -7776,3 +7776,109 @@ mod reachability_recovery_tests {
         assert_eq!(reads(&parsed), vec!["REPO_ORDER"]);
     }
 }
+
+/// nw-349, cause 3. `queries/rust.scm` had no attribute capture of any kind —
+/// no `attribute_item`, no `attribute`, no `token_tree`, no `string_literal` —
+/// so `#[serde(default = "f")]` produced NO reference and `f` had in-degree 0.
+///
+/// Measured over this repository's own tracked `.rs` files before the rule:
+/// 97 serde attribute sites naming a function as a string, 31 distinct
+/// user-defined names inside them, and 12 of those 31 with no ordinary call
+/// site anywhere in the workspace. Twelve guaranteed `dead-code` false
+/// positives on NestWeaver's own source, from this one gap.
+#[cfg(test)]
+mod attribute_string_reference_tests {
+    use super::*;
+
+    fn calls(source: &str) -> Vec<String> {
+        let parsed = parse_source(Path::new("t.rs"), source).expect("parse");
+        let mut names: Vec<String> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_function_named_only_by_a_serde_attribute_is_still_referenced() {
+        // `default` is the dominant spelling and is a CONTEXTUAL KEYWORD, so
+        // tree-sitter tokenises it as an anonymous node rather than an
+        // `identifier`. A rule that matched only identifiers would have closed
+        // almost nothing while appearing to work — all twelve measured false
+        // positives are `default = "..."`.
+        assert_eq!(
+            calls(
+                r#"
+                struct Config {
+                    #[serde(default = "default_limit")]
+                    limit: usize,
+                    #[serde(skip_serializing_if = "is_empty")]
+                    tags: Vec<String>,
+                    #[serde(deserialize_with = "de_duration", serialize_with = "ser_duration")]
+                    timeout: u64,
+                }
+                "#
+            ),
+            vec!["de_duration", "default_limit", "is_empty", "ser_duration"],
+        );
+    }
+
+    /// THE COUNTERWEIGHT, and without it this rule fabricates edges rather than
+    /// finding them. Every one of these carries a string literal inside an
+    /// attribute, and not one of them names a symbol. A blanket
+    /// `(string_literal) @reference.call` inside any attribute — the obvious
+    /// form of this fix — would mint a reference for all of them, and a
+    /// fabricated edge is worse than a missing one because a caller cannot tell
+    /// it from a real one.
+    #[test]
+    fn attribute_strings_that_name_nothing_mint_no_reference() {
+        let names = calls(
+            r#"
+            #[derive(Debug, thiserror::Error, Diagnostic)]
+            enum E {
+                #[error("Database not found: {path}")]
+                #[diagnostic(code(nestweaver::db_not_found), help("Run `nestweaver index`"))]
+                NotFound { path: String },
+            }
+
+            #[serde(rename_all = "camelCase")]
+            struct Wire {
+                #[serde(rename = "camelCase")]
+                snake_case: String,
+            }
+
+            struct Args {
+                #[arg(long, help = "Path to the database file", default_value = "3600")]
+                idle_timeout: u64,
+            }
+            "#,
+        );
+        assert!(
+            names.is_empty(),
+            "an attribute string that names no symbol must mint no edge — \
+             `rename`, `rename_all`, `help`, `default_value`, an `#[error]` \
+             message and a `#[diagnostic]` code are all strings that name \
+             nothing: {names:?}"
+        );
+    }
+
+    /// `default_value` and `default` are one character apart and mean opposite
+    /// things: `default_value` is a clap LITERAL, `default` is a serde
+    /// FUNCTION PATH. Pinned separately because an allow-list matched with a
+    /// prefix rather than an anchored alternation would silently swallow it,
+    /// and the assertion above would still pass on the other rows.
+    #[test]
+    fn default_value_is_a_literal_and_default_is_a_path() {
+        assert_eq!(
+            calls(r#"struct A { #[arg(default_value = "3600")] t: u64 }"#),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            calls(r#"struct A { #[serde(default = "default_timeout")] t: u64 }"#),
+            vec!["default_timeout"],
+        );
+    }
+}

@@ -6843,3 +6843,714 @@ fn a_context_budget_cut_names_the_budget_and_a_limit_cut_names_the_limit() {
          satisfy the assertions above: {stderr}"
     );
 }
+
+/// nw-366. `frontmatter_raw` is an additive column populated by
+/// `ALTER TABLE ... DEFAULT ''`, which fills the COLUMN and not the DATA. Every
+/// note indexed by 8.0.0 therefore reads back empty, both regex collectors
+/// `continue` past it, and an upgrader who does not re-index keeps nw-298's
+/// symptom on a binary that contains the fix — silently.
+///
+/// Two halves, and the second is the one this project keeps getting wrong:
+///
+///  1. `brain status` must DISCLOSE the deficit, and
+///  2. the remedy it prints must be EXECUTED here, not asserted as a string.
+///
+/// The ticket proposed `brain add --force`. There is no `--force` on `Add` or
+/// on `Refresh` — shipping that string would have reintroduced the exact class
+/// of defect (nw-328, nw-318, nw-259a) this fix is disclosing. `brain refresh
+/// <root>` is run below and its effect is measured.
+#[test]
+fn a_pre_column_note_is_disclosed_and_the_printed_remedy_actually_fixes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("note.md"),
+        "---\nstatus: loadbearingtoken\n---\n\n# A note\n\nBody text.\n",
+    )
+    .unwrap();
+    let db = dir.path().join("scratch.lbug");
+
+    // A real index, so the row shape is the product's own and not a fixture's.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Now reproduce the pre-column state exactly: the Note row keeps its parsed
+    // `frontmatter` (8.0.0 wrote that) and loses `frontmatter_raw` (the column
+    // did not exist). `content_hash` is PRESERVED — so this also tests the
+    // claim the remedy rests on, that the vault path has no unchanged-file
+    // short-circuit. If `brain refresh` skipped the file, the assertions below
+    // would fail and the remedy would be wrong.
+    {
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1, "precondition: one indexed note");
+        for note in notes {
+            assert!(
+                note.frontmatter_raw.is_some(),
+                "precondition: this binary DOES write frontmatter_raw"
+            );
+            store.delete_note_cascade(&note.uid).unwrap();
+            let mut legacy = note.clone();
+            legacy.frontmatter_raw = None;
+            store.insert_note(&legacy).unwrap();
+        }
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            1,
+            "precondition: the deficit is present"
+        );
+    }
+
+    // Half 1 — the deficit is DISCLOSED, and the disclosure names the vault the
+    // remedy has to be pointed at.
+    let status = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        rendered.contains("brain refresh"),
+        "a deficit nobody can see is the defect itself: {rendered}"
+    );
+    assert!(
+        rendered.contains(vault.to_str().unwrap()),
+        "and the remedy must name WHICH vault to refresh: {rendered}"
+    );
+    assert!(
+        !rendered.contains("--force"),
+        "there is no --force on `brain add` or `brain refresh`; printing one \
+         would be the very defect being disclosed: {rendered}"
+    );
+
+    // Half 2 — RUN the remedy that was printed, then measure.
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+
+    {
+        let store = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .count_notes_predating_frontmatter_indexing(None)
+                .unwrap(),
+            0,
+            "the printed remedy must actually clear the deficit"
+        );
+        let hits = store
+            .regex_search("loadbearingtoken", None, None, Some(10), Some(5_000))
+            .unwrap();
+        assert!(
+            hits.results.iter().any(|r| r.kind == "Frontmatter"),
+            "and the SYMPTOM must be gone: frontmatter text that is in the file \
+             must be findable again, which is what the count stands in for: {:?}",
+            hits.results
+        );
+    }
+
+    // The counterweight: the disclosure must not fire on a healthy vault, or it
+    // becomes noise that trains the operator to ignore it.
+    let clean = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let clean_rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&clean.stdout),
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(
+        !clean_rendered.contains("brain refresh"),
+        "a healthy vault must produce no backfill warning: {clean_rendered}"
+    );
+}
+
+/// nw-367. `<db>.wal.checkpoint` left by a crash makes every read-only open
+/// report *"Cannot open database in read-only mode while checkpoint is in
+/// progress. Please retry later."* as a bare `nestweaver::error` with no help
+/// text — advice to WAIT for a state that nothing later removes.
+///
+/// Round 2 declined to classify it because a checkpoint genuinely can be in
+/// progress. It IS decidable: the engine takes `F_WRLCK` POSIX record locks on
+/// `<db>.checkpoint.{intent,apply}.lock`, the kernel releases them when the
+/// holder dies, and `releaseCheckpointLocks` runs AFTER the artifacts are
+/// removed — so "no lock held, artifacts present" cannot describe a healthy
+/// checkpoint.
+///
+/// This must NOT reach the corrupt-WAL runbook. That runbook moves the frozen
+/// WAL aside, which discards committed transactions and then demands a full
+/// re-index. A read-write open replays it and removes the debris itself — and
+/// this test RUNS that, rather than asserting the sentence.
+#[test]
+fn stale_checkpoint_debris_is_named_and_its_remedy_is_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    // The observed state, built with plain file operations: a frozen WAL plus
+    // both lock files, and NO process holding either lock. The lock files are
+    // present deliberately — the item claimed they were causal and they are
+    // not (a lock file that merely exists returns early in the engine), so
+    // including them proves the classification does not depend on them.
+    let frozen = dir.path().join("scratch.lbug.wal.checkpoint");
+    std::fs::write(&frozen, b"").unwrap();
+    std::fs::write(dir.path().join("scratch.lbug.checkpoint.apply.lock"), b"").unwrap();
+    std::fs::write(dir.path().join("scratch.lbug.checkpoint.intent.lock"), b"").unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("db_checkpoint_debris"),
+        "no process holds either checkpoint lock or the database write lock, so \
+         this is debris and must be a NAMED condition — not `nestweaver::error` \
+         with no remedy at all: {combined}"
+    );
+    assert!(
+        !combined.contains("Please retry later"),
+        "a state that never clears must not tell the operator to wait: {combined}"
+    );
+    assert!(
+        !combined.contains("MOVE ASIDE"),
+        "and it must NOT reach the corrupt-WAL runbook: moving a frozen WAL \
+         aside discards committed transactions. A read-write open replays it: \
+         {combined}"
+    );
+
+    // The remedy, RUN. `nestweaver daemon --db <path> start` is named in the
+    // help because starting the daemon is the canonical read-write open; the
+    // operation it performs on the database is exactly this one, and doing it
+    // here keeps the test free of a spawned process.
+    {
+        let _store = nestweaver_store::GraphStore::open(&db).unwrap();
+    }
+    assert!(
+        !frozen.exists(),
+        "the engine's own recovery path must have replayed the frozen log and \
+         removed it — that is what makes the printed remedy true"
+    );
+    nestweaver_store::GraphStore::open_read_only(&db)
+        .expect("and the read-only open the operator was trying to make now succeeds");
+}
+
+/// The counterweight, and the reason round 2 declined to classify at all: a
+/// checkpoint that IS in progress must keep today's transient message. Held
+/// here by a real `fcntl` write lock taken by this test process, which is
+/// precisely the evidence the classifier consults.
+#[test]
+fn a_genuinely_held_checkpoint_lock_stays_transient() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal.checkpoint"), b"").unwrap();
+
+    let apply_path = dir.path().join("scratch.lbug.checkpoint.apply.lock");
+    let apply = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&apply_path)
+        .unwrap();
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    assert_eq!(
+        unsafe { libc::fcntl(apply.as_raw_fd(), libc::F_SETLK, &fl) },
+        0,
+        "precondition: this test process holds the checkpoint write lock"
+    );
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("checkpoint is in progress"),
+        "precondition: the engine still refuses the read-only open: {combined}"
+    );
+    assert!(
+        !combined.contains("db_checkpoint_debris"),
+        "a LIVE checkpoint must not be called debris — that is an \
+         unconditional attribution wearing the other hat: {combined}"
+    );
+    drop(apply);
+}
+
+/// nw-359 leg (2). `repair` never opens the database when the publication
+/// marker is clean, so on a database that cannot be opened at all it prints
+/// three true sentences — Database, Marker, "Index publication is CLEAN —
+/// nothing to repair" — and exits 0.
+///
+/// (The item said it "prints nothing". It does not; the code prints three
+/// lines. The precise version is the one with a fix: every sentence it prints
+/// is TRUE and the EXIT CODE is the lie, and exit 0 is the one answer an
+/// unattended caller acts on.)
+#[test]
+fn repair_does_not_report_success_over_a_database_it_cannot_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    // The nw-332 state, built without a crash: garbage in the WAL with no
+    // `.shadow` beside it makes every open report an unreadable log.
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "exit 0 declares a repair that did not happen, on a database that \
+         cannot be opened: {combined}"
+    );
+    assert!(
+        combined.contains("MOVE ASIDE"),
+        "and it must reach the ONE runbook, not a second phrasing: {combined}"
+    );
+
+    // The same probe must ALSO see nw-367's state, which is why nw-367 had to
+    // land first: without its discriminator this arm would either miss the
+    // condition or send a frozen WAL to the move-aside runbook, which discards
+    // committed transactions.
+    let debris_dir = tempfile::tempdir().unwrap();
+    let debris_db = debris_dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&debris_db).unwrap();
+    }
+    std::fs::write(debris_dir.path().join("scratch.lbug.wal.checkpoint"), b"").unwrap();
+    let debris = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&debris_db)
+        .output()
+        .unwrap();
+    let debris_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&debris.stdout),
+        String::from_utf8_lossy(&debris.stderr)
+    );
+    assert_ne!(debris.status.code(), Some(0), "{debris_out}");
+    assert!(
+        debris_out.contains("db_checkpoint_debris"),
+        "and it must carry nw-367's classification, not the corrupt-WAL \
+         runbook: {debris_out}"
+    );
+}
+
+/// The counterweight, and it is what keeps the probe from being a blanket
+/// refusal: a HEALTHY database with a clean publication marker must still
+/// report clean and still exit 0. Without this, `repair` could satisfy the
+/// test above by failing always.
+#[test]
+fn repair_still_reports_a_clean_publication_on_a_healthy_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["repair", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "{combined}");
+    assert!(
+        combined.contains("CLEAN"),
+        "a healthy database is still reported clean: {combined}"
+    );
+
+    // And the JSON route must agree on BOTH facts, or the two routes disagree
+    // about whether a repair happened — the class this repo keeps re-finding.
+    let json = nestweaver_cmd()
+        .args(["repair", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(0));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("repair --json emits JSON");
+    assert_eq!(payload["after"]["dirty"], serde_json::json!(false));
+    assert_eq!(payload["error"], serde_json::Value::Null);
+}
+
+/// nw-359 leg (1). The product ships a runbook whose FIRST instruction is to
+/// stop everything that opens this database, because starting a daemon against
+/// a log whose records do not parse IS the crash-restart loop that took a graph
+/// down for seven hours (nw-332). The product then auto-started one against
+/// exactly that state, and what the operator saw was "daemon process exited
+/// before becoming healthy" — a message about the spawn, describing a problem
+/// in the database.
+///
+/// Autostart was a TRANSPORT decision made with no knowledge of STORAGE state:
+/// not one frame in `ensure_daemon_impl` opened, stat'd or classified the
+/// database. The guard is not new machinery — the store already classifies this
+/// as `CorruptionKind::WalUnreadable` at the FFI boundary.
+#[test]
+fn a_command_that_would_autostart_refuses_an_unreadable_wal_and_names_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    std::fs::write(dir.path().join("scratch.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("scratch.lbug.shadow"));
+
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    // The DEFAULT route, the one that auto-starts — which is the whole point of
+    // the item. `env_remove` rather than absence: an inherited
+    // NESTWEAVER_NO_DAEMON would silently move this test off the path it exists
+    // to cover, and `every_cli_invocation_pins_its_daemon_routing` requires the
+    // choice to be explicit for exactly that reason.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !combined.contains("did not become healthy")
+            && !combined.contains("exited before becoming healthy"),
+        "the refusal must name the DATABASE state, not report a spawn that was \
+         never allowed to happen: {combined}"
+    );
+    assert!(
+        combined.contains("db_wal_corrupt"),
+        "and it must carry the corrupt-WAL classification so the CLI renders \
+         the runbook rather than a transport error: {combined}"
+    );
+}
+
+/// The counterweight, and it is the half that makes the guard honest: a
+/// database that is merely UNREPLAYED, or carrying nw-367's checkpoint debris,
+/// must still be allowed to start a daemon — a read-write open is the CORRECT
+/// remedy for both, and for the debris it is the remedy this release prints. A
+/// guard that refused there would be nw-333's unconditional attribution
+/// pointing the other way.
+#[test]
+fn the_autostart_guard_only_refuses_a_log_no_open_can_replay() {
+    use nestweaver_daemon::lifecycle::db_wal_unreadable;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A database that does not exist yet: a cold start creating one.
+    assert!(db_wal_unreadable(&dir.path().join("absent.lbug")).is_none());
+
+    // A healthy database.
+    let healthy = dir.path().join("healthy.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&healthy).unwrap();
+    }
+    assert!(db_wal_unreadable(&healthy).is_none());
+
+    // nw-367's checkpoint debris: a read-only open is refused, and starting a
+    // read-write daemon is the PUBLISHED remedy. Refusing here would break the
+    // instruction shipped in the same release.
+    let debris = dir.path().join("debris.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&debris).unwrap();
+    }
+    std::fs::write(dir.path().join("debris.lbug.wal.checkpoint"), b"").unwrap();
+    assert!(
+        nestweaver_store::GraphStore::open_read_only(&debris).is_err(),
+        "precondition: the read-only open really is refused"
+    );
+    assert!(
+        db_wal_unreadable(&debris).is_none(),
+        "checkpoint debris must still be allowed to start a daemon — that IS \
+         its remedy"
+    );
+
+    // And the one state it does refuse.
+    let corrupt = dir.path().join("corrupt.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&corrupt).unwrap();
+    }
+    std::fs::write(dir.path().join("corrupt.lbug.wal"), vec![0xABu8; 4096]).unwrap();
+    assert!(db_wal_unreadable(&corrupt).is_some());
+}
+
+/// nw-359 leg (3). `run` resolves the daemon decision exactly once, in
+/// `resolve_use_daemon`, and `Commands::Instance` dropped it on the floor:
+/// `run_instance` took no `use_daemon` at all, so `instance merge` connected —
+/// and therefore auto-started a daemon — with the caller's bypass nowhere in
+/// sight and nothing said about it.
+///
+/// The item's stated trigger was wrong and is corrected here. Bare
+/// `NESTWEAVER_NO_DAEMON=1` routing through the daemon is CORRECT by policy:
+/// `no_daemon_allowed_from` grants the bypass on `NESTWEAVER_ALLOW_NO_DAEMON`
+/// alone, and `CI`/`GITHUB_ACTIONS` confer nothing, deliberately. The case that
+/// matters is the one where the bypass IS granted.
+///
+/// The cost is concrete and is already recorded elsewhere in this repo:
+/// `tests/error_remedy_test.rs` stops the daemon by hand after running this
+/// exact command, with a comment noting that the auto-started daemon holds the
+/// write lease "for its idle timeout — an hour" and would otherwise break the
+/// re-index that follows. That workaround IS the bug report.
+#[test]
+fn instance_merge_discloses_that_it_cannot_honour_a_granted_bypass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["instance", "merge", "--from", "a", "--to", "b", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        stderr.contains("cannot be honoured"),
+        "a bypass that is granted and then silently not honoured is the defect: \
+         {stderr}"
+    );
+    assert!(
+        stderr.contains("write lease"),
+        "and the disclosure must name the COST, not just the fact — the lease \
+         is what blocks the follow-up index: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("nestweaver daemon --db {} stop", db.display())),
+        "and it must carry the command that releases it, substituted for THIS \
+         database: {stderr}"
+    );
+}
+
+/// The counterweight, and it is what keeps the disclosure from becoming noise:
+/// with no bypass granted there is nothing to disclose. Bare
+/// `NESTWEAVER_NO_DAEMON=1` without the opt-in is the SAME case — the bypass
+/// was requested and REFUSED, so the daemon route is correct and expected — and
+/// that is the half the item had backwards.
+#[test]
+fn instance_merge_says_nothing_when_no_bypass_was_granted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["instance", "merge", "--from", "a", "--to", "b", "--db"])
+        .arg(&db)
+        // Requested but NOT granted: policy says route through the daemon, and
+        // no warning is owed for behaviour that is correct.
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "30")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !stderr.contains("cannot be honoured"),
+        "no bypass was granted, so nothing was dishonoured: {stderr}"
+    );
+
+    // Clean up whatever this test started, in its own runtime tree.
+    let _ = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "--db"])
+        .arg(&db)
+        .arg("stop")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .output();
+}
+
+/// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
+/// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
+/// preserved this case as a SEMANTIC refusal. That reasoning stands and the
+/// exit code is not changed here.
+///
+/// What is wrong is the SHAPE. Two individually valid enums whose COMBINATION
+/// is unsupported reached the user as a raw RPC error naming neither value:
+/// `PossibleValuesParser` is per-argument and cannot see the other one, the
+/// daemon's own good sentence arrived as a `tonic::Status` wrapped in
+/// `.context("export_graph RPC failed")`, and `into_diagnostic` had no arm for
+/// it — so it fell to `CliDiagnostic::General` and printed the transport's
+/// words instead of the condition's.
+#[test]
+fn an_unsupported_format_scope_pair_is_named_not_relayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+
+    let output = nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !combined.contains("RPC failed") && !combined.contains("invalid argument"),
+        "the transport's words are not this condition's words: {combined}"
+    );
+    assert!(
+        combined.contains("export_scope_unsupported"),
+        "an unsupported COMBINATION must be a named condition: {combined}"
+    );
+    assert!(
+        combined.contains("graphml"),
+        "and the remedy must name a format that DOES satisfy --scope vault, or \
+         it is a refusal with no next step: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "semantic refusal, per d565547f — not a usage error: {combined}"
+    );
+}
+
+/// The parity half, and the reason the check is a client-side PRE-FLIGHT rather
+/// than two validations: the direct route and the daemon route must refuse the
+/// same pair with the same words. They already disagreed once on this exact
+/// argument — the daemon rejected a vault scope while the direct path emitted a
+/// code-only file and reported success.
+#[test]
+fn both_export_routes_refuse_the_pair_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+
+    let bypassed = nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    // The DEFAULT route. The pre-flight sits above the route split, so this
+    // must not even reach the daemon — and therefore must not autostart one.
+    let routed = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["export", "--format", "msgpack", "--scope", "vault", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+        .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        String::from_utf8_lossy(&bypassed.stderr),
+        String::from_utf8_lossy(&routed.stderr),
+        "one condition, one sentence, whichever route the caller happened to take"
+    );
+    assert_eq!(bypassed.status.code(), routed.status.code());
+    assert_eq!(
+        std::fs::read_dir(runtime.path().join("nestweaver"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "an argument-only refusal must not start a daemon to deliver itself"
+    );
+}
+
+/// The counterweight: the pair that IS supported must still work, or the
+/// pre-flight could satisfy the tests above by refusing every export.
+#[test]
+fn a_supported_format_scope_pair_still_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scratch.lbug");
+    {
+        let _store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+    }
+    nestweaver_cmd()
+        .args(["export", "--format", "graphml", "--scope", "vault", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["export", "--format", "msgpack", "--scope", "code", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+}

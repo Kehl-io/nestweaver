@@ -6381,6 +6381,28 @@ fn vault_status_json<E: std::fmt::Display>(
             (None, "none")
         }
     };
+    // nw-366. `frontmatter_raw` was added by `ALTER TABLE ... DEFAULT ''`,
+    // which populates the COLUMN and not the DATA: every note indexed by 8.0.0
+    // reads back empty and both regex collectors `continue` past it, so the
+    // upgrader keeps nw-298's symptom on a binary that contains the fix.
+    //
+    // Counted from the notes already read — no second query — and `null` on the
+    // same failure path as `note_count`, for the same reason: a deficit derived
+    // from a scan that came back short is not a deficit, and a confident `0`
+    // here would say "you have nothing to repair" about a vault nobody read.
+    // The remedy is per-VAULT, which is why this is a per-vault row.
+    let frontmatter_deficit = if read_failed {
+        Value::Null
+    } else {
+        json!(
+            notes
+                .iter()
+                .filter(|note| {
+                    nestweaver_store::GraphStore::note_predates_frontmatter_indexing(note)
+                })
+                .count()
+        )
+    };
     let row = json!({
         // `uid` + `instance_id` let callers disambiguate rows that share a
         // name/root_path (collision state) and target precise operations like
@@ -6390,6 +6412,7 @@ fn vault_status_json<E: std::fmt::Display>(
         "name": vault.name,
         "root_path": vault.root_path,
         "note_count": note_count,
+        "notes_predating_frontmatter_indexing": frontmatter_deficit,
         "last_indexed": last_indexed,
         "last_indexed_source": last_indexed_source,
     });
@@ -13726,6 +13749,79 @@ mod cache_dispatch_tests {
         );
     }
 
+    /// nw-366. The per-vault row must carry the frontmatter-backfill deficit,
+    /// because the remedy (`brain refresh <root>`) is per-VAULT and the row is
+    /// the only place a caller learns which root to point it at.
+    ///
+    /// Three cases, and the last two are the ones that keep the field
+    /// meaningful: a `null` on an unreadable vault (a confident `0` there would
+    /// say "nothing to repair" about notes nobody read), and a `0` on a healthy
+    /// vault (a field that fires always is noise).
+    #[test]
+    fn the_per_vault_row_discloses_notes_predating_frontmatter_indexing() {
+        let vault = vault_fixture();
+
+        let mut legacy = note_fixture("note:legacy");
+        legacy.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        legacy.frontmatter_raw = None;
+        let mut current = note_fixture("note:current");
+        current.frontmatter = Some(r#"{"status":"open"}"#.to_string());
+        current.frontmatter_raw = Some("status: open\n".to_string());
+        // A plain note: no frontmatter at all, and therefore no deficit.
+        let plain = note_fixture("note:plain");
+
+        let (row, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![legacy, current.clone(), plain.clone()],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            row["notes_predating_frontmatter_indexing"],
+            json!(1),
+            "exactly the pre-column note is a deficit: {row}"
+        );
+
+        let (healthy, _) = vault_status_json(
+            &vault,
+            Ok::<_, nestweaver_store::StoreError>((
+                vec![current, plain],
+                nestweaver_store::ScanIntegrity::default(),
+            )),
+            None,
+        );
+        assert_eq!(
+            healthy["notes_predating_frontmatter_indexing"],
+            json!(0),
+            "a healthy vault must report ZERO, not be silent — a field that \
+             only ever appears when set cannot be distinguished from a field \
+             that was dropped: {healthy}"
+        );
+
+        let (unread, _) = vault_status_json(
+            &vault,
+            Err::<
+                (
+                    Vec<nestweaver_schema::Note>,
+                    nestweaver_store::ScanIntegrity,
+                ),
+                _,
+            >(nestweaver_store::StoreError::Query(
+                "execute: injected".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(
+            unread["notes_predating_frontmatter_indexing"],
+            Value::Null,
+            "a deficit derived from a read that failed is not a deficit, and a \
+             confident 0 would tell the operator there is nothing to repair \
+             about notes nobody read: {unread}"
+        );
+    }
+
     /// nw-260, the fold. `unavailable` and `counts_complete` were two
     /// independent expressions over the same failure, and the only fixture that
     /// reached them handed both `(vec![], 0)` — so either could be deleted
@@ -17265,5 +17361,120 @@ mod broken_links_window_tests {
             "nw-297: classification is over the POPULATION, so it survives any \
              window: {page}"
         );
+    }
+}
+
+/// nw-354. The end-to-end half: the engine's disclosure is worthless unless it
+/// reaches the consumer. `detect_changes` is the ONE non-test caller of
+/// `detect_changes_impact`, and its `gate_state` is what an agent or CI reads
+/// to decide whether a change is safe. Assert the PAYLOAD, not the struct.
+#[cfg(test)]
+mod detect_changes_gate_disclosure_tests {
+    use super::*;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    fn sym(uid: &str, name: &str, file: &str, sig: &str, entry: bool) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: sig.to_string(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn calls(src: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: "sym:target".to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 0.9,
+            link_type: None,
+            evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn a_dropped_symbol_row_cannot_reach_the_caller_as_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        for s in [
+            sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ),
+            sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true),
+            sym("sym:e1", "e1", "src/e1.rs", "fn e1()", true),
+            sym("sym:e2", "e2", "src/e2.rs", "fn e2()", true),
+            // The undecodable row: an embedded NUL in `signature`.
+            sym("sym:e3", "e3", "src/e3.rs", "fn e\u{0}3()", true),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        for src in ["sym:e0", "sym:e1", "sym:e2", "sym:e3"] {
+            store.insert_edge(&calls(src)).unwrap();
+        }
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+
+        assert_ne!(
+            payload["gate_state"],
+            json!("ok"),
+            "the gate field an agent reads must not say `ok` over a scan that \
+             dropped a row: {payload}"
+        );
+        assert_eq!(payload["status"], json!("degraded"), "{payload}");
+        let descriptors: Vec<&str> = payload["notifications"]
+            .as_array()
+            .expect("notifications array")
+            .iter()
+            .filter_map(|n| n["descriptor"].as_str())
+            .collect();
+        assert!(
+            descriptors.contains(&"store.list-symbols-incomplete"),
+            "and the reason must travel with it: {payload}"
+        );
+    }
+
+    /// The counterweight: a clean corpus must still serialise a clean gate, or
+    /// the field means nothing.
+    #[test]
+    fn a_clean_corpus_still_serialises_a_clean_gate() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&sym("sym:e0", "e0", "src/e0.rs", "fn e0()", true))
+            .unwrap();
+        store
+            .insert_symbol(&sym(
+                "sym:target",
+                "target",
+                "src/target.rs",
+                "fn target()",
+                false,
+            ))
+            .unwrap();
+        store.insert_edge(&calls("sym:e0")).unwrap();
+
+        let payload =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/target.rs"] })).unwrap();
+        assert_eq!(payload["gate_state"], json!("ok"), "{payload}");
+        assert_eq!(payload["status"], json!("complete"), "{payload}");
+        assert_eq!(payload["notifications"], json!([]), "{payload}");
     }
 }
