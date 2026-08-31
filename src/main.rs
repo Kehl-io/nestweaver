@@ -1576,6 +1576,31 @@ fn parse_unit_interval_f64(value: &str) -> Result<f64, String> {
 /// A sub-1.0 confidence means the link matched at a lower resolver tier, not
 /// that it is wrong. Printing only the number let a same-folder match (0.95)
 /// and a link pointing at nothing (0.0) read identically (nw-100).
+/// nw-362(a). Say when the suggestion list is a SAMPLE.
+///
+/// `max_suggestions` cuts inside the row, so without the population a row cut
+/// at N reads exactly like a row that genuinely had N and the reader cannot
+/// tell whether raising `--max-suggestions` would help. One helper, called by
+/// both the daemon-rendered and the direct-disk branch, because two copies of
+/// this line is how the routes came to print different things before.
+///
+/// `suggested_total` is 0 on a reply from a daemon older than the field; that
+/// is below the list length, so the sample form is simply not taken and the
+/// output is exactly what it was.
+fn print_link_suggestions(l: &nestweaver_engine::BrokenLink) {
+    let shown = l.suggested_target_uids.join(", ");
+    if l.suggested_total > l.suggested_target_uids.len() {
+        println!(
+            "    suggested ({} of {}): {}",
+            l.suggested_target_uids.len(),
+            l.suggested_total,
+            shown
+        );
+    } else {
+        println!("    suggested: {shown}");
+    }
+}
+
 fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
     match &link.resolved_target_uid {
         Some(uid) => format!("resolves to {uid}"),
@@ -1676,6 +1701,16 @@ fn impact_json_ok(
         "truncated": truncated_by_threshold || truncated_by_depth || capped,
         "truncated_by_threshold": truncated_by_threshold,
         "truncated_by_depth": truncated_by_depth,
+        // nw-357 step 2. An INDEPENDENT boolean beside the other two, not a
+        // `truncated_by` scalar: these three caps do not compose in an order,
+        // so all three remedies — raise `--depth`, lower `--min-score`, raise
+        // `--limit` — stay independently useful when more than one fires.
+        // That is the same reasoning `summary` records for its own pair, and
+        // the opposite of `context`, whose caps DO compose.
+        //
+        // Derived from `capped` rather than taken as a parameter, so it cannot
+        // disagree with the `returned`/`total` printed beside it.
+        "truncated_by_limit": capped,
     });
     if let Some(obj) = payload.as_object_mut() {
         // nw-123: `total` and `returned` used to be inserted only when the
@@ -1793,8 +1828,44 @@ impl ResolverStaleness {
         }
     }
 
-    /// Sidecar-only answer, for the daemon path — which has no store handle and
-    /// must not open one, since the daemon owns the write lock.
+    /// The daemon's OWN answer, decoded out of the response it already sent.
+    ///
+    /// nw-358. `attach_ranking_staleness` puts `rankings_stale` and
+    /// `stale_repos` on every `hub_nodes` / `bridge_nodes` reply, computed by
+    /// `ranking_stale_repos` from `store.list_repos` — the EXACT enumeration.
+    /// The CLI decoded the rows and the `_meta` out of that same value and
+    /// then called [`Self::from_sidecar`] anyway, recomputing client-side, from
+    /// a weaker source, an answer it was already holding. That is what made
+    /// `hubs --json` via daemon, `hubs --json --no-daemon` and MCP `hub_nodes`
+    /// three answers for one database.
+    ///
+    /// Reading what you were sent is the same rule as nw-347's `_meta`: strip
+    /// for the decode, carry the provenance to the print.
+    ///
+    /// Falls back to the sidecar when the keys are absent, which is a daemon
+    /// older than `attach_ranking_staleness` — an under-approximation, but
+    /// never a false alarm, and strictly better than claiming nothing.
+    fn from_daemon_response(value: &serde_json::Value, db_path: &std::path::Path) -> Self {
+        match (
+            value.get("rankings_stale").and_then(|v| v.as_bool()),
+            value.get("stale_repos").and_then(|v| v.as_array()),
+        ) {
+            (Some(rankings_stale), Some(repos)) => Self {
+                rankings_stale,
+                stale_repos: repos
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            },
+            _ => Self::from_sidecar(db_path),
+        }
+    }
+
+    /// Sidecar-only answer. The FALLBACK for a daemon that did not send its
+    /// own (see [`Self::from_daemon_response`]), and nothing else uses it.
+    ///
+    /// It has no store handle and must not open one, since the daemon owns
+    /// the write lock.
     ///
     /// This is an UNDER-approximation and deliberately so. It catches the two
     /// cases the sidecar can prove: no record at all (every repo predates the
@@ -1923,10 +1994,43 @@ fn render_investigate_text(payload: &serde_json::Value) {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    let more_available = payload
-        .get("more_available")
+    // nw-362(b). `more_available` counts the token-budget loop and nothing
+    // else, so a map cut by `DEFAULT_RETRIEVAL_BREADTH` printed a bare entry
+    // count with no clause at all — the same silence the machine route had,
+    // on the route a human reads. Drive the disclosure off the triple, and
+    // name each cap separately: the breadth bound is INTERNAL and cannot be
+    // raised, so telling the reader to raise `--token-budget` for it is the
+    // wrong remedy.
+    let returned = entries.len() as u64;
+    let total = payload
+        .get("total")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        .unwrap_or(returned)
+        .max(returned);
+    let dropped_notes: Vec<String> = payload
+        .get("dropped_reasons")
+        .and_then(|v| v.as_object())
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|(reason, count)| {
+                    let n = count.as_u64()?;
+                    Some(match reason.as_str() {
+                        "token_budget" => format!(
+                            "{n} entr{} dropped by the token budget — raise --token-budget",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                        "retrieval_breadth" => format!(
+                            "{n} entr{} dropped by the retrieval-breadth bound, which is \
+                             internal and cannot be raised — narrow the query or pass --scope",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                        other => format!("{n} dropped ({other})"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     println!(
         "Bundle: {}  (query: {:?})",
@@ -1938,12 +2042,15 @@ fn render_investigate_text(payload: &serde_json::Value) {
         domains.len(),
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" },
-        if more_available > 0 {
-            format!(" ({more_available} more available — raise --token-budget)")
+        if total > returned {
+            format!(" of {total}")
         } else {
             String::new()
         }
     );
+    for note in &dropped_notes {
+        println!("  note: {note}");
+    }
     // nw-120: the daemon ranks with its warm embedding model; the direct path
     // has none, so the SAME query returns a different ordering. Say which one
     // produced this map rather than letting the ranking imply a quality it did
@@ -3225,6 +3332,23 @@ enum Commands {
         instance: Option<String>,
         #[arg(long, help = "Filter to symbols in this repo")]
         repo: Option<String>,
+        /// nw-357. The `brain_impact` schema has carried a `limit` with a
+        /// default of 50 all along, and this command had none — it neither
+        /// declared one nor sent one, so with a daemon `impact X --json`
+        /// returned at most 50 rows and without one it returned every row.
+        /// The bound was a property of the TRANSPORT rather than of the
+        /// contract, which is nw-259(b)'s shape exactly, and it made
+        /// `returned < total` structurally unreachable on the direct route.
+        ///
+        /// The range is COPIED from the schema (`RESULT_LIMIT_MAX`), not
+        /// re-derived, exactly as `hubs --top` / `bridges --top` do after
+        /// nw-251.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum impact nodes to return (1-1000; default 50, matching the MCP brain_impact schema)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -11642,7 +11766,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
-                                print_brain_context_json(&result, cut)?;
+                                print_brain_context_json(&result, cut, token_budget)?;
                             } else {
                                 print_brain_context_text(&result, cut, token_budget);
                             }
@@ -12321,7 +12445,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     print_ranking_json(
                         "hubs",
                         &hubs,
-                        &ResolverStaleness::from_sidecar(&db_path),
+                        // nw-358: read the answer the daemon already sent.
+                        &ResolverStaleness::from_daemon_response(&value, &db_path),
                         daemon_meta,
                     )?;
                 } else if hubs.is_empty() {
@@ -12437,6 +12562,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // back, so the daemon's own stamp was discarded on a route
                     // where it is strictly richer than anything this layer knows.
                     let daemon_meta = value.get(nestweaver_schema::provenance::META_KEY).cloned();
+                    // nw-358: captured BEFORE `strip_hybrid_meta` consumes
+                    // `value`, for the same reason `daemon_meta` is — the
+                    // daemon already computed this from `store.list_repos` and
+                    // this layer cannot do better.
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     let bridges: Vec<nestweaver_engine::BridgeNode> =
                         match strip_hybrid_meta(value).get("bridges").cloned() {
                             Some(serde_json::Value::Null) | None => Vec::new(),
@@ -12446,12 +12576,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         // nw-308: same disclosure as `hubs`; bridges are
                         // downstream of the same edges.
-                        print_ranking_json(
-                            "bridges",
-                            &bridges,
-                            &ResolverStaleness::from_sidecar(&db_path),
-                            daemon_meta,
-                        )?;
+                        print_ranking_json("bridges", &bridges, &staleness, daemon_meta)?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
                     } else {
@@ -12639,7 +12764,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // Persisted exactly as before: `generate_summaries` saved this
                 // same capped set, and changing WHAT the sidecar holds is a
                 // different decision from reporting the count honestly.
-                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                //
+                // nw-361: what changed is that the count travels WITH it. This
+                // CLI is the WRITER of the set `get_summary` reads back, and
+                // it is the only place that knows the cap fired, so persisting
+                // the rows without the count is what made the MCP route call a
+                // capped set complete.
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &out.summaries,
+                    &nestweaver_engine::summaries::cap_provenance(
+                        SummaryLevel::Cluster,
+                        cap_dropped,
+                    ),
+                )?;
                 if let Some(ref t) = target {
                     filter_by_target(&out.summaries, t)
                         .into_iter()
@@ -12658,7 +12797,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if out.capped {
                     cap_dropped = out.matched_total.saturating_sub(out.summaries.len());
                 }
-                save_summaries(&db_path, store.graph_generation(), &out.summaries)?;
+                // nw-361: see the cluster branch — the writer records what it
+                // dropped, because no later reader can recover it.
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &out.summaries,
+                    &nestweaver_engine::summaries::cap_provenance(SummaryLevel::Hub, cap_dropped),
+                )?;
                 if let Some(ref t) = target {
                     filter_by_target(&out.summaries, t)
                         .into_iter()
@@ -12669,8 +12815,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 let summaries = generate_summaries(&store, parsed_level)?;
-                // Save to sidecar for later use.
-                save_summaries(&db_path, store.graph_generation(), &summaries)?;
+                // Save to sidecar for later use. This branch is File level
+                // only — Symbol, Cluster and Hub are handled above — and File
+                // has no generator cap, so a recorded ZERO here is a positive
+                // statement rather than a default (nw-361).
+                save_summaries(
+                    &db_path,
+                    store.graph_generation(),
+                    &summaries,
+                    &nestweaver_engine::summaries::cap_provenance(parsed_level, 0),
+                )?;
                 // Optional target filter.
                 if let Some(ref t) = target {
                     filter_by_target(&summaries, t)
@@ -15686,6 +15840,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             depth,
             confidence,
             min_score,
+            limit,
             json,
             db,
             repo: repo_filter,
@@ -15693,6 +15848,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ..
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+            // nw-357. ONE effective limit for both routes, resolved the same
+            // way `configured_result_limit()` resolves it inside the tool:
+            // explicit flag, else `[limits].default_result_limit`, else the
+            // schema's own 50. Computed here rather than per-branch so the two
+            // routes cannot fall to different defaults again.
+            let limit = resolve_limit(
+                limit,
+                load_instance_config_opt(config_opt.as_deref()).as_ref(),
+                nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+            );
             // ── daemon guard ──────────────────────────────────────
             // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
             // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
@@ -15719,8 +15884,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // additionalProperties:false, so the daemon path would
                     // reject the call outright.
                     serde_json::json!({
+                        // nw-357: `limit` was never sent, so the daemon fell
+                        // to the schema default of 50 while the direct route
+                        // capped nothing. Sending the effective limit is what
+                        // makes the cap a property of the contract.
                         "symbol": name_or_uid,
                         "depth": depth,
+                        "limit": limit,
                     }),
                 )? {
                     // Honor the daemon tool's status so daemon mode matches the direct path's
@@ -15938,7 +16108,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let result = store.impact_with_flags_and_threshold(
                         &uid, depth, confidence, threshold, None,
                     )?;
-                    let nodes = &result.nodes;
+                    // nw-357. The result-set cap now applies HERE too, not
+                    // only on the daemon route, and it applies to BOTH
+                    // renderers — a flag that bounded `--json` and not the
+                    // text output would just move the divergence rather than
+                    // close it. `total` is the PRE-cap population, which is
+                    // what the daemon has always reported under that name.
+                    let total = result.nodes.len();
+                    let nodes: Vec<_> = result.nodes.iter().take(limit).collect();
                     let count = nodes.len();
 
                     if json {
@@ -15964,7 +16141,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         let json_nodes: Vec<_> = nodes
                             .iter()
-                            .map(|n| ImpactNodeJson {
+                            .map(|&n| ImpactNodeJson {
                                 uid: &n.uid,
                                 name: &n.name,
                                 file_path: &n.file_path,
@@ -15999,10 +16176,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 result.truncated_by_depth,
                                 // `total` is the RESULT-SET size, matching the
                                 // daemon, which computes `nodes.len()` after
-                                // its visibility retain and regardless of
-                                // truncation. The truncation flags carry the
-                                // "this set is a FLOOR" meaning; `total` does
-                                // not.
+                                // its visibility retain and BEFORE its
+                                // `.take(limit)`. The truncation flags carry
+                                // the "this set is a FLOOR" meaning; `total`
+                                // does not.
                                 //
                                 // An earlier version of this emitted `None`
                                 // when truncated, reasoning that the
@@ -16013,7 +16190,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 // divergence it was meant to close, in the one
                                 // case the happy-path parity fixture cannot
                                 // reach.
-                                Some(json_nodes.len() as u64),
+                                //
+                                // nw-357: these two were BOTH `json_nodes.len()`,
+                                // so `returned < total` could never hold and
+                                // the daemon's documented cap signal had no
+                                // counterpart here. They are now the pre-cap
+                                // and post-cap counts, the same two quantities
+                                // `tool_brain_impact` computes.
+                                Some(total as u64),
                                 Some(json_nodes.len() as u64),
                                 note,
                             ))?
@@ -16027,7 +16211,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     } else {
                         if !out.quiet {
-                            println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                            // nw-357: say when the list is a SAMPLE. The
+                            // daemon route already returns a capped list here;
+                            // printing a bare count on either route is how a
+                            // reader came to believe the walk found exactly
+                            // this many.
+                            if count < total {
+                                println!(
+                                    "Impact of '{name_or_uid}' ({count} of {total} nodes, \
+                                     capped by --limit):"
+                                );
+                            } else {
+                                println!("Impact of '{name_or_uid}' ({count} nodes):");
+                            }
                         }
                         for n in nodes {
                             if out.verbose {
@@ -22563,7 +22759,7 @@ fn run_brain(
                         None => limit.min(result.connected.len()),
                     };
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_brain_context_json(&result, cut, token_budget)?;
                     } else {
                         print_brain_context_text(&result, cut, token_budget);
                     }
@@ -22858,7 +23054,7 @@ fn run_brain(
                     };
                     let node_count = result.seeds.len() + cut;
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_brain_context_json(&result, cut, token_budget)?;
                     } else {
                         print_brain_context_text(&result, cut, token_budget);
                     }
@@ -22956,7 +23152,7 @@ fn run_brain(
                                 describe_link_resolution(l)
                             );
                             if !l.suggested_target_uids.is_empty() {
-                                println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                                print_link_suggestions(l);
                             }
                         }
                     }
@@ -23007,7 +23203,7 @@ fn run_brain(
                         describe_link_resolution(l)
                     );
                     if !l.suggested_target_uids.is_empty() {
-                        println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                        print_link_suggestions(l);
                     }
                 }
             }
@@ -25610,16 +25806,51 @@ fn render_project_context_daemon_response(
     println!("Tokens used: {used} / budget: {token_budget}");
 }
 
-fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
-    let resp = brain_context_json_value(result, limit);
+fn print_brain_context_json(
+    result: &BrainContextResult,
+    limit: usize,
+    token_budget: Option<usize>,
+) -> anyhow::Result<()> {
+    let resp = brain_context_json_value(result, limit, token_budget);
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 
-fn brain_context_json_value(result: &BrainContextResult, limit: usize) -> serde_json::Value {
+/// nw-353. `limit` is the cut the caller already computed; `result.connected`
+/// is the PRE-cut list, so the total is right here behind the `.take()` and
+/// used to be thrown away. `print_brain_context_text` one function over has
+/// printed `Connected (N of M, ...)` all along, so the machine route was the
+/// only audience that could not tell a capped answer from a complete one.
+///
+/// `token_budget` is a parameter rather than re-derived because this function
+/// could not name a cause without it — and naming the wrong cap sends the
+/// caller to a knob that cannot help, which is the whole of nw-259.
+fn brain_context_json_value(
+    result: &BrainContextResult,
+    limit: usize,
+    token_budget: Option<usize>,
+) -> serde_json::Value {
+    let total = result.connected.len();
+    let returned = limit.min(total);
+    let truncated = returned < total;
+    // The two CLI caps are mutually exclusive at every call site: the `cut`
+    // above is `token_budgeted_truncate(..)` when `--token-budget` is set and
+    // `limit.min(len)` otherwise — "token_budget takes precedence over the
+    // count-based limit". `resolve` still decides which to blame so the CLI
+    // and `tool_brain_context` cannot drift on the precedence rule.
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(
+        truncated && token_budget.is_some(),
+        truncated && token_budget.is_none(),
+    );
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
         "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "returned": returned,
+        "total": total,
+        "truncated": truncated,
+        // Emitted even when null, matching the MCP twin: one shape parses
+        // both routes.
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "semantic_applied": result.semantic_applied,
         "degraded_components": result.degraded_components,
     });
@@ -25656,7 +25887,7 @@ mod context_json_renderer_tests {
 
     #[test]
     fn direct_brain_context_never_drops_semantic_honesty() {
-        let value = brain_context_json_value(&degraded_context(), 30);
+        let value = brain_context_json_value(&degraded_context(), 30, None);
         assert_eq!(value["semantic_applied"], false);
         assert_eq!(
             value["degraded_components"],

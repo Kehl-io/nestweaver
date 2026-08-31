@@ -4180,9 +4180,33 @@ fn tool_brain_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // nw-353. `budgeted_cut` returns a slice index and nothing else;
+    // `result.connected.len()` — the pre-cap total — is in scope on the line
+    // above the `.take(cut)` and was dropped, so a capped answer was
+    // byte-identical to a complete one on the only route an agent can read.
+    // The CLI's HUMAN renderer has printed `Connected (N of M, ...)` all
+    // along (`print_brain_context_text`), which makes this nw-259(a)'s shape
+    // exactly: the human is told and the agent is not. The spellings are
+    // `Bounded::merge_into`'s and `code_context`'s; no sixth one is invented.
+    let total = result.connected.len();
+    let returned = connected_json.len();
+    let truncated = returned < total;
+    // `token_budget` is this tool's only cap on `connected`, so only the
+    // budget branch of `resolve` is reachable here. Called anyway, exactly as
+    // `code_context` does: the precedence rule lives in ONE place even where
+    // one branch of it cannot fire, because a second copy is how the human and
+    // machine routes came to disagree in the first place.
+    let truncated_by = nestweaver_engine::TruncationCause::resolve(truncated, false);
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
+        "returned": returned,
+        "total": total,
+        "truncated": truncated,
+        // Emitted even when null, matching `code_context`: a caller parsing a
+        // fixed shape should not have to tell "absent because complete" from
+        // "absent because this producer is old".
+        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str),
         "tokens_used": used_tokens,
         "token_budget": token_budget,
         "semantic_applied": result.semantic_applied,
@@ -7824,6 +7848,13 @@ fn tool_brain_impact(
         // caller could not detect truncation here at all. Same "confident
         // answer to a partial read" family as nw-320, one field over.
         "truncated": truncated_by_threshold || truncated_by_depth || rows.len() < total,
+        // nw-357 step 2. The result-set cap had no flag beside the two
+        // traversal ones on EITHER route, so `truncated` was the only signal
+        // and it cannot say which of three independent remedies applies.
+        // Independent boolean, not a `truncated_by` scalar: raising `--depth`,
+        // lowering `--min-score` and raising `limit` do not compose in an
+        // order, so blaming exactly one would discard two live remedies.
+        "truncated_by_limit": rows.len() < total,
         "note": note,
     }))
 }
@@ -10409,7 +10440,8 @@ fn generate_summaries_reporting_cap(
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::{load_summaries, merge_and_save_summaries};
+    use nestweaver_engine::merge_and_save_summaries;
+    use nestweaver_engine::summaries::load_summaries_with_cap;
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
@@ -10539,9 +10571,18 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // 71,184-community graph and `truncated` computes to false. The honesty
     // machinery existed and was wired for `SummaryLevel::Symbol` only.
     let mut cap_dropped: usize = 0;
+    // nw-361. `load_summaries_with_cap`, not `load_summaries`: this payload
+    // publishes `truncated` and `truncated_by_cap`, so it needs the count the
+    // GENERATOR recorded when the set was written. Reading the plain sibling
+    // left `cap_dropped` at 0 on every cache hit, which reported a capped set
+    // as complete — correct on the cold path, wrong on the warm one, i.e.
+    // wrong on every path except the one a verifier would use.
+    //
+    // A sidecar with no recorded provenance comes back as `None` here, so this
+    // regenerates rather than republishing a claim its writer never made.
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && !bypass
-        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
+        && let Ok(Some((cached, drops))) = load_summaries_with_cap(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
@@ -10553,6 +10594,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
             (fresh, false)
         } else {
+            cap_dropped = drops.get(&level.to_string()).copied().unwrap_or(0);
             (level_filtered, true)
         }
     } else {
@@ -10561,9 +10603,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
 
     // Persist freshly generated summaries so subsequent calls hit the cache,
-    // preserving cached entries at other levels (shared invariant).
+    // preserving cached entries at other levels (shared invariant) — and, now,
+    // what the generator dropped, so the next reader can say it.
     if !from_cache && let Some(ref db) = db_path {
-        merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
+        merge_and_save_summaries(db, store.graph_generation(), level, &summaries, cap_dropped);
     }
 
     // Build the display list: filter by target, then truncate by budget.
@@ -10621,12 +10664,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // `target`. Independent booleans, per the symbol-level rationale
         // above — both remedies stay useful when both caps fire.
         //
-        // `truncated_by_cap` is `cap_dropped > 0`, which is FALSE on a sidecar
-        // cache hit even when the cached set was itself capped, because the
-        // generator did not run and nothing recorded what it dropped. That is
-        // a pre-existing hole in `truncated` itself, not one this field adds;
-        // it is called out here so the next reader does not mistake the field
-        // for a guarantee.
+        // nw-361 closed the hole this comment used to describe: `cap_dropped`
+        // was FALSE on a sidecar cache hit even for a set that was capped when
+        // it was written, because the generator did not run. The count now
+        // travels WITH the stored set (`SummaryStore::cap_dropped`), and a
+        // sidecar that recorded none is treated as a miss rather than as a
+        // claim of completeness.
         "truncated_by_budget": display.len() < after_filter_len,
         "truncated_by_cap": cap_dropped > 0,
         "cached": from_cache,
@@ -12100,7 +12143,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- more_available counts entries dropped by token budget — raise token_budget to see them\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -87,13 +87,30 @@ impl ResolverGenerations {
         self.repos.get(repo_uid).copied().unwrap_or(0)
     }
 
-    /// Repo uids whose edges predate [`RESOLVER_GENERATION`].
+    /// Repo uids whose edges predate [`RESOLVER_GENERATION`], SORTED.
+    ///
+    /// nw-358. This is the sole computation behind every route's
+    /// `stale_repos` — the CLI's two staleness constructors, `hub_nodes` /
+    /// `bridge_nodes` over MCP, and `staleness_note` — and it used to preserve
+    /// its caller's order. The callers enumerate different containers: a
+    /// `BTreeMap`'s keys on one side (lexicographic INCIDENTALLY, with nothing
+    /// stating the intent) and `MATCH (r:Repo) RETURN` with no `ORDER BY` on
+    /// the other. So the same database answered in two byte-shapes depending
+    /// on which one asked.
+    ///
+    /// Sorting HERE rather than in a printer is the point: a sort in
+    /// `print_ranking_json` would fix the CLI's two legs and leave MCP
+    /// unsorted, converting a three-way divergence into a two-way one. Here it
+    /// also makes the answer stable across databases, not merely across
+    /// routes on one.
     pub fn stale_repos<'a, I: IntoIterator<Item = &'a str>>(&self, known: I) -> Vec<String> {
-        known
+        let mut stale: Vec<String> = known
             .into_iter()
             .filter(|uid| self.generation_for(uid) < RESOLVER_GENERATION)
             .map(|uid| uid.to_string())
-            .collect()
+            .collect();
+        stale.sort_unstable();
+        stale
     }
 }
 
