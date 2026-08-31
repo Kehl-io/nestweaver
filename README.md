@@ -170,6 +170,35 @@ otherwise). Other ranking-derived surfaces still do not — `clusters`,
 `blast-radius`, `generate-guide`, PPR-backed `context`, and the whole web UI —
 so on those, absence of a warning is not evidence of freshness.
 
+### `_meta` moved to the payload and lost its `nestweaver.io/` prefix
+
+**Only affects raw HTTP MCP clients that read result metadata.** The CLI, the
+MCP stdio server and the daemon are unchanged for callers.
+
+Through 8.x the HTTP `/mcp` boundary stamped provenance onto the **outer
+`tools/call` envelope** under namespaced keys — `nestweaver.io/sources`,
+`nestweaver.io/scope`, `nestweaver.io/stale_repos`. It is now written once, at
+the tool layer, as an unprefixed `_meta` object **on the result payload**:
+
+```jsonc
+// 8.x — outer envelope
+{ "result": { "_meta": { "nestweaver.io/sources": ["local"] }, "content": [...] } }
+
+// 9.0.0 — on the payload itself
+{ "map": "...", "_meta": { "scope": "local", "sources": ["local"], "stale_repos": [] } }
+```
+
+A client reading `result._meta["nestweaver.io/sources"]` gets nothing. Read
+`_meta.sources` on the payload instead. The payload location is what the
+server's own `initialize` instructions have always promised and what both CLI
+routes already emitted; the envelope was the odd one out, and MCP over stdio
+sent no provenance at all.
+
+Note that `_meta.stale_repos` is **federation** staleness (which upstreams were
+behind). It is a different population from the top-level `stale_repos` on
+`hub_nodes` / `repo_map`, which is resolver-generation staleness, and from
+`stale_repos` on `stale_check`, which is behind-HEAD.
+
 Note that `hubs --json` carries two different `stale_repos`: the **top-level**
 one is resolver-generation staleness, and `_meta.stale_repos` is federation
 staleness (repos where the *local* index is behind an upstream server). They
