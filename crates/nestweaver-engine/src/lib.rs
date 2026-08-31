@@ -411,6 +411,7 @@ pub mod suggest;
 pub mod summaries;
 pub mod summary;
 pub mod tls;
+pub mod user_config;
 pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;

@@ -12818,17 +12818,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 use nestweaver_engine::admin;
                 let rt = admin::Runtime::parse(&runtime)?;
                 let settings_path = admin::runtime_settings_path(rt);
-                let existing: serde_json::Value = if settings_path.exists() {
-                    let raw = std::fs::read_to_string(&settings_path)?;
-                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
-                } else {
-                    serde_json::Value::Null
-                };
                 if dry_run {
                     // PRINT only the minimal delta that WOULD be added — not the
                     // whole merged settings document (which may contain unrelated
                     // pre-existing permissions). Do not write.
-                    let delta = admin::compute_hook_delta(rt, &existing)?;
+                    //
+                    // Reading is deliberately more permissive than writing: this
+                    // branch works on a JSONC file and on a symlink, because it
+                    // is the remedy the write path's refusals hand back, and a
+                    // remedy that cannot run on the file that triggered it is
+                    // not a remedy.
+                    let existing = admin::read_runtime_settings(&settings_path)?;
+                    let delta = admin::compute_hook_delta(rt, &existing.value)?;
                     println!("{}", serde_json::to_string_pretty(&delta)?);
                     eprintln!(
                         "(dry-run) Would merge the above hook entry into {} (existing settings preserved). Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
@@ -12836,15 +12837,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                     return Ok((EXIT_SUCCESS, None));
                 }
-                let patched = admin::compute_hook_patch(rt, &existing)?;
-                if let Some(parent) = settings_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                // This used to read the file, fold ANY parse failure into
+                // `Value::Null`, merge the hook into that, and `fs::write` the
+                // result. A single `//` comment — which Claude Code accepts in
+                // this very file — was enough to replace a user's `env` block,
+                // containing a live API key, with nothing but NestWeaver's
+                // hook, at exit 0, under the message "Hook installed
+                // (idempotent)". The read, the merge and the write now live in
+                // `admin::install_hook`, where they are unit-testable and where
+                // refusing is the default for anything it cannot read.
+                match admin::install_hook(rt, &settings_path)? {
+                    admin::HookInstall::Installed => out.status(&format!(
+                        "Hook installed to {} (every other setting preserved)",
+                        settings_path.display()
+                    )),
+                    admin::HookInstall::AlreadyPresent => out.status(&format!(
+                        "Hook already present in {} (nothing written)",
+                        settings_path.display()
+                    )),
                 }
-                std::fs::write(&settings_path, serde_json::to_string_pretty(&patched)?)?;
-                out.status(&format!(
-                    "Hook installed (idempotent) to {}",
-                    settings_path.display()
-                ));
                 Ok((EXIT_SUCCESS, None))
             }
         },
