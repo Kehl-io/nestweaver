@@ -105,6 +105,11 @@ pub struct RestoreResult {
     pub manifest: BackupManifest,
     pub data_dir: PathBuf,
     pub duration: Duration,
+    /// A pre-restore copy left by an EARLIER interrupted restore whose
+    /// redundancy this run could not prove, and which was therefore renamed
+    /// aside instead of deleted. Surfaced so the operator can remove it once
+    /// satisfied — silently keeping it would leak a full copy of the graph.
+    pub preserved_copy: Option<PathBuf>,
 }
 
 /// Seal an already-built publication slot in its live store layout.
@@ -487,44 +492,491 @@ pub fn backup_list(dir: &Path) -> anyhow::Result<Vec<(PathBuf, BackupManifest)>>
     Ok(results)
 }
 
-/// Reconcile a leftover `<data>.restoring` directory from a previously
-/// interrupted restore, before starting a new one.
+// ---------------------------------------------------------------------------
+// Durable restore journal
+// ---------------------------------------------------------------------------
+
+/// How far a restore had got when it stopped.
 ///
-/// The restore uses a rename-aside dance: move `data_dir` -> `.restoring`, then
-/// move the new data into `data_dir`, then delete `.restoring`. If a prior
-/// restore crashed *between* those first two steps, `data_dir` is gone and
-/// `.restoring` holds the ONLY surviving copy of the old data. In that case we
-/// rename it back into place rather than destroying it. If `data_dir` is present,
-/// `.restoring` is a harmless orphan (crash after the new data landed) and is
-/// removed.
-fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<()> {
-    let restoring_dir = data_dir.with_extension("restoring");
-    if !restoring_dir.exists() {
-        return Ok(());
+/// This type exists because "the destination directory is not empty" is not,
+/// and never was, evidence that a restore finished. The cutover falls back to a
+/// recursive copy whenever the atomic rename cannot be used, and a copy that
+/// dies after its first file leaves a destination that is NONEMPTY AND USELESS
+/// while the only complete copy of the user's data sits in `<data>.restoring`.
+/// The previous recovery read nonemptiness as completion and deleted that copy
+/// — the last complete copy — before the retry.
+///
+/// Every phase below is published DURABLY (see [`publish_restore_phase`]) and
+/// is ordered against the filesystem effect it describes so that the journal
+/// can never claim more than the disk has reached:
+///
+/// * phases that say "the destination is not to be trusted" are published
+///   BEFORE the action, because over-claiming them is safe;
+/// * phases that say "the replacement is complete" are published AFTER the
+///   action, its `fsync`, and its validation, because over-claiming those is
+///   exactly the data loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestorePhase {
+    /// The archive is extracted into a staging directory and has passed every
+    /// integrity check. Nothing in the target has been touched yet.
+    StagingVerified,
+    /// The incumbent data directory has been renamed to `<data>.restoring`,
+    /// which now holds the only complete copy of the user's pre-restore data.
+    OldDataPreserved,
+    /// The destination is being built and is NOT authoritative, however many
+    /// files it already contains. Published before the first byte of a
+    /// cross-device copy lands, and before a rollback after a failed
+    /// post-cutover validation.
+    CopyInProgress,
+    /// The replacement is fully in place, durable on disk, and validated. Only
+    /// now is `<data>.restoring` provably redundant.
+    CutoverValidated,
+    /// The preserved copy is being removed.
+    Cleanup,
+}
+
+/// Bumped when the on-disk journal shape changes. A journal this build cannot
+/// read is treated as ABSENT, which routes it to the no-proof branch of
+/// [`recover_interrupted_restore`] — preserve, never delete.
+const RESTORE_JOURNAL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreJournal {
+    version: u32,
+    phase: RestorePhase,
+    data_dir: PathBuf,
+    restoring_dir: PathBuf,
+    snapshot_path: PathBuf,
+}
+
+/// Where the incumbent data directory is moved to while the replacement lands.
+fn restoring_dir_for(data_dir: &Path) -> PathBuf {
+    data_dir.with_extension("restoring")
+}
+
+/// The journal lives BESIDE `<data>.restoring`, in the parent of the data
+/// directory — never inside it. Everything inside the data directory is
+/// renamed aside, copied over, or deleted by the very operation the journal
+/// exists to describe, so a marker kept there would be destroyed by its own
+/// subject.
+fn restore_journal_path(data_dir: &Path) -> PathBuf {
+    let mut name = restoring_dir_for(data_dir).into_os_string();
+    name.push(".journal");
+    PathBuf::from(name)
+}
+
+/// `fsync` a directory, so that a `rename` or `unlink` performed inside it
+/// survives power loss. A file's own `fsync` does not make the directory entry
+/// that names it durable.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Publish a restore phase durably.
+///
+/// A phase marker that is not fsynced does not survive the process death it
+/// exists to describe, so this performs the full atomic-durable publish:
+/// write a sibling temp file, `fsync` the file, `rename` it over the journal
+/// (atomic within one directory), then `fsync` the parent directory so the
+/// rename itself is durable. Anything less can leave the journal claiming a
+/// phase the filesystem never reached — the same failure this journal exists
+/// to remove, pointing the other way.
+fn publish_restore_phase(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let path = restore_journal_path(&journal.data_dir);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create restore journal directory {}", parent.display()))?;
+
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("create restore journal {}", tmp.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("write restore journal {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync restore journal {}", tmp.display()))?;
     }
-    if dir_is_present(data_dir) {
-        // Data dir intact — `.restoring` is a harmless orphan.
-        let _ = std::fs::remove_dir_all(&restoring_dir);
-    } else {
-        // Data dir missing/empty — `.restoring` is the only surviving copy.
-        std::fs::rename(&restoring_dir, data_dir).with_context(|| {
-            format!(
-                "recover interrupted restore: rename {} back to {}",
-                restoring_dir.display(),
-                data_dir.display()
-            )
-        })?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("publish restore journal {}", path.display()))?;
+    fsync_dir(parent)
+        .with_context(|| format!("fsync restore journal directory {}", parent.display()))?;
+    Ok(())
+}
+
+/// Read the journal for `data_dir`, or `None` if there is none this build can
+/// trust. Unreadable and unparseable journals deliberately land on `None`: the
+/// no-proof branch preserves the aside copy, so an unreadable marker costs a
+/// directory that has to be removed by hand rather than a database.
+fn read_restore_journal(data_dir: &Path) -> Option<RestoreJournal> {
+    let bytes = std::fs::read(restore_journal_path(data_dir)).ok()?;
+    let journal: RestoreJournal = serde_json::from_slice(&bytes).ok()?;
+    (journal.version == RESTORE_JOURNAL_VERSION).then_some(journal)
+}
+
+/// Durably retire the journal. The unlink is followed by a parent `fsync` for
+/// the same reason the publish is: an unlink that is not durable can come back.
+fn clear_restore_journal(data_dir: &Path) {
+    let path = restore_journal_path(data_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                let _ = fsync_dir(parent);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                journal = %path.display(),
+                "could not remove the restore journal: {error}"
+            );
+        }
+    }
+}
+
+/// Make an entire restored dataset durable before anything claims it complete.
+///
+/// Without this, `CutoverValidated` could be on disk while the bytes it vouches
+/// for are still only in the page cache — a marker that survives the crash its
+/// data does not is worse than no marker at all.
+fn fsync_tree(root: &Path) -> std::io::Result<()> {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        } else if entry.file_type().is_dir() {
+            fsync_dir(entry.path())?;
+        }
+    }
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fsync_dir(parent)?;
     }
     Ok(())
 }
 
-/// True if `dir` exists and contains at least one entry. A missing or empty
-/// data dir means a prior restore had already moved the real data aside.
+/// Does `dest` hold a COMPLETE copy of the dataset `manifest` describes?
+///
+/// Used as a positive proof only, and that asymmetry is deliberate: a dataset
+/// that fails here is NOT thereby known to be partial. A restore that succeeded
+/// and was then written to by a daemon stops matching its manifest within
+/// seconds, which is precisely why a failure here may never authorize deleting
+/// a preserved copy.
+///
+/// `clones/` -> `workspace/`: the restore renames the archive's historical
+/// `clones/` directory to the runtime `workspace/` name before cutover, so
+/// manifest keys under `clones/` address files that are correctly no longer at
+/// that name. Accepting both spellings is not laxity — it is the same file.
+fn verify_restored_dataset(dest: &Path, manifest: &BackupManifest) -> anyhow::Result<()> {
+    for (filename, expected_hash) in &manifest.checksums {
+        let mut path = dest.join(filename);
+        if !path.exists()
+            && let Some(rest) = filename.strip_prefix("clones/")
+        {
+            path = dest.join("workspace").join(rest);
+        }
+        if !path.exists() {
+            anyhow::bail!("restored dataset is missing {filename}");
+        }
+        let actual =
+            sha256_stream_path(&path).with_context(|| format!("hashing restored {filename}"))?;
+        if actual != *expected_hash {
+            anyhow::bail!(
+                "restored {filename} does not match the archive: expected {expected_hash}, \
+                 got {actual}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Can `dest` prove, from its own embedded `manifest.json`, that it is a
+/// complete restored dataset?
+///
+/// This is the second of the two admissible completion proofs (the journal is
+/// the first). It exists so that a `.restoring` left by a build that had no
+/// journal, or one whose journal was lost, can still be cleaned up when the
+/// replacement really did land — without ever inferring completeness from
+/// nonemptiness.
+fn restored_dataset_is_self_proving(dest: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dest.join("manifest.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<BackupManifest>(&text) else {
+        return false;
+    };
+    verify_restored_dataset(dest, &manifest).is_ok()
+}
+
+/// A `<data>.restoring` whose redundancy could not be PROVEN, renamed aside
+/// rather than deleted.
+fn preserve_unproven_copy(restoring_dir: &Path) -> anyhow::Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut candidate = PathBuf::new();
+    for attempt in 0..1_000 {
+        let mut name = restoring_dir.as_os_str().to_owned();
+        if attempt == 0 {
+            name.push(format!(".preserved-{stamp}"));
+        } else {
+            name.push(format!(".preserved-{stamp}-{attempt}"));
+        }
+        candidate = PathBuf::from(name);
+        if !candidate.exists() {
+            break;
+        }
+    }
+    std::fs::rename(restoring_dir, &candidate).with_context(|| {
+        format!(
+            "preserve unverified pre-restore copy {} as {}",
+            restoring_dir.display(),
+            candidate.display()
+        )
+    })?;
+    if let Some(parent) = candidate.parent() {
+        let _ = fsync_dir(parent);
+    }
+    tracing::warn!(
+        preserved = %candidate.display(),
+        "a previous restore left a copy of your data whose redundancy could not be proven; \
+         it has been preserved rather than deleted"
+    );
+    Ok(candidate)
+}
+
+/// What reconciling a previously interrupted restore did.
+#[derive(Debug, Default)]
+struct RestoreRecovery {
+    /// A pre-restore copy that could not be proven redundant and was therefore
+    /// renamed aside instead of deleted. The caller surfaces this path so the
+    /// operator can remove it once satisfied.
+    preserved: Option<PathBuf>,
+}
+
+/// Reconcile a leftover `<data>.restoring` from a previously interrupted
+/// restore, before starting a new one.
+///
+/// The restore uses a rename-aside dance: move `data_dir` -> `.restoring`,
+/// land the new data at `data_dir`, then delete `.restoring`. What decides
+/// whether `.restoring` may be deleted is DURABLE COMPLETION PROOF, and only
+/// two things count as proof:
+///
+/// 1. the fsynced journal says the cutover was validated, or
+/// 2. `data_dir` validates against its own embedded `manifest.json`.
+///
+/// Nonemptiness is not proof and never was. A cross-device copy that died
+/// after one file leaves `data_dir` nonempty and worthless while `.restoring`
+/// holds the user's only complete dataset; the previous version of this
+/// function deleted it on exactly that evidence.
+fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecovery> {
+    let restoring_dir = restoring_dir_for(data_dir);
+    let journal = read_restore_journal(data_dir);
+    let phase = journal.as_ref().map(|journal| journal.phase);
+
+    if !restoring_dir.exists() {
+        // Nothing was preserved, so nothing can be lost. The one thing still
+        // worth doing is discarding a destination the journal PROVES is
+        // partial, so the retry does not copy into debris.
+        if phase == Some(RestorePhase::CopyInProgress) && data_dir.exists() {
+            std::fs::remove_dir_all(data_dir).with_context(|| {
+                format!(
+                    "discard the partial restore destination {}",
+                    data_dir.display()
+                )
+            })?;
+        }
+        clear_restore_journal(data_dir);
+        return Ok(RestoreRecovery::default());
+    }
+
+    match phase {
+        // PROVABLY not authoritative. Discard the destination and put the
+        // preserved copy back. If the copy had in fact just finished, we have
+        // discarded something the archive can rebuild; the alternative is
+        // discarding something nothing can rebuild.
+        Some(RestorePhase::CopyInProgress) => {
+            if data_dir.exists() {
+                std::fs::remove_dir_all(data_dir).with_context(|| {
+                    format!(
+                        "discard the unfinished restore destination {}",
+                        data_dir.display()
+                    )
+                })?;
+            }
+            std::fs::rename(&restoring_dir, data_dir).with_context(|| {
+                format!(
+                    "recover interrupted restore: rename {} back to {}",
+                    restoring_dir.display(),
+                    data_dir.display()
+                )
+            })?;
+            if let Some(parent) = data_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                let _ = fsync_dir(parent);
+            }
+            clear_restore_journal(data_dir);
+            Ok(RestoreRecovery::default())
+        }
+
+        // PROVABLY redundant: the journal was published only after the
+        // replacement was durable and validated.
+        Some(RestorePhase::CutoverValidated | RestorePhase::Cleanup) => {
+            std::fs::remove_dir_all(&restoring_dir).with_context(|| {
+                format!(
+                    "remove the superseded pre-restore copy {}",
+                    restoring_dir.display()
+                )
+            })?;
+            clear_restore_journal(data_dir);
+            Ok(RestoreRecovery::default())
+        }
+
+        // No proof either way — including every `.restoring` written by a
+        // build that had no journal at all.
+        Some(RestorePhase::StagingVerified | RestorePhase::OldDataPreserved) | None => {
+            if !dir_is_present(data_dir) {
+                // `.restoring` holds the only surviving copy.
+                std::fs::rename(&restoring_dir, data_dir).with_context(|| {
+                    format!(
+                        "recover interrupted restore: rename {} back to {}",
+                        restoring_dir.display(),
+                        data_dir.display()
+                    )
+                })?;
+                if let Some(parent) = data_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    let _ = fsync_dir(parent);
+                }
+                clear_restore_journal(data_dir);
+                Ok(RestoreRecovery::default())
+            } else if restored_dataset_is_self_proving(data_dir) {
+                std::fs::remove_dir_all(&restoring_dir).with_context(|| {
+                    format!(
+                        "remove the superseded pre-restore copy {}",
+                        restoring_dir.display()
+                    )
+                })?;
+                clear_restore_journal(data_dir);
+                Ok(RestoreRecovery::default())
+            } else {
+                let preserved = preserve_unproven_copy(&restoring_dir)?;
+                clear_restore_journal(data_dir);
+                Ok(RestoreRecovery {
+                    preserved: Some(preserved),
+                })
+            }
+        }
+    }
+}
+
+/// True if `dir` exists and contains at least one entry.
+///
+/// This answers "is there anything here", which is the ONLY question it may be
+/// asked. It is not, and must never again be used as, an answer to "did the
+/// restore finish" — see [`recover_interrupted_restore`].
 fn dir_is_present(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|mut it| it.next().is_some())
         .unwrap_or(false)
 }
+
+/// Force the cross-device copy fallback. Test builds only.
+///
+/// The atomic rename is taken whenever the kernel allows it, and through the
+/// CLI's own path construction the staging directory is almost always a
+/// sibling of the target — so the copy fallback, which is the unsafe half of
+/// the cutover, is very hard to reach on purpose. This seam makes it
+/// reachable in tests without a second filesystem. It is compiled out of every
+/// non-test build.
+#[cfg(test)]
+fn force_cross_device_copy_for_test() -> bool {
+    std::env::var_os("NW_RESTORE_TEST_FORCE_COPY").is_some()
+}
+
+#[cfg(not(test))]
+fn force_cross_device_copy_for_test() -> bool {
+    false
+}
+
+/// Die at an exact restore phase, with no unwinding, no destructors and no
+/// flushing — `_exit`, the closest thing to `SIGKILL` a test can aim
+/// precisely. Test builds only; the child process that does the dying is the
+/// test binary re-invoked against itself.
+#[cfg(test)]
+fn maybe_crash_for_test(phase: RestorePhase) {
+    let label = match phase {
+        RestorePhase::StagingVerified => "staging-verified",
+        RestorePhase::OldDataPreserved => "old-data-preserved",
+        RestorePhase::CopyInProgress => "copy-in-progress",
+        RestorePhase::CutoverValidated => "cutover-validated",
+        RestorePhase::Cleanup => "cleanup",
+    };
+    if std::env::var("NW_RESTORE_TEST_CRASH_AT").as_deref() == Ok(label) {
+        // SAFETY: `_exit` is async-signal-safe and terminates immediately.
+        unsafe { libc::_exit(9) };
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_crash_for_test(_phase: RestorePhase) {}
+
+/// Die PART WAY THROUGH the cross-device copy, having landed exactly one file,
+/// so a test can construct the state the defect was reported against: a
+/// destination that is nonempty and worthless beside the only complete copy.
+/// Test builds only.
+#[cfg(test)]
+fn maybe_crash_mid_copy_for_test(source: &Path, dest: &Path) {
+    if std::env::var("NW_RESTORE_TEST_CRASH_AT").as_deref() != Ok("copy-midway") {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dest);
+    if let Ok(entries) = std::fs::read_dir(source)
+        && let Some(first) = entries
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().is_file())
+    {
+        let _ = std::fs::copy(first.path(), dest.join(first.file_name()));
+    }
+    // SAFETY: `_exit` is async-signal-safe and terminates immediately, running
+    // no destructor and flushing nothing.
+    unsafe { libc::_exit(9) };
+}
+
+#[cfg(not(test))]
+fn maybe_crash_mid_copy_for_test(_source: &Path, _dest: &Path) {}
+
+/// Corrupt one file of the freshly-copied destination, so a test can drive the
+/// post-cutover validation failure and the rollback it triggers. Test builds
+/// only.
+#[cfg(test)]
+fn maybe_corrupt_after_copy_for_test(dest: &Path) {
+    if std::env::var_os("NW_RESTORE_TEST_CORRUPT_AFTER_COPY").is_none() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dest)
+        && let Some(victim) = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && path.file_name().is_some_and(|name| name != "manifest.json")
+            })
+            .min()
+    {
+        let _ = std::fs::write(&victim, b"corrupted by the test");
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_corrupt_after_copy_for_test(_dest: &Path) {}
 
 /// Restore a backup archive into a target directory.
 ///
@@ -533,6 +985,16 @@ fn dir_is_present(dir: &Path) -> bool {
 /// directory is cleaned up and the target is left untouched.
 pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let start = Instant::now();
+
+    let restoring_dir = restoring_dir_for(&config.data_dir);
+
+    // Reconcile a previously interrupted restore FIRST, before this run
+    // extracts or touches anything — and do it from the durable journal
+    // rather than from "the data directory has something in it". Running it
+    // here rather than just before the cutover means a target left broken by
+    // an earlier death is repaired even if THIS archive turns out to be
+    // invalid.
+    let recovery = recover_interrupted_restore(&config.data_dir)?;
 
     // Extract to a sibling temp directory so we can atomically rename on success.
     let parent = config
@@ -633,12 +1095,19 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // Move the verified extraction to the target directory. If the target
     // already exists, remove it first (we've already verified the new data).
     // Atomic restore: rename-aside pattern (similar to dpkg atomic upgrades).
-    let restoring_dir = config.data_dir.with_extension("restoring");
-
-    // Reconcile any leftover .restoring dir from a previously interrupted
-    // restore. If it holds the only surviving copy (data dir gone), recover it
-    // instead of deleting it.
-    recover_interrupted_restore(&config.data_dir)?;
+    //
+    // Every step below is bracketed by a DURABLE phase marker, because the
+    // only alternative evidence available to the next run — "the destination
+    // has something in it" — is not evidence at all. See [`RestorePhase`].
+    let mut journal = RestoreJournal {
+        version: RESTORE_JOURNAL_VERSION,
+        phase: RestorePhase::StagingVerified,
+        data_dir: config.data_dir.clone(),
+        restoring_dir: restoring_dir.clone(),
+        snapshot_path: config.snapshot_path.clone(),
+    };
+    publish_restore_phase(&journal)?;
+    maybe_crash_for_test(RestorePhase::StagingVerified);
 
     if config.data_dir.exists() {
         // Step 1: Move existing data aside (crash here = old data at .restoring, recoverable).
@@ -649,19 +1118,39 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                 restoring_dir.display()
             )
         })?;
+        if let Some(dir) = config
+            .data_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let _ = fsync_dir(dir);
+        }
+        journal.phase = RestorePhase::OldDataPreserved;
+        publish_restore_phase(&journal)?;
+        maybe_crash_for_test(RestorePhase::OldDataPreserved);
     }
 
-    // Step 2: Move new data into place (crash here = old data at .restoring, recoverable).
-    if std::fs::rename(temp_dir.path(), &config.data_dir).is_err() {
-        // Cross-device: fall back to copy.
+    // Step 2: Move new data into place. The rename is atomic; the copy
+    // fallback is not, and everything below exists because of that difference.
+    let cross_device_copy = force_cross_device_copy_for_test()
+        || std::fs::rename(temp_dir.path(), &config.data_dir).is_err();
+    if cross_device_copy {
+        // Published BEFORE the first byte lands. Over-claiming "the
+        // destination is not authoritative" costs a retry; under-claiming it
+        // costs the user's only complete dataset.
+        journal.phase = RestorePhase::CopyInProgress;
+        publish_restore_phase(&journal)?;
+        maybe_crash_for_test(RestorePhase::CopyInProgress);
+        maybe_crash_mid_copy_for_test(temp_dir.path(), &config.data_dir);
+
         if let Err(e) = nestweaver_storage::copy_dir_all(temp_dir.path(), &config.data_dir) {
-            // Partial write may have occurred. Log recovery instructions before
-            // propagating so the user knows the old data is still available.
+            // Partial write may have occurred. The journal already records
+            // that, so the next run reinstates the preserved copy rather than
+            // deleting it; say so here too, in the terms the operator sees.
             tracing::error!(
-                "Cross-device copy failed: {e}. Your previous data is preserved at '{}'. \
-                 To recover, remove the partially-written '{}' and rename '{}' back to '{}'.",
-                restoring_dir.display(),
-                config.data_dir.display(),
+                "Cross-device copy failed: {e}. Your previous data is preserved at '{}' and \
+                 the next `nestweaver backup restore --data-dir {}` will reinstate it \
+                 automatically.",
                 restoring_dir.display(),
                 config.data_dir.display(),
             );
@@ -672,17 +1161,63 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                 )
             });
         }
+        maybe_corrupt_after_copy_for_test(&config.data_dir);
     }
 
-    // Step 3: Remove the old data (crash here = orphan .restoring, harmless).
-    if restoring_dir.exists() {
-        let _ = std::fs::remove_dir_all(&restoring_dir);
+    // Make the replacement DURABLE before anything claims it is complete: a
+    // marker that outlives the data it vouches for is worse than no marker.
+    fsync_tree(&config.data_dir).with_context(|| {
+        format!(
+            "make the restored data at {} durable",
+            config.data_dir.display()
+        )
+    })?;
+
+    // Validate the replacement IN PLACE — but only on the copy path. The
+    // rename path moved a directory that was already checksum-verified in
+    // staging, atomically; re-hashing a possibly multi-gigabyte dataset there
+    // would buy nothing. The copy path has no such guarantee, and it is the
+    // one that can land a partial dataset.
+    if cross_device_copy && let Err(error) = verify_restored_dataset(&config.data_dir, &manifest) {
+        // The destination is not usable. Roll back under the phase that says
+        // exactly that, so a death during the rollback still recovers.
+        journal.phase = RestorePhase::CopyInProgress;
+        publish_restore_phase(&journal)?;
+        let recovered = recover_interrupted_restore(&config.data_dir);
+        return Err(error.context(format!(
+            "restored data at {} failed validation after the cutover{}",
+            config.data_dir.display(),
+            match recovered {
+                Ok(_) => "; the pre-restore data has been reinstated".to_string(),
+                Err(problem) =>
+                    format!("; reinstating the pre-restore data also failed: {problem}"),
+            }
+        )));
     }
+
+    journal.phase = RestorePhase::CutoverValidated;
+    publish_restore_phase(&journal)?;
+    maybe_crash_for_test(RestorePhase::CutoverValidated);
+
+    // Step 3: only NOW is the preserved copy provably redundant.
+    if restoring_dir.exists() {
+        journal.phase = RestorePhase::Cleanup;
+        publish_restore_phase(&journal)?;
+        maybe_crash_for_test(RestorePhase::Cleanup);
+        if let Err(error) = std::fs::remove_dir_all(&restoring_dir) {
+            tracing::warn!(
+                path = %restoring_dir.display(),
+                "the superseded pre-restore copy could not be removed: {error}"
+            );
+        }
+    }
+    clear_restore_journal(&config.data_dir);
 
     Ok(RestoreResult {
         manifest,
         data_dir: config.data_dir.clone(),
         duration: start.elapsed(),
+        preserved_copy: recovery.preserved,
     })
 }
 
@@ -2000,26 +2535,502 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Restore recovery: no failure path may delete the last complete copy
+    // -----------------------------------------------------------------------
+
+    /// A small, structurally complete stand-in dataset carrying an identifying
+    /// marker, so a test can say WHICH copy survived rather than merely that
+    /// something did.
+    fn seed_dataset(dir: &Path, marker: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("brain.lbug"), marker).unwrap();
+        std::fs::write(dir.join("brain.lbug.filemeta.json"), b"{}").unwrap();
+    }
+
+    /// Every directory directly under `root` holding a `brain.lbug` equal to
+    /// `marker`.
+    ///
+    /// The assertions use this instead of one hard-coded path because a
+    /// correct recovery is allowed to MOVE the surviving copy — what it is
+    /// never allowed to do is destroy it.
+    fn copies_of(root: &Path, marker: &[u8]) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| std::fs::read(path.join("brain.lbug")).ok().as_deref() == Some(marker))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn journal_at(data_dir: &Path, phase: RestorePhase) {
+        publish_restore_phase(&RestoreJournal {
+            version: RESTORE_JOURNAL_VERSION,
+            phase,
+            data_dir: data_dir.to_path_buf(),
+            restoring_dir: restoring_dir_for(data_dir),
+            snapshot_path: PathBuf::from("/nonexistent.nwsnap.zst"),
+        })
+        .unwrap();
+    }
+
+    /// THE DEFECT, reproduced.
+    ///
+    /// A cross-device cutover that died after its first file leaves a NONEMPTY
+    /// and worthless `data_dir` while `<data>.restoring` holds the only
+    /// complete copy of the user's database. `recover_interrupted_restore`
+    /// read that nonemptiness as "the cutover finished" and best-effort
+    /// deleted the copy — so one partial file destroyed the sole good
+    /// pre-restore dataset, before the retry that needed it.
+    ///
+    /// Against the unfixed function this fails with
+    /// "recovery destroyed the only complete copy of the user's data".
     #[test]
-    fn restore_removes_orphan_restoring_when_data_present() {
-        // Prior restore completed the swap but crashed before deleting
-        // `.restoring`: the data dir is intact, `.restoring` is a stale orphan.
+    fn recovery_never_deletes_the_last_complete_copy_after_a_partial_copy() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("brain.lbug"), b"CURRENT").unwrap();
         let restoring = tmp.path().join("data.restoring");
-        std::fs::create_dir_all(&restoring).unwrap();
-        std::fs::write(restoring.join("stale"), b"x").unwrap();
 
-        recover_interrupted_restore(&data).expect("recover");
+        seed_dataset(&restoring, b"THE ONLY COMPLETE COPY");
+        // The partial destination. Nonempty; nothing more is true of it.
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("brain.lbug"), b"PARTIAL").unwrap();
 
-        assert!(!restoring.exists(), "orphan .restoring must be removed");
-        assert_eq!(
-            std::fs::read(data.join("brain.lbug")).unwrap(),
-            b"CURRENT",
-            "current data must be left untouched"
+        recover_interrupted_restore(&data).expect("recovery must not error");
+
+        assert!(
+            !copies_of(tmp.path(), b"THE ONLY COMPLETE COPY").is_empty(),
+            "recovery destroyed the only complete copy of the user's data, on the sole \
+             evidence that a partial destination was nonempty"
         );
+    }
+
+    /// With the durable journal saying the destination was still being built,
+    /// recovery can do better than merely preserving: it KNOWS the destination
+    /// is not authoritative, discards it, and reinstates the preserved copy.
+    /// Repeating recovery changes nothing.
+    #[test]
+    fn a_journalled_partial_copy_is_discarded_and_the_preserved_copy_reinstated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+
+        seed_dataset(&restoring, b"COMPLETE");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("brain.lbug"), b"PARTIAL").unwrap();
+        journal_at(&data, RestorePhase::CopyInProgress);
+
+        for pass in 0..3 {
+            recover_interrupted_restore(&data).unwrap_or_else(|e| panic!("pass {pass}: {e}"));
+            assert_eq!(
+                std::fs::read(data.join("brain.lbug")).unwrap(),
+                b"COMPLETE",
+                "pass {pass}: the preserved copy must be reinstated"
+            );
+            assert!(
+                !restoring.exists(),
+                "pass {pass}: the aside copy was consumed"
+            );
+            assert!(
+                !restore_journal_path(&data).exists(),
+                "pass {pass}: a reconciled journal must be retired"
+            );
+        }
+    }
+
+    /// The completed-cutover counterweight. The journal is published only
+    /// after the replacement is durable AND validated, so at
+    /// `CutoverValidated` the aside copy is PROVABLY redundant and removing it
+    /// is correct. Without this the fix would simply never clean up.
+    #[test]
+    fn a_journalled_validated_cutover_retires_the_aside_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+
+        seed_dataset(&data, b"RESTORED");
+        seed_dataset(&restoring, b"SUPERSEDED");
+        journal_at(&data, RestorePhase::CutoverValidated);
+
+        for pass in 0..3 {
+            recover_interrupted_restore(&data).unwrap_or_else(|e| panic!("pass {pass}: {e}"));
+            assert!(
+                !restoring.exists(),
+                "pass {pass}: proven-redundant copy removed"
+            );
+            assert_eq!(
+                std::fs::read(data.join("brain.lbug")).unwrap(),
+                b"RESTORED",
+                "pass {pass}: the restored dataset must be untouched"
+            );
+            assert!(!restore_journal_path(&data).exists(), "pass {pass}");
+        }
+    }
+
+    /// The second admissible proof, for a `.restoring` written by a build that
+    /// had no journal at all: the destination validates against its OWN
+    /// embedded `manifest.json`, which is a complete-dataset proof that owes
+    /// nothing to nonemptiness.
+    #[test]
+    fn a_self_proving_destination_retires_the_aside_copy_without_a_journal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+
+        seed_dataset(&data, b"RESTORED");
+        seed_dataset(&restoring, b"SUPERSEDED");
+        write_self_proof(&data);
+
+        recover_interrupted_restore(&data).unwrap();
+
+        assert!(
+            !restoring.exists(),
+            "a self-proving destination retires the orphan"
+        );
+        assert_eq!(std::fs::read(data.join("brain.lbug")).unwrap(), b"RESTORED");
+    }
+
+    /// Nonempty, no journal, and no self-proof: nothing establishes that the
+    /// destination is complete, so the aside copy is PRESERVED — renamed, not
+    /// deleted — and the caller is told where it went.
+    #[test]
+    fn an_unprovable_destination_preserves_the_aside_copy_instead_of_deleting_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+
+        seed_dataset(&restoring, b"LAST GOOD COPY");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("brain.lbug"), b"PARTIAL").unwrap();
+
+        let recovery = recover_interrupted_restore(&data).unwrap();
+        let preserved = recovery
+            .preserved
+            .expect("an unprovable copy must be reported, not silently kept");
+
+        assert!(preserved.exists(), "the preserved copy must be on disk");
+        assert_eq!(
+            std::fs::read(preserved.join("brain.lbug")).unwrap(),
+            b"LAST GOOD COPY"
+        );
+        assert!(
+            !restoring.exists(),
+            "`.restoring` must be freed so the next restore is not wedged"
+        );
+
+        // And a second restore is not wedged by it: `.restoring` is free.
+        let second = recover_interrupted_restore(&data).unwrap();
+        assert!(second.preserved.is_none(), "nothing left to preserve");
+        assert_eq!(
+            copies_of(tmp.path(), b"LAST GOOD COPY").len(),
+            1,
+            "repeated recovery must neither duplicate nor destroy the preserved copy"
+        );
+    }
+
+    /// A journal this build cannot read must not be treated as a completion
+    /// proof. Garbage routes to the no-proof branch, which preserves.
+    #[test]
+    fn an_unreadable_journal_is_not_a_completion_proof() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+
+        seed_dataset(&restoring, b"LAST GOOD COPY");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("brain.lbug"), b"PARTIAL").unwrap();
+        std::fs::write(restore_journal_path(&data), b"{not json").unwrap();
+
+        let recovery = recover_interrupted_restore(&data).unwrap();
+        assert!(recovery.preserved.is_some());
+        assert_eq!(copies_of(tmp.path(), b"LAST GOOD COPY").len(), 1);
+    }
+
+    /// Give `dir` an embedded `manifest.json` that its own contents satisfy.
+    fn write_self_proof(dir: &Path) {
+        let mut checksums = HashMap::new();
+        for name in ["brain.lbug", "brain.lbug.filemeta.json"] {
+            checksums.insert(
+                name.to_string(),
+                sha256_stream_path(dir.join(name)).unwrap(),
+            );
+        }
+        let manifest = BackupManifest {
+            version: 2,
+            tier: "standard".to_string(),
+            nestweaver_version: "test".to_string(),
+            schema_version: 1,
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            instance_id: "test".to_string(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
+            publication_manifest_blake3: String::new(),
+            repos: Vec::new(),
+            repo_count: 0,
+            symbol_count: 0,
+            sizes: BackupSizes {
+                db: 0,
+                tantivy: 0,
+                parsed_cache: 0,
+                total_uncompressed: 0,
+                total_compressed: 0,
+            },
+            checksums,
+        };
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Real process death, at every cutover phase
+    // -----------------------------------------------------------------------
+
+    /// Re-invoked as a CHILD PROCESS by
+    /// [`a_restore_killed_at_any_cutover_phase_leaves_a_complete_dataset`]; a
+    /// no-op in a normal run. The child performs a real restore and dies with
+    /// `_exit` at the phase named by `NW_RESTORE_TEST_CRASH_AT` — no
+    /// unwinding, no destructors, no flushing. That is the point: a phase
+    /// marker that is not fsynced does not survive the death it describes, and
+    /// only a real death proves it does.
+    #[test]
+    fn restore_crash_child() {
+        let (Ok(snapshot), Ok(data_dir)) = (
+            std::env::var("NW_RESTORE_TEST_SNAPSHOT"),
+            std::env::var("NW_RESTORE_TEST_DATA_DIR"),
+        ) else {
+            return;
+        };
+        if let Err(error) = backup_restore(&RestoreConfig {
+            snapshot_path: PathBuf::from(snapshot),
+            data_dir: PathBuf::from(data_dir),
+        }) {
+            eprintln!("child restore returned an error: {error}");
+            // A distinct code, so the parent can tell "the restore refused"
+            // from "the injected crash fired" (9) and from "it succeeded" (0).
+            std::process::exit(3);
+        }
+    }
+
+    fn run_restore_in_child(
+        snapshot: &Path,
+        data_dir: &Path,
+        crash_at: &str,
+    ) -> std::process::ExitStatus {
+        run_restore_in_child_with(snapshot, data_dir, crash_at, &[])
+    }
+
+    fn run_restore_in_child_with(
+        snapshot: &Path,
+        data_dir: &Path,
+        crash_at: &str,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::ExitStatus {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "backup::tests::restore_crash_child",
+            ])
+            .env("NW_RESTORE_TEST_SNAPSHOT", snapshot)
+            .env("NW_RESTORE_TEST_DATA_DIR", data_dir)
+            .env("NW_RESTORE_TEST_CRASH_AT", crash_at)
+            // Force the copy fallback. A same-filesystem rename is atomic and
+            // has no partial state to test; the copy is the unsafe half, and
+            // the CLI's own path construction makes it very hard to reach on
+            // purpose, so it is injected here rather than staged on a second
+            // real filesystem.
+            .env("NW_RESTORE_TEST_FORCE_COPY", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command.status().expect("spawn the crash child")
+    }
+
+    /// Kill a REAL restore process at every phase of a cross-device cutover
+    /// and require that a complete, openable dataset is recoverable each time.
+    ///
+    /// Up to and including `copy-midway` the user's own pre-restore data must
+    /// come back — nothing else can rebuild it. From `cutover-validated` on it
+    /// may legitimately be gone, because the replacement has been proven
+    /// complete and the archive can rebuild anything discarded.
+    #[test]
+    fn a_restore_killed_at_any_cutover_phase_leaves_a_complete_dataset() {
+        for (crash_at, incumbent_must_survive) in [
+            ("staging-verified", true),
+            ("old-data-preserved", true),
+            ("copy-in-progress", true),
+            ("copy-midway", true),
+            ("cutover-validated", false),
+            ("cleanup", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+
+            // The archive to restore.
+            let source_db = tmp.path().join("source").join("test.lbug");
+            std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+            drop(nestweaver_store::GraphStore::create(&source_db).unwrap());
+            let snapshot = tmp.path().join("test.nwsnap.zst");
+            backup_save(&BackupConfig {
+                db_path: source_db,
+                output_path: snapshot.clone(),
+                include_clones: false,
+                instance_id: "crash-test".to_string(),
+                workspace_path: None,
+            })
+            .unwrap();
+
+            // The incumbent dataset the restore is about to replace: a real
+            // store, plus a marker that only the incumbent carries.
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
+            std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+
+            let status = run_restore_in_child(&snapshot, &data_dir, crash_at);
+            assert_eq!(
+                status.code(),
+                Some(9),
+                "the child must have died at {crash_at}, not exited normally"
+            );
+
+            recover_interrupted_restore(&data_dir)
+                .unwrap_or_else(|error| panic!("recovery after {crash_at}: {error}"));
+
+            assert!(
+                nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok(),
+                "after a death at {crash_at} the data directory must hold an openable graph"
+            );
+            if incumbent_must_survive {
+                assert!(
+                    data_dir.join("INCUMBENT").exists(),
+                    "a death at {crash_at} lost the user's own pre-restore data — the one \
+                     thing no archive can rebuild"
+                );
+            }
+
+            // And the retry works: recovery leaves a state a restore can run
+            // from, with no wedged `.restoring` and no second death needed.
+            backup_restore(&RestoreConfig {
+                snapshot_path: snapshot.clone(),
+                data_dir: data_dir.clone(),
+            })
+            .unwrap_or_else(|error| panic!("retry after {crash_at}: {error}"));
+            assert!(
+                nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok(),
+                "the retry after {crash_at} must leave an openable graph"
+            );
+            assert!(
+                !restoring_dir_for(&data_dir).exists(),
+                "a completed restore after {crash_at} must retire its aside copy"
+            );
+            assert!(!restore_journal_path(&data_dir).exists());
+        }
+    }
+
+    /// A cutover that copied every byte and STILL does not match the archive
+    /// must not be published as complete. The rollback runs under the phase
+    /// that says the destination is not authoritative, so a death during the
+    /// rollback recovers too — and after it, the user's own pre-restore data
+    /// is back and a clean retry succeeds.
+    #[test]
+    fn a_cutover_that_fails_validation_rolls_back_to_the_pre_restore_data() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source_db = tmp.path().join("source").join("test.lbug");
+        std::fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        drop(nestweaver_store::GraphStore::create(&source_db).unwrap());
+        let snapshot = tmp.path().join("test.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: source_db,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "validation-failure".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
+        std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+
+        // "crash-at" is deliberately a phase name that never fires: this run
+        // must reach validation and refuse there, not die on the way.
+        let status = run_restore_in_child_with(
+            &snapshot,
+            &data_dir,
+            "never",
+            &[("NW_RESTORE_TEST_CORRUPT_AFTER_COPY", "1")],
+        );
+        assert_eq!(
+            status.code(),
+            Some(3),
+            "the restore must have REFUSED the corrupt cutover, not crashed or succeeded"
+        );
+
+        // The rollback already ran inside the child; recovery is idempotent
+        // over it, twice.
+        for pass in 0..2 {
+            recover_interrupted_restore(&data_dir)
+                .unwrap_or_else(|error| panic!("pass {pass}: {error}"));
+            assert!(
+                data_dir.join("INCUMBENT").exists(),
+                "pass {pass}: a failed validation must leave the pre-restore data in place"
+            );
+            assert!(
+                nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok(),
+                "pass {pass}: the reinstated dataset must open"
+            );
+            assert!(!restoring_dir_for(&data_dir).exists(), "pass {pass}");
+        }
+
+        // And a clean retry, with nothing injected, still works.
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+        })
+        .expect("the retry after a rolled-back validation failure must succeed");
+        assert!(nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok());
+        assert!(!restore_journal_path(&data_dir).exists());
+    }
+
+    /// The absent-target counterweight, end to end: restoring into a directory
+    /// that does not exist writes no journal residue and needs no recovery.
+    #[test]
+    fn restoring_into_an_absent_target_leaves_no_journal_or_aside_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.lbug");
+        drop(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        let snapshot = tmp.path().join("test.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "absent-target".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        let data_dir = tmp.path().join("fresh");
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+
+        assert!(nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok());
+        assert!(!restoring_dir_for(&data_dir).exists());
+        assert!(!restore_journal_path(&data_dir).exists());
     }
 
     #[test]

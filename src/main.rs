@@ -28916,6 +28916,20 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             eprintln!("  Symbols:      {}", m.symbol_count);
             eprintln!("  Restored in:  {}", format_elapsed(result.duration));
 
+            if let Some(preserved) = &result.preserved_copy {
+                eprintln!();
+                eprintln!(
+                    "An earlier restore of this data directory was interrupted, and the copy of \
+                     your pre-restore data it left behind could not be PROVEN redundant, so it \
+                     was preserved rather than deleted:"
+                );
+                eprintln!("  {}", preserved.display());
+                eprintln!(
+                    "Check the restored data, then remove it: rm -rf {}",
+                    preserved.display()
+                );
+            }
+
             if m.tier == "standard" {
                 eprintln!();
                 eprintln!(
