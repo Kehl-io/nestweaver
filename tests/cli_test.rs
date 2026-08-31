@@ -837,13 +837,20 @@ fn installation_docs_only_claim_live_channels() {
     if repo_root.join("smithery.yaml").exists() {
         docs.push("smithery.yaml");
     }
+    // FLIP THESE WHEN THE PUBLISH ACTUALLY LANDS. The npm entries are listed as
+    // unsupported because `nestweaver` has never been published (registry 404 as
+    // of 9.0.0 prep) -- nw-115: the release job's publish step exits 0 when
+    // NPM_TOKEN is unset, so a green release has never implied a published
+    // package. Once `npm view nestweaver version` resolves, drop the four npm
+    // lines so the docs are free to advertise the install. `cargo install` and
+    // `brew install` stay: neither channel exists.
     let unsupported_commands = [
-        "npm install -g @kehl-io/nestweaver",
-        "npm install @kehl-io/nestweaver",
+        "npm install -g nestweaver",
+        "npm install nestweaver",
         "cargo install nestweaver",
         "brew install nestweaver",
-        "npx @kehl-io/nestweaver",
-        "npm exec @kehl-io/nestweaver",
+        "npx nestweaver",
+        "npm exec nestweaver",
     ];
 
     for relative_path in docs {

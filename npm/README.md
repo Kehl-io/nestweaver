@@ -1,4 +1,4 @@
-# @kehl-io/nestweaver
+# nestweaver
 
 This directory contains packaging source and staging material for a future npm
 wrapper. The wrapper is not currently published or available as an installation
