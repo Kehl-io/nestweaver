@@ -63,11 +63,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux GNU archives are built on the OLDEST supported runner on
+          # purpose. glibc is backward compatible, not forward: a binary built
+          # against 2.39 will not start on 2.35, so the build host's glibc IS
+          # the compatibility floor shipped to users. `ubuntu-latest` moved to
+          # 24.04 and silently raised that floor to 2.39, which is why the
+          # public v8.0.0 GNU archive cannot start on Ubuntu 22.04 (2.35),
+          # Debian 12 (2.36) or RHEL 9 (2.34). Pinning 22.04 covers all three.
+          # The `Verify release binary` step enforces the floor rather than
+          # trusting this pin.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             features: ""
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             features: ""
           - target: x86_64-apple-darwin
             os: macos-15-intel
@@ -229,6 +238,27 @@ jobs:
               echo "release binary has a dynamic OpenSSL dependency" >&2
               exit 1
             fi
+
+            # Enforce the declared glibc baseline. The runner pin above sets
+            # this floor, but a pin is a claim about the build host; this reads
+            # the requirement back off the ARTIFACT WE ARE ABOUT TO SHIP, which
+            # is the only thing users run. Without it, a future runner-image
+            # bump raises the floor silently again -- exactly how the v8.0.0
+            # archive shipped requiring GLIBC_2.39.
+            GLIBC_BASELINE=2.35
+            MAX_GLIBC="$(readelf -V "$BIN" 2>/dev/null \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+            echo "max glibc required by artifact: ${MAX_GLIBC:-none}"
+            if [ -z "$MAX_GLIBC" ]; then
+              echo "::error::could not read glibc requirements from $BIN; refusing to ship an unverified floor" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$GLIBC_BASELINE" | sort -V | tail -1)" != "$GLIBC_BASELINE" ]; then
+              echo "::error::artifact requires GLIBC_$MAX_GLIBC, above the declared baseline of $GLIBC_BASELINE." >&2
+              echo "It will not start on Ubuntu 22.04 (2.35), Debian 12 (2.36) or RHEL 9 (2.34)." >&2
+              echo "Either build on an older runner or raise the baseline deliberately and document it in INSTALL.md." >&2
+              exit 1
+            fi
           fi
 
           HOST="$(uname -s)-$(uname -m)"
@@ -279,16 +309,40 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       # The wrapper's postinstall downloads the matching release binary, so it
       # must publish only after the `build` job has uploaded the assets for
-      # this tag. No-ops with a clear message until NPM_TOKEN is configured,
-      # so releases stay green before the secret exists.
+      # this tag.
+      #
+      # This step FAILS rather than skips when the token is absent. It used to
+      # exit 0 with a "skipping" message so releases stayed green before the
+      # secret existed -- and the result was that every release since the
+      # wrapper was added reported success while publishing nothing, which is
+      # how the package reached 8.0.0 having never been published at all
+      # (nw-115). A release job that cannot publish must say so.
       - name: Publish to npm
         working-directory: npm
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN not set — skipping npm publish."
-            echo "Add the NPM_TOKEN repo secret to enable automatic publishing."
-            exit 0
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is not set, so the npm wrapper cannot be published." >&2
+            echo "Add the NPM_TOKEN repository secret. A release must not report" >&2
+            echo "success while silently dropping a distribution channel (nw-115)." >&2
+            exit 1
           fi
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
           npm publish --access public
+          # Read it back. `npm publish` exiting 0 is a claim, not evidence: a
+          # publish that is not resolvable from the registry did not happen, and
+          # trusting the exit code is the exact failure this step is here to
+          # stop. Retry only for registry propagation lag.
+          for attempt in 1 2 3 4 5; do
+            if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+              echo "Verified $NAME@$VERSION is resolvable from the registry."
+              exit 0
+            fi
+            echo "Registry has not caught up (attempt $attempt/5); retrying in 10s."
+            sleep 10
+          done
+          echo "::error::npm publish exited 0 but $NAME@$VERSION is not resolvable." >&2
+          exit 1
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

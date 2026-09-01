@@ -8,10 +8,31 @@ echo "$COMMAND" | grep -qE 'git\s+commit' || exit 0
 DB="${NESTWEAVER_DB:-./nestweaver.lbug}"
 [ ! -f "$DB" ] && exit 0
 
-CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || exit 0)
-INDEXED_SHA=$(nestweaver list-repos --json --db "$DB" 2>/dev/null | jq -r '.[0].indexed_sha // empty' || true)
+# Ask the product rather than re-deriving the answer: `stale-check` exits
+#   0 = every repo is fresh
+#   1 = the check itself could not run  (say nothing — a broken check is not drift)
+#   2 = at least one repo needs a re-index
+#   64 = bad usage
+# Gating on 2 specifically is what the CLI's own --help prescribes. The previous
+# version compared `list-repos[0].indexed_sha` against `git rev-parse HEAD`,
+# which reported "? commit(s) behind" for any repo whose indexed_sha is not a
+# real SHA (e.g. the literal "local" for an untracked tree).
+set +e
+REPORT=$(nestweaver stale-check --db "$DB" --json 2>/dev/null)
+RC=$?
+set -e
 
-if [ -n "$INDEXED_SHA" ] && [ "$CURRENT_SHA" != "$INDEXED_SHA" ]; then
-  BEHIND=$(git rev-list --count "$INDEXED_SHA".."$CURRENT_SHA" 2>/dev/null || echo "?")
-  echo "NestWeaver index is ${BEHIND} commit(s) behind HEAD. Run: nestweaver index --repo . --db $DB" >&2
+if [ "$RC" -eq 2 ]; then
+  # As of 9.0.0 exit 2 also covers `status: "outdated_resolver"` — a repo at
+  # HEAD whose edges were written by an older resolver generation. The remedy
+  # differs: incremental indexing is a NO-OP on such a repo (nothing changed),
+  # so only `--force` clears it. Printing the wrong one sends the user round a
+  # loop where the command succeeds and the warning returns.
+  if [ -n "$(echo "${REPORT:-}" | jq -r '.resolver_stale_repos // [] | .[]' 2>/dev/null)" ]; then
+    echo "NestWeaver graph was built by an older resolver generation." >&2
+    echo "  Run: nestweaver index --repo . --db $DB --force   (--force is required)" >&2
+  else
+    echo "NestWeaver index needs a re-index. Run: nestweaver index --repo . --db $DB" >&2
+  fi
+  echo "  (details: nestweaver stale-check --db $DB --json)" >&2
 fi

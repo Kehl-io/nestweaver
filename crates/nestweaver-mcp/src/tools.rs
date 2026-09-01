@@ -2209,6 +2209,72 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
     hasher.finish()
 }
 
+/// The response-cache key for one call, derived in ONE place.
+///
+/// nw-372. `maybe_cached` built this inline and
+/// `cancelled_follower_rejects_failed_leaders_degraded_result` built it AGAIN,
+/// to name the flight slot it expects to observe in `IN_FLIGHT`. Adding a
+/// fourth salt to one copy left the other naming a key nothing computes — and
+/// its `.expect("leader must publish the in-flight slot")` fires while holding
+/// the `IN_FLIGHT` mutex, so the copy did not merely fail: it POISONED a
+/// global and took two unrelated single-flight tests down with it. Same class
+/// as the byte-identical `stale-check` renderers nw-370 collapsed.
+fn response_cache_key(
+    name: &str,
+    args: &Value,
+    db_path: &Path,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> u64 {
+    // Fold the caller's repo-visibility in so a redacted blast_radius result is
+    // never served across identities (R9b). A `None`/`All` visibility (the
+    // unconfigured single-trust-domain default) contributes salt 0, so the key
+    // is byte-identical to before and existing entries still hit — zero
+    // behavior change when no `[authz]` policy is set. A restricting
+    // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
+    // visibility scope its own cache slot.
+    let key = mix_visibility_cache_key(
+        nestweaver_store::cache::ResponseCache::key(name, args),
+        visibility_cache_salt(visible),
+    );
+    let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
+    // nw-372: the rest of the key covers the GRAPH (`graph_generation`) and the
+    // FILES (`whole_db_scope_digest`), and the resolver-generation sidecar is
+    // neither. Downgrading it — exactly what bumping `RESOLVER_GENERATION` does
+    // to every existing database — changes the right answer for `dead_code`
+    // (refuse) and for every `rankings_stale` field without changing either
+    // input, so a hit would serve a pre-bump deletion list past the bump.
+    // Measured on a build without this salt: `refused` absent and
+    // `unreachable_count: 5` on a downgraded database, straight from cache.
+    mix_visibility_cache_key(key, resolver_generation_cache_salt(db_path))
+}
+
+/// Salt folded into every cacheable tool's key so a response cannot outlive
+/// the resolver generation it was computed under.
+///
+/// nw-372. `graph_generation` is bumped by indexing and `whole_db_scope_digest`
+/// tracks file content hashes; neither moves when `RESOLVER_GENERATION` is
+/// bumped in the BINARY, because that changes no byte of the database. The
+/// `RESPONSE_SHAPE_VERSION` namespace covers the real upgrade path, but not a
+/// sidecar edited under a running process — and `dead_code`'s answer flips
+/// from a list to a refusal on exactly that transition.
+fn resolver_generation_cache_salt(db_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let generations = nestweaver_engine::resolver_generation::load(db_path);
+    if generations.repos.is_empty() {
+        // No record at all is the pre-nw-124 state and the default the key
+        // already had; contribute nothing so existing entries still hit.
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `repos` is a BTreeMap, so this walk is ordered and the salt is stable.
+    for (uid, generation) in &generations.repos {
+        uid.hash(&mut hasher);
+        generation.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Semantic context is a function of both graph contents and the exact model
 /// instance available to this process. Include a versioned model namespace in
 /// its cache/single-flight key so a loading request cannot join or hit a ready
@@ -2411,18 +2477,10 @@ fn maybe_cached(
     }
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
-    // Fold the caller's repo-visibility into the cache key so a redacted
-    // blast_radius result is never served across identities (R9b). A `None`/`All`
-    // visibility (the unconfigured single-trust-domain default) contributes salt
-    // 0, so the key is byte-identical to before and existing entries still hit —
-    // zero behavior change when no `[authz]` policy is set. A restricting
-    // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
-    // visibility scope its own cache slot.
-    let key = mix_visibility_cache_key(
-        nestweaver_store::cache::ResponseCache::key(name, &args),
-        visibility_cache_salt(visible),
-    );
-    let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
+    // Every salt this key carries lives in `response_cache_key`, which the
+    // single-flight test also calls — see its doc for why that is not an
+    // aesthetic preference.
+    let key = response_cache_key(name, &args, &db_path, embed_model, visible);
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 
@@ -8727,7 +8785,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Check whether the graph index is current by comparing each repo's indexed git SHA against HEAD. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- If stale, re-index with brain_add_source or CLI nestweaver index\n\nLimitations:\n- Only checks git repos, not vault/note freshness\n- For viewing what actually changed, use brain_diff",
+        "description": "Check whether the graph index is current. Compares each repo's indexed git SHA against HEAD AND checks whether its edges were built by the current resolver generation. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- Gate on `any_needs_reindex` / `needs_reindex_repos` — that is the actionable union of all four states\n- If a repo needs re-indexing, run `nestweaver index --repo <path> --force`. Plain `index` is incremental and does nothing on a repo already at HEAD, which is exactly the shape of an `outdated_resolver` repo\n\nReading `status`:\n- `ok` — current\n- `stale` — indexed SHA is behind git HEAD (`is_stale`)\n- `incomplete` — the SHA was recorded but the content never landed\n- `missing` — the working tree has been deleted\n- `outdated_resolver` — the repo is at HEAD and fully indexed, but its edges were written by an OLDER resolver. Rankings over them are wrong and edge families added since (C/C++ MEMBER_OF, C++ IMPORTS) are absent. Upgrading the binary does not repair data already on disk. The independent `resolver_stale` boolean carries this fact even when `status` reports a git reason instead, and `resolver_stale_repos` lists the URLs\n\nLimitations:\n- Only checks git repos, not vault/note freshness — vaults are not Repo nodes and carry no resolver generation\n- For viewing what actually changed, use brain_diff",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -8740,6 +8798,24 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let repos = store
         .list_repos(None)
         .map_err(|e| anyhow!("list_repos: {e}"))?;
+
+    // nw-370: the FOURTH rung of the ladder. `missing` / `incomplete` /
+    // behind-HEAD all ask "is the input newer than the index?"; this one asks
+    // "was the index built by the resolver we are running?" — a question no
+    // git SHA can answer, because a generation-stale repo sits exactly AT HEAD
+    // with every file unchanged.
+    //
+    // This is the command a user runs to decide whether to re-index, and until
+    // now it answered "up to date" and exited 0 on a graph whose every edge
+    // predates the running binary. `RESOLVER_GENERATION` 3 → 4 in 9.0.0 makes
+    // that the state of EVERY pre-existing database.
+    //
+    // `ranking_stale_repos` is the same accessor `hub_nodes` / `bridge_nodes`
+    // use, over `ResolverGenerations::stale_repos` — the sole computation
+    // (nw-358). No second decider is introduced here; this reads the same
+    // answer and joins it to the rows by uid.
+    let resolver_stale: std::collections::HashSet<String> =
+        ranking_stale_repos(store).into_iter().collect();
 
     let mut results = Vec::new();
     let mut any_stale = false;
@@ -8806,17 +8882,30 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
 
+        // nw-370: `outdated_resolver` sits BELOW the three git-derived states
+        // deliberately. A repo that is `missing`, `incomplete` or behind HEAD
+        // is also generation-stale in almost every case, and the git answer is
+        // the more specific and more urgent one; `resolver_stale` remains a
+        // separate boolean on the row so the fact is never hidden by that
+        // precedence.
+        let repo_resolver_stale = resolver_stale.contains(&repo.uid);
         let status = if local_missing {
             "missing"
         } else if content_missing {
             "incomplete"
         } else if is_stale {
             "stale"
+        } else if repo_resolver_stale {
+            "outdated_resolver"
         } else {
             "ok"
         };
         // The ACTIONABLE union, and the only thing a CI gate should key on:
-        // every non-`ok` status is fixed by re-indexing.
+        // every non-`ok` status is fixed by re-indexing. nw-370: this line is
+        // unchanged and now covers the fourth rung too, which is the point of
+        // adding the rung to `status` rather than beside it — an existing CI
+        // gate on `any_needs_reindex` (or on exit 2) catches the 9.0.0
+        // migration with no edit.
         let needs_reindex = status != "ok";
 
         if is_stale {
@@ -8831,6 +8920,12 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
+            // nw-370. Named separately from `is_stale` for the same reason
+            // nw-163 narrowed `is_stale` to behind-HEAD: one flag meaning three
+            // unrelated things is what made the row self-contradictory. This
+            // one is INDEPENDENT of `is_stale` and stays readable even when the
+            // `status` precedence above reports the git reason instead.
+            "resolver_stale": repo_resolver_stale,
             "needs_reindex": needs_reindex,
             "staleness_commits_behind": commits_behind,
             "status": status,
@@ -8858,6 +8953,13 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     };
     let stale_repos = urls_where("is_stale");
     let needs_reindex_repos = urls_where("needs_reindex");
+    // nw-370: deliberately NOT called `stale_repos`. That key already exists on
+    // this tool and means behind-HEAD URLs; on `hub_nodes` / `bridge_nodes` the
+    // same key means generation-stale repo UIDs. Reusing it here would make
+    // `ResolverStaleness::from_daemon_response` — which keys on
+    // `rankings_stale` + `stale_repos` — silently decode a list of git URLs as
+    // a list of repo UIDs the moment anyone pointed it at this payload.
+    let resolver_stale_repos = urls_where("resolver_stale");
 
     Ok(json!({
         "repo_count": repos.len(),
@@ -8869,6 +8971,9 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         "stale_repos": stale_repos,
         // The ACTIONABLE set, matching `any_needs_reindex`/`needs_reindex`.
         "needs_reindex_repos": needs_reindex_repos,
+        // nw-370: the generation-stale subset, by URL so it lines up with the
+        // other two lists rather than making a caller join uids to urls.
+        "resolver_stale_repos": resolver_stale_repos,
         "repos": results,
     }))
 }
@@ -9855,7 +9960,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos` and a `remedies` array, and NO `unreachable_symbols` key at all — a missing edge can only fail to reach a LIVE symbol, so an under-resolved graph moves live code onto a deletion list. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required) and call again.\n\nGuidelines:\n- Confidence scoring: High (private BY CONVENTION — leading underscore, or a lowercase-initial name in a Go file), Medium (everything else, INCLUDING an explicitly private symbol), Low (explicitly public — could be library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Confidence ranks how UNADDRESSABLE a symbol is from outside its file, not how certain the reachability walk is. Treat every tier as review candidates: a reference the parser does not capture is indistinguishable from no reference. `private` visibility alone does NOT reach High — on a real index that population measured ~0% precision (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code\n- CHECK `coverage` FIRST. It reads \"degraded\" when the walk proved nothing: either the store could not decode part of the corpus (`undecodable_symbols` > 0, so every count is a floor) or NO entry point was found (`entry_points` == 0), in which case the BFS had no seed and every symbol is unreachable BY CONSTRUCTION — the list is then the absence of a finding, not a finding",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9890,6 +9995,14 @@ fn tool_dead_code(
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
+    // nw-372: REFUSE before doing any work. Every other resolver-generation
+    // surface discloses and prints anyway; this one is a list of symbols to
+    // delete, and a missing edge can only move a LIVE symbol onto it. See
+    // `DeadCodeRefusal` for the full argument.
+    if let Some(refusal) = dead_code_refusal(store)? {
+        return Ok(refusal.payload());
+    }
+
     let min_conf_str = args
         .get("min_confidence")
         .and_then(|v| v.as_str())
@@ -10666,7 +10779,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
     let text = render_text(&display);
 
-    Ok(json!({
+    let mut resp = json!({
         "level": level_str,
         "target": target,
         // See the symbol-level payload above: `returned`/`total` is the one
@@ -10698,7 +10811,17 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "cached": from_cache,
         "summaries": display,
         "summaries_text": text,
-    }))
+    });
+    // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects and
+    // orders by the same degree/PageRank the import fan-out corrupted, so on a
+    // generation-stale graph it summarises the wrong thirty symbols. File and
+    // Cluster level reach this same return: File is not ranking-derived at all,
+    // and attaching the disclosure to it would make the flag unfalsifiable —
+    // present on everything means it distinguishes nothing.
+    if level == SummaryLevel::Hub {
+        attach_ranking_staleness(&mut resp, store);
+    }
+    Ok(resp)
 }
 
 /// Shallow check: does the directory contain any `.md` file in its tree?
@@ -12356,13 +12479,98 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 
 /// Attach the ranking-staleness disclosure to a result, in the shape the CLI
 /// has emitted since nw-308: both keys, always.
-fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+///
+/// nw-370: `pub` so the daemon's engine-level RPCs can use it. `repo_map_json`
+/// is a gRPC handler in `nestweaver-daemon`, not an entry in either of this
+/// file's dispatch tables, so it could not reach this — and `repo-map`'s entire
+/// output ORDERING is PageRank order (`generate_repo_map` →
+/// `symbols_by_pagerank`), which makes it the sharpest ranking-derived surface
+/// there is. Exporting the one attacher is what stops the daemon growing a
+/// second, drifting spelling of the same disclosure.
+pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
+    // nw-370: fail CLOSED when the answer cannot be computed.
+    //
+    // `ranking_stale_repos` and `ranking_staleness_note` both `.ok()?` their
+    // way out of a missing `CURRENT_DB_PATH` or a failing `list_repos`, and the
+    // two lines below then turned that into `rankings_stale: false` — a
+    // confident "your rankings are current" produced by an inability to look.
+    // That is the same defect this very field exists to remove: this file's own
+    // doc for it says "an absent key cannot be read as `false`", and a
+    // FABRICATED `false` is strictly worse than an absent one.
+    //
+    // It is not hypothetical. It fired on the first new caller: the daemon's
+    // `repo_map_json` runs its work on a `spawn_blocking` worker where the
+    // thread-local was unset, so `repo-map` via daemon replied "not stale" on a
+    // generation-3 database while `hubs` on the same daemon replied "stale".
+    // The call site is fixed; this makes the next one loud instead of silent.
+    let unavailable = match (current_db_path(store), store.list_repos(None)) {
+        (Err(error), _) => Some(format!(
+            "the database path is not set on this server ({error})"
+        )),
+        (Ok(_), Err(error)) => Some(format!("the repo list could not be read ({error})")),
+        (Ok(_), Ok(_)) => None,
+    };
+    if let Some(reason) = unavailable {
+        resp["rankings_stale"] = json!(true);
+        // Empty, not absent: nothing can be PROVEN stale here, and naming a
+        // repo we did not check would be the same invention in the other
+        // direction.
+        resp["stale_repos"] = json!([]);
+        attach_note(
+            resp,
+            format!(
+                "resolver-generation staleness could not be determined because {reason};                  these rankings are UNVERIFIED, not verified-current. Check                  `nestweaver stale-check` before trusting them."
+            ),
+        );
+        return;
+    }
     let note = ranking_staleness_note(store);
     resp["rankings_stale"] = json!(note.is_some());
     resp["stale_repos"] = json!(ranking_stale_repos(store));
     if let Some(note) = note {
         attach_note(resp, note);
     }
+}
+
+/// `dead_code`'s refusal verdict for this database, or `None` when every repo
+/// is current.
+///
+/// nw-372. This is the MCP-side access path to `ResolverGenerations::stale_repos`
+/// — the sole computation (nw-358) — and it is the one the CLI's DAEMON route
+/// reaches too, since that route calls this tool over RPC and prints the
+/// refusal it is sent rather than re-deriving one client-side.
+///
+/// It does NOT reuse `ranking_stale_repos`, and the difference is the whole
+/// point: that helper `.ok()`s its way out of an unset `CURRENT_DB_PATH` or a
+/// failing `list_repos` and returns an empty vec, which reads as "nothing is
+/// stale". For a disclosure that is a missing sentence. For a deletion list it
+/// IS the deletion list.
+///
+/// THE THREAD-LOCAL IS A FALLBACK HERE, NOT THE SOURCE. `attach_ranking_staleness`
+/// resolves the db path through `CURRENT_DB_PATH` alone, which is why the
+/// daemon's `repo_map_json` answered `rankings_stale: false` on a
+/// generation-3 database: the value is unset on a `spawn_blocking` worker
+/// unless the call site remembers to set it. `GraphStore::db_path` cannot be
+/// unset by a worker thread, so reading it second REMOVES that hazard rather
+/// than merely refusing on it. `None` from both means the store has no
+/// database file at all — an in-memory store, which has no sidecar because it
+/// has no disk, and whose graph was necessarily built in-process by THIS
+/// binary. There is nothing there that can predate the running resolver.
+fn dead_code_refusal(
+    store: &GraphStore,
+) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
+    let db_path = match (current_db_path(store), store.db_path()) {
+        (Ok(path), _) => path,
+        (Err(_), Some(path)) => path.to_path_buf(),
+        (Err(_), None) => return Ok(None),
+    };
+    // A store that cannot list repos cannot serve a reachability walk either,
+    // so this PROPAGATES instead of refusing: the caller gets the store's own
+    // error (and, on the CLI, the diagnostic nw-285 built for a schema-less
+    // database) rather than a binder exception quoted inside a paragraph about
+    // resolver generations.
+    let repos = store.list_repos(None)?;
+    Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
 
 /// Attach a disclosure to a tool result without dropping one already there.
@@ -13912,47 +14120,80 @@ mod cache_dispatch_tests {
     /// Asserted on the RESULT, which is what becomes structuredContent. A
     /// disclosure in `_meta` would not count: `_meta` is client/UI-facing and
     /// is typically hidden from the model.
+    /// nw-370: BOTH aged shapes are exercised. This test used to DELETE the
+    /// sidecar, which is the pre-nw-103 state — a graph so old it has no record
+    /// at all. That is no longer the common case: bumping `RESOLVER_GENERATION`
+    /// 3 -> 4 makes the sidecar PRESENT and every entry in it BEHIND on every
+    /// pre-existing database, and the delete-only fixture is what let the
+    /// equivalent `hubs` gap (nw-365) survive its own test.
     #[test]
     fn stale_rankings_are_disclosed_to_the_agent_in_the_result() {
-        for tool in ["hub_nodes", "bridge_nodes"] {
-            let (_dir, db_path) = index_on_disk();
-            set_current_db_path(db_path.clone());
-            let store = GraphStore::open(&db_path).unwrap();
+        // "absent" — the pre-nw-103 graph, no record at all.
+        // "downgraded" — the 9.0.0 upgrade case: present, well-formed, behind.
+        for aged in ["absent", "downgraded"] {
+            for tool in ["hub_nodes", "bridge_nodes"] {
+                let (_dir, db_path) = index_on_disk();
+                set_current_db_path(db_path.clone());
+                let store = GraphStore::open(&db_path).unwrap();
 
-            // Age the fixture: `index_directory` records a CURRENT generation,
-            // so the sidecar has to go for the repo to look pre-fix — which is
-            // exactly the on-disk state of any graph indexed before nw-103.
-            let sidecar = nestweaver_engine::sidecar_path(
-                &db_path,
-                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
-            );
-            fs::remove_file(&sidecar).unwrap();
+                let sidecar = nestweaver_engine::sidecar_path(
+                    &db_path,
+                    nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+                );
+                if aged == "absent" {
+                    fs::remove_file(&sidecar).unwrap();
+                } else {
+                    let mut generations = nestweaver_engine::resolver_generation::load(&db_path);
+                    assert!(
+                        !generations.repos.is_empty(),
+                        "the fixture recorded nothing, so the downgrade leg is vacuous"
+                    );
+                    let behind = nestweaver_engine::resolver_generation::RESOLVER_GENERATION - 1;
+                    for generation in generations.repos.values_mut() {
+                        *generation = behind;
+                    }
+                    fs::write(
+                        &sidecar,
+                        serde_json::to_string_pretty(&generations).unwrap(),
+                    )
+                    .unwrap();
+                }
 
-            let value = dispatch(&store, None, tool, json!({}), None).unwrap();
+                let value = dispatch(&store, None, tool, json!({}), None).unwrap();
 
-            assert_eq!(
-                value.get("rankings_stale").and_then(Value::as_bool),
-                Some(true),
-                "{tool} must flag stale rankings"
-            );
-            // nw-217a: WHICH, not merely that some are. The human has had this
-            // list since nw-308; the agent was given a count and told to go
-            // find out — the same defect nw-315 closed for `stale_check`.
-            assert!(
-                value["stale_repos"]
-                    .as_array()
-                    .is_some_and(|repos| !repos.is_empty()),
-                "{tool} must name the stale repos: {value}"
-            );
-            let note = value
-                .get("note")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            assert!(
-                note.contains("nw-103") && note.contains("index"),
-                "{tool} note must say what is wrong AND how to fix it, got: {note}"
-            );
+                assert_eq!(
+                    value.get("rankings_stale").and_then(Value::as_bool),
+                    Some(true),
+                    "{tool} ({aged}) must flag stale rankings"
+                );
+                // nw-217a: WHICH, not merely that some are. The human has had this
+                // list since nw-308; the agent was given a count and told to go
+                // find out — the same defect nw-315 closed for `stale_check`.
+                assert!(
+                    value["stale_repos"]
+                        .as_array()
+                        .is_some_and(|repos| !repos.is_empty()),
+                    "{tool} ({aged}) must name the stale repos: {value}"
+                );
+                let note = value
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    note.contains("indexed by an older resolver"),
+                    "{tool} ({aged}) note must say WHAT is wrong, got: {note}"
+                );
+                // nw-370: the remedy must be the one that WORKS. Plain
+                // `nestweaver index --repo <path>` is incremental and a no-op on
+                // a repo already at HEAD, which is exactly the shape of a
+                // generation-stale repo — so asserting only `contains("index")`
+                // passed against a remedy that could not clear the condition.
+                assert!(
+                    note.contains("nestweaver index --repo <path> --force"),
+                    "{tool} ({aged}) note must give a remedy that RUNS, got: {note}"
+                );
+            }
         }
     }
 
@@ -14687,20 +14928,16 @@ mod cache_dispatch_tests {
             release: std::sync::Mutex::new(release_rx),
         });
 
-        let flight_key = {
-            let key = mix_visibility_cache_key(
-                nestweaver_store::cache::ResponseCache::key("brain_context", &args),
-                visibility_cache_salt(None),
-            );
-            let key =
-                mix_visibility_cache_key(key, semantic_cache_salt("brain_context", Some(&*model)));
-            (
-                db_path.clone(),
-                key,
-                store.graph_generation(),
-                whole_db_scope_digest(&db_path),
-            )
-        };
+        // The SAME derivation `maybe_cached` uses, not a copy of it — see
+        // `response_cache_key`. The copy this replaces named a key nothing
+        // computed the moment a salt was added, and panicked holding the
+        // `IN_FLIGHT` mutex.
+        let flight_key = (
+            db_path.clone(),
+            response_cache_key("brain_context", &args, &db_path, Some(&*model), None),
+            store.graph_generation(),
+            whole_db_scope_digest(&db_path),
+        );
 
         let leader_store = store.clone();
         let leader_path = db_path.clone();

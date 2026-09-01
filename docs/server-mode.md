@@ -32,6 +32,15 @@ nestweaver daemon --db ./brain.lbug run \
 | `--tls-cert <path>` | PEM-encoded TLS certificate |
 | `--tls-key <path>` | PEM-encoded TLS private key |
 | `--webhook-secret <secret>` | HMAC secret for webhook signature verification |
+| `--webhook-secret-old <secret>` | Previous secret, accepted during rotation |
+| `--snapshot <dir>` | Boot as a **read-only snapshot replica**: materialize this snapshot directory into a private working copy and serve it read-only. Requires `--server`; write RPCs, background indexing and `/webhook` are disabled |
+| `--acme-domain <domain>` | Auto-provision a publicly-trusted TLS cert at runtime via Let's Encrypt TLS-ALPN-01. Requires `--server` and the `acme` build feature. TLS-ALPN-01 validates on **port 443**, so bind such that `:443` reaches the daemon (e.g. `--bind 0.0.0.0:443`) |
+| `--acme-email <email>` | ACME account contact — recommended, for expiry notices |
+| `--acme-production` | Use the Let's Encrypt **production** directory. The default is **staging** (untrusted certs, high rate limits), so issuance can be debugged without a rate-limit ban. Pass this only once the staging flow works end to end |
+| `--port-file <path>` | Write the actual bound port to this file — the way to read an ephemeral `--bind …:0` port programmatically |
+
+`--acme-*` is a third TLS option alongside self-signed (`server init-tls`) and
+bring-your-own (`--tls-cert`/`--tls-key`); see [TLS Setup](#tls-setup).
 
 ### Environment variables
 
@@ -42,6 +51,7 @@ All flags can be set via environment variables:
 | `NESTWEAVER_AUTH_TOKEN` | `--auth-token` |
 | `NESTWEAVER_ADMIN_TOKEN` | `--admin-token` |
 | `NESTWEAVER_WEBHOOK_SECRET` | `--webhook-secret` |
+| `NESTWEAVER_WEBHOOK_SECRET_OLD` | `--webhook-secret-old` |
 | `NESTWEAVER_BIND` | `--bind` |
 
 ### Instance config (instance.toml)
@@ -180,7 +190,30 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
 
 The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixed binds. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker. Exception: with an ephemeral `--bind 127.0.0.1:0` the gRPC port is OS-assigned at runtime, so the MCP listener binds its own ephemeral port (`:0`) instead of gRPC + 1; read both actual ports from the daemon's port file or startup log.
 
-Tool exposure and validation are identical on every MCP transport — local stdio, daemon proxy, hybrid, and MCP-over-HTTP all enforce the `--tools`/`--lite` allowlists, and tool schemas reject unknown argument names and out-of-range numeric values (e.g. `token_budget` outside 1–16000, `depth` outside 1–15) instead of silently ignoring them.
+The MCP endpoint is **`POST /mcp`** on the HTTP port.
+
+NestWeaver's registry holds **42** tools. The number is derivable, not typed:
+`all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs` is the
+registry, and `tools::tool_doc_tests::all_tools_have_doc_categories` asserts the
+documented table covers exactly `tool_list(false)["tools"].len()`. Read it back
+with a `tools/list` call rather than trusting this paragraph.
+
+| Transport | Tools advertised |
+|---|---|
+| Daemon-backed stdio, daemon proxy, hybrid, MCP-over-HTTP | 42 |
+| Direct read-only mode | 36 — the registry minus the six `MUTATING_TOOLS` |
+| `--lite` | 6 — `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, `detect_changes` |
+
+**Validation** *is* identical on every transport: all of them enforce the
+`--tools`/`--lite` allowlists, and tool schemas reject unknown argument names and
+out-of-range numeric values (e.g. `token_budget` outside 1–16000, `depth` outside
+1–15) instead of silently ignoring them. **Tool exposure is not** — direct
+read-only mode drops the six mutating tools from both `tools/list` and dispatch.
+
+Every tool schema carries MCP `annotations` — `readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint` — derived from the same
+`MUTATING_TOOLS` table rather than hand-written, so a client can distinguish
+`prune_stale` from `brain_status` on the wire without a local table.
 
 | Port | Protocol | Auth | Purpose |
 |------|----------|------|---------|
@@ -215,6 +248,13 @@ Admin API endpoints require a separate `admin_token`. This token grants access t
 - Job queue management (drain, resume, clear dead-letter)
 - Backup operations
 - Server configuration
+- **Six MCP tools.** A query token may only invoke read-only tools. The six
+  entries of `MUTATING_TOOLS` (`crates/nestweaver-mcp/src/http.rs` — the single
+  canonical list, which both the HTTP gate and the daemon's gRPC gate consult)
+  require the admin token: `brain_add_source`, `brain_remove_source`,
+  `brain_memory_consolidate`, `set_extension`, `prune_stale`,
+  `compact_embeddings`. If an agent gets a 403 from `prune_stale` over
+  MCP-over-HTTP while every other tool works, this is why.
 
 ```bash
 curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
@@ -243,8 +283,45 @@ nestweaver daemon --db ./brain.lbug run \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 ```
 
-Re-running `init-tls` over an existing CA warns that the new CA invalidates
-certificates signed by the old one — re-issue client/server certs afterwards.
+#### Re-running is key rotation, not initialization
+
+`init-tls` **refuses** to touch a directory that already holds any of `ca.pem`,
+`ca-key.pem`, `server.pem`, `server-key.pem`, `client.pem` or `client-key.pem`.
+It exits **64** (`EX_USAGE`) and prints the exact invocation that would perform
+the replacement. Nothing on disk changes.
+
+Through 8.x it printed a warning and overwrote anyway: the CA private key was
+gone, `client.pem` was left behind signed by the CA that no longer existed, and
+the command exited 0 over a directory whose client certificate failed with
+`unable to get local issuer certificate`.
+
+```bash
+# Rotate the CA and everything under it, in one staged install.
+nestweaver server init-tls --output-dir ./tls --san localhost --client --force
+```
+
+`--force`:
+
+- replaces the **whole** bundle. Any managed file the new bundle does not
+  provide is retired with the CA that signed it — dropping `--client` removes
+  `client.pem` and `client-key.pem` rather than leaving them unverifiable. The
+  refusal says so before you run it;
+- stages the complete new bundle (final modes, fsynced) before touching
+  anything, then installs by `rename` only. Files are retired leaf-first and
+  installed root-first, so at no instant does the directory hold a leaf
+  certificate signed by a CA other than the `ca.pem` beside it;
+- keeps the replaced bundle in `<output-dir>/.nestweaver-tls.backup/` (mode
+  0700), so a rotation you did not mean to perform is recoverable. Exactly one
+  generation is kept;
+- takes an exclusive lock on `<output-dir>/.nestweaver-tls.lock`. A second
+  concurrent `init-tls` stands down with an error rather than interleaving its
+  writes into a split bundle;
+- replaces a symlinked member with a regular file instead of writing through
+  it.
+
+An install interrupted part way through (a kill, a crash, a full disk) leaves a
+`.nestweaver-tls.journal`; the next `init-tls` rolls the directory back to the
+bundle that preceded it and says so on stderr.
 
 ### Manual certificate setup
 
@@ -369,14 +446,28 @@ During rotation, the server checks the new secret first, falls back to the old s
 The server automatically polls repos for changes using `git ls-remote`. The polling interval adapts based on repo activity:
 
 ```
-interval = time_since_last_commit / 2
+base     = time_since_last_commit / 2
+interval = clamp(base, floor, max_poll)
+actual   = uniform in [interval / 2, interval * 1.5)   # jitter, anti-thundering-herd
 ```
 
-Bounded between `min_poll` (default 45s) and `max_poll` (default 8h). Active repos are polled frequently; dormant repos back off.
+Active repos are polled frequently; dormant repos back off. Source of truth:
+`compute_interval` and `jittered` in `crates/nestweaver-engine/src/scheduler.rs`.
+
+**The floor depends on webhook health**, which the earlier `min_poll` wording did
+not say:
+
+| Webhook state | Floor |
+|---|---|
+| healthy | **300s** (`WEBHOOK_HEALTHY_FLOOR`) — polling is only a safety net when pushes already arrive |
+| unhealthy / not configured | `min_poll` (default 45s) |
+
+So configuring `min_poll = "45s"` does **not** give you 45-second polling while
+webhooks are working; you will see ~5 minutes as the floor, jittered.
 
 ```toml
 [server.indexing]
-min_poll = "45s"    # minimum polling interval
+min_poll = "45s"    # floor only when webhooks are unhealthy
 max_poll = "8h"     # maximum polling interval
 workers = 8         # concurrent indexing workers
 ```
@@ -386,14 +477,29 @@ Per-repo overrides:
 ```toml
 [[repos]]
 url = "https://github.com/acme/monorepo"
-poll = "30s"    # high-traffic repo: poll aggressively
+poll = "30s"        # fixed interval — bypasses the adaptive formula and both floors
 ```
+
+`poll` also accepts `"never"` and `"manual"`, which disable scheduled polling for
+that repo entirely (`PollOverride::Never | Manual`). Use them for a repo driven
+solely by webhooks or by `POST /admin/api/repos/{id}/reindex`.
 
 ### Three-layer reindexing
 
 1. **Webhooks** — near-instant (push to indexed in <60s)
 2. **Adaptive polling** — catches missed webhooks, backs off for dormant repos
-3. **Periodic full re-index** — after 150 incremental updates, 7 days, or 0.25% random spot-check
+3. **Periodic full re-index** — whichever comes first:
+   - `max(150, file_count * 0.5%)` incremental updates. The threshold is
+     **proportional**, not a flat 150: a 100k-file monorepo needs 500, not 150
+     (`ReindexTracker`, `crates/nestweaver-engine/src/scheduler.rs`).
+   - a 7-day time backstop, stored as wall-clock so it survives a daemon restart
+   - a 0.25% random spot-check per poll cycle
+
+None of these detect a **resolver-generation** bump. A full re-index triggered by
+any of the three does bring a repo up to the current generation, but nothing
+schedules one because the generation changed — after upgrading NestWeaver, force
+one: `POST /admin/api/repos/{id}/reindex`, or `nestweaver index --repo <path>
+--force`.
 
 ---
 
@@ -572,7 +678,7 @@ timeout = "1s"    # ceiling; the live deadline is adaptive (see below)
 
 The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client scales off a rolling EWMA of observed upstream latencies and clamps the result per routing mode:
 
-- **`fallback`** keeps the deadline tight (capped at ~250ms) so the local fast path is never blocked waiting on the server.
+- **`fallback`** keeps the deadline tight — capped at **200ms** (`FALLBACK_MODE_CAP` in `crates/nestweaver-federation/src/health.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) — so the local fast path is never blocked waiting on the server.
 - **`merge`** and **`primary`** allow up to the configured `timeout` ceiling (default 1s) — the richer org-wide answer is the whole point of those modes.
 
 On a cold start (no latency samples yet) the mode ceiling is used directly. Raising `timeout` only affects `merge`/`primary`; the fallback cap is fixed.
@@ -640,10 +746,36 @@ the `source_server` it came from. Provenance is carried in `_meta.sources`.
     }
   },
   "_meta": {
-    "sources": ["local", "server"]
+    "scope": "hybrid",
+    "sources": ["local", "server"],
+    "stale_repos": []
   }
 }
 ```
+
+`provenance()` always emits all three legs — see
+`crates/nestweaver-schema/src/provenance.rs`. The `scope` vocabulary is `local`
+(one local source), the single source's own name, or `hybrid` when more than one
+contributed. The example above is the **CLI/hybrid** route's vocabulary; on the
+daemon's own `/mcp` path `add_provenance_metadata` stamps `scope: "federated"`
+with `sources: ["daemon", "<upstream>"]` when an upstream is healthy, and
+`scope: "single-node"` with `sources: ["daemon"]` when not.
+
+`_meta` also carries a `limits` leg when a safeguard clamped the request
+(`add_limit_metadata` in `crates/nestweaver-mcp/src/http.rs`).
+
+> ### Wire change in 9.0.0 — read this if you speak MCP-over-HTTP directly
+>
+> `_meta` used to be stamped on the **outer `tools/call` envelope** under
+> `nestweaver.io/`-prefixed keys: `nestweaver.io/sources`, `nestweaver.io/scope`,
+> `nestweaver.io/stale_repos`. It now lives on the **payload**, under the
+> unprefixed key `_meta`, with the shape above. The prefixed envelope keys are
+> gone.
+>
+> Clients that go through an MCP SDK are unaffected, since they read the tool
+> result. A client that reached into the envelope for `nestweaver.io/sources`
+> now reads `null` and will silently treat every federated answer as
+> unattributed. Update to `payload._meta`.
 
 When no healthy upstream is configured, the response degrades to
 `tier: "local_only"` (the local result plus a `tier` marker, with no
@@ -658,6 +790,27 @@ or times out, `tier` stays `"two_tier"` and `org_wide_impact` becomes
 Impact, repo-map, and the UI overview rank symbols by PageRank ("CodeRank").
 NestWeaver keeps that computation off the critical path so ranks are served
 immediately in normal operation.
+
+> **This section is about *latency*, not *correctness*.** Everything below
+> describes how fast ranks are served, and assumes the underlying edges are the
+> ones the current resolver would write. **9.0.0 bumps `RESOLVER_GENERATION`
+> from 3 to 4** (`crates/nestweaver-engine/src/resolver_generation.rs`), so a
+> graph indexed by an earlier release serves ranks *quickly* and *wrongly*: they
+> are computed over edges written before `.h` files were dispatched to the C++
+> grammar, before C/C++ `MEMBER_OF` edges existed at all, and before C++
+> `#include` resolved to `IMPORTS`. Re-index every repo — `nestweaver index
+> --repo <path> --force` — before trusting any ranking on this server.
+>
+> **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports
+> `status: "outdated_resolver"` with `resolver_stale: true` and
+> `needs_reindex: true`, and the command exits 2. Through 8.x it did not: the
+> ladder was `missing`/`incomplete`/SHA-behind-HEAD only and never read
+> `<db>.resolver_generation.json`, so a generation-3 graph reported `ok` and
+> exited 0. `hub_nodes`, `bridge_nodes`, `repo_map`, `ranking rank` and
+> `get_summary` at hub level also disclose it, via the `rankings_stale` boolean
+> and a top-level `stale_repos` array (distinct from `_meta.stale_repos`, which
+> is federation staleness). `clusters`, `blast_radius`, `generate-guide`,
+> PPR-backed context and the web UI still disclose nothing.
 
 - **Computed at index time.** A full re-index (`index --force`) and every
   incremental update compute PageRank and persist it to `<db>.pagerank.json`.
@@ -745,6 +898,19 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/dead-letter` | GET | View failed jobs |
 | `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
 | `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
+| `/admin/api/status` | GET | Server status — what `nestweaver server status` reads |
+| `/admin/api/metrics` | GET | Prometheus metrics, admin-token-gated (the same series as the unauthenticated `/metrics`, so a single scrape target works on either port) |
+
+`GET /admin` issues a permanent redirect to `/admin/api/status`.
+
+The OAuth 2.0 Device Authorization Grant (RFC 8628) flow is mounted at `/auth`
+on the same listener. Route these three if NestWeaver is behind a reverse proxy:
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/auth/device` | POST | none (per-IP rate limited) | Start the device flow; returns a user code |
+| `/auth/token` | POST | none (per-IP rate limited) | Poll for the issued token |
+| `/auth/device/approve` | POST | admin token | Operator approves a pending device |
 | `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; requires a valid bearer token when `auth_token` is configured — the query token or the admin token both work, it is not admin-only; open only on unauthenticated loopback dev binds) |
 
 ```bash
@@ -963,8 +1129,18 @@ nestweaver brain reindex-search
 ### Stale index
 
 ```bash
-# Check which repos are behind
+# Check which repos are behind HEAD.
+# Exit: 0 = all fresh · 2 = at least one needs a re-index (behind HEAD,
+# incomplete, missing, OR built by an older resolver generation) · 1 = the check
+# itself failed · 64 = bad usage. Gate on 2, never on 1 — those demand opposite
+# responses.
 nestweaver brain stale-check
+
+# As of 9.0.0 stale-check also reads <db>.resolver_generation.json: a graph
+# built by an older NestWeaver reports status "outdated_resolver" and exits 2.
+# To name just that subset (the remedy needs --force; plain `index` is
+# incremental and a no-op on a repo already at HEAD):
+nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
 
 # Force reindex a specific repo (use UID from GET /admin/api/repos)
 REPO_UID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \

@@ -17,3 +17,20 @@ rules:
       - deps
       - docs
       - release
+      # Added 2026-08-30 to match practice. These 13 all appear in commits
+      # merged since v8.0.0; the enum had drifted behind the codebase, and
+      # because commitlint runs only as a pre-commit hook (not in CI) the
+      # drift never surfaced -- the rule silently stopped describing the
+      # repository it governs.
+      - brain
+      - client
+      - context
+      - daemon
+      - federation
+      - impact
+      - investigate
+      - parity
+      - proto
+      - queries
+      - rankings
+      - summaries

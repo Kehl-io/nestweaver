@@ -138,11 +138,17 @@ shell env for directly-spawned daemons, or baked into the launchd plist's
 shell env — re-run `daemon start` after changing it).
 
 **The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
-tools against the DB while the daemon is running. The `--no-daemon` flag and
-`NESTWEAVER_NO_DAEMON=1` env var exist only for CI/testing. Bypassing the
-daemon risks WAL corruption from concurrent access. If you see "database
-locked" errors, stop the daemon (`nestweaver daemon stop`) rather than using
-`--no-daemon`.
+tools against the DB while the daemon is running. Bypassing the daemon risks
+WAL corruption from concurrent access. If you see "database locked" errors,
+stop the daemon (`nestweaver daemon stop`) rather than using `--no-daemon`.
+
+`--no-daemon` and `NESTWEAVER_NO_DAEMON=1` only **request** the bypass.
+`NESTWEAVER_ALLOW_NO_DAEMON` is the only thing that **permits** it — `CI` and
+`GITHUB_ACTIONS` confer nothing (they used to, and an ambient `CI=true` deciding
+writer exclusivity was the defect). A requested-but-unpermitted bypass is
+disclosed on stderr and the command routes through an autostarted daemon
+anyway, so a CI job that passes `--no-daemon` and expects isolation gets a
+daemon. See `no_daemon_allowed_from` in `src/main.rs`.
 
 ## Environment variables (operator-facing)
 
@@ -222,7 +228,8 @@ nestweaver pr-impact --strict            # exit 2 on a contract-verified breakin
 nestweaver affected-tests --base-ref main  # tiered regression-test selection for a diff
 nestweaver rts-eval record-truth --sha X --failed-test-files a.test.ts  # CI reports full-suite outcome
 nestweaver rts-eval report               # measured recall/breadth of past selections (nw-037 loop)
-nestweaver dead-code                     # detect unreachable symbols via entry point reachability
+nestweaver dead-code                     # REVIEW AID, not a deletion list — measured 0/15 top-15 precision on Rust, poor on C++
+#                                        REFUSES (exit 2) on a resolver-generation-stale graph — see the sidecar bullet
 
 # Export
 nestweaver export --format cypher        # graph export (cypher, graphml, mermaid)
@@ -276,11 +283,22 @@ nestweaver completions bash              # also: zsh, fish, powershell
 nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tracking
 nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
 nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
+nestweaver interactions forget <uid> --db ./nestweaver.lbug    # drop one node's memory, keep the rest
+nestweaver extensions list --db ./nestweaver.lbug              # read back what agents wrote via set_extension
+nestweaver extensions unset --uid <uid> --key <key>            # remove one extension property from one node
 
-# MCP server (41 tools, or 6 in lite mode for Cursor)
+# MCP server (42 tools; 36 in direct read-only mode; 6 with --lite, e.g. for Cursor).
+# The count is derivable, not typed: `all_tool_schemas_undecorated()` in
+# crates/nestweaver-mcp/src/tools.rs is the registry, and
+# tools::tool_doc_tests::all_tools_have_doc_categories asserts the doc table
+# covers exactly tool_list(false)["tools"].len(). Read it back with tools/list
+# rather than restating it.
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
-nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
+# --tools takes exact, case-sensitive REGISTRY names, not CLI verb names.
+# `--tools context,search,symbol` is rejected at startup: those are CLI
+# subcommands, not tools.
+nestweaver mcp --tools brain_context,brain_search,read_symbols --db ./nestweaver.lbug
 
 # Instance config: external MCP servers with timeout
 # [[mcp_servers]]
@@ -323,7 +341,7 @@ Sidecar files written alongside the database:
 - `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read). Every entry also records the response-SHAPE version of the binary that wrote it (derived by `nestweaver-mcp/build.rs` from the shape-relevant crate sources). Foreign-shape entries are dropped at open and refused on lookup, so a release that adds a response field cannot serve the old shape from cache across an upgrade. The digest is deliberately over-broad: a comment-only edit in a hashed crate also invalidates the cache, costing one recompute
 - `<db>.parsed_cache.bin` — Cached parse results (symbols, references, type bindings) keyed by content hash, for skipping re-parsing unchanged files
 - `<db>.resolution_deps.bin` — Per-file resolution dependency tracker for incremental cross-file resolution
-- `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE (nw-103's import fan-out) cannot repair edges already written — only re-indexing can
+- `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and reads as generation 0. A repo below `RESOLVER_GENERATION` is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE cannot repair edges already written — only re-indexing can. **`RESOLVER_GENERATION` is 4 as of 9.0.0** (`crates/nestweaver-engine/src/resolver_generation.rs`, which carries the per-generation rationale); every graph built by an earlier release must be re-indexed before rankings, `MEMBER_OF` edges and C++ `IMPORTS` edges are correct. **`stale-check` consults this sidecar as of 9.0.0** — a repo below `RESOLVER_GENERATION` reports `status: "outdated_resolver"`, `resolver_stale: true`, `needs_reindex: true`, and the command exits 2 (through 8.x its ladder was SHA-vs-HEAD only and a generation-3 graph exited 0). The remedy needs `--force`: a generation-stale repo is at HEAD with nothing modified, so plain `nestweaver index --repo <path>` takes the incremental path and writes nothing. `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` disclose it too (`rankings_stale` / `stale_repos`). **`dead-code` REFUSES as of 9.0.0** on every route (CLI direct, CLI daemon, `--json`, MCP `dead_code`): it returns `refused: true` with `reason: "outdated_resolver"`, a `remedies` array of ready-to-run `nestweaver index --repo <path> --force` commands, and NO `unreachable_symbols` key, and the CLI exits 2. It refuses rather than disclosing because its output is a list of symbols to DELETE computed by a forward reachability walk, so a missing edge can only move a LIVE symbol onto it — the error is one-directional and the deletion is not recoverable. The response cache is salted with this sidecar (`resolver_generation_cache_salt`) so a pre-bump list cannot be replayed past the bump. `clusters`, `blast-radius`, `affected-tests`, `generate-guide`, PPR-backed `context` and the web UI still do not disclose. Vaults are not `Repo` nodes and carry no generation
 
 ## Architecture
 
@@ -392,11 +410,24 @@ federation          (leaf: schema + proto only)
 
 ## Exit codes
 
+Canonical list: the `EXIT_*` constants at the top of `src/main.rs`.
+
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Error |
-| 2 | Not found (symbol, service) |
+| 1 | Error — including the check itself failing |
+| 2 | Not found (symbol, service) · `stale-check`: at least one repo needs a re-index — behind HEAD, incomplete, missing, or built by an older resolver generation · `pr-impact --strict`: blocked on a contract-verified breaking change |
 | 3 | Ambiguous match (multiple symbols with same name) |
 | 4 | Unauthorized (pull) |
 | 5 | Unavailable (pull) |
+| 64 | Usage error — unknown flag, bad value, missing argument (`EX_USAGE` from BSD `sysexits.h`) |
+
+**64, not clap's 2.** Clap's default collided with `EXIT_NEEDS_REINDEX`, so a CI
+gate could not tell `nestweaver stale-chekc` (a typo) from "your graph is
+stale". Anything that gates on exit codes must treat 64 as a usage bug, never as
+drift. Note that 2 is overloaded across commands — `case $rc in 2)` is not
+portable between `stale-check` and `pr-impact --strict`.
+
+Measured on this branch: `export --format json` → 64 · `export --scope bogus` →
+64 · `impact --limit 5000` → 64 · `impact <unknown>` → 2 · `export --format
+cypher --scope vault` (valid enums, unsupported *combination*) → 1.

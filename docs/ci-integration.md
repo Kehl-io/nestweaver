@@ -247,6 +247,13 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }   # need the merge-base
       # ... install nestweaver and build/restore the index (nestweaver.lbug) ...
+      # Daemon note: `--no-daemon` / NESTWEAVER_NO_DAEMON no longer confer a
+      # bypass on their own, and `CI=true` / `GITHUB_ACTIONS` confer nothing.
+      # Set NESTWEAVER_ALLOW_NO_DAEMON=1 if you want daemon-free steps;
+      # otherwise the index step autostarts a daemon that holds the write
+      # lease for the rest of the job.
+      # After upgrading NestWeaver, re-index once: `stale-check` does not
+      # detect a resolver-generation bump. See "Index freshness gate".
       - name: Blast radius (SARIF)
         run: |
           base="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
@@ -428,13 +435,25 @@ Collapsing "found drift" into the error code is how a gate ends up unable to
 distinguish a stale graph from a crashed check — the two need opposite
 responses.
 
-Three conditions produce exit `2`, all fixed the same way:
+Four conditions produce exit `2`, all fixed the same way:
 
 | `status` | Meaning |
 |----------|---------|
 | `stale` | indexed SHA is behind git HEAD |
 | `incomplete` | the SHA was recorded but the content never landed (interrupted index) — the repo compares equal to HEAD while serving an empty graph |
 | `missing` | the working tree has been deleted |
+| `outdated_resolver` | the repo is at HEAD and fully indexed, but its edges were written by an older resolver generation (**new in 9.0.0**) |
+
+`outdated_resolver` is the only one no git comparison can find: such a repo sits
+exactly *at* HEAD with every file unchanged. It reuses exit `2` deliberately —
+the remedy is identical, and every gate already written against `2` therefore
+catches a resolver-generation upgrade with no edit. The independent
+`resolver_stale` boolean on each row carries the fact even when `status` reports
+a git reason instead, and `resolver_stale_repos` lists the URLs.
+
+**Re-index with `--force`.** `nestweaver index --repo <path>` is incremental and
+is a no-op on an `outdated_resolver` repo — it reports `0 modified`, writes
+nothing, and leaves the old generation recorded. Only `--force` clears it.
 
 **Gate on `any_needs_reindex`** (or on exit `2`). `any_stale` and `is_stale`
 mean *behind HEAD* specifically, so a repo that is at HEAD but incompletely
@@ -442,7 +461,11 @@ indexed reports `is_stale: false` with `needs_reindex: true`. The JSON also
 carries two arrays so a job can name what to act on: `needs_reindex_repos` is
 the actionable set matching the exit code, and `stale_repos` is the
 behind-HEAD subset. Gate on `needs_reindex_repos` — `stale_repos` will not
-name an `incomplete` or `missing` repo.
+name an `incomplete`, `missing` or `outdated_resolver` repo. A third array,
+`resolver_stale_repos`, names the generation-stale subset. Note that
+`stale_repos` means *behind HEAD* on this command and *generation-stale repo
+UIDs* on `hub_nodes`/`bridge_nodes` — different populations under one name,
+which is why the new list did not reuse it.
 
 ```yaml
 - name: Fail if the NestWeaver index needs re-indexing
@@ -463,6 +486,73 @@ Read/lookup commands against a non-existent database also fail (exit 1,
 `db_not_found`) instead of creating an empty DB and reporting success — a CI
 job pointed at the wrong `--db` path fails loudly rather than passing on an
 empty graph.
+
+### The resolver-generation upgrade, and what this gate used to miss
+
+Through 8.x, `stale-check` derived `status` from three conditions only —
+`missing`, `incomplete`, and indexed-SHA-behind-`HEAD`. **It never consulted
+`<db>.resolver_generation.json`**, so when a NestWeaver upgrade bumped
+`RESOLVER_GENERATION` every repo in an existing graph reported `ok` and the gate
+exited `0` while the graph's edges were the ones the *old* resolver wrote.
+Verified against a generation-3 sidecar on the 8.x binary: `up to date`, exit 0.
+
+**9.0.0 bumps `RESOLVER_GENERATION` 3 → 4 and adds the fourth rung.** A
+generation-stale repo now reports `status: "outdated_resolver"` with
+`resolver_stale: true` and `needs_reindex: true`, and the command exits `2`. The
+gate recipe above needs no change — `any_needs_reindex` and exit `2` already
+cover it. **This is a behaviour change to a CI-facing exit code:** a job pointed
+at a graph built by 8.x will start failing on the first run after the upgrade,
+which is the intended signal.
+
+Until each repo is re-indexed, its rankings are computed over stale edges, C and
+C++ `MEMBER_OF` edges do not exist at all, and C++ `IMPORTS` edges are missing.
+
+To name the generation-stale subset specifically:
+
+```yaml
+- name: Report which repos predate the current resolver generation
+  run: |
+    nestweaver stale-check --json --db nestweaver.lbug \
+      | jq -r '.resolver_stale_repos[]'
+```
+
+`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
+disclose it (`rankings_stale` / `stale_repos` on `--json`, a stderr warning
+otherwise). `clusters`, `blast-radius`, `affected-tests`, `generate-guide`,
+PPR-backed `context` and the web UI do not. Do not read the absence of a warning
+on those as evidence of freshness.
+
+**`dead-code` does not disclose — it refuses**, and it exits `2` doing so. Its
+output is a list of symbols to *delete*, computed by walking forward from entry
+points, so a missing edge can only fail to reach a live symbol: the error is
+one-directional and points at deleting live code. On a generation-stale graph
+every route (CLI direct, CLI via daemon, `--json`, MCP `dead_code`) returns
+`refused: true` with `reason: "outdated_resolver"`, `resolver_stale_repos`, and
+a `remedies` array whose `command` is a ready-to-run
+`nestweaver index --repo <path> --force`. There is **no `unreachable_symbols`
+key** on a refusal and no override flag: re-index and re-run.
+
+```yaml
+- name: Dead-code review candidates
+  run: |
+    rc=0
+    nestweaver dead-code --json --db nestweaver.lbug > dead-code.json || rc=$?
+    case $rc in
+      0) ;;
+      2) echo "::error::dead-code refused — re-index first"
+         jq -r '.remedies[].command' dead-code.json; exit 1 ;;
+      *) echo "::error::dead-code could not run"; exit 1 ;;
+    esac
+```
+
+### Exit `2` is overloaded across commands
+
+`stale-check` uses `2` for "needs re-index"; `dead-code` uses `2` for "refused,
+re-index first" (the same `EXIT_NEEDS_REINDEX`, **new in 9.0.0** — it exited `0`
+with a list through 8.x); `pr-impact --strict` uses `2` (`EXIT_STRICT_BLOCK`)
+for "blocked on a contract-verified breaking change"; most other commands use
+`2` for "not found". A shared `case $rc in 2) ... esac` helper reused across
+two of these does the wrong thing. Interpret `2` per-command.
 
 ## Networking
 

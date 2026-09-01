@@ -7479,6 +7479,17 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
+            // nw-370: `CURRENT_DB_PATH` is a THREAD-LOCAL, and this closure runs
+            // on a `spawn_blocking` worker, not the thread that accepted the
+            // RPC. Both MCP dispatch paths in this file set it inside their own
+            // `spawn_blocking` for exactly this reason; the engine-level RPCs
+            // never needed it until `attach_ranking_staleness` below, which
+            // reads the db path through it to find the generation sidecar.
+            //
+            // Measured before this line existed: `repo-map` via daemon replied
+            // `rankings_stale: false` on a generation-3 database while `hubs`
+            // on the SAME daemon replied `true`.
+            nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             let token_budget = args
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
@@ -7486,11 +7497,27 @@ impl NestWeaverDaemon for DaemonService {
             let map = nestweaver_engine::generate_repo_map(&state.store, token_budget)
                 .map_err(|e| Status::internal(format!("generate_repo_map failed: {e:#}")))?;
             let token_count = map.len().div_ceil(4);
-            serde_json::to_string(&serde_json::json!({
+            let mut resp = serde_json::json!({
                 "map": map,
                 "token_count": token_count,
-            }))
-            .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            });
+            // nw-370: `repo-map`'s entire output ORDERING is PageRank order
+            // (`generate_repo_map` -> `symbols_by_pagerank`), so on a graph
+            // whose edges predate the running resolver the map is wrong in the
+            // one dimension it exists to convey — and it disclosed nothing on
+            // either route.
+            //
+            // The DAEMON answers because only the daemon holds the store: the
+            // CLI cannot enumerate repos on this route without taking a lock
+            // the daemon owns. `attach_ranking_staleness` is the same attacher
+            // `hub_nodes` / `bridge_nodes` use, over
+            // `ResolverGenerations::stale_repos` — the sole computation
+            // (nw-358) — so the CLI can read this with
+            // `ResolverStaleness::from_daemon_response` instead of deriving a
+            // weaker client-side answer.
+            nestweaver_mcp::tools::attach_ranking_staleness(&mut resp, &state.store);
+            serde_json::to_string(&resp)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
@@ -17887,15 +17914,38 @@ credential_method = "gh"
     /// ACTIVE observations specifically, not total reads, so a vacuous run
     /// fails instead of passing. With both, 2,000 iterations detect either
     /// broken design in 100% of runs, faster than 20,000 did without them.
+    ///
+    /// The `yield_now` makes an observation LIKELY; it does not make one
+    /// certain, and a release CI run proved that by failing here with the
+    /// reader having caught nothing. The writer therefore runs until the
+    /// reader has actually observed a pass (bounded by a deadline, so a real
+    /// starvation still fails rather than hanging). The completeness assertion
+    /// stays exactly as it was: it is the thing that makes a vacuous run
+    /// visible, and it must keep failing when nothing was observed.
     #[test]
     fn a_reader_never_sees_two_passes_mixed_together() {
         let progress = Arc::new(EmbedProgress::default());
         let stop = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
 
         let writer_progress = Arc::clone(&progress);
         let writer_stop = Arc::clone(&stop);
+        let writer_observed = Arc::clone(&observed);
         let writer = std::thread::spawn(move || {
-            for _ in 0..2_000 {
+            // The writer stops on the READER'S progress, not on a fixed count.
+            // `yield_now` alone makes the reader LIKELY to catch a pass, and on
+            // a loaded CI runner likely is not enough: this failed a release
+            // build with "the reader never caught a pass in flight", where the
+            // reader thread simply never ran inside the writer's whole loop.
+            // Ending the run on an observation instead of an iteration count
+            // makes the liveness condition the exit condition, so the vacuity
+            // guard below can only fire for a real starvation.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut passes = 0_u64;
+            while passes < 2_000
+                || (!writer_observed.load(Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline)
+            {
                 let pass = writer_progress.begin("all");
                 pass.set_total(88_131);
                 pass.advance(41_230);
@@ -17903,6 +17953,7 @@ credential_method = "gh"
                 // actually gets to observe passes in flight.
                 std::thread::yield_now();
                 drop(pass);
+                passes += 1;
             }
             writer_stop.store(true, Ordering::Relaxed);
         });
@@ -17912,6 +17963,7 @@ credential_method = "gh"
             let snapshot = progress.snapshot();
             if snapshot.active {
                 active_observations += 1;
+                observed.store(true, Ordering::Relaxed);
                 assert!(
                     snapshot.started_at > 0,
                     "a live pass always carries its start stamp: {snapshot:?}"

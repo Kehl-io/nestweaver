@@ -14,6 +14,28 @@ file for your platform. Release archive names follow this pattern:
 | macOS Intel | `x86_64-apple-darwin` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 
+### Platform baselines
+
+These are the floors the release archives are built against, and they are
+enforced in CI against the artifact itself rather than assumed from the build
+host.
+
+| Platform | Baseline | Covers |
+| --- | --- | --- |
+| Linux (both architectures) | **glibc 2.35** | Ubuntu 22.04 LTS and newer, Debian 12, RHEL/Rocky 9 |
+| macOS | **13.3** | LadybugDB uses floating-point `std::format` |
+
+Check your glibc with `ldd --version`. If it is older than 2.35 — RHEL 8,
+Ubuntu 20.04, Debian 11 — the GNU archives will not start, and the failure is
+a loader error naming a missing `GLIBC_` symbol rather than anything from
+NestWeaver. Build from source on those systems.
+
+Releases through v8.0.0 were built on `ubuntu-latest`, which moved to 24.04 and
+raised the shipped floor to glibc 2.39 without anyone declaring it, so those
+archives do not start on any of the distributions listed above. If you are on
+v8.0.0 and hit a `GLIBC_` loader error, that is this defect; upgrade to 9.0.0
+or later.
+
 For the selected release tag and target, download
 `nestweaver-<tag>-<target>.tar.gz` and
 `nestweaver-<tag>-<target>.tar.gz.sha256`. Do not substitute a version number
@@ -98,6 +120,37 @@ bash app/build.sh
 open target/release/NestWeaver.app
 ```
 
+## Upgrading from 8.x — re-index every graph
+
+**9.0.0 bumps `RESOLVER_GENERATION` from 3 to 4.** Installing the new binary
+does not repair edges already on disk. Until each repo is re-indexed, its
+rankings, C/C++ `MEMBER_OF` edges and C++ `IMPORTS` edges are wrong, and `.h`
+files carry symbols extracted by the C grammar rather than C++.
+
+```sh
+nestweaver index --repo <path> --force   # per repo — a full index, not incremental
+```
+
+**`--force` is not optional.** A generation-stale repo is at HEAD with every
+file unchanged, so plain `nestweaver index --repo <path>` reports `0 modified`,
+writes nothing, and leaves the old edges — and the old generation — in place.
+Vaults carry no resolver generation and do not need refreshing for this.
+
+**`nestweaver stale-check` detects it as of 9.0.0** (in 8.x it did not — its
+ladder was SHA-vs-HEAD only, so a generation-3 graph exited 0):
+
+```sh
+nestweaver stale-check                 # status: outdated_resolver, exit 2
+nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
+# or read the sidecar directly — any repo below 4 needs a re-index:
+cat <db>.resolver_generation.json
+```
+
+`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
+disclose it. `clusters`, `blast-radius`, `generate-guide`, PPR-backed `context`
+and the web UI still do not — on those, treat the absence of a warning as no
+evidence either way.
+
 ## Configure for your AI tool
 
 ```sh
@@ -119,6 +172,12 @@ nestweaver mcp --db ./nestweaver.lbug
 
 The daemon owns the database exclusively. It auto-starts on first use and logs
 to `~/.local/state/nestweaver/<instance>/daemon.log`.
+
+In CI, `--no-daemon` / `NESTWEAVER_NO_DAEMON=1` only **request** a daemon
+bypass. `NESTWEAVER_ALLOW_NO_DAEMON=1` is the only thing that **permits** one —
+`CI=true` and `GITHUB_ACTIONS` confer nothing. Without the opt-in the flag is
+disclosed on stderr and the command autostarts a daemon anyway, which then holds
+the write lease for the rest of the job.
 
 ## Optional: Git history analysis
 

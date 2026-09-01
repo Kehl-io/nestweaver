@@ -23,10 +23,12 @@ Restart Cursor to detect the MCP server.
 
 Cursor has a 40-tool cap across all MCP servers. NestWeaver uses `--lite` mode by default for Cursor, exposing 6 core tools: `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, `detect_changes`.
 
-NestWeaver now advertises **41** tools, so the full set no longer fits under
-Cursor's cap on its own — and it counts against every other MCP server you have
-configured. Removing `--lite` from `.cursor/mcp.json` will exceed the cap unless
-NestWeaver is your only MCP server, and even then it is one over.
+NestWeaver advertises **42** tools (registry:
+`all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs`; read it
+back with `tools/list`), so the full set no longer fits under Cursor's cap on its
+own — and it counts against every other MCP server you have configured. Removing
+`--lite` from `.cursor/mcp.json` will exceed the cap unless NestWeaver is your
+only MCP server, and even then it is two over.
 
 Use `--tools` to pick an explicit subset instead, which is the supported way to
 go beyond lite mode without tripping the cap:

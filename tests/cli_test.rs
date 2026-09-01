@@ -837,13 +837,20 @@ fn installation_docs_only_claim_live_channels() {
     if repo_root.join("smithery.yaml").exists() {
         docs.push("smithery.yaml");
     }
+    // FLIP THESE WHEN THE PUBLISH ACTUALLY LANDS. The npm entries are listed as
+    // unsupported because `nestweaver` has never been published (registry 404 as
+    // of 9.0.0 prep) -- nw-115: the release job's publish step exits 0 when
+    // NPM_TOKEN is unset, so a green release has never implied a published
+    // package. Once `npm view nestweaver version` resolves, drop the four npm
+    // lines so the docs are free to advertise the install. `cargo install` and
+    // `brew install` stay: neither channel exists.
     let unsupported_commands = [
-        "npm install -g @kehl-io/nestweaver",
-        "npm install @kehl-io/nestweaver",
+        "npm install -g nestweaver",
+        "npm install nestweaver",
         "cargo install nestweaver",
         "brew install nestweaver",
-        "npx @kehl-io/nestweaver",
-        "npm exec @kehl-io/nestweaver",
+        "npx nestweaver",
+        "npm exec nestweaver",
     ];
 
     for relative_path in docs {
@@ -1123,6 +1130,15 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
     entries
 }
 
+/// The Linux entries pin an OLD runner deliberately: glibc is backward
+/// compatible but not forward, so the build host's glibc is the compatibility
+/// floor shipped to users. These were `ubuntu-latest`/`ubuntu-24.04-arm`, and
+/// when `ubuntu-latest` moved to 24.04 the shipped floor rose to GLIBC_2.39
+/// without any label changing -- which is why the public v8.0.0 GNU archive
+/// cannot start on Ubuntu 22.04, Debian 12 or RHEL 9. Do NOT "modernise" these
+/// back to `ubuntu-latest`. The floor is separately enforced against the built
+/// artifact in the workflow's `Verify release binary` step, because a runner
+/// pin is a claim about the build host and the artifact is what users run.
 #[test]
 fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1141,7 +1157,7 @@ fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
         ),
         (
             "aarch64-unknown-linux-gnu".to_string(),
-            (Some("ubuntu-24.04-arm".to_string()), Some(String::new())),
+            (Some("ubuntu-22.04-arm".to_string()), Some(String::new())),
         ),
         (
             "x86_64-apple-darwin".to_string(),
@@ -1152,7 +1168,7 @@ fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
         ),
         (
             "x86_64-unknown-linux-gnu".to_string(),
-            (Some("ubuntu-latest".to_string()), Some(String::new())),
+            (Some("ubuntu-22.04".to_string()), Some(String::new())),
         ),
     ]);
 
@@ -7622,4 +7638,845 @@ fn a_supported_format_scope_pair_still_exports() {
         .arg(&db)
         .assert()
         .success();
+}
+
+// ── `server init-tls` is key rotation, not initialization ─────────────────
+
+/// The six files `server init-tls` owns, mirroring
+/// `nestweaver_engine::tls::MANAGED_FILES`.
+const TLS_MANAGED: [&str; 6] = [
+    "ca.pem",
+    "ca-key.pem",
+    "server.pem",
+    "server-key.pem",
+    "client.pem",
+    "client-key.pem",
+];
+
+fn tls_snapshot(dir: &std::path::Path) -> Vec<(&'static str, Vec<u8>)> {
+    TLS_MANAGED
+        .iter()
+        .filter_map(|name| std::fs::read(dir.join(name)).ok().map(|b| (*name, b)))
+        .collect()
+}
+
+/// The reported defect, end to end, through the real binary.
+///
+/// Steps 1-4 of the filed reproduction: generate a bundle with a client cert,
+/// confirm the client verifies, re-run WITHOUT any destructive option, and
+/// look at what the directory holds. Measured on 8.0.0 that second run exited
+/// 0, replaced `ca.pem` and the CA private key, left `client.pem` byte
+/// identical, and produced a directory whose client certificate failed with
+/// `unable to get local issuer certificate`.
+///
+/// The refusal's remedy is then EXECUTED verbatim, because a message naming a
+/// flag is worth nothing until the string it prints has been run.
+#[test]
+fn init_tls_refuses_to_destroy_an_existing_ca_and_its_force_remedy_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--san",
+            "localhost",
+            "--client",
+        ])
+        .assert()
+        .success();
+    let before = tls_snapshot(&tls);
+    assert_eq!(before.len(), 6, "the first run writes the whole bundle");
+
+    // Step 3: the exact invocation that destroyed the CA on 8.0.0.
+    let refused = nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--san",
+            "localhost",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(64),
+        "a destructive replacement without --force must exit EXIT_USAGE"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "a refusal must not print a success report: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("refusing to replace the TLS bundle already in"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("would also retire client.pem and client-key.pem"),
+        "the refusal must disclose what a replacement costs: {stderr}"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        before,
+        "a refused run must not touch one byte, least of all the CA private key"
+    );
+
+    // The remedy, taken from the message and run as printed.
+    let remedy = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("nestweaver server init-tls"))
+        .unwrap_or_else(|| panic!("refusal must print a runnable command: {stderr}"))
+        .to_string();
+    assert_eq!(
+        remedy,
+        format!(
+            "nestweaver server init-tls --output-dir {} --san localhost --force",
+            tls.display()
+        ),
+        "the remedy must be the caller's own invocation plus --force"
+    );
+    let argv: Vec<&str> = remedy.split_whitespace().skip(1).collect();
+    let forced = nestweaver_cmd().args(&argv).output().unwrap();
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "the printed remedy must work: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+
+    // It did what the refusal said it would do, and nothing else.
+    let after = tls_snapshot(&tls);
+    assert_eq!(
+        after.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        ["ca.pem", "ca-key.pem", "server.pem", "server-key.pem"],
+        "the client certificate the destroyed CA signed must not survive it"
+    );
+    for (name, bytes) in &after {
+        let old = before.iter().find(|(n, _)| n == name).unwrap();
+        assert_ne!(&old.1, bytes, "{name} should have been replaced");
+    }
+    // And the destroyed CA is recoverable rather than gone.
+    let backup = tls.join(".nestweaver-tls.backup");
+    assert_eq!(tls_snapshot(&backup), before);
+}
+
+/// A PARTIAL directory is an existing bundle. `ca.pem` alone was the only
+/// thing checked on 8.0.0, so a directory missing exactly that file was
+/// overwritten with no warning printed at all.
+#[test]
+fn init_tls_refuses_on_partial_directories_in_both_directions() {
+    for missing in [
+        vec!["ca.pem", "ca-key.pem"],
+        vec!["client.pem", "client-key.pem"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        nestweaver_cmd()
+            .args([
+                "server",
+                "init-tls",
+                "--output-dir",
+                tls.to_str().unwrap(),
+                "--client",
+            ])
+            .assert()
+            .success();
+        for name in &missing {
+            std::fs::remove_file(tls.join(name)).unwrap();
+        }
+        let before = tls_snapshot(&tls);
+
+        let out = nestweaver_cmd()
+            .args(["server", "init-tls", "--output-dir", tls.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(64),
+            "a directory missing {missing:?} is still a bundle"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for (name, _) in &before {
+            assert!(
+                stderr.contains(name),
+                "the refusal must enumerate {name}: {stderr}"
+            );
+        }
+        assert_eq!(tls_snapshot(&tls), before);
+    }
+}
+
+/// An install interrupted part way through is rolled back by the next run,
+/// which says so — the directory never keeps a mix of two bundles.
+///
+/// The interrupt is DETERMINISTIC: the on-disk state a kill leaves is planted
+/// directly, using the same dot-file names `install` writes. Killing a real
+/// process instead would put the fatal signal inside a window microseconds
+/// wide and pass on unfixed code most of the time, which is not a test.
+/// `nestweaver_engine::tls`'s own suite walks every reachable interrupt point;
+/// this asserts the CLI surfaces the recovery rather than performing it in
+/// silence.
+#[test]
+fn init_tls_rolls_back_a_half_replaced_directory_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    let original = tls_snapshot(&tls);
+    assert_eq!(original.len(), 6);
+
+    // The state a crash between "old bundle moved aside" and "new bundle in
+    // place" leaves: three files retired, two of them already replaced by a
+    // different run's bundle.
+    let retired = tls.join(".nestweaver-tls.retired");
+    std::fs::create_dir(&retired).unwrap();
+    let interloper = dir.path().join("other");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            interloper.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    for name in TLS_MANAGED {
+        std::fs::rename(tls.join(name), retired.join(name)).unwrap();
+    }
+    for name in ["ca.pem", "ca-key.pem"] {
+        std::fs::copy(interloper.join(name), tls.join(name)).unwrap();
+    }
+    std::fs::write(
+        tls.join(".nestweaver-tls.journal"),
+        serde_json::json!({ "retiring": TLS_MANAGED, "installing": TLS_MANAGED }).to_string(),
+    )
+    .unwrap();
+    // As it stands the directory is a split bundle: a CA from one run beside
+    // nothing it signed.
+    assert_eq!(tls_snapshot(&tls).len(), 2);
+
+    let out = nestweaver_cmd()
+        .args(["server", "init-tls", "--output-dir", tls.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rolled back an interrupted `server init-tls` install"),
+        "a silent recovery is indistinguishable from nothing having gone wrong: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "the restored bundle is an existing bundle, so the run still refuses"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        original,
+        "the bundle that preceded the interrupted install must be restored whole"
+    );
+    for debris in [
+        ".nestweaver-tls.journal",
+        ".nestweaver-tls.retired",
+        ".nestweaver-tls.staging",
+    ] {
+        assert!(!tls.join(debris).exists(), "{debris} left behind");
+    }
+}
+
+/// Two simultaneous invocations must not interleave into a split bundle. On
+/// 8.0.0 both exited 0 and the directory was left with a `ca.pem` and a
+/// `ca-key.pem` from different processes — reproducible, but only sometimes,
+/// which is why the lock is asserted directly rather than raced for.
+#[cfg(unix)]
+#[test]
+fn init_tls_stands_down_while_another_install_holds_the_directory() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+        ])
+        .assert()
+        .success();
+    let before = tls_snapshot(&tls);
+
+    // Stand in for an install in progress by holding the lock it holds.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tls.join(".nestweaver-tls.lock"))
+        .expect("an installed bundle leaves the lock file behind");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let blocked = nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "a contended directory is a transient runtime condition, not a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("already installing into"),
+        "the loser must say why it stood down: {stderr}"
+    );
+    assert_eq!(
+        tls_snapshot(&tls),
+        before,
+        "a run that stood down must not have written anything"
+    );
+
+    // Releasing the lock lets the same command through.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    nestweaver_cmd()
+        .args([
+            "server",
+            "init-tls",
+            "--output-dir",
+            tls.to_str().unwrap(),
+            "--client",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    // And under real contention the directory is still one coherent bundle.
+    let children: Vec<_> = (0..6)
+        .map(|_| {
+            StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+                .args([
+                    "server",
+                    "init-tls",
+                    "--output-dir",
+                    tls.to_str().unwrap(),
+                    "--client",
+                    "--force",
+                    "--validity-days",
+                    "3650",
+                ])
+                .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+                .env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert!(outputs.iter().any(|o| o.status.success()));
+    for out in outputs.iter().filter(|o| !o.status.success()) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("already installing into"), "{stderr}");
+    }
+    assert_eq!(
+        tls_snapshot(&tls)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>(),
+        TLS_MANAGED
+    );
+    // `openssl verify` is what the filed reproduction used; run it when the
+    // host has it so this asserts exactly what the bug report asserted.
+    if StdCommand::new("openssl").arg("version").output().is_ok() {
+        for leaf in ["server.pem", "client.pem"] {
+            let verify = StdCommand::new("openssl")
+                .args(["verify", "-CAfile"])
+                .arg(tls.join("ca.pem"))
+                .arg(tls.join(leaf))
+                .output()
+                .unwrap();
+            assert!(
+                verify.status.success(),
+                "{leaf} does not verify under the installed ca.pem: {}",
+                String::from_utf8_lossy(&verify.stderr)
+            );
+        }
+    }
+}
+
+// ── `admin install-hook` must never destroy content it did not write ────────
+//
+// The defect, reproduced by hand before any of this was written: a temp
+// directory holding `.claude/settings.local.json` with one `//` comment — JSONC,
+// which Claude Code itself accepts in this very file — and a live API key.
+// `nestweaver admin install-hook` exited 0, printed "Hook installed
+// (idempotent) to .claude/settings.local.json", and left the file containing
+// NOTHING but NestWeaver's hook. `MY_API_KEY` and the permission grants were
+// gone.
+//
+// Mechanism: the handler read the file, folded ANY `serde_json` failure into
+// `Value::Null`, merged its hook into that, and `fs::write`-truncated the
+// result over the user's settings.
+//
+// These run the real binary with its CWD inside a temp directory, because the
+// settings path is resolved RELATIVE TO THE CWD — that is exactly what makes
+// the command dangerous, so it is what the tests must exercise.
+
+/// The reproduction, verbatim.
+#[test]
+fn install_hook_does_not_eat_a_secret_out_of_a_commented_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    // Unknown keys ride along here rather than only in the well-formed-file
+    // test below, because THIS is the fixture on which preservation actually
+    // failed. On well-formed JSON the old merge already preserved everything.
+    let original = "{\n  // project-local overrides\n  \
+                    \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" },\n  \
+                    \"permissions\": { \"allow\": [\"Bash(git status:*)\"] },\n  \
+                    \"aKeyFromSomeFutureRelease\": { \"nested\": [1, 2] }\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "the settings file must be byte-for-byte what it was: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "exiting 0 is how this went unnoticed — the user was told the hook was \
+         installed while their key was being deleted: {stderr}"
+    );
+    // Honest about what it did and did not do, and about WHY comments are the
+    // problem rather than pretending the file is corrupt.
+    assert!(stderr.contains("contains JSON comments"), "{stderr}");
+    assert!(stderr.contains("changed nothing"), "{stderr}");
+    assert!(
+        stderr.contains("nestweaver admin install-hook --dry-run"),
+        "a refusal has to hand back something runnable: {stderr}"
+    );
+}
+
+/// The remedy the refusal above prints, executed. A message naming a command
+/// that cannot run on the file that triggered it is not a remedy.
+///
+/// The refusal is asserted here too, and deliberately: without it this test
+/// passes on the unfixed binary, because both remedies happen to work on code
+/// that never refuses. A remedy test whose precondition is not checked is a
+/// test of nothing.
+#[test]
+fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = "{\n  // project-local overrides\n  \
+                    \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" }\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    // The precondition: it refuses, and the refusal names the remedy below.
+    let refusal = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&refusal.stderr).to_string();
+    assert!(!refusal.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nestweaver admin install-hook --dry-run"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("remove the comments"),
+        "the second remedy has to be named too: {stderr}"
+    );
+
+    // Remedy 1: `--dry-run` prints the entry to add by hand.
+    let dry = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook", "--dry-run"])
+        .assert()
+        .success();
+    let printed = String::from_utf8_lossy(&dry.get_output().stdout).to_string();
+    let delta: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "the remedy must not write either"
+    );
+
+    // Remedy 2: remove the comments and run it again.
+    std::fs::write(
+        &settings,
+        "{\n  \"env\": { \"MY_API_KEY\": \"sk-live-do-not-lose-me\" }\n}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+}
+
+/// Well-formed JSON that NestWeaver does not own survives — in both shapes it
+/// comes in.
+///
+/// The first half (an object with keys from the future) is a FLOOR, not a
+/// reproduction: on a well-formed object the old merge already preserved
+/// everything, so that half passes on the unfixed binary. It is kept because
+/// the merge is what a future change would break, and the reproduction test
+/// above now carries an unknown key of its own so the property is covered by
+/// something that can fail.
+///
+/// The second half is the well-formed case the old code DID destroy. Valid JSON
+/// that is not an object — `[]`, `"text"`, `null` — parsed fine, and then
+/// `compute_claude_hook_patch` replaced anything non-object with `{}` and wrote
+/// the hook over it. Nothing here is unreadable; it is simply not this
+/// command's to replace.
+#[test]
+fn install_hook_preserves_every_key_it_does_not_own() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = serde_json::json!({
+        "env": { "MY_API_KEY": "sk-live-do-not-lose-me" },
+        "permissions": { "allow": ["Bash(git status:*)"], "deny": ["Bash(rm:*)"] },
+        "model": "opus",
+        "hooks": { "PreToolUse": [ { "matcher": "Edit", "hooks": [] } ] },
+        "aKeyFromSomeFutureRelease": { "nested": [1, 2, { "deep": true }] }
+    });
+    std::fs::write(&settings, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    for key in ["env", "permissions", "model", "aKeyFromSomeFutureRelease"] {
+        assert_eq!(after[key], original[key], "`{key}` must survive in value");
+    }
+    let matchers: Vec<&str> = after["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["matcher"].as_str())
+        .collect();
+    assert_eq!(
+        matchers,
+        vec!["Edit", "Task"],
+        "the user's own matcher is not NestWeaver's to move or drop"
+    );
+
+    // Well-formed, not an object, and not NestWeaver's to replace.
+    for content in ["[1, 2]", "\"just a string\"", "null"] {
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join(".claude")).unwrap();
+        let path = other.path().join(".claude/settings.local.json");
+        std::fs::write(&path, content).unwrap();
+
+        let output = nestweaver_cmd()
+            .current_dir(other.path())
+            .args(["admin", "install-hook"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(!output.status.success(), "on {content}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "valid JSON that is not an object was replaced wholesale: {stderr}"
+        );
+        assert!(
+            stderr.contains("not an object"),
+            "on {content}, say what it found: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn install_hook_run_twice_neither_duplicates_the_hook_nor_touches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    std::fs::write(&settings, "{\"env\": {\"MY_API_KEY\": \"sk-live\"}}").unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success()
+        .stderr(contains("Hook installed"));
+    let after_first = std::fs::read_to_string(&settings).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success()
+        .stderr(contains("already present").and(contains("nothing written")));
+
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        after_first,
+        "a second run has nothing to add, so it must not rewrite the file at all"
+    );
+    let after: serde_json::Value = serde_json::from_str(&after_first).unwrap();
+    assert_eq!(after["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live");
+}
+
+/// An interrupted write must leave the original intact.
+///
+/// A hard link is a second name for the SAME inode. `fs::write` opens that
+/// inode and TRUNCATES it before writing a byte, so the user's settings are
+/// destroyed first and a crash in between leaves an empty file. A temp file
+/// plus rename never touches the old inode — which is why the witness still
+/// holds the original bytes at every instant of the write, and why a crash is
+/// survivable.
+#[test]
+fn install_hook_replaces_the_settings_file_instead_of_truncating_it_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let witness = dir.path().join("witness.json");
+    let original = "{\"env\": {\"MY_API_KEY\": \"sk-live-do-not-lose-me\"}}";
+    std::fs::write(&settings, original).unwrap();
+    std::fs::hard_link(&settings, &witness).unwrap();
+
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(&witness).unwrap(),
+        original,
+        "the original inode was truncated in place — a crash mid-write would \
+         have left the user with nothing"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".claude"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "a failed or completed atomic write leaves no temp file: {leftovers:?}"
+    );
+}
+
+/// THE DOTFILES CASE, end to end through the real binary.
+///
+/// `.claude/settings.local.json` is a symbolic link into a dotfiles repository
+/// outside the project. `abbde5d8` refused it; that refusal was correct for
+/// `server init-tls`, which was writing a CA private key through a link and
+/// landing it outside `--output-dir`, and wrong for a user config the user
+/// deliberately linked. The hook goes into the file the link names, every other
+/// setting in it survives, and the link is still a link afterwards — a rename
+/// over the LINK would have replaced it with a regular file, which breaks the
+/// dotfiles checkout just as silently as the truncation this command started
+/// with.
+#[cfg(unix)]
+#[test]
+fn install_hook_follows_a_symlinked_settings_file_into_a_dotfiles_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let dotfiles = dir.path().join("dotfiles");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("settings.local.json");
+    std::fs::write(
+        &target,
+        "{ \"env\": { \"SHARED_KEY\": \"sk-live-shared\" } }\n",
+    )
+    .unwrap();
+    let link = project.join(".claude/settings.local.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(&project)
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(output.status.success(), "{stderr}");
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(
+        after["env"]["SHARED_KEY"], "sk-live-shared",
+        "the user's key must survive the merge: {after}"
+    );
+    assert_eq!(
+        after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+        "the hook must land in the file the link names: {after}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself is content NestWeaver did not write: {stderr}"
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    // No temp file may be left beside the link: the replacement is staged in
+    // the RESOLVED target's directory, so the rename cannot cross a filesystem.
+    let beside: Vec<_> = std::fs::read_dir(project.join(".claude"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(beside.len(), 1, "{beside:?}");
+
+    // Second run is idempotent and still does not disturb the link.
+    nestweaver_cmd()
+        .current_dir(&project)
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// A DANGLING link is still refused: there is nothing to merge into, and
+/// creating the target would write settings to a path the command was never
+/// pointed at. The remedy it prints is executed here.
+#[cfg(unix)]
+#[test]
+fn install_hook_refuses_a_dangling_symlinked_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let missing = dir.path().join("elsewhere/gone.json");
+    let link = dir.path().join(".claude/settings.local.json");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("gone.json"), "name it: {stderr}");
+    // The CLI classifier rewrites any message containing "path" and "does not
+    // exist" into `repo_not_found` — which retitled the first draft of this
+    // refusal "Repository path does not exist" and dropped the sentence naming
+    // the link. Pin the two clauses that survive only if it does not fire.
+    assert!(stderr.contains("symbolic link"), "misclassified: {stderr}");
+    assert!(
+        stderr.contains("changed nothing"),
+        "misclassified: {stderr}"
+    );
+    assert!(
+        !missing.exists(),
+        "nothing may be created out there: {stderr}"
+    );
+
+    // The remedy it prints, executed verbatim against the same tree.
+    std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+    std::fs::write(&missing, "{}\n").unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+}
+
+/// Unparseable input is a refusal, not an empty object.
+#[test]
+fn install_hook_refuses_unparseable_settings_and_names_the_position() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    let original = "{\n  \"env\": { \"MY_API_KEY\": \"sk-live\" },\n}\n";
+    std::fs::write(&settings, original).unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+    assert!(stderr.contains("not valid JSON"), "{stderr}");
+    assert!(stderr.contains("settings.local.json"), "{stderr}");
+    assert!(
+        stderr.contains("line 3") && stderr.contains("column"),
+        "the parse position has to be in the message: {stderr}"
+    );
+
+    // The remedy: fix the syntax at that position and run it again.
+    std::fs::write(
+        &settings,
+        "{\n  \"env\": { \"MY_API_KEY\": \"sk-live\" }\n}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["admin", "install-hook"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after["env"]["MY_API_KEY"], "sk-live");
 }

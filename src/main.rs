@@ -134,6 +134,14 @@ const EXIT_AMBIGUOUS: i32 = 3;
 const EXIT_USAGE: i32 = 64;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
+/// Default `server init-tls --validity-days`.
+///
+/// Named rather than inlined so the clap default and the `--force` remedy
+/// `init_tls_force_command` prints cannot drift: the remedy omits the flag
+/// only when the caller took the default, and a drifted literal would print a
+/// command that rotates to a different validity than the one refused.
+const DEFAULT_TLS_VALIDITY_DAYS: u32 = 365;
+
 /// Explicit device policy for direct local embedding.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum CliEmbeddingAccelerator {
@@ -1932,9 +1940,11 @@ fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
         // there are no recorded repos to list. Every repo predates the record.
         None => eprintln!(
             "warning: no resolver generation is recorded for this database, so every repo \
-             was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
-             rankings are NOT corrected by upgrading alone. Re-index each repo \
-             (`nestweaver index --repo <path>`) to get accurate rankings."
+             was indexed before the record existed — rankings are computed over the edges \
+             that resolver wrote, and edge families added since (C/C++ MEMBER_OF, C++ \
+             IMPORTS) are absent entirely. Upgrading the binary does not repair data \
+             already on disk. Re-index each repo with \
+             `nestweaver index --repo <path> --force`."
         ),
     }
 }
@@ -2056,6 +2066,42 @@ fn print_ranking_json<T: serde::Serialize>(
 ) -> anyhow::Result<()> {
     let mut payload = serde_json::json!({
         key: rows,
+        "rankings_stale": staleness.rankings_stale,
+        "stale_repos": staleness.stale_repos,
+    });
+    if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
+        obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+    }
+    print_json_payload(&payload)
+}
+
+/// `repo-map --json`, as ONE shape for both routes.
+///
+/// nw-370. Two things were wrong with the branch this replaces, and they had
+/// the same cause — the payload was assembled inline, twice:
+///
+///  * it hand-rolled a `RepoMapJson` struct and `println!`d it, bypassing
+///    [`print_json_payload`], so this was the one `--json` payload on either
+///    route carrying no `_meta` provenance at all; and
+///  * it had nowhere to put the staleness disclosure, which is the same reason
+///    `hubs --json` had none before nw-308 — a payload with no object to hang a
+///    field on cannot disclose, so it does not.
+///
+/// `token_count` stays derived from `map` here rather than read off the daemon
+/// reply, so the two routes cannot disagree about a number neither of them
+/// needs a daemon to compute.
+fn print_repo_map_json(
+    map: &str,
+    staleness: &ResolverStaleness,
+    daemon_meta: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let mut payload = serde_json::json!({
+        "map": map,
+        "token_count": map.len().div_ceil(4),
+        // The same two keys `print_ranking_json` emits, unconditionally. An
+        // absent key cannot be read as `false`: "not stale" and "this command
+        // does not say" are the same observation to an agent, and only one of
+        // them is a reason to trust the ordering.
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
     });
@@ -2378,6 +2424,27 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
     }
 }
 
+/// The refusal paragraph out of a `dead_code` payload the DAEMON produced.
+///
+/// nw-372. The daemon route re-renders nothing: the tool that computed the
+/// refusal also wrote the sentence, so this reads `note` and prints it. The
+/// fallback exists only for a payload that says `refused` and carries no
+/// `note`, which this binary cannot produce — and it still names a remedy,
+/// because a refusal with no way forward is the failure mode nw-370 fixed.
+fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
+    payload
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            "dead-code refused: this graph's edges predate the running resolver, and a \
+             missing edge can only move a LIVE symbol onto a deletion list. Run \
+             `nestweaver stale-check` to list the repos, then re-index each one with \
+             `nestweaver index --repo <path> --force`."
+                .to_string()
+        })
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -2610,6 +2677,59 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
 /// `warning` text, plus the `action` when present — because the previous
 /// renderer matched only that one kind and silently dropped everything else,
 /// which is how a wedged index publication produced no text output at all.
+/// Render ONE `stale-check` row, for BOTH routes.
+///
+/// This match existed twice — once in the daemon branch and once in the direct
+/// branch of `BrainCommands::StaleCheck` — as byte-identical copies. That
+/// function pair has now diverged three times for exactly this reason: nw-163
+/// (`is_stale`), nw-256 (`commits_behind`) and nw-266 (`current_head`), each
+/// fix leaving a comment saying the routes must not drift and the next
+/// divergence appearing underneath it. nw-370 adds a fourth state to the
+/// ladder, which is one more thing to copy wrong, so the copy is deleted
+/// instead of extended.
+///
+/// Takes the row as JSON because that is what BOTH routes hold: the daemon
+/// route decodes the daemon's `repos` array and the direct route builds the
+/// same shape. Anything typed here would have to be built twice again.
+fn stale_check_row_line(r: &serde_json::Value) -> String {
+    let url = r["url"].as_str().unwrap_or("?");
+    let stale = r["is_stale"].as_bool().unwrap_or(false);
+    let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
+    let indexed = &indexed_full[..8.min(indexed_full.len())];
+    let head = r["current_head"]
+        .as_str()
+        .map(|h| &h[..8.min(h.len())])
+        .unwrap_or("unknown");
+    // nw-256: `null` means the distance could not be counted, and
+    // `unwrap_or(0)` made that print identically to a real zero — undoing the
+    // fix one layer down. Rendered as three distinct states.
+    let behind = r["staleness_commits_behind"].as_u64();
+    let marker = match r["status"].as_str() {
+        Some("missing") => "missing",
+        Some("incomplete") => "incomplete",
+        Some("outdated_resolver") => "OLD-RESOLVER",
+        _ if stale => "STALE",
+        _ => "ok",
+    };
+    // nw-370: an `outdated_resolver` row has `indexed == HEAD`, so without a
+    // reason the line reads exactly like an `[ok]` one with a louder marker.
+    // Say WHY, on the row, because that is where the user is looking.
+    let reason = if r["status"].as_str() == Some("outdated_resolver") {
+        "  (edges built by an older resolver — re-index)"
+    } else {
+        ""
+    };
+    match behind {
+        Some(behind) if stale && behind > 0 => {
+            format!("  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)")
+        }
+        None if stale => format!(
+            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
+        ),
+        _ => format!("  [{marker}] {url}  indexed={indexed}  HEAD={head}{reason}"),
+    }
+}
+
 fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for w in warnings {
@@ -3102,12 +3222,16 @@ mod daemon_status_renderer_tests {
 enum Commands {
     /// Read the custom annotations agents write via the `set_extension` MCP tool.
     ///
-    /// nw-229: `set_extension` and `query_extensions` were BOTH agent-only, so
-    /// an agent could write key/value annotations that influence a human's
-    /// results — the CLI consumes the sidecar internally for alias matching and
-    /// `external_refs` — with no command to read them back. Write-only-for-
-    /// agents is a defensible design; write-AND-read-only-for-agents makes a
-    /// persistent store that affects output unauditable by its owner.
+    /// These annotations are not inert: the CLI consumes the sidecar
+    /// internally for alias matching and `external_refs`, so they influence
+    /// the results you get from other commands.
+    //
+    // nw-229. `set_extension` and `query_extensions` were BOTH agent-only, so
+    // an agent could write annotations that steer a human's results with no
+    // command to read them back. Write-only-for-agents is a defensible design;
+    // write-AND-read-only-for-agents makes a persistent store that affects
+    // output unauditable by its owner. That is the RATIONALE for the command
+    // existing, which is not what someone running `--help` is asking.
     #[command(
         after_help = "Examples:\n  nestweaver extensions list\n  nestweaver extensions list --uid sym:repo:abc\n  nestweaver extensions list --key owner --value platform-team\n  nestweaver extensions list --json"
     )]
@@ -3168,9 +3292,9 @@ enum Commands {
     /// vector that was never tombstoned is still SCORED, and one outranking a
     /// live result silently consumes a top-k slot in semantic search.
     ///
-    /// Ongoing tombstoning is automatic (nw-204); this exists for brains that
-    /// already accumulated orphans, and as an explicit way to force the
-    /// reclaim rather than waiting for the ratio threshold.
+    /// Ongoing tombstoning is automatic; this exists for brains that already
+    /// accumulated orphans, and as an explicit way to force the reclaim rather
+    /// than waiting for the ratio threshold.
     ///
     /// Runs through the daemon, which holds the same write gate for this that
     /// it holds for indexing — so it cannot race an in-flight index or watcher
@@ -3243,8 +3367,12 @@ enum Commands {
     ///
     /// Gate CI on 2, never on 1: those two demand opposite responses, and a
     /// gate that treats them alike either re-indexes on a crash or passes on
-    /// real drift. This said "exits 1 when any repo is stale" while the code
-    /// exited 2, which inverted both.
+    /// real drift.
+    //
+    // This help once said "exits 1 when any repo is stale" while the code
+    // exited 2, which inverted both. What the text USED to claim is history,
+    // not an instruction — a reader of `--help` needs the current ladder and
+    // nothing else.
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
@@ -3257,8 +3385,8 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
-    /// Measure affected-tests selection quality against full-suite outcomes
-    /// (nw-037): record ground truth from CI, report rolling recall.
+    /// Measure affected-tests selection quality against full-suite outcomes:
+    /// record ground truth from CI, report rolling recall.
     RtsEval {
         #[command(subcommand)]
         command: RtsEvalCommands,
@@ -3985,12 +4113,13 @@ enum Commands {
 
         /// Repository to watch under `--watch`. Defaults to the repository
         /// root detected from the current directory.
-        ///
-        /// nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
-        /// mutates the graph continuously and previously had no way to state
-        /// its source at all, so a guard that refuses a wholly-inferred write
-        /// would have left `ui --watch` unusable rather than correctable.
-        /// Additive and non-breaking.
+        //
+        // nw-284/S2: added so the S2 guard is SATISFIABLE here. `ui --watch`
+        // mutates the graph continuously and previously had no way to state
+        // its source at all, so a guard that refuses a wholly-inferred write
+        // would have left `ui --watch` unusable rather than correctable.
+        // Additive and non-breaking. Deliberately `//`: that is why the flag
+        // EXISTS, not what it does, and clap would print it as `--help`.
         #[arg(
             long,
             help = "Repository to watch (with --watch); defaults to the detected repo root"
@@ -4272,20 +4401,28 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
-        /// nw-316: `Option<bool>`, because a bare clap `bool` cannot express
-        /// "unset" and the tool's documented default is TRUE. Sending clap's
-        /// `false` unconditionally made that default UNREACHABLE on this
-        /// route, and `component_uids` feeds both the PPR seed set and the x5
-        /// membership boost — so the daemon and direct routes ranked the same
-        /// request differently, and neither said so.
-        ///
-        /// `--include-components` bare still means true; `--include-components
-        /// false` is how you opt out.
+        // nw-316: `Option<bool>`, because a bare clap `bool` cannot express
+        // "unset" and the tool's documented default is TRUE. Sending clap's
+        // `false` unconditionally made that default UNREACHABLE on this route,
+        // and `component_uids` feeds both the PPR seed set and the x5
+        // membership boost — so the daemon and direct routes ranked the same
+        // request differently, and neither said so.
+        //
+        // Deliberately `//`, and the user-facing half is an explicit
+        // `long_help =` rather than a `///`: that rationale WAS the entire
+        // `--help` entry for this flag, and a doc comment sitting beside a
+        // `help =` is silently DISCARDED by clap-derive unless it runs to two
+        // paragraphs — which is how the three states would have vanished while
+        // looking like they had been written down.
         #[arg(
             long,
             num_args = 0..=1,
             default_missing_value = "true",
-            help = "Also include notes/symbols from component sub-projects (default: true)"
+            help = "Also include notes/symbols from component sub-projects (default: true)",
+            long_help = "Also include notes/symbols from component sub-projects.\n\n\
+                         Three-state: passing neither form leaves the default (true) in \
+                         place, `--include-components` bare means true, and \
+                         `--include-components false` is how you opt out."
         )]
         include_components: Option<bool>,
         #[arg(long, help = "Output as JSON")]
@@ -4297,18 +4434,25 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
-        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
-        /// Symbol nodes are always kept.
+        /// Hard filter: only Note/Section nodes modified after this ISO 8601
+        /// timestamp. Symbol nodes are always kept.
         ///
-        /// nw-295: validated AND normalised at the clap boundary, not at the
-        /// filter. `modified_at` is a String column, so the downstream
-        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
-        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
-        /// `'2'` (0x32), which made an unparseable value byte-identical to
-        /// `2099-12-31`: it matched no note and silently dropped every Note and
-        /// Section from the answer while exiting 0. Parsing here is the only
-        /// layer that runs before BOTH the daemon and direct routes, so neither
-        /// can be reached with a value the other would have rejected.
+        /// Accepts a date (`2026-01-31`) or a full timestamp
+        /// (`2026-01-31T00:00:00Z`); anything else is refused at parse time.
+        //
+        // nw-295: validated AND normalised at the clap boundary, not at the
+        // filter. `modified_at` is a String column, so the downstream
+        // `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        // `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        // `'2'` (0x32), which made an unparseable value byte-identical to
+        // `2099-12-31`: it matched no note and silently dropped every Note and
+        // Section from the answer while exiting 0. Parsing here is the only
+        // layer that runs before BOTH the daemon and direct routes, so neither
+        // can be reached with a value the other would have rejected.
+        //
+        // Deliberately `//`: this was the ENTIRE `--help` entry for `--since`,
+        // so the long form described the String column while only `-h` named
+        // the two accepted spellings. The `///` above now carries both.
         #[arg(
             long = "since",
             value_parser = |s: &str| nestweaver_engine::parse_since(s),
@@ -4515,8 +4659,14 @@ enum Commands {
     /// deadness: the caveat is not scoped to Low. Confidence ranks how
     /// unaddressable a symbol is from outside its file, never how sure the
     /// reachability walk is.
+    ///
+    /// REFUSES on a resolver-generation-stale graph, exiting 2: on such a
+    /// graph C/C++ `MEMBER_OF` and C++ `IMPORTS` edges are absent entirely,
+    /// and a missing edge can only fail to REACH a live symbol — so the error
+    /// is one-directional and points at deleting live code. Re-index the repos
+    /// it names with `nestweaver index --repo <path> --force` and re-run.
     #[command(
-        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
+        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json\n\nExit codes:\n  0  a list was produced\n  2  REFUSED — the graph's edges predate the running resolver; re-index with\n     `nestweaver index --repo <path> --force` (each stale repo is named on stderr)"
     )]
     DeadCode {
         #[arg(
@@ -4729,7 +4879,7 @@ enum Commands {
         files: Option<String>,
         #[arg(
             long,
-            help = "Diff against this ref (e.g. the merge-base) instead of the working tree"
+            help = "Diff against this ref instead of the working tree alone. Runs `git diff --name-only <ref>`, so uncommitted edits are still included; pass a merge-base sha for branch-only changes"
         )]
         base: Option<String>,
         #[arg(
@@ -4777,9 +4927,16 @@ enum Commands {
             conflicts_with = "base_ref"
         )]
         files: Option<String>,
+        // This said "uses git diff --name-only base...HEAD". It runs
+        // `git diff --name-only <ref>` — two dots, against the WORKING TREE.
+        // The two are different selections on any branch whose base has moved
+        // on: three-dot is the merge-base diff and excludes uncommitted edits,
+        // two-dot includes them and also reports files the base changed. For a
+        // command whose whole output is "which tests must run", describing the
+        // wrong one of those is a wrong CI gate.
         #[arg(
             long = "base-ref",
-            help = "Git ref to diff against (e.g. main); uses git diff --name-only base...HEAD"
+            help = "Git ref to diff against (e.g. main). Runs `git diff --name-only <ref>`: that compares the ref to your WORKING TREE, so uncommitted edits are included and this is NOT the merge-base (`<ref>...HEAD`) diff — pass a merge-base sha if that is what you want"
         )]
         base_ref: Option<String>,
         #[arg(long, help = "Output as JSON")]
@@ -4819,7 +4976,12 @@ enum Commands {
     /// supported source files. Changes are debounced into 2-second windows
     /// and each batch triggers an incremental re-index. Ctrl-C stops cleanly.
     #[command(
-        after_help = "Examples:\n  nestweaver watch\n  nestweaver watch --repo ./my-project\n  nestweaver watch --repo ./my-project --db ./custom.lbug"
+        // The repo is POSITIONAL here (`[REPO]`), unlike `index --repo`. These
+        // examples spelled it `--repo`, so two of the three documented
+        // invocations exited 64 with "unexpected argument '--repo' found" —
+        // from the command that had just recommended them. Pinned by
+        // `every_help_example_parses`.
+        after_help = "Examples:\n  nestweaver watch\n  nestweaver watch ./my-project\n  nestweaver watch ./my-project --db ./custom.lbug"
     )]
     Watch {
         /// Path to the repository to watch (auto-detects if omitted)
@@ -4963,7 +5125,7 @@ enum ServerAction {
     /// Generate TLS certificates for secure server communication
     #[command(
         name = "init-tls",
-        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90"
+        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90\n  nestweaver server init-tls --output-dir ./tls --client --force   # rotate an existing CA\n\nThis is key rotation, not idempotent initialization. A directory that already\nholds ANY of ca.pem, ca-key.pem, server.pem, server-key.pem, client.pem or\nclient-key.pem is left untouched and the command exits 64 unless --force is\npassed. With --force the whole bundle is replaced in one staged install and\nthe replaced bundle is kept in <output-dir>/.nestweaver-tls.backup/."
     )]
     InitTls {
         /// Directory to write certificate files
@@ -4973,11 +5135,22 @@ enum ServerAction {
         #[arg(long = "san")]
         sans: Vec<String>,
         /// Certificate validity in days (1-36500)
-        #[arg(long, default_value = "365", value_parser = clap::value_parser!(u32).range(1..=36500))]
+        #[arg(long, default_value_t = DEFAULT_TLS_VALIDITY_DAYS, value_parser = clap::value_parser!(u32).range(1..=36500))]
         validity_days: u32,
         /// Generate client certificate for mTLS
         #[arg(long)]
         client: bool,
+        /// Replace an existing CA, private key and signed bundle.
+        ///
+        /// DESTRUCTIVE. The existing CA private key is retired and the
+        /// certificates it signed stop verifying. The whole bundle is
+        /// replaced in one staged install, and any managed file the new
+        /// bundle does not provide is retired with it — a client
+        /// certificate cannot outlive the CA that signed it. The replaced
+        /// bundle is kept in `.nestweaver-tls.backup/` inside the output
+        /// directory.
+        #[arg(long)]
+        force: bool,
     },
     /// Backup and restore the NestWeaver database (alias for `nestweaver backup`)
     Backup {
@@ -5093,7 +5266,7 @@ enum DaemonAction {
     /// daemon is STILL draining then, this command does NOT kill it: it reports
     /// what is in flight and exits non-zero, leaving the daemon serving reads.
     /// Nothing in the process can abort a `spawn_blocking` write, and the graph
-    /// store is not crash-safe (nw-126), so abandoning one is an explicit
+    /// store is not crash-safe, so abandoning one is an explicit
     /// operator decision — `--force`, or `kill -9`.
     ///
     /// NOTE: under a process supervisor (systemd `TimeoutStopSec`, default 90s;
@@ -5109,7 +5282,7 @@ enum DaemonAction {
         /// SIGTERM, abandoning any in-flight write.
         ///
         /// This is the known-unsafe act: a SIGKILLed daemon has left a stale
-        /// WAL that made a live 5.6 GB database look absent (nw-126). It exists
+        /// WAL that made a live 5.6 GB database look absent. It exists
         /// so an operator who has decided to accept that can say so explicitly,
         /// rather than having the tool decide it for them on a timer.
         #[arg(long)]
@@ -5405,9 +5578,13 @@ enum ExtensionCommands {
     },
     /// Remove one extension property from one node.
     ///
-    /// `set_extension` requires `value`, so not even a null-set was
-    /// expressible, and the only existing delete removes ALL of a uid's
-    /// properties and is reachable solely from daemon reindex paths (nw-281b).
+    /// Removes exactly the named key. Every other property on that node, and
+    /// every other node, is left untouched.
+    //
+    // nw-281b. `set_extension` requires `value`, so not even a null-set was
+    // expressible, and the only existing delete removes ALL of a uid's
+    // properties and is reachable solely from daemon reindex paths. That is
+    // why the command exists; it is not what it does.
     Unset {
         /// Node UID.
         uid: String,
@@ -5489,8 +5666,12 @@ enum BrainCommands {
     ///
     /// Gate CI on 2, never on 1: those two demand opposite responses, and a
     /// gate that treats them alike either re-indexes on a crash or passes on
-    /// real drift. This said "exits 1 when any repo is stale" while the code
-    /// exited 2, which inverted both.
+    /// real drift.
+    //
+    // This help once said "exits 1 when any repo is stale" while the code
+    // exited 2, which inverted both. What the text USED to claim is history,
+    // not an instruction — a reader of `--help` needs the current ladder and
+    // nothing else.
     ///
     /// Flags a repo whose working tree is missing —
     /// usable as a CI freshness gate.
@@ -5721,36 +5902,52 @@ enum BrainCommands {
             help = "Exclude note/section nodes tagged with any of these tags"
         )]
         exclude_tags: Vec<String>,
-        /// PPR ranking weight for hybrid RRF fusion (default 0.7).
+        // The three stated defaults were 0.7 / 0.3 / 0.0. The real ones are
+        // `HybridSearchConfig::default()` — 0.40 / 0.25 / 0.35 — on the direct
+        // route, and `[embedding]`'s identically-valued defaults on the daemon
+        // route. The semantic figure was the damaging one: help said the
+        // embedding leg is OFF unless asked for, while it carries the second
+        // largest weight in the fusion by default, so a user reasoning about
+        // whether embeddings touched their results was reading the opposite of
+        // the truth. Same class as `dead-code --limit`'s "default: all".
+        /// PPR ranking weight for hybrid RRF fusion (default 0.40).
         #[arg(
             long = "weight-ppr",
-            help = "PPR weight for hybrid retrieval (default 0.7)"
+            help = "PPR weight for hybrid retrieval (default 0.40)"
         )]
         weight_ppr: Option<f64>,
-        /// BM25 text search weight for hybrid RRF fusion (default 0.3).
+        /// BM25 text search weight for hybrid RRF fusion (default 0.25).
         #[arg(
             long = "weight-bm25",
-            help = "BM25 weight for hybrid retrieval (default 0.3)"
+            help = "BM25 weight for hybrid retrieval (default 0.25)"
         )]
         weight_bm25: Option<f64>,
-        /// Semantic embedding weight for hybrid RRF fusion (default 0.0).
+        /// Semantic embedding weight for hybrid RRF fusion (default 0.35 — the
+        /// embedding leg is ON by default; `--no-embed` turns it off).
         #[arg(
             long = "weight-semantic",
-            help = "Semantic embedding weight for hybrid retrieval (default 0.0)"
+            help = "Semantic embedding weight for hybrid retrieval (default 0.35; --no-embed forces 0)"
         )]
         weight_semantic: Option<f64>,
-        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
-        /// Symbol nodes are always kept.
+        /// Hard filter: only Note/Section nodes modified after this ISO 8601
+        /// timestamp. Symbol nodes are always kept.
         ///
-        /// nw-295: validated AND normalised at the clap boundary, not at the
-        /// filter. `modified_at` is a String column, so the downstream
-        /// `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
-        /// `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
-        /// `'2'` (0x32), which made an unparseable value byte-identical to
-        /// `2099-12-31`: it matched no note and silently dropped every Note and
-        /// Section from the answer while exiting 0. Parsing here is the only
-        /// layer that runs before BOTH the daemon and direct routes, so neither
-        /// can be reached with a value the other would have rejected.
+        /// Accepts a date (`2026-01-31`) or a full timestamp
+        /// (`2026-01-31T00:00:00Z`); anything else is refused at parse time.
+        //
+        // nw-295: validated AND normalised at the clap boundary, not at the
+        // filter. `modified_at` is a String column, so the downstream
+        // `>= $since` is a LEXICOGRAPHIC comparison that cannot fail —
+        // `"garbage"` leads with `'g'` (0x67) and every stored timestamp with
+        // `'2'` (0x32), which made an unparseable value byte-identical to
+        // `2099-12-31`: it matched no note and silently dropped every Note and
+        // Section from the answer while exiting 0. Parsing here is the only
+        // layer that runs before BOTH the daemon and direct routes, so neither
+        // can be reached with a value the other would have rejected.
+        //
+        // Deliberately `//`: this was the ENTIRE `--help` entry for `--since`,
+        // so the long form described the String column while only `-h` named
+        // the two accepted spellings. The `///` above now carries both.
         #[arg(
             long = "since",
             value_parser = |s: &str| nestweaver_engine::parse_since(s),
@@ -5837,9 +6034,11 @@ enum BrainCommands {
     /// Suggestions are offered WHERE CANDIDATES EXIST, which is not every entry:
     /// a link whose target exists nowhere in the vault — a deleted note, or an ID
     /// that is a backlog entry rather than a note — has nothing to suggest, and
-    /// an empty list is the honest answer. The old wording promised "suggested
-    /// target notes for each" and so read as a defect whenever the list was
-    /// empty (nw-100).
+    /// an empty suggestion list is the honest answer, not a failure.
+    //
+    // nw-100. The old wording promised "suggested target notes for each" and so
+    // read as a defect whenever the list was empty. What that wording USED to
+    // say belongs to the history, not to `--help`.
     ///
     /// Check `resolved_target_uid` to tell a link that RESOLVED at a lower tier
     /// from one that points at nothing.
@@ -6449,9 +6648,13 @@ enum InteractionCommands {
     },
     /// Forget one node's interaction memory, leaving the rest intact.
     ///
-    /// `clear` is all-or-nothing. A single poisoned entry — a phantom key from
-    /// a pre-nw-296 binary, or an oversized caller-supplied seed — could only
-    /// be removed by destroying every accumulated ranking signal (nw-313).
+    /// The selective counterpart to `clear`, which is all-or-nothing. Use it
+    /// to drop a single poisoned entry — a phantom key left by an older
+    /// binary, or an oversized caller-supplied seed — without destroying every
+    /// accumulated ranking signal.
+    //
+    // nw-313, and the phantom keys are the pre-nw-296 shape. Ticket ids are
+    // for whoever reads this file, not for whoever runs `--help`.
     Forget {
         /// Node UID to forget.
         uid: String,
@@ -6661,6 +6864,137 @@ enum DbSource {
 /// target is not refused — that target is derived from the source rather than
 /// from the ambient environment.
 ///
+/// Single-quote an argument for a shell only when it needs it.
+///
+/// The refusals below print a command the user is meant to paste. A path with
+/// a space in it that comes back unquoted is an unexecutable remedy, which is
+/// the failure mode this repository has shipped five times.
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-,".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+/// The exact `server init-tls` invocation that WOULD perform the replacement:
+/// the caller's own arguments with `--force` appended.
+///
+/// Reconstructed from the parsed arguments rather than templated, in the shape
+/// `dead-code`'s per-repo remedy established — a message naming a flag is only
+/// worth printing if running the string it prints does what it says.
+fn init_tls_force_command(
+    output_dir: &Path,
+    sans: &[String],
+    validity_days: u32,
+    client: bool,
+) -> String {
+    let mut cmd = format!(
+        "nestweaver server init-tls --output-dir {}",
+        shell_quote(&output_dir.display().to_string())
+    );
+    for san in sans {
+        cmd.push_str(&format!(" --san {}", shell_quote(san)));
+    }
+    if validity_days != DEFAULT_TLS_VALIDITY_DAYS {
+        cmd.push_str(&format!(" --validity-days {validity_days}"));
+    }
+    if client {
+        cmd.push_str(" --client");
+    }
+    cmd.push_str(" --force");
+    cmd
+}
+
+/// Why `server init-tls` will not overwrite a directory that already holds a
+/// bundle, and the exact command that performs the replacement.
+///
+/// The old behaviour printed this same fact as a WARNING and then performed
+/// the overwrite anyway, which in automation is advisory noise above an
+/// irrecoverable act: measured on 8.0.0, a second run replaced `ca.pem` and
+/// the CA private key, left `client.pem` untouched, and exited 0 over a
+/// directory whose client certificate no longer verified.
+///
+/// The trigger is ANY managed name, not `ca.pem` alone. A directory holding
+/// only `client.pem` and `client-key.pem` is a bundle whose root has already
+/// been lost, and overwriting it in silence is how it stayed lost.
+fn init_tls_replace_refusal(
+    output_dir: &Path,
+    state: &nestweaver_engine::tls::DirState,
+    sans: &[String],
+    validity_days: u32,
+    client: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let installing: Vec<&str> = nestweaver_engine::tls::MANAGED_FILES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| client || !name.starts_with("client"))
+        .collect();
+    let will_retire: Vec<&str> = state
+        .present
+        .iter()
+        .copied()
+        .filter(|name| !installing.contains(name))
+        .collect();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Error: refusing to replace the TLS bundle already in {}",
+        output_dir.display()
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  present: {}", state.present.join(", "));
+    if !state.symlinked.is_empty() {
+        let _ = writeln!(
+            out,
+            "  symlinks: {} (a replacement would retire the link itself, never write through it)",
+            state.symlinked.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "This is key rotation, not idempotent initialization. Re-running mints a NEW"
+    );
+    let _ = writeln!(
+        out,
+        "certificate authority and retires the old CA private key, so every certificate"
+    );
+    let _ = writeln!(out, "the old CA signed stops verifying.");
+    if !will_retire.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "A replacement would also retire {}, which the new CA cannot vouch for.",
+            will_retire.join(" and ")
+        );
+        let _ = writeln!(
+            out,
+            "Pass --client to reissue a client certificate under the new CA instead."
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Replace it (the bundle being replaced is kept in {}/{}/):",
+        output_dir.display(),
+        nestweaver_engine::tls::BACKUP_DIR
+    );
+    let _ = writeln!(
+        out,
+        "  {}",
+        init_tls_force_command(output_dir, sans, validity_days, client)
+    );
+    out
+}
+
 /// Returns the refusal text, or `None` when the caller may proceed.
 fn wholly_inferred_write_refusal(
     action: &str,
@@ -10872,6 +11206,39 @@ fn require_exclusive_store_access(
     db_path: &std::path::Path,
     operation: &str,
 ) -> anyhow::Result<nestweaver_daemon::lifecycle::DbWriteLease> {
+    require_exclusive_store_access_with_remedy(
+        db_path,
+        operation,
+        ExclusivityRemedy::RouteThroughDaemon,
+    )
+}
+
+/// Which remedy an exclusivity refusal should print.
+///
+/// One primitive, two remedies. `backup restore` cannot take the
+/// daemon-routing advice — there is no `--no-daemon` on it and no RPC that
+/// performs a restore — so printing that line there would ship an
+/// unexecutable remedy inside the fix for a destructive-safety defect.
+#[derive(Debug, Clone, Copy)]
+enum ExclusivityRemedy {
+    /// The caller can route the work through the daemon instead.
+    RouteThroughDaemon,
+    /// The caller cannot; the holder has to stop.
+    StopTheHolder,
+}
+
+/// [`require_exclusive_store_access`] with the remedy chosen by the caller.
+///
+/// The proof is identical in both cases and is taken in exactly one place —
+/// this is a message split, not a second way to establish exclusivity.
+#[must_use = "the lease must be HELD for the duration of the write; dropping it \
+              immediately reduces this to a probe, which is the check-then-act \
+              race it exists to remove"]
+fn require_exclusive_store_access_with_remedy(
+    db_path: &std::path::Path,
+    operation: &str,
+    remedy: ExclusivityRemedy,
+) -> anyhow::Result<nestweaver_daemon::lifecycle::DbWriteLease> {
     use nestweaver_daemon::lifecycle::WriteLeaseError;
 
     match nestweaver_daemon::lifecycle::acquire_db_write_lease(db_path) {
@@ -10887,21 +11254,41 @@ fn require_exclusive_store_access(
                 }
                 _ => "another process".to_string(),
             };
-            anyhow::bail!(
-                "cannot {operation} directly: {holder} holds the write lease for {}.\n\
-                 Route through the daemon (drop --no-daemon), or stop the holder first with \
-                 `nestweaver daemon --db {} stop`.",
-                db_path.display(),
-                db_path.display()
-            )
+            match remedy {
+                ExclusivityRemedy::RouteThroughDaemon => anyhow::bail!(
+                    "cannot {operation} directly: {holder} holds the write lease for {}.\n\
+                     Route through the daemon (drop --no-daemon), or stop the holder first with \
+                     `nestweaver daemon --db {} stop`.",
+                    db_path.display(),
+                    db_path.display()
+                ),
+                ExclusivityRemedy::StopTheHolder => anyhow::bail!(
+                    "cannot {operation}: {holder} holds the write lease for {}.\n\
+                     This operation renames that data directory aside and deletes it, so it \
+                     cannot proceed while anything is still writing the database — the writer \
+                     would keep operating on unlinked files and the result would silently \
+                     diverge. Stop the holder and retry: `nestweaver daemon --db {} stop`.",
+                    db_path.display(),
+                    db_path.display()
+                ),
+            }
         }
-        Err(WriteLeaseError::Unavailable(error)) => anyhow::bail!(
-            "cannot {operation} directly: the write lease for {} could not be taken \
-             ({error}), so exclusivity is NOT established.\n\
-             Refusing rather than risking a second writer against a store that is not \
-             crash-safe.",
-            db_path.display()
-        ),
+        Err(WriteLeaseError::Unavailable(error)) => match remedy {
+            ExclusivityRemedy::RouteThroughDaemon => anyhow::bail!(
+                "cannot {operation} directly: the write lease for {} could not be taken \
+                 ({error}), so exclusivity is NOT established.\n\
+                 Refusing rather than risking a second writer against a store that is not \
+                 crash-safe.",
+                db_path.display()
+            ),
+            ExclusivityRemedy::StopTheHolder => anyhow::bail!(
+                "cannot {operation}: the write lease for {} could not be taken ({error}), so \
+                 exclusivity is NOT established.\n\
+                 Refusing rather than renaming a data directory aside and deleting it while an \
+                 unknown writer may still be using it.",
+                db_path.display()
+            ),
+        },
     }
 }
 
@@ -11598,40 +11985,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
+                    // nw-370: read the daemon's own verdict, the same way
+                    // `hubs`/`bridges` do. Hoisted out of `if json` on purpose
+                    // — that is precisely the mistake nw-365 fixed on `hubs`,
+                    // where the verdict was built inside the JSON branch and
+                    // the plain-text route (the one users run) had nothing to
+                    // print.
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     if json {
-                        // Match the direct path's {map, token_count} shape — the daemon tool
-                        // returns only {map}, so compute token_count the same way here.
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "map": map,
-                                "token_count": map.len().div_ceil(4),
-                            }))?
-                        );
+                        // nw-370: through `print_json_payload`, which stamps
+                        // `_meta`. This branch hand-rolled a struct and printed
+                        // it directly, so `repo-map --json` was the one payload
+                        // on this route with no provenance at all.
+                        print_repo_map_json(
+                            map,
+                            &staleness,
+                            value.get(nestweaver_schema::provenance::META_KEY).cloned(),
+                        )?;
                     } else {
                         print!("{map}");
                     }
+                    warn_stale_resolver_rankings_no_store(&staleness);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
 
             let store = open_store(db.as_deref())?;
+            let db_path = db.clone().unwrap_or_else(default_db_path);
             let map = generate_repo_map(&store, token_budget)?;
-            let token_count = map.len().div_ceil(4);
+
+            // nw-370: `generate_repo_map` orders by `symbols_by_pagerank`, so
+            // on a generation-stale graph the ORDERING — the whole content of
+            // this command — is computed over the edges an older resolver
+            // wrote. Same disclosure as `hubs`, for a stronger reason: `hubs`
+            // prints scores a reader can discount, this prints only an order.
+            warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
-                #[derive(serde::Serialize)]
-                struct RepoMapJson<'a> {
-                    map: &'a str,
-                    token_count: usize,
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&RepoMapJson {
-                        map: &map,
-                        token_count,
-                    })?
-                );
+                print_repo_map_json(&map, &ResolverStaleness::from_store(&store, &db_path), None)?;
             } else {
                 print!("{map}");
             }
@@ -12630,17 +13021,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 use nestweaver_engine::admin;
                 let rt = admin::Runtime::parse(&runtime)?;
                 let settings_path = admin::runtime_settings_path(rt);
-                let existing: serde_json::Value = if settings_path.exists() {
-                    let raw = std::fs::read_to_string(&settings_path)?;
-                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
-                } else {
-                    serde_json::Value::Null
-                };
                 if dry_run {
                     // PRINT only the minimal delta that WOULD be added — not the
                     // whole merged settings document (which may contain unrelated
                     // pre-existing permissions). Do not write.
-                    let delta = admin::compute_hook_delta(rt, &existing)?;
+                    //
+                    // Reading is deliberately more permissive than writing: this
+                    // branch works on a JSONC file and on a symlink, because it
+                    // is the remedy the write path's refusals hand back, and a
+                    // remedy that cannot run on the file that triggered it is
+                    // not a remedy.
+                    let existing = admin::read_runtime_settings(&settings_path)?;
+                    let delta = admin::compute_hook_delta(rt, &existing.value)?;
                     println!("{}", serde_json::to_string_pretty(&delta)?);
                     eprintln!(
                         "(dry-run) Would merge the above hook entry into {} (existing settings preserved). Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
@@ -12648,15 +13040,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                     return Ok((EXIT_SUCCESS, None));
                 }
-                let patched = admin::compute_hook_patch(rt, &existing)?;
-                if let Some(parent) = settings_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                // This used to read the file, fold ANY parse failure into
+                // `Value::Null`, merge the hook into that, and `fs::write` the
+                // result. A single `//` comment — which Claude Code accepts in
+                // this very file — was enough to replace a user's `env` block,
+                // containing a live API key, with nothing but NestWeaver's
+                // hook, at exit 0, under the message "Hook installed
+                // (idempotent)". The read, the merge and the write now live in
+                // `admin::install_hook`, where they are unit-testable and where
+                // refusing is the default for anything it cannot read.
+                match admin::install_hook(rt, &settings_path)? {
+                    admin::HookInstall::Installed => out.status(&format!(
+                        "Hook installed to {} (every other setting preserved)",
+                        settings_path.display()
+                    )),
+                    admin::HookInstall::AlreadyPresent => out.status(&format!(
+                        "Hook already present in {} (nothing written)",
+                        settings_path.display()
+                    )),
                 }
-                std::fs::write(&settings_path, serde_json::to_string_pretty(&patched)?)?;
-                out.status(&format!(
-                    "Hook installed (idempotent) to {}",
-                    settings_path.display()
-                ));
                 Ok((EXIT_SUCCESS, None))
             }
         },
@@ -12946,16 +13348,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // mode — for --json fall through to the direct path, whose bare
             // Vec<Summary> output the daemon shape cannot reproduce.
             if use_daemon && !json {
-                let mut args = serde_json::json!({ "level": level });
-                if token_budget > 0 {
-                    args["token_budget"] = serde_json::json!(token_budget);
-                }
-                if let Some(ref t) = target {
-                    args["target"] = serde_json::json!(t);
-                }
+                let args = summary_tool_args(&level, token_budget, target.as_deref());
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
+                    // nw-370: `get_summary` attaches the verdict on hub level,
+                    // so this route reads the daemon's own answer rather than
+                    // deriving a weaker one. On any other level the keys are
+                    // absent and `from_daemon_response` would fall back to the
+                    // sidecar — which would disclose on `--level file`, where
+                    // the claim is not true — so the gate is here as well as
+                    // there.
+                    if parsed_level == SummaryLevel::Hub {
+                        warn_stale_resolver_rankings_no_store(
+                            &ResolverStaleness::from_daemon_response(&value, &db_path),
+                        );
+                    }
                     if text.is_empty() {
                         println!("No summaries generated (graph may be empty).");
                     } else {
@@ -13133,21 +13541,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let truncated_by_cap = cap_dropped > 0;
             let truncated = truncated_by_budget || truncated_by_cap;
 
+            // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects
+            // and orders by the same degree/PageRank nw-103's import fan-out
+            // corrupted, so on a generation-stale graph it summarises the wrong
+            // thirty symbols. The other three levels are deliberately excluded:
+            // File is not ranking-derived at all, and a flag present on every
+            // level distinguishes nothing.
+            let hub_staleness = (parsed_level == SummaryLevel::Hub)
+                .then(|| ResolverStaleness::from_store(&store, &db_path));
+            if hub_staleness.is_some() {
+                // The store-holding variant, so this route prints the exact
+                // `N of M` denominator rather than the daemon route's floor.
+                warn_stale_resolver_rankings(&store, &db_path);
+            }
+
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "summaries": display,
-                        // `total` now counts what MATCHED, not what survived
-                        // the cap — otherwise `returned == total` beside
-                        // `truncated: true` is a contradiction.
-                        "total": total + cap_dropped,
-                        "returned": display.len(),
-                        "truncated": truncated,
-                        "truncated_by_budget": truncated_by_budget,
-                        "truncated_by_cap": truncated_by_cap,
-                    }))?
-                );
+                let mut payload = serde_json::json!({
+                    "summaries": display,
+                    // `total` now counts what MATCHED, not what survived
+                    // the cap — otherwise `returned == total` beside
+                    // `truncated: true` is a contradiction.
+                    "total": total + cap_dropped,
+                    "returned": display.len(),
+                    "truncated": truncated,
+                    "truncated_by_budget": truncated_by_budget,
+                    "truncated_by_cap": truncated_by_cap,
+                });
+                // Both keys, always — but only on the level they describe.
+                if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
+                    obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
+                    obj.insert("stale_repos".into(), staleness.stale_repos.clone().into());
+                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if display.is_empty() {
                 println!("No summaries generated (graph may be empty).");
             } else {
@@ -13807,6 +14232,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["limit"] = serde_json::json!(n);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
+                    // nw-372: the daemon PRINTS what it was sent. The refusal
+                    // is computed by the `dead_code` tool the daemon ran, from
+                    // `ResolverGenerations::stale_repos` — the sole
+                    // computation — so this route decides nothing and cannot
+                    // disagree with the tool about one database. That is the
+                    // same rule `ResolverStaleness::from_daemon_response`
+                    // follows, and the reason `hubs` had three answers before
+                    // nw-358 was that its daemon route re-derived instead.
+                    if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        }
+                        eprintln!("Error: {}", dead_code_refusal_note(&value));
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -13826,8 +14266,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 });
             let store = open_store(db.as_deref())?;
 
-            // Load manifest sidecar for manifest-driven entry points.
             let db_path = db.clone().unwrap_or_else(default_db_path);
+
+            // nw-372: REFUSE before the walk. `DeadCodeRefusal::for_repos`
+            // wraps `ResolverGenerations::stale_repos` — the sole computation
+            // — and returns `None` only when every repo is provably current.
+            //
+            // The enumeration PROPAGATES rather than becoming a refusal. A
+            // store that cannot list repos cannot serve a reachability walk
+            // either, and the CLI's error classifier turns that failure into
+            // the diagnostic it earned: a zero-length database reports
+            // `nestweaver::db_no_schema` with its size and a runnable
+            // `nestweaver index`, which nw-285 built and which a refusal here
+            // would have replaced with a binder exception quoted inside a
+            // paragraph about resolver generations.
+            let repos = store.list_repos(None)?;
+            if let Some(refusal) =
+                nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos)
+            {
+                // stdout stays pure JSON for a `--json` gate; the paragraph
+                // goes to stderr on BOTH modes, the same split `stale-check`
+                // and every ranking surface already use.
+                if json {
+                    print_json_payload(&refusal.payload())?;
+                }
+                eprintln!("Error: {}", refusal.message());
+                return Ok((EXIT_NEEDS_REINDEX, None));
+            }
+
+            // Load manifest sidecar for manifest-driven entry points.
             let manifests =
                 nestweaver_engine::load_manifest_cache_for_db(&store, &db_path).unwrap_or_default();
 
@@ -13840,13 +14307,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .filter(|s| s.confidence >= min_conf)
                 .collect();
             let filtered_count = filtered.len();
-            // Optional cap (default: show all). `filtered_count` stays the true
-            // total; `shown` is the capped view rendered/serialized.
-            let truncated = limit.is_some_and(|n| n < filtered_count);
-            let shown: Vec<_> = match limit {
-                Some(n) => filtered.into_iter().take(n).collect(),
-                None => filtered,
-            };
+            let (shown, truncated) = dead_code_cut(filtered, limit);
 
             #[derive(serde::Serialize)]
             struct DeadCodeJson<'a> {
@@ -19254,22 +19715,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 sans,
                 validity_days,
                 client,
+                force,
             } => {
                 use nestweaver_engine::tls;
 
-                // Re-running init-tls silently replaces the CA, which
-                // invalidates every cert it signed — warn before doing so.
-                if output_dir.join("ca.pem").exists() {
+                // Take the exclusive install lock BEFORE deciding anything.
+                // `TlsDir::open` also rolls back an interrupted previous
+                // install, so the state inspected below is a settled bundle
+                // rather than a half-replaced one.
+                let dir = tls::TlsDir::open(&output_dir)?;
+                if !dir.recovered().is_empty() {
                     eprintln!(
-                        "warning: {} already contains a CA (ca.pem) — overwriting it \
-                         invalidates every certificate it signed",
-                        output_dir.display()
+                        "notice: rolled back an interrupted `server init-tls` install in {} \
+                         and restored {}",
+                        output_dir.display(),
+                        dir.recovered().join(", ")
                     );
                 }
 
-                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+                let state = dir.state()?;
+                if !state.present.is_empty() && !force {
+                    eprint!(
+                        "{}",
+                        init_tls_replace_refusal(&output_dir, &state, &sans, validity_days, client,)
+                    );
+                    return Ok((EXIT_USAGE, None));
+                }
 
-                tls::write_tls_bundle(&output_dir, &bundle)?;
+                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+                let report = dir.install(&bundle)?;
 
                 let dir_display = output_dir.display();
                 println!("Generated TLS certificates in {dir_display}/");
@@ -19281,6 +19755,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if client {
                     println!("  client.pem       Client certificate (mTLS)");
                     println!("  client-key.pem   Client private key (mTLS)");
+                }
+                if !report.removed.is_empty() {
+                    println!();
+                    println!(
+                        "Retired (signed by the CA this run replaced): {}",
+                        report.removed.join(", ")
+                    );
+                }
+                if let Some(backup) = report.backup_dir.as_ref() {
+                    println!();
+                    println!("Replaced bundle kept at {}/", backup.display());
                 }
                 println!();
                 println!("Start server with:");
@@ -20008,6 +20493,19 @@ fn run_ranking(
             let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
             let final_rank = base_pagerank * multiplier;
 
+            // nw-370: this command prints a raw `base_pagerank` to eight
+            // decimal places and said nothing about where it came from. A
+            // number rendered that precisely reads as authoritative, and on a
+            // generation-stale graph it is PageRank over the edges an older
+            // resolver wrote — the exact quantity nw-103 corrupted. Same
+            // disclosure as `hubs`.
+            //
+            // There is no daemon route to mirror: `ranking rank` opens the
+            // store directly and has no `try_hybrid_json_rpc` guard, so the
+            // direct constructor is the only one reachable.
+            warn_stale_resolver_rankings(&store, &db_path);
+            let staleness = ResolverStaleness::from_store(&store, &db_path);
+
             if json {
                 println!(
                     "{}",
@@ -20019,6 +20517,11 @@ fn run_ranking(
                         "git_activity_weight": weight,
                         "multiplier": multiplier,
                         "final_rank": final_rank,
+                        // nw-308's contract: both keys, always. `base_pagerank`
+                        // is the whole answer here, so an agent reading it needs
+                        // to know whether the edges under it are current.
+                        "rankings_stale": staleness.rankings_stale,
+                        "stale_repos": staleness.stale_repos,
                     }))?
                 );
             } else {
@@ -21650,6 +22153,14 @@ fn run_brain(
                 // this array names. `needs_reindex_repos` is the actionable
                 // set; `stale_repos` stays behind-HEAD only.
                 let needs_reindex_urls = urls_where("needs_reindex");
+                // nw-370: read the daemon's OWN per-row verdict rather than
+                // recomputing one. The client refuses to talk to a
+                // version-mismatched daemon at all — it restarts it (see
+                // `NestweaverClient::connect`) — so the daemon serving this
+                // reply is always this binary's own `tool_stale_check`, and a
+                // client-side fallback here would be dead code pretending to
+                // be a safety net.
+                let resolver_stale_urls = urls_where("resolver_stale");
                 let any_stale = value
                     .get("any_stale")
                     .and_then(|v| v.as_bool())
@@ -21668,6 +22179,7 @@ fn run_brain(
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "needs_reindex_repos": needs_reindex_urls,
+                        "resolver_stale_repos": resolver_stale_urls,
                         "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
                     });
                     println!("{}", serde_json::to_string_pretty(&normalized)?);
@@ -21699,38 +22211,45 @@ fn run_brain(
                             }
                         );
                         for r in &repos {
-                            let url = r["url"].as_str().unwrap_or("?");
-                            let stale = r["is_stale"].as_bool().unwrap_or(false);
-                            let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
-                            let indexed = &indexed_full[..8.min(indexed_full.len())];
-                            let head = r["current_head"]
-                                .as_str()
-                                .map(|h| &h[..8.min(h.len())])
-                                .unwrap_or("unknown");
-                            // nw-256: `null` means the distance could not be
-                            // counted, and `unwrap_or(0)` made that print
-                            // identically to a real zero — undoing the fix one
-                            // layer down. Rendered as three distinct states.
-                            let behind = r["staleness_commits_behind"].as_u64();
-                            let marker = match r["status"].as_str() {
-                                Some("missing") => "missing",
-                                Some("incomplete") => "incomplete",
-                                _ if stale => "STALE",
-                                _ => "ok",
-                            };
-                            match behind {
-                                Some(behind) if stale && behind > 0 => println!(
-                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                                ),
-                                None if stale => println!(
-                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
-                                ),
-                                _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
-                            }
+                            println!("{}", stale_check_row_line(r));
                         }
                     }
                 }
+                // nw-370: the remedy, on stderr in BOTH modes — the same
+                // channel and the same renderer `hubs`/`bridges` use, so the
+                // migration instruction cannot drift between the command that
+                // detects the condition and the commands that suffer from it.
+                // A `--json` gate reads `resolver_stale_repos`; stdout stays
+                // pure JSON either way.
+                //
+                // This route knows the denominator (`repo_count` is on the
+                // payload), unlike the `hubs` daemon route, so it passes
+                // `Some` rather than printing a floor.
+                let resolver_stale_names: Vec<String> = resolver_stale_urls
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if let Some(note) = nestweaver_engine::resolver_generation::staleness_note_for(
+                    &resolver_stale_names,
+                    value
+                        .get("repo_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
+                ) {
+                    eprintln!("warning: {note}");
+                }
                 // Stale-check is a freshness gate — exit non-zero when stale.
+                //
+                // nw-370: generation staleness reuses EXIT_NEEDS_REINDEX (2)
+                // rather than taking a fifth code. `2` already means "at least
+                // one repo needs re-indexing", the remedy is identical, and
+                // `docs/ci-integration.md` plus the shipped pre-push hook
+                // already gate on it — so every existing CI gate catches the
+                // 9.0.0 migration with no edit. A new code would be silently
+                // ignored by exactly the gates that need to fire, which is the
+                // opposite of what a migration signal is for. Callers that
+                // must distinguish the states read `status` /
+                // `resolver_stale_repos`, which is what those fields are for.
                 return Ok((
                     if any_needs_reindex {
                         EXIT_NEEDS_REINDEX
@@ -21748,6 +22267,21 @@ fn run_brain(
             let repos = store
                 .list_repos(None)
                 .map_err(|error| anyhow::anyhow!("list repos: {error}"))?;
+
+            // nw-370: the fourth rung. See `tool_stale_check` — the two
+            // routes must answer identically, so this is the same decision
+            // made from the same computation.
+            //
+            // `ResolverStaleness::from_store` is the existing direct-route
+            // constructor (`hubs`, `bridges`), which wraps
+            // `ResolverGenerations::stale_repos`, the sole computation
+            // (nw-358). No fourth decider is added here; this reads the same
+            // verdict and joins it to the rows by uid.
+            let resolver_stale: std::collections::HashSet<String> =
+                ResolverStaleness::from_store(&store, &db_path)
+                    .stale_repos
+                    .into_iter()
+                    .collect();
 
             let mut any_stale = false;
             let mut any_needs_reindex = false;
@@ -21828,12 +22362,20 @@ fn run_brain(
                 // nw-163: `is_stale` means BEHIND HEAD and nothing else; the
                 // actionable union lives in `needs_reindex`. Mirrors
                 // `tool_stale_check` exactly — the two paths must not drift.
+                //
+                // nw-370: `outdated_resolver` sits BELOW the three git-derived
+                // states, matching `tool_stale_check`. `resolver_stale` on the
+                // row keeps the fact visible when that precedence reports a git
+                // reason instead.
+                let repo_resolver_stale = resolver_stale.contains(&repo.uid);
                 let status = if local_missing {
                     "missing"
                 } else if content_missing {
                     "incomplete"
                 } else if is_stale {
                     "stale"
+                } else if repo_resolver_stale {
+                    "outdated_resolver"
                 } else {
                     "ok"
                 };
@@ -21850,6 +22392,9 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
+                    // nw-370: independent of `is_stale`, matching
+                    // `tool_stale_check`.
+                    "resolver_stale": repo_resolver_stale,
                     "needs_reindex": needs_reindex,
                     "staleness_commits_behind": commits_behind,
                     "status": status,
@@ -21868,6 +22413,11 @@ fn run_brain(
                 };
                 let stale_urls = urls_where("is_stale");
                 let needs_reindex_urls = urls_where("needs_reindex");
+                // nw-370: NOT folded into `stale_repos` — that key means
+                // behind-HEAD here and generation-stale on `hub_nodes`, and
+                // merging the two populations under one name is how those
+                // surfaces would start contradicting each other.
+                let resolver_stale_urls = urls_where("resolver_stale");
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -21876,6 +22426,7 @@ fn run_brain(
                         "any_needs_reindex": any_needs_reindex,
                         "stale_repos": stale_urls,
                         "needs_reindex_repos": needs_reindex_urls,
+                        "resolver_stale_repos": resolver_stale_urls,
                         "repos": results,
                     }))?
                 );
@@ -21896,37 +22447,26 @@ fn run_brain(
                     }
                 );
                 for r in &results {
-                    let url = r["url"].as_str().unwrap_or("?");
-                    let stale = r["is_stale"].as_bool().unwrap_or(false);
-                    let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
-                    let indexed = &indexed_full[..8.min(indexed_full.len())];
-                    let head = r["current_head"]
-                        .as_str()
-                        .map(|h| &h[..8.min(h.len())])
-                        .unwrap_or("unknown");
-                    // nw-256: `null` means the distance could not be counted,
-                    // and `unwrap_or(0)` made that print identically to a real
-                    // zero — undoing the fix one layer down. Rendered as three
-                    // distinct states.
-                    let behind = r["staleness_commits_behind"].as_u64();
-                    let marker = match r["status"].as_str() {
-                        Some("missing") => "missing",
-                        Some("incomplete") => "incomplete",
-                        _ if stale => "STALE",
-                        _ => "ok",
-                    };
-                    match behind {
-                        Some(behind) if stale && behind > 0 => println!(
-                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
-                        ),
-                        None if stale => println!(
-                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  (commits behind: unavailable — could not be counted)"
-                        ),
-                        _ => println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}"),
-                    }
+                    println!("{}", stale_check_row_line(r));
                 }
             }
+            // nw-370: same note, same renderer, same stream as the daemon
+            // route above. This route holds the store, so the denominator is
+            // exact.
+            let resolver_stale_names: Vec<String> = results
+                .iter()
+                .filter(|r| r["resolver_stale"].as_bool().unwrap_or(false))
+                .filter_map(|r| r["url"].as_str().map(String::from))
+                .collect();
+            if let Some(note) = nestweaver_engine::resolver_generation::staleness_note_for(
+                &resolver_stale_names,
+                Some(repos.len()),
+            ) {
+                eprintln!("warning: {note}");
+            }
             // Stale-check is a freshness gate — exit non-zero when stale.
+            // nw-370: see the daemon route for why generation staleness reuses
+            // EXIT_NEEDS_REINDEX rather than taking a code of its own.
             Ok((
                 if any_needs_reindex {
                     EXIT_NEEDS_REINDEX
@@ -24305,6 +24845,59 @@ fn clusters_tool_args(limit: usize, members: usize, resolution: Option<f64>) -> 
     args
 }
 
+/// Apply `dead-code`'s result cut on the direct route, and its DEFAULT cut.
+///
+/// Returns `(shown, truncated)`; the caller keeps the pre-cut count as the
+/// reported total.
+///
+/// Round 3 rewrote this flag's help from "default: all" to "default 50",
+/// because 50 is what the `dead_code` TOOL applies, and stopped there. The
+/// direct arm still read `match limit { None => everything }`, so the two
+/// routes answered the same bare `dead-code` differently: 50 rows and
+/// `truncated: true` with a daemon up, every row and `truncated: false` when
+/// the daemon was unreachable and the fallback ran. Help that is true on only
+/// one transport is the nw-357 shape, one command over — and `truncated` was
+/// the field that existed to disclose it.
+///
+/// `DEFAULT_RESULT_LIMIT` rather than [`resolve_limit`]: `dead-code` takes no
+/// `--config`, so there is no instance config to consult on this side. An
+/// operator's `[limits].default_result_limit` still applies on the daemon
+/// route, where the daemon reads its own — which is what the help's "or
+/// [limits].default_result_limit from config" clause names, and why a value is
+/// NOT synthesised here and sent, which would override it.
+fn dead_code_cut<T>(rows: Vec<T>, limit: Option<usize>) -> (Vec<T>, bool) {
+    let total = rows.len();
+    let effective = limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT);
+    (
+        rows.into_iter().take(effective).collect(),
+        effective < total,
+    )
+}
+
+/// Build the `get_summary` tool arguments for `summary`'s daemon route.
+///
+/// `token_budget` is sent UNCONDITIONALLY, including `0`.
+///
+/// `--token-budget` documents "0 = unlimited" and the direct path honours it.
+/// The daemon route used to omit the key when the budget was 0, and the tool's
+/// default for an ABSENT key is `SUMMARY_DEFAULT_TOKEN_BUDGET` (20000) — so on
+/// the route that serves text output by default, asking for unlimited silently
+/// got the TIGHTEST bound instead of none, and `--help` said the opposite. The
+/// tool's schema is `minimum: 0` and its own comment already reads "`0` still
+/// means unlimited on both"; the CLI simply never sent the value that would
+/// have made that true.
+///
+/// A function rather than an inline `json!`, for the same reason
+/// [`clusters_tool_args`] is one: the omission is only assertable if the
+/// arguments can be built without a daemon.
+fn summary_tool_args(level: &str, token_budget: usize, target: Option<&str>) -> serde_json::Value {
+    let mut args = serde_json::json!({ "level": level, "token_budget": token_budget });
+    if let Some(t) = target {
+        args["target"] = serde_json::json!(t);
+    }
+    args
+}
+
 fn print_clusters_output_with_total(
     output: &nestweaver_engine::ClusteringOutput,
     json: bool,
@@ -25969,6 +26562,396 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             "these backtick-quoted remedies name a subcommand the CLI does not \
              have, so a user who pastes them gets a clap parse error instead of \
              a fix: {unknown:#?}"
+        );
+    }
+
+    /// Render every command's help exactly as a user sees it.
+    ///
+    /// Returns `(path, long_help, short_help)` for the whole tree. BOTH forms,
+    /// because the pair is where nw-357 hid: clap promotes a `///` doc comment
+    /// to `long_help`, so `--help` answered with a changelog while `-h` showed
+    /// the correct one-liner — a divergence that is invisible to anyone who
+    /// only checks one of them.
+    fn rendered_help_tree() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let root = Cli::command();
+        let mut queue: Vec<(clap::Command, String)> = vec![(root, String::new())];
+        while let Some((cmd, parent)) = queue.pop() {
+            let path = if parent.is_empty() {
+                cmd.get_name().to_string()
+            } else {
+                format!("{parent} {}", cmd.get_name())
+            };
+            for sub in cmd.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                queue.push((sub.clone(), path.clone()));
+            }
+            let mut long = cmd.clone();
+            let mut short = cmd.clone();
+            out.push((
+                path,
+                long.render_long_help().to_string(),
+                short.render_help().to_string(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    /// No internal ticket reference may reach `--help`.
+    ///
+    /// nw-357's `impact --limit` shipped a whole changelog as its `long_help`
+    /// because a `///` rationale sat where a `help =` string belonged, and it
+    /// survived review precisely because `-h` looked fine. A ticket id is the
+    /// one token that can only have come from a rationale, so it is the
+    /// cheapest exhaustive detector for the class: rationale is for whoever
+    /// reads the source (`//`), not for whoever runs the command (`help =`).
+    ///
+    /// This does NOT claim the remaining help text is free of implementation
+    /// notes — a note that never names a ticket still gets past it. It claims
+    /// the strongest single signal is now checked on every command, on both
+    /// help forms, rather than found by accident on two of them.
+    #[test]
+    fn rendered_help_never_names_an_internal_ticket() {
+        fn ticket_at(text: &str) -> Option<String> {
+            let bytes = text.as_bytes();
+            let mut at = 0usize;
+            while let Some(found) = text[at..].find("nw-") {
+                let start = at + found;
+                let digits = start + 3;
+                if bytes.get(digits).is_some_and(u8::is_ascii_digit) {
+                    let end = text[digits..]
+                        .find(|c: char| !c.is_ascii_digit())
+                        .map_or(text.len(), |n| digits + n);
+                    return Some(text[start..end].to_string());
+                }
+                at = start + 3;
+            }
+            None
+        }
+
+        let leaks = on_big_stack(|| {
+            let mut leaks: Vec<String> = Vec::new();
+            for (path, long, short) in rendered_help_tree() {
+                if let Some(ticket) = ticket_at(&long) {
+                    leaks.push(format!("`{path} --help` names {ticket}"));
+                }
+                if let Some(ticket) = ticket_at(&short) {
+                    leaks.push(format!("`{path} -h` names {ticket}"));
+                }
+            }
+            leaks
+        });
+
+        assert!(
+            leaks.is_empty(),
+            "{} help screen(s) print an internal ticket id, so a user asking \
+             what a flag does gets a changelog instead. Move the rationale to a \
+             `//` comment and leave the user-facing sentence in `help =`:\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
+    }
+
+    /// Split one help example into argv the way a shell would.
+    ///
+    /// Honours single and double quotes and stops at the first shell operator,
+    /// because `completions bash > file` is a redirect the CLI never sees.
+    /// Returns `None` for a line with nothing left to parse.
+    fn example_argv(line: &str) -> Option<Vec<String>> {
+        let line = line.trim();
+        // Trailing `# …` annotations are prose, not arguments.
+        let line = match line.find(" #") {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        let mut argv: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        for ch in line.chars() {
+            match (quote, ch) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => current.push(c),
+                (None, '\'') | (None, '"') => quote = Some(ch),
+                // A redirect or pipe ends the part the CLI parses.
+                (None, '>') | (None, '<') | (None, '|') => break,
+                (None, c) if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        argv.push(std::mem::take(&mut current));
+                    }
+                }
+                (None, c) => current.push(c),
+            }
+        }
+        if !current.is_empty() {
+            argv.push(current);
+        }
+        (!argv.is_empty()).then_some(argv)
+    }
+
+    /// Every `--limit`-class default the help STATES must be the one the code
+    /// APPLIES.
+    ///
+    /// These defaults are applied in the handler, not by clap, so `--help`
+    /// prints whatever the `help =` string claims and nothing checks it. That
+    /// is exactly how `dead-code --limit` shipped "(1-1000, default: all)"
+    /// against a real default of 50 with `--limit 0` rejected, so no value
+    /// could ever have reached "all".
+    ///
+    /// Explicit inventory, in this module's idiom: one entry per argument
+    /// whose default lives in code, naming the constant or literal the handler
+    /// passes. A new bounded argument does not join automatically — it is
+    /// added here with the number it actually applies, or it is not covered
+    /// and the omission is visible.
+    ///
+    /// The check is on the STATED number only. It cannot prove the handler
+    /// still calls `resolve_limit` with that value; `dead_code_cut_applies_
+    /// the_default_the_help_states` covers the one route where the two had
+    /// already come apart.
+    #[test]
+    fn stated_limit_defaults_match_the_values_the_code_applies() {
+        const RESULT: usize = nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
+        // (command path, argument, the default the handler applies)
+        let inventory: Vec<(&str, &str, usize)> = vec![
+            // `resolve_limit(limit, cfg, 500)` — CODE_CONTEXT_DEFAULT_LIMIT.
+            (
+                "nestweaver context",
+                "limit",
+                nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT,
+            ),
+            // `dead_code_cut`, and the dead_code tool's own schema default.
+            ("nestweaver dead-code", "limit", RESULT),
+            ("nestweaver detect-changes", "limit", RESULT),
+            ("nestweaver impact", "limit", RESULT),
+            ("nestweaver search", "limit", 10),
+            ("nestweaver brain search", "limit", 20),
+            ("nestweaver brain context", "limit", 30),
+            ("nestweaver brain broken-links", "limit", 50),
+            ("nestweaver brain orphans", "limit", 50),
+            ("nestweaver brain topic-clusters", "limit", 50),
+            ("nestweaver brain tag-graph", "limit", 50),
+        ];
+
+        let helps = on_big_stack(|| {
+            rendered_help_tree()
+                .into_iter()
+                .map(|(path, long, _)| (path, long))
+                .collect::<Vec<_>>()
+        });
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (path, arg, expected) in inventory {
+            let Some((_, help)) = helps.iter().find(|(p, _)| p == path) else {
+                wrong.push(format!("`{path}` is no longer a command"));
+                continue;
+            };
+            // The rendered block for this argument, so a number belonging to a
+            // NEIGHBOURING flag cannot satisfy the assertion.
+            let flag = format!("--{arg} <");
+            let Some(start) = help.find(&flag) else {
+                wrong.push(format!("`{path}` no longer has `--{arg}`"));
+                continue;
+            };
+            let block = &help[start..];
+            let end = block[flag.len()..]
+                .find("\n\n      -")
+                .map_or(block.len(), |n| n + flag.len());
+            let block = &block[..end];
+            let stated = [
+                format!("default: {expected}"),
+                format!("default {expected}"),
+                format!("[default: {expected}]"),
+            ];
+            if !stated.iter().any(|claim| block.contains(claim.as_str())) {
+                wrong.push(format!(
+                    "`{path} --{arg}` help does not state its real default of \
+                     {expected}:\n{}",
+                    block.trim_end()
+                ));
+            }
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "{} stated default(s) do not match the code:\n{}",
+            wrong.len(),
+            wrong.join("\n\n")
+        );
+    }
+
+    /// `brain context`'s retrieval weights must state the fusion's real
+    /// defaults.
+    ///
+    /// These said 0.7 / 0.3 / 0.0 against a real
+    /// `HybridSearchConfig::default()` of 0.40 / 0.25 / 0.35. The semantic
+    /// figure was the damaging one: help declared the embedding leg OFF unless
+    /// asked for, while it carries the second largest weight in the fusion by
+    /// default — so a user deciding whether embeddings had touched their
+    /// results read the opposite of the truth.
+    ///
+    /// Asserted against the struct rather than against a literal, so a future
+    /// re-weighting cannot leave the help behind again.
+    #[test]
+    fn brain_context_weight_help_states_the_real_fusion_defaults() {
+        let defaults = nestweaver_engine::HybridSearchConfig::default();
+        let help = on_big_stack(|| {
+            rendered_help_tree()
+                .into_iter()
+                .find(|(path, _, _)| path == "nestweaver brain context")
+                .map(|(_, long, _)| long)
+                .expect("`brain context` must still exist")
+        });
+
+        for (flag, value) in [
+            ("--weight-ppr", defaults.weight_ppr),
+            ("--weight-bm25", defaults.weight_bm25),
+            ("--weight-semantic", defaults.weight_semantic),
+        ] {
+            let claim = format!("default {value:.2}");
+            let start = help
+                .find(&format!("{flag} <"))
+                .unwrap_or_else(|| panic!("`brain context` no longer has `{flag}`"));
+            let block = &help[start..];
+            let end = block.find("\n\n").unwrap_or(block.len());
+            let block = &block[..end];
+            assert!(
+                block.contains(&claim),
+                "`brain context {flag}` help does not state its real default \
+                 ({claim}):\n{block}"
+            );
+        }
+    }
+
+    /// `dead-code`'s direct route applies the default its help states.
+    ///
+    /// The help was corrected to "default 50" while this arm still returned
+    /// every row, so a bare `dead-code` answered differently depending on
+    /// whether a daemon happened to be reachable — and `truncated` said
+    /// `false` on the route that had, in fact, not truncated only because it
+    /// had no bound at all.
+    #[test]
+    fn dead_code_cut_applies_the_default_the_help_states() {
+        let rows: Vec<usize> = (0..200).collect();
+
+        let (shown, truncated) = dead_code_cut(rows.clone(), None);
+        assert_eq!(
+            shown.len(),
+            nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+            "an omitted --limit must apply the documented default, not 'all'"
+        );
+        assert!(truncated, "a cut that dropped 150 rows must disclose it");
+
+        let (shown, truncated) = dead_code_cut(rows.clone(), Some(3));
+        assert_eq!(shown.len(), 3);
+        assert!(truncated);
+
+        // A limit at or above the population is not a truncation.
+        let (shown, truncated) = dead_code_cut(rows, Some(1000));
+        assert_eq!(shown.len(), 200);
+        assert!(
+            !truncated,
+            "`truncated` must describe the cut, not the flag"
+        );
+    }
+
+    /// `summary --token-budget 0` must reach the daemon as `0`.
+    ///
+    /// "0 = unlimited" is what `--help` says and what the direct path does.
+    /// The daemon route omitted the key for 0, and an ABSENT `token_budget`
+    /// makes `get_summary` fall back to `SUMMARY_DEFAULT_TOKEN_BUDGET` — so on
+    /// the route that serves text output by default, asking for no bound got
+    /// the tightest one. Omission and zero are not the same request.
+    #[test]
+    fn summary_sends_an_unlimited_token_budget_rather_than_omitting_it() {
+        let args = summary_tool_args("file", 0, None);
+        assert_eq!(
+            args.get("token_budget").and_then(|v| v.as_u64()),
+            Some(0),
+            "a zero budget must be SENT; omitting it means the tool's default \
+             (SUMMARY_DEFAULT_TOKEN_BUDGET), which is the opposite of unlimited"
+        );
+        assert!(
+            args.get("target").is_none(),
+            "an absent --target is genuinely absent, unlike a zero budget"
+        );
+
+        let args = summary_tool_args("cluster", 2000, Some("auth"));
+        assert_eq!(
+            args.get("token_budget").and_then(|v| v.as_u64()),
+            Some(2000)
+        );
+        assert_eq!(args.get("level").and_then(|v| v.as_str()), Some("cluster"));
+        assert_eq!(args.get("target").and_then(|v| v.as_str()), Some("auth"));
+    }
+
+    /// Every example printed in `--help` must actually parse.
+    ///
+    /// An example is the most literally actionable thing help text contains —
+    /// it is there to be pasted. `watch --help` shipped two of three examples
+    /// using `--repo` for what is a POSITIONAL argument, so a user who pasted
+    /// the documented invocation got `error: unexpected argument '--repo'`
+    /// (exit 64) from the command that had just recommended it.
+    ///
+    /// Parse-only on purpose: this asserts the invocation is well-formed, not
+    /// that it succeeds against a graph. Running them would need a corpus and
+    /// would start a daemon, and neither is what a stale flag name breaks.
+    #[test]
+    fn every_help_example_parses() {
+        let failures = on_big_stack(|| {
+            let mut failures: Vec<String> = Vec::new();
+            let mut examples: Vec<(String, String)> = Vec::new();
+            for (path, long, short) in rendered_help_tree() {
+                for text in [&long, &short] {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.starts_with("nestweaver ") {
+                            examples.push((path.clone(), line.to_string()));
+                        }
+                    }
+                }
+            }
+            examples.sort();
+            examples.dedup();
+
+            // A vacuous harvest would report zero failures and read exactly
+            // like a clean bill of health.
+            assert!(
+                examples.len() > 60,
+                "only {} help example(s) harvested — the sweep is not reading \
+                 the help tree",
+                examples.len()
+            );
+
+            for (path, line) in examples {
+                let Some(argv) = example_argv(&line) else {
+                    continue;
+                };
+                if let Err(error) = Cli::command()
+                    .no_binary_name(true)
+                    .try_get_matches_from(&argv[1..])
+                {
+                    let first = error
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    failures.push(format!("`{path}` example `{line}` → {first}"));
+                }
+            }
+            failures.sort();
+            failures.dedup();
+            failures
+        });
+
+        assert!(
+            failures.is_empty(),
+            "{} help example(s) do not parse, so pasting them yields a usage \
+             error from the command that printed them:\n{}",
+            failures.len(),
+            failures.join("\n")
         );
     }
 }
@@ -28090,7 +29073,17 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             // Refuse if a daemon is live on the target: restore renames the live
             // dir aside and deletes it, so a running daemon would keep writing to
             // unlinked inodes and the restored state would silently diverge.
+            //
+            // A pure read, run FIRST so that this refusal — the one that can
+            // name the daemon and its pid — mutates nothing whatsoever.
             ensure_no_live_daemon_for_restore(&data_dir)?;
+
+            // THE authorization, and it is held for the whole restore: through
+            // the rename-aside, the cutover, the recovery journal and the
+            // cleanup. The pidfile above permits absent, empty and stale
+            // states; none of those is evidence that nobody is writing, and
+            // this is what supplies that evidence.
+            let _restore_leases = require_exclusive_restore_access(&data_dir)?;
 
             let config = nestweaver_engine::RestoreConfig {
                 snapshot_path: path,
@@ -28107,6 +29100,20 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             eprintln!("  Repos:        {}", m.repo_count);
             eprintln!("  Symbols:      {}", m.symbol_count);
             eprintln!("  Restored in:  {}", format_elapsed(result.duration));
+
+            if let Some(preserved) = &result.preserved_copy {
+                eprintln!();
+                eprintln!(
+                    "An earlier restore of this data directory was interrupted, and the copy of \
+                     your pre-restore data it left behind could not be PROVEN redundant, so it \
+                     was preserved rather than deleted:"
+                );
+                eprintln!("  {}", preserved.display());
+                eprintln!(
+                    "Check the restored data, then remove it: rm -rf {}",
+                    preserved.display()
+                );
+            }
 
             if m.tier == "standard" {
                 eprintln!();
@@ -28195,7 +29202,73 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Every incumbent database a restore of `data_dir` is about to rename aside,
+/// copy over, or delete.
+///
+/// Both the live data directory AND a `<data>.restoring` left by an earlier
+/// interrupted restore, because the restore reconciles that directory too —
+/// and because a daemon whose data directory was already renamed aside still
+/// holds its lease on the inode that now lives under `.restoring`. Looking
+/// only at `data_dir` would create a brand-new, trivially-free lease file
+/// beside a partial copy and conclude that nobody was writing.
+fn restore_lease_targets(data_dir: &Path) -> Vec<PathBuf> {
+    [data_dir.to_path_buf(), data_dir.with_extension("restoring")]
+        .iter()
+        .filter_map(|dir| find_lbug_in_dir(dir))
+        .collect()
+}
+
+/// Hold the canonical database write lease over every database a restore is
+/// about to destroy, for as long as the restore runs.
+///
+/// This is the authorization `backup restore` never had. Its only guard was
+/// [`ensure_no_live_daemon_for_restore`], which reads a pidfile — advisory
+/// runtime metadata whose flock is held on an INODE, so unlinking `daemon.pid`
+/// silently defeats every path-based owner check — and which PERMITS absent,
+/// empty and stale pidfiles. None of those states says anything about whether
+/// a process is writing the database right now. Restore then renames the
+/// directory aside and `remove_dir_all`s it, so a daemon with a missing
+/// pidfile, a standalone watcher, or any direct writer kept operating on
+/// unlinked inodes while the directory was replaced underneath it: split
+/// brain, and the loss of the current data.
+///
+/// The lease is the same one `index`, `watch`, `embed`, `brain watch`, the
+/// vault commands, the Tantivy rebuild and the daemon itself take — an
+/// `flock` on `<db>.write.lock`, per-DESCRIPTOR so it survives the store's own
+/// open/close, released by the kernel on process exit so there is no stale
+/// state to reap. `snapshot build` already corroborates its pidfile check with
+/// the database write lock, for exactly this reason; restore did not.
+///
+/// A probe answers "was anyone holding this a moment ago". Only a HELD lease
+/// answers "is anyone holding this for as long as I am deleting their data",
+/// which is the question a check-then-destroy cannot ask.
+#[must_use = "the leases must be HELD for the whole restore — dropping them \
+              immediately reduces this to a probe, and the window that reopens \
+              is precisely the one in which the data directory is renamed aside \
+              and unlinked"]
+fn require_exclusive_restore_access(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<nestweaver_daemon::lifecycle::DbWriteLease>> {
+    restore_lease_targets(data_dir)
+        .iter()
+        .map(|db| {
+            require_exclusive_store_access_with_remedy(
+                db,
+                "restore a backup over this data directory",
+                ExclusivityRemedy::StopTheHolder,
+            )
+        })
+        .collect()
+}
+
 /// Refuse a restore while a live daemon serves the target data directory.
+///
+/// **This is not the authorization.** [`require_exclusive_restore_access`] is;
+/// this runs first only because it is a pure read that can name the daemon and
+/// its pid, which is a better message than "another process holds the lease",
+/// and because a refusal here mutates nothing at all — not even a lease file.
+/// Every permissive answer below is now backed by the write lease, so an
+/// absent, empty or stale pidfile can no longer authorize anything on its own.
 ///
 /// Restore renames the live data dir aside and `remove_dir_all`s it. If a
 /// daemon is actively serving that dir, it keeps writing to now-unlinked inodes
@@ -28221,6 +29294,11 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// refused the restore and told the operator to "remove the stale pidfile" —
 /// pushing them toward the `rm daemon.pid` that causes the runtime-ownership
 /// incident. Fail-closed on garbage is unchanged; empty is not garbage.
+///
+/// What that permission cost, before the write lease was required, is the
+/// whole of this guard's former job: "no PID is claimed here" and "nobody is
+/// writing" are different facts, and only the second one may authorize a
+/// destructive restore.
 fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
     let Some(db) = find_lbug_in_dir(data_dir) else {
         return Ok(());
@@ -30910,30 +31988,278 @@ mod restore_guard_tests {
         assert!(!data_dir.path().with_extension("restoring").exists());
     }
 
-    /// An EMPTY pidfile claims no PID, exactly as an absent one does, and must
-    /// permit the restore. This is the state `retract_failed_start_pidfile`
-    /// leaves after a failed `daemon start`; refusing here blocked a
-    /// destructive-but-legitimate restore and told the operator to "remove the
-    /// stale pidfile", which is the action this branch exists to stop
-    /// provoking. Fail-closed on genuine garbage is unchanged.
+    /// Every file under `dir`, by relative path and exact bytes. Used to pin
+    /// "the refusal mutated NOTHING" rather than spot-checking two files.
+    fn dir_fingerprint(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    out.push((rel, std::fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The authorization, held. A writer that no pidfile can reveal — the
+    /// daemon whose advisory pidfile was unlinked, the standalone watcher, the
+    /// direct writer — holds the database write lease, and the restore must
+    /// refuse before any rename, copy, unlink or replacement.
     #[test]
-    fn restore_permits_an_empty_pidfile() {
+    fn restore_refuses_while_the_write_lease_is_held() {
         let rt = tempfile::tempdir().unwrap();
         let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, sidecar, pidfile) = fixture();
 
-        let (data_dir, _db, _sidecar, pidfile) = fixture();
+        let _held = require_exclusive_store_access(&db, "hold the fixture database")
+            .expect("nothing else holds this fixture");
+        assert!(
+            !pidfile.exists(),
+            "the point of this test is that NO pidfile names the writer"
+        );
 
-        std::fs::write(&pidfile, b"").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect("an empty pidfile claims nothing and must not block a restore");
+        let before = dir_fingerprint(data_dir.path());
+        let error = require_exclusive_restore_access(data_dir.path())
+            .expect_err("a held write lease must stop a destructive restore");
+        let rendered = error.to_string();
+        assert!(rendered.contains("write lease"), "err was: {rendered}");
 
-        std::fs::write(&pidfile, b"  \n").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect("a whitespace-only pidfile claims nothing either");
+        assert_eq!(
+            before,
+            dir_fingerprint(data_dir.path()),
+            "the refusal must not have mutated the target by one byte"
+        );
+        assert!(
+            !data_dir.path().with_extension("restoring").exists(),
+            "no rename-aside may have happened"
+        );
+        assert!(sidecar.exists(), "sidecar untouched");
+    }
 
-        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
-        ensure_no_live_daemon_for_restore(data_dir.path())
-            .expect_err("garbage must still fail closed");
+    /// The free-lock counterweight: with nothing holding the database, the
+    /// restore is authorized and the lease comes back HELD, not merely probed.
+    #[test]
+    fn restore_is_authorized_when_the_write_lease_is_free() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, _pidfile) = fixture();
+
+        let leases = require_exclusive_restore_access(data_dir.path())
+            .expect("a free lease must authorize the restore");
+        assert_eq!(leases.len(), 1, "the incumbent database must be leased");
+
+        require_exclusive_store_access(&db, "prove the restore lease is held")
+            .expect_err("the restore must still be HOLDING the lease, not have dropped it");
+    }
+
+    /// No pidfile state — absent, empty, whitespace-only or stale — may stand
+    /// in for lock proof, in either direction.
+    ///
+    /// This replaces `restore_permits_an_empty_pidfile`, which pinned the
+    /// opposite: it asserted that an EMPTY pidfile is sufficient permission for
+    /// a destructive restore, with nothing anywhere corroborating that no
+    /// process was writing. That test encoded the defect as intended
+    /// behaviour. The pidfile reading itself is unchanged and still permits
+    /// every state below — what changed is that permission from the pidfile is
+    /// no longer permission to restore.
+    #[test]
+    fn no_pidfile_state_can_substitute_for_the_write_lease() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, pidfile) = fixture();
+
+        let states: Vec<(&str, Option<Vec<u8>>)> = vec![
+            ("absent", None),
+            ("empty", Some(Vec::new())),
+            ("whitespace-only", Some(b"  \n".to_vec())),
+            ("stale pid", Some(i32::MAX.to_string().into_bytes())),
+        ];
+
+        for (label, contents) in states {
+            match &contents {
+                None => {
+                    let _ = std::fs::remove_file(&pidfile);
+                }
+                Some(bytes) => std::fs::write(&pidfile, bytes).unwrap(),
+            }
+
+            // The pidfile guard's own answer is unchanged: it permits.
+            ensure_no_live_daemon_for_restore(data_dir.path())
+                .unwrap_or_else(|error| panic!("{label}: pidfile guard changed: {error}"));
+
+            // And it decides nothing while the lease is held.
+            let held = require_exclusive_store_access(&db, "hold the fixture database")
+                .unwrap_or_else(|error| panic!("{label}: fixture already held: {error}"));
+            let before = dir_fingerprint(data_dir.path());
+            let error = require_exclusive_restore_access(data_dir.path()).expect_err(&format!(
+                "{label}: a pidfile that claims nothing must not authorize a destructive restore"
+            ));
+            assert!(
+                error.to_string().contains("write lease"),
+                "{label}: err was: {error}"
+            );
+            assert_eq!(
+                before,
+                dir_fingerprint(data_dir.path()),
+                "{label}: the refusal mutated the target"
+            );
+            assert!(
+                !data_dir.path().with_extension("restoring").exists(),
+                "{label}: no rename-aside may have happened"
+            );
+            drop(held);
+
+            // With the lease free, the same pidfile state is fine.
+            require_exclusive_restore_access(data_dir.path())
+                .unwrap_or_else(|error| panic!("{label}: a free lease must authorize: {error}"));
+        }
+    }
+
+    /// A daemon whose data directory was already renamed aside still holds its
+    /// lease on the inode now under `<data>.restoring`. Leasing only
+    /// `data_dir` would create a fresh, trivially-free lease file beside a
+    /// partial copy and conclude nobody was writing.
+    #[test]
+    fn a_writer_holding_the_aside_copy_also_refuses_the_restore() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, _db, _sidecar, _pidfile) = fixture();
+
+        let restoring = data_dir.path().with_extension("restoring");
+        std::fs::create_dir_all(&restoring).unwrap();
+        std::fs::write(restoring.join("graph.lbug"), b"aside").unwrap();
+        let _held = require_exclusive_store_access(
+            &restoring.join("graph.lbug"),
+            "hold the aside database",
+        )
+        .expect("nothing else holds it");
+
+        let error = require_exclusive_restore_access(data_dir.path())
+            .expect_err("a writer on the aside copy must stop the restore");
+        assert!(error.to_string().contains("write lease"), "err: {error}");
+
+        let _ = std::fs::remove_dir_all(&restoring);
+    }
+
+    /// The whole handler, not just the guard: with the lease held,
+    /// `run_backup` must refuse BEFORE it opens the archive. The archive named
+    /// here does not exist, so a "no such file" error would prove the guard
+    /// ran too late to protect anything.
+    #[test]
+    fn run_backup_restore_refuses_before_it_reads_the_archive() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (data_dir, db, _sidecar, _pidfile) = fixture();
+
+        let _held = require_exclusive_store_access(&db, "hold the fixture database")
+            .expect("nothing else holds this fixture");
+
+        let archive = data_dir.path().parent().unwrap().join("no-such.nwsnap.zst");
+        let before = dir_fingerprint(data_dir.path());
+
+        let error = run_backup(BackupCommands::Restore {
+            path: archive.clone(),
+            data_dir: data_dir.path().to_path_buf(),
+            start: false,
+        })
+        .expect_err("run_backup must refuse while the write lease is held");
+        let rendered = error.to_string();
+        assert!(rendered.contains("write lease"), "err was: {rendered}");
+        assert!(
+            !rendered.contains("No such file"),
+            "the guard ran AFTER the archive was opened: {rendered}"
+        );
+
+        assert!(!archive.exists(), "the backup archive must not be created");
+        assert_eq!(
+            before,
+            dir_fingerprint(data_dir.path()),
+            "a refused restore must not mutate the target"
+        );
+        assert!(!data_dir.path().with_extension("restoring").exists());
+    }
+
+    /// `nestweaver backup restore` and `nestweaver server backup restore` are
+    /// two spellings of ONE handler, so the guard cannot be present on the
+    /// direct path and missing on the daemon-aware one.
+    ///
+    /// Parsed on a thread with a large stack: `Commands` is a very wide clap
+    /// enum and building its parser overflows libtest's default 2 MiB thread
+    /// stack, which is a property of the CLI surface and not of this test.
+    #[test]
+    fn both_backup_entry_paths_reach_the_same_restore_handler() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(both_backup_entry_paths_reach_the_same_restore_handler_body)
+            .expect("spawn a wide-stack thread")
+            .join()
+            .expect("the parse must not panic");
+    }
+
+    fn both_backup_entry_paths_reach_the_same_restore_handler_body() {
+        use clap::Parser;
+
+        fn restore_payload(command: BackupCommands) -> (PathBuf, PathBuf, bool) {
+            match command {
+                BackupCommands::Restore {
+                    path,
+                    data_dir,
+                    start,
+                } => (path, data_dir, start),
+                _ => panic!("expected a Restore subcommand"),
+            }
+        }
+
+        let direct = Cli::try_parse_from([
+            "nestweaver",
+            "backup",
+            "restore",
+            "/tmp/x.nwsnap.zst",
+            "--data-dir",
+            "/tmp/data",
+        ])
+        .expect("`nestweaver backup restore` must parse");
+        let daemon_aware = Cli::try_parse_from([
+            "nestweaver",
+            "server",
+            "backup",
+            "restore",
+            "/tmp/x.nwsnap.zst",
+            "--data-dir",
+            "/tmp/data",
+        ])
+        .expect("`nestweaver server backup restore` must parse");
+
+        let direct = match direct.command {
+            Commands::Backup { command } => restore_payload(command),
+            _ => panic!("expected Commands::Backup"),
+        };
+        let daemon_aware = match daemon_aware.command {
+            Commands::Server { action } => match action {
+                ServerAction::Backup { command } => restore_payload(command),
+                _ => panic!("expected ServerAction::Backup"),
+            },
+            _ => panic!("expected Commands::Server"),
+        };
+
+        assert_eq!(
+            direct, daemon_aware,
+            "both entry paths must hand the same Restore payload to run_backup"
+        );
     }
 }
 
