@@ -1131,33 +1131,55 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
 }
 
 /// The 22.04 runner pin fixes the glibc floor and BREAKS the C++ build unless
-/// the toolchain is also pinned. 22.04's default is GCC 11.4; lbug vendors
-/// simsimd, which uses AVX-512 FP16 intrinsics GCC 11 does not have. Measured on
-/// the exact translation unit CI died on, `simsimd/lib.c`, in an ubuntu:22.04
-/// container: gcc-11 gives exit 1 with 127 errors naming `__m512h` and
-/// `avx512fp16`; gcc-12 gives exit 0 and a 389 KB object. glibc stays 2.35
-/// either way, because the compiler does not choose the C library.
+/// the toolchain and runtime are also controlled. 22.04's default GCC 11 lacks
+/// both lbug's AVX-512 FP16 intrinsics and `std::format`; GCC 12 has the former
+/// but its libstdc++ still lacks the latter. GCC 13 supplies both, but its
+/// dynamic libstdc++ is newer than the one installed on stock 22.04, so the C++
+/// and GCC runtimes must be linked statically into the release binary.
 ///
-/// This shipped a v9.0.0 whose Linux binaries failed to build AFTER the tag was
-/// public, so the two pins belong together and neither may be removed alone.
+/// v9.0.0 failed on the SIMD requirement and v9.0.1 failed on `std::format`
+/// AFTER each tag was public. These constraints belong together and must be
+/// preflighted on the architecture where each one applies.
 #[test]
-fn release_workflow_pins_a_linux_toolchain_new_enough_for_the_vendored_simd() {
+fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let preflight = workflow_step(
+        &workflow,
+        "Verify the Linux C++20 and architecture toolchain",
+    );
+    let linker =
+        std::fs::read_to_string(repo_root.join("scripts/gcc13-static-cxx-linker")).unwrap();
 
-    for needle in ["gcc-12", "g++-12", "CC=gcc-12", "CXX=g++-12"] {
+    for needle in ["gcc-13", "g++-13", "CC=gcc-13", "CXX=g++-13"] {
         assert!(
             workflow.contains(needle),
             "the Linux build must pin {needle}: ubuntu-22.04 defaults to GCC 11, \
-             which cannot compile lbug's vendored simsimd"
+             and GCC 12 still cannot compile lbug's use of std::format"
         );
     }
     assert!(
-        workflow.contains("avx512fp16"),
-        "the job must PREFLIGHT the intrinsics it needs, so a runner image that \
-         drops gcc-12 fails in seconds rather than twenty minutes into the C++ \
-         build of a release whose tag is already cut"
+        preflight.contains("#include <format>") && preflight.contains("-std=c++20"),
+        "the job must preflight the C++20 std::format support lbug requires"
+    );
+    assert!(
+        preflight.contains("if [ \"${{ matrix.target }}\" = \"x86_64-unknown-linux-gnu\" ]; then")
+            && preflight.contains("avx512fp16"),
+        "the AVX-512 FP16 probe must run on x86_64 without being passed to the \
+         native ARM64 compiler"
+    );
+    assert!(
+        workflow.contains("scripts/gcc13-static-cxx-linker")
+            && linker.contains("libstdc++.a")
+            && linker.contains("-lstdc++")
+            && linker.contains("-lgcc_s"),
+        "the GCC 13 C++ runtime must be linked statically so the archive starts \
+         on an unmodified Ubuntu 22.04 host"
+    );
+    assert!(
+        workflow.contains("GLIBCXX_") && workflow.contains("lib(stdc\\+\\+|gcc_s|ssl|crypto)"),
+        "artifact verification must reject undeclared dynamic toolchain runtimes"
     );
 }
 
