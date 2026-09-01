@@ -1130,6 +1130,57 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
     entries
 }
 
+/// The release PR is the ONE pull request in this repo that receives no CI:
+/// release-please opens it with `GITHUB_TOKEN`, and GitHub deliberately does not
+/// trigger workflows for bot-token-created PRs. Everything that would otherwise
+/// be caught by a check has to be caught here instead.
+///
+/// This pins the specific hole that reached a cut: the lockfile-sync steps were
+/// gated on `prs_created`, which release-please sets ONLY when it CREATES the
+/// PR. On every later push it UPDATES the existing PR, `prs_created` is false,
+/// and the sync never ran -- so `Cargo.toml` advanced to 9.0.0 while
+/// `Cargo.lock` stayed at 8.0.0. `cargo build --locked` refuses that outright
+/// ("cannot update the lock file ... because --locked was passed", exit 101),
+/// so merging would have cut the tag and then failed all four binary builds,
+/// publishing a release with no artifacts.
+#[test]
+fn release_workflow_syncs_the_lockfile_however_the_release_pr_got_there() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+
+    assert!(
+        workflow.contains("Synchronize release lockfile"),
+        "the release job must synchronize Cargo.lock; without it a version bump \
+         ships a lockfile the build refuses"
+    );
+    // Assert on the GATES, not on the file text: the comments above these steps
+    // name `prs_created` deliberately, to explain why it is the wrong condition.
+    // A test that forbids the word would forbid the explanation.
+    let gated_on_prs_created: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("if:") && line.contains("prs_created"))
+        .collect();
+    assert!(
+        gated_on_prs_created.is_empty(),
+        "no step may be gated on `prs_created`: it is true only when \
+         release-please CREATES the PR, so an UPDATED release PR silently skips \
+         the step -- the defect this test exists to prevent. Found: {gated_on_prs_created:?}"
+    );
+    assert!(
+        workflow.contains("autorelease: pending"),
+        "the release PR must be located by its own label, which is present \
+         however the PR got there, rather than by a create-only output"
+    );
+    assert!(
+        workflow.contains("cargo metadata --locked"),
+        "the job must PROVE --locked accepts the synchronized tree; \
+         `cargo update` exiting 0 says the lock was refreshed, not that the \
+         build job's --locked will accept it"
+    );
+}
+
 /// The Linux entries pin an OLD runner deliberately: glibc is backward
 /// compatible but not forward, so the build host's glibc is the compatibility
 /// floor shipped to users. These were `ubuntu-latest`/`ubuntu-24.04-arm`, and
