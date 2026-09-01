@@ -1,6 +1,20 @@
 # Installing NestWeaver
 
-Install a pre-built CLI from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest), or build from source. There is currently no published npm or crates.io package.
+Install the CLI from npm or a verified pre-built archive from
+[GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest), or
+build from source. There is currently no published crates.io package.
+
+## npm
+
+```sh
+npm install --global nestweaver
+nestweaver --version
+```
+
+The npm package downloads the matching release archive for macOS or Linux on
+x86_64 or arm64 and verifies its published SHA-256 checksum before installing
+the executable. See the platform baselines below when installing on Linux or
+macOS.
 
 ## Pre-built CLI (recommended)
 
