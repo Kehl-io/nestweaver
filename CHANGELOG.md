@@ -1,5 +1,12 @@
 # Changelog
 
+## [9.0.4](https://github.com/Kehl-io/nestweaver/compare/v9.0.3...v9.0.4) (2026-09-01)
+
+
+### Bug Fixes
+
+* **release:** bundle GCC runtime and smoke-test artifacts ([#346](https://github.com/Kehl-io/nestweaver/issues/346)) ([150e229](https://github.com/Kehl-io/nestweaver/commit/150e2292c08c8342165e12cf2cf91db54c63f4c6))
+
 ## [9.0.3](https://github.com/Kehl-io/nestweaver/compare/v9.0.2...v9.0.3) (2026-09-01)
 
 
