@@ -196,9 +196,10 @@ jobs:
       # The toolchain PPA also supplies a newer dynamic C++ runtime, which a
       # stock 22.04 installation does not have. The checked-in linker wrapper
       # records `$ORIGIN/lib` as the runtime search path, and the packaging step
-      # ships the matching GCC 13 libstdc++ and libgcc beside the binary. Do not
-      # statically link them: the v9.0.3 artifacts passed `--version` but
-      # segfaulted on the first LadybugDB open across its Rust/C++ boundary.
+      # ships the matching GCC 13 libstdc++ and libgcc beside the binary. Keep
+      # those libraries dynamic so the archive's C++ ABI is explicit and
+      # inspectable. The functional smoke below guards the separate final-link
+      # contract that `--version` alone missed in both v9.0.3 and v9.0.4.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -285,7 +286,11 @@ jobs:
           if [ "${{ runner.os }}" = "Linux" ]; then
             CXX_VER=$("$CXX" -dumpfullversion -dumpversion)
             LINKER_HASH=$(shasum -a 256 scripts/gcc13-bundled-cxx-linker | cut -c1-12)
-            TOOLCHAIN_KEY="gcc${CXX_VER}-bundledcxx${LINKER_HASH}"
+            # CFLAGS changes Ladybug's vendored zstd objects. Include that
+            # native-code contract in the immutable cache key so a release
+            # cannot restore the pre-v9.0.5 ASM build and spend ~38 minutes
+            # discovering/rebuilding the mismatch during the final binary.
+            TOOLCHAIN_KEY="gcc${CXX_VER}-bundledcxx${LINKER_HASH}-zstdnoasm-gnuld"
           else
             TOOLCHAIN_KEY=$(clang --version | shasum -a 256 | cut -c1-16)
           fi
