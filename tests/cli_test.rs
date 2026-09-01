@@ -1198,6 +1198,20 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
         "release verification must open a real database and index code; \
          `--version` did not catch the v9.0.3 runtime segfault"
     );
+    assert!(
+        workflow.contains("workflow_dispatch:")
+            && workflow.contains("github.event_name == 'workflow_dispatch'")
+            && workflow.contains("CFLAGS: \"-DZSTD_DISABLE_ASM\"")
+            && !workflow.contains("fuse-ld=mold")
+            && workflow.contains("thread apply all backtrace")
+            && workflow
+                .matches("if: github.event_name != 'workflow_dispatch'")
+                .count()
+                == 4,
+        "release artifacts must be manually verifiable before tagging; Linux must use \
+         the system linker and the same zstd native-code contract as normal CI, with a \
+         backtrace on functional-smoke failure, without uploading to a release"
+    );
 }
 
 /// Ubuntu 22.04's protobuf-compiler is protoc 3.12. The schema uses proto3
