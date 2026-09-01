@@ -3,6 +3,12 @@ name: Release Please
 on:
   push:
     branches: [main]
+  # A release artifact is materially different from the ordinary CI binary:
+  # it is built on the compatibility runner, with the release linker and the
+  # exact runtime layout users download. Allow that contract to be exercised
+  # before cutting another public tag when a platform-specific failure needs
+  # diagnosis. A manual run builds and verifies the matrix but cannot publish.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -125,7 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: ${{ needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -201,7 +207,7 @@ jobs:
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
           sudo apt-get update
-          sudo apt-get install -y cmake gcc-13 g++-13 libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+          sudo apt-get install -y cmake gcc-13 g++-13 gdb libssl-dev libzstd-dev pkg-config protobuf-compiler
           LINKER="$GITHUB_WORKSPACE/scripts/gcc13-bundled-cxx-linker"
           test -x "$LINKER"
           {
@@ -256,12 +262,11 @@ jobs:
               ;;
           esac
           echo "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" >> "$GITHUB_ENV"
-      - name: Use mold as the linker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          F="-C link-arg=-fuse-ld=mold"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$F" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$F" >> "$GITHUB_ENV"
+      # Do not use mold for release artifacts. Both v9.0.4 Linux binaries linked
+      # by mold started and printed their versions, then segfaulted as soon as
+      # LadybugDB opened a database. The same GCC 13 source build linked with
+      # GNU ld passes that operation, and native upstream Ladybug builds also
+      # use the system linker. Link speed is not an artifact requirement.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -337,6 +342,11 @@ jobs:
           TARGET: ${{ matrix.target }}
           FEATURES: ${{ matrix.features }}
           LBUG_BUILD_FROM_SOURCE: "1"
+          # Normal CI has always disabled Ladybug's vendored zstd assembly;
+          # release artifacts must compile the same native code path. Besides
+          # avoiding hidden ELF Huffman symbols, this removes architecture-
+          # specific assembly from the ARM64 crash surface.
+          CFLAGS: "-DZSTD_DISABLE_ASM"
         run: |
           if [ -n "$FEATURES" ]; then
             cargo build --locked --release --target "$TARGET" --features "$FEATURES"
@@ -442,14 +452,33 @@ jobs:
               "$BIN" --version
               SMOKE_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-smoke.XXXXXX")"
               trap 'rm -rf "$SMOKE_DIR"' EXIT
-              NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+              if NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
                 "$BIN" index \
-                  --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
-                  --name release-artifact-smoke \
-                  --db "$SMOKE_DIR/smoke.lbug" \
-                  --no-embed \
-                  --with-trigrams \
-                  --json
+                    --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                    --name release-artifact-smoke \
+                    --db "$SMOKE_DIR/smoke.lbug" \
+                    --no-embed \
+                    --with-trigrams \
+                    --json; then
+                :
+              else
+                SMOKE_STATUS=$?
+                if [ "${{ runner.os }}" = "Linux" ]; then
+                  DEBUG_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-debug.XXXXXX")"
+                  NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+                    gdb --batch --quiet \
+                      -ex run \
+                      -ex 'thread apply all backtrace' \
+                      --args "$BIN" index \
+                        --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                        --name release-artifact-debug \
+                        --db "$DEBUG_DIR/debug.lbug" \
+                        --no-embed \
+                        --with-trigrams \
+                        --json || true
+                fi
+                exit "$SMOKE_STATUS"
+              fi
               ;;
           esac
       - name: Verify Apple Metal capability
@@ -463,6 +492,7 @@ jobs:
           printf '%s\n' "$CAPABILITIES"
           jq -e '.metal_compiled == true' <<< "$CAPABILITIES"
       - name: Package binary
+        if: github.event_name != 'workflow_dispatch'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -475,12 +505,15 @@ jobs:
           fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Generate SHA-256 checksum
+        if: github.event_name != 'workflow_dispatch'
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Attest build provenance
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.ARCHIVE }}
       - name: Upload release artifact
+        if: github.event_name != 'workflow_dispatch'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
