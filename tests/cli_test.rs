@@ -1183,6 +1183,22 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
     );
 }
 
+/// Ubuntu 22.04's protobuf-compiler is protoc 3.12. The schema uses proto3
+/// optional fields, which that version refuses unless explicitly enabled.
+/// Current protoc releases still accept the compatibility flag, so the build
+/// script must carry it rather than making only one CI runner special.
+#[test]
+fn proto_build_supports_the_declared_ubuntu_2204_baseline() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let build_script =
+        std::fs::read_to_string(repo_root.join("crates/nestweaver-proto/build.rs")).unwrap();
+
+    assert!(
+        build_script.contains(".protoc_arg(\"--experimental_allow_proto3_optional\")"),
+        "the proto build must opt into proto3 optional fields for Ubuntu 22.04's protoc 3.12"
+    );
+}
+
 /// The release PR is the ONE pull request in this repo that receives no CI:
 /// release-please opens it with `GITHUB_TOKEN`, and GitHub deliberately does not
 /// trigger workflows for bot-token-created PRs. Everything that would otherwise
