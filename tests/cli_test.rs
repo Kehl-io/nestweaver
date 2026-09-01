@@ -1201,8 +1201,24 @@ fn release_workflow_syncs_the_lockfile_however_the_release_pr_got_there() {
     );
     assert!(
         workflow.contains("autorelease: pending"),
-        "the release PR must be located by its own label, which is present \
-         however the PR got there, rather than by a create-only output"
+        "the release PR must be locatable by its own label, for the UPDATE case \
+         where release-please emits no `pr` output at all"
+    );
+    // Both lookups are required, and neither is sufficient alone. The label
+    // alone RACES: PR #338 was created at 04:49:05 and the label lookup ran
+    // within five seconds, matched nothing, and skipped the sync -- shipping a
+    // 9.0.1 PR with a 9.0.0 lockfile, the exact defect the lookup was added to
+    // fix. The action output alone misses the update case.
+    assert!(
+        workflow.contains("steps.release.outputs.pr"),
+        "the job must prefer release-please's own `pr` output, which is \
+         populated in-process and cannot race the label being attached"
+    );
+    assert!(
+        workflow.contains("refusing to skip the lockfile sync"),
+        "if the action reports creating a PR that cannot then be located, that \
+         is an inconsistency and must fail the job -- silently skipping the \
+         sync is how a release reaches `cargo build --locked` with a stale lock"
     );
     assert!(
         workflow.contains("cargo metadata --locked"),

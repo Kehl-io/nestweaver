@@ -40,12 +40,51 @@ jobs:
         id: release_pr
         env:
           GH_TOKEN: ${{ github.token }}
+          ACTION_PR: ${{ steps.release.outputs.pr }}
+          PRS_CREATED: ${{ steps.release.outputs.prs_created }}
         run: |
           set -euo pipefail
-          PR_JSON="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-            --label 'autorelease: pending' --json number,headRefName --limit 1)"
-          echo "number=$(jq -r '.[0].number // empty' <<< "$PR_JSON")" >> "$GITHUB_OUTPUT"
-          echo "branch=$(jq -r '.[0].headRefName // empty' <<< "$PR_JSON")" >> "$GITHUB_OUTPUT"
+          NUM=""
+          BRANCH=""
+
+          # PREFER THE ACTION'S OWN OUTPUT. When release-please has just CREATED
+          # the PR, its `autorelease: pending` label is not attached yet: PR #338
+          # was created at 04:49:05 and the label lookup here ran within five
+          # seconds, matched nothing, and skipped the sync -- reproducing the
+          # exact defect the lookup was added to fix, on the very next release.
+          # The action's output is populated in-process and cannot race.
+          if [ -n "${ACTION_PR:-}" ] && [ "$ACTION_PR" != "null" ]; then
+            NUM="$(jq -r '.number // empty' <<< "$ACTION_PR")"
+            BRANCH="$(jq -r '.headBranchName // empty' <<< "$ACTION_PR")"
+          fi
+
+          # FALL BACK TO THE LABEL for a PR that already existed and was merely
+          # UPDATED -- the case that has no `pr` output at all, and the reason
+          # 9.0.0 shipped with a stale lockfile. Retry: a just-labelled PR can
+          # take a moment to appear in the list API.
+          if [ -z "$NUM" ]; then
+            for attempt in 1 2 3; do
+              PR_JSON="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                --label 'autorelease: pending' --json number,headRefName --limit 1)"
+              NUM="$(jq -r '.[0].number // empty' <<< "$PR_JSON")"
+              BRANCH="$(jq -r '.[0].headRefName // empty' <<< "$PR_JSON")"
+              [ -n "$NUM" ] && break
+              echo "no open release PR yet (attempt $attempt/3); retrying in 5s"
+              sleep 5
+            done
+          fi
+
+          # If the action says it created a PR and we still cannot find it, that
+          # is an inconsistency, not an absence. Failing here is far cheaper than
+          # discovering it after the tag is public.
+          if [ "${PRS_CREATED:-false}" = "true" ] && [ -z "$NUM" ]; then
+            echo "::error::release-please reported creating a PR but none could be located; refusing to skip the lockfile sync" >&2
+            exit 1
+          fi
+
+          echo "located release PR: ${NUM:-<none>} (${BRANCH:-<none>})"
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
       - name: Check out release PR
         if: steps.release_pr.outputs.number != ''
         uses: actions/checkout@v7
