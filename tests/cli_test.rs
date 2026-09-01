@@ -1130,6 +1130,37 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
     entries
 }
 
+/// The 22.04 runner pin fixes the glibc floor and BREAKS the C++ build unless
+/// the toolchain is also pinned. 22.04's default is GCC 11.4; lbug vendors
+/// simsimd, which uses AVX-512 FP16 intrinsics GCC 11 does not have. Measured on
+/// the exact translation unit CI died on, `simsimd/lib.c`, in an ubuntu:22.04
+/// container: gcc-11 gives exit 1 with 127 errors naming `__m512h` and
+/// `avx512fp16`; gcc-12 gives exit 0 and a 389 KB object. glibc stays 2.35
+/// either way, because the compiler does not choose the C library.
+///
+/// This shipped a v9.0.0 whose Linux binaries failed to build AFTER the tag was
+/// public, so the two pins belong together and neither may be removed alone.
+#[test]
+fn release_workflow_pins_a_linux_toolchain_new_enough_for_the_vendored_simd() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+
+    for needle in ["gcc-12", "g++-12", "CC=gcc-12", "CXX=g++-12"] {
+        assert!(
+            workflow.contains(needle),
+            "the Linux build must pin {needle}: ubuntu-22.04 defaults to GCC 11, \
+             which cannot compile lbug's vendored simsimd"
+        );
+    }
+    assert!(
+        workflow.contains("avx512fp16"),
+        "the job must PREFLIGHT the intrinsics it needs, so a runner image that \
+         drops gcc-12 fails in seconds rather than twenty minutes into the C++ \
+         build of a release whose tag is already cut"
+    );
+}
+
 /// The release PR is the ONE pull request in this repo that receives no CI:
 /// release-please opens it with `GITHUB_TOKEN`, and GitHub deliberately does not
 /// trigger workflows for bot-token-created PRs. Everything that would otherwise

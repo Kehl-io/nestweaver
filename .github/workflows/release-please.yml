@@ -140,9 +140,45 @@ jobs:
         with:
           cache-targets: false
           cache-on-failure: true
+      # gcc-12 is REQUIRED and is not the 22.04 default.
+      #
+      # The runners are pinned to 22.04 so the shipped glibc floor is 2.35 (see
+      # the matrix comment). 22.04's default toolchain is GCC 11.4, and lbug
+      # vendors simsimd, which uses AVX-512 FP16 intrinsics that GCC 11 does not
+      # have: `unknown type name '__m512h'` and `attribute 'avx512fp16' argument
+      # 'target' is unknown`. That combination failed every Linux build of
+      # v9.0.0 AFTER the tag was already public.
+      #
+      # glibc and GCC are independent -- glibc comes from the OS, and the
+      # compiler version does not change which glibc symbols get linked. So
+      # gcc-12 on 22.04 gives BOTH a compiler new enough for simsimd and the
+      # 2.35 floor. Verified in an ubuntu:22.04 container: gcc-12 compiles an
+      # `_mm512_add_ph` probe with -mavx512fp16 (exit 0) while `ldd --version`
+      # reports 2.35.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-12 g++-12 libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+          {
+            echo "CC=gcc-12"
+            echo "CXX=g++-12"
+          } >> "$GITHUB_ENV"
+      - name: Verify the Linux toolchain can build the vendored SIMD code
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Fail HERE, in seconds, rather than twenty minutes into the C++ build
+          # of a release whose tag is already cut. A future runner image that
+          # drops gcc-12 must be loud, not slow.
+          gcc-12 --version | head -1
+          printf '%s\n' \
+            '#include <immintrin.h>' \
+            '__attribute__((target("avx512fp16")))' \
+            'static __m512h probe(__m512h a, __m512h b) { return _mm512_add_ph(a, b); }' \
+            'int main(void) { (void)probe; return 0; }' > /tmp/fp16probe.c
+          gcc-12 -c /tmp/fp16probe.c -o /tmp/fp16probe.o -mavx512fp16
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
