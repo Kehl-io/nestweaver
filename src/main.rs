@@ -2077,7 +2077,7 @@ fn print_ranking_json<T: serde::Serialize>(
 
 /// `repo-map --json`, as ONE shape for both routes.
 ///
-/// nw-366. Two things were wrong with the branch this replaces, and they had
+/// nw-370. Two things were wrong with the branch this replaces, and they had
 /// the same cause — the payload was assembled inline, twice:
 ///
 ///  * it hand-rolled a `RepoMapJson` struct and `println!`d it, bypassing
@@ -2426,11 +2426,11 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
 
 /// The refusal paragraph out of a `dead_code` payload the DAEMON produced.
 ///
-/// nw-367. The daemon route re-renders nothing: the tool that computed the
+/// nw-372. The daemon route re-renders nothing: the tool that computed the
 /// refusal also wrote the sentence, so this reads `note` and prints it. The
 /// fallback exists only for a payload that says `refused` and carries no
 /// `note`, which this binary cannot produce — and it still names a remedy,
-/// because a refusal with no way forward is the failure mode nw-366 fixed.
+/// because a refusal with no way forward is the failure mode nw-370 fixed.
 fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
     payload
         .get("note")
@@ -2684,7 +2684,7 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
 /// function pair has now diverged three times for exactly this reason: nw-163
 /// (`is_stale`), nw-256 (`commits_behind`) and nw-266 (`current_head`), each
 /// fix leaving a comment saying the routes must not drift and the next
-/// divergence appearing underneath it. nw-366 adds a fourth state to the
+/// divergence appearing underneath it. nw-370 adds a fourth state to the
 /// ladder, which is one more thing to copy wrong, so the copy is deleted
 /// instead of extended.
 ///
@@ -2711,7 +2711,7 @@ fn stale_check_row_line(r: &serde_json::Value) -> String {
         _ if stale => "STALE",
         _ => "ok",
     };
-    // nw-366: an `outdated_resolver` row has `indexed == HEAD`, so without a
+    // nw-370: an `outdated_resolver` row has `indexed == HEAD`, so without a
     // reason the line reads exactly like an `[ok]` one with a louder marker.
     // Say WHY, on the row, because that is where the user is looking.
     let reason = if r["status"].as_str() == Some("outdated_resolver") {
@@ -11985,7 +11985,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
-                    // nw-366: read the daemon's own verdict, the same way
+                    // nw-370: read the daemon's own verdict, the same way
                     // `hubs`/`bridges` do. Hoisted out of `if json` on purpose
                     // — that is precisely the mistake nw-365 fixed on `hubs`,
                     // where the verdict was built inside the JSON branch and
@@ -11993,7 +11993,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // print.
                     let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     if json {
-                        // nw-366: through `print_json_payload`, which stamps
+                        // nw-370: through `print_json_payload`, which stamps
                         // `_meta`. This branch hand-rolled a struct and printed
                         // it directly, so `repo-map --json` was the one payload
                         // on this route with no provenance at all.
@@ -12014,7 +12014,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.clone().unwrap_or_else(default_db_path);
             let map = generate_repo_map(&store, token_budget)?;
 
-            // nw-366: `generate_repo_map` orders by `symbols_by_pagerank`, so
+            // nw-370: `generate_repo_map` orders by `symbols_by_pagerank`, so
             // on a generation-stale graph the ORDERING — the whole content of
             // this command — is computed over the edges an older resolver
             // wrote. Same disclosure as `hubs`, for a stronger reason: `hubs`
@@ -13352,7 +13352,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
-                    // nw-366: `get_summary` attaches the verdict on hub level,
+                    // nw-370: `get_summary` attaches the verdict on hub level,
                     // so this route reads the daemon's own answer rather than
                     // deriving a weaker one. On any other level the keys are
                     // absent and `from_daemon_response` would fall back to the
@@ -13541,7 +13541,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let truncated_by_cap = cap_dropped > 0;
             let truncated = truncated_by_budget || truncated_by_cap;
 
-            // nw-366: hub level ONLY. `generate_hub_summaries_bounded` selects
+            // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects
             // and orders by the same degree/PageRank nw-103's import fan-out
             // corrupted, so on a generation-stale graph it summarises the wrong
             // thirty symbols. The other three levels are deliberately excluded:
@@ -14232,7 +14232,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["limit"] = serde_json::json!(n);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
-                    // nw-367: the daemon PRINTS what it was sent. The refusal
+                    // nw-372: the daemon PRINTS what it was sent. The refusal
                     // is computed by the `dead_code` tool the daemon ran, from
                     // `ResolverGenerations::stale_repos` — the sole
                     // computation — so this route decides nothing and cannot
@@ -14268,7 +14268,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let db_path = db.clone().unwrap_or_else(default_db_path);
 
-            // nw-367: REFUSE before the walk. `DeadCodeRefusal::for_repos`
+            // nw-372: REFUSE before the walk. `DeadCodeRefusal::for_repos`
             // wraps `ResolverGenerations::stale_repos` — the sole computation
             // — and returns `None` only when every repo is provably current.
             //
@@ -20493,7 +20493,7 @@ fn run_ranking(
             let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
             let final_rank = base_pagerank * multiplier;
 
-            // nw-366: this command prints a raw `base_pagerank` to eight
+            // nw-370: this command prints a raw `base_pagerank` to eight
             // decimal places and said nothing about where it came from. A
             // number rendered that precisely reads as authoritative, and on a
             // generation-stale graph it is PageRank over the edges an older
@@ -22153,7 +22153,7 @@ fn run_brain(
                 // this array names. `needs_reindex_repos` is the actionable
                 // set; `stale_repos` stays behind-HEAD only.
                 let needs_reindex_urls = urls_where("needs_reindex");
-                // nw-366: read the daemon's OWN per-row verdict rather than
+                // nw-370: read the daemon's OWN per-row verdict rather than
                 // recomputing one. The client refuses to talk to a
                 // version-mismatched daemon at all — it restarts it (see
                 // `NestweaverClient::connect`) — so the daemon serving this
@@ -22215,7 +22215,7 @@ fn run_brain(
                         }
                     }
                 }
-                // nw-366: the remedy, on stderr in BOTH modes — the same
+                // nw-370: the remedy, on stderr in BOTH modes — the same
                 // channel and the same renderer `hubs`/`bridges` use, so the
                 // migration instruction cannot drift between the command that
                 // detects the condition and the commands that suffer from it.
@@ -22240,7 +22240,7 @@ fn run_brain(
                 }
                 // Stale-check is a freshness gate — exit non-zero when stale.
                 //
-                // nw-366: generation staleness reuses EXIT_NEEDS_REINDEX (2)
+                // nw-370: generation staleness reuses EXIT_NEEDS_REINDEX (2)
                 // rather than taking a fifth code. `2` already means "at least
                 // one repo needs re-indexing", the remedy is identical, and
                 // `docs/ci-integration.md` plus the shipped pre-push hook
@@ -22268,7 +22268,7 @@ fn run_brain(
                 .list_repos(None)
                 .map_err(|error| anyhow::anyhow!("list repos: {error}"))?;
 
-            // nw-366: the fourth rung. See `tool_stale_check` — the two
+            // nw-370: the fourth rung. See `tool_stale_check` — the two
             // routes must answer identically, so this is the same decision
             // made from the same computation.
             //
@@ -22363,7 +22363,7 @@ fn run_brain(
                 // actionable union lives in `needs_reindex`. Mirrors
                 // `tool_stale_check` exactly — the two paths must not drift.
                 //
-                // nw-366: `outdated_resolver` sits BELOW the three git-derived
+                // nw-370: `outdated_resolver` sits BELOW the three git-derived
                 // states, matching `tool_stale_check`. `resolver_stale` on the
                 // row keeps the fact visible when that precedence reports a git
                 // reason instead.
@@ -22392,7 +22392,7 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
-                    // nw-366: independent of `is_stale`, matching
+                    // nw-370: independent of `is_stale`, matching
                     // `tool_stale_check`.
                     "resolver_stale": repo_resolver_stale,
                     "needs_reindex": needs_reindex,
@@ -22413,7 +22413,7 @@ fn run_brain(
                 };
                 let stale_urls = urls_where("is_stale");
                 let needs_reindex_urls = urls_where("needs_reindex");
-                // nw-366: NOT folded into `stale_repos` — that key means
+                // nw-370: NOT folded into `stale_repos` — that key means
                 // behind-HEAD here and generation-stale on `hub_nodes`, and
                 // merging the two populations under one name is how those
                 // surfaces would start contradicting each other.
@@ -22450,7 +22450,7 @@ fn run_brain(
                     println!("{}", stale_check_row_line(r));
                 }
             }
-            // nw-366: same note, same renderer, same stream as the daemon
+            // nw-370: same note, same renderer, same stream as the daemon
             // route above. This route holds the store, so the denominator is
             // exact.
             let resolver_stale_names: Vec<String> = results
@@ -22465,7 +22465,7 @@ fn run_brain(
                 eprintln!("warning: {note}");
             }
             // Stale-check is a freshness gate — exit non-zero when stale.
-            // nw-366: see the daemon route for why generation staleness reuses
+            // nw-370: see the daemon route for why generation staleness reuses
             // EXIT_NEEDS_REINDEX rather than taking a code of its own.
             Ok((
                 if any_needs_reindex {

@@ -209,7 +209,7 @@ pub fn staleness_note_for(stale: &[String], total: Option<usize>) -> Option<Stri
 
 /// Why `dead-code` REFUSES on a generation-stale graph instead of warning.
 ///
-/// nw-367. Every other resolver-generation surface discloses and then prints
+/// nw-372. Every other resolver-generation surface discloses and then prints
 /// anyway, and that is right for them: their output is a RANKING, and a reader
 /// told the order is suspect can discount the order. `dead-code`'s output is a
 /// list of symbols to DELETE.
@@ -250,7 +250,7 @@ pub struct StaleRepoRemedy {
     pub path: Option<String>,
     /// The exact command that clears THIS repo's staleness, or `None` when
     /// there is no local working tree to name. Never a command that cannot
-    /// run: an unexecutable remedy is the defect nw-366 was fixing.
+    /// run: an unexecutable remedy is the defect nw-370 was fixing.
     pub command: Option<String>,
 }
 
@@ -382,7 +382,7 @@ impl DeadCodeRefusal {
 mod tests {
     use super::*;
 
-    /// nw-367. Two properties the route test cannot see from outside, because
+    /// nw-372. Two properties the route test cannot see from outside, because
     /// its fixture's repo path is a tempdir and its assertions are structural:
     ///
     ///  * the refusal carries NO deletion list — not an empty one. An empty

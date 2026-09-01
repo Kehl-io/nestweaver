@@ -3342,7 +3342,7 @@ fn stale_rankings_are_disclosed_on_all_three_routes_including_default_text() {
     );
 }
 
-/// nw-366. `stale-check` is the command a user runs to answer "do I need to
+/// nw-370. `stale-check` is the command a user runs to answer "do I need to
 /// re-index?", and it could not see the one thing 9.0.0 makes true of every
 /// pre-existing database.
 ///
@@ -3567,7 +3567,7 @@ fn stale_check_detects_a_generation_stale_graph_on_every_route() {
     );
 }
 
-/// nw-366. `repo-map` is the sharpest of the silent ranking surfaces:
+/// nw-370. `repo-map` is the sharpest of the silent ranking surfaces:
 /// `generate_repo_map` orders its entire output by `symbols_by_pagerank`, so on
 /// a generation-stale graph the ORDER — which is the whole content of the
 /// command — is computed over the edges an older resolver wrote. `hubs` at
@@ -3746,7 +3746,7 @@ fn repo_map_and_ranking_rank_disclose_stale_rankings_on_every_route() {
     }
 }
 
-/// nw-367. `dead-code` REFUSES on a resolver-generation-stale graph — every
+/// nw-372. `dead-code` REFUSES on a resolver-generation-stale graph — every
 /// route, exit `2` — where every other generation-aware surface discloses and
 /// prints anyway.
 ///
@@ -3785,7 +3785,7 @@ fn repo_map_and_ranking_rank_disclose_stale_rankings_on_every_route() {
 /// `unreachable_count: 5`, on the downgraded database.
 ///
 /// The last section EXECUTES the remedy the refusal prints, un-forced form
-/// first — the same discipline nw-366 established, because a test that only
+/// first — the same discipline nw-370 established, because a test that only
 /// ran `--force` would call a broken remedy correct.
 #[test]
 fn dead_code_refuses_to_list_on_a_generation_stale_graph_on_every_route() {

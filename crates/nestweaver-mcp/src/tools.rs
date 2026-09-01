@@ -2211,14 +2211,14 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
 
 /// The response-cache key for one call, derived in ONE place.
 ///
-/// nw-367. `maybe_cached` built this inline and
+/// nw-372. `maybe_cached` built this inline and
 /// `cancelled_follower_rejects_failed_leaders_degraded_result` built it AGAIN,
 /// to name the flight slot it expects to observe in `IN_FLIGHT`. Adding a
 /// fourth salt to one copy left the other naming a key nothing computes — and
 /// its `.expect("leader must publish the in-flight slot")` fires while holding
 /// the `IN_FLIGHT` mutex, so the copy did not merely fail: it POISONED a
 /// global and took two unrelated single-flight tests down with it. Same class
-/// as the byte-identical `stale-check` renderers nw-366 collapsed.
+/// as the byte-identical `stale-check` renderers nw-370 collapsed.
 fn response_cache_key(
     name: &str,
     args: &Value,
@@ -2238,7 +2238,7 @@ fn response_cache_key(
         visibility_cache_salt(visible),
     );
     let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
-    // nw-367: the rest of the key covers the GRAPH (`graph_generation`) and the
+    // nw-372: the rest of the key covers the GRAPH (`graph_generation`) and the
     // FILES (`whole_db_scope_digest`), and the resolver-generation sidecar is
     // neither. Downgrading it — exactly what bumping `RESOLVER_GENERATION` does
     // to every existing database — changes the right answer for `dead_code`
@@ -2252,7 +2252,7 @@ fn response_cache_key(
 /// Salt folded into every cacheable tool's key so a response cannot outlive
 /// the resolver generation it was computed under.
 ///
-/// nw-367. `graph_generation` is bumped by indexing and `whole_db_scope_digest`
+/// nw-372. `graph_generation` is bumped by indexing and `whole_db_scope_digest`
 /// tracks file content hashes; neither moves when `RESOLVER_GENERATION` is
 /// bumped in the BINARY, because that changes no byte of the database. The
 /// `RESPONSE_SHAPE_VERSION` namespace covers the real upgrade path, but not a
@@ -8799,7 +8799,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         .list_repos(None)
         .map_err(|e| anyhow!("list_repos: {e}"))?;
 
-    // nw-366: the FOURTH rung of the ladder. `missing` / `incomplete` /
+    // nw-370: the FOURTH rung of the ladder. `missing` / `incomplete` /
     // behind-HEAD all ask "is the input newer than the index?"; this one asks
     // "was the index built by the resolver we are running?" — a question no
     // git SHA can answer, because a generation-stale repo sits exactly AT HEAD
@@ -8882,7 +8882,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .repo_index_incomplete(repo)
             .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
 
-        // nw-366: `outdated_resolver` sits BELOW the three git-derived states
+        // nw-370: `outdated_resolver` sits BELOW the three git-derived states
         // deliberately. A repo that is `missing`, `incomplete` or behind HEAD
         // is also generation-stale in almost every case, and the git answer is
         // the more specific and more urgent one; `resolver_stale` remains a
@@ -8901,7 +8901,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "ok"
         };
         // The ACTIONABLE union, and the only thing a CI gate should key on:
-        // every non-`ok` status is fixed by re-indexing. nw-366: this line is
+        // every non-`ok` status is fixed by re-indexing. nw-370: this line is
         // unchanged and now covers the fourth rung too, which is the point of
         // adding the rung to `status` rather than beside it — an existing CI
         // gate on `any_needs_reindex` (or on exit 2) catches the 9.0.0
@@ -8920,7 +8920,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
-            // nw-366. Named separately from `is_stale` for the same reason
+            // nw-370. Named separately from `is_stale` for the same reason
             // nw-163 narrowed `is_stale` to behind-HEAD: one flag meaning three
             // unrelated things is what made the row self-contradictory. This
             // one is INDEPENDENT of `is_stale` and stays readable even when the
@@ -8953,7 +8953,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     };
     let stale_repos = urls_where("is_stale");
     let needs_reindex_repos = urls_where("needs_reindex");
-    // nw-366: deliberately NOT called `stale_repos`. That key already exists on
+    // nw-370: deliberately NOT called `stale_repos`. That key already exists on
     // this tool and means behind-HEAD URLs; on `hub_nodes` / `bridge_nodes` the
     // same key means generation-stale repo UIDs. Reusing it here would make
     // `ResolverStaleness::from_daemon_response` — which keys on
@@ -8971,7 +8971,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         "stale_repos": stale_repos,
         // The ACTIONABLE set, matching `any_needs_reindex`/`needs_reindex`.
         "needs_reindex_repos": needs_reindex_repos,
-        // nw-366: the generation-stale subset, by URL so it lines up with the
+        // nw-370: the generation-stale subset, by URL so it lines up with the
         // other two lists rather than making a caller join uids to urls.
         "resolver_stale_repos": resolver_stale_repos,
         "repos": results,
@@ -9995,7 +9995,7 @@ fn tool_dead_code(
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
-    // nw-367: REFUSE before doing any work. Every other resolver-generation
+    // nw-372: REFUSE before doing any work. Every other resolver-generation
     // surface discloses and prints anyway; this one is a list of symbols to
     // delete, and a missing edge can only move a LIVE symbol onto it. See
     // `DeadCodeRefusal` for the full argument.
@@ -10812,7 +10812,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "summaries": display,
         "summaries_text": text,
     });
-    // nw-366: hub level ONLY. `generate_hub_summaries_bounded` selects and
+    // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects and
     // orders by the same degree/PageRank the import fan-out corrupted, so on a
     // generation-stale graph it summarises the wrong thirty symbols. File and
     // Cluster level reach this same return: File is not ranking-derived at all,
@@ -12480,7 +12480,7 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 /// Attach the ranking-staleness disclosure to a result, in the shape the CLI
 /// has emitted since nw-308: both keys, always.
 ///
-/// nw-366: `pub` so the daemon's engine-level RPCs can use it. `repo_map_json`
+/// nw-370: `pub` so the daemon's engine-level RPCs can use it. `repo_map_json`
 /// is a gRPC handler in `nestweaver-daemon`, not an entry in either of this
 /// file's dispatch tables, so it could not reach this — and `repo-map`'s entire
 /// output ORDERING is PageRank order (`generate_repo_map` →
@@ -12488,7 +12488,7 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 /// there is. Exporting the one attacher is what stops the daemon growing a
 /// second, drifting spelling of the same disclosure.
 pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
-    // nw-366: fail CLOSED when the answer cannot be computed.
+    // nw-370: fail CLOSED when the answer cannot be computed.
     //
     // `ranking_stale_repos` and `ranking_staleness_note` both `.ok()?` their
     // way out of a missing `CURRENT_DB_PATH` or a failing `list_repos`, and the
@@ -12535,7 +12535,7 @@ pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
 /// `dead_code`'s refusal verdict for this database, or `None` when every repo
 /// is current.
 ///
-/// nw-367. This is the MCP-side access path to `ResolverGenerations::stale_repos`
+/// nw-372. This is the MCP-side access path to `ResolverGenerations::stale_repos`
 /// — the sole computation (nw-358) — and it is the one the CLI's DAEMON route
 /// reaches too, since that route calls this tool over RPC and prints the
 /// refusal it is sent rather than re-deriving one client-side.
@@ -14120,7 +14120,7 @@ mod cache_dispatch_tests {
     /// Asserted on the RESULT, which is what becomes structuredContent. A
     /// disclosure in `_meta` would not count: `_meta` is client/UI-facing and
     /// is typically hidden from the model.
-    /// nw-366: BOTH aged shapes are exercised. This test used to DELETE the
+    /// nw-370: BOTH aged shapes are exercised. This test used to DELETE the
     /// sidecar, which is the pre-nw-103 state — a graph so old it has no record
     /// at all. That is no longer the common case: bumping `RESOLVER_GENERATION`
     /// 3 -> 4 makes the sidecar PRESENT and every entry in it BEHIND on every
@@ -14184,7 +14184,7 @@ mod cache_dispatch_tests {
                     note.contains("indexed by an older resolver"),
                     "{tool} ({aged}) note must say WHAT is wrong, got: {note}"
                 );
-                // nw-366: the remedy must be the one that WORKS. Plain
+                // nw-370: the remedy must be the one that WORKS. Plain
                 // `nestweaver index --repo <path>` is incremental and a no-op on
                 // a repo already at HEAD, which is exactly the shape of a
                 // generation-stale repo — so asserting only `contains("index")`
