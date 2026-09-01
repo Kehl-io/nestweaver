@@ -5,8 +5,9 @@ set -euo pipefail
 # artifacts target stock Ubuntu 22.04. Keep libstdc++ and libgcc dynamic and
 # load the copies shipped beside the binary in `lib/`.
 #
-# Do not replace these libraries with static archives. LadybugDB passes C++
-# strings across its Rust/C++ boundary; statically linking the GCC runtime made
-# that boundary segfault on the first database open in the v9.0.3 artifacts.
-# The release workflow runs a real index smoke test to guard this contract.
+# Keep these libraries dynamic so the archive's C++ ABI is explicit and can be
+# inspected before shipping. The v9.0.3 static-runtime and v9.0.4 dynamic-runtime
+# binaries were both linked by mold and both segfaulted on the first database
+# open; using GNU ld fixed that separate final-link failure. The release workflow
+# runs a real index smoke test to guard the complete contract.
 exec gcc-13 '-Wl,-rpath,$ORIGIN/lib' "$@"

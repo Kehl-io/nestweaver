@@ -1135,9 +1135,11 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
 /// both lbug's AVX-512 FP16 intrinsics and `std::format`; GCC 12 has the former
 /// but its libstdc++ still lacks the latter. GCC 13 supplies both, but its
 /// dynamic libstdc++ is newer than the one installed on stock 22.04, so the C++
-/// and GCC runtimes must be shipped beside the release binary. They must remain
-/// dynamic: the statically linked v9.0.3 artifact segfaulted on its first
-/// LadybugDB open even though its version-only release check passed.
+/// and GCC runtimes must be shipped beside the release binary. The v9.0.3
+/// static-runtime and v9.0.4 dynamic-runtime artifacts were both linked with
+/// mold and both segfaulted on their first LadybugDB open even though their
+/// version-only release checks passed. GNU ld plus the real database smoke is
+/// the verified final-link contract.
 ///
 /// v9.0.0 failed on the SIMD requirement and v9.0.1 failed on `std::format`
 /// AFTER each tag was public. These constraints belong together and must be
@@ -1203,6 +1205,7 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
             && workflow.contains("github.event_name == 'workflow_dispatch'")
             && workflow.contains("CFLAGS: \"-DZSTD_DISABLE_ASM\"")
             && !workflow.contains("fuse-ld=mold")
+            && workflow.contains("zstdnoasm-gnuld")
             && workflow.contains("thread apply all backtrace")
             && workflow
                 .matches("if: github.event_name != 'workflow_dispatch'")
