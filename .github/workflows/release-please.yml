@@ -189,9 +189,10 @@ jobs:
       #
       # The toolchain PPA also supplies a newer dynamic C++ runtime, which a
       # stock 22.04 installation does not have. The checked-in linker wrapper
-      # replaces lbug's explicit `-lstdc++` and Rust's `-lgcc_s` with the GCC 13
-      # static archives. This keeps the archive runnable on an unmodified 22.04
-      # system instead of silently trading a GLIBC_ failure for a GLIBCXX_ one.
+      # records `$ORIGIN/lib` as the runtime search path, and the packaging step
+      # ships the matching GCC 13 libstdc++ and libgcc beside the binary. Do not
+      # statically link them: the v9.0.3 artifacts passed `--version` but
+      # segfaulted on the first LadybugDB open across its Rust/C++ boundary.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -201,7 +202,7 @@ jobs:
           sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
           sudo apt-get update
           sudo apt-get install -y cmake gcc-13 g++-13 libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-          LINKER="$GITHUB_WORKSPACE/scripts/gcc13-static-cxx-linker"
+          LINKER="$GITHUB_WORKSPACE/scripts/gcc13-bundled-cxx-linker"
           test -x "$LINKER"
           {
             echo "CC=gcc-13"
@@ -278,8 +279,8 @@ jobs:
           RUSTC_VER=$(rustc --version | awk '{print $2}')
           if [ "${{ runner.os }}" = "Linux" ]; then
             CXX_VER=$("$CXX" -dumpfullversion -dumpversion)
-            LINKER_HASH=$(shasum -a 256 scripts/gcc13-static-cxx-linker | cut -c1-12)
-            TOOLCHAIN_KEY="gcc${CXX_VER}-staticcxx${LINKER_HASH}"
+            LINKER_HASH=$(shasum -a 256 scripts/gcc13-bundled-cxx-linker | cut -c1-12)
+            TOOLCHAIN_KEY="gcc${CXX_VER}-bundledcxx${LINKER_HASH}"
           else
             TOOLCHAIN_KEY=$(clang --version | shasum -a 256 | cut -c1-16)
           fi
@@ -342,6 +343,23 @@ jobs:
           else
             cargo build --locked --release --target "$TARGET"
           fi
+      - name: Stage Linux compiler runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          RUNTIME_DIR="target/$TARGET/release/lib"
+          mkdir -p "$RUNTIME_DIR"
+          CXX_RUNTIME="$(g++-13 -print-file-name=libstdc++.so.6)"
+          GCC_RUNTIME="$(gcc-13 -print-file-name=libgcc_s.so.1)"
+          test -f "$CXX_RUNTIME"
+          test -f "$GCC_RUNTIME"
+          test -f /usr/share/doc/libstdc++6/copyright
+          cp -L "$CXX_RUNTIME" "$RUNTIME_DIR/libstdc++.so.6"
+          cp -L "$GCC_RUNTIME" "$RUNTIME_DIR/libgcc_s.so.1"
+          cp /usr/share/doc/libstdc++6/copyright "$RUNTIME_DIR/LICENSE-GCC-runtime"
       - name: Verify release binary
         shell: bash
         env:
@@ -365,15 +383,32 @@ jobs:
               exit 1
             fi
           else
+            RUNTIME_DIR="target/$TARGET/release/lib"
             readelf -d "$BIN" | tee linked-libraries.txt
-            if grep -Eq 'Shared library: \[lib(stdc\+\+|gcc_s|ssl|crypto)\.so' linked-libraries.txt; then
-              echo "release binary has an undeclared dynamic toolchain or OpenSSL dependency" >&2
+            if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' linked-libraries.txt; then
+              echo "release binary has a non-system OpenSSL dependency" >&2
               exit 1
             fi
-            if readelf -V "$BIN" 2>/dev/null | grep -q 'GLIBCXX_'; then
-              echo "release binary still requires a dynamic GLIBCXX symbol" >&2
+            for runtime in libstdc++.so.6 libgcc_s.so.1; do
+              if ! grep -Fq "Shared library: [$runtime]" linked-libraries.txt; then
+                echo "release binary does not declare $runtime" >&2
+                exit 1
+              fi
+              test -f "$RUNTIME_DIR/$runtime"
+            done
+            if ! readelf -d "$BIN" | grep -Fq "Library runpath: [\$ORIGIN/lib]"; then
+              echo "release binary must resolve its bundled GCC runtime from \$ORIGIN/lib" >&2
               exit 1
             fi
+
+            ldd "$BIN" | tee resolved-libraries.txt
+            for runtime in libstdc++.so.6 libgcc_s.so.1; do
+              expected="$(cd "$RUNTIME_DIR" && pwd)/$runtime"
+              if ! grep -Fq "$runtime => $expected" resolved-libraries.txt; then
+                echo "$runtime did not resolve to the copy staged in the release archive" >&2
+                exit 1
+              fi
+            done
 
             # Enforce the declared glibc baseline. The runner pin above sets
             # this floor, but a pin is a claim about the build host; this reads
@@ -382,8 +417,12 @@ jobs:
             # bump raises the floor silently again -- exactly how the v8.0.0
             # archive shipped requiring GLIBC_2.39.
             GLIBC_BASELINE=2.35
-            MAX_GLIBC="$(readelf -V "$BIN" 2>/dev/null \
-              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+            MAX_GLIBC="$(
+              for artifact in "$BIN" "$RUNTIME_DIR/libstdc++.so.6" "$RUNTIME_DIR/libgcc_s.so.1"; do
+                readelf -V "$artifact" 2>/dev/null || true
+              done \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1
+            )"
             echo "max glibc required by artifact: ${MAX_GLIBC:-none}"
             if [ -z "$MAX_GLIBC" ]; then
               echo "::error::could not read glibc requirements from $BIN; refusing to ship an unverified floor" >&2
@@ -391,7 +430,7 @@ jobs:
             fi
             if [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$GLIBC_BASELINE" | sort -V | tail -1)" != "$GLIBC_BASELINE" ]; then
               echo "::error::artifact requires GLIBC_$MAX_GLIBC, above the declared baseline of $GLIBC_BASELINE." >&2
-              echo "It will not start on Ubuntu 22.04 (2.35), Debian 12 (2.36) or RHEL 9 (2.34)." >&2
+              echo "It will not start on the declared Ubuntu 22.04 (2.35) baseline." >&2
               echo "Either build on an older runner or raise the baseline deliberately and document it in INSTALL.md." >&2
               exit 1
             fi
@@ -401,6 +440,16 @@ jobs:
           case "$HOST:$TARGET" in
             Linux-x86_64:x86_64-unknown-linux-gnu|Linux-aarch64:aarch64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
               "$BIN" --version
+              SMOKE_DIR="$(mktemp -d "$RUNNER_TEMP/nestweaver-release-smoke.XXXXXX")"
+              trap 'rm -rf "$SMOKE_DIR"' EXIT
+              NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1 \
+                "$BIN" index \
+                  --repo "$GITHUB_WORKSPACE/crates/nestweaver-parser/tests" \
+                  --name release-artifact-smoke \
+                  --db "$SMOKE_DIR/smoke.lbug" \
+                  --no-embed \
+                  --with-trigrams \
+                  --json
               ;;
           esac
       - name: Verify Apple Metal capability
@@ -414,9 +463,16 @@ jobs:
           printf '%s\n' "$CAPABILITIES"
           jq -e '.metal_compiled == true' <<< "$CAPABILITIES"
       - name: Package binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          ARCHIVE="nestweaver-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz"
-          tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" nestweaver
+          ARCHIVE="nestweaver-${{ needs.release-please.outputs.tag_name }}-$TARGET.tar.gz"
+          if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
+            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver lib
+          else
+            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver
+          fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Generate SHA-256 checksum
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"

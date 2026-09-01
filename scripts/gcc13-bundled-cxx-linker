@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# LadybugDB 0.19.1 requires GCC 13's C++20 runtime, while the Linux release
+# artifacts target stock Ubuntu 22.04. Keep libstdc++ and libgcc dynamic and
+# load the copies shipped beside the binary in `lib/`.
+#
+# Do not replace these libraries with static archives. LadybugDB passes C++
+# strings across its Rust/C++ boundary; statically linking the GCC runtime made
+# that boundary segfault on the first database open in the v9.0.3 artifacts.
+# The release workflow runs a real index smoke test to guard this contract.
+exec gcc-13 '-Wl,-rpath,$ORIGIN/lib' "$@"

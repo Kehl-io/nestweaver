@@ -14,10 +14,11 @@ macOS and Linux, on x86_64 and arm64. On any other platform the install step
 exits without failing and prints the supported targets; use a release archive
 or a source build instead.
 
-Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer,
-Debian 12, and RHEL/Rocky 9. Check yours with `ldd --version`; on anything
-older the binary will not start and the error names a missing `GLIBC_` symbol.
-macOS builds target **13.3**.
+Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer and
+Debian 12. The archive includes the GCC 13 runtime LadybugDB needs and the npm
+installer preserves it beside the binary. Check your glibc with `ldd --version`;
+on anything older the binary will not start and the error names a missing
+`GLIBC_` symbol. macOS builds target **13.3**.
 
 ## Upgrading an existing graph
 

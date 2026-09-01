@@ -1135,7 +1135,9 @@ fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>
 /// both lbug's AVX-512 FP16 intrinsics and `std::format`; GCC 12 has the former
 /// but its libstdc++ still lacks the latter. GCC 13 supplies both, but its
 /// dynamic libstdc++ is newer than the one installed on stock 22.04, so the C++
-/// and GCC runtimes must be linked statically into the release binary.
+/// and GCC runtimes must be shipped beside the release binary. They must remain
+/// dynamic: the statically linked v9.0.3 artifact segfaulted on its first
+/// LadybugDB open even though its version-only release check passed.
 ///
 /// v9.0.0 failed on the SIMD requirement and v9.0.1 failed on `std::format`
 /// AFTER each tag was public. These constraints belong together and must be
@@ -1150,7 +1152,7 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
         "Verify the Linux C++20 and architecture toolchain",
     );
     let linker =
-        std::fs::read_to_string(repo_root.join("scripts/gcc13-static-cxx-linker")).unwrap();
+        std::fs::read_to_string(repo_root.join("scripts/gcc13-bundled-cxx-linker")).unwrap();
 
     for needle in ["gcc-13", "g++-13", "CC=gcc-13", "CXX=g++-13"] {
         assert!(
@@ -1170,16 +1172,31 @@ fn release_workflow_pins_a_portable_linux_cxx20_toolchain() {
          native ARM64 compiler"
     );
     assert!(
-        workflow.contains("scripts/gcc13-static-cxx-linker")
-            && linker.contains("libstdc++.a")
-            && linker.contains("-lstdc++")
-            && linker.contains("-lgcc_s"),
-        "the GCC 13 C++ runtime must be linked statically so the archive starts \
-         on an unmodified Ubuntu 22.04 host"
+        workflow.contains("scripts/gcc13-bundled-cxx-linker")
+            && linker.contains("-Wl,-rpath,$ORIGIN/lib")
+            && !linker.contains("libstdc++.a")
+            && !repo_root.join("scripts/gcc13-static-cxx-linker").exists(),
+        "the binary must dynamically load the compiler runtime bundled at \
+         $ORIGIN/lib; static libstdc++ corrupts LadybugDB's Rust/C++ boundary"
     );
     assert!(
-        workflow.contains("GLIBCXX_") && workflow.contains("lib(stdc\\+\\+|gcc_s|ssl|crypto)"),
-        "artifact verification must reject undeclared dynamic toolchain runtimes"
+        workflow.contains("Stage Linux compiler runtime")
+            && workflow.contains("g++-13 -print-file-name=libstdc++.so.6")
+            && workflow.contains("gcc-13 -print-file-name=libgcc_s.so.1")
+            && workflow.contains("cp -L")
+            && workflow.contains("LICENSE-GCC-runtime")
+            && workflow.contains("Library runpath:")
+            && workflow.contains("$ORIGIN/lib")
+            && workflow
+                .contains("tar czf \"$ARCHIVE\" -C \"target/$TARGET/release\" nestweaver lib"),
+        "the Linux archive must carry and resolve the exact GCC 13 runtimes it was built against"
+    );
+    assert!(
+        workflow.contains("NESTWEAVER_ALLOW_NO_DAEMON=1 NESTWEAVER_NO_DAEMON=1")
+            && workflow.contains("--name release-artifact-smoke")
+            && workflow.contains("--with-trigrams"),
+        "release verification must open a real database and index code; \
+         `--version` did not catch the v9.0.3 runtime segfault"
     );
 }
 
