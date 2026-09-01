@@ -289,9 +289,16 @@ The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x f
 
 ### All platforms (CLI)
 
-The primary pre-built installation path is a GitHub Release archive. Select the
-archive for your platform, verify its matching SHA-256 file, then install it as
-described in [INSTALL.md](INSTALL.md#pre-built-cli-recommended). Starting with
+Install the release-matched CLI wrapper from npm:
+
+```sh
+npm install --global nestweaver
+nestweaver --version
+```
+
+Alternatively, select the GitHub Release archive for your platform, verify its
+matching SHA-256 file, then install it as described in
+[INSTALL.md](INSTALL.md#pre-built-cli-recommended). Starting with
 the release that contains this change, both macOS CLI archives are built with
 Metal support. The default `accelerator = "auto"` therefore requires Metal in
 those builds and reports a Metal initialization or inference-probe failure
