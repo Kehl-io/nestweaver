@@ -1,5 +1,13 @@
 # Changelog
 
+## [9.0.2](https://github.com/Kehl-io/nestweaver/compare/v9.0.1...v9.0.2) (2026-09-01)
+
+
+### Bug Fixes
+
+* **ci:** make Linux release builds portable ([eee4334](https://github.com/Kehl-io/nestweaver/commit/eee4334fd879ed37074e8603ef14ddcb638d972f))
+* **ci:** make v9 Linux release builds portable ([dcc5b3d](https://github.com/Kehl-io/nestweaver/commit/dcc5b3d18dd633a18460640aade81371d3b641da))
+
 ## [9.0.1](https://github.com/Kehl-io/nestweaver/compare/v9.0.0...v9.0.1) (2026-09-01)
 
 
