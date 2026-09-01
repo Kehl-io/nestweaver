@@ -1,5 +1,12 @@
 # Changelog
 
+## [9.0.5](https://github.com/Kehl-io/nestweaver/compare/v9.0.4...v9.0.5) (2026-09-01)
+
+
+### Bug Fixes
+
+* **release:** use verified GNU linker contract ([#349](https://github.com/Kehl-io/nestweaver/issues/349)) ([6972765](https://github.com/Kehl-io/nestweaver/commit/6972765d9b8633a8cb8c43bdaf7a8e56ab88cb8e))
+
 ## [9.0.4](https://github.com/Kehl-io/nestweaver/compare/v9.0.3...v9.0.4) (2026-09-01)
 
 
