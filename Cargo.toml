@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "9.0.0"
+version = "9.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Kehl-io/nestweaver"

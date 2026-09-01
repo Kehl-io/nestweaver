@@ -1,5 +1,15 @@
 # Changelog
 
+## [9.0.1](https://github.com/Kehl-io/nestweaver/compare/v9.0.0...v9.0.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **ci:** pin gcc-12 on the 22.04 Linux runners so the release actually builds ([91d9390](https://github.com/Kehl-io/nestweaver/commit/91d939040f10d338fef282a90cfe12c5b4d5b047))
+* **ci:** pin gcc-12 on the 22.04 Linux runners so the release actually builds ([b037812](https://github.com/Kehl-io/nestweaver/commit/b037812c71c2f59dbf655951b561a34042d40e15))
+* **ci:** stop the release-PR lookup racing the label that identifies it ([44ae901](https://github.com/Kehl-io/nestweaver/commit/44ae9012aa01d1386a504e429335dfbee45a7046))
+* **ci:** stop the release-PR lookup racing the label that identifies it ([81628db](https://github.com/Kehl-io/nestweaver/commit/81628db30edcbd311c74bed465b1e82c122bf591))
+
 ## [9.0.0](https://github.com/Kehl-io/nestweaver/compare/v8.0.0...v9.0.0) (2026-09-01)
 
 
