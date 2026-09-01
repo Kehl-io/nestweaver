@@ -1,5 +1,13 @@
 # Changelog
 
+## [9.0.3](https://github.com/Kehl-io/nestweaver/compare/v9.0.2...v9.0.3) (2026-09-01)
+
+
+### Bug Fixes
+
+* **proto:** support Ubuntu 22.04 protoc ([42905f9](https://github.com/Kehl-io/nestweaver/commit/42905f9af7a5ef5ba2ace15c232291138fc1938c))
+* **proto:** support Ubuntu 22.04 protoc ([3458714](https://github.com/Kehl-io/nestweaver/commit/34587146d5cfcd5f6a87fd07154f3fc9414b2d1f))
+
 ## [9.0.2](https://github.com/Kehl-io/nestweaver/compare/v9.0.1...v9.0.2) (2026-09-01)
 
 
