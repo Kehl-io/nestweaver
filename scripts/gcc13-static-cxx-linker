@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# LadybugDB 0.19.1 requests dynamic libstdc++/libgcc_s from its Cargo build
+# script. Release builds use GCC 13 because it is the first libstdc++ with
+# std::format, but Ubuntu 22.04 users do not have that runtime. Replace only
+# those two native-library arguments with the matching GCC 13 static archives;
+# every other linker argument remains byte-for-byte unchanged.
+static_cxx="$(g++-13 -print-file-name=libstdc++.a)"
+static_gcc="$(gcc-13 -print-libgcc-file-name)"
+static_gcc_eh="$(dirname "$static_gcc")/libgcc_eh.a"
+
+for archive in "$static_cxx" "$static_gcc" "$static_gcc_eh"; do
+    if [ ! -f "$archive" ]; then
+        echo "required GCC 13 static runtime archive is missing: $archive" >&2
+        exit 1
+    fi
+done
+
+rewritten=()
+for argument in "$@"; do
+    case "$argument" in
+        -lstdc++) rewritten+=("$static_cxx") ;;
+        -lgcc_s) rewritten+=("$static_gcc_eh" "$static_gcc") ;;
+        *) rewritten+=("$argument") ;;
+    esac
+done
+
+exec gcc-13 "${rewritten[@]}"

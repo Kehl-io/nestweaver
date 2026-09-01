@@ -179,45 +179,66 @@ jobs:
         with:
           cache-targets: false
           cache-on-failure: true
-      # gcc-12 is REQUIRED and is not the 22.04 default.
+      # GCC 13 is REQUIRED and is not available in the 22.04 base archive.
       #
       # The runners are pinned to 22.04 so the shipped glibc floor is 2.35 (see
-      # the matrix comment). 22.04's default toolchain is GCC 11.4, and lbug
-      # vendors simsimd, which uses AVX-512 FP16 intrinsics that GCC 11 does not
-      # have: `unknown type name '__m512h'` and `attribute 'avx512fp16' argument
-      # 'target' is unknown`. That combination failed every Linux build of
-      # v9.0.0 AFTER the tag was already public.
+      # the matrix comment). lbug 0.19.1 requires BOTH C++20 `std::format` and,
+      # on x86_64, AVX-512 FP16 intrinsics. Ubuntu 22.04's GCC 11 has neither;
+      # GCC 12 has the intrinsics but its libstdc++ still has no `<format>`.
+      # GCC 13 is the first version that satisfies both requirements.
       #
-      # glibc and GCC are independent -- glibc comes from the OS, and the
-      # compiler version does not change which glibc symbols get linked. So
-      # gcc-12 on 22.04 gives BOTH a compiler new enough for simsimd and the
-      # 2.35 floor. Verified in an ubuntu:22.04 container: gcc-12 compiles an
-      # `_mm512_add_ph` probe with -mavx512fp16 (exit 0) while `ldd --version`
-      # reports 2.35.
+      # The toolchain PPA also supplies a newer dynamic C++ runtime, which a
+      # stock 22.04 installation does not have. The checked-in linker wrapper
+      # replaces lbug's explicit `-lstdc++` and Rust's `-lgcc_s` with the GCC 13
+      # static archives. This keeps the archive runnable on an unmodified 22.04
+      # system instead of silently trading a GLIBC_ failure for a GLIBCXX_ one.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cmake gcc-12 g++-12 libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-13 g++-13 libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+          LINKER="$GITHUB_WORKSPACE/scripts/gcc13-static-cxx-linker"
+          test -x "$LINKER"
           {
-            echo "CC=gcc-12"
-            echo "CXX=g++-12"
+            echo "CC=gcc-13"
+            echo "CXX=g++-13"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$LINKER"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$LINKER"
           } >> "$GITHUB_ENV"
-      - name: Verify the Linux toolchain can build the vendored SIMD code
+      - name: Verify the Linux C++20 and architecture toolchain
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          # Fail HERE, in seconds, rather than twenty minutes into the C++ build
-          # of a release whose tag is already cut. A future runner image that
-          # drops gcc-12 must be loud, not slow.
-          gcc-12 --version | head -1
+          gcc-13 --version | head -1
+          g++-13 --version | head -1
+
+          # This catches the v9.0.1 x86_64 failure (`<format>` missing) on both
+          # architectures before the full LadybugDB build begins.
           printf '%s\n' \
-            '#include <immintrin.h>' \
-            '__attribute__((target("avx512fp16")))' \
-            'static __m512h probe(__m512h a, __m512h b) { return _mm512_add_ph(a, b); }' \
-            'int main(void) { (void)probe; return 0; }' > /tmp/fp16probe.c
-          gcc-12 -c /tmp/fp16probe.c -o /tmp/fp16probe.o -mavx512fp16
+            '#include <format>' \
+            '#include <string>' \
+            'int main() { return std::format("{}", 42) == "42" ? 0 : 1; }' \
+            > "$RUNNER_TEMP/cxx20-format-probe.cpp"
+          g++-13 -std=c++20 "$RUNNER_TEMP/cxx20-format-probe.cpp" \
+            -o "$RUNNER_TEMP/cxx20-format-probe"
+          "$RUNNER_TEMP/cxx20-format-probe"
+
+          # AVX-512 is an x86 ISA. Running this probe on the native ARM64 job
+          # caused the other v9.0.1 failure before Cargo even started.
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            printf '%s\n' \
+              '#include <immintrin.h>' \
+              '__attribute__((target("avx512fp16")))' \
+              'static __m512h probe(__m512h a, __m512h b) { return _mm512_add_ph(a, b); }' \
+              'int main(void) { (void)probe; return 0; }' \
+              > "$RUNNER_TEMP/fp16-probe.c"
+            gcc-13 -c "$RUNNER_TEMP/fp16-probe.c" \
+              -o "$RUNNER_TEMP/fp16-probe.o" -mavx512fp16
+          fi
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -255,11 +276,18 @@ jobs:
           LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
           OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
           RUSTC_VER=$(rustc --version | awk '{print $2}')
-          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            CXX_VER=$("$CXX" -dumpfullversion -dumpversion)
+            LINKER_HASH=$(shasum -a 256 scripts/gcc13-static-cxx-linker | cut -c1-12)
+            TOOLCHAIN_KEY="gcc${CXX_VER}-staticcxx${LINKER_HASH}"
+          else
+            TOOLCHAIN_KEY=$(clang --version | shasum -a 256 | cut -c1-16)
+          fi
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}-${TOOLCHAIN_KEY}" >> "$GITHUB_OUTPUT"
       - name: Cache native build outputs (lbug C++, OpenSSL)
         # Keyed on package versions (not Cargo.lock) so the cache survives
-        # release lockfile churn; per-target since the build matrix crosses
-        # os/arch.
+        # release lockfile churn; per-target and per-native-toolchain so an
+        # incomplete GCC 12 build cannot poison the GCC 13 repair job.
         uses: actions/cache@v6
         with:
           path: |
@@ -338,8 +366,12 @@ jobs:
             fi
           else
             readelf -d "$BIN" | tee linked-libraries.txt
-            if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' linked-libraries.txt; then
-              echo "release binary has a dynamic OpenSSL dependency" >&2
+            if grep -Eq 'Shared library: \[lib(stdc\+\+|gcc_s|ssl|crypto)\.so' linked-libraries.txt; then
+              echo "release binary has an undeclared dynamic toolchain or OpenSSL dependency" >&2
+              exit 1
+            fi
+            if readelf -V "$BIN" 2>/dev/null | grep -q 'GLIBCXX_'; then
+              echo "release binary still requires a dynamic GLIBCXX symbol" >&2
               exit 1
             fi
 
