@@ -31,7 +31,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Kehl-io/nestweaver"
+    "url": "git+https://github.com/Kehl-io/nestweaver.git"
   },
   "license": "MIT",
   "homepage": "https://github.com/Kehl-io/nestweaver"

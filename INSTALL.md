@@ -36,13 +36,13 @@ host.
 
 | Platform | Baseline | Covers |
 | --- | --- | --- |
-| Linux (both architectures) | **glibc 2.35** | Ubuntu 22.04 LTS and newer, Debian 12, RHEL/Rocky 9 |
+| Linux (both architectures) | **glibc 2.35** | Ubuntu 22.04 LTS and newer, Debian 12 |
 | macOS | **13.3** | LadybugDB uses floating-point `std::format` |
 
-Check your glibc with `ldd --version`. If it is older than 2.35 — RHEL 8,
-Ubuntu 20.04, Debian 11 — the GNU archives will not start, and the failure is
-a loader error naming a missing `GLIBC_` symbol rather than anything from
-NestWeaver. Build from source on those systems.
+Check your glibc with `ldd --version`. If it is older than 2.35 — including
+RHEL/Rocky 9, RHEL 8, Ubuntu 20.04, and Debian 11 — the GNU archives will not
+start, and the failure is a loader error naming a missing `GLIBC_` symbol
+rather than anything from NestWeaver. Build from source on those systems.
 
 Releases through v8.0.0 were built on `ubuntu-latest`, which moved to 24.04 and
 raised the shipped floor to glibc 2.39 without anyone declaring it, so those
@@ -55,13 +55,18 @@ For the selected release tag and target, download
 `nestweaver-<tag>-<target>.tar.gz.sha256`. Do not substitute a version number
 in this guide; use the tag displayed by the release you selected.
 
-Verify the archive before extracting it:
+Verify the archive before extracting it. Linux archives also contain a `lib/`
+directory with the exact GCC 13 C++ runtime used by LadybugDB; keep that
+directory beside the executable. Installing only the Linux `nestweaver` file
+will leave its required runtime behind.
 
 ```sh
 ARCHIVE="nestweaver-<tag>-<target>.tar.gz"
 shasum -a 256 -c "$ARCHIVE.sha256"
-tar -xzf "$ARCHIVE"
-sudo install -m 755 nestweaver /usr/local/bin/nestweaver
+INSTALL_DIR="/opt/nestweaver-<tag>"
+sudo mkdir -p "$INSTALL_DIR"
+sudo tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
+sudo ln -sfn "$INSTALL_DIR/nestweaver" /usr/local/bin/nestweaver
 nestweaver --version
 ```
 
