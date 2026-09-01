@@ -1,5 +1,170 @@
 # Changelog
 
+## [9.0.0](https://github.com/Kehl-io/nestweaver/compare/v8.0.0...v9.0.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** `nestweaver_engine::admin::compute_claude_hook_patch` now returns `Result<serde_json::Value, anyhow::Error>` instead of `serde_json::Value`, and returns `Err` for any `existing` that is not a JSON object — including `Value::Null`, which its documentation previously suggested passing. Library callers must handle the `Result`; pass
+* **cli,setup:** `nestweaver admin install-hook` and `nestweaver setup` no longer refuse a symbolic link. abbde5d8 listed "is a symbolic link" as one of four conditions under which `install-hook` exits 1; that condition is now narrower — only a link whose target does not exist, or which cannot be resolved (a cycle), is refused. A working link is FOLLOWED: the merge lands on the file the link names and the link is left intact. Relative to 8.x the net contract still differs, which is why this footer stays: 8.x wrote through a link with a non-atomic `fs::write` and exited 0 in every case, including a dangling one, where it CREATED the target outside the project. Both of those now behave differently — the write is atomic and aimed at the canonical target, and the dangling case exits 1 naming the target and the command to re-run.
+* **cli:** `nestweaver admin install-hook` now exits 1 instead of 0 when `.claude/settings.local.json` cannot be safely rewritten — it is unparseable, is not a JSON object, contains comments, or is a symbolic link. It previously exited 0 in all four cases, having overwritten the file. The success message also changed: "Hook installed (idempotent) to <path>" is now either "Hook installed to <path> (every other setting preserved)" or "Hook already present in <path> (nothing written)". `nestweaver setup` gains the same refusals on the config files it merges into, though auto-setup treats them as non-fatal as it always has.
+* **cli,engine:** `server init-tls` now REFUSES a directory that already holds any of `ca.pem`, `ca-key.pem`, `server.pem`, `server-key.pem`, `client.pem` or `client-key.pem`, exiting 64 (`EXIT_USAGE`) with nothing written to stdout and the refusal on stderr. Through 8.x it printed a warning, overwrote the CA and its private key, and exited 0. A job that re-runs `init-tls` over a populated directory will now fail on its first run after upgrading to 9.0.0; that is the intended signal. Pass `--force` to replace the bundle — the refusal prints the exact invocation. `--force` replaces the WHOLE managed set, so a run that omits `--client` over a bundle that had one REMOVES `client.pem` and `client-key.pem` rather than leaving them signed by a CA that no longer exists; pass `--client` to reissue them. The replaced bundle is kept at `<output-dir>/.nestweaver-tls.backup/`, and the directory now also carries a `.nestweaver-tls.lock`. The shipped `docker-compose.yml` is unaffected: its `init-tls` service is already guarded by `if [ ! -f .../server.pem ]`.
+* **cli,mcp,engine:** `dead-code` now REFUSES on a resolver-generation-stale graph instead of printing a list. On every route — CLI direct, CLI via daemon, `--json` on both, and MCP `dead_code` — a graph whose repos are below `RESOLVER_GENERATION` yields `refused: true` with `reason: "outdated_resolver"`, `resolver_stale_repos`, `needs_reindex: true` and a `remedies` array, and NO `unreachable_symbols` key at all; the CLI writes nothing to stdout in text mode and the refusal to stderr. THIS CHANGES A CI-FACING EXIT CODE: `dead-code` returned `0` with a list on a generation-stale graph through 8.x and now returns `2` (`EXIT_NEEDS_REINDEX`, the code `stale-check` already uses for the same condition), so a job that runs `dead-code` will fail on its first run after upgrading to 9.0.0 until the graph is re-indexed. That is the intended signal. Fix it with `nestweaver index --repo <path> --force` for each repo the refusal names — `--force` is required, because a generation-stale repo is already at HEAD and the incremental path writes nothing. There is no override flag. A consumer that must keep reading a list from an un-re-indexed graph has no supported way to do so, which is the point.
+* **cli:** `--no-daemon` and `NESTWEAVER_NO_DAEMON=1` now only REQUEST a daemon bypass; `NESTWEAVER_ALLOW_NO_DAEMON` is the sole variable that permits it. `CI` and `GITHUB_ACTIONS` no longer confer permission. A requested but unpermitted bypass is disclosed on stderr and the command routes through an autostarted daemon anyway rather than failing, so a CI job that passed `--no-daemon` expecting an isolated direct store will keep exiting 0 while silently using a daemon. Set `NESTWEAVER_ALLOW_NO_DAEMON=1` alongside `--no-daemon` to restore the previous behaviour.
+* **mcp:** MCP result provenance moved from the outer `tools/call` envelope to the result payload, and its keys lost the `nestweaver.io/` prefix. A raw HTTP MCP client reading `result._meta["nestweaver.io/sources"]`, `nestweaver.io/scope` or `nestweaver.io/stale_repos` now reads nothing; read `_meta.sources`, `_meta.scope` and `_meta.stale_repos` on the payload instead. The payload location is what the server's `initialize` instructions already promised and what both CLI routes already emitted. MCP over stdio previously sent no provenance at all and now sends it in the same place.
+* **cli,mcp,daemon:** `RESOLVER_GENERATION` is bumped 3 -> 4, so every graph indexed by an earlier release is stale by design and must be re-indexed. Until it is, rankings (`hubs`, `bridges`, `repo-map`, `clusters`, PageRank order everywhere) are computed over the edges the old resolver wrote, C and C++ `MEMBER_OF` edges do not exist at all, and C++ `IMPORTS` edges are missing. Detect it with `nestweaver stale-check`: a generation-stale repo now reports `status: "outdated_resolver"` with `resolver_stale: true` and `needs_reindex: true`, and the command exits `2`. Fix it with `nestweaver index --repo <path> --force` for each repo — `--force` is required, because such a repo is already at HEAD and the incremental path writes nothing. Vaults are unaffected. THIS CHANGES A CI-FACING EXIT CODE: `stale-check` returned `0` on a generation-stale graph through 8.x and now returns `2`, so a job gating on `any_needs_reindex` or on exit `2` will fail on its first run after the upgrade until the graph is re-indexed. That is the intended signal.
+* **engine:** `MarkdownIndexResult.wikilinks_resolved` / `wikilinks_unresolved`, `MarkdownSinceResult.wikilinks_resolved`, and `DocStats.total_wikilinks` / `broken_wikilinks` / `low_confidence_wikilinks` are renamed, as are the corresponding `brain_add` and `brain_doc_stats` JSON keys and two CLI summary lines. `DocStats` is `Serialize`/`Deserialize`, so this is a JSON contract change and belongs in the same release as the disclosure.
+* **cli:** let --include-components stay unset so the documented default governs
+
+### Features
+
+* **cli:** add selective delete verbs for the two authored sidecars ([de42f33](https://github.com/Kehl-io/nestweaver/commit/de42f33c3c4ba1adbcc7279c822db6ee0bc9b54c))
+* **cli:** let --include-components stay unset so the documented default governs ([c011da6](https://github.com/Kehl-io/nestweaver/commit/c011da6f76c5e1198f7c004039033a66cb673add))
+* **engine,cli,daemon:** per-repo exclude globs for tracked code ([f8793c7](https://github.com/Kehl-io/nestweaver/commit/f8793c75b2e0a0e4fd08e2ab0accc9c090bbad40))
+* **engine:** add selective delete for interaction and extension sidecars ([7c9608c](https://github.com/Kehl-io/nestweaver/commit/7c9608c7f511e3fd7300a852a1ad2dac1cf08ff4))
+* **impact:** make the result-set cap a property of the CONTRACT, not of the transport (nw-357) ([1bdb6a1](https://github.com/Kehl-io/nestweaver/commit/1bdb6a101ce7d22279851a640cc0de39f261622d))
+* **mcp:** derive tool annotations from MUTATING_TOOLS (nw-293) ([8533ba0](https://github.com/Kehl-io/nestweaver/commit/8533ba0c8f3dcf6188cbe4d74efc6635dcf7addc))
+* **mcp:** window broken-links so the tiers a reviewer needs are reachable ([ced4305](https://github.com/Kehl-io/nestweaver/commit/ced4305bc317b3fe9164d75413f51592bb2d1e20))
+
+
+### Bug Fixes
+
+* **backup:** authorize `backup restore` on the database write lease, not a pidfile ([7709127](https://github.com/Kehl-io/nestweaver/commit/770912785860287fb4cc148cd67db195bbbd6541))
+* **backup:** prove a restore cutover complete before deleting the last copy ([b9ae3ac](https://github.com/Kehl-io/nestweaver/commit/b9ae3ac003d6b1fc66aed38fd7d93c39435bee84))
+* **brain:** say how many notes matched before --max-suggestions cut the row (nw-362a) ([6a95f76](https://github.com/Kehl-io/nestweaver/commit/6a95f768b07b7f9075bf94b08464d9289ca4f592))
+* **ci:** make the release fail when it cannot publish, and verify that it did (nw-115) ([4599d8e](https://github.com/Kehl-io/nestweaver/commit/4599d8e201ab19fa8d9e775bd7f28b048f25838e))
+* **ci:** ship Linux archives against a declared glibc baseline, and enforce it ([c2e0835](https://github.com/Kehl-io/nestweaver/commit/c2e0835b77a6741ad28cf438f315d92f1c3128c9))
+* **ci:** sync the release lockfile however the release PR got there ([819dbd5](https://github.com/Kehl-io/nestweaver/commit/819dbd5ff47246b62ad8d0b07a227b8f160d6aac))
+* **ci:** sync the release lockfile however the release PR got there ([af44f35](https://github.com/Kehl-io/nestweaver/commit/af44f35a74b0f8f270fce86a0abddd95f6671670))
+* **cli,engine,mcp:** report the pre-cap total for every capped summary level ([a81858b](https://github.com/Kehl-io/nestweaver/commit/a81858b7ec01698e9dccef0e47c8e2220a33d988))
+* **cli,engine:** make `server init-tls` refuse to destroy a CA it did not mint ([0a2f152](https://github.com/Kehl-io/nestweaver/commit/0a2f152fb28bd17cd2384504fa73b6a24887c745))
+* **cli,mcp,daemon:** make stale-check see the resolver generation, and disclose it on repo-map (nw-370) ([8c3bd9c](https://github.com/Kehl-io/nestweaver/commit/8c3bd9cd0ab974ffc70f440a6cd6867be0b507b6))
+* **cli,mcp,engine:** make dead-code refuse a deletion list on a stale graph (nw-372) ([d4cf67d](https://github.com/Kehl-io/nestweaver/commit/d4cf67d9b2f22402994584d409a3e8180b91dc72))
+* **cli,mcp:** charge the token budget at the rate the renderer spends (nw-316) ([aa5f4da](https://github.com/Kehl-io/nestweaver/commit/aa5f4daaaf91bb58e60384e6d0229116611f2a69))
+* **cli,mcp:** forward the clusters bounds to the daemon, clamped to its schema ([ae55333](https://github.com/Kehl-io/nestweaver/commit/ae553333f5310304a178402ed1c6c401d128bf68))
+* **cli,setup:** resolve a symlinked user config instead of refusing it ([c925d49](https://github.com/Kehl-io/nestweaver/commit/c925d49af9d3a3b3fd4b1d518d856eec4d7c381e))
+* **cli:** bound context --limit and name the cap that actually truncated (nw-259) ([6f1bd48](https://github.com/Kehl-io/nestweaver/commit/6f1bd481074cbc3dc12183a9a7eab20293b776e4))
+* **cli:** carry the daemon's pre-cut total through `brain context` ([753229b](https://github.com/Kehl-io/nestweaver/commit/753229b5596dd3102ca33ca55b795e82b6b15a51))
+* **cli:** classify broken wikilinks over the population, not the page ([6b36f54](https://github.com/Kehl-io/nestweaver/commit/6b36f54523c07fea6fae91b4cc4e35e267d3407d))
+* **cli:** classify the corrupt-WAL diagnostic in the exhaustive matcher ([b01b313](https://github.com/Kehl-io/nestweaver/commit/b01b313f47c1f0d5797faeedd20089c7957b85f4))
+* **cli:** disclose an unhonourable daemon bypass instead of refusing it ([d08e287](https://github.com/Kehl-io/nestweaver/commit/d08e2877fe61f81f9794a560b981fe213c83773d))
+* **cli:** disclose stale rankings on the default plain-text route (nw-365) ([8ba08fc](https://github.com/Kehl-io/nestweaver/commit/8ba08fc4a592558a387ec51e68cb2e79521e946f))
+* **client:** name the per-command instance override in the --config refusal ([341d7af](https://github.com/Kehl-io/nestweaver/commit/341d7af5ee7a03897506ced442361663e0362d6e))
+* **client:** refuse to autostart a daemon against an unreadable write-ahead log ([c79b2d1](https://github.com/Kehl-io/nestweaver/commit/c79b2d1bf38a99762e781e93c9f2f4ad7f7369e8))
+* **client:** report a daemon that will never boot instead of waiting it out ([415a5d6](https://github.com/Kehl-io/nestweaver/commit/415a5d603a03d14aba316c058b7599a63935cfba))
+* **cli:** give every corruption mode a named, accurate, followable remedy (nw-285) ([1e4de63](https://github.com/Kehl-io/nestweaver/commit/1e4de6389350151b1f5abc178b192ebfd4527099))
+* **cli:** give the CLI one `--json` emitter, so provenance has one author there too (nw-347) ([1ac3c59](https://github.com/Kehl-io/nestweaver/commit/1ac3c59428f957dbaa0c0635b38cacd4301fcf4c))
+* **cli:** instance merge must honour a granted daemon bypass ([af9a758](https://github.com/Kehl-io/nestweaver/commit/af9a75863cfed6f3622bb94a85189c2dcce5925f))
+* **cli:** make help text true, and fix the three places code was wrong instead ([3932db6](https://github.com/Kehl-io/nestweaver/commit/3932db6b78c7809d6ca308e1c7229ecc5035469a))
+* **cli:** make project-context's direct route call the tool instead of restating it (nw-316, nw-218) ([1fb1a54](https://github.com/Kehl-io/nestweaver/commit/1fb1a547f927bd1571a6faf405bac97f34d67278))
+* **cli:** make the impact floor clause idempotent instead of unconditional ([fd42507](https://github.com/Kehl-io/nestweaver/commit/fd4250734ca2d849ebd827055e829bbb3bed39f2))
+* **cli:** name the unsupported --format/--scope pair instead of relaying the transport ([a8f6a2a](https://github.com/Kehl-io/nestweaver/commit/a8f6a2af8b8acf0466f33f255a51b4c4f252ca92))
+* **cli:** one recovery runbook for an unreadable WAL, on all three paths (nw-332, nw-333) ([9412007](https://github.com/Kehl-io/nestweaver/commit/941200746c7ab57d5323a0fd8b8dcc9fe4763fa4))
+* **cli:** parse and normalise `--since` at the clap boundary (nw-295) ([1c54b3f](https://github.com/Kehl-io/nestweaver/commit/1c54b3faa045ff3128fb9dedf1e489dc20ec3d0a))
+* **cli:** probe readability on the vault guards that only stat it ([1f49d76](https://github.com/Kehl-io/nestweaver/commit/1f49d76dc4334fd40575efa79c9b305f1f8f3eb6))
+* **cli:** put ranking staleness on the hubs/bridges JSON payload ([f3f7b3d](https://github.com/Kehl-io/nestweaver/commit/f3f7b3d2ae71f636adc9289c0ce150f2829837bf))
+* **cli:** read-symbols sends the caller's root and stops printing blank bodies (nw-340) ([85f856a](https://github.com/Kehl-io/nestweaver/commit/85f856a1e6cc06f1950a4dc826b58aa568725298))
+* **cli:** refuse wholly-inferred writes and make error remedies executable ([f69f633](https://github.com/Kehl-io/nestweaver/commit/f69f6330b6866a2cca6fd7143222164e4cc590b1))
+* **cli:** reject an invalid export enum at parse time, as a usage error (nw-312) ([d565547](https://github.com/Kehl-io/nestweaver/commit/d565547f13bb0f756744f8d28c9503f31350b10f))
+* **cli:** render clusters through one bounded renderer on both routes ([7267fe6](https://github.com/Kehl-io/nestweaver/commit/7267fe60214469442a3244bfc68934ffa5442ea6))
+* **cli:** render the impact truncation note from one producer (nw-317 leg 1) ([7f01542](https://github.com/Kehl-io/nestweaver/commit/7f0154278df93fb71fa8c3d9c903017dda127599))
+* **cli:** repair must not exit 0 over a database it never opened ([5a883bb](https://github.com/Kehl-io/nestweaver/commit/5a883bbb4a60afc28e612ca786e2384234dde8c1))
+* **cli:** resolve a service once and render what the resolver returns (nw-311) ([2c3d61e](https://github.com/Kehl-io/nestweaver/commit/2c3d61e718109eb558880b12d0a65b4bce2d0cee))
+* **cli:** stop `admin install-hook` from deleting the settings it merges into ([abbde5d](https://github.com/Kehl-io/nestweaver/commit/abbde5d85461a34714afc4d2b2dc46ec58534653))
+* **cli:** take the adaptive cluster resolution from its one authority (F-DC-7) ([6df6dcb](https://github.com/Kehl-io/nestweaver/commit/6df6dcb0e36f9b066e521a82fbb429d15f78a7fa))
+* **cli:** tell stale checkpoint debris apart from a live checkpoint ([3f85362](https://github.com/Kehl-io/nestweaver/commit/3f85362d2f7d41dd994443e7f7814cecab619867))
+* **context:** disclose on brain_context's MACHINE routes that the answer was cut (nw-353) ([cae16cc](https://github.com/Kehl-io/nestweaver/commit/cae16cc6ac3327acc8ec31c066ee5fef77b174e1))
+* **context:** put the truncation CAUSE in the payload, not only in the prose ([dd7318f](https://github.com/Kehl-io/nestweaver/commit/dd7318fd91f720bb513af7cedc490453f12a8f5e))
+* **daemon,docs:** end the progress race on an observation, and cite the right tickets ([5deff62](https://github.com/Kehl-io/nestweaver/commit/5deff620390087e143be667cedace018d70d05aa))
+* **daemon,engine,mcp:** let a daemon re-open a search index it could not open at boot ([40decec](https://github.com/Kehl-io/nestweaver/commit/40dececab06e2e15759a9b5a5327066225583cc6))
+* **daemon,engine:** resolve the data instance live, at all six readers ([d1bb956](https://github.com/Kehl-io/nestweaver/commit/d1bb956fa538abd3c0972ccc3b070777a2b24807))
+* **daemon:** reclaim a watcher whose owning client process is gone ([6a45256](https://github.com/Kehl-io/nestweaver/commit/6a45256b3a597e5ec1cb635e3efd6681924cf687))
+* **engine,cli,mcp:** stop visibility alone from promoting dead code to High (nw-291) ([b27fc8a](https://github.com/Kehl-io/nestweaver/commit/b27fc8a65c4f767344668d835f647a0dbdda6031))
+* **engine,daemon:** substitute the instances the merge remedy already knows ([570cc5d](https://github.com/Kehl-io/nestweaver/commit/570cc5de39ee706b4b59ae1e4b4a0860a7590493))
+* **engine,mcp,federation:** report the pre-cap total for code_context (nw-320) ([fd8550a](https://github.com/Kehl-io/nestweaver/commit/fd8550a74e847c28d8db8850ce1ffa03faa42cf0))
+* **engine,schema:** make body fetch total over the UID space and say why it failed (nw-301) ([b6a38d6](https://github.com/Kehl-io/nestweaver/commit/b6a38d632b0a6727dbaa62dd3f0d6b836afdb1e7))
+* **engine,store,daemon:** resolve a service once, with its candidates and entry points (nw-311) ([4375c49](https://github.com/Kehl-io/nestweaver/commit/4375c497719e49fd96ea21ded850c6e6ba3194fc))
+* **engine,store,mcp:** parse and normalise `since` at the boundary (nw-295) ([2300701](https://github.com/Kehl-io/nestweaver/commit/23007011f3c49917e3282718410fc95f1eea81c0))
+* **engine:** a cfg-gated twin of a reachable symbol is not dead code ([d51f7b7](https://github.com/Kehl-io/nestweaver/commit/d51f7b7b7434c5ff0f102c6e6e6ed28b981d0645))
+* **engine:** a path-qualified wikilink re-enters the proximity ladder ([3006148](https://github.com/Kehl-io/nestweaver/commit/3006148130c5598cab8e4a3f6ebedaff3e5743a3))
+* **engine:** a scan that dropped a row must not report a clean merge gate ([d6b2922](https://github.com/Kehl-io/nestweaver/commit/d6b29229c56b3c063c188ad3ce7a2386136226d7))
+* **engine:** a Spring controller class is not a route implementer ([3f7fffa](https://github.com/Kehl-io/nestweaver/commit/3f7fffa5babae403c21dff68dca53cf7e76f9550))
+* **engine:** bump RESOLVER_GENERATION 3 -&gt; 4 ([2cc960b](https://github.com/Kehl-io/nestweaver/commit/2cc960b5df3df1cd0bd49da0e3ff3de691791a41))
+* **engine:** bump RESOLVER_GENERATION to 2 for the lane-A resolver fixes ([d292794](https://github.com/Kehl-io/nestweaver/commit/d2927949d21ce3cdb31090e4a09624bd5da05ab3))
+* **engine:** carry the manifest cache across every generation advance (nw-289) ([c5ae05f](https://github.com/Kehl-io/nestweaver/commit/c5ae05f47b55c1c3d8e9f930909f7038f5221319))
+* **engine:** clear a stale unavailable_reason when the entry has a body (nw-301) ([de069f0](https://github.com/Kehl-io/nestweaver/commit/de069f01e005fe6215ac19be10474f91c8c43b57))
+* **engine:** disclose every pruned directory and stop hiding native modules ([39ee90f](https://github.com/Kehl-io/nestweaver/commit/39ee90f96219161e1ffc2970b18a94d4ce51db65))
+* **engine:** give the graphml export test the note field the vault index added ([77c87e1](https://github.com/Kehl-io/nestweaver/commit/77c87e10ae91899ba13ab36acace23429595b993))
+* **engine:** key memory-lint templates by template, not by NoteKind ([081abc3](https://github.com/Kehl-io/nestweaver/commit/081abc395aac256038f566dcefe513e1541f4c0d))
+* **engine:** resolve wikilinks by filename before title, and by nearest ancestor ([ad94698](https://github.com/Kehl-io/nestweaver/commit/ad94698932affa708942b85630875e8bc165a97a))
+* **engine:** skip a binary source file instead of voiding the whole index ([f083edd](https://github.com/Kehl-io/nestweaver/commit/f083eddbde9a4c26767e4aa21de73531a32f983c))
+* **engine:** stop `compute_claude_hook_patch` discarding the document it is given ([940127f](https://github.com/Kehl-io/nestweaver/commit/940127fce0a3616d3404e0ac2681c417dfcfdad9))
+* **engine:** stop backup refusing a healthy graph over a stale derived cache ([ac13afd](https://github.com/Kehl-io/nestweaver/commit/ac13afd9759b029c901ed7fe888ce7c1479a954b))
+* **engine:** stop calling a seedless dead-code walk "complete" coverage ([771fb3c](https://github.com/Kehl-io/nestweaver/commit/771fb3c17cfa418a3395005308805fe9459bdbf2))
+* **engine:** treat an unreadable vault root as an error, not an empty vault ([9844a67](https://github.com/Kehl-io/nestweaver/commit/9844a67e8251211eb595c4079dd2ef17c8311acb))
+* **investigate:** count all five caps, not only the token budget (nw-362b) ([b29dfe9](https://github.com/Kehl-io/nestweaver/commit/b29dfe9e1fcb796ecfb2cb2ae660fc332573e46d))
+* **mcp,engine:** bound the clusters listing and unify the cluster ID space (nw-299, F-DC-7, F-DC-11, F-MCP-6) ([c15df32](https://github.com/Kehl-io/nestweaver/commit/c15df324cab4873f5277bfbd2d6bbef68f457fe8))
+* **mcp,schema:** record only resolvable node UIDs as interaction seeds ([10081dd](https://github.com/Kehl-io/nestweaver/commit/10081ddc77094e6c61d983ec6fbadadcb3066b9f))
+* **mcp:** create the bounds/total/truncation seam and bound every limit param (nw-304) ([4819a70](https://github.com/Kehl-io/nestweaver/commit/4819a701d1f48c1662d3feb52978230c04966b52))
+* **mcp:** escape U+2028/U+2029 on the JSON-RPC wire ([d54d4d3](https://github.com/Kehl-io/nestweaver/commit/d54d4d33a5e550ca100c3c3ebaa41b8c7ca72409))
+* **mcp:** give summary one shape and one pair of count names (nw-321) ([359ca48](https://github.com/Kehl-io/nestweaver/commit/359ca48dca36500398e6f9c3b729bc283af6a1b3))
+* **mcp:** make brain_status's read-failure disclosure reachable by a test (nw-260) ([325621f](https://github.com/Kehl-io/nestweaver/commit/325621fe47be6376791c395563b437dcf0a1d253))
+* **mcp:** stamp result provenance at BOTH dispatch seams, not one (nw-315) ([d51dee1](https://github.com/Kehl-io/nestweaver/commit/d51dee1a0b8502cee1007af5f907f469de490a6d))
+* **npm:** claim the real package name, and stop the tarball shipping a home directory (nw-115) ([ad7378f](https://github.com/Kehl-io/nestweaver/commit/ad7378fd99c7b9af3347a968df2b65e0d07b26f3))
+* **parser:** a symbol's span must cover its body — six languages, not one ([904a2dc](https://github.com/Kehl-io/nestweaver/commit/904a2dc4b1fcd7678947dca39f5f99eda26515e4))
+* **parser:** bind C and C++ members to their enclosing class ([aab7902](https://github.com/Kehl-io/nestweaver/commit/aab790250ba04313beb1f4f328f6eec78b151f2a))
+* **parser:** capture the function a serde attribute names as a string ([516610a](https://github.com/Kehl-io/nestweaver/commit/516610aa45471ddb2fec773499e7ddd3cf7651b5))
+* **parser:** dispatch .h to the C++ grammar, not C ([6c877c9](https://github.com/Kehl-io/nestweaver/commit/6c877c9b2f1ced0ab1bbbc26b490fff3de203161))
+* **parser:** give Rust impl blocks an identity distinct from the struct (nw-330, nw-349 cause 5) ([c21a587](https://github.com/Kehl-io/nestweaver/commit/c21a587344857d3087e9cf2a34638828c0866ca6))
+* **parser:** give the graph the reachability edges it was missing (nw-291) ([66d180f](https://github.com/Kehl-io/nestweaver/commit/66d180fa6f191190a4ccfc5affc8db8fc4bc0c32))
+* **parser:** span Python and SystemVerilog definitions on the declaration ([19845a0](https://github.com/Kehl-io/nestweaver/commit/19845a0a3a201faa0645bfca6ab7c09b98657458))
+* **parser:** three modelling defects — julia call sites, reference context, SFC export kinds ([01c3d16](https://github.com/Kehl-io/nestweaver/commit/01c3d16f3f6b44fa96af11fa72910543669798ea))
+* **proto,daemon,federation,mcp:** let an unset boolean stay unset across the RPC (nw-316, partial) ([91af830](https://github.com/Kehl-io/nestweaver/commit/91af8300e86ccf40cd739fa76ad96fb744bd064d))
+* **rankings:** read the daemon's own stale_repos instead of recomputing a weaker one (nw-358) ([0dd98b0](https://github.com/Kehl-io/nestweaver/commit/0dd98b08d47b9baef71cecd4e2f71ecbddbe5b5c))
+* remediate the v8.0.0 post-release bug hunt (nw-284..nw-331) ([b1ac8a4](https://github.com/Kehl-io/nestweaver/commit/b1ac8a40a762eac3047d524671890deecfe2fb71))
+* **resolver,parser:** close the two escape hatches that kept the nw-308 gate ineffective ([5a100c2](https://github.com/Kehl-io/nestweaver/commit/5a100c26cad24df047234e7fd45fdb680277a9bb))
+* **resolver,queries:** resolve TS/JS imports and capture new/re-export references ([3fe2665](https://github.com/Kehl-io/nestweaver/commit/3fe26659d00d3e9b2a978a5b412b3ee8ce8f1721))
+* **resolver:** gate every name-only tier on the receiver, and resolve Rust uniform paths ([a739eb6](https://github.com/Kehl-io/nestweaver/commit/a739eb63f58ede396c8c630b77ca07eff2459649))
+* **resolver:** resolve C++ #include instead of discarding it ([53af1b3](https://github.com/Kehl-io/nestweaver/commit/53af1b3f18318105d699e31e733e3cc7669dadea))
+* **resolver:** tell a module-scope reference apart from a degenerate-span guess (nw-349) ([87e800c](https://github.com/Kehl-io/nestweaver/commit/87e800c51a947e26f2751b7651d94ad6ac6b18de))
+* **schema,mcp,federation:** author result provenance once, at the tool layer (nw-315) ([1cc9bdf](https://github.com/Kehl-io/nestweaver/commit/1cc9bdf507d1076593908273d1d33238471e1cee))
+* **schema,store,engine:** index the raw frontmatter so both search surfaces agree ([6d99b96](https://github.com/Kehl-io/nestweaver/commit/6d99b96d54317cbbb22eaae0ad4ea68b9f47ac7d))
+* second backlog remediation pass — 42 ready items, four lanes ([a442624](https://github.com/Kehl-io/nestweaver/commit/a4426242c9a8f5cf2a0805a9d4836efdad10ce82))
+* **store,cli:** classify the engine's SECOND corrupt-WAL phrasing, and execute the runbook (nw-332, nw-346) ([7dbe70c](https://github.com/Kehl-io/nestweaver/commit/7dbe70c850b4bf21261dd4efc213b0e9658c025f))
+* **store,daemon:** reload the git-activity sidecar the daemon just wrote (nw-258) ([bf5b8d3](https://github.com/Kehl-io/nestweaver/commit/bf5b8d3b866aa9c21daee2636619d3fbfe8bb8af))
+* **store,engine,parser:** persist visibility, drop discard bindings, rank dead code by importance ([6882244](https://github.com/Kehl-io/nestweaver/commit/68822441e0c151780dbe511e5bb57d08af794f66))
+* **store,engine:** emit the vault's edges in the graphml export ([2644b4a](https://github.com/Kehl-io/nestweaver/commit/2644b4a04489ceb83c106dcfe870bc7fe50b7d4b))
+* **store,mcp:** derive the intent enum from its parser and move the impact note down (nw-317) ([dc8e24b](https://github.com/Kehl-io/nestweaver/commit/dc8e24b824350e18ea55190ef9428fc401394f19))
+* **store,mcp:** rank broken wikilinks by severity, and count the population ([1f5d4b3](https://github.com/Kehl-io/nestweaver/commit/1f5d4b31494ebd2e22a6dccc2a20ab039d892977))
+* **store:** a merge moves the recorded data instance identity (nw-264) ([c66144a](https://github.com/Kehl-io/nestweaver/commit/c66144a4e918b61b8f72054b29874eb4f1fcbb32))
+* **store:** count regex occurrences, not the nodes that contain one ([694da93](https://github.com/Kehl-io/nestweaver/commit/694da93663b0d85c782512896e35829e65d16329))
+* **store:** disclose notes that predate frontmatter indexing, with a remedy that was run ([f00877c](https://github.com/Kehl-io/nestweaver/commit/f00877cc9fa45d263d926a0a8f632c8da7aaf406))
+* **store:** give engine corruption a type, classified once at the FFI boundary (nw-346) ([32d494b](https://github.com/Kehl-io/nestweaver/commit/32d494b8d4318cb5d295dc14f83a33bb141e9bef))
+* **store:** latch the engine thread bound so a test cannot disarm it (nw-265) ([9716562](https://github.com/Kehl-io/nestweaver/commit/971656223d3046563614ff8ebb75d3af1528c1d7))
+* **store:** make a crash inside a database open attributable ([39437db](https://github.com/Kehl-io/nestweaver/commit/39437db95e2492e609c0c24ee7982488e36dff64))
+* **store:** make a degraded whole-corpus scan observable to the caller, not just the log ([74f82da](https://github.com/Kehl-io/nestweaver/commit/74f82da050241333a132ed93b117fdeeb4ddc5a5))
+* **store:** one poisoned note must not take the whole index dark ([204e116](https://github.com/Kehl-io/nestweaver/commit/204e1166ee320b25d0c587b0db2ad7ba845e2807))
+* **store:** place the reindex recovery lock outside every publication slot (nw-263, nw-255) ([81f685e](https://github.com/Kehl-io/nestweaver/commit/81f685eb5964603f7c463f494818c73a25bba04d))
+* **store:** run schema migrations on the path that reads the database ([741cfbf](https://github.com/Kehl-io/nestweaver/commit/741cfbf7c502a764372c70e2b2af607a2729248b))
+* **summaries:** make the generator's cap a property of the STORED set, not of the code path (nw-361) ([410482a](https://github.com/Kehl-io/nestweaver/commit/410482ae0c592f3fd136e3022545ca14a8daa9e5))
+* third backlog remediation pass — C++ header dispatch, truncation honesty, recovery ([0a7c460](https://github.com/Kehl-io/nestweaver/commit/0a7c4601f070a72b64d1a9f91e37bd30fd6f0777))
+
+
+### Performance Improvements
+
+* **engine:** make the score-fusion dedup linear (nw-322, leg 2) ([116f451](https://github.com/Kehl-io/nestweaver/commit/116f4516feabeed85d7fc4b6245b03526a6d43b4))
+
+
+### Documentation
+
+* **cli:** record that only NESTWEAVER_ALLOW_NO_DAEMON permits a bypass ([b3ca6ec](https://github.com/Kehl-io/nestweaver/commit/b3ca6ecf34c81adf2dadbdd80c896ad34c0c8a67))
+* **mcp:** record the `_meta` relocation as the wire break it is (nw-315) ([3863735](https://github.com/Kehl-io/nestweaver/commit/38637356a06130bde34c1a1dafebdb82cdedfd0c))
+
+
+### Code Refactoring
+
+* **engine:** name the population every link count measures ([c6e05b4](https://github.com/Kehl-io/nestweaver/commit/c6e05b49b6b2afeba5a3810b380c5d4bb500bdf8))
+
 ## [8.0.0](https://github.com/Kehl-io/nestweaver/compare/v7.0.0...v8.0.0) (2026-08-27)
 
 
