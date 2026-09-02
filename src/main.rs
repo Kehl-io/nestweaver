@@ -471,11 +471,16 @@ enum CliDiagnostic {
     },
 
     /// nw-285. A zero-length `.lbug`, or one that was created but never
-    /// indexed. `require_openable_db` passes a zero-byte file on purpose (it
-    /// is what the store itself initialises), and a read-only open does not
-    /// run `init_schema`, so the first query fails in the engine's binder with
-    /// `Table <X> does not exist` — an internal sentence with no remedy, for a
-    /// condition whose remedy is obvious and safe to name.
+    /// indexed.
+    ///
+    /// STALE UNTIL nw-385, corrected here: this used to say
+    /// `require_openable_db` "passes a zero-byte file on purpose". It no longer
+    /// does — passing it is what let a READ command initialise a store over a
+    /// user's 0-byte file, create four sidecars and spawn a daemon, all at exit
+    /// 0. The guard now RAISES this variant directly, so this diagnostic is
+    /// reached from the guard rather than from the binder failure downstream of
+    /// it. The binder arm below is kept because a database can still reach a
+    /// query with no schema by other routes.
     ///
     /// This is the one database-shaped diagnostic that MAY prescribe a write:
     /// `read_path_diagnostics_never_prescribe_a_write` bars a write when the
@@ -781,6 +786,18 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                 }
                 .into()
             }
+            // nw-385. `require_openable_db` raises this one directly, so it
+            // needs an arm: without it the `_` fallback below renders the
+            // sentence and DROPS `nestweaver::db_no_schema`, and a read
+            // against a zero-byte `--db` would report the right words with no
+            // code for `error_remedy_test` — or any operator's grep — to key
+            // on. The text arm at the top of this function still produces the
+            // same variant for the binder-exception route.
+            CliDiagnostic::DatabaseNoSchema { path, detail } => CliDiagnostic::DatabaseNoSchema {
+                path: path.clone(),
+                detail: detail.clone(),
+            }
+            .into(),
             // Every other variant is currently produced BY this function rather
             // than raised as an error, so there is nothing to pass through.
             // A variant that starts being raised directly adds its arm here.
@@ -848,10 +865,16 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         return corruption_diagnostic(kind, path, message);
     }
 
-    // nw-285. A zero-length `.lbug` passes `require_openable_db` by design, and
-    // `open_read_only` does not run `init_schema`, so the first query dies in
-    // the binder. `Table Symbol does not exist` / `Table Vault does not exist`
-    // is an internal sentence for a condition with an obvious remedy.
+    // nw-285. `open_read_only` does not run `init_schema`, so a query against a
+    // schema-less database dies in the binder. `Table Symbol does not exist` /
+    // `Table Vault does not exist` is an internal sentence for a condition with
+    // an obvious remedy.
+    //
+    // NOTE, corrected under nw-385: this comment used to say a zero-length
+    // `.lbug` "passes `require_openable_db` by design". That is no longer true —
+    // the guard refuses it up front. This arm is now the BACKSTOP for a
+    // schema-less database that reached a query some other way, not the primary
+    // path for the zero-byte case.
     if lower.contains("does not exist")
         && (lower.contains("binder exception") || lower.contains("table "))
     {
@@ -2384,14 +2407,60 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
+    // nw-390. The JSON payload marks every place the tree was CUT — a
+    // depth-capped node, a node whose canonical expansion lives elsewhere, and
+    // rows a visibility policy removed. The text renderer read NONE of them, so
+    // the human surface still showed a capped node as an ordinary leaf: exactly
+    // the defect nw-390 exists to close, surviving on the route the item's own
+    // reproducer uses. A marker that only the machine payload carries has not
+    // fixed the confusion for the person reading it.
+    fn cut_marker(node: &serde_json::Value) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        // `deduped_ref` first: it explains WHERE the subtree went, which is the
+        // question a reader has on seeing an empty node. The uid is printed
+        // because it is the argument you would trace next.
+        if let Some(uid) = node.get("deduped_ref").and_then(|v| v.as_str()) {
+            parts.push(format!("expanded above as {uid}"));
+        }
+        if node
+            .get("truncated_at_depth")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            match node
+                .get("children_omitted")
+                .and_then(serde_json::Value::as_u64)
+            {
+                // Distinguish "cut, and this many were dropped" from "cut, count
+                // unknown". Printing `0 callees` for the second would state a
+                // census the payload never made.
+                Some(n) if n > 0 => parts.push(format!("depth cap: {n} callee(s) not shown")),
+                _ => parts.push("depth cap: callees not shown".to_string()),
+            }
+        }
+        if let Some(n) = node
+            .get("children_redacted")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            parts.push(format!("{n} hidden by policy"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", parts.join("; "))
+        }
+    }
+
     fn walk(node: &serde_json::Value, depth: usize) {
         let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let edge = node.get("edge_type").and_then(|v| v.as_str());
         let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let indent = "  ".repeat(depth + 1);
+        let cut = cut_marker(node);
         match edge {
-            Some(e) => println!("{indent}{name}  [{e}]  {path}"),
-            None => println!("{indent}{name}  {path}"),
+            Some(e) => println!("{indent}{name}  [{e}]  {path}{cut}"),
+            None => println!("{indent}{name}  {path}{cut}"),
         }
         for child in node
             .get("children")
@@ -2411,7 +2480,38 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
     println!("Flow trace from '{root_name}':");
 
     // A class root expands to one tree per method.
-    if let Some(trees) = payload.get("method_trees").and_then(|v| v.as_array()) {
+    //
+    // KEY FIX, and it was silent: this looked ONLY for `method_trees`, while the
+    // tool emits `methods`. So a class root fell through to the single-tree arm
+    // below and its per-method trees were never rendered at all on the text
+    // route. Both spellings are accepted rather than just swapped, because the
+    // daemon and direct routes are independently versioned and a payload built
+    // by an older peer must not silently render nothing.
+    if let Some(trees) = payload
+        .get("methods")
+        .or_else(|| payload.get("method_trees"))
+        .and_then(|v| v.as_array())
+    {
+        // nw-390's third cap: the class-to-methods expansion is capped at
+        // MAX_METHODS and the payload says so. Silence here would misreport a
+        // partial method list as the whole class.
+        if payload
+            .get("methods_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let shown = payload
+                .get("methods_returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(trees.len() as u64);
+            match payload
+                .get("methods_total")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(total) => println!("  (showing {shown} of {total} methods)"),
+                None => println!("  (method list truncated)"),
+            }
+        }
         for tree in trees {
             walk(tree, 0);
         }
@@ -2443,6 +2543,90 @@ fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
              `nestweaver index --repo <path> --force`."
                 .to_string()
         })
+}
+
+/// Why `affected-tests` refuses a generation-stale graph instead of answering
+/// a narrower question.
+///
+/// nw-412. The counterpart of `WHY_DEAD_CODE_REFUSES`, worded separately
+/// because the ERROR DIRECTION is the opposite one and that is the whole
+/// argument. `dead-code` on a stale graph puts a LIVE symbol on a deletion
+/// list — bad, but a human reviewing the list can catch it. Here a missing
+/// edge makes the affected-test set SMALLER: the regression test that would
+/// have caught the change is never selected, the gate reports success, and
+/// there is no list for anyone to review. A test selector that refuses is
+/// safe; one that silently narrows is not.
+///
+/// Byte-identical to `WHY_AFFECTED_TESTS_REFUSES` in
+/// `crates/nestweaver-mcp/src/tools.rs`, which is where the same sentence is
+/// produced for the MCP tool and for this command's DAEMON route.
+const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
+     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
+     safer — it can only drop a test that should have run, while `status` still reads complete. \
+     The error is one-directional and it is silent: nothing downstream can tell a test that was \
+     not selected from a test that does not exist.";
+
+/// Turn the shared resolver-generation verdict into `affected-tests`' refusal.
+///
+/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
+/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
+/// `status`, same `remedies` array of ready-to-run
+/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
+/// a CI job already gates on. Only two things are tool-specific:
+///
+///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
+///    "dead-code will not produce a list on this graph", which is the wrong
+///    sentence in front of the right remedies.
+///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
+///    consumer acts on, and the refusal deliberately carries no
+///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
+///    get tiers" would read the refusal as "no tests affected", which is the
+///    exact silent narrowing this refusal exists to prevent.
+///
+/// This mirrors `affected_tests_refusal_payload` in the MCP crate so the
+/// direct route and the daemon route emit the SAME object; a CI gate must not
+/// be able to tell which one answered.
+fn affected_tests_refusal_payload(
+    refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
+) -> serde_json::Value {
+    let mut payload = refusal.payload();
+    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
+    for remedy in payload
+        .get("remedies")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match remedy.get("command").and_then(|v| v.as_str()) {
+            Some(command) => note.push_str(&format!("\n  {command}")),
+            None => note.push_str(&format!(
+                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
+                 pass to `--repo`; re-index it where it lives",
+                remedy
+                    .get("uid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unnamed repo)")
+            )),
+        }
+    }
+    payload["note"] = serde_json::json!(note);
+    payload["recommendation"] = serde_json::json!("run-full-suite");
+    payload
+}
+
+/// The refusal paragraph out of an `affected_tests` payload the DAEMON
+/// produced.
+///
+/// The twin of [`dead_code_refusal_note`], and it decides nothing for the same
+/// reason: the tool that computed the refusal also wrote the sentence, so this
+/// route prints what it was sent. The fallback covers only a payload that says
+/// `refused` and carries no `note`, which this binary cannot produce.
+fn affected_tests_refusal_note(payload: &serde_json::Value) -> String {
+    payload
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| WHY_AFFECTED_TESTS_REFUSES.to_string())
 }
 
 fn render_dead_code_text(payload: &serde_json::Value) {
@@ -7461,6 +7645,84 @@ fn pr_impact_exit_code(
     }
 }
 
+/// The notification descriptor attached when a blast-radius run's graph is
+/// resolver-generation-stale.
+///
+/// nw-412 asked for a decision between refusing and degrading, per surface,
+/// and the two land differently:
+///
+///  * `affected-tests` REFUSES. It is a selector: its answer is consumed as
+///    "run exactly these", there is no field a caller can read to widen it
+///    back, and a narrowed selection is indistinguishable from a correct one.
+///  * `pr-impact` / `blast-radius` DEGRADE. They are an assessment, not a
+///    selector, and they already ship the exact contract this condition wants:
+///    `status` + `gate_state`, whose documented rule is that a run which did
+///    not complete is `degraded-unknown` and NEVER `risk-flagged` — "unknown,
+///    review manually", not "safe". A stale-resolver run IS a run that did not
+///    complete. Degrading also preserves `coverage`, `blind_spots` and the
+///    changed-file echo, and keeps the SARIF rendering valid; a refusal
+///    payload is not a SARIF run and would break `pr-impact --sarif` outright.
+///
+/// Same string as `BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR` in the MCP crate,
+/// so a consumer matching on the descriptor sees one code from both surfaces.
+const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale";
+
+/// Degrade a locally-computed blast-radius result when this graph's edges
+/// predate the running resolver.
+///
+/// nw-412, the CLI twin of the block in `tool_blast_radius`. `status` is only
+/// ever pushed DOWN (`.max` over the ordered ladder Complete < Partial <
+/// Degraded < Failed), matching nw-105's rule that a run already Degraded or
+/// Failed is never upgraded by a later finding, and `gate_state` is then
+/// forced to `DegradedUnknown`. That mirrors `derive_gate_state`'s
+/// "non-Complete => DegradedUnknown" without calling it (it is `pub(crate)` to
+/// the engine) and closes the direction that made this dangerous: a
+/// stale-resolver run reported `gate_state: ok` over a shrunken affected set,
+/// and can no longer report `ok` at all.
+///
+/// The consequence on the pre-push hook is the point of wiring it here:
+/// `print_pr_impact_hook` is SILENT on an `Ok` + `Low` + nothing-affected run,
+/// and a stale graph is exactly the run most likely to look like that. It can
+/// no longer be silent.
+///
+/// `list_repos` PROPAGATES rather than becoming a degrade: a store that cannot
+/// enumerate repos cannot serve the traversal either, so the caller gets the
+/// CLI's own error classifier (nw-285's `db_no_schema` diagnostic) instead of
+/// a binder exception quoted inside a paragraph about resolver generations.
+fn degrade_blast_radius_if_resolver_stale(
+    store: &GraphStore,
+    db_path: &Path,
+    result: &mut BlastRadiusResult,
+) -> Result<(), anyhow::Error> {
+    let repos = store.list_repos(None)?;
+    let Some(refusal) =
+        nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
+    else {
+        return Ok(());
+    };
+    result.status = result
+        .status
+        .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+    result.gate_state = GateState::DegradedUnknown;
+    result
+        .notifications
+        .push(nestweaver_engine::blast_radius::Notification {
+            level: NotificationLevel::Error,
+            message: refusal.message(),
+            descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
+        });
+    // `render_blast_summary` appends `[status: …]` for any non-Complete run
+    // and is `pub(crate)`, so the marker is restated here rather than leaving
+    // the human summary claiming a clean run. Guarded so a summary that
+    // already carries one is not double-tagged.
+    if !result.summary.contains("[status: ") {
+        result
+            .summary
+            .push_str(&format!(" [status: {}]", result.status.label()));
+    }
+    Ok(())
+}
+
 /// Name the top reason a run was degraded/unknown, for the advisory banner.
 /// Prefers an error-level notification, then any notification, then coverage.
 fn pr_impact_degraded_reason(result: &BlastRadiusResult) -> String {
@@ -7966,9 +8228,17 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // `sidecar_path(db, ".pagerank.json")`; the old `with_extension` idiom
     // yielded `<db>.pagerank.json`, so a direct (non-daemon) `ui`/query never
     // warm-loaded ranks. Mirror the daemon's idiom (server.rs).
-    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
-    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
-    let _ = store.load_pagerank_cache(&pr_path);
+    //
+    // nw-391: and SAY SO when the loader refuses it. This was
+    // `let _ = store.load_pagerank_cache(&pr_path);` — one of three sites that
+    // discarded a fully composed, correct diagnostic, so a stale or foreign
+    // sidecar degraded every ranked surface at exit 0 with no output at all.
+    // stderr, not stdout: `--json` consumers parse stdout, and this is exactly
+    // the split `warn_stale_resolver_rankings` already uses for the same class
+    // of ranking-provenance warning.
+    if let Some(disclosure) = nestweaver_mcp::warm_pagerank_from_sidecar(&store, path) {
+        eprintln!("Warning: {disclosure}");
+    }
 
     // Load interaction memory scores so PPR can apply a small bias toward
     // frequently-accessed nodes.
@@ -9971,9 +10241,15 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// same answer to the caller and were being given wildly different service.
 ///
 /// Deliberately a cheap header probe and NOT an open: an open is what costs,
-/// and this runs before every daemon-routed read. It is also deliberately
-/// conservative — an empty file passes, because a zero-byte `.lbug` is what
-/// the store itself initialises.
+/// and this runs before every daemon-routed read.
+///
+/// nw-385: this is a READ guard, and every one of its callers is a read —
+/// `open_store` (which only ever performs `open_read_only`) and
+/// `try_hybrid_json_rpc_checked` (the daemon-routed read funnel, which `index`
+/// deliberately does not route through). It used to exempt a zero-byte file
+/// "because the store initialises it", which is a statement about the CREATE
+/// path and was therefore an exemption for a caller that has never existed.
+/// See the `Ok(0)` arm for what that cost.
 ///
 /// This does NOT claim to detect corruption. A `.lbug` whose header is intact
 /// and whose index region is not still passes here, by construction; see
@@ -9999,9 +10275,37 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
              at a database you can read.",
             db_path.display()
         ),
-        // A zero-byte file is what an interrupted create leaves; the store
-        // initialises it. Not this guard's business.
-        Ok(0) => Ok(()),
+        // nw-385. A `--db` that yields NO bytes is REFUSED on the read path,
+        // and the exemption this arm replaces is the whole bug.
+        //
+        // The old arm read: "a zero-byte file is what an interrupted create
+        // leaves; the store initialises it. Not this guard's business." Every
+        // clause of that is true of a CREATE path, and no create path calls
+        // this guard — `index` opens read-write directly and never funnels
+        // through either call site. So the exemption protected nobody while
+        // admitting the entire READ surface to the route whose very next step
+        // is "the store initialises it", against a file the USER created.
+        //
+        // MEASURED: `nestweaver search --db ./important-notes.txt user`
+        // overwrote a 0-byte `important-notes.txt` with a 4096-byte LadybugDB
+        // header, created `.publications/`, `.tantivy/`, `.wal` and
+        // `.write.lock` beside it, left a persistent daemon running against
+        // it, printed "No symbols found matching 'user'." and exited 0. A read
+        // command destroyed the file it was pointed at and called it success.
+        //
+        // `index` keeps today's behaviour BY CONSTRUCTION rather than by
+        // exception: it does not consult this guard, and the store still
+        // initialises a zero-byte file on the create path — pinned by
+        // `the_create_path_still_initialises_a_zero_byte_database` so the
+        // justification the old comment gave is asserted where it is actually
+        // true instead of where it was actually harmful.
+        //
+        // Refusing HERE, before the dial, is also what fixes the adjacent leg:
+        // `--db /dev/null` reads EOF, so it took this arm and then paid the
+        // full 30s `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` ceiling and
+        // registered a launchd instance directory for `/dev/null` — exactly
+        // the cost nw-309 (see above) exists to eliminate.
+        Ok(0) => Err(no_bytes_refusal(db_path)),
         Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
         Ok(_) => anyhow::bail!(
             "{} is not a NestWeaver database (its header is not `LBUG`). \
@@ -10010,6 +10314,43 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
             db_path.display()
         ),
     }
+}
+
+/// The refusal for a `--db` that opens but yields no bytes at all (nw-385).
+///
+/// Two different shapes reach it and they have earned two different sentences.
+///
+/// A zero-byte REGULAR file is nw-285's `db_no_schema`: an interrupted create,
+/// or a file the user made with `touch` / `: >`. That variant already states
+/// the size, already names `nestweaver index` as the remedy, and is the one
+/// database diagnostic explicitly ALLOWED to prescribe a write, because a file
+/// with no schema demonstrably holds no data (see the variant's own doc). It is
+/// raised as the typed `CliDiagnostic` rather than as prose so the code survives
+/// to `into_diagnostic` instead of being re-derived from a sentence — the shrink
+/// -the-domain move nw-360 added the pass-through for.
+///
+/// A path that reads EOF but is NOT a regular file — `/dev/null`, the reported
+/// case, and any fifo or device — can never hold a database however often it is
+/// indexed, so prescribing `index` against it would be a remedy nobody can
+/// follow to a good end. It gets the same "not a NestWeaver database" sentence
+/// the non-`LBUG` header arm gives, which points at a different `--db` instead.
+fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
+    let regular_file = std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file());
+    if !regular_file {
+        return anyhow::anyhow!(
+            "{} is not a NestWeaver database (it is not a regular file, and it \
+             yields no bytes to read). Point --db at a `.lbug` file, or run \
+             `nestweaver index --repo <path> --db <new path>` to create one.",
+            db_path.display()
+        );
+    }
+    anyhow::Error::new(CliDiagnostic::DatabaseNoSchema {
+        path: db_path.display().to_string(),
+        detail: format!(
+            "{} is 0 bytes — an interrupted create leaves exactly this.",
+            db_path.display()
+        ),
+    })
 }
 
 /// Stable machine name for a recovery outcome, for `--json` consumers.
@@ -14730,8 +15071,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 include_data_edges: false,
                 limit: None,
             };
-            let result =
+            let mut result =
                 analyze_blast_radius(&store, &changed_files, &options, None, Some(&db_path))?;
+
+            // nw-412: applied HERE — after the analysis, before EITHER
+            // rendering — so the SARIF leg carries it too. `pr-impact --sarif`
+            // is the merge-gate surface most likely to be read by a machine
+            // that never sees the JSON, and `--sarif` also forces this direct
+            // path, so it is the leg that most needs the marker.
+            degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result)?;
 
             if sarif {
                 let mut sarif_value =
@@ -14834,10 +15182,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let daemon_result: Option<nestweaver_engine::AffectedTestsResult> = if use_daemon {
                 let args = affected_tests_rpc_args(&changed_files);
                 match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)? {
-                    Some(value) => Some(
-                        serde_json::from_value(value)
-                            .context("decoding daemon affected_tests result")?,
-                    ),
+                    Some(value) => {
+                        // nw-412: a refusal is NOT an `AffectedTestsResult`
+                        // and must be intercepted before `from_value`, which
+                        // would fail on the missing tiers and report a decode
+                        // bug instead of a stale graph. The daemon PRINTS what
+                        // it was sent — the `affected_tests` tool it ran
+                        // computed the refusal from the sole
+                        // `ResolverGenerations::stale_repos` computation, so
+                        // this route decides nothing and cannot disagree with
+                        // the tool about one database (the same rule the
+                        // `dead-code` daemon route follows).
+                        if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                            if json {
+                                print_json_payload(&value)?;
+                            }
+                            eprintln!("Error: {}", affected_tests_refusal_note(&value));
+                            return Ok((EXIT_NEEDS_REINDEX, None));
+                        }
+                        Some(
+                            serde_json::from_value(value)
+                                .context("decoding daemon affected_tests result")?,
+                        )
+                    }
                     None => None,
                 }
             } else {
@@ -14848,6 +15215,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(r) => r,
                 None => {
                     let store = open_store(Some(&db_path))?;
+                    // nw-412: REFUSE before the selection, the way `dead-code`
+                    // does. On a resolver-generation-stale graph a MISSING
+                    // edge makes the affected-test set SMALLER, so the
+                    // regression test that should have run is silently dropped
+                    // while `status` still reads complete — the one error
+                    // direction nothing downstream can detect. See
+                    // `WHY_AFFECTED_TESTS_REFUSES` for why this refuses where
+                    // `pr-impact` degrades.
+                    let repos = store.list_repos(None)?;
+                    if let Some(refusal) =
+                        nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
+                            &db_path, &repos,
+                        )
+                    {
+                        let payload = affected_tests_refusal_payload(&refusal);
+                        // stdout stays pure JSON for a `--json` gate; the
+                        // paragraph goes to stderr on BOTH modes, the same
+                        // split `dead-code` and `stale-check` already use.
+                        if json {
+                            print_json_payload(&payload)?;
+                        }
+                        eprintln!("Error: {}", affected_tests_refusal_note(&payload));
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     nestweaver_engine::rts_eval::run_recorded(
                         &store,
                         &changed_files,
@@ -20054,7 +20445,23 @@ fn resolve_uid_with_repo_filter(
 
 /// Print a human-readable representation of a `ContextResult`.
 fn print_context_text(result: &ContextResult) {
-    println!("Seeds ({} resolved):", result.seeds.len());
+    // nw-393: `Seeds (5 resolved):` was printed for a bare-name input that
+    // matched 200 symbols, so the human reader had no way to tell an arbitrary
+    // 5-of-200 seeding from a name with five definitions — while the JSON twin
+    // beside it already carried `seed_matches_total` / `seeds_truncated`.
+    // `ContextResult` has no semantic seed leg, so the provenance half of
+    // `seed_header` is always zero here; the shared function is used anyway so
+    // this line and `brain context`'s cannot describe the same cap differently.
+    println!(
+        "{}",
+        seed_header(
+            result.seeds.len(),
+            0,
+            result.seed_matches_total,
+            result.seed_matches_total_relation.as_deref(),
+            result.seeds_truncated,
+        )
+    );
     for node in &result.seeds {
         println!(
             "  {}  {}  {}:{}",
@@ -23720,6 +24127,25 @@ fn run_brain(
                         });
                     }
 
+                    // nw-405: resolve the scope flags to CONCRETE container
+                    // UIDs BEFORE filtering anything, mirroring
+                    // `tool_brain_context`. Resolution sits outside the
+                    // per-list closure so an unresolvable entry is one ERROR
+                    // for the command rather than a predicate that silently
+                    // matches nothing on both lists — and it is the same
+                    // resolver, so this route and the daemon route can no
+                    // longer answer differently for one flag value.
+                    let repo_scope = if repos.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_repo_filter(&store, &repos)?)
+                    };
+                    let vault_scope = if vaults.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_vault_filter(&store, &vaults)?)
+                    };
+
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =
                         kinds.iter().map(|k| k.to_lowercase()).collect();
@@ -23732,22 +24158,14 @@ fn run_brain(
                                     .any(|k| kind_lower.starts_with(k.as_str()))
                             });
                         }
-                        if !repos.is_empty() {
-                            nodes.retain(|n| {
-                                repos.iter().any(|r| {
-                                    n.uid.contains(r.as_str()) || n.location.contains(r.as_str())
-                                })
-                            });
+                        if let Some(ref repo_uids) = repo_scope {
+                            retain_nodes_in_repos(nodes, repo_uids);
                         }
-                        if !vaults.is_empty() {
-                            nodes.retain(|n| {
-                                vaults.iter().any(|v| {
-                                    n.uid.contains(v.as_str()) || n.location.contains(v.as_str())
-                                })
-                            });
+                        if let Some(ref vault_uids) = vault_scope {
+                            retain_nodes_in_vaults(nodes, vault_uids);
                         }
                         if let Some(ref prefix) = path_prefix {
-                            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+                            retain_nodes_under_path_prefix(nodes, prefix.as_str());
                         }
                     };
                     apply_filters(&mut result.seeds);
@@ -23800,6 +24218,23 @@ fn run_brain(
                     }
 
                     // tags filter: keep only note/section nodes tagged with any of these.
+                    //
+                    // nw-407: Symbol nodes used to be kept UNCONDITIONALLY
+                    // here ("no tag concept for code"), which made `--tags` an
+                    // EXPANSION rather than a filter. Measured on the live
+                    // graph at one seed and budget: with `--tags security` the
+                    // result was n=71 of which 70 were Symbols and ONE was a
+                    // tagged Note; without it, n=30 with 22 of 30 vault
+                    // content. Adding the filter GREW the result 30 -> 71 and
+                    // drove the tagged share from 22/30 to 1/71.
+                    //
+                    // The budget leg is why this is not cosmetic: the
+                    // pass-through happens before the token budget is spent,
+                    // so untagged symbols eat the budget the tagged notes were
+                    // asked for. "No tag concept for code" means a symbol
+                    // cannot SATISFY a tag scope, not that it is exempt from
+                    // one — the old comment documented the mechanism and never
+                    // the consequence.
                     if !tags.is_empty() {
                         let tagged_notes = store
                             .list_note_uids_with_tags(&tags)
@@ -23808,13 +24243,7 @@ fn run_brain(
                             .list_section_uids_with_tags(&tags)
                             .map_err(|e| anyhow::anyhow!(e))?;
                         let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-                            nodes.retain(|item| {
-                                if item.kind.to_lowercase().contains("symbol") {
-                                    return true;
-                                }
-                                tagged_notes.contains(&item.uid)
-                                    || tagged_sections.contains(&item.uid)
-                            });
+                            retain_tagged_nodes(nodes, &tagged_notes, &tagged_sections);
                         };
                         filter_tagged(&mut result.seeds);
                         filter_tagged(&mut result.connected);
@@ -24485,6 +24914,224 @@ fn run_brain(
     }
 }
 
+// ── `brain context` scope filters (nw-405 / nw-406 / nw-407) ────────────────
+//
+// The CLI twins of the private helpers in `crates/nestweaver-mcp/src/tools.rs`
+// (`NodeOwner`, `node_owner`, `resolve_repo_filter`, `resolve_vault_filter`,
+// `retain_nodes_in_repos`, `retain_nodes_in_vaults`,
+// `retain_nodes_under_path_prefix`), which carry the full argument for each
+// decision. They must stay equivalent to those: nw-405's fourth measured
+// symptom was the two surfaces DISAGREEING about one flag value — the CLI's
+// predicate was case-SENSITIVE where MCP's was not — and `brain context`
+// forwards these flags to the daemon except under `--no-tests` /
+// `--prefer-instance`, which force this direct path. So the same command
+// answered differently depending on whether a daemon happened to be running.
+//
+// They are DUPLICATED rather than shared only because the MCP copies are
+// crate-private. The durable fix is to lift one copy into `nestweaver-engine`
+// and have both surfaces call it; until then a change to either must be made
+// to both, which is exactly the hazard this item was filed about.
+
+/// The container a node UID names as its owner.
+///
+/// The UID is the authority because it is the only field on a `BrainNode` that
+/// NAMES an owner: `sym:`/`file:`/`svc:` embed the whole `repo:{inst}:{hash}`,
+/// and `note:`/`sec:`/`head:`/`tag:` embed the whole `vlt:{inst}:{hash}`.
+/// `location` names neither — a symbol's location is REPO-RELATIVE and so
+/// never contains its own repo name, which is why `--repos website` used to
+/// return ZERO symbols from the repo it named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeOwner {
+    Repo(String),
+    /// Vault content carries no `repo_uid` at all — the same fact
+    /// `RepoScope::NotRepoScoped` is written on.
+    Vault(String),
+    /// Nothing in the UID names an owner.
+    Unattributable,
+}
+
+/// The owner of `uid`.
+///
+/// Matched over [`nestweaver_schema::uid::UidKind`] rather than an `if` chain
+/// of `starts_with`, for nw-301's reason: an `if` chain cannot be exhaustive,
+/// so a twelfth UID domain would fall silently into whatever the trailing arm
+/// does instead of failing this build.
+fn node_owner(uid: &str) -> NodeOwner {
+    use nestweaver_schema::uid::UidKind;
+
+    /// `{prefix}{owner_uid}:{…}` — an owner UID is always exactly three
+    /// colon-separated components, so take three and discard the tail.
+    fn owner_head(rest: &str) -> Option<String> {
+        let parts: Vec<&str> = rest.splitn(4, ':').collect();
+        (parts.len() >= 3).then(|| format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+    }
+
+    let Some(kind) = UidKind::of(uid) else {
+        return NodeOwner::Unattributable;
+    };
+    let rest = &uid[kind.prefix().len()..];
+    match kind {
+        UidKind::Repo => NodeOwner::Repo(uid.to_string()),
+        UidKind::Vault => NodeOwner::Vault(uid.to_string()),
+        UidKind::File | UidKind::Service | UidKind::Symbol => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Repo)
+        }
+        UidKind::Note | UidKind::Tag => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Vault)
+        }
+        // `sec:{note_uid}:{…}` / `head:{note_uid}:{…}`, and a note UID is
+        // itself `note:{vault_uid}:{…}`, so the inner `note:` comes off too.
+        UidKind::Section | UidKind::Heading => rest
+            .strip_prefix(UidKind::Note.prefix())
+            .and_then(owner_head)
+            .map_or(NodeOwner::Unattributable, NodeOwner::Vault),
+        // `proj:` names an INSTANCE and a contract UID carries no repo
+        // component, so neither can be attributed to a container.
+        UidKind::Project | UidKind::Contract => NodeOwner::Unattributable,
+    }
+}
+
+/// Resolve `--repos` entries to concrete repo UIDs.
+///
+/// The resolution is [`nestweaver_engine::resolve_repo_selector`] — the SAME
+/// resolver `--repo` already uses everywhere else — so this flag cannot grow a
+/// second, drifting notion of what a repo name means, and an ambiguous
+/// selector (`website` under two orgs) FAILS naming both candidates instead of
+/// quietly merging two tenants' code into one answer. An unresolvable entry
+/// ERRORS: the old predicate matched nothing and returned a confident empty
+/// result, which reads as "this repo has no relevant content" rather than "you
+/// named a repo that is not here".
+fn resolve_repo_filter(
+    store: &GraphStore,
+    selectors: &[String],
+) -> Result<std::collections::HashSet<String>, anyhow::Error> {
+    let repos = store
+        .list_repos(None)
+        .context("listing repositories to resolve --repos")?;
+    selectors
+        .iter()
+        .map(|selector| {
+            nestweaver_engine::resolve_repo_selector(&repos, selector)
+                .map(|repo| repo.uid.clone())
+                // Flattened with `{error:#}` rather than `.context(…)` so the
+                // resolver's own "ambiguous; use an exact UID: …" candidate
+                // list — the only actionable part — survives to the terminal.
+                .map_err(|error| anyhow::anyhow!("--repos entry {selector:?}: {error:#}"))
+        })
+        .collect()
+}
+
+/// Resolve `--vaults` entries to concrete vault UIDs.
+///
+/// The mirror of [`resolve_repo_filter`], written out because there is no
+/// engine-side vault selector to reuse: `--repo` is a first-class selector and
+/// `--vault` is not. Precedence deliberately matches `resolve_repo_selector`'s
+/// (exact UID, then case-insensitive exact name, then exact root path) and is
+/// exact-only — the substring leg is precisely what nw-405 removes.
+fn resolve_vault_filter(
+    store: &GraphStore,
+    selectors: &[String],
+) -> Result<std::collections::HashSet<String>, anyhow::Error> {
+    let vaults = store
+        .list_vaults(None)
+        .context("listing vaults to resolve --vaults")?;
+    selectors
+        .iter()
+        .map(|selector| {
+            let needle = selector.to_lowercase();
+            let matches: Vec<&nestweaver_schema::Vault> = vaults
+                .iter()
+                .filter(|vault| {
+                    vault.uid == *selector
+                        || vault.name.to_lowercase() == needle
+                        || vault.root_path == *selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [vault] => Ok(vault.uid.clone()),
+                [] => {
+                    let known: Vec<&str> = vaults.iter().map(|vault| vault.name.as_str()).collect();
+                    Err(anyhow::anyhow!(
+                        "--vaults entry {selector:?} matches no indexed vault; known vaults: {}",
+                        if known.is_empty() {
+                            "(none indexed)".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    ))
+                }
+                ambiguous => Err(anyhow::anyhow!(
+                    "--vaults entry {selector:?} is ambiguous; use an exact UID: {}",
+                    ambiguous
+                        .iter()
+                        .map(|vault| format!("{} ({})", vault.name, vault.uid))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Keep only nodes owned by one of `repo_uids`.
+///
+/// **VAULT NODES ARE DROPPED.** This is nw-405's required recorded decision
+/// and it matches the MCP schema text for `repos`. A Note, Section, Heading or
+/// Tag belongs to a VAULT and carries no `repo_uid`, so it is not "in repo X"
+/// under any reading — keeping it is exactly the measured over-include where
+/// `--repos clientA` returned clientB's notes because their PATH contained the
+/// string. Vault content is scoped with `--vaults`.
+///
+/// An unattributable UID is dropped for nw-403's redactor's reason: "I cannot
+/// tell what owns this" is not a reason to return it under a scope argument.
+fn retain_nodes_in_repos(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    repo_uids: &std::collections::HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Repo(uid) if repo_uids.contains(&uid)),
+    );
+}
+
+/// Keep only nodes owned by one of `vault_uids`.
+///
+/// The mirror of [`retain_nodes_in_repos`]: Symbol/File/Service nodes belong
+/// to a repo, so they cannot satisfy a vault scope and are dropped.
+fn retain_nodes_in_vaults(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    vault_uids: &std::collections::HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Vault(uid) if vault_uids.contains(&uid)),
+    );
+}
+
+/// Apply `--path-prefix`, exempting nodes that have no path at all.
+///
+/// nw-406. The predicate was the bare
+/// `nodes.retain(|n| n.location.starts_with(prefix))`, and a Tag node carries
+/// `location: ""`: `"".starts_with("Workspaces/")` is false, so
+/// `--kinds Tag --path-prefix Workspaces/` measured 25 Tag nodes -> 0 on a
+/// vault whose 606 tags ALL live under `Workspaces/`. A confident zero with no
+/// disclosure. A tag is not "outside" the prefix — it has no path concept for
+/// the prefix to test, so an empty location is EXEMPT rather than excluded.
+fn retain_nodes_under_path_prefix(nodes: &mut Vec<nestweaver_engine::BrainNode>, prefix: &str) {
+    nodes.retain(|node| node.location.is_empty() || node.location.starts_with(prefix));
+}
+
+/// Keep only nodes that actually carry one of the requested tags.
+///
+/// nw-407. Extracted from the `--tags` closure so the one decision it encodes
+/// is assertable: a Symbol is NOT exempt. See the call site for the measured
+/// 30 -> 71 expansion the old unconditional `return true` produced.
+fn retain_tagged_nodes(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    tagged_notes: &std::collections::HashSet<String>,
+    tagged_sections: &std::collections::HashSet<String>,
+) {
+    nodes.retain(|node| tagged_notes.contains(&node.uid) || tagged_sections.contains(&node.uid));
+}
+
 /// Greedy token-budget selection: include nodes in PPR-rank order until the
 /// next one would exceed the budget. Returns the count of nodes to take.
 /// Token cost per node = (rendered length) / 4 — the standard cheap estimate.
@@ -24926,12 +25573,63 @@ fn print_clusters_output_with_total(
 /// "blast radius" fails a direct lookup against the symbol `blast_radius` yet
 /// its semantic hits are excellent, so labelling them guesses would understate
 /// them exactly as counting them as direct matches overstated them.
-fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
+///
+/// nw-393: the header also carries the SEED-RESOLUTION disclosure, because
+/// `Seeds (5 resolved)` for a name that matched 200 symbols is
+/// indistinguishable from a name that genuinely has five definitions. The
+/// machine payloads (`seed_matches_total`, `seed_matches_total_relation`,
+/// `seeds_truncated`, `seed_resolution_limit`) already say the set was cut; a
+/// human line that does not is the human-vs-machine split nw-259(a) ruled
+/// against — the prose must not claim something the payload contradicts.
+/// Shared with `print_context_text` rather than given a second spelling: two
+/// surfaces drifting apart about the same query is the failure mode being
+/// fixed, not a shape to reproduce.
+fn seed_header(
+    total_seeds: usize,
+    semantic_seeds: usize,
+    seed_matches_total: Option<usize>,
+    seed_matches_total_relation: Option<&str>,
+    seeds_truncated: Option<bool>,
+) -> String {
     let matched = total_seeds.saturating_sub(semantic_seeds);
-    if semantic_seeds > 0 {
-        format!("Seeds ({matched} matched directly, {semantic_seeds} via semantic search):")
+    // Annotate ONLY when the cap actually BIT. `Some(false)` — a name with
+    // exactly `SEED_NAME_MATCH_LIMIT` definitions, all of them resolved — and
+    // `None` — no bare-name input reached symbol search at all, e.g. a `sym:`
+    // UID or note-title seed, where the cap was never in force — both leave
+    // the line byte-identical to before. "5 of 5" is noise and "0 of 0" is a
+    // false cut claim about an exhaustive seed form; either one trains the
+    // reader to skip the clause that matters.
+    let (of_total, cap) = if seeds_truncated == Some(true) {
+        let of_total = match (seed_matches_total, seed_matches_total_relation) {
+            // `gte` means the counted search stopped at
+            // `SYMBOL_SEARCH_COUNT_CAP`, so the number is a LOWER BOUND and
+            // printing it as exact would replace one false precision with
+            // another. Same wording `brain search` already uses for a `gte`
+            // total ("N of at least M result(s)"), so there is one human
+            // spelling of "this count is a floor", not two.
+            (Some(total), Some("gte")) => format!(" of at least {total}"),
+            (Some(total), _) => format!(" of {total}"),
+            // Flag set, count absent: a producer that predates the count, or a
+            // daemon payload that carried one field and not the other. Name the
+            // cut — it is the load-bearing half — but do not invent a total.
+            (None, _) => String::new(),
+        };
+        (of_total, ", seed-resolution cap")
     } else {
-        format!("Seeds ({matched} resolved):")
+        (String::new(), "")
+    };
+    if semantic_seeds > 0 {
+        // The cap bounds the DIRECT name-match leg only; semantic hits are
+        // injected by KNN and are not subject to it, so the `of N` rides on the
+        // "matched directly" count and never on the semantic one.
+        format!(
+            "Seeds ({matched}{of_total} matched directly, \
+             {semantic_seeds} via semantic search{cap}):"
+        )
+    } else if of_total.is_empty() {
+        format!("Seeds ({matched} resolved{cap}):")
+    } else {
+        format!("Seeds ({matched}{of_total}{cap}):")
     }
 }
 
@@ -24952,9 +25650,19 @@ fn print_brain_context_text(
     // both as "resolved" made the output contradict itself: a nonsense query
     // printed `Seeds (5 resolved)` while ALSO listing that same query under
     // `Unresolved seeds (1)`. Report the two separately.
+    // nw-393 rides on the same line: the seed set is also cut by the
+    // per-input name-match cap, and this route resolves seeds through its own
+    // loop, so the disclosure has to be attached here too or `brain context`
+    // and `context` would disagree about an identical query.
     println!(
         "{}",
-        seed_header(result.seeds.len(), result.semantic_seed_count)
+        seed_header(
+            result.seeds.len(),
+            result.semantic_seed_count,
+            result.seed_matches_total,
+            result.seed_matches_total_relation.as_deref(),
+            result.seeds_truncated,
+        )
     );
     for n in &result.seeds {
         if n.location.is_empty() {
@@ -26493,17 +27201,195 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
         let error = require_openable_db(&directory).unwrap_err().to_string();
         assert!(error.contains("is a directory"), "{error}");
 
-        // A zero-byte file is what an interrupted create leaves and what the
-        // store itself initialises. Refusing it would break creation.
+        // nw-385: a zero-byte file is now REFUSED, because every caller of
+        // this guard is a read and "the store initialises it" is precisely
+        // what a read must never do. Fully asserted in
+        // `a_zero_byte_db_is_refused_on_the_read_path_without_writing_to_it`;
+        // named here so this inventory of shapes stays complete.
         let empty = dir.path().join("empty.lbug");
         std::fs::write(&empty, b"").unwrap();
-        require_openable_db(&empty).expect("an empty file is the store's business");
+        let error = require_openable_db(&empty).unwrap_err().to_string();
+        assert!(error.contains("no graph schema"), "{error}");
 
         // And a real header passes, so the guard cannot be satisfied by
         // rejecting everything.
         let real = dir.path().join("real.lbug");
         std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
         require_openable_db(&real).expect("a real LadybugDB header must pass");
+    }
+
+    /// nw-385. A READ command WROTE, and what it wrote over was a file the
+    /// user had made themselves.
+    ///
+    /// Reproduced verbatim before the fix: `: > important-notes.txt` then
+    /// `nestweaver search --db ./important-notes.txt user` turned the 0-byte
+    /// file into a 4096-byte LadybugDB, dropped `.publications/`, `.tantivy/`,
+    /// `.wal` and `.write.lock` next to it, left a daemon running against it,
+    /// and exited **0** with "No symbols found matching 'user'." The guard was
+    /// the one thing standing between a read and that route, and it waved the
+    /// file through on purpose.
+    ///
+    /// So this asserts all three halves of the DONE WHEN — refused, named
+    /// `db_no_schema`, and the file byte-for-byte untouched — plus the
+    /// counterweights that keep the other `--db` shapes exactly as they were.
+    #[test]
+    fn a_zero_byte_db_is_refused_on_the_read_path_without_writing_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("important-notes.txt");
+        std::fs::write(&notes, b"").unwrap();
+
+        let error = require_openable_db(&notes).unwrap_err();
+
+        // The typed variant, not a lookalike sentence: `into_diagnostic`
+        // renders `nestweaver::db_no_schema` from the TYPE, and
+        // `error_remedy_test::a_zero_length_database_says_what_to_run` greps
+        // stderr for that code.
+        let diagnostic = error
+            .downcast_ref::<CliDiagnostic>()
+            .expect("the refusal must carry its code, not just its words");
+        assert!(
+            matches!(diagnostic, CliDiagnostic::DatabaseNoSchema { .. }),
+            "expected db_no_schema, got {diagnostic:?}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("no graph schema"), "{message}");
+
+        // What the operator actually sees. The size is the diagnosis and the
+        // remedy has to be runnable — the same two facts
+        // `error_remedy_test::a_zero_length_database_says_what_to_run` greps
+        // for, asserted here so the wiring cannot rot silently between the
+        // guard, the pass-through arm and the rendered report.
+        let rendered = format!("{:?}", into_diagnostic(error));
+        assert!(rendered.contains("nestweaver::db_no_schema"), "{rendered}");
+        assert!(rendered.contains("0 bytes"), "{rendered}");
+        assert!(rendered.contains("nestweaver index"), "{rendered}");
+
+        // The point of the item: the file is still the user's empty file.
+        let after = std::fs::metadata(&notes).unwrap();
+        assert_eq!(after.len(), 0, "a read guard must not have written a byte");
+
+        // …and no sidecar was materialised beside it. `.tantivy`,
+        // `.publications`, `.wal` and `.write.lock` are the four the repro
+        // produced; asserting the directory is otherwise empty catches any
+        // fifth a future route might add.
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "a refused read left artifacts behind: {siblings:?}"
+        );
+
+        // COUNTERWEIGHT 1 — the refusal must not swallow the whole read
+        // surface. A real database still passes the guard untouched.
+        let real = dir.path().join("real.lbug");
+        std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
+        require_openable_db(&real).expect("a real LadybugDB header must still pass");
+
+        // COUNTERWEIGHT 2 — the four shapes nw-385 explicitly says are handled
+        // WELL today keep their own accurate, distinct sentences. A single
+        // catch-all refusal would pass the assertions above and destroy these.
+        let missing = dir.path().join("nope.lbug");
+        assert!(
+            require_openable_db(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("not found")
+        );
+        let text = dir.path().join("fake.lbug");
+        std::fs::write(&text, b"hello not a db").unwrap();
+        assert!(
+            require_openable_db(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("not a NestWeaver database")
+        );
+        let directory = dir.path().join("adir.lbug");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            require_openable_db(&directory)
+                .unwrap_err()
+                .to_string()
+                .contains("is a directory")
+        );
+    }
+
+    /// nw-385, the adjacent leg. `--db /dev/null` reads EOF, so it took the
+    /// zero-byte exemption and then paid the FULL 30s daemon-boot ceiling
+    /// before failing — the exact cost nw-309 was written to eliminate — and
+    /// registered a launchd instance directory for `/dev/null` on the way.
+    ///
+    /// It is refused by shape now, before any dial. `/dev/null` is not a
+    /// regular file, so it earns the "point --db somewhere else" sentence
+    /// rather than an `index` invocation that could never help it.
+    #[cfg(unix)]
+    #[test]
+    fn a_character_device_db_is_refused_by_shape_rather_than_by_daemon_timeout() {
+        let error = require_openable_db(std::path::Path::new("/dev/null"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a NestWeaver database"), "{error}");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    /// nw-385 COUNTERWEIGHT for the create path, which must keep today's
+    /// behaviour.
+    ///
+    /// The exemption that was removed justified itself with "the store
+    /// initialises it", and that sentence is TRUE — it is just true of the
+    /// create path, which never consulted the guard. Asserted here, where it
+    /// holds, so a future change that breaks `index` against an interrupted
+    /// create fails a test instead of the user.
+    #[test]
+    fn the_create_path_still_initialises_a_zero_byte_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("interrupted.lbug");
+        std::fs::write(&empty, b"").unwrap();
+
+        // This is what `index` does with a zero-byte `--db`: a read-write open,
+        // no guard in front of it.
+        let store = GraphStore::open(&empty).expect("the store initialises a zero-byte file");
+        drop(store);
+
+        assert!(
+            std::fs::metadata(&empty).unwrap().len() > 0,
+            "the create path must still turn a zero-byte file into a database"
+        );
+        require_openable_db(&empty)
+            .expect("and the database it created is then readable by the guard");
+    }
+
+    /// nw-385. The daemon leg, which is where the damage actually happened:
+    /// `try_hybrid_json_rpc_checked` autostarts a daemon, and an autostarted
+    /// daemon opens the store READ-WRITE, which is what materialised a database
+    /// on top of the user's file. The guard has to fire before the dial, not
+    /// after it.
+    #[test]
+    fn a_zero_byte_db_is_refused_before_any_daemon_can_be_dialled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("zero.lbug");
+        std::fs::write(&db, b"").unwrap();
+
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &db,
+            None,
+            "search_symbols",
+            serde_json::json!({ "query": "user" }),
+        )
+        .expect_err("a zero-byte --db must not reach the daemon route");
+        assert!(
+            format!("{error:#}").contains("no graph schema"),
+            "{error:#}"
+        );
+
+        // The daemon opens read-write; if one had been dialled and started,
+        // the file would no longer be empty and its sidecars would exist.
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), 0);
+        assert!(!dir.path().join("zero.lbug.tantivy").exists());
+        assert!(!dir.path().join("zero.lbug.publications").exists());
     }
 
     /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
@@ -27269,6 +28155,34 @@ fn brain_context_json_value(
         "degraded_components": result.degraded_components,
     });
 
+    // nw-393. The SEED cap, one layer upstream of the connected-list disclosure
+    // above. `seeds_expanded` alone cannot distinguish a name with five
+    // definitions from a name with two hundred, and `truncated_by: "limit"`
+    // MISDIRECTS here, because no caller-settable knob can recover a seed that
+    // was never resolved.
+    //
+    // Independent fields rather than a `truncated_by: "seed_resolution"`
+    // variant, deliberately: the two caps do NOT compose. `truncated_by:
+    // "limit"` stays a correct, actionable statement about `connected` even
+    // when the seed set was separately cut, so folding them into one scalar
+    // would have to discard one true answer to state the other.
+    //
+    // Emitted only when the cap was IN FORCE (a uid-form seed is exhaustive and
+    // reports nothing), so a "0 of 0" is never printed for a seed form the cap
+    // cannot bound.
+    if let Some(total) = result.seed_matches_total {
+        resp["seed_matches_total"] = serde_json::json!(total);
+    }
+    if let Some(relation) = result.seed_matches_total_relation.as_deref() {
+        resp["seed_matches_total_relation"] = serde_json::json!(relation);
+    }
+    if let Some(t) = result.seeds_truncated {
+        resp["seeds_truncated"] = serde_json::json!(t);
+    }
+    if let Some(l) = result.seed_resolution_limit {
+        resp["seed_resolution_limit"] = serde_json::json!(l);
+    }
+
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
     }
@@ -27303,6 +28217,14 @@ mod context_json_renderer_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec!["semantic".to_string()],
+            // nw-393 added the seed-cap disclosure to `BrainContextResult`.
+            // This fixture is about the SEMANTIC degradation contract, so the
+            // cap fields stay at their "no bare-name seed was capped" values —
+            // the disclosure has its own tests.
+            seed_matches_total: None,
+            seed_matches_total_relation: None,
+            seeds_truncated: None,
+            seed_resolution_limit: None,
         }
     }
 
@@ -33041,7 +33963,7 @@ credential_method = "ssh"
     #[test]
     fn seed_header_never_counts_semantic_hits_as_resolved() {
         // The reported case: nothing matched, five nearest neighbours injected.
-        let h = seed_header(5, 5);
+        let h = seed_header(5, 5, None, None, None);
         assert!(h.contains("0 matched directly"), "{h}");
         assert!(h.contains("5 via semantic search"), "{h}");
         assert!(
@@ -33050,10 +33972,10 @@ credential_method = "ssh"
         );
 
         // Genuine direct matches, no semantic leg.
-        assert_eq!(seed_header(3, 0), "Seeds (3 resolved):");
+        assert_eq!(seed_header(3, 0, None, None, None), "Seeds (3 resolved):");
 
         // Mixed: two direct, three semantic.
-        let m = seed_header(5, 3);
+        let m = seed_header(5, 3, None, None, None);
         assert!(
             m.contains("2 matched directly") && m.contains("3 via semantic search"),
             "{m}"
@@ -33064,8 +33986,80 @@ credential_method = "ssh"
     /// older payload must not underflow the subtraction.
     #[test]
     fn seed_header_does_not_underflow_on_inconsistent_counts() {
-        let h = seed_header(2, 9);
+        let h = seed_header(2, 9, None, None, None);
         assert!(h.contains("0 matched directly"), "{h}");
+    }
+
+    /// nw-393: the human line must not claim something the machine payload
+    /// beside it contradicts. `search validate --limit 200` reports >=200
+    /// symbols named `validate`, the seed cap keeps 5, and the JSON twin says
+    /// so via `seed_matches_total` / `seeds_truncated` — the text renderer
+    /// printed a bare `Seeds (5 resolved):`, which reads exactly like a name
+    /// that genuinely has five definitions.
+    #[test]
+    fn a_cut_seed_set_cannot_print_as_an_exhaustive_one() {
+        let h = seed_header(5, 0, Some(200), Some("eq"), Some(true));
+        assert_eq!(h, "Seeds (5 of 200, seed-resolution cap):");
+        assert!(
+            !h.contains("5 resolved"),
+            "a cut seed set must not read as a resolved-in-full one: {h}"
+        );
+
+        // The mixed case: the cap bounds the DIRECT leg only, so the `of N`
+        // must ride on the matched-directly count, never on the semantic one.
+        let m = seed_header(5, 3, Some(200), Some("eq"), Some(true));
+        assert_eq!(
+            m,
+            "Seeds (2 of 200 matched directly, 3 via semantic search, seed-resolution cap):"
+        );
+    }
+
+    /// nw-393: past `SYMBOL_SEARCH_COUNT_CAP` the store stops counting and
+    /// reports `gte`, so the total is a LOWER BOUND. Printing it as exact
+    /// would swap one false precision for another.
+    #[test]
+    fn a_lower_bound_seed_total_is_never_printed_as_an_exact_count() {
+        let h = seed_header(5, 0, Some(200), Some("gte"), Some(true));
+        assert_eq!(h, "Seeds (5 of at least 200, seed-resolution cap):");
+        assert!(
+            !h.contains("of 200"),
+            "a gte total must not be stated as an exact one: {h}"
+        );
+    }
+
+    /// COUNTERWEIGHT for nw-393, both halves. The disclosure must not
+    /// over-apply: when the cap did not bite, and when the cap was never in
+    /// force at all, the line is byte-identical to what it printed before.
+    #[test]
+    fn a_seed_set_the_cap_did_not_cut_prints_the_unchanged_line() {
+        // Cap IN FORCE and did not reach — a name with exactly
+        // `SEED_NAME_MATCH_LIMIT` definitions, all five resolved. "5 of 5" is
+        // noise, so the wording is unchanged.
+        assert_eq!(
+            seed_header(5, 0, Some(5), Some("eq"), Some(false)),
+            "Seeds (5 resolved):"
+        );
+
+        // Cap NOT APPLICABLE — a `sym:` UID seed never reaches the name
+        // search, so all three fields are absent. This is the case that must
+        // never print "0 of 0" about an exhaustive seed form.
+        assert_eq!(seed_header(2, 0, None, None, None), "Seeds (2 resolved):");
+        assert_eq!(seed_header(0, 0, None, None, None), "Seeds (0 resolved):");
+
+        // Semantic provenance (nw-102) survives untouched in both.
+        assert_eq!(
+            seed_header(5, 3, Some(5), Some("eq"), Some(false)),
+            "Seeds (2 matched directly, 3 via semantic search):"
+        );
+    }
+
+    /// Defensive twin of the underflow test: a daemon payload that carried the
+    /// flag but not the count must still disclose the cut, and must not invent
+    /// a total to do it.
+    #[test]
+    fn a_cut_seed_set_without_a_total_names_the_cap_without_inventing_a_number() {
+        let h = seed_header(5, 0, None, None, Some(true));
+        assert_eq!(h, "Seeds (5 resolved, seed-resolution cap):");
     }
 
     /// nw-123: the impact envelope's key set must not depend on which
@@ -37192,6 +38186,497 @@ mod render_cost_parity_tests {
              nodes for the same budget ({at_detailed_rate} vs \
              {at_concise_rate}) — that gap IS the reported item-count \
              divergence between the two routes"
+        );
+    }
+}
+
+/// nw-405 / nw-406 / nw-407 — the CLI half of `brain context`'s scope filters.
+///
+/// The predicates these replace were a case-SENSITIVE substring match over
+/// uid-or-location, a bare `starts_with` on `path_prefix`, and a `tags` filter
+/// that passed every Symbol through unconditionally. The MCP twins are pinned
+/// by the same assertions in `crates/nestweaver-mcp/src/tools.rs`; the two
+/// suites are deliberately parallel, because the reported symptom was the two
+/// surfaces answering differently for ONE flag value.
+#[cfg(test)]
+mod brain_context_scope_filter_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const REPO_A: &str = "repo:default:aaaaaaaaaaaa";
+    const REPO_B: &str = "repo:default:bbbbbbbbbbbb";
+    const VAULT: &str = "vlt:default:cccccccccccc";
+
+    fn node(uid: &str, kind: &str, location: &str) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: "t".to_string(),
+            location: location.to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    /// A fixture built so the OLD predicate gets each leg wrong:
+    ///
+    ///  * repo A's symbol has a repo-relative location that never contains
+    ///    "aaaaaaaaaaaa" — the under-include leg;
+    ///  * repo B's symbol sits under `vendor/alpha/`, so a location substring
+    ///    pulls it into a scope it does not belong to;
+    ///  * the note lives under `Workspaces/Alpha/`, so a location substring
+    ///    keeps it even though it belongs to no repo at all;
+    ///  * the tag carries `location: ""`, which every `path_prefix` deleted.
+    fn mixed_nodes() -> Vec<nestweaver_engine::BrainNode> {
+        vec![
+            node(&format!("sym:{REPO_A}:f1:n1:10"), "Symbol", "src/lib.rs"),
+            node(
+                &format!("sym:{REPO_B}:f2:n2:20"),
+                "Symbol",
+                "vendor/alpha/shim.rs",
+            ),
+            node(
+                &format!("note:{VAULT}:n1"),
+                "Note",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(
+                &format!("sec:note:{VAULT}:n1:1:abc"),
+                "Section",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(&format!("tag:{VAULT}:t1"), "Tag", ""),
+        ]
+    }
+
+    fn uids(nodes: &[nestweaver_engine::BrainNode]) -> Vec<String> {
+        nodes.iter().map(|n| n.uid.clone()).collect()
+    }
+
+    fn store_with_two_repos_named_website() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, url, name) in [
+            (REPO_A, "https://github.com/coyote/website", "website"),
+            (REPO_B, "https://github.com/wavelength/website", "website"),
+        ] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "deadbeef".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: Some(name.to_string()),
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-405, all three keep/drop legs at once.
+    ///
+    /// COUNTERWEIGHT: scoping to repo B must SELECT repo B's symbol. Without
+    /// that half, a filter that simply deleted everything would pass the "no
+    /// foreign rows" assertion.
+    #[test]
+    fn a_repos_scope_keeps_the_named_repos_own_symbols_and_no_one_elses() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_A}:f1:n1:10")],
+            "repo A's own symbol must survive despite a repo-relative location \
+             that never contains its repo name, and nothing else may"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_B.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_B}:f2:n2:20")],
+            "the filter must SELECT by owner, not merely delete"
+        );
+    }
+
+    /// nw-405's recorded vault decision, pinned so it cannot be reverted by
+    /// accident: `--repos` drops vault content because a note belongs to a
+    /// vault and to no repo. On a consulting vault the old behaviour returned
+    /// clientB's notes for `--repos clientA`.
+    ///
+    /// COUNTERWEIGHT: the UNFILTERED list carries every one of those rows, so
+    /// the drop is attributable to the scope flag and not to the fixture.
+    #[test]
+    fn a_repos_scope_drops_vault_content_that_merely_mentions_the_repo_in_its_path() {
+        assert_eq!(
+            mixed_nodes().len(),
+            5,
+            "the fixture must carry the vault rows this test claims are dropped"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert!(
+            !nodes.iter().any(|n| n.uid.starts_with("note:")
+                || n.uid.starts_with("sec:")
+                || n.uid.starts_with("tag:")),
+            "vault content belongs to no repo and must not pass a repo scope: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// The mirror image, so `--vaults` is a scope in the same sense.
+    #[test]
+    fn a_vaults_scope_keeps_that_vaults_content_and_drops_repo_symbols() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(&mut nodes, &HashSet::from([VAULT.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![
+                format!("note:{VAULT}:n1"),
+                format!("sec:note:{VAULT}:n1:1:abc"),
+                format!("tag:{VAULT}:t1"),
+            ],
+            "notes, sections and tags are vault-owned; symbols are not"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(
+            &mut nodes,
+            &HashSet::from(["vlt:default:999999999999".to_string()]),
+        );
+        assert!(
+            nodes.is_empty(),
+            "a vault nobody owns must select nothing, not everything"
+        );
+    }
+
+    /// nw-406. `--path-prefix` must not silently delete a whole KIND it has no
+    /// way to judge — all 606 tags in the measured vault vanished this way.
+    ///
+    /// COUNTERWEIGHT: a node that HAS a path and does not match is still
+    /// dropped. The exemption is for "no path concept", not for everything.
+    #[test]
+    fn a_path_prefix_exempts_nodes_with_no_path_but_still_drops_non_matching_paths() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_under_path_prefix(&mut nodes, "Workspaces/");
+        assert!(
+            nodes.iter().any(|n| n.uid.starts_with("tag:")),
+            "a Tag carries location \"\"; \"\".starts_with(prefix) is false, which \
+             deleted every tag in the vault: {:?}",
+            uids(&nodes)
+        );
+        assert!(
+            !nodes.iter().any(|n| n.location == "src/lib.rs"),
+            "a node with a real, non-matching path must still be dropped: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// nw-407. `--tags` is a FILTER, so a Symbol — which cannot carry a tag —
+    /// cannot satisfy it. The old `if kind.contains("symbol") { return true }`
+    /// made the flag an expansion: measured 30 -> 71 rows, of which 70 were
+    /// untagged symbols eating the token budget the tagged notes asked for.
+    ///
+    /// COUNTERWEIGHT: a tagged note is KEPT, so the filter selects rather than
+    /// merely emptying the list.
+    #[test]
+    fn a_tags_scope_drops_symbols_and_keeps_the_content_that_carries_the_tag() {
+        let mut nodes = mixed_nodes();
+        retain_tagged_nodes(
+            &mut nodes,
+            &HashSet::from([format!("note:{VAULT}:n1")]),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("note:{VAULT}:n1")],
+            "only the tagged note carries the tag; the two symbols cannot"
+        );
+    }
+
+    /// An unattributable UID is dropped rather than kept, matching nw-403's
+    /// redactor: "I cannot tell what owns this" is not a reason to return it
+    /// under a scope argument.
+    #[test]
+    fn an_unattributable_uid_survives_no_scope_at_all() {
+        assert_eq!(node_owner("proj:default:abc"), NodeOwner::Unattributable);
+        assert_eq!(node_owner("banana"), NodeOwner::Unattributable);
+        assert_eq!(
+            node_owner(&format!("sym:{REPO_A}:f:n:1")),
+            NodeOwner::Repo(REPO_A.to_string())
+        );
+        assert_eq!(
+            node_owner(&format!("head:note:{VAULT}:n1:h:3")),
+            NodeOwner::Vault(VAULT.to_string())
+        );
+    }
+
+    /// nw-405 legs (2) and (4): a colliding display name must FAIL naming both
+    /// candidates rather than quietly merging two tenants, and the documented
+    /// UID form must resolve — it used to answer `connected: 0`.
+    #[test]
+    fn a_colliding_repo_name_is_refused_while_the_documented_uid_form_resolves() {
+        let store = store_with_two_repos_named_website();
+
+        let err = resolve_repo_filter(&store, &["website".to_string()])
+            .expect_err("two repos share this display name; merging them silently is the bug")
+            .to_string();
+        assert!(
+            err.contains("ambiguous") && err.contains(REPO_A) && err.contains(REPO_B),
+            "the error must name both candidates so the caller can disambiguate: {err}"
+        );
+
+        // COUNTERWEIGHT: the disambiguated form the error recommends works.
+        assert_eq!(
+            resolve_repo_filter(&store, &[REPO_A.to_string()]).unwrap(),
+            HashSet::from([REPO_A.to_string()])
+        );
+    }
+
+    /// nw-405: an entry that names no repo is an ERROR. The old predicate
+    /// matched nothing and returned a confident empty result, which a caller
+    /// reads as "this repo has no relevant content" rather than "you named a
+    /// repo that is not here".
+    #[test]
+    fn an_unresolvable_repos_entry_errors_instead_of_matching_nothing() {
+        let store = store_with_two_repos_named_website();
+        let err = resolve_repo_filter(&store, &["not-a-repo".to_string()])
+            .expect_err("an unresolvable scope must not silently answer")
+            .to_string();
+        assert!(
+            err.contains("not-a-repo"),
+            "the error must name the entry that failed: {err}"
+        );
+    }
+
+    /// The `--vaults` contract, plus the CASE leg that made the two surfaces
+    /// disagree: the old CLI predicate was `contains`, case-SENSITIVE, while
+    /// MCP's was `to_lowercase().contains`. `--vaults BRAIN` therefore answered
+    /// one way through the daemon and another through this path, for one flag
+    /// value. Both resolvers are now case-insensitive on the name leg.
+    #[test]
+    fn an_unresolvable_vaults_entry_errors_while_a_real_vault_resolves_in_any_case() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: VAULT.to_string(),
+                name: "brain".to_string(),
+                root_path: "/home/k/brain".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+
+        let err = resolve_vault_filter(&store, &["nope".to_string()])
+            .expect_err("an unresolvable vault scope must not silently answer")
+            .to_string();
+        assert!(
+            err.contains("nope") && err.contains("brain"),
+            "the error must name the failed entry and the known vaults: {err}"
+        );
+
+        for selector in [VAULT, "brain", "BRAIN", "/home/k/brain"] {
+            assert_eq!(
+                resolve_vault_filter(&store, &[selector.to_string()]).unwrap(),
+                HashSet::from([VAULT.to_string()]),
+                "selector {selector:?} must resolve"
+            );
+        }
+    }
+}
+
+/// nw-412 — `affected-tests` REFUSES and `pr-impact` DEGRADES on a graph whose
+/// edges predate the running resolver.
+///
+/// Both directions matter and they are different contracts: a test selector
+/// that silently narrows drops the regression test that would have caught the
+/// change, with nothing downstream able to tell that from "no tests exist".
+#[cfg(test)]
+mod resolver_generation_gate_tests {
+    use super::*;
+    use nestweaver_engine::blast_radius::{AnalysisStatus, BlastRadiusResult};
+    use nestweaver_engine::resolver_generation::{self, DeadCodeRefusal};
+
+    const REPO: &str = "repo:default:aaaaaaaaaaaa";
+
+    fn repo_row(root: &std::path::Path) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: REPO.to_string(),
+            url: "https://github.com/example/demo".to_string(),
+            indexed_sha: "deadbeef".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: Some("demo".to_string()),
+            root_path: Some(root.display().to_string()),
+        }
+    }
+
+    fn store_with_one_repo(root: &std::path::Path) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo_row(root)).unwrap();
+        store
+    }
+
+    /// A run that reported the clean gate this item is about: `Complete`,
+    /// `Ok`, `Low`, nothing affected — the exact shape `print_pr_impact_hook`
+    /// prints NOTHING for.
+    fn clean_result() -> BlastRadiusResult {
+        BlastRadiusResult {
+            changed_symbols: Vec::new(),
+            affected_symbols: Vec::new(),
+            affected_symbol_count: 0,
+            affected_clusters: Vec::new(),
+            risk_level: RiskLevel::Low,
+            summary: "1 changed symbol, 0 affected".to_string(),
+            org_wide: None,
+            status: AnalysisStatus::Complete,
+            notifications: Vec::new(),
+            gate_state: GateState::Ok,
+            coverage: nestweaver_engine::blast_radius::Coverage::default(),
+            blind_spots: Vec::new(),
+            cochanged_files: Vec::new(),
+            analysis_direction: "over-approximate".to_string(),
+        }
+    }
+
+    /// The direction that made nw-412 dangerous: a stale graph understates
+    /// impact, and the run that understates it most is the one that looks
+    /// cleanest. After the degrade it cannot report `ok` at all, which is also
+    /// what breaks `print_pr_impact_hook`'s silence — that banner is skipped
+    /// only for `gate_state == Ok && risk_level == Low && nothing affected`,
+    /// and a stale graph is exactly the run most likely to look like that.
+    #[test]
+    fn a_generation_stale_graph_cannot_report_a_clean_blast_radius_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        // No sidecar written: an unrecorded repo reads as generation 0, which
+        // is the "indexed before this record existed" case by definition.
+
+        let mut result = clean_result();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert_eq!(
+            result.gate_state,
+            GateState::DegradedUnknown,
+            "a run that did not complete is `degraded-unknown`, never `ok`"
+        );
+        assert_ne!(
+            result.gate_state,
+            GateState::Ok,
+            "`print_pr_impact_hook` is silent on an Ok/Low/empty run — the whole \
+             point is that a stale graph must no longer reach that branch"
+        );
+        assert!(
+            result.notifications.iter().any(|n| {
+                n.descriptor == BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR
+                    && matches!(n.level, NotificationLevel::Error)
+            }),
+            "the reason must be a NAMED error notification, not an unexplained \
+             degrade: {:?}",
+            result.notifications
+        );
+        assert!(
+            result.summary.contains("[status: degraded]"),
+            "the human summary must not still claim a clean run: {}",
+            result.summary
+        );
+    }
+
+    /// COUNTERWEIGHT, and the assertion nw-412 explicitly requires: a
+    /// generation-CURRENT graph must NOT degrade. Without this, wiring that
+    /// degraded unconditionally would pass every test above while making the
+    /// gate useless.
+    #[test]
+    fn a_generation_current_graph_still_reports_its_own_clean_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        let mut result = clean_result();
+        let before = result.summary.clone();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.gate_state, GateState::Ok);
+        assert!(
+            result.notifications.is_empty(),
+            "a current graph must not be told it is stale: {:?}",
+            result.notifications
+        );
+        assert_eq!(result.summary, before, "the summary must not be re-tagged");
+    }
+
+    /// `affected-tests` refuses rather than degrades, and the refusal has to
+    /// be readable by the CI job that consumes it: no tiers at all (an empty
+    /// tier list is a CLAIM, and the wrong one), `needs_reindex` for the gate
+    /// that already keys on it, and `run-full-suite` as the widening a caller
+    /// acts on.
+    ///
+    /// The `note` check is the one this item names specifically: reusing
+    /// `DeadCodeRefusal::message()` verbatim would print "dead-code will not
+    /// produce a list…" in front of the right remedies.
+    #[test]
+    fn an_affected_tests_refusal_says_run_the_full_suite_and_carries_no_tiers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let repos = vec![repo_row(tmp.path())];
+
+        let refusal = DeadCodeRefusal::for_repos(&db_path, &repos)
+            .expect("an unrecorded repo is generation 0 and therefore stale");
+        let payload = affected_tests_refusal_payload(&refusal);
+
+        assert_eq!(payload["refused"], serde_json::json!(true));
+        assert_eq!(payload["reason"], serde_json::json!("outdated_resolver"));
+        assert_eq!(payload["needs_reindex"], serde_json::json!(true));
+        assert_eq!(
+            payload["recommendation"],
+            serde_json::json!("run-full-suite"),
+            "a caller that keys off `did I get tiers` reads a refusal as `no \
+             tests affected` — the exact silent narrowing this prevents"
+        );
+        for tier in ["tier_1", "tier_2", "tier_3"] {
+            assert!(
+                payload.get(tier).is_none(),
+                "{tier} must be ABSENT; an empty list is a claim and it is wrong"
+            );
+        }
+
+        let note = payload["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("affected-tests will not produce a selection"),
+            "the refusal must use the affected-tests wording, not dead-code's: {note}"
+        );
+        assert!(
+            !note.contains("dead-code"),
+            "dead-code's sentence is the wrong one in front of these remedies: {note}"
+        );
+        assert!(
+            note.contains("--force"),
+            "the remedy must be runnable: a plain re-index is a no-op on a \
+             generation-stale repo that is already at HEAD: {note}"
+        );
+        // The daemon route prints what it was sent; the extractor must find
+        // exactly this paragraph rather than falling back.
+        assert_eq!(affected_tests_refusal_note(&payload), note);
+    }
+
+    /// COUNTERWEIGHT for the selector: a generation-CURRENT graph produces no
+    /// refusal at all, so `affected-tests` still answers. A selector that
+    /// refuses unconditionally is safe and useless.
+    #[test]
+    fn a_generation_current_graph_produces_no_affected_tests_refusal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let repos = vec![repo_row(tmp.path())];
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        assert!(
+            DeadCodeRefusal::for_repos(&db_path, &repos).is_none(),
+            "a repo recorded at the current generation must not refuse"
         );
     }
 }

@@ -504,6 +504,61 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
     load_bundle_store(db_path).bundles.remove(bundle_id)
 }
 
+/// Fail a ranked query closed while an index publication is in flight.
+///
+/// nw-384. The contract is stated verbatim in four operator-facing places —
+/// `repair --help` (`src/main.rs`), the `investigate` MCP tool description
+/// (`nestweaver-mcp/src/tools.rs`) and the daemon's (`server.rs`) — all of the
+/// form "every ranked query (brain_context, project_context, investigate)
+/// fails closed ... because the PageRank and generation sidecars may predate
+/// the committed graph". `investigate` was named in all four and honoured none
+/// of them, because it never reaches the guard that enforces it for `context`:
+///
+/// * `context` errors through `personalized_pagerank_with_intent`, which
+///   returns `Err(RankingUnavailable)` on a dirty marker.
+/// * `investigate`'s seed path lands on the SILENT-EMPTY guards instead —
+///   `symbols_by_pagerank` -> `Ok(vec![])`, `pagerank_scores` -> an empty map —
+///   and then, when hybrid retrieval bails, on a BM25 fallback with no
+///   publication check at all.
+///
+/// That split gives the SAME bug two opposite faces, and both were observed on
+/// the same build: on a small graph, `returned: 0, dropped_reasons: {}` at exit
+/// 0 — a "this code does not exist" answer; on the 193k-node live graph, a
+/// fully populated `returned: 30, total: 30, truncated: false` at exit 0,
+/// ranked against sidecars the guard itself declares untrustworthy. **The
+/// populated face is the worse one**, because an empty map invites suspicion
+/// and a complete-looking one does not.
+///
+/// Deliberately the STORE's own condition (`is_index_publication_dirty`) and
+/// the STORE's own error, not a second formulation: `classify_index_publication_error`
+/// at the MCP boundary keys on the substring "index publication", so reusing
+/// `RankingUnavailable` is what makes `investigate` produce the identical
+/// TRANSIENT/WEDGED message `context` produces rather than a near-miss of it.
+/// An in-memory store has no marker and is never dirty, so this is inert there.
+fn ensure_ranking_publication_clean(store: &GraphStore) -> Result<(), anyhow::Error> {
+    if store.is_index_publication_dirty() {
+        return Err(anyhow::anyhow!(
+            nestweaver_store::StoreError::RankingUnavailable
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a retrieval failure is the fail-closed publication guard rather
+/// than an ordinary "no seeds resolved" miss.
+///
+/// nw-384. `investigate` used to match `Err(_)` and fall through to BM25, so a
+/// guard firing DEEPER in retrieval was converted into a successful-looking
+/// answer — the exact inversion the guard exists to prevent. Matched on the
+/// rendered chain (`{:#}`) rather than by downcast because the error crosses
+/// `build_brain_context_hybrid_with_aliases`'s `anyhow` boundary, where it may
+/// already have been wrapped in context; the substring is the same one
+/// `classify_index_publication_error` keys on, so the two cannot drift apart
+/// on one route and not the other.
+fn is_index_publication_failure(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("index publication")
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Run an investigation: hybrid retrieval → domain grouping → inline bodies →
@@ -538,6 +593,14 @@ pub fn investigate(
     let budget = token_budget
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
         .min(MAX_TOKEN_BUDGET);
+
+    // 0. nw-384. Fail closed BEFORE any retrieval, exactly as `context` does.
+    //    This has to be an up-front refusal and not an after-the-fact check on
+    //    the results, because the two faces of this bug are contradictory:
+    //    "empty" and "fully populated" are both wrong here, and no assertion
+    //    about the RESULT can reject both. The only thing they share is the
+    //    condition, so the condition is what is tested.
+    ensure_ranking_publication_clean(store)?;
 
     // 1. Resolve scope into the seed inputs and an optional post-filter.
     let (seed_inputs, scope_filter) = resolve_scope(store, query, scope)?;
@@ -578,8 +641,33 @@ pub fn investigate(
             );
             nodes
         }
-        Err(_) => bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH),
+        Err(e) => {
+            // nw-384. A publication that BEGAN after the step-0 check is the
+            // window this arm used to launder: hybrid retrieval fails closed,
+            // `Err(_)` swallows it, and the BM25 fallback added by `36c8ecab`
+            // — which has no publication check of its own — answers instead.
+            // That fallback is why the large-graph face returned a complete
+            // 30-entry map at exit 0 rather than an empty one.
+            if is_index_publication_failure(&e) {
+                return Err(e);
+            }
+            // Re-check before falling back for the OTHER half of the same
+            // race: the seed path's guards are silent-empty
+            // (`symbols_by_pagerank` -> `Ok(vec![])`), so a publication
+            // starting mid-retrieval can surface as a benign-looking "no seeds
+            // resolved" that carries no publication string to recognise.
+            ensure_ranking_publication_clean(store)?;
+            bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH)
+        }
     };
+    // nw-384, third and last site. The `Ok` branch needs its own re-check for
+    // the reason the `Err` branch cannot cover it: the seed path's publication
+    // guards return `Ok(vec![])` / an empty score map rather than an error, so
+    // a publication that began mid-retrieval produces a SUCCESS carrying
+    // silently degraded ranks. Mirrors `compute_pagerank_warm_inner`'s own
+    // mid-compute dirty re-check — the whole point of a fail-closed guard is
+    // that it is cheaper to refuse a good answer than to serve a bad one.
+    ensure_ranking_publication_clean(store)?;
     if let Some(ref filter) = scope_filter {
         connected.retain(|n| node_in_scope(store, n, filter));
     }
@@ -1496,6 +1584,169 @@ mod tests {
             load_bundle(&db_path, &result.bundle_id).is_some(),
             "bundle should be persisted to the sidecar"
         );
+    }
+
+    // ── nw-384: the index-publication fail-closed guard ──────────────────
+    //
+    // A file-backed store is mandatory for these: the marker is a FILE beside
+    // the db, and `index_directory_in_memory` (which every other test here
+    // uses) yields a store with no `db_path` and therefore no marker to be
+    // dirty. That is exactly why this guard could sit unenforced under a full
+    // test suite.
+
+    fn on_disk_store() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        for (i, name) in ["greet", "greetUser", "formatGreeting"].iter().enumerate() {
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym:g{i}"),
+                    name: (*name).to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:test".to_string(),
+                    file_path: format!("src/g{i}.js"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("function {name}()"),
+                    summary: None,
+                    content_hash: format!("g{i}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        (dir, db_path, store)
+    }
+
+    /// Plant the same durable marker a real in-flight publication writes.
+    fn begin_publication(db_path: &std::path::Path) {
+        let marker = nestweaver_store::index_publication::marker_path(db_path);
+        fs::write(
+            &marker,
+            nestweaver_store::index_publication::format_marker_payload(std::process::id(), 1, None),
+        )
+        .unwrap();
+    }
+
+    fn run(
+        store: &GraphStore,
+        db_path: &std::path::Path,
+        root: &std::path::Path,
+        query: &str,
+    ) -> Result<InvestigateResult, anyhow::Error> {
+        investigate(
+            store,
+            None,
+            Some(db_path),
+            root,
+            query,
+            "vault",
+            Some(4000),
+            None,
+        )
+    }
+
+    /// FACE ONE — seeds resolve, so retrieval succeeds and `investigate` used
+    /// to hand back `returned: 30, total: 30, truncated: false,
+    /// dropped_reasons: {}` at exit 0 while `context` on the same DB at the
+    /// same moment refused. This is the WORSE face: an empty map invites
+    /// suspicion and a complete-looking one does not.
+    #[test]
+    fn a_dirty_publication_refuses_an_investigation_whose_seeds_resolve() {
+        let (dir, db_path, store) = on_disk_store();
+
+        // The fixture must actually produce a populated answer, or this test
+        // would pass for the wrong reason — refusing something that was empty
+        // anyway proves nothing about the populated face.
+        let clean = run(&store, &db_path, dir.path(), "greet").unwrap();
+        assert!(
+            !clean.entries.is_empty(),
+            "fixture must yield a populated map so the guard is proven against \
+             the face that looks complete"
+        );
+
+        begin_publication(&db_path);
+
+        let error = run(&store, &db_path, dir.path(), "greet")
+            .expect_err("a ranked query must fail closed during a dirty publication");
+        assert!(
+            format!("{error:#}").contains("index publication"),
+            "the error must carry the substring `classify_index_publication_error` keys on, \
+             so `investigate` produces the SAME TRANSIENT/WEDGED message `context` does; got: {error:#}"
+        );
+    }
+
+    /// FACE TWO — no seed resolves, so retrieval bails and the BM25 fallback
+    /// (`36c8ecab`, which carries no publication check) answers. On the sweep's
+    /// smaller graph that produced `0 domains, 0 entries` at exit 0: a "this
+    /// code does not exist" answer. Same guard, opposite symptom; closing only
+    /// one of them closes neither.
+    #[test]
+    fn a_dirty_publication_refuses_an_investigation_that_falls_back_to_bm25() {
+        let (dir, db_path, store) = on_disk_store();
+
+        let clean = run(&store, &db_path, dir.path(), "no_such_identifier_anywhere").unwrap();
+        assert!(
+            clean.entries.is_empty(),
+            "fixture must exercise the empty/fallback face"
+        );
+
+        begin_publication(&db_path);
+
+        let error = run(&store, &db_path, dir.path(), "no_such_identifier_anywhere")
+            .expect_err("the BM25 fallback must fail closed too, not report an empty graph");
+        assert!(
+            format!("{error:#}").contains("index publication"),
+            "got: {error:#}"
+        );
+    }
+
+    /// COUNTERWEIGHT. A clean publication must not trigger the guard on either
+    /// face — a fail-closed check that fires when nothing is in flight would
+    /// convert this honesty fix into an outage.
+    #[test]
+    fn a_clean_publication_does_not_trigger_the_fail_closed_guard() {
+        let (dir, db_path, store) = on_disk_store();
+        assert!(
+            !store.is_index_publication_dirty(),
+            "a freshly created store has no publication in flight"
+        );
+
+        let populated = run(&store, &db_path, dir.path(), "greet")
+            .expect("a clean publication must serve the populated face");
+        assert!(!populated.entries.is_empty());
+
+        let empty = run(&store, &db_path, dir.path(), "no_such_identifier_anywhere")
+            .expect("a clean publication must serve the empty face as a normal answer");
+        assert!(empty.entries.is_empty());
+
+        // And it must still be clean afterwards: the guard reads the marker,
+        // it never plants one.
+        assert!(!store.is_index_publication_dirty());
+    }
+
+    /// A retired marker restores service. The guard is a WINDOW, not a latch —
+    /// if it were a latch, the remedy an operator is told to wait for would
+    /// never take effect.
+    #[test]
+    fn retiring_the_marker_restores_investigation_service() {
+        let (dir, db_path, store) = on_disk_store();
+        begin_publication(&db_path);
+        assert!(run(&store, &db_path, dir.path(), "greet").is_err());
+
+        fs::remove_file(nestweaver_store::index_publication::marker_path(&db_path)).unwrap();
+
+        let result = run(&store, &db_path, dir.path(), "greet")
+            .expect("service resumes once the publication retires");
+        assert!(!result.entries.is_empty());
     }
 
     #[test]
