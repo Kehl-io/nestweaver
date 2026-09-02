@@ -2468,6 +2468,90 @@ fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
         })
 }
 
+/// Why `affected-tests` refuses a generation-stale graph instead of answering
+/// a narrower question.
+///
+/// nw-412. The counterpart of `WHY_DEAD_CODE_REFUSES`, worded separately
+/// because the ERROR DIRECTION is the opposite one and that is the whole
+/// argument. `dead-code` on a stale graph puts a LIVE symbol on a deletion
+/// list — bad, but a human reviewing the list can catch it. Here a missing
+/// edge makes the affected-test set SMALLER: the regression test that would
+/// have caught the change is never selected, the gate reports success, and
+/// there is no list for anyone to review. A test selector that refuses is
+/// safe; one that silently narrows is not.
+///
+/// Byte-identical to `WHY_AFFECTED_TESTS_REFUSES` in
+/// `crates/nestweaver-mcp/src/tools.rs`, which is where the same sentence is
+/// produced for the MCP tool and for this command's DAEMON route.
+const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
+     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
+     safer — it can only drop a test that should have run, while `status` still reads complete. \
+     The error is one-directional and it is silent: nothing downstream can tell a test that was \
+     not selected from a test that does not exist.";
+
+/// Turn the shared resolver-generation verdict into `affected-tests`' refusal.
+///
+/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
+/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
+/// `status`, same `remedies` array of ready-to-run
+/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
+/// a CI job already gates on. Only two things are tool-specific:
+///
+///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
+///    "dead-code will not produce a list on this graph", which is the wrong
+///    sentence in front of the right remedies.
+///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
+///    consumer acts on, and the refusal deliberately carries no
+///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
+///    get tiers" would read the refusal as "no tests affected", which is the
+///    exact silent narrowing this refusal exists to prevent.
+///
+/// This mirrors `affected_tests_refusal_payload` in the MCP crate so the
+/// direct route and the daemon route emit the SAME object; a CI gate must not
+/// be able to tell which one answered.
+fn affected_tests_refusal_payload(
+    refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
+) -> serde_json::Value {
+    let mut payload = refusal.payload();
+    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
+    for remedy in payload
+        .get("remedies")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match remedy.get("command").and_then(|v| v.as_str()) {
+            Some(command) => note.push_str(&format!("\n  {command}")),
+            None => note.push_str(&format!(
+                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
+                 pass to `--repo`; re-index it where it lives",
+                remedy
+                    .get("uid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unnamed repo)")
+            )),
+        }
+    }
+    payload["note"] = serde_json::json!(note);
+    payload["recommendation"] = serde_json::json!("run-full-suite");
+    payload
+}
+
+/// The refusal paragraph out of an `affected_tests` payload the DAEMON
+/// produced.
+///
+/// The twin of [`dead_code_refusal_note`], and it decides nothing for the same
+/// reason: the tool that computed the refusal also wrote the sentence, so this
+/// route prints what it was sent. The fallback covers only a payload that says
+/// `refused` and carries no `note`, which this binary cannot produce.
+fn affected_tests_refusal_note(payload: &serde_json::Value) -> String {
+    payload
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| WHY_AFFECTED_TESTS_REFUSES.to_string())
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -7482,6 +7566,84 @@ fn pr_impact_exit_code(
     } else {
         EXIT_SUCCESS
     }
+}
+
+/// The notification descriptor attached when a blast-radius run's graph is
+/// resolver-generation-stale.
+///
+/// nw-412 asked for a decision between refusing and degrading, per surface,
+/// and the two land differently:
+///
+///  * `affected-tests` REFUSES. It is a selector: its answer is consumed as
+///    "run exactly these", there is no field a caller can read to widen it
+///    back, and a narrowed selection is indistinguishable from a correct one.
+///  * `pr-impact` / `blast-radius` DEGRADE. They are an assessment, not a
+///    selector, and they already ship the exact contract this condition wants:
+///    `status` + `gate_state`, whose documented rule is that a run which did
+///    not complete is `degraded-unknown` and NEVER `risk-flagged` — "unknown,
+///    review manually", not "safe". A stale-resolver run IS a run that did not
+///    complete. Degrading also preserves `coverage`, `blind_spots` and the
+///    changed-file echo, and keeps the SARIF rendering valid; a refusal
+///    payload is not a SARIF run and would break `pr-impact --sarif` outright.
+///
+/// Same string as `BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR` in the MCP crate,
+/// so a consumer matching on the descriptor sees one code from both surfaces.
+const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale";
+
+/// Degrade a locally-computed blast-radius result when this graph's edges
+/// predate the running resolver.
+///
+/// nw-412, the CLI twin of the block in `tool_blast_radius`. `status` is only
+/// ever pushed DOWN (`.max` over the ordered ladder Complete < Partial <
+/// Degraded < Failed), matching nw-105's rule that a run already Degraded or
+/// Failed is never upgraded by a later finding, and `gate_state` is then
+/// forced to `DegradedUnknown`. That mirrors `derive_gate_state`'s
+/// "non-Complete => DegradedUnknown" without calling it (it is `pub(crate)` to
+/// the engine) and closes the direction that made this dangerous: a
+/// stale-resolver run reported `gate_state: ok` over a shrunken affected set,
+/// and can no longer report `ok` at all.
+///
+/// The consequence on the pre-push hook is the point of wiring it here:
+/// `print_pr_impact_hook` is SILENT on an `Ok` + `Low` + nothing-affected run,
+/// and a stale graph is exactly the run most likely to look like that. It can
+/// no longer be silent.
+///
+/// `list_repos` PROPAGATES rather than becoming a degrade: a store that cannot
+/// enumerate repos cannot serve the traversal either, so the caller gets the
+/// CLI's own error classifier (nw-285's `db_no_schema` diagnostic) instead of
+/// a binder exception quoted inside a paragraph about resolver generations.
+fn degrade_blast_radius_if_resolver_stale(
+    store: &GraphStore,
+    db_path: &Path,
+    result: &mut BlastRadiusResult,
+) -> Result<(), anyhow::Error> {
+    let repos = store.list_repos(None)?;
+    let Some(refusal) =
+        nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
+    else {
+        return Ok(());
+    };
+    result.status = result
+        .status
+        .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+    result.gate_state = GateState::DegradedUnknown;
+    result
+        .notifications
+        .push(nestweaver_engine::blast_radius::Notification {
+            level: NotificationLevel::Error,
+            message: refusal.message(),
+            descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
+        });
+    // `render_blast_summary` appends `[status: …]` for any non-Complete run
+    // and is `pub(crate)`, so the marker is restated here rather than leaving
+    // the human summary claiming a clean run. Guarded so a summary that
+    // already carries one is not double-tagged.
+    if !result.summary.contains("[status: ") {
+        result
+            .summary
+            .push_str(&format!(" [status: {}]", result.status.label()));
+    }
+    Ok(())
 }
 
 /// Name the top reason a run was degraded/unknown, for the advisory banner.
@@ -14832,8 +14994,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 include_data_edges: false,
                 limit: None,
             };
-            let result =
+            let mut result =
                 analyze_blast_radius(&store, &changed_files, &options, None, Some(&db_path))?;
+
+            // nw-412: applied HERE — after the analysis, before EITHER
+            // rendering — so the SARIF leg carries it too. `pr-impact --sarif`
+            // is the merge-gate surface most likely to be read by a machine
+            // that never sees the JSON, and `--sarif` also forces this direct
+            // path, so it is the leg that most needs the marker.
+            degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result)?;
 
             if sarif {
                 let mut sarif_value =
@@ -14936,10 +15105,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let daemon_result: Option<nestweaver_engine::AffectedTestsResult> = if use_daemon {
                 let args = affected_tests_rpc_args(&changed_files);
                 match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)? {
-                    Some(value) => Some(
-                        serde_json::from_value(value)
-                            .context("decoding daemon affected_tests result")?,
-                    ),
+                    Some(value) => {
+                        // nw-412: a refusal is NOT an `AffectedTestsResult`
+                        // and must be intercepted before `from_value`, which
+                        // would fail on the missing tiers and report a decode
+                        // bug instead of a stale graph. The daemon PRINTS what
+                        // it was sent — the `affected_tests` tool it ran
+                        // computed the refusal from the sole
+                        // `ResolverGenerations::stale_repos` computation, so
+                        // this route decides nothing and cannot disagree with
+                        // the tool about one database (the same rule the
+                        // `dead-code` daemon route follows).
+                        if value.get("refused").and_then(|v| v.as_bool()) == Some(true) {
+                            if json {
+                                print_json_payload(&value)?;
+                            }
+                            eprintln!("Error: {}", affected_tests_refusal_note(&value));
+                            return Ok((EXIT_NEEDS_REINDEX, None));
+                        }
+                        Some(
+                            serde_json::from_value(value)
+                                .context("decoding daemon affected_tests result")?,
+                        )
+                    }
                     None => None,
                 }
             } else {
@@ -14950,6 +15138,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(r) => r,
                 None => {
                     let store = open_store(Some(&db_path))?;
+                    // nw-412: REFUSE before the selection, the way `dead-code`
+                    // does. On a resolver-generation-stale graph a MISSING
+                    // edge makes the affected-test set SMALLER, so the
+                    // regression test that should have run is silently dropped
+                    // while `status` still reads complete — the one error
+                    // direction nothing downstream can detect. See
+                    // `WHY_AFFECTED_TESTS_REFUSES` for why this refuses where
+                    // `pr-impact` degrades.
+                    let repos = store.list_repos(None)?;
+                    if let Some(refusal) =
+                        nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
+                            &db_path, &repos,
+                        )
+                    {
+                        let payload = affected_tests_refusal_payload(&refusal);
+                        // stdout stays pure JSON for a `--json` gate; the
+                        // paragraph goes to stderr on BOTH modes, the same
+                        // split `dead-code` and `stale-check` already use.
+                        if json {
+                            print_json_payload(&payload)?;
+                        }
+                        eprintln!("Error: {}", affected_tests_refusal_note(&payload));
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     nestweaver_engine::rts_eval::run_recorded(
                         &store,
                         &changed_files,
@@ -23822,6 +24034,25 @@ fn run_brain(
                         });
                     }
 
+                    // nw-405: resolve the scope flags to CONCRETE container
+                    // UIDs BEFORE filtering anything, mirroring
+                    // `tool_brain_context`. Resolution sits outside the
+                    // per-list closure so an unresolvable entry is one ERROR
+                    // for the command rather than a predicate that silently
+                    // matches nothing on both lists — and it is the same
+                    // resolver, so this route and the daemon route can no
+                    // longer answer differently for one flag value.
+                    let repo_scope = if repos.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_repo_filter(&store, &repos)?)
+                    };
+                    let vault_scope = if vaults.is_empty() {
+                        None
+                    } else {
+                        Some(resolve_vault_filter(&store, &vaults)?)
+                    };
+
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =
                         kinds.iter().map(|k| k.to_lowercase()).collect();
@@ -23834,22 +24065,14 @@ fn run_brain(
                                     .any(|k| kind_lower.starts_with(k.as_str()))
                             });
                         }
-                        if !repos.is_empty() {
-                            nodes.retain(|n| {
-                                repos.iter().any(|r| {
-                                    n.uid.contains(r.as_str()) || n.location.contains(r.as_str())
-                                })
-                            });
+                        if let Some(ref repo_uids) = repo_scope {
+                            retain_nodes_in_repos(nodes, repo_uids);
                         }
-                        if !vaults.is_empty() {
-                            nodes.retain(|n| {
-                                vaults.iter().any(|v| {
-                                    n.uid.contains(v.as_str()) || n.location.contains(v.as_str())
-                                })
-                            });
+                        if let Some(ref vault_uids) = vault_scope {
+                            retain_nodes_in_vaults(nodes, vault_uids);
                         }
                         if let Some(ref prefix) = path_prefix {
-                            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+                            retain_nodes_under_path_prefix(nodes, prefix.as_str());
                         }
                     };
                     apply_filters(&mut result.seeds);
@@ -23902,6 +24125,23 @@ fn run_brain(
                     }
 
                     // tags filter: keep only note/section nodes tagged with any of these.
+                    //
+                    // nw-407: Symbol nodes used to be kept UNCONDITIONALLY
+                    // here ("no tag concept for code"), which made `--tags` an
+                    // EXPANSION rather than a filter. Measured on the live
+                    // graph at one seed and budget: with `--tags security` the
+                    // result was n=71 of which 70 were Symbols and ONE was a
+                    // tagged Note; without it, n=30 with 22 of 30 vault
+                    // content. Adding the filter GREW the result 30 -> 71 and
+                    // drove the tagged share from 22/30 to 1/71.
+                    //
+                    // The budget leg is why this is not cosmetic: the
+                    // pass-through happens before the token budget is spent,
+                    // so untagged symbols eat the budget the tagged notes were
+                    // asked for. "No tag concept for code" means a symbol
+                    // cannot SATISFY a tag scope, not that it is exempt from
+                    // one — the old comment documented the mechanism and never
+                    // the consequence.
                     if !tags.is_empty() {
                         let tagged_notes = store
                             .list_note_uids_with_tags(&tags)
@@ -23910,13 +24150,7 @@ fn run_brain(
                             .list_section_uids_with_tags(&tags)
                             .map_err(|e| anyhow::anyhow!(e))?;
                         let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-                            nodes.retain(|item| {
-                                if item.kind.to_lowercase().contains("symbol") {
-                                    return true;
-                                }
-                                tagged_notes.contains(&item.uid)
-                                    || tagged_sections.contains(&item.uid)
-                            });
+                            retain_tagged_nodes(nodes, &tagged_notes, &tagged_sections);
                         };
                         filter_tagged(&mut result.seeds);
                         filter_tagged(&mut result.connected);
@@ -24585,6 +24819,224 @@ fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
     }
+}
+
+// ── `brain context` scope filters (nw-405 / nw-406 / nw-407) ────────────────
+//
+// The CLI twins of the private helpers in `crates/nestweaver-mcp/src/tools.rs`
+// (`NodeOwner`, `node_owner`, `resolve_repo_filter`, `resolve_vault_filter`,
+// `retain_nodes_in_repos`, `retain_nodes_in_vaults`,
+// `retain_nodes_under_path_prefix`), which carry the full argument for each
+// decision. They must stay equivalent to those: nw-405's fourth measured
+// symptom was the two surfaces DISAGREEING about one flag value — the CLI's
+// predicate was case-SENSITIVE where MCP's was not — and `brain context`
+// forwards these flags to the daemon except under `--no-tests` /
+// `--prefer-instance`, which force this direct path. So the same command
+// answered differently depending on whether a daemon happened to be running.
+//
+// They are DUPLICATED rather than shared only because the MCP copies are
+// crate-private. The durable fix is to lift one copy into `nestweaver-engine`
+// and have both surfaces call it; until then a change to either must be made
+// to both, which is exactly the hazard this item was filed about.
+
+/// The container a node UID names as its owner.
+///
+/// The UID is the authority because it is the only field on a `BrainNode` that
+/// NAMES an owner: `sym:`/`file:`/`svc:` embed the whole `repo:{inst}:{hash}`,
+/// and `note:`/`sec:`/`head:`/`tag:` embed the whole `vlt:{inst}:{hash}`.
+/// `location` names neither — a symbol's location is REPO-RELATIVE and so
+/// never contains its own repo name, which is why `--repos website` used to
+/// return ZERO symbols from the repo it named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeOwner {
+    Repo(String),
+    /// Vault content carries no `repo_uid` at all — the same fact
+    /// `RepoScope::NotRepoScoped` is written on.
+    Vault(String),
+    /// Nothing in the UID names an owner.
+    Unattributable,
+}
+
+/// The owner of `uid`.
+///
+/// Matched over [`nestweaver_schema::uid::UidKind`] rather than an `if` chain
+/// of `starts_with`, for nw-301's reason: an `if` chain cannot be exhaustive,
+/// so a twelfth UID domain would fall silently into whatever the trailing arm
+/// does instead of failing this build.
+fn node_owner(uid: &str) -> NodeOwner {
+    use nestweaver_schema::uid::UidKind;
+
+    /// `{prefix}{owner_uid}:{…}` — an owner UID is always exactly three
+    /// colon-separated components, so take three and discard the tail.
+    fn owner_head(rest: &str) -> Option<String> {
+        let parts: Vec<&str> = rest.splitn(4, ':').collect();
+        (parts.len() >= 3).then(|| format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+    }
+
+    let Some(kind) = UidKind::of(uid) else {
+        return NodeOwner::Unattributable;
+    };
+    let rest = &uid[kind.prefix().len()..];
+    match kind {
+        UidKind::Repo => NodeOwner::Repo(uid.to_string()),
+        UidKind::Vault => NodeOwner::Vault(uid.to_string()),
+        UidKind::File | UidKind::Service | UidKind::Symbol => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Repo)
+        }
+        UidKind::Note | UidKind::Tag => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Vault)
+        }
+        // `sec:{note_uid}:{…}` / `head:{note_uid}:{…}`, and a note UID is
+        // itself `note:{vault_uid}:{…}`, so the inner `note:` comes off too.
+        UidKind::Section | UidKind::Heading => rest
+            .strip_prefix(UidKind::Note.prefix())
+            .and_then(owner_head)
+            .map_or(NodeOwner::Unattributable, NodeOwner::Vault),
+        // `proj:` names an INSTANCE and a contract UID carries no repo
+        // component, so neither can be attributed to a container.
+        UidKind::Project | UidKind::Contract => NodeOwner::Unattributable,
+    }
+}
+
+/// Resolve `--repos` entries to concrete repo UIDs.
+///
+/// The resolution is [`nestweaver_engine::resolve_repo_selector`] — the SAME
+/// resolver `--repo` already uses everywhere else — so this flag cannot grow a
+/// second, drifting notion of what a repo name means, and an ambiguous
+/// selector (`website` under two orgs) FAILS naming both candidates instead of
+/// quietly merging two tenants' code into one answer. An unresolvable entry
+/// ERRORS: the old predicate matched nothing and returned a confident empty
+/// result, which reads as "this repo has no relevant content" rather than "you
+/// named a repo that is not here".
+fn resolve_repo_filter(
+    store: &GraphStore,
+    selectors: &[String],
+) -> Result<std::collections::HashSet<String>, anyhow::Error> {
+    let repos = store
+        .list_repos(None)
+        .context("listing repositories to resolve --repos")?;
+    selectors
+        .iter()
+        .map(|selector| {
+            nestweaver_engine::resolve_repo_selector(&repos, selector)
+                .map(|repo| repo.uid.clone())
+                // Flattened with `{error:#}` rather than `.context(…)` so the
+                // resolver's own "ambiguous; use an exact UID: …" candidate
+                // list — the only actionable part — survives to the terminal.
+                .map_err(|error| anyhow::anyhow!("--repos entry {selector:?}: {error:#}"))
+        })
+        .collect()
+}
+
+/// Resolve `--vaults` entries to concrete vault UIDs.
+///
+/// The mirror of [`resolve_repo_filter`], written out because there is no
+/// engine-side vault selector to reuse: `--repo` is a first-class selector and
+/// `--vault` is not. Precedence deliberately matches `resolve_repo_selector`'s
+/// (exact UID, then case-insensitive exact name, then exact root path) and is
+/// exact-only — the substring leg is precisely what nw-405 removes.
+fn resolve_vault_filter(
+    store: &GraphStore,
+    selectors: &[String],
+) -> Result<std::collections::HashSet<String>, anyhow::Error> {
+    let vaults = store
+        .list_vaults(None)
+        .context("listing vaults to resolve --vaults")?;
+    selectors
+        .iter()
+        .map(|selector| {
+            let needle = selector.to_lowercase();
+            let matches: Vec<&nestweaver_schema::Vault> = vaults
+                .iter()
+                .filter(|vault| {
+                    vault.uid == *selector
+                        || vault.name.to_lowercase() == needle
+                        || vault.root_path == *selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [vault] => Ok(vault.uid.clone()),
+                [] => {
+                    let known: Vec<&str> = vaults.iter().map(|vault| vault.name.as_str()).collect();
+                    Err(anyhow::anyhow!(
+                        "--vaults entry {selector:?} matches no indexed vault; known vaults: {}",
+                        if known.is_empty() {
+                            "(none indexed)".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    ))
+                }
+                ambiguous => Err(anyhow::anyhow!(
+                    "--vaults entry {selector:?} is ambiguous; use an exact UID: {}",
+                    ambiguous
+                        .iter()
+                        .map(|vault| format!("{} ({})", vault.name, vault.uid))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Keep only nodes owned by one of `repo_uids`.
+///
+/// **VAULT NODES ARE DROPPED.** This is nw-405's required recorded decision
+/// and it matches the MCP schema text for `repos`. A Note, Section, Heading or
+/// Tag belongs to a VAULT and carries no `repo_uid`, so it is not "in repo X"
+/// under any reading — keeping it is exactly the measured over-include where
+/// `--repos clientA` returned clientB's notes because their PATH contained the
+/// string. Vault content is scoped with `--vaults`.
+///
+/// An unattributable UID is dropped for nw-403's redactor's reason: "I cannot
+/// tell what owns this" is not a reason to return it under a scope argument.
+fn retain_nodes_in_repos(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    repo_uids: &std::collections::HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Repo(uid) if repo_uids.contains(&uid)),
+    );
+}
+
+/// Keep only nodes owned by one of `vault_uids`.
+///
+/// The mirror of [`retain_nodes_in_repos`]: Symbol/File/Service nodes belong
+/// to a repo, so they cannot satisfy a vault scope and are dropped.
+fn retain_nodes_in_vaults(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    vault_uids: &std::collections::HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Vault(uid) if vault_uids.contains(&uid)),
+    );
+}
+
+/// Apply `--path-prefix`, exempting nodes that have no path at all.
+///
+/// nw-406. The predicate was the bare
+/// `nodes.retain(|n| n.location.starts_with(prefix))`, and a Tag node carries
+/// `location: ""`: `"".starts_with("Workspaces/")` is false, so
+/// `--kinds Tag --path-prefix Workspaces/` measured 25 Tag nodes -> 0 on a
+/// vault whose 606 tags ALL live under `Workspaces/`. A confident zero with no
+/// disclosure. A tag is not "outside" the prefix — it has no path concept for
+/// the prefix to test, so an empty location is EXEMPT rather than excluded.
+fn retain_nodes_under_path_prefix(nodes: &mut Vec<nestweaver_engine::BrainNode>, prefix: &str) {
+    nodes.retain(|node| node.location.is_empty() || node.location.starts_with(prefix));
+}
+
+/// Keep only nodes that actually carry one of the requested tags.
+///
+/// nw-407. Extracted from the `--tags` closure so the one decision it encodes
+/// is assertable: a Symbol is NOT exempt. See the call site for the measured
+/// 30 -> 71 expansion the old unconditional `return true` produced.
+fn retain_tagged_nodes(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    tagged_notes: &std::collections::HashSet<String>,
+    tagged_sections: &std::collections::HashSet<String>,
+) {
+    nodes.retain(|node| tagged_notes.contains(&node.uid) || tagged_sections.contains(&node.uid));
 }
 
 /// Greedy token-budget selection: include nodes in PPR-rank order until the
@@ -37508,6 +37960,497 @@ mod render_cost_parity_tests {
              nodes for the same budget ({at_detailed_rate} vs \
              {at_concise_rate}) — that gap IS the reported item-count \
              divergence between the two routes"
+        );
+    }
+}
+
+/// nw-405 / nw-406 / nw-407 — the CLI half of `brain context`'s scope filters.
+///
+/// The predicates these replace were a case-SENSITIVE substring match over
+/// uid-or-location, a bare `starts_with` on `path_prefix`, and a `tags` filter
+/// that passed every Symbol through unconditionally. The MCP twins are pinned
+/// by the same assertions in `crates/nestweaver-mcp/src/tools.rs`; the two
+/// suites are deliberately parallel, because the reported symptom was the two
+/// surfaces answering differently for ONE flag value.
+#[cfg(test)]
+mod brain_context_scope_filter_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const REPO_A: &str = "repo:default:aaaaaaaaaaaa";
+    const REPO_B: &str = "repo:default:bbbbbbbbbbbb";
+    const VAULT: &str = "vlt:default:cccccccccccc";
+
+    fn node(uid: &str, kind: &str, location: &str) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: "t".to_string(),
+            location: location.to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    /// A fixture built so the OLD predicate gets each leg wrong:
+    ///
+    ///  * repo A's symbol has a repo-relative location that never contains
+    ///    "aaaaaaaaaaaa" — the under-include leg;
+    ///  * repo B's symbol sits under `vendor/alpha/`, so a location substring
+    ///    pulls it into a scope it does not belong to;
+    ///  * the note lives under `Workspaces/Alpha/`, so a location substring
+    ///    keeps it even though it belongs to no repo at all;
+    ///  * the tag carries `location: ""`, which every `path_prefix` deleted.
+    fn mixed_nodes() -> Vec<nestweaver_engine::BrainNode> {
+        vec![
+            node(&format!("sym:{REPO_A}:f1:n1:10"), "Symbol", "src/lib.rs"),
+            node(
+                &format!("sym:{REPO_B}:f2:n2:20"),
+                "Symbol",
+                "vendor/alpha/shim.rs",
+            ),
+            node(
+                &format!("note:{VAULT}:n1"),
+                "Note",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(
+                &format!("sec:note:{VAULT}:n1:1:abc"),
+                "Section",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(&format!("tag:{VAULT}:t1"), "Tag", ""),
+        ]
+    }
+
+    fn uids(nodes: &[nestweaver_engine::BrainNode]) -> Vec<String> {
+        nodes.iter().map(|n| n.uid.clone()).collect()
+    }
+
+    fn store_with_two_repos_named_website() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, url, name) in [
+            (REPO_A, "https://github.com/coyote/website", "website"),
+            (REPO_B, "https://github.com/wavelength/website", "website"),
+        ] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "deadbeef".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: Some(name.to_string()),
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-405, all three keep/drop legs at once.
+    ///
+    /// COUNTERWEIGHT: scoping to repo B must SELECT repo B's symbol. Without
+    /// that half, a filter that simply deleted everything would pass the "no
+    /// foreign rows" assertion.
+    #[test]
+    fn a_repos_scope_keeps_the_named_repos_own_symbols_and_no_one_elses() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_A}:f1:n1:10")],
+            "repo A's own symbol must survive despite a repo-relative location \
+             that never contains its repo name, and nothing else may"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_B.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_B}:f2:n2:20")],
+            "the filter must SELECT by owner, not merely delete"
+        );
+    }
+
+    /// nw-405's recorded vault decision, pinned so it cannot be reverted by
+    /// accident: `--repos` drops vault content because a note belongs to a
+    /// vault and to no repo. On a consulting vault the old behaviour returned
+    /// clientB's notes for `--repos clientA`.
+    ///
+    /// COUNTERWEIGHT: the UNFILTERED list carries every one of those rows, so
+    /// the drop is attributable to the scope flag and not to the fixture.
+    #[test]
+    fn a_repos_scope_drops_vault_content_that_merely_mentions_the_repo_in_its_path() {
+        assert_eq!(
+            mixed_nodes().len(),
+            5,
+            "the fixture must carry the vault rows this test claims are dropped"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert!(
+            !nodes.iter().any(|n| n.uid.starts_with("note:")
+                || n.uid.starts_with("sec:")
+                || n.uid.starts_with("tag:")),
+            "vault content belongs to no repo and must not pass a repo scope: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// The mirror image, so `--vaults` is a scope in the same sense.
+    #[test]
+    fn a_vaults_scope_keeps_that_vaults_content_and_drops_repo_symbols() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(&mut nodes, &HashSet::from([VAULT.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![
+                format!("note:{VAULT}:n1"),
+                format!("sec:note:{VAULT}:n1:1:abc"),
+                format!("tag:{VAULT}:t1"),
+            ],
+            "notes, sections and tags are vault-owned; symbols are not"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(
+            &mut nodes,
+            &HashSet::from(["vlt:default:999999999999".to_string()]),
+        );
+        assert!(
+            nodes.is_empty(),
+            "a vault nobody owns must select nothing, not everything"
+        );
+    }
+
+    /// nw-406. `--path-prefix` must not silently delete a whole KIND it has no
+    /// way to judge — all 606 tags in the measured vault vanished this way.
+    ///
+    /// COUNTERWEIGHT: a node that HAS a path and does not match is still
+    /// dropped. The exemption is for "no path concept", not for everything.
+    #[test]
+    fn a_path_prefix_exempts_nodes_with_no_path_but_still_drops_non_matching_paths() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_under_path_prefix(&mut nodes, "Workspaces/");
+        assert!(
+            nodes.iter().any(|n| n.uid.starts_with("tag:")),
+            "a Tag carries location \"\"; \"\".starts_with(prefix) is false, which \
+             deleted every tag in the vault: {:?}",
+            uids(&nodes)
+        );
+        assert!(
+            !nodes.iter().any(|n| n.location == "src/lib.rs"),
+            "a node with a real, non-matching path must still be dropped: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// nw-407. `--tags` is a FILTER, so a Symbol — which cannot carry a tag —
+    /// cannot satisfy it. The old `if kind.contains("symbol") { return true }`
+    /// made the flag an expansion: measured 30 -> 71 rows, of which 70 were
+    /// untagged symbols eating the token budget the tagged notes asked for.
+    ///
+    /// COUNTERWEIGHT: a tagged note is KEPT, so the filter selects rather than
+    /// merely emptying the list.
+    #[test]
+    fn a_tags_scope_drops_symbols_and_keeps_the_content_that_carries_the_tag() {
+        let mut nodes = mixed_nodes();
+        retain_tagged_nodes(
+            &mut nodes,
+            &HashSet::from([format!("note:{VAULT}:n1")]),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("note:{VAULT}:n1")],
+            "only the tagged note carries the tag; the two symbols cannot"
+        );
+    }
+
+    /// An unattributable UID is dropped rather than kept, matching nw-403's
+    /// redactor: "I cannot tell what owns this" is not a reason to return it
+    /// under a scope argument.
+    #[test]
+    fn an_unattributable_uid_survives_no_scope_at_all() {
+        assert_eq!(node_owner("proj:default:abc"), NodeOwner::Unattributable);
+        assert_eq!(node_owner("banana"), NodeOwner::Unattributable);
+        assert_eq!(
+            node_owner(&format!("sym:{REPO_A}:f:n:1")),
+            NodeOwner::Repo(REPO_A.to_string())
+        );
+        assert_eq!(
+            node_owner(&format!("head:note:{VAULT}:n1:h:3")),
+            NodeOwner::Vault(VAULT.to_string())
+        );
+    }
+
+    /// nw-405 legs (2) and (4): a colliding display name must FAIL naming both
+    /// candidates rather than quietly merging two tenants, and the documented
+    /// UID form must resolve — it used to answer `connected: 0`.
+    #[test]
+    fn a_colliding_repo_name_is_refused_while_the_documented_uid_form_resolves() {
+        let store = store_with_two_repos_named_website();
+
+        let err = resolve_repo_filter(&store, &["website".to_string()])
+            .expect_err("two repos share this display name; merging them silently is the bug")
+            .to_string();
+        assert!(
+            err.contains("ambiguous") && err.contains(REPO_A) && err.contains(REPO_B),
+            "the error must name both candidates so the caller can disambiguate: {err}"
+        );
+
+        // COUNTERWEIGHT: the disambiguated form the error recommends works.
+        assert_eq!(
+            resolve_repo_filter(&store, &[REPO_A.to_string()]).unwrap(),
+            HashSet::from([REPO_A.to_string()])
+        );
+    }
+
+    /// nw-405: an entry that names no repo is an ERROR. The old predicate
+    /// matched nothing and returned a confident empty result, which a caller
+    /// reads as "this repo has no relevant content" rather than "you named a
+    /// repo that is not here".
+    #[test]
+    fn an_unresolvable_repos_entry_errors_instead_of_matching_nothing() {
+        let store = store_with_two_repos_named_website();
+        let err = resolve_repo_filter(&store, &["not-a-repo".to_string()])
+            .expect_err("an unresolvable scope must not silently answer")
+            .to_string();
+        assert!(
+            err.contains("not-a-repo"),
+            "the error must name the entry that failed: {err}"
+        );
+    }
+
+    /// The `--vaults` contract, plus the CASE leg that made the two surfaces
+    /// disagree: the old CLI predicate was `contains`, case-SENSITIVE, while
+    /// MCP's was `to_lowercase().contains`. `--vaults BRAIN` therefore answered
+    /// one way through the daemon and another through this path, for one flag
+    /// value. Both resolvers are now case-insensitive on the name leg.
+    #[test]
+    fn an_unresolvable_vaults_entry_errors_while_a_real_vault_resolves_in_any_case() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: VAULT.to_string(),
+                name: "brain".to_string(),
+                root_path: "/home/k/brain".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+
+        let err = resolve_vault_filter(&store, &["nope".to_string()])
+            .expect_err("an unresolvable vault scope must not silently answer")
+            .to_string();
+        assert!(
+            err.contains("nope") && err.contains("brain"),
+            "the error must name the failed entry and the known vaults: {err}"
+        );
+
+        for selector in [VAULT, "brain", "BRAIN", "/home/k/brain"] {
+            assert_eq!(
+                resolve_vault_filter(&store, &[selector.to_string()]).unwrap(),
+                HashSet::from([VAULT.to_string()]),
+                "selector {selector:?} must resolve"
+            );
+        }
+    }
+}
+
+/// nw-412 — `affected-tests` REFUSES and `pr-impact` DEGRADES on a graph whose
+/// edges predate the running resolver.
+///
+/// Both directions matter and they are different contracts: a test selector
+/// that silently narrows drops the regression test that would have caught the
+/// change, with nothing downstream able to tell that from "no tests exist".
+#[cfg(test)]
+mod resolver_generation_gate_tests {
+    use super::*;
+    use nestweaver_engine::blast_radius::{AnalysisStatus, BlastRadiusResult};
+    use nestweaver_engine::resolver_generation::{self, DeadCodeRefusal};
+
+    const REPO: &str = "repo:default:aaaaaaaaaaaa";
+
+    fn repo_row(root: &std::path::Path) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: REPO.to_string(),
+            url: "https://github.com/example/demo".to_string(),
+            indexed_sha: "deadbeef".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: Some("demo".to_string()),
+            root_path: Some(root.display().to_string()),
+        }
+    }
+
+    fn store_with_one_repo(root: &std::path::Path) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo_row(root)).unwrap();
+        store
+    }
+
+    /// A run that reported the clean gate this item is about: `Complete`,
+    /// `Ok`, `Low`, nothing affected — the exact shape `print_pr_impact_hook`
+    /// prints NOTHING for.
+    fn clean_result() -> BlastRadiusResult {
+        BlastRadiusResult {
+            changed_symbols: Vec::new(),
+            affected_symbols: Vec::new(),
+            affected_symbol_count: 0,
+            affected_clusters: Vec::new(),
+            risk_level: RiskLevel::Low,
+            summary: "1 changed symbol, 0 affected".to_string(),
+            org_wide: None,
+            status: AnalysisStatus::Complete,
+            notifications: Vec::new(),
+            gate_state: GateState::Ok,
+            coverage: nestweaver_engine::blast_radius::Coverage::default(),
+            blind_spots: Vec::new(),
+            cochanged_files: Vec::new(),
+            analysis_direction: "over-approximate".to_string(),
+        }
+    }
+
+    /// The direction that made nw-412 dangerous: a stale graph understates
+    /// impact, and the run that understates it most is the one that looks
+    /// cleanest. After the degrade it cannot report `ok` at all, which is also
+    /// what breaks `print_pr_impact_hook`'s silence — that banner is skipped
+    /// only for `gate_state == Ok && risk_level == Low && nothing affected`,
+    /// and a stale graph is exactly the run most likely to look like that.
+    #[test]
+    fn a_generation_stale_graph_cannot_report_a_clean_blast_radius_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        // No sidecar written: an unrecorded repo reads as generation 0, which
+        // is the "indexed before this record existed" case by definition.
+
+        let mut result = clean_result();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert_eq!(
+            result.gate_state,
+            GateState::DegradedUnknown,
+            "a run that did not complete is `degraded-unknown`, never `ok`"
+        );
+        assert_ne!(
+            result.gate_state,
+            GateState::Ok,
+            "`print_pr_impact_hook` is silent on an Ok/Low/empty run — the whole \
+             point is that a stale graph must no longer reach that branch"
+        );
+        assert!(
+            result.notifications.iter().any(|n| {
+                n.descriptor == BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR
+                    && matches!(n.level, NotificationLevel::Error)
+            }),
+            "the reason must be a NAMED error notification, not an unexplained \
+             degrade: {:?}",
+            result.notifications
+        );
+        assert!(
+            result.summary.contains("[status: degraded]"),
+            "the human summary must not still claim a clean run: {}",
+            result.summary
+        );
+    }
+
+    /// COUNTERWEIGHT, and the assertion nw-412 explicitly requires: a
+    /// generation-CURRENT graph must NOT degrade. Without this, wiring that
+    /// degraded unconditionally would pass every test above while making the
+    /// gate useless.
+    #[test]
+    fn a_generation_current_graph_still_reports_its_own_clean_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        let mut result = clean_result();
+        let before = result.summary.clone();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.gate_state, GateState::Ok);
+        assert!(
+            result.notifications.is_empty(),
+            "a current graph must not be told it is stale: {:?}",
+            result.notifications
+        );
+        assert_eq!(result.summary, before, "the summary must not be re-tagged");
+    }
+
+    /// `affected-tests` refuses rather than degrades, and the refusal has to
+    /// be readable by the CI job that consumes it: no tiers at all (an empty
+    /// tier list is a CLAIM, and the wrong one), `needs_reindex` for the gate
+    /// that already keys on it, and `run-full-suite` as the widening a caller
+    /// acts on.
+    ///
+    /// The `note` check is the one this item names specifically: reusing
+    /// `DeadCodeRefusal::message()` verbatim would print "dead-code will not
+    /// produce a list…" in front of the right remedies.
+    #[test]
+    fn an_affected_tests_refusal_says_run_the_full_suite_and_carries_no_tiers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let repos = vec![repo_row(tmp.path())];
+
+        let refusal = DeadCodeRefusal::for_repos(&db_path, &repos)
+            .expect("an unrecorded repo is generation 0 and therefore stale");
+        let payload = affected_tests_refusal_payload(&refusal);
+
+        assert_eq!(payload["refused"], serde_json::json!(true));
+        assert_eq!(payload["reason"], serde_json::json!("outdated_resolver"));
+        assert_eq!(payload["needs_reindex"], serde_json::json!(true));
+        assert_eq!(
+            payload["recommendation"],
+            serde_json::json!("run-full-suite"),
+            "a caller that keys off `did I get tiers` reads a refusal as `no \
+             tests affected` — the exact silent narrowing this prevents"
+        );
+        for tier in ["tier_1", "tier_2", "tier_3"] {
+            assert!(
+                payload.get(tier).is_none(),
+                "{tier} must be ABSENT; an empty list is a claim and it is wrong"
+            );
+        }
+
+        let note = payload["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("affected-tests will not produce a selection"),
+            "the refusal must use the affected-tests wording, not dead-code's: {note}"
+        );
+        assert!(
+            !note.contains("dead-code"),
+            "dead-code's sentence is the wrong one in front of these remedies: {note}"
+        );
+        assert!(
+            note.contains("--force"),
+            "the remedy must be runnable: a plain re-index is a no-op on a \
+             generation-stale repo that is already at HEAD: {note}"
+        );
+        // The daemon route prints what it was sent; the extractor must find
+        // exactly this paragraph rather than falling back.
+        assert_eq!(affected_tests_refusal_note(&payload), note);
+    }
+
+    /// COUNTERWEIGHT for the selector: a generation-CURRENT graph produces no
+    /// refusal at all, so `affected-tests` still answers. A selector that
+    /// refuses unconditionally is safe and useless.
+    #[test]
+    fn a_generation_current_graph_produces_no_affected_tests_refusal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let repos = vec![repo_row(tmp.path())];
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        assert!(
+            DeadCodeRefusal::for_repos(&db_path, &repos).is_none(),
+            "a repo recorded at the current generation must not refuse"
         );
     }
 }
