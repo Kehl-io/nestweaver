@@ -5274,6 +5274,21 @@ impl NestWeaverDaemon for DaemonService {
                 .as_ref()
                 .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
                 .unwrap_or_default();
+            // nw-418/nw-422: the `unskip` half of the same `[[repos]]` block,
+            // resolved from the SAME config against the SAME (url, path) pair —
+            // `unskip_names_for` mirrors `exclude_globs_for`'s resolution
+            // exactly so the two halves can never disagree about which repo they
+            // describe.
+            //
+            // WITHOUT THIS the daemon-served index route keeps the bug the CLI
+            // route no longer has, which is the INVERSE of the asymmetry nw-418
+            // was filed for: `--no-daemon` and the daemon would disagree about
+            // what the repo contains.
+            let repo_unskip: Vec<String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| cfg.unskip_names_for(&repo_url, Some(&repo_path)).to_vec())
+                .unwrap_or_default();
 
             let index_opts = nestweaver_engine::index::IndexOptions::new(
                 // nw-019: stamp the effective logical instance on indexed repos —
@@ -5285,7 +5300,8 @@ impl NestWeaverDaemon for DaemonService {
             .force(force)
             .name(name.as_deref())
             .limits(index_limits)
-            .excludes(&repo_excludes);
+            .excludes(&repo_excludes)
+            .unskip(&repo_unskip);
 
             match nestweaver_engine::index::index_directory_with_store_opts(
                 &state.store,
@@ -17084,6 +17100,8 @@ mod startup_helper_tests {
             url: url.to_string(),
             repo_type,
             name: None,
+            // nw-422: no SKIP_DIRS re-admission in these fixtures.
+            unskip: Vec::new(),
             sparse: None,
             pin_sha: None,
             use_git_activity: None,
@@ -21453,6 +21471,8 @@ mod watch_path_allowed_tests {
             url: url.to_string(),
             repo_type,
             name: None,
+            // nw-422: no SKIP_DIRS re-admission in these fixtures.
+            unskip: Vec::new(),
             sparse: None,
             pin_sha: None,
             use_git_activity: None,

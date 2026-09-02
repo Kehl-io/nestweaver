@@ -167,6 +167,17 @@ fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     generate_hub_summaries_bounded(store).map(|out| out.summaries)
 }
 
+/// How many hubs a hub-level summary generates.
+///
+/// Module-level and `pub` so the number is NAMEABLE by the surfaces that
+/// disclose it, mirroring [`MAX_CLUSTER_SUMMARIES`]. It was a `const` local to
+/// [`generate_hub_summaries_bounded`], which is why the caller could report
+/// `total: 30` without anywhere to say where the 30 came from — an internal
+/// constant the caller never chose. Deliberately NOT yet a parameter: the
+/// cluster sibling takes its cap as an argument, so the shape to copy exists
+/// if a caller ever needs to choose it ([[nw-409]]).
+pub const HUB_COUNT: usize = 30;
+
 /// Hub summaries with the two facts that say whether the list is complete.
 pub struct HubSummaries {
     pub summaries: Vec<Summary>,
@@ -188,9 +199,12 @@ pub struct HubSummaries {
 /// caller's own request, and returning N of N is the correct answer to it.
 /// The lie is specific to a bound the caller could not see or state.
 pub fn generate_hub_summaries_bounded(store: &GraphStore) -> Result<HubSummaries> {
-    const HUB_COUNT: usize = 30;
     let found = crate::hubs::find_hub_nodes_bounded(store, HUB_COUNT)?;
     let candidate_total = found.candidate_total;
+    // nw-398: take the cut/no-cut verdict from `HubNodes` rather than
+    // recomputing it here, so this level and the `hubs` surfaces cannot come to
+    // disagree about what "capped" means on the same population.
+    let capped = found.truncated();
     let summaries: Vec<Summary> = found
         .hubs
         .iter()
@@ -212,7 +226,7 @@ pub fn generate_hub_summaries_bounded(store: &GraphStore) -> Result<HubSummaries
         })
         .collect();
     Ok(HubSummaries {
-        capped: candidate_total > summaries.len(),
+        capped,
         matched_total: candidate_total,
         summaries,
     })

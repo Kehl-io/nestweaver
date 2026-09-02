@@ -18,13 +18,12 @@ use nestweaver_engine::{
     SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
     broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
     detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
-    generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
-    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
-    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
-    tag_graph_all, topic_clusters, truncate_to_budget,
+    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
+    generate_guide_with_tools, generate_skill_with_tools, generate_summaries, get_all_properties,
+    get_last_indexed_at, investigate, investigate_expand, investigate_hydrate, load_alias_sidecar,
+    load_clusters, load_extensions, memory_consolidate, memory_lint, memory_related,
+    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
+    render_text, tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
@@ -957,31 +956,33 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     bounded
 }
 
-fn missing_alias_requirement(name: &str, args: &Value) -> Option<&'static str> {
-    if !args.is_object() {
-        return None;
+/// Guidance for an argument sent to the WRONG tool, keyed by (tool, property).
+///
+/// nw-408. `investigate_hydrate` carried this text INSIDE its handler, as a
+/// loop over `["targets", "target", "uid", "uids"]` that returned "it hydrates
+/// the whole bundle — use investigate_expand with 'targets'". Validation runs
+/// first on every route (`dispatch_cancellable`, `dispatch_via_daemon`,
+/// `http.rs`), and `additionalProperties: false` rejects all four keys, so the
+/// handler was never entered and the message was UNREACHABLE dead code. The
+/// authored guidance is better than anything a generic renderer can produce —
+/// it names the tool the caller actually wanted — so it moves to the layer
+/// that runs instead of being deleted.
+///
+/// A table, not a per-tool hook, because the failure mode is generic: an agent
+/// confusing two tools in the same family sends the sibling's argument. Add a
+/// row when a second pair earns one; do not add a second mechanism.
+fn unknown_argument_hint(tool: &str, property: &str) -> Option<String> {
+    match (tool, property) {
+        // Kept inside MAX_VALIDATION_ITEM_BYTES on purpose: the item budget
+        // is what stops a hostile instance from writing the error message, so
+        // the hint is worded to survive it rather than to be truncated
+        // mid-sentence by it.
+        ("investigate_hydrate", "targets" | "target" | "uid" | "uids") => Some(format!(
+            "investigate_hydrate takes no '{property}' — it hydrates the whole bundle. \
+             Use investigate_expand instead."
+        )),
+        _ => None,
     }
-
-    let (first, second, message) = match name {
-        "read_symbols" => (
-            "targets",
-            "uids_or_fqns",
-            "missing required argument: expected 'targets' or 'uids_or_fqns'",
-        ),
-        "regex_search" => (
-            "pattern",
-            "query",
-            "missing required argument: expected 'pattern' or 'query'",
-        ),
-        "detect_changes" => (
-            "changed_files",
-            "files",
-            "missing required argument: expected 'changed_files' or 'files'",
-        ),
-        _ => return None,
-    };
-
-    (args.get(first).is_none() && args.get(second).is_none()).then_some(message)
 }
 
 /// Reject alias pairs that are BOTH present — `regex_search` called with both
@@ -999,7 +1000,141 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
     }
 }
 
-fn render_validation_error(error: &jsonschema::ValidationError<'_>) -> String {
+/// How many offending property names an error message will list before it
+/// collapses the rest into a count. Three is enough to see a pattern; the
+/// names come from the INSTANCE, so an unbounded list is caller-controlled
+/// error length.
+const MAX_NAMED_PROPERTIES: usize = 3;
+
+/// Per-name budget for a quoted property list. The whole item is truncated to
+/// [`MAX_VALIDATION_ITEM_BYTES`] anyway, but truncating per name keeps all
+/// three visible when one of them is hostile rather than letting the first eat
+/// the budget.
+const MAX_PROPERTY_NAME_BYTES: usize = 48;
+
+fn quoted_property_list(names: &[String]) -> String {
+    let mut rendered = names
+        .iter()
+        .take(MAX_NAMED_PROPERTIES)
+        .map(|name| format!("'{}'", truncate_utf8_bytes(name, MAX_PROPERTY_NAME_BYTES)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX_NAMED_PROPERTIES {
+        rendered.push_str(&format!(
+            " (and {} more)",
+            names.len() - MAX_NAMED_PROPERTIES
+        ));
+    }
+    rendered
+}
+
+/// Render an `anyOf` failure whose branches are pure `required` groups as the
+/// either/or prose it actually means.
+///
+/// nw-410. The eight either/or tools now declare
+/// `anyOf: [{required:["uid"]},{required:["title"]}]`, so `tools/list`,
+/// `brain_guide` and the validator read ONE source. Left unrendered, that
+/// costs the caller the message the hand-coded `missing_alias_requirement`
+/// used to produce: bare `anyOf` reports `/` and a keyword and names nothing.
+///
+/// The phrasing is "provide either 'a' or 'b'" because that is the wording
+/// five of the eight HANDLERS already use for the same requirement
+/// (`note_get`, `backlinks`, `cross_repo_contracts`, `affected_tests`,
+/// `query_extensions`). Those handler errors are now shadowed on the MCP route
+/// — validation runs first — so the message a caller sees must not change
+/// meaning just because it started arriving one layer earlier.
+///
+/// Returns empty for any `anyOf` that is not a pure requirement group — a
+/// branch that constrains a value rather than demanding a key cannot be
+/// summarised as "either X or Y" without lying about it.
+fn either_or_detail(context: &[Vec<jsonschema::ValidationError<'static>>]) -> String {
+    use jsonschema::error::ValidationErrorKind as Kind;
+
+    let mut branches = Vec::new();
+    for branch in context {
+        let mut missing = Vec::new();
+        for error in branch {
+            let Kind::Required { property } = error.kind() else {
+                return String::new();
+            };
+            let Some(property) = property.as_str() else {
+                return String::new();
+            };
+            missing.push(format!(
+                "'{}'",
+                truncate_utf8_bytes(property, MAX_PROPERTY_NAME_BYTES)
+            ));
+        }
+        // A branch needing several keys at once (`query_extensions`
+        // key+value) reads as "both 'key' and 'value'", so a conjunction is
+        // never mistaken for one more choice.
+        branches.push(match missing.len() {
+            0 => return String::new(),
+            1 => missing.remove(0),
+            2 => format!("both {} and {}", missing[0], missing[1]),
+            _ => format!("all of {}", missing.join(", ")),
+        });
+    }
+    match branches.len() {
+        0 => String::new(),
+        1 => format!(" — provide {}", branches[0]),
+        2 => format!(" — provide either {} or {}", branches[0], branches[1]),
+        _ => format!(" — provide one of {}", branches.join(", ")),
+    }
+}
+
+/// The part of a validation message that names WHAT failed, not just which
+/// keyword rejected it.
+///
+/// nw-408. `additionalProperties` was the ONE error class that withheld the
+/// property name: `instance_path` is `""` for it (the object as a whole
+/// violated the keyword, not any one member), so every one of the 42 tools —
+/// all of which set `additionalProperties: false` — answered a typo with the
+/// identical, unactionable `/: schema keyword 'additionalProperties' failed`.
+/// The name was never missing, only discarded: `jsonschema` carries it in
+/// `ValidationErrorKind::AdditionalProperties { unexpected }`.
+///
+/// This is the shared renderer, so the CLI face of the same defect (nw-400)
+/// is fixed by the same code rather than by a second MCP-only special case.
+///
+/// Deliberately contains no `; ` — that is the separator
+/// [`validate_tool_arguments`] joins its (at most three) errors with.
+fn validation_error_detail(tool: &str, kind: &jsonschema::error::ValidationErrorKind) -> String {
+    use jsonschema::error::ValidationErrorKind as Kind;
+
+    match kind {
+        Kind::AdditionalProperties { unexpected } | Kind::UnevaluatedProperties { unexpected } => {
+            let plural = if unexpected.len() == 1 { "" } else { "s" };
+            let mut detail = format!(
+                " — unknown argument{plural} {}",
+                quoted_property_list(unexpected)
+            );
+            if let Some(hint) = unexpected
+                .iter()
+                .find_map(|property| unknown_argument_hint(tool, property))
+            {
+                detail.push_str(". ");
+                detail.push_str(&hint);
+            }
+            detail
+        }
+        // `required` reports the OBJECT's path, so without the name a nested
+        // failure is as anonymous as `additionalProperties` was.
+        Kind::Required { property } => property
+            .as_str()
+            .map(|property| {
+                format!(
+                    " — missing required argument '{}'",
+                    truncate_utf8_bytes(property, MAX_PROPERTY_NAME_BYTES)
+                )
+            })
+            .unwrap_or_default(),
+        Kind::AnyOf { context } => either_or_detail(context),
+        _ => String::new(),
+    }
+}
+
+fn render_validation_error(tool: &str, error: &jsonschema::ValidationError<'_>) -> String {
     let instance_path = error.instance_path().to_string();
     let instance_path = if instance_path.is_empty() {
         "/".to_string()
@@ -1008,8 +1143,9 @@ fn render_validation_error(error: &jsonschema::ValidationError<'_>) -> String {
     };
     truncate_utf8_bytes(
         &format!(
-            "{instance_path}: schema keyword '{}' failed",
-            error.kind().keyword()
+            "{instance_path}: schema keyword '{}' failed{}",
+            error.kind().keyword(),
+            validation_error_detail(tool, error.kind())
         ),
         MAX_VALIDATION_ITEM_BYTES,
     )
@@ -1023,15 +1159,19 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::E
         return Err(anyhow!(message));
     };
 
-    let errors: Vec<String> = if let Some(message) = missing_alias_requirement(name, args) {
-        vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
-    } else if let Some(message) = conflicting_alias_error(name, args) {
+    let errors: Vec<String> = if let Some(message) = conflicting_alias_error(name, args) {
         vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
     } else {
+        // nw-410: the missing-alias rule used to short-circuit here, hand-coded
+        // for 3 of the 8 either/or tools. It now lives in each schema as
+        // `anyOf: [{required: [...]}, ...]`, which the validator honours and
+        // `either_or_detail` renders with the same wording — so `tools/list`,
+        // `brain_guide`'s key-parameter column and this error all derive from
+        // one declaration instead of drifting apart.
         validator
             .iter_errors(args)
             .take(3)
-            .map(|error| render_validation_error(&error))
+            .map(|error| render_validation_error(name, &error))
             .collect()
     };
     if errors.is_empty() {
@@ -1364,21 +1504,272 @@ mod tool_schema_validation_tests {
         assert!(error.starts_with("unknown tool: "));
     }
 
+    /// nw-410. All EIGHT either/or tools, not the three that were hand-coded,
+    /// and the requirement is asserted in the two places that used to
+    /// disagree: the validation error AND `brain_guide`'s key-parameter cell.
     #[test]
     fn missing_alias_pairs_name_every_accepted_field() {
-        for (name, accepted) in [
-            ("read_symbols", ["targets", "uids_or_fqns"]),
-            ("regex_search", ["pattern", "query"]),
-            ("detect_changes", ["changed_files", "files"]),
-        ] {
+        let entries = tool_doc_entries();
+        for &(name, accepted) in EITHER_OR_TOOLS {
             let error = assert_invalid(name, json!({}));
+            let (_, _, _, key_params) = entries
+                .iter()
+                .find(|(entry, ..)| entry.as_str() == name)
+                .unwrap_or_else(|| panic!("{name} is not in the doc table"));
+            let cell = key_params.join(", ");
             for field in accepted {
                 assert!(
                     error.contains(field),
                     "{name} missing-argument error must name '{field}': {error}"
                 );
+                assert!(
+                    cell.contains(field),
+                    "brain_guide's key-parameter cell for {name} must name '{field}': {cell:?}"
+                );
+            }
+            // The cell is rendered into a MARKDOWN TABLE row; a pipe would
+            // split it into an extra column in the file this gets written to.
+            assert!(
+                !cell.contains('|'),
+                "{name} key-parameter cell would break the guide's table: {cell:?}"
+            );
+        }
+    }
+
+    /// The eight tools whose requirement is an either/or, with the spellings
+    /// each accepts. `query_extensions` needs `key` AND `value` together in
+    /// its second mode, which is why the table holds three names for it.
+    const EITHER_OR_TOOLS: &[(&str, &[&str])] = &[
+        ("read_symbols", &["targets", "uids_or_fqns"]),
+        ("regex_search", &["pattern", "query"]),
+        ("detect_changes", &["changed_files", "files"]),
+        ("note_get", &["uid", "title"]),
+        ("backlinks", &["uid", "title"]),
+        ("cross_repo_contracts", &["uid", "name"]),
+        ("affected_tests", &["changed_files", "base_ref"]),
+        ("query_extensions", &["uid", "key", "value"]),
+    ];
+
+    /// COUNTERWEIGHT to `missing_alias_pairs_name_every_accepted_field`:
+    /// nw-410's `anyOf` must express "one of these", never "all of these".
+    ///
+    /// The failure this guards against is the obvious mis-encoding — writing
+    /// the alternatives into `required` — which would turn every one of these
+    /// eight tools into a call that can no longer be made at all.
+    #[test]
+    fn either_or_requirements_are_satisfied_by_either_side_alone() {
+        for (name, args) in [
+            ("read_symbols", json!({ "targets": ["sym:x"] })),
+            ("read_symbols", json!({ "uids_or_fqns": ["sym:x"] })),
+            ("regex_search", json!({ "pattern": "fn\\s+x" })),
+            ("regex_search", json!({ "query": "fn\\s+x" })),
+            ("detect_changes", json!({ "changed_files": ["src/a.rs"] })),
+            ("detect_changes", json!({ "files": ["src/a.rs"] })),
+            ("note_get", json!({ "uid": "note:vlt:V:abc" })),
+            ("note_get", json!({ "title": "Home" })),
+            ("backlinks", json!({ "uid": "note:vlt:V:abc" })),
+            ("backlinks", json!({ "title": "Home" })),
+            ("cross_repo_contracts", json!({ "uid": "sym:x" })),
+            ("cross_repo_contracts", json!({ "name": "UserService" })),
+            ("affected_tests", json!({ "changed_files": ["src/a.rs"] })),
+            ("affected_tests", json!({ "base_ref": "main" })),
+            ("query_extensions", json!({ "uid": "sym:x" })),
+            (
+                "query_extensions",
+                json!({ "key": "team", "value": "core" }),
+            ),
+        ] {
+            assert_valid(name, args);
+        }
+
+        // ...and a branch that needs two keys is not satisfied by one of them.
+        let error = assert_invalid("query_extensions", json!({ "key": "team" }));
+        assert!(error.contains("value"), "{error}");
+    }
+
+    /// nw-410's acceptance criterion, asserted over the REGISTRY so tool 43
+    /// cannot be added with a silent cell — the same rule
+    /// `every_registered_schema_rejects_unknown_arguments` enforces for
+    /// `additionalProperties`.
+    ///
+    /// This matters beyond documentation: `brain_guide{format: "claude-md" |
+    /// "agents-md" | "skill"}` WRITES this table into a persistent
+    /// agent-instruction file, so an em-dash where a requirement belongs is
+    /// checked in and misleads every later session.
+    #[test]
+    fn no_guide_entry_is_silent_about_a_requirement_it_enforces() {
+        let mut silent = Vec::new();
+        let mut over_stated = Vec::new();
+        for (name, _category, _purpose, key_params) in tool_doc_entries() {
+            let rejects_empty = validate_tool_arguments(&name, &json!({})).is_err();
+            if rejects_empty && key_params.is_empty() {
+                silent.push(name);
+            } else if !rejects_empty && !key_params.is_empty() {
+                // COUNTERWEIGHT: a tool that happily accepts `{}` must not
+                // advertise a requirement it does not have. Over-applying the
+                // fix would send agents hunting for a mandatory argument that
+                // is optional.
+                over_stated.push(name);
             }
         }
+        assert!(
+            silent.is_empty(),
+            "these tools render an empty key-parameter cell while rejecting an empty \
+             argument object, and brain_guide writes that into CLAUDE.md/AGENTS.md/SKILL.md: \
+             {silent:?}"
+        );
+        assert!(
+            over_stated.is_empty(),
+            "these tools advertise a required parameter but accept an empty call: {over_stated:?}"
+        );
+    }
+
+    /// nw-408. `additionalProperties` was the ONE error class that named
+    /// nothing, and it is the likeliest failure for an LLM client because all
+    /// 42 tools set `additionalProperties: false`.
+    #[test]
+    fn an_unknown_argument_is_named_and_a_correctly_spelled_one_is_not_disturbed() {
+        let error = assert_invalid("flow_trace", json!({ "symbol": "s", "max_dpeth": 100 }));
+        assert!(error.contains("additionalProperties"), "{error}");
+        assert!(
+            error.contains("'max_dpeth'"),
+            "the unknown-property error must name the property: {error}"
+        );
+
+        // Two typos at once used to yield one message with zero names.
+        let both = assert_invalid(
+            "flow_trace",
+            json!({ "symbol": "s", "max_dpeth": 1, "respons_format": "concise" }),
+        );
+        assert!(both.contains("'max_dpeth'"), "{both}");
+        assert!(both.contains("'respons_format'"), "{both}");
+
+        // COUNTERWEIGHT: the correctly-spelled call still validates, and a
+        // DIFFERENT error class keeps naming its own instance path rather than
+        // being relabelled as an unknown argument.
+        assert_valid("flow_trace", json!({ "symbol": "s", "max_depth": 15 }));
+        let ranged = assert_invalid("flow_trace", json!({ "symbol": "s", "max_depth": 100 }));
+        assert!(ranged.contains("/max_depth"), "{ranged}");
+        assert!(
+            !ranged.contains("unknown argument"),
+            "an out-of-range value is not an unknown argument: {ranged}"
+        );
+    }
+
+    /// nw-408's sharp consequence. `investigate_hydrate` carried purpose-built
+    /// typo guidance in its HANDLER, behind validation, so
+    /// `additionalProperties: false` rejected all four keys first and the good
+    /// message was unreachable on every MCP path. The guard is deleted; the
+    /// message now comes from `unknown_argument_hint`, which the validator
+    /// reaches.
+    #[test]
+    fn investigate_hydrate_typo_guidance_is_reachable_and_stays_scoped_to_that_tool() {
+        for key in ["targets", "target", "uid", "uids"] {
+            let error = assert_invalid(
+                "investigate_hydrate",
+                json!({ "bundle_id": "b", key: ["sym:x"] }),
+            );
+            assert!(
+                error.contains(&format!("'{key}'")),
+                "hydrate's rejection must name '{key}': {error}"
+            );
+            assert!(
+                error.contains("investigate_expand"),
+                "hydrate's rejection must point at investigate_expand: {error}"
+            );
+            // The per-item byte budget must not eat the remedy. A hint that
+            // truncates mid-sentence is only marginally better than the
+            // anonymous message it replaced.
+            assert!(
+                !error.contains('\u{2026}'),
+                "the guidance must fit MAX_VALIDATION_ITEM_BYTES intact: {error}"
+            );
+        }
+
+        // COUNTERWEIGHT: the hint is keyed to (tool, property), so the tool
+        // that legitimately TAKES `targets` is untouched, and an unrelated
+        // typo on hydrate is not given advice about a tool that would not
+        // have helped either.
+        assert_valid(
+            "investigate_expand",
+            json!({ "bundle_id": "b", "targets": ["sym:x"] }),
+        );
+        let unrelated = assert_invalid(
+            "investigate_hydrate",
+            json!({ "bundle_id": "b", "bogus": 1 }),
+        );
+        assert!(unrelated.contains("'bogus'"), "{unrelated}");
+        assert!(
+            !unrelated.contains("investigate_expand"),
+            "an unrelated typo must not be given hydrate/expand advice: {unrelated}"
+        );
+    }
+
+    /// nw-411. `brain_memory_related` bounded NOTHING: no `limit` (and
+    /// `additionalProperties: false` rejected one), `depth` with no
+    /// minimum/maximum, and `depth: -1` reinterpreted as the engine default 2
+    /// because `as_u64()` fails.
+    #[test]
+    fn brain_memory_related_rejects_an_unbounded_traversal_without_rejecting_a_legal_one() {
+        for args in [
+            json!({ "uid": "note:x", "depth": -1 }),
+            json!({ "uid": "note:x", "depth": 0 }),
+            json!({ "uid": "note:x", "depth": 16 }),
+            json!({ "uid": "note:x", "depth": 100_000 }),
+            json!({ "uid": "note:x", "limit": 0 }),
+            json!({ "uid": "note:x", "limit": -1 }),
+            json!({ "uid": "note:x", "limit": 1001 }),
+        ] {
+            assert_invalid("brain_memory_related", args);
+        }
+
+        // COUNTERWEIGHT: the bound is not over-applied. Both ends of the
+        // declared range validate, omitting either parameter validates, and
+        // `limit` — which `additionalProperties: false` used to reject
+        // outright, leaving the caller no remedy at all — is now accepted.
+        for args in [
+            json!({ "uid": "note:x" }),
+            json!({ "uid": "note:x", "depth": 1 }),
+            json!({ "uid": "note:x", "depth": 15 }),
+            json!({ "uid": "note:x", "limit": 1 }),
+            json!({ "uid": "note:x", "limit": 5 }),
+            json!({ "uid": "note:x", "limit": 1000 }),
+        ] {
+            assert_valid("brain_memory_related", args);
+        }
+    }
+
+    /// nw-409. `level: "hub"`/`"cluster"` reported `truncated_by_cap: true`
+    /// while declaring no parameter that could raise the cap, and `limit` was
+    /// rejected by `additionalProperties`.
+    #[test]
+    fn get_summary_declares_a_cluster_row_bound_and_still_refuses_an_undeclared_one() {
+        assert_valid(
+            "get_summary",
+            json!({ "level": "cluster", "max_summaries": 500 }),
+        );
+        assert_valid(
+            "get_summary",
+            json!({ "level": "cluster", "max_summaries": 1 }),
+        );
+        assert_valid(
+            "get_summary",
+            json!({ "level": "cluster", "max_summaries": 1000 }),
+        );
+        for args in [
+            json!({ "level": "cluster", "max_summaries": 0 }),
+            json!({ "level": "cluster", "max_summaries": -1 }),
+            json!({ "level": "cluster", "max_summaries": 1001 }),
+        ] {
+            assert_invalid("get_summary", args);
+        }
+
+        // COUNTERWEIGHT, and the nw-408 tie-in: the knob a caller GUESSED at
+        // is still refused — but the refusal now names it, so the caller can
+        // read the schema and find `max_summaries` instead of seeing the same
+        // anonymous `/: schema keyword 'additionalProperties' failed`.
+        let error = assert_invalid("get_summary", json!({ "level": "hub", "limit": 100 }));
+        assert!(error.contains("'limit'"), "{error}");
     }
 
     #[test]
@@ -2172,37 +2563,38 @@ mod tool_schema_validation_tests {
             args
         }
 
-        // Some tools express "one of these two" as an alias rule enforced
-        // beside the schema (`missing_alias_requirement`), not as `required`.
-        // Satisfy it by adding declared properties until the rule is happy,
-        // so the assertion below is about the cache pair and nothing else.
-        fn satisfy_alias_requirement(
-            name: &str,
+        // nw-410: "one of these two" is now declared IN the schema as
+        // `anyOf: [{required: [...]}, ...]` rather than hand-coded beside it,
+        // so satisfying it is reading the first branch instead of consulting a
+        // second table. Satisfied here so the assertion below is about the
+        // cache pair and nothing else.
+        fn satisfy_either_or_requirement(
             schema: &Value,
             args: &mut serde_json::Map<String, Value>,
         ) {
-            if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
-                return;
-            }
-            let Some(properties) = schema["properties"].as_object() else {
+            let Some(branch) = schema["anyOf"].as_array().and_then(|b| b.first()) else {
                 return;
             };
-            for (field, declared) in properties {
+            let properties = schema["properties"].as_object();
+            for field in branch["required"].as_array().into_iter().flatten() {
+                let Some(field) = field.as_str() else {
+                    continue;
+                };
                 if args.contains_key(field) {
                     continue;
                 }
-                let value = match declared["type"].as_str().unwrap_or("string") {
+                let declared = properties.and_then(|properties| properties.get(field));
+                let value = match declared
+                    .and_then(|d| d["type"].as_str())
+                    .unwrap_or("string")
+                {
                     "array" => json!(["x"]),
                     "integer" | "number" => json!(1),
                     "boolean" => json!(true),
                     "object" => json!({}),
                     _ => json!("x"),
                 };
-                args.insert(field.clone(), value);
-                if missing_alias_requirement(name, &Value::Object(args.clone())).is_none() {
-                    return;
-                }
-                args.remove(field);
+                args.insert(field.to_string(), value);
             }
         }
 
@@ -2226,7 +2618,7 @@ mod tool_schema_validation_tests {
 
             // Declaring it is not enough — it has to actually validate.
             let mut base = minimal_args(schema);
-            satisfy_alias_requirement(name, schema, &mut base);
+            satisfy_either_or_requirement(schema, &mut base);
             for bypass in [json!({ "cache": "bypass" }), json!({ "no_cache": true })] {
                 let mut args = base.clone();
                 for (key, value) in bypass.as_object().expect("bypass args are an object") {
@@ -2240,6 +2632,58 @@ mod tool_schema_validation_tests {
             }
         }
     }
+}
+
+/// The key-parameter list `brain_guide` publishes for one tool, read from its
+/// `inputSchema` alone.
+///
+/// nw-410. This was `inputSchema.required` and nothing else, so the eight
+/// tools whose requirement is an EITHER/OR — `read_symbols`, `note_get`,
+/// `backlinks`, `cross_repo_contracts`, `query_extensions`, `affected_tests`,
+/// `regex_search`, `detect_changes` — rendered an em-dash in the "Key
+/// parameters" column while erroring on an empty argument object. That is not
+/// a cosmetic doc bug: `brain_guide{format: "claude-md"|"agents-md"|"skill"}`
+/// WRITES the table into a persistent agent-instruction file, so the wrong
+/// entry gets checked in and misleads every later session.
+///
+/// The either/or group now comes from the schema's `anyOf`, which is also what
+/// the validator enforces — one declaration, three consumers.
+fn key_parameter_names(input_schema: &Value) -> Vec<String> {
+    let mut names: Vec<String> = input_schema["required"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(either_or) = either_or_requirement(input_schema) {
+        names.push(either_or);
+    }
+    names
+}
+
+/// `anyOf: [{required: [...]}, ...]` rendered as prose: `"uid or title"`, or
+/// `"uid or key + value"` when a branch needs two keys at once.
+///
+/// Joined with the word "or", never a `|`: the guide renders these into a
+/// MARKDOWN TABLE cell, where a pipe would split the row into a new column.
+///
+/// Returns `None` for an `anyOf` that is not a pure requirement group — the
+/// same conservatism [`either_or_detail`] applies, so the guide cannot claim a
+/// value constraint is a parameter name.
+fn either_or_requirement(input_schema: &Value) -> Option<String> {
+    let branches = input_schema["anyOf"].as_array()?;
+    let mut rendered = Vec::new();
+    for branch in branches {
+        let required = branch["required"].as_array()?;
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        if names.is_empty() || names.len() != required.len() {
+            return None;
+        }
+        rendered.push(names.join(" + "));
+    }
+    (!rendered.is_empty()).then(|| rendered.join(" or "))
 }
 
 /// Returns structured documentation metadata for every registered tool.
@@ -2307,14 +2751,7 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
             // Take just the first sentence/line as purpose
             let purpose = desc.split('\n').next().unwrap_or(desc).to_string();
             let category = cat_map.get(name.as_str()).unwrap_or(&"Other").to_string();
-            let key_params: Vec<String> = t["inputSchema"]["required"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let key_params = key_parameter_names(&t["inputSchema"]);
             (name, category, purpose, key_params)
         })
         .collect()
@@ -3726,6 +4163,15 @@ fn tool_schema_read_symbols() -> Value {
                     "description": "Repository root for resolving file paths (default: server working directory)."
                 }
             },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["targets"] },
+                { "required": ["uids_or_fqns"] }
+            ],
             "additionalProperties": false
         }
     })
@@ -3821,6 +4267,15 @@ fn tool_schema_regex_search() -> Value {
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["pattern"] },
+                { "required": ["query"] }
+            ],
             "additionalProperties": false
         }
     })
@@ -4205,18 +4660,47 @@ fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, a
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'uid' (string) is required"))?;
     let edge_types = parse_string_array(&args, "edge_types").unwrap_or_default();
-    let depth = args
-        .get("depth")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
-    let related = memory_related(store, uid, &edge_types, depth)?;
-    Ok(json!({ "related": serde_json::to_value(&related)?, "total": related.len() }))
+    // nw-411: `read_limit`, not `as_u64()`. `as_u64` collapses "absent",
+    // "negative" and "not an integer" into one `None`, so `depth: -1` fell
+    // through to the engine default of 2 and the caller was told nothing —
+    // they believed they had set -1 and got a confident answer to a request
+    // they did not make. The bound is 1..=15, the same range every sibling
+    // traversal (`flow_trace`, `brain_impact`, `blast_radius`) declares.
+    let depth = read_limit(&args, "depth", MEMORY_RELATED_DEFAULT_DEPTH, 1, 15)?;
+    // nw-411: this tool had NO bound at all, and `additionalProperties: false`
+    // rejected a `limit` a caller tried to add — an unbounded list-returning
+    // MCP tool with no client-side remedy, the same defect nw-299 fixed for
+    // `clusters`.
+    let limit = read_limit(
+        &args,
+        "limit",
+        configured_result_limit(),
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
+    let related = memory_related(store, uid, &edge_types, Some(depth))?;
+    let rows: Vec<Value> = related
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, serde_json::Error>>()?;
+    // nw-411: through `Bounded`, so `returned`/`truncated` ride along with
+    // `total` rather than leaving a caller to infer the cut from `related.len()
+    // < total` — a comparison the old `{related, total}` envelope made
+    // impossible, since `total` WAS `related.len()`.
+    let mut out = json!({ "depth": depth });
+    Bounded::take(rows, limit).merge_into(&mut out, "related");
+    Ok(out)
 }
+
+/// The engine's own BFS default, restated here because the schema must
+/// advertise a `default` a caller can rely on and `read_limit` needs a value
+/// for the absent case.
+const MEMORY_RELATED_DEFAULT_DEPTH: usize = 2;
 
 fn tool_schema_brain_memory_related() -> Value {
     json!({
         "name": "brain_memory_related",
-        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to configurable depth (default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
+        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to `depth` (1-15, default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Bounded: `total` is the pre-cap match count, `returned` the page, `truncated` says whether `limit` cut it — raise `limit` to see the rest\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -4227,7 +4711,16 @@ fn tool_schema_brain_memory_related() -> Value {
                     "items": { "type": "string" },
                     "description": "Edge types to follow (Supersedes, DependsOn, CausedBy, RelatesTo; case/format-insensitive). Default: all four."
                 },
-                "depth": { "type": "integer", "description": "Max BFS depth (default 2).", "default": 2 }
+                // nw-411. Declared with no minimum/maximum, `depth: 100000` was
+                // ACCEPTED and `depth: -1` was silently reinterpreted as 2.
+                // 1..=15 is the range `flow_trace`, `brain_impact` and
+                // `blast_radius` already declare for the same traversal shape.
+                "depth": limit_schema(
+                    "Max BFS depth (1-15, default 2). Out-of-range values are REJECTED, never clamped or defaulted.",
+                    MEMORY_RELATED_DEFAULT_DEPTH, 1, 15),
+                "limit": limit_schema(
+                    "Max related notes to return (1-1000, default 50). The pre-cap total is always reported as `total`, with `returned` and `truncated`.",
+                    DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             },
             "required": ["uid"]
         }
@@ -6824,7 +7317,16 @@ fn tool_schema_note_get() -> Value {
                     "items": { "type": "string" },
                     "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match."
                 }
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["uid"] },
+                { "required": ["title"] }
+            ]
         }
     })
 }
@@ -6970,7 +7472,16 @@ fn tool_schema_backlinks() -> Value {
             "properties": {
                 "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred for unambiguous lookup." },
                 "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." }
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["uid"] },
+                { "required": ["title"] }
+            ]
         }
     })
 }
@@ -8504,7 +9015,16 @@ fn tool_schema_cross_repo_contracts() -> Value {
                 "limit": limit_schema(
                     "Max contract links to return (1-1000, default 50). The total count is always reported.",
                     DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["uid"] },
+                { "required": ["name"] }
+            ]
         }
     })
 }
@@ -9451,7 +9971,16 @@ fn tool_schema_detect_changes() -> Value {
                     "description": "Max affected symbols AND max affected processes to inline (default 50). The totals are always reported as affected_symbol_count / affected_process_count, and truncated says whether anything was omitted. NOTE: the cut is positional, not by importance — symbols are ordered by (file_path, name) and processes by name, because neither carries an impact score. Raise limit rather than assuming the first N are the most impactful; for ranked results use blast_radius.",
                     "default": DEFAULT_RESULT_LIMIT
                 }
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["changed_files"] },
+                { "required": ["files"] }
+            ]
         }
     })
 }
@@ -9588,7 +10117,16 @@ fn tool_schema_affected_tests() -> Value {
                     "type": "string",
                     "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted; diffs the locally-indexed repo via git."
                 }
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["changed_files"] },
+                { "required": ["base_ref"] }
+            ]
         }
     })
 }
@@ -10266,7 +10804,16 @@ fn tool_schema_query_extensions() -> Value {
                     "type": "string",
                     "description": "Return all custom properties for this specific node UID. When provided, key and value are ignored."
                 }
-            }
+            },
+            // nw-410: the either/or requirement, declared where the
+            // validator, `tools/list` and `brain_guide` can all read it.
+            // Hand-coded beside the schema it was invisible to the guide,
+            // which published "Key parameters: —" for this tool and WROTE
+            // THAT into CLAUDE.md/AGENTS.md/SKILL.md via `format:`.
+            "anyOf": [
+                { "required": ["uid"] },
+                { "required": ["key", "value"] }
+            ]
         }
     })
 }
@@ -11289,7 +11836,16 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         .unwrap_or(10);
     let concise = is_concise(&args);
 
-    let mut hubs = find_hub_nodes(store, top_n).context("find_hub_nodes")?;
+    // nw-398. The engine already COMPUTES the population this ranking was cut
+    // from; the discarding wrapper threw it away and `count` reported
+    // `len(list)` — the anti-pattern the `Bounded` seam comment names by hand.
+    // The CLI now publishes `total`/`truncated`, and `no_cli_command_discloses_
+    // more_than_its_mcp_twin` forbids the CLI knowing more than this route, so
+    // these two must move together.
+    let found = nestweaver_engine::hubs::find_hub_nodes_bounded(store, top_n)
+        .context("find_hub_nodes_bounded")?;
+    let (hub_total, hub_truncated) = (found.candidate_total, found.truncated());
+    let mut hubs = found.hubs;
 
     // Attach cluster IDs if clustering sidecar exists.
     let db_path = current_db_path(store).unwrap_or_default();
@@ -11327,6 +11883,12 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
     let mut resp = json!({
         "top_n": top_n,
         "count": nodes_json.len(),
+        // `count` is KEPT as an alias so no existing consumer breaks;
+        // `returned` is the spelling the Bounded seam standardises on.
+        "returned": nodes_json.len(),
+        "total": hub_total,
+        "truncated": hub_truncated,
+        "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
         "hubs": nodes_json,
         "clustering_available": clustering_available,
     });
@@ -11387,7 +11949,20 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .unwrap_or(10);
     let concise = is_concise(&args);
 
-    let mut bridges = find_bridge_nodes(store, top_n).context("find_bridge_nodes")?;
+    // nw-398. The engine already COMPUTES the population this ranking was cut
+    // from; the discarding wrapper threw it away and `count` reported
+    // `len(list)` — the anti-pattern the `Bounded` seam comment names by hand.
+    // The CLI now publishes `total`/`truncated`, and `no_cli_command_discloses_
+    // more_than_its_mcp_twin` forbids the CLI knowing more than this route, so
+    // these two must move together.
+    let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(store, top_n)
+        .context("find_bridge_nodes_bounded")?;
+    let (bridge_total, bridge_truncated) = (found.candidate_total, found.truncated());
+    // `betweenness_score` is a SAMPLE over at most SAMPLE_LIMIT sources, rendered
+    // to 14 significant digits with nothing in the payload saying so. The digits
+    // cannot carry that; a field can.
+    let (bridge_sampled, bridge_sources) = (found.sampled, found.sources_sampled);
+    let mut bridges = found.bridges;
 
     // Attach community connection info if clustering sidecar exists.
     let db_path = current_db_path(store).unwrap_or_default();
@@ -11418,6 +11993,12 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let mut resp = json!({
         "top_n": top_n,
         "count": nodes_json.len(),
+        "returned": nodes_json.len(),
+        "total": bridge_total,
+        "truncated": bridge_truncated,
+        "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
+        "sampled": bridge_sampled,
+        "sources_sampled": bridge_sources,
         "bridges": nodes_json,
     });
     attach_ranking_staleness(&mut resp, store);
@@ -11733,8 +12314,24 @@ fn tool_schema_get_summary() -> Value {
                 "token_budget": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Approximate token cap for the result. Defaults to 20000; pass 0 for unlimited. The response reports `total_available` and sets `truncated` when the cap applied.",
-                }
+                    "description": "Approximate token cap for the result. Defaults to 20000; pass 0 for unlimited. The response reports `total_available` and sets `truncated_by_budget` when THIS cap applied. It does NOT raise the generator's row cap — see `cap_parameter`.",
+                },
+                // nw-409: the row bound for `level: "cluster"`, which had none.
+                // `truncated_by_cap: true` against `total: 19287` named a
+                // remedy that did not exist: the only declared knob was
+                // `token_budget`, raising it tenfold changed nothing (773
+                // tokens against 200,000), and `additionalProperties: false`
+                // rejected any `limit` a caller invented. This is nw-299's fix
+                // for `clusters`, applied one level down.
+                //
+                // Cluster only, because `generate_cluster_summaries_bounded`
+                // already TAKES a cap. Hub's `HUB_COUNT` is a private constant
+                // inside `generate_hub_summaries_bounded`, so hub cannot be
+                // parameterised from here — it is disclosed as an internal
+                // bound instead (`cap_parameter: null`).
+                "max_summaries": limit_schema(
+                    "Max cluster summaries to generate before the token budget applies (1-1000, default 50). ONLY affects `level: \"cluster\"`; the hub cap is internal and cannot be raised. An explicit value bypasses the summary sidecar in both directions, so a differently-capped set is never cached as \"the\" summaries.",
+                    nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES, 1, RESULT_LIMIT_MAX)
             }
         }
     })
@@ -11752,13 +12349,14 @@ fn tool_schema_get_summary() -> Value {
 fn generate_summaries_reporting_cap(
     store: &GraphStore,
     level: nestweaver_engine::SummaryLevel,
+    cluster_cap: usize,
     cap_dropped: &mut usize,
 ) -> Result<Vec<nestweaver_engine::Summary>, anyhow::Error> {
     match level {
         nestweaver_engine::SummaryLevel::Cluster => {
             let bounded = nestweaver_engine::summaries::generate_cluster_summaries_bounded(
                 store,
-                nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+                cluster_cap,
             )?;
             *cap_dropped = bounded
                 .matched_total
@@ -11801,6 +12399,24 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         .map(|n| n as usize)
         .unwrap_or(nestweaver_engine::SUMMARY_DEFAULT_TOKEN_BUDGET);
     let token_budget = (requested_budget > 0).then_some(requested_budget);
+    // nw-409. `read_limit` rejects an out-of-range value rather than
+    // substituting the default, so a caller who asks for 5000 is told no
+    // instead of quietly receiving 50 and believing they raised the cap —
+    // which is the same class of dishonesty the item is about.
+    let cluster_cap = read_limit(
+        &args,
+        "max_summaries",
+        nestweaver_engine::summaries::MAX_CLUSTER_SUMMARIES,
+        1,
+        RESULT_LIMIT_MAX,
+    )?;
+    // An EXPLICIT cap must not read from or write to the summary sidecar. The
+    // sidecar stores one set per level with the drop count its writer
+    // recorded; caching a 500-row set under `cluster` would serve 500 rows to
+    // the next default caller (and a cached 50 would be served to a caller who
+    // asked for 500, reporting `truncated_by_cap` they cannot act on). Same
+    // rule the symbol level already follows for its bounded path.
+    let explicit_cluster_cap = args.get("max_summaries").is_some();
 
     // ── Symbol level: bounded, target-pushed-down path (nw-079) ───────────────
     // Symbol summaries are O(symbols × per-symbol caller/callee queries). An
@@ -11882,6 +12498,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "truncated": truncated_by_budget || truncated_by_cap,
             "truncated_by_budget": truncated_by_budget,
             "truncated_by_cap": truncated_by_cap,
+            // nw-409: the same two keys every level publishes, so a caller
+            // parses one envelope. `DEFAULT_SYMBOL_SUMMARY_CAP` is internal
+            // and no parameter raises it, hence null — the remedy is `target`,
+            // which the note names.
+            "cap_parameter": Value::Null,
+            "total_population": "symbols matching `target` (or all symbols when untargeted)",
             "partial": truncated_by_cap,
             "cached": false,
             "note": note,
@@ -11902,7 +12524,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // `no_cache` / `cache: "bypass"` must skip the summary sidecar too, not just
     // the F16 response cache — otherwise a caller asking for fresh data got
     // `cached: true` served from the sidecar, which reads as contradictory.
-    let bypass = cache_bypassed(&args);
+    let bypass = cache_bypassed(&args) || explicit_cluster_cap;
     // F-DC-11. `generate_cluster_summaries` truncates to 50 INSIDE the
     // generator, so a total taken from what it returned reports 50 against a
     // 71,184-community graph and `truncated` computes to false. The honesty
@@ -11928,21 +12550,25 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
                 level = level_str,
                 "sidecar has summaries but none at requested level; regenerating"
             );
-            let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
+            let fresh =
+                generate_summaries_reporting_cap(store, level, cluster_cap, &mut cap_dropped)?;
             (fresh, false)
         } else {
             cap_dropped = drops.get(&level.to_string()).copied().unwrap_or(0);
             (level_filtered, true)
         }
     } else {
-        let fresh = generate_summaries_reporting_cap(store, level, &mut cap_dropped)?;
+        let fresh = generate_summaries_reporting_cap(store, level, cluster_cap, &mut cap_dropped)?;
         (fresh, false)
     };
 
     // Persist freshly generated summaries so subsequent calls hit the cache,
     // preserving cached entries at other levels (shared invariant) — and, now,
     // what the generator dropped, so the next reader can say it.
-    if !from_cache && let Some(ref db) = db_path {
+    if !from_cache
+        && !explicit_cluster_cap
+        && let Some(ref db) = db_path
+    {
         merge_and_save_summaries(db, store.graph_generation(), level, &summaries, cap_dropped);
     }
 
@@ -11980,6 +12606,61 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
     let text = render_text(&display);
 
+    // nw-409. `{truncated_by_cap: true, total: 130162, tokens_used: 773}` at
+    // `level: "hub"` named a remedy that does not exist: the only declared
+    // knob was `token_budget`, and raising it tenfold to 200,000 returned the
+    // same 30 rows. The pattern copied here is the one `investigate`'s own
+    // description already states — "`token_budget` is recoverable by raising
+    // it; `retrieval_breadth` is an internal bound that is NOT" — made
+    // machine-readable: `cap_parameter` NAMES the parameter that raises the
+    // generator's cap, or is null when no such parameter exists.
+    let cap_parameter = match level {
+        SummaryLevel::Cluster => Some("max_summaries"),
+        _ => None,
+    };
+    // nw-409, second defect. `total`/`total_available` and `returned` count
+    // DIFFERENT populations at hub level: `HubSummaries::matched_total` is
+    // `find_hub_nodes_bounded`'s `candidate_total`, i.e. every symbol with at
+    // least one code edge, not the number of hub summaries obtainable. So the
+    // ratio 30/130162 is not a completeness ratio and no `max_summaries` could
+    // ever close it. Making the two agree means changing the engine's
+    // `HubSummaries` (`crates/nestweaver-engine/src/summaries.rs`, owned
+    // elsewhere), so it is DECLARED here instead of silently mis-implied.
+    let total_population = match level {
+        SummaryLevel::Hub => {
+            "hub CANDIDATES — every symbol with at least one code edge, NOT the number of \
+             hub summaries obtainable, so `total` and `returned` count different populations"
+        }
+        SummaryLevel::Cluster => "non-singleton communities",
+        SummaryLevel::Symbol => "matching symbols",
+        _ => "matching summaries",
+    };
+    let truncated_by_budget = display.len() < after_filter_len;
+    let note = if cap_dropped > 0 {
+        Some(match cap_parameter {
+            Some(parameter) => format!(
+                "{level_str}-level summaries were capped by the generator ({} of {total_available} \
+                 returned); raise `{parameter}` (1-{RESULT_LIMIT_MAX}) to see more. \
+                 `token_budget` does not raise this bound.",
+                display.len()
+            ),
+            None => format!(
+                "{level_str}-level summaries are capped at {} by an INTERNAL bound that no \
+                 parameter raises — `token_budget` cannot recover the rest, and `total` counts \
+                 {total_population}. Narrow with `target`, or use `hub_nodes`/`clusters`, whose \
+                 `limit` is caller-stated.",
+                display.len()
+            ),
+        })
+    } else if truncated_by_budget {
+        Some(format!(
+            "output was cut by `token_budget` ({total_tokens} tokens used); raise it or pass 0 \
+             for unlimited. The generator did not cap this level."
+        ))
+    } else {
+        None
+    };
+
     let mut resp = json!({
         "level": level_str,
         "target": target,
@@ -12007,8 +12688,15 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         // travels WITH the stored set (`SummaryStore::cap_dropped`), and a
         // sidecar that recorded none is treated as a miss rather than as a
         // claim of completeness.
-        "truncated_by_budget": display.len() < after_filter_len,
+        "truncated_by_budget": truncated_by_budget,
         "truncated_by_cap": cap_dropped > 0,
+        // nw-409: which of the two bounds the caller can actually move, and
+        // what the number they are comparing `returned` against counts.
+        // Without these the disclosure prescribed a remedy that provably did
+        // nothing, which is the "wrong-remedy" defect nw-321 exists to close.
+        "cap_parameter": cap_parameter,
+        "total_population": total_population,
+        "note": note,
         "cached": from_cache,
         "summaries": display,
         "summaries_text": text,
@@ -13599,19 +14287,13 @@ fn tool_schema_investigate_hydrate() -> Value {
 }
 
 fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // hydrate is the BULK operation — it hydrates every un-hydrated entry in the
-    // bundle and takes no per-entry selector. A caller passing `targets`/`target`/
-    // `uid`/`uids` has confused it with investigate_expand; those keys were silently
-    // ignored (a no-op that reads as "nothing to hydrate"), so reject them with a
-    // pointer instead, matching investigate_expand's own strictness.
-    for key in ["targets", "target", "uid", "uids"] {
-        if args.get(key).is_some() {
-            return Err(anyhow!(
-                "investigate_hydrate takes no '{key}' — it hydrates the whole bundle. \
-                 Use investigate_expand with 'targets' to hydrate specific entries."
-            ));
-        }
-    }
+    // nw-408: the `targets`/`target`/`uid`/`uids` guard that used to stand here
+    // was DEAD. hydrate is the BULK operation and declares none of those keys,
+    // so `additionalProperties: false` rejected all four during validation —
+    // which runs before every dispatch arm — and this loop was never entered.
+    // The guidance it carried now lives in `unknown_argument_hint`, keyed by
+    // (tool, property), where the validator that actually rejects the call can
+    // emit it. Re-adding it here would restore the dead code, not the message.
     let bundle_id = args
         .get("bundle_id")
         .and_then(|v| v.as_str())
@@ -16982,11 +17664,21 @@ mod arg_alias_tests {
         // nw-084: hydrate is bulk (no per-entry selector). Passing targets/target/
         // uid/uids was silently ignored (looked like "nothing hydrated"); now it's a
         // clear error pointing to investigate_expand, matching expand's strictness.
+        //
+        // nw-408: asserted through `dispatch`, the route a caller actually
+        // takes. The guard this used to call directly lived in the HANDLER,
+        // behind `additionalProperties: false`, so it was unreachable on every
+        // MCP path and this test was the only thing that ever ran it — a test
+        // passing on dead code. The guidance now comes from
+        // `unknown_argument_hint` during validation, which every route runs.
         let store = GraphStore::in_memory().unwrap();
         for key in ["targets", "target", "uid", "uids"] {
-            let err = tool_investigate_hydrate(
+            let err = dispatch(
                 &store,
+                None,
+                "investigate_hydrate",
                 json!({ "bundle_id": "bndl_x", key: ["sym:whatever"] }),
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -16995,12 +17687,18 @@ mod arg_alias_tests {
                 "expected a pointer to investigate_expand for key {key}, got: {err}"
             );
         }
-        // A well-formed call (no targeting keys) gets PAST the new validation —
-        // it fails later on db-path/bundle resolution, not on a targeting-key
+        // A well-formed call (no targeting keys) gets PAST validation — it
+        // fails later on db-path/bundle resolution, not on a targeting-key
         // rejection.
-        let err = tool_investigate_hydrate(&store, json!({ "bundle_id": "bndl_missing" }))
-            .unwrap_err()
-            .to_string();
+        let err = dispatch(
+            &store,
+            None,
+            "investigate_hydrate",
+            json!({ "bundle_id": "bndl_missing" }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !err.contains("investigate_hydrate takes no"),
             "a well-formed call must pass targeting-key validation, got: {err}"
@@ -18811,6 +19509,191 @@ mod cluster_flag_forwarding_precondition_tests {
             "members is capped at 200 — a DIFFERENT ceiling from limit, which \
              is exactly the kind of asymmetry a single clamp constant would miss"
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_related_bound_tests {
+    use super::*;
+    use nestweaver_engine::index_markdown_directory_in_memory;
+    use std::fs;
+
+    /// A chain Seed → n1 → n2 → … over `DependsOn`, so BFS depth and the row
+    /// cap are independently observable.
+    ///
+    /// nw-411's own note called the blast radius UNMEASURED, because the vault
+    /// it was filed against had no typed Supersedes/DependsOn/CausedBy/
+    /// RelatesTo edges at all and `total` was 0 on every probe. This builds the
+    /// scratch vault that note asks for, so the bound is asserted against real
+    /// traversal output rather than an empty one.
+    fn depends_on_chain(length: usize) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Seed.md"),
+            "---\ndepends_on: [n1]\n---\n# Seed\n\nbody\n",
+        )
+        .unwrap();
+        for i in 1..=length {
+            let body = if i < length {
+                format!("---\ndepends_on: [n{}]\n---\n# n{i}\n", i + 1)
+            } else {
+                format!("# n{i}\n")
+            };
+            fs::write(root.join(format!("n{i}.md")), body).unwrap();
+        }
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        (dir, store)
+    }
+
+    fn seed_uid(store: &GraphStore) -> String {
+        store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.title == "Seed")
+            .expect("seed note")
+            .uid
+    }
+
+    /// nw-411. The envelope was `{related, total}` where `total` WAS
+    /// `related.len()`, so `returned < total` — the signal nw-341's note
+    /// relies on for every other F9 tool — was not derivable here.
+    #[test]
+    fn a_capped_memory_traversal_reports_returned_and_truncated_beside_the_precap_total() {
+        let (_dir, store) = depends_on_chain(6);
+        let uid = seed_uid(&store);
+
+        let full = tool_brain_memory_related(&store, json!({ "uid": uid, "depth": 15 })).unwrap();
+        let matched = full["total"].as_u64().expect("total") as usize;
+        assert!(
+            matched >= 4,
+            "the fixture must produce a traversable chain: {full}"
+        );
+        assert_eq!(full["returned"], json!(matched));
+        assert_eq!(
+            full["truncated"],
+            json!(false),
+            "COUNTERWEIGHT: an uncut page must not claim truncation: {full}"
+        );
+        assert_eq!(full["depth"], json!(15), "the honoured depth is echoed");
+
+        let page =
+            tool_brain_memory_related(&store, json!({ "uid": uid, "depth": 15, "limit": 2 }))
+                .unwrap();
+        assert_eq!(page["returned"], json!(2), "{page}");
+        assert_eq!(
+            page["total"],
+            json!(matched),
+            "`total` is the PRE-cap match count, not the page size: {page}"
+        );
+        assert_eq!(page["truncated"], json!(true), "{page}");
+    }
+
+    /// nw-411's acceptance criterion: a negative depth must be REJECTED, not
+    /// reinterpreted. `as_u64()` failed on `-1`, `unwrap_or` fired, and the
+    /// caller got depth 2 while believing they had asked for -1.
+    ///
+    /// Asserted at the HANDLER, not only at the schema: `dispatch` is not the
+    /// only route in, and the schema bound and the handler bound are two
+    /// enforcement points on purpose.
+    #[test]
+    fn a_negative_memory_depth_is_refused_rather_than_reinterpreted_as_the_default() {
+        let (_dir, store) = depends_on_chain(3);
+        let uid = seed_uid(&store);
+
+        let error = tool_brain_memory_related(&store, json!({ "uid": uid, "depth": -1 }))
+            .expect_err("a negative depth must not silently become 2")
+            .to_string();
+        assert!(error.contains("depth"), "{error}");
+        assert!(error.contains("out of range"), "{error}");
+
+        // COUNTERWEIGHT: omitting `depth` still gets the documented default,
+        // so rejecting the negative did not turn the parameter into a
+        // mandatory one.
+        let defaulted = tool_brain_memory_related(&store, json!({ "uid": uid })).unwrap();
+        assert_eq!(defaulted["depth"], json!(MEMORY_RELATED_DEFAULT_DEPTH));
+    }
+}
+
+#[cfg(test)]
+mod summary_cap_disclosure_tests {
+    use super::*;
+
+    /// nw-409. `get_summary{level:"hub"}` reported `truncated_by_cap: true`
+    /// against a 130,162 total while declaring no parameter that could raise
+    /// the cap — a disclosure naming a remedy that does not exist. The two
+    /// levels now say WHICH kind of bound they hit, using the split
+    /// `investigate`'s own description already states: "`token_budget` is
+    /// recoverable by raising it; `retrieval_breadth` is an internal bound
+    /// that is NOT."
+    #[test]
+    fn hub_and_cluster_levels_disclose_whether_their_cap_can_be_raised() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let hub = tool_get_summary(&store, json!({ "level": "hub" })).unwrap();
+        assert_eq!(
+            hub["cap_parameter"],
+            Value::Null,
+            "hub's HUB_COUNT is a private engine constant — claiming a parameter \
+             raises it would be the same wrong remedy in a new field: {hub}"
+        );
+        let population = hub["total_population"].as_str().unwrap_or_default();
+        assert!(
+            population.contains("CANDIDATES"),
+            "nw-409's second defect: hub's `total` is `candidate_total`, a DIFFERENT \
+             population from `returned`, and that must be stated: {hub}"
+        );
+
+        // COUNTERWEIGHT: the level whose cap IS raisable names the parameter,
+        // so `cap_parameter: null` means something rather than being a
+        // constant that decorates every response.
+        let cluster = tool_get_summary(&store, json!({ "level": "cluster" })).unwrap();
+        assert_eq!(
+            cluster["cap_parameter"],
+            json!("max_summaries"),
+            "{cluster}"
+        );
+        assert!(
+            cluster["total_population"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("communities"),
+            "{cluster}"
+        );
+
+        // An uncapped, unbudget-cut answer must not manufacture a remedy.
+        // `note` is a SHARED, accumulating channel (`attach_note`) that hub
+        // level also uses for nw-370's ranking-staleness disclosure, so this
+        // asserts the absence of the cap prose specifically rather than an
+        // empty note.
+        assert_eq!(hub["truncated_by_cap"], json!(false), "{hub}");
+        assert!(
+            !hub["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("INTERNAL bound"),
+            "a complete answer has no cap remedy to name: {hub}"
+        );
+    }
+
+    /// The declared bound has to actually reach the generator — declaring it
+    /// and ignoring it would be the silent-default failure nw-411 is about,
+    /// committed while fixing nw-409.
+    #[test]
+    fn an_explicit_cluster_cap_is_honoured_and_never_cached_as_the_summaries() {
+        let store = GraphStore::in_memory().unwrap();
+        // `max_summaries` is accepted where `limit` was rejected outright, and
+        // an out-of-range value is refused rather than replaced by the default.
+        assert!(
+            tool_get_summary(&store, json!({ "level": "cluster", "max_summaries": 5 })).is_ok()
+        );
+        let error = tool_get_summary(&store, json!({ "level": "cluster", "max_summaries": 0 }))
+            .expect_err("0 is below the declared minimum")
+            .to_string();
+        assert!(error.contains("max_summaries"), "{error}");
+        assert!(error.contains("out of range"), "{error}");
     }
 }
 

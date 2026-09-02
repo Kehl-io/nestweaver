@@ -76,20 +76,85 @@ fn load_graph(store: &GraphStore) -> Result<Option<LoadedGraph>> {
 
 /// Find the top-N bridge nodes in the code graph, ranked by betweenness centrality.
 ///
-/// Uses Brandes' algorithm with sampling: for each of up to `SAMPLE_LIMIT`
-/// randomly-selected source nodes, runs BFS to compute shortest-path counts
-/// and accumulates betweenness contributions. The result is normalized by
-/// the number of sources sampled.
+/// Discards everything a caller needs to describe the answer honestly. Prefer
+/// [`find_bridge_nodes_bounded`] on any surface that publishes a `total`, a
+/// `truncated`, or the score itself; this wrapper exists for the callers that
+/// publish none of them.
 pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeNode>> {
+    find_bridge_nodes_bounded(store, top_n).map(|found| found.bridges)
+}
+
+/// The top-N bridges, the population they were selected FROM, and how the
+/// score in them was actually computed.
+///
+/// nw-398. Both halves of this struct are honesty fixes, and they point in
+/// OPPOSITE directions. `candidate_total` exists because the cut was invisible:
+/// `bridges --top 3` reported neither a total nor a `truncated`, and the MCP
+/// twin's `count` was `len(list)` by construction. `sources_sampled` /
+/// `sampled` exist because the score was invisibly APPROXIMATE: a
+/// `SAMPLE_LIMIT`-source estimate rendered at full `f64` precision
+/// (`18866919.81139078`) with no field a program could branch on. The tool
+/// description said "approximate for large graphs" — prose a human reads.
+pub struct BridgeNodes {
+    pub bridges: Vec<BridgeNode>,
+    /// How many symbols were CANDIDATES — i.e. had at least one code edge.
+    /// A symbol with no edges lies on no path between any pair and therefore
+    /// cannot be a bridge at any `top_n`, so counting it would overstate the
+    /// population. Same definition, and the same argument, as
+    /// [`crate::hubs::HubNodes::candidate_total`].
+    pub candidate_total: usize,
+    /// How many BFS sources the betweenness computation actually ran from.
+    /// Equal to the node count when the graph is small enough to do exactly.
+    pub sources_sampled: usize,
+    /// True when `sources_sampled` was a SAMPLE rather than every node — i.e.
+    /// every `betweenness_score` in `bridges` is an estimate. This is the
+    /// field a program should branch on; the digits in the score itself carry
+    /// no information about it.
+    pub sampled: bool,
+}
+
+impl BridgeNodes {
+    /// Whether `top_n` cut the population — the one definition, so a consumer
+    /// cannot re-derive it from the already-cut list and get `false` for free.
+    pub fn truncated(&self) -> bool {
+        self.candidate_total > self.bridges.len()
+    }
+}
+
+/// [`find_bridge_nodes`] with the candidate count and the sampling provenance
+/// retained.
+///
+/// Uses Brandes' algorithm over a bounded set of BFS sources: every node when
+/// the graph has at most `SAMPLE_LIMIT` of them, otherwise `SAMPLE_LIMIT`
+/// sources chosen by even spacing over graph INSERTION ORDER. That spacing is
+/// deterministic, NOT random, so the resulting bias is systematic and
+/// reproducible rather than self-cancelling across calls — which is precisely
+/// why the estimate has to be labelled as one rather than left to average out.
+pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<BridgeNodes> {
     let graph = match load_graph(store)? {
         Some(g) => g,
-        None => return Ok(vec![]),
+        None => {
+            return Ok(BridgeNodes {
+                bridges: vec![],
+                candidate_total: 0,
+                sources_sampled: 0,
+                sampled: false,
+            });
+        }
     };
 
     let n = graph.symbols.len();
 
+    // Counted from the adjacency rather than the ranked list, and BEFORE the
+    // truncate below, so the population is reported even when `top_n` is 0 and
+    // nothing survives selection.
+    let candidate_total = graph.adj.iter().filter(|nbrs| !nbrs.is_empty()).count();
+
     // Compute betweenness centrality via Brandes' algorithm with sampling.
-    let betweenness = brandes_sampled(&graph.adj, n);
+    let Betweenness {
+        scores: betweenness,
+        sources_sampled,
+    } = brandes_sampled(&graph.adj, n);
 
     // Build bridge nodes.
     let mut bridges: Vec<BridgeNode> = graph
@@ -113,7 +178,15 @@ pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeN
     });
 
     bridges.truncate(top_n);
-    Ok(bridges)
+    Ok(BridgeNodes {
+        bridges,
+        candidate_total,
+        // A sample only when fewer sources ran than the graph has nodes; on a
+        // graph of at most SAMPLE_LIMIT nodes every node is a source and the
+        // result is exact, which callers must be able to say too.
+        sampled: sources_sampled < n,
+        sources_sampled,
+    })
 }
 
 /// Attach community connection information to bridge nodes.
@@ -160,6 +233,14 @@ pub fn attach_communities(
     }
 }
 
+/// Betweenness scores plus the fact that says how much to trust them.
+struct Betweenness {
+    scores: Vec<f64>,
+    /// How many BFS sources were actually run. `< n` means the scores are an
+    /// extrapolated estimate, not an exact count.
+    sources_sampled: usize,
+}
+
 /// Brandes' algorithm for betweenness centrality with source sampling.
 ///
 /// For each source node s (up to SAMPLE_LIMIT), runs BFS to compute:
@@ -167,8 +248,17 @@ pub fn attach_communities(
 /// - delta[v]: dependency of s on v
 ///
 /// The betweenness of each node v is the sum of delta[v] across all sources,
-/// normalized by the number of sources sampled.
-fn brandes_sampled(adj: &[Vec<usize>], n: usize) -> Vec<f64> {
+/// then scaled — see the scaling block at the end for what that scale IS.
+///
+/// nw-398: this doc used to claim the result was "normalized by the number of
+/// sources sampled". It is not, and never was: on the sampled path the scale
+/// factor is `n / (2 * num_sources)`, which SCALES UP to estimate the
+/// full-graph pair count. Dividing by the source count would have produced a
+/// per-source average, a different quantity an order of magnitude smaller. The
+/// claim was removed rather than implemented because the unnormalized value is
+/// what every existing caller ranks and renders; what was missing was the
+/// label, not the division.
+fn brandes_sampled(adj: &[Vec<usize>], n: usize) -> Betweenness {
     let mut betweenness = vec![0.0f64; n];
 
     // Select source nodes: if graph is small enough, use all; otherwise sample.
@@ -224,8 +314,10 @@ fn brandes_sampled(adj: &[Vec<usize>], n: usize) -> Vec<f64> {
         }
     }
 
-    // Normalize by the number of sources sampled. For an undirected graph,
-    // each pair is counted twice in the BFS, so we also divide by 2.
+    // Scale the accumulated dependencies. For an undirected graph each pair is
+    // counted twice in the BFS, hence the factor of 2 in both branches. This is
+    // NOT a normalization to any unit interval, and on the sampled branch it is
+    // an extrapolation, not a division by the sample size (nw-398).
     if num_sources > 0 {
         let scale = if n <= SAMPLE_LIMIT {
             // Exact computation: standard normalization for undirected graphs.
@@ -239,7 +331,10 @@ fn brandes_sampled(adj: &[Vec<usize>], n: usize) -> Vec<f64> {
         }
     }
 
-    betweenness
+    Betweenness {
+        scores: betweenness,
+        sources_sampled: num_sources,
+    }
 }
 
 #[cfg(test)]
@@ -380,5 +475,125 @@ mod tests {
 
         let bridges = find_bridge_nodes(&store, 3).unwrap();
         assert_eq!(bridges.len(), 3);
+    }
+
+    /// A chain of `chain` edge-bearing symbols plus `isolated` symbols with no
+    /// edges at all. The isolated ones are the counterweight's material: they
+    /// pad the returned list without enlarging the candidate population.
+    fn chain_store(chain: usize, isolated: usize) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..chain {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("s{i}"),
+                    &format!("fn_{i}"),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+        }
+        for i in 0..chain.saturating_sub(1) {
+            store
+                .insert_edge(&make_edge(&format!("s{i}"), &format!("s{}", i + 1)))
+                .unwrap();
+        }
+        for i in 0..isolated {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("lone{i}"),
+                    &format!("lone_{i}"),
+                    "src/lone.rs",
+                ))
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-398. `bridges --top 3 --json` returned `['_meta', 'bridges',
+    /// 'rankings_stale', 'stale_repos']` — not even a `count` — and the MCP
+    /// twin's `count` was `len(list)`, true by construction. The number that
+    /// makes the cut visible has to be the population BEFORE the truncate, and
+    /// it was never even computed on this path.
+    #[test]
+    fn a_cut_bridge_ranking_reports_the_population_it_was_cut_from() {
+        let store = chain_store(8, 2);
+
+        let found = find_bridge_nodes_bounded(&store, 3).unwrap();
+        assert_eq!(found.bridges.len(), 3);
+        assert_eq!(
+            found.candidate_total, 8,
+            "the population is the edge-bearing symbols, not the returned rows              and not the whole store"
+        );
+        assert!(found.truncated(), "3 of 8 is a truncation");
+    }
+
+    /// COUNTERWEIGHT. A ranking that was NOT cut must say so, including the
+    /// case where the caller asked for more than exists — there the heap pads
+    /// the tail with zero-degree symbols, so `bridges.len()` EXCEEDS
+    /// `candidate_total`, and a `!=` comparison would report truncation on a
+    /// complete answer.
+    #[test]
+    fn an_uncut_bridge_ranking_reports_no_truncation_even_when_asked_for_more() {
+        let store = chain_store(8, 2);
+
+        let exact = find_bridge_nodes_bounded(&store, 8).unwrap();
+        assert!(
+            !exact.truncated(),
+            "8 of 8 candidates is complete: {} of {}",
+            exact.bridges.len(),
+            exact.candidate_total
+        );
+
+        let over = find_bridge_nodes_bounded(&store, 50).unwrap();
+        assert_eq!(over.bridges.len(), 10, "every symbol is returned");
+        assert_eq!(over.candidate_total, 8);
+        assert!(
+            !over.truncated(),
+            "asking for 50 and being given everything is not a truncation"
+        );
+
+        let empty = find_bridge_nodes_bounded(&GraphStore::in_memory().unwrap(), 5).unwrap();
+        assert_eq!(empty.candidate_total, 0);
+        assert!(!empty.truncated(), "an empty graph is complete, not cut");
+    }
+
+    /// nw-398 leg 2, the honesty defect pointing the OTHER way:
+    /// `betweenness_score` is rendered at full `f64` precision
+    /// (`18866919.81139078`) whether it was computed exactly or estimated from
+    /// at most `SAMPLE_LIMIT` sources. A graph small enough to do exactly must
+    /// be able to SAY it was exact, or the flag is useless — every payload
+    /// would carry the same warning and consumers would learn to ignore it.
+    #[test]
+    fn a_betweenness_run_over_every_source_reports_that_it_sampled_nothing() {
+        let store = chain_store(10, 0);
+
+        let found = find_bridge_nodes_bounded(&store, 5).unwrap();
+        assert_eq!(
+            found.sources_sampled, 10,
+            "every node is a BFS source below the sample limit"
+        );
+        assert!(
+            !found.sampled,
+            "an exact computation must not be labelled a sample"
+        );
+    }
+
+    /// The other half: past `SAMPLE_LIMIT` the score is an estimate produced
+    /// from evenly-spaced sources over INSERTION ORDER — deterministic, so the
+    /// bias does not average out across calls — and the payload must carry a
+    /// field a program can branch on rather than prose in a tool description.
+    #[test]
+    fn a_graph_past_the_sample_limit_reports_that_the_score_is_a_sample() {
+        let store = chain_store(SAMPLE_LIMIT + 20, 0);
+
+        let found = find_bridge_nodes_bounded(&store, 5).unwrap();
+        assert_eq!(
+            found.sources_sampled, SAMPLE_LIMIT,
+            "the source set is capped at the sample limit"
+        );
+        assert!(
+            found.sampled,
+            "a {SAMPLE_LIMIT}-source estimate over {} nodes must be labelled one",
+            SAMPLE_LIMIT + 20
+        );
     }
 }

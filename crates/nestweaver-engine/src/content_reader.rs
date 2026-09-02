@@ -1,6 +1,7 @@
 // content_reader.rs — abstracts how the indexer reads file contents and discovers files.
 // `FilesystemReader` for local repos, `GitBareReader` for server-side bare clones (Task 6).
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -159,6 +160,40 @@ pub trait ContentReader: Send + Sync {
     fn skipped_dirs(&self) -> Vec<SkippedDir> {
         Vec::new()
     }
+
+    /// The `SKIP_DIRS` names this reader's repo has re-admitted via
+    /// `[[repos]] unskip`.
+    ///
+    /// nw-418 PUT THIS ON THE TRAIT, and the reason is structural rather than
+    /// convenient. `FilesystemReader::list_files` honoured `unskip` — the FULL
+    /// scan enumerated a re-admitted `public/` — while the INCREMENTAL change
+    /// loop tested `crate::index::path_in_skip_dir`, which took no `unskip`
+    /// argument and could not have honoured it. So a user who configured
+    /// `unskip` correctly got the files on `nestweaver index --force` and lost
+    /// them again on every plain `nestweaver index`, both runs reporting
+    /// `coverage_status: "complete"`.
+    ///
+    /// AND NW-387'S DISCLOSURE CHANNEL COULD NOT CATCH IT: on the incremental
+    /// route the directory is NOT pruned — `unskip` re-admitted it — so there
+    /// is no [`SkippedDir`] row to drain. The files were dropped one at a time
+    /// inside the change loop, below the level any disclosure watches.
+    ///
+    /// Exposed on the reader rather than passed alongside it because the reader
+    /// is the thing that already owns the set, and every incremental helper
+    /// (`prepare_incremental_files`, the Added/Modified/Renamed arms, the
+    /// server twin) already holds a `&dyn ContentReader`. One set, reached one
+    /// way, feeding one predicate — nw-217's finding is that two copies of a
+    /// rule drift, and a second parameter threaded past the reader is a second
+    /// copy waiting to happen.
+    ///
+    /// Empty by default: a reader with no per-repo config re-admits nothing,
+    /// which is exactly the pre-nw-418 behaviour for [`GitBareReader`] and the
+    /// mock readers.
+    fn unskipped_skip_dirs(&self) -> &std::collections::HashSet<String> {
+        static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(std::collections::HashSet::new)
+    }
 }
 
 /// Rewrite lone `\r` line endings to `\n`, leaving `\r\n` byte-for-byte alone.
@@ -234,6 +269,16 @@ pub struct FilesystemReader {
     /// invisible. Recording the pruned directory itself is what turns a
     /// silently wrong answer into a visible one.
     skipped_dirs: std::sync::Arc<std::sync::Mutex<Vec<SkippedDir>>>,
+    /// Repo-relative paths git's INDEX lists as tracked, or `None` when this
+    /// root is not a git working tree / git could not be asked.
+    ///
+    /// nw-394. Computed at most once per reader: `list_files` runs several
+    /// times in one index (the scan, `manifest::parse_manifest` ->
+    /// `find_csproj`, the incremental contract prep), and one `git ls-files`
+    /// per index run is a cost worth paying where four is not. The window
+    /// between the walk and the `ls-files` is not load-bearing — a file added
+    /// to the index mid-index is already outside this run's snapshot.
+    tracked_files: std::sync::Arc<std::sync::OnceLock<Option<HashSet<PathBuf>>>>,
 }
 
 /// The `reason` a [`SkippedDir`] carries when a configured `[[repos]] exclude`
@@ -249,10 +294,49 @@ pub struct FilesystemReader {
 /// silently; a rename breaks the build instead of the remedy.
 pub const CONFIGURED_EXCLUDE_REASON: &str = "configured exclude";
 
-/// A directory the walk pruned, and why.
+/// The `reason` a [`SkippedDir`] carries when the path is a FILE that git
+/// TRACKS and the walk dropped anyway because it matches an ignore rule.
+///
+/// nw-394. `WalkBuilder` is configured `.git_ignore(true).git_global(true)
+/// .git_exclude(true)` and has no notion of the git INDEX, but **git does not
+/// ignore a tracked file** — `.gitignore` applies to untracked paths only. So
+/// the walker's view and git's view diverge on exactly one population:
+/// committed-but-ignored files. Measured shape: `.gitignore` holding
+/// `generated/`, `generated/api_client.py` force-added and COMMITTED, index
+/// reporting `files_processed: 1, symbols_found: 1, skipped_count: 0,
+/// coverage_status: "complete"` with `--fail-on-skip` exit 0. The callee half
+/// of the graph was absent and the caller's import edge to it could not exist.
+///
+/// **DECISION RECORDED (nw-394 offered two fixes and asked which): DISCLOSE,
+/// do not re-admit.** Honouring the index would mean indexing every tracked
+/// path the walk dropped, and the realistic population here is committed
+/// GENERATED code — `generated/`, `proto/gen/`, vendored SDKs — which is
+/// exactly the content the graph is better off without and which a repo may
+/// have gitignored deliberately. Silently pulling megabytes of generated
+/// output into the graph is a different wrong answer at a much higher cost.
+/// Disclosure keeps the walk's behaviour identical, degrades `coverage_status`
+/// so the loss is visible, fires `--fail-on-skip`, and hands the user a remedy
+/// that works. The remedy is `.gitignore` itself — NOT `[[repos]] unskip`,
+/// which governs `SKIP_DIRS` names only, and NOT `[[repos]] exclude`, which
+/// points the other way. nw-387 already learned that lesson the hard way; see
+/// `index::disclose_pruned_dir`.
+pub const TRACKED_BUT_IGNORED_REASON: &str = "tracked by git but gitignored";
+
+/// A path the walk did not hand to the indexer, and why.
+///
+/// Named for its original and still dominant case — nw-325/nw-387 record
+/// pruned DIRECTORIES here, because `WalkBuilder::filter_entry` cuts the
+/// subtree before enumeration and the directory is the only artefact that
+/// survives. nw-394 adds rows whose `path` is a single FILE
+/// ([`TRACKED_BUT_IGNORED_REASON`]): there the directory may well have been
+/// walked normally and only the one committed-but-ignored file inside it was
+/// dropped, so the file IS the finest artefact available. The type is kept
+/// rather than renamed because it is crate-internal, and `reason` already
+/// discriminates the cases for `index::disclose_pruned_dir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedDir {
-    /// Repo-relative path of the pruned directory.
+    /// Repo-relative path of the pruned directory, or of the single dropped
+    /// file for [`TRACKED_BUT_IGNORED_REASON`].
     pub path: String,
     /// The `SKIP_DIRS` entry that matched, or [`CONFIGURED_EXCLUDE_REASON`]
     /// when a `[[repos]] exclude` glob did. That second value is a MARKER, not
@@ -270,6 +354,7 @@ impl FilesystemReader {
             dir_excludes: None,
             unskip: std::collections::HashSet::new(),
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -281,6 +366,7 @@ impl FilesystemReader {
             dir_excludes: None,
             unskip: std::collections::HashSet::new(),
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -323,6 +409,131 @@ impl FilesystemReader {
         self.dir_excludes = Some(dir_builder.build().context("build exclude globset")?);
         Ok(self)
     }
+
+    /// Repo-relative paths in git's index, or `None` when this root is not a
+    /// git working tree or git could not answer. Computed once per reader.
+    ///
+    /// nw-394. `None` and `Some(empty)` mean different things and must not be
+    /// collapsed: "git has no opinion here" versus "git tracks nothing here".
+    /// Only the second is evidence of anything, and neither produces an error —
+    /// a missing or broken git is a reason to say less, never a reason to fail
+    /// an index that otherwise succeeded.
+    fn git_tracked_files(&self) -> Option<&HashSet<PathBuf>> {
+        self.tracked_files
+            .get_or_init(|| load_git_tracked_files(&self.repo_path))
+            .as_ref()
+    }
+
+    /// Record every git-TRACKED source file the walk did not enumerate.
+    ///
+    /// nw-394 — see [`TRACKED_BUT_IGNORED_REASON`] for the divergence and for
+    /// why this discloses rather than re-admits.
+    ///
+    /// FOUR SUPPRESSIONS, each closing a false positive that would have made
+    /// the gate fire on a correct index:
+    ///
+    ///  1. `SKIP_DIRS` paths. A committed `vendor/v.py` is tracked and absent,
+    ///     but it is absent because of skip-dir policy, is already disclosed at
+    ///     DIRECTORY granularity by the `filter_entry` recorder, and has a
+    ///     different remedy (`[[repos]] unskip`). Reporting it twice under two
+    ///     reasons would make the two rows contradict each other. `unskip` is
+    ///     consulted here for the same reason the walk consults it.
+    ///  2. `[[repos]] exclude`, per-file and per-directory. That is the user
+    ///     asking for this file to be absent; nw-387 established that telling
+    ///     someone their deliberate configuration degraded their coverage is a
+    ///     defect, not a disclosure.
+    ///  3. Non-parseable paths. `git ls-files` lists PNGs, licences and lock
+    ///     files; none of them would have produced a symbol had the walk seen
+    ///     them, so their absence is not a coverage loss and reporting it would
+    ///     bury the real rows.
+    ///  4. Paths with no regular file on disk. `ls-files --cached` reports the
+    ///     INDEX, so it lists files deleted from the working tree, and a
+    ///     tracked symlink is not enumerated by a `follow_links(false)` walk
+    ///     either. `symlink_metadata` (not `metadata`) is what keeps the
+    ///     symlink case out — the latter follows the link and would report the
+    ///     target's type.
+    ///
+    /// What survives all four is the exact nw-394 population: a file git
+    /// tracks, that would have contributed symbols, that no policy of ours
+    /// removed, that exists on disk, and that the walk still did not yield.
+    fn record_tracked_but_ignored(&self, enumerated: &[PathBuf]) {
+        let Some(tracked) = self.git_tracked_files() else {
+            return;
+        };
+        let seen: HashSet<&Path> = enumerated.iter().map(PathBuf::as_path).collect();
+        let mut rows: Vec<SkippedDir> = tracked
+            .iter()
+            .filter(|rel| !seen.contains(rel.as_path()))
+            .filter(|rel| crate::index::is_parseable(rel))
+            .filter(|rel| !crate::index::path_in_skip_dir_with_unskip(rel, &self.unskip))
+            .filter(|rel| !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel)))
+            .filter(|rel| {
+                !rel.ancestors().skip(1).any(|dir| {
+                    !dir.as_os_str().is_empty() && dir_is_excluded(self.dir_excludes.as_ref(), dir)
+                })
+            })
+            .filter(|rel| {
+                std::fs::symlink_metadata(self.repo_path.join(rel))
+                    .is_ok_and(|meta| meta.file_type().is_file())
+            })
+            .map(|rel| SkippedDir {
+                path: rel.to_string_lossy().into_owned(),
+                reason: TRACKED_BUT_IGNORED_REASON.to_string(),
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        // Deterministic order: `skipped_files` is printed and asserted on, and
+        // a HashSet iteration order would make the report reshuffle run to run
+        // over an unchanged repo.
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        if let Ok(mut recorded) = self.skipped_dirs.lock() {
+            recorded.extend(rows);
+        }
+    }
+}
+
+/// Ask git which repo-relative paths it tracks under `root`.
+///
+/// nw-394. Free rather than a method so it is testable against any directory,
+/// and deliberately total: every failure mode returns `None`.
+///
+/// The `.git` probe is a GUARD, not an optimisation. Without it, a `root` that
+/// merely sits inside some other repository would make git answer about THAT
+/// repository, and every path it named would be reported as a coverage loss of
+/// this one. `.exists()` rather than `.is_dir()` because a linked worktree and
+/// a submodule both carry `.git` as a FILE.
+///
+/// Paths are emitted NUL-separated (`-z`), so no unquoting is needed and a
+/// filename containing a newline or a quote cannot desynchronise the parse.
+/// `--cached` is the index, which is the whole point: it is the one view that
+/// knows a gitignored file was committed anyway.
+fn load_git_tracked_files(root: &Path) -> Option<HashSet<PathBuf>> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("ls-files")
+        .arg("-z")
+        .arg("--cached")
+        .current_dir(root);
+    apply_git_isolation(&mut cmd);
+    // Bounded: `ls-files` is a local index read with no network, but an index
+    // this run cannot read is a reason to disclose nothing, never a reason to
+    // park the whole index forever.
+    let output = run_git_with_timeout(cmd, Duration::from_secs(60)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| PathBuf::from(String::from_utf8_lossy(record).into_owned()))
+            .collect(),
+    )
 }
 
 impl ContentReader for FilesystemReader {
@@ -520,6 +731,23 @@ impl ContentReader for FilesystemReader {
                 files.push(rel.to_path_buf());
             }
         }
+        // nw-394: ADD THE GIT-TRACKED-BUT-GITIGNORED DROPS TO THE SAME CHANNEL.
+        //
+        // This is the second population of paths that never reach the per-file
+        // `SkippedFile` route, and for the same structural reason as nw-325's
+        // pruned directories: they are removed BEFORE enumeration, so no
+        // `ParseOutcome::Skipped` can ever describe them. nw-387's drain site
+        // in `index::index_into_store_with_write_gate` says in as many words
+        // that this channel is "deliberately not scoped to `SKIP_DIRS` alone"
+        // and that nw-394 "needs to add its own rows to exactly this list" —
+        // this is that.
+        //
+        // MUST STAY AFTER THE WALK AND INSIDE `list_files`. It compares against
+        // `files`, and the recorder it appends to is cleared at the top of
+        // every `list_files` call, so both halves of the answer describe one
+        // walk. Every existing drain site reads the recorder immediately after
+        // `list_files` and therefore picks these rows up with no change.
+        self.record_tracked_but_ignored(&files);
         Ok(files)
     }
 
@@ -562,6 +790,13 @@ impl ContentReader for FilesystemReader {
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default()
+    }
+
+    /// nw-418: the set this reader's own walk consults, handed to the
+    /// incremental route so both routes decide with the same data. See the
+    /// trait doc for why it travels on the reader.
+    fn unskipped_skip_dirs(&self) -> &std::collections::HashSet<String> {
+        &self.unskip
     }
 }
 

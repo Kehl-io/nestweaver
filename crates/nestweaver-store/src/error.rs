@@ -99,6 +99,14 @@ impl std::fmt::Display for CorruptionKind {
 ///    survived) would re-derive `WalUnreadable` from our own disclosure and
 ///    print the move-aside runbook anyway. Evidence and veto have to travel
 ///    together.
+///
+/// This phrase is NOT exclusive to this crate, which is why the sentinel is
+/// scoped to the unreadable-WAL arm and not to the whole classifier: the
+/// daemon's boot refusal (`server.rs`) and `require_exclusive_store_access`
+/// (`src/main.rs`, when the probe cannot name the holder) both emit it verbatim,
+/// and neither has established anything about a write-ahead log. A sentinel that
+/// short-circuited the whole classifier would let either of them suppress a
+/// truncated file or an engine assertion reported in the same error chain.
 pub const LIVE_WRITER_DISCLOSURE: &str = "another process holds the write lease";
 
 /// Path of the write-lease file for `db_path` — `<db>.write.lock`.
@@ -128,6 +136,143 @@ fn write_lease_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Every name a lease for `db_path` could be held under, most-canonical first.
+///
+/// nw-404. `write_lease_path` canonicalises and so does the daemon's
+/// `acquire_db_write_lease`, but neither can be sure the other resolved the same
+/// spelling — a `--db` reached through a symlink, or a path whose parent did not
+/// exist when one of them looked, resolves differently. Asking about both names
+/// costs one extra `open` on a path that already ended in an error and removes
+/// the whole class of "the lease WAS held, under the other name".
+///
+/// Extracted from [`live_writer_holds_write_lease`] so the `flock` probe and the
+/// self-ownership latch below cannot disagree about WHICH file they are talking
+/// about: a latch registered under one spelling and probed under the other would
+/// be a latch that silently does nothing.
+fn write_lease_path_candidates(db_path: &Path) -> Vec<PathBuf> {
+    let canonical = write_lease_path(db_path);
+    let mut literal = db_path.to_path_buf().into_os_string();
+    literal.push(".write.lock");
+    let literal = PathBuf::from(literal);
+    if literal == canonical {
+        vec![canonical]
+    } else {
+        vec![canonical, literal]
+    }
+}
+
+/// The lease files THIS process is holding, counted.
+///
+/// nw-404 (review defect 1). `flock` conflicts between open file DESCRIPTIONS,
+/// not processes: a second descriptor opened by the SAME process conflicts
+/// exactly as a stranger's would. So the probe below answers "a live writer
+/// holds this" to the holder ITSELF, and there is no kernel question that can
+/// tell the two apart — `flock` records no owner, and `F_GETLK` cannot see
+/// `flock` locks at all. (`/proc/locks` can, on Linux only, which leaves the
+/// hazard live on macOS.) The only way to know is to remember.
+///
+/// `nestweaver brain reindex-search` is exactly the shape that goes wrong: it
+/// takes the write lease and THEN does a read-only `open_store`. Against a
+/// genuinely damaged WAL the un-latched probe suppresses `db_wal_corrupt` and
+/// blames "another process" — which is precisely the failure the `db_wal_corrupt`
+/// docblock in `src/main.rs` already records against `repair`: "naming a process
+/// that does not exist".
+///
+/// Keyed by LEASE FILE, not by a process-wide boolean, which is deliberate and
+/// buys two things the daemon's `LOCAL_STORE_WRITE_LOCK_HELD` boolean cannot:
+/// holding a lease on database A never suppresses a corruption verdict for
+/// database B, and tests that set the latch do not race their siblings, because
+/// each one keys on its own tempdir. (`lifecycle::db_write_lock_probe` had to be
+/// split apart to be testable for want of that property; 2 failures in 60 runs.)
+///
+/// Counted rather than flagged so nested or repeated leases on one database
+/// release in any order without the last drop clearing a claim someone else
+/// still holds.
+static SELF_HELD_WRITE_LEASES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The latch registry, tolerating poisoning.
+///
+/// A panic elsewhere must not turn this into a panic on the CORRUPTION-REPORTING
+/// path: `into_inner` keeps the map (whose invariant is a count, not something a
+/// half-finished mutation can break) rather than unwinding inside an error
+/// classifier that is already handling a failure.
+fn self_held_write_leases()
+-> std::sync::MutexGuard<'static, std::collections::BTreeMap<PathBuf, usize>> {
+    SELF_HELD_WRITE_LEASES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Proof that THIS process holds the write lease on a database, for as long as
+/// this value lives.
+///
+/// nw-404. Registered by [`note_self_held_write_lease`] and cleared on drop, so
+/// the latch cannot outlive the lease it describes — a stale `true` here would
+/// suppress a genuine corruption report forever, which is the failure mode with
+/// the worse ending.
+#[must_use = "the latch must live as long as the lease does; dropping it \
+              immediately re-arms the writer-liveness veto against this \
+              process's own lease, which is the defect it exists to remove"]
+#[derive(Debug)]
+pub struct SelfHeldWriteLease {
+    /// Every candidate spelling registered, so drop clears exactly what
+    /// registration added.
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for SelfHeldWriteLease {
+    fn drop(&mut self) {
+        let mut held = self_held_write_leases();
+        for path in &self.paths {
+            match held.get_mut(path) {
+                Some(count) if *count > 1 => *count -= 1,
+                _ => {
+                    held.remove(path);
+                }
+            }
+        }
+    }
+}
+
+/// Record that this process now holds the write lease on `db_path`.
+///
+/// nw-404. Call it at the moment the lease is TAKEN and keep the returned value
+/// beside the lease — the two must have the same lifetime or the latch is
+/// either useless (dropped early) or dangerous (dropped late).
+///
+/// HANDOFF: the one producer of write leases is
+/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which is outside this
+/// crate. This crate cannot call itself into that path, so until `DbWriteLease`
+/// carries a `SelfHeldWriteLease` field the latch is armed only by callers that
+/// know to do it, and `open_failure`'s `read_write` gate stays as the structural
+/// backstop. The mechanism lives here rather than in the daemon because the
+/// question it answers — "may I call this WAL corrupt?" — is asked here, and a
+/// latch in the upper crate would leave this one asking a question it cannot
+/// answer.
+pub fn note_self_held_write_lease(db_path: &Path) -> SelfHeldWriteLease {
+    let paths = write_lease_path_candidates(db_path);
+    let mut held = self_held_write_leases();
+    for path in &paths {
+        *held.entry(path.clone()).or_insert(0) += 1;
+    }
+    drop(held);
+    SelfHeldWriteLease { paths }
+}
+
+/// Does THIS process hold the write lease on `db_path`, as far as
+/// [`note_self_held_write_lease`] has been told?
+///
+/// Answers only what was RECORDED. An unlatched lease reads `false`, which keeps
+/// the pre-latch behaviour exactly — the veto stays armed — rather than
+/// inventing a claim from a probe that cannot make it.
+pub fn self_holds_write_lease(db_path: &Path) -> bool {
+    let held = self_held_write_leases();
+    write_lease_path_candidates(db_path)
+        .iter()
+        .any(|path| held.contains_key(path))
+}
+
 /// Is `lease_path` locked RIGHT NOW by a process that is still alive?
 ///
 /// nw-404. The lease is an `flock`, and `flock` is the reason this is a proof
@@ -148,6 +293,11 @@ fn write_lease_path(db_path: &Path) -> PathBuf {
 /// * `create(false)`: an absent lease file is a real answer (nobody has ever
 ///   taken a lease on this database), and creating one would leave debris in
 ///   every directory a read-only open ever failed in.
+///
+/// It answers WHETHER, never WHOSE. `flock` conflicts per open file description,
+/// so this returns `true` for a lease the CALLING process holds — see
+/// [`SELF_HELD_WRITE_LEASES`], and never call this without asking the latch
+/// first, or a self-held lease reads as a stranger's.
 ///
 /// Only reached on the corruption branch of a failed open, so the shared lock
 /// is held for microseconds on a path that already ended in an error.
@@ -190,22 +340,35 @@ fn write_lease_is_held(_lease_path: &Path) -> bool {
 /// nw-404, the primitive the classifier consults before it is willing to call a
 /// write-ahead log damaged.
 ///
+/// "LIVE" and "WRITER" are both load-bearing, and the second one is what the
+/// first version of this got wrong. `flock` conflicts per open file DESCRIPTION,
+/// so the raw probe reports a conflict against a lease this very process holds —
+/// it proves someone is writing, not that it is someone ELSE. A caller that took
+/// the lease and then opened read-only (`brain reindex-search`) would therefore
+/// have a genuine WAL corruption suppressed and be told to wait for a process
+/// that does not exist. [`SELF_HELD_WRITE_LEASES`] is consulted FIRST, and only a
+/// lease this process did not record can answer "another writer".
+///
 /// HANDOFF (out of this crate's reach): `write_lease_path` here and
 /// `nestweaver_daemon::lifecycle::write_lease_path` derive the same
 /// `<db>.write.lock` name independently, because the store cannot depend on the
-/// daemon. The lasting shape is for the daemon's to delegate to this one; that
-/// is a `crates/nestweaver-daemon/src/lifecycle.rs` edit. Until then the probe
-/// asks about BOTH the canonicalised and the literal name — a lease held under
-/// either is a live writer, and asking twice on an error path is free.
+/// daemon. The lasting shape is for the daemon's to delegate to this one, and for
+/// `acquire_db_write_lease` to arm the latch; both are
+/// `crates/nestweaver-daemon/src/lifecycle.rs` edits. Until then the probe asks
+/// about BOTH the canonicalised and the literal name — a lease held under either
+/// is a live writer, and asking twice on an error path is free.
 pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
-    let canonical = write_lease_path(db_path);
-    if write_lease_is_held(&canonical) {
-        return true;
+    let candidates = write_lease_path_candidates(db_path);
+    // The self-ownership latch, before any syscall. Cheap, and it is the only
+    // question whose answer can distinguish "someone is writing" from "someone
+    // ELSE is writing" — see `SELF_HELD_WRITE_LEASES` for why the kernel cannot.
+    {
+        let held = self_held_write_leases();
+        if candidates.iter().any(|path| held.contains_key(path)) {
+            return false;
+        }
     }
-    let mut literal = db_path.to_path_buf().into_os_string();
-    literal.push(".write.lock");
-    let literal = PathBuf::from(literal);
-    literal != canonical && write_lease_is_held(&literal)
+    candidates.iter().any(|path| write_lease_is_held(path))
 }
 
 /// Classify an engine message into a [`CorruptionKind`], or `None` when it
@@ -228,18 +391,6 @@ pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
 /// calls, where a path is in hand.
 pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     let lower = message.to_lowercase();
-    // nw-404. The one exception to "decide from the message alone", and it is
-    // not a heuristic: this phrase is only ever written by
-    // `StoreError::from_engine_message_for_db` AFTER it proved a live writer
-    // holds the lease. The engine's verbatim words ride along in the same
-    // string and still say "corrupted wal", so without this the prose fallback
-    // in `into_diagnostic` re-derives `WalUnreadable` from our own disclosure
-    // and prints the move-aside-your-WAL runbook against a healthy database
-    // being written by the running daemon. A verdict must not be overturned by
-    // the evidence it was careful to preserve.
-    if lower.contains(LIVE_WRITER_DISCLOSURE) {
-        return None;
-    }
     // The engine has at least TWO phrasings for an unreadable log and they do
     // not share a word order:
     //
@@ -253,6 +404,38 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     // has seen one incident; this is the whole reason the classification lives
     // in one function with `Unclassified` underneath it.
     if lower.contains("corrupted wal") || (lower.contains("wal") && lower.contains("corrupt")) {
+        // nw-404. The one exception to "decide from the message alone", and it
+        // sits INSIDE this arm rather than above the whole function because the
+        // phrase has THREE producers and only one of them proved anything:
+        //
+        //   * `StoreError::from_engine_message_for_db`, which writes it only
+        //     after `live_writer_holds_write_lease` said yes — and which carries
+        //     the engine's verbatim "corrupted wal" along with it, so without a
+        //     veto here the prose fallback in `into_diagnostic` (which re-runs
+        //     this classifier over the RENDERED error when no type survived)
+        //     re-derives `WalUnreadable` from our own disclosure and prints the
+        //     move-aside-your-WAL runbook against a healthy database the daemon
+        //     is appending to. A verdict must not be overturned by the evidence
+        //     it was careful to preserve;
+        //   * the daemon's boot refusal in `server.rs` ("another process holds
+        //     the write lease for {db}. Stop it before starting a daemon — two
+        //     writers ... risk corruption."), which proves nothing about a WAL
+        //     and lands in this arm only because it says "corrupt" and a db path
+        //     may contain "wal";
+        //   * `require_exclusive_store_access` in `src/main.rs`, same shape,
+        //     when the lock probe cannot name the holder and it falls back to
+        //     the literal words "another process".
+        //
+        // Scoped to `WalUnreadable` — the only verdict a live append can make
+        // ambiguous. As a whole-function short circuit (which is how this
+        // shipped) any of those three sentences appearing anywhere in an error
+        // chain also suppressed `FileTruncated`, `EngineAssertion` and
+        // `Unclassified`, none of which a writer's liveness has any bearing on:
+        // it traded nw-404's false alarm for a silent one, which is the trade
+        // the whole item exists to refuse.
+        if lower.contains(LIVE_WRITER_DISCLOSURE) {
+            return None;
+        }
         return Some(CorruptionKind::WalUnreadable);
     }
     if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
@@ -299,12 +482,16 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
 ///   it is what stops this fix from becoming a way to never report corruption.
 /// * The engine's own words survive into whatever the caller returns. The veto
 ///   changes the VERDICT, never the evidence.
-/// * CALLER-SCOPED. `flock` carries no holder identity, so this cannot tell "someone
-///   else is writing" from "I am writing" — and the daemon takes the lease before it
-///   opens the store. The store's open funnel therefore calls this for READ-ONLY
-///   opens only; `db::open_failure` carries that reasoning and the handoff that
-///   would make the answer exact instead of structural. Anyone else calling this
-///   owes the same question.
+/// * CALLER-SCOPED, in two layers. `flock` carries no holder identity, so the
+///   kernel cannot tell "someone else is writing" from "I am writing" — and both
+///   the daemon and every `--no-daemon` writer take the lease before they open the
+///   store. [`note_self_held_write_lease`] is the exact answer: a process that
+///   records its own lease is never told a stranger holds it, which is what makes
+///   `brain reindex-search` (lease, then a read-only open) able to see a genuinely
+///   corrupt WAL again. `db::open_failure`'s `read_write` gate is the second layer
+///   and remains a STRUCTURAL approximation, not an exact one — see its docblock,
+///   which now says which write-capable caller passes `read_write: false`. Anyone
+///   calling this from a frame that might hold the lease owes the latch.
 pub fn classify_engine_corruption_for_db(message: &str, db_path: &Path) -> Option<CorruptionKind> {
     let kind = classify_engine_corruption(message)?;
     if kind == CorruptionKind::WalUnreadable && live_writer_holds_write_lease(db_path) {
@@ -858,6 +1045,160 @@ mod corruption_classification_tests {
                 &db
             ),
             None
+        );
+    }
+
+    /// nw-404, review defect 1: THE SELF-LEASE CASE, which had no test.
+    ///
+    /// `flock` conflicts between open file DESCRIPTIONS, so the probe opens a
+    /// second descriptor and gets `EWOULDBLOCK` from a lease this very process
+    /// holds. `nestweaver brain reindex-search` is exactly that shape — take the
+    /// write lease, then do a read-only `open_store` — so against a GENUINELY
+    /// damaged WAL it suppressed `db_wal_corrupt` and told the operator to wait
+    /// for "another process", which is verbatim the failure the `db_wal_corrupt`
+    /// docblock in `src/main.rs` records against `repair`: "naming a process
+    /// that does not exist".
+    ///
+    /// The counterweight rides in the same test on purpose: the latch must
+    /// retract the claim for THIS lease and for no other. A second database with
+    /// its own held lease keeps its contention answer throughout, and dropping
+    /// the latch restores the veto for the first — so a latch that leaked (by
+    /// database, or by outliving its lease) fails here rather than in the field,
+    /// where it would mean corruption reported as contention forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_lease_this_process_holds_itself_cannot_suppress_a_corrupt_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.lbug");
+        let theirs = dir.path().join("theirs.lbug");
+        std::fs::write(&mine, b"").unwrap();
+        std::fs::write(&theirs, b"").unwrap();
+        let _my_lease = HeldLease::take(&mine);
+        let _their_lease = HeldLease::take(&theirs);
+
+        // The kernel's answer, which is the defect: a lock held by this process
+        // is indistinguishable from a stranger's.
+        assert!(
+            live_writer_holds_write_lease(&mine),
+            "the raw flock probe cannot see whose descriptor holds the lease — \
+             if this stops being true the latch below is testing nothing"
+        );
+
+        let latch = note_self_held_write_lease(&mine);
+        assert!(
+            self_holds_write_lease(&mine),
+            "the latch must be readable through the same path spelling it was \
+             armed with, or it silently does nothing"
+        );
+        assert!(
+            !live_writer_holds_write_lease(&mine),
+            "a lease this process holds is not ANOTHER process writing"
+        );
+        assert_eq!(
+            classify_engine_corruption_for_db(LIVE_WRITER_WAL_PHRASE, &mine),
+            Some(CorruptionKind::WalUnreadable),
+            "the holder must see a damaged log as damaged; suppressing it here \
+             is the false negative that leaves a corrupt database unreported"
+        );
+        assert_eq!(
+            StoreError::from_engine_message_for_db(LIVE_WRITER_WAL_PHRASE, &mine).corruption_kind(),
+            Some(CorruptionKind::WalUnreadable),
+            "and the recovery runbook must be reachable, which is the whole \
+             point of reporting it"
+        );
+
+        // COUNTERWEIGHT 1: a latch on one database says nothing about another.
+        assert!(
+            !self_holds_write_lease(&theirs),
+            "the latch is keyed by lease file, not by a process-wide flag"
+        );
+        assert!(live_writer_holds_write_lease(&theirs));
+        assert_eq!(
+            classify_engine_corruption_for_db(LIVE_WRITER_WAL_PHRASE, &theirs),
+            None,
+            "a lease held by someone else must still retract the WAL verdict — \
+             that is nw-404's original fix and it must survive this one"
+        );
+
+        // COUNTERWEIGHT 2: the latch cannot outlive the lease. A stale `true`
+        // would suppress every corruption report for this database forever.
+        drop(latch);
+        assert!(!self_holds_write_lease(&mine));
+        assert!(live_writer_holds_write_lease(&mine));
+        assert_eq!(
+            classify_engine_corruption_for_db(LIVE_WRITER_WAL_PHRASE, &mine),
+            None
+        );
+    }
+
+    /// nw-404, review defect 2: the sentinel is SCOPED to the verdict it can
+    /// speak to.
+    ///
+    /// The phrase [`LIVE_WRITER_DISCLOSURE`] has three producers and only one of
+    /// them proved a live writer against a WAL. As a whole-function short
+    /// circuit, either of the other two — the daemon's boot refusal and
+    /// `require_exclusive_store_access`'s "another process holds the write
+    /// lease" — suppressed EVERY corruption kind wherever their prose appeared
+    /// in an error chain, which is a silent failure traded for a loud one.
+    #[test]
+    fn the_live_writer_sentinel_cannot_suppress_a_verdict_it_never_spoke_to() {
+        // The daemon's boot refusal, verbatim from `server.rs`. Note the db
+        // path: a directory called `walnut` puts "wal" in the message and the
+        // sentence already says "corruption", so this lands in the
+        // unreadable-WAL arm on prose alone. It must still be retracted — this
+        // message is about a lease, not a log.
+        const DAEMON_REFUSAL: &str = "another process holds the write lease for \
+             /home/u/walnut/brain.lbug. Stop it before starting a daemon — two writers \
+             against this store risk corruption.";
+        assert_eq!(
+            classify_engine_corruption(DAEMON_REFUSAL),
+            None,
+            "a contention message must never print the move-aside-your-WAL runbook"
+        );
+
+        // ...and the corruption kinds a lease says NOTHING about must survive
+        // the same prose. `into_diagnostic` re-classifies rendered error CHAINS,
+        // so a contention sentence and an engine sentence share one string
+        // routinely.
+        for (phrase, expected) in [
+            (
+                "cannot reindex directly: another process holds the write lease for \
+                 /home/u/brain.lbug. catalog page range starts at 3567 and spans 5 \
+                 pages, outside the database file with 1696 pages",
+                CorruptionKind::FileTruncated,
+            ),
+            (
+                "another process holds the write lease. Assertion failed in file \
+                 \"<crate>/column.cpp\" on line 289: x <= y",
+                CorruptionKind::EngineAssertion,
+            ),
+            (
+                "another process holds the write lease: database error: basic_string",
+                CorruptionKind::EngineAssertion,
+            ),
+        ] {
+            assert_eq!(
+                classify_engine_corruption(phrase),
+                Some(expected),
+                "a lease-contention sentence has no bearing on this verdict and \
+                 must not suppress it: {phrase}"
+            );
+        }
+
+        // And the producer that DID prove a live writer keeps its retraction —
+        // this is the sentinel's actual job and it is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"").unwrap();
+        let disclosure = format!(
+            "{LIVE_WRITER_DISCLOSURE} on {} ... The storage engine's own words, \
+             kept verbatim: {LIVE_WRITER_WAL_PHRASE}",
+            db.display()
+        );
+        assert_eq!(
+            classify_engine_corruption(&disclosure),
+            None,
+            "the prose fallback must not re-promote our own disclosure"
         );
     }
 
