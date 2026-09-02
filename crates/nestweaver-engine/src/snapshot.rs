@@ -269,7 +269,13 @@ pub fn build_snapshot(
     manifest: &Manifest,
     db_path: &Path,
 ) -> Result<Stamp, anyhow::Error> {
-    let store = nestweaver_store::GraphStore::open(db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to acquire writer authority for snapshot of {}: {error:?}",
+            db_path.display()
+        )
+    })?;
+    let store = nestweaver_store::GraphStore::open_with_authority(db_path, &authority)
         .map_err(|error| anyhow::anyhow!("failed to open snapshot database: {error}"))?;
     build_snapshot_from_store(output_dir, stamp, manifest, &store)
 }
@@ -975,7 +981,7 @@ fn verify_snapshot_artifacts(snapshot_dir: &Path, stamp: &Stamp) -> Result<(), a
     if stamp.format_version >= 3 {
         verify_publication_bundle(snapshot_dir, stamp, true)?;
         let graph_path = snapshot_dir.join(GRAPH_FILE);
-        let graph = nestweaver_store::GraphStore::open_read_only(&graph_path)
+        let graph = nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
             .map_err(|error| anyhow::anyhow!("open snapshot graph for identity check: {error}"))?;
         let graph_identity = graph
             .publication_identity()

@@ -4959,16 +4959,37 @@ fn daemon_extension_arg_errors_use_tool_failed_format() {
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
 
-    // MCP-visible path: query_extensions (its schema lets these through to the
-    // daemon handler).
+    // MCP-visible path: query_extensions.
+    //
+    // nw-410 CHANGED WHICH LAYER ANSWERS THESE, and the expectations move with
+    // it. The either/or requirement is now declared in the schema as
+    // `anyOf: [{required:["uid"]}, {required:["key","value"]}]` — which is what
+    // lets `tools/list` and the generated guide state it, instead of
+    // `brain_guide` rendering "Key parameters: —" for a tool that hard-errors
+    // without arguments. So VALIDATION now rejects the call before dispatch, and
+    // the handler's own message is shadowed on this route.
+    //
+    // NOTHING IS LOST IN PRECISION, which is why the two expectations below
+    // DIFFER. The renderer reports only the members a branch is actually
+    // MISSING, so it is instance-aware:
+    //   {}                  -> "either 'uid' or both 'key' and 'value'"
+    //   { "key": "owner" }  -> "either 'uid' or 'value'"
+    // The second names exactly the one field the caller still owes — the same
+    // information the handler's "'value' is required when 'key' is given"
+    // carried, plus the alternative form. Asserting both cases against the SAME
+    // string would have hidden that and let a future change collapse the
+    // partial case back to a generic list without failing anything.
+    //
+    // The raw-gRPC handler (`server.rs`) is untouched and still produces the
+    // pointed message for direct gRPC clients, so nothing is lost there.
     for (args, needle) in [
         (
             serde_json::json!({}),
-            "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
+            "invalid arguments for tool 'query_extensions': /: schema keyword 'anyOf' failed — provide either 'uid' or both 'key' and 'value'",
         ),
         (
             serde_json::json!({ "key": "owner" }),
-            "tool query_extensions failed: 'value' is required when 'key' is given",
+            "invalid arguments for tool 'query_extensions': /: schema keyword 'anyOf' failed — provide either 'uid' or 'value'",
         ),
     ] {
         let output = mcp_tool_call_in_mode(&db_path, "query_extensions", args, McpMode::Daemon);

@@ -6319,6 +6319,21 @@ impl NestWeaverDaemon for DaemonService {
                 .as_ref()
                 .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
                 .unwrap_or_default();
+            // nw-418/nw-422: the `unskip` half of the same `[[repos]]` block,
+            // resolved from the SAME config against the SAME (url, path) pair —
+            // `unskip_names_for` mirrors `exclude_globs_for`'s resolution
+            // exactly so the two halves can never disagree about which repo they
+            // describe.
+            //
+            // WITHOUT THIS the daemon-served index route keeps the bug the CLI
+            // route no longer has, which is the INVERSE of the asymmetry nw-418
+            // was filed for: `--no-daemon` and the daemon would disagree about
+            // what the repo contains.
+            let repo_unskip: Vec<String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| cfg.unskip_names_for(&repo_url, Some(&repo_path)).to_vec())
+                .unwrap_or_default();
 
             let index_opts = nestweaver_engine::index::IndexOptions::new(
                 // nw-019: stamp the effective logical instance on indexed repos —
@@ -6330,7 +6345,8 @@ impl NestWeaverDaemon for DaemonService {
             .force(force)
             .name(name.as_deref())
             .limits(index_limits)
-            .excludes(&repo_excludes);
+            .excludes(&repo_excludes)
+            .unskip(&repo_unskip);
 
             match nestweaver_engine::index::index_directory_with_store_opts(
                 &state.store,
@@ -11705,6 +11721,37 @@ fn refresh_git_activity(store: &GraphStore, ga_path: &Path) {
     }
 }
 
+/// A snapshot replica must preserve the materialized bytes exactly, so it
+/// cannot use the convenience read-only open that may run additive DDL. Fail
+/// at boot with a repair path instead of accepting an older physical catalog
+/// and surfacing binder errors only when a tool touches a missing column.
+fn require_snapshot_replica_schema(
+    store: &GraphStore,
+    db_path: &Path,
+) -> Result<(), anyhow::Error> {
+    let missing = store.missing_schema_columns().with_context(|| {
+        format!(
+            "inspect the physical schema of snapshot working copy {}",
+            db_path.display()
+        )
+    })?;
+    require_snapshot_replica_columns(db_path, &missing)
+}
+
+fn require_snapshot_replica_columns(
+    db_path: &Path,
+    missing: &[String],
+) -> Result<(), anyhow::Error> {
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "snapshot working copy {} requires a schema upgrade (missing {}). Rebuild the snapshot with this NestWeaver version, or open the source database writable once with this version before taking a new snapshot",
+            db_path.display(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_server(
     db_path: &Path,
     mut idle_timeout: Option<Duration>,
@@ -11903,11 +11950,16 @@ pub async fn run_server(
     let boot_started = std::time::Instant::now();
 
     let store = if read_only {
-        GraphStore::open_read_only(&db_path).with_context(|| {
+        let store = GraphStore::open_read_only_without_migration(&db_path).with_context(|| {
             format!("failed to open snapshot read-only at {}", db_path.display())
-        })?
+        })?;
+        require_snapshot_replica_schema(&store, &db_path)?;
+        store
     } else {
-        match GraphStore::open_or_create(&db_path) {
+        let authority = write_authority
+            .as_deref()
+            .expect("a read-write daemon acquired writer authority before opening the store");
+        match GraphStore::open_or_create_with_authority(&db_path, authority) {
             Ok(s) => s,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -18997,6 +19049,8 @@ credential_method = "gh"
             url: url.to_string(),
             repo_type,
             name: None,
+            // nw-422: no SKIP_DIRS re-admission in these fixtures.
+            unskip: Vec::new(),
             sparse: None,
             pin_sha: None,
             use_git_activity: None,
@@ -23588,6 +23642,29 @@ external_model = "unavailable-test-model"
 mod boot_reconciliation_tests {
     use super::*;
 
+    #[test]
+    fn snapshot_replica_rejects_an_old_physical_schema_with_remediation() {
+        let path = std::path::Path::new("/replica/working/graph.lbug");
+        let missing = vec![
+            "Symbol.visibility".to_string(),
+            "Note.frontmatter_raw".to_string(),
+        ];
+        let error = require_snapshot_replica_columns(path, &missing)
+            .expect_err("a strict snapshot reader must reject missing additive columns")
+            .to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("Symbol.visibility"), "{error}");
+        assert!(error.contains("Note.frontmatter_raw"), "{error}");
+        assert!(error.contains("Rebuild the snapshot"), "{error}");
+        assert!(
+            error.contains("open the source database writable"),
+            "{error}"
+        );
+
+        require_snapshot_replica_columns(path, &[])
+            .expect("a current physical schema must pass the replica gate");
+    }
+
     /// A pid guaranteed not to name a live process: spawn a child, wait for it
     /// (reaping the zombie), and return its now-free pid, so `kill(pid, 0)`
     /// reports ESRCH deterministically.
@@ -23974,6 +24051,8 @@ mod watch_path_allowed_tests {
             url: url.to_string(),
             repo_type,
             name: None,
+            // nw-422: no SKIP_DIRS re-admission in these fixtures.
+            unskip: Vec::new(),
             sparse: None,
             pin_sha: None,
             use_git_activity: None,

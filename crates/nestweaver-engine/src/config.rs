@@ -776,6 +776,22 @@ pub struct RepoConfig {
     pub branch: Option<String>,
     #[serde(default)]
     pub poll: Option<String>,
+    /// `SKIP_DIRS` names to RE-ADMIT for this repo — the inverse of `exclude`.
+    ///
+    /// nw-418. This key was DOCUMENTED BEFORE IT EXISTED. `SKIP_DIRS` prunes
+    /// directory names like `public`, `vendor`, `dist` at any depth, and
+    /// nw-387's disclosure message tells the operator to "re-admit it with
+    /// `[[repos]] unskip`" — but `RepoConfig` is `deny_unknown_fields` and had
+    /// no such field, so anyone who FOLLOWED that advice got a TOML parse error
+    /// and their whole instance config failed to load. Advice that breaks the
+    /// thing it claims to fix is worse than the silent drop it was written for.
+    ///
+    /// Names, not globs, because `SKIP_DIRS` matches a single path COMPONENT at
+    /// any depth — `unskip = ["public"]` re-admits every `public/` in the repo.
+    /// Use `exclude` for the opposite direction; the two are not
+    /// interchangeable and each disclosure names only its own.
+    #[serde(default)]
+    pub unskip: Vec<String>,
     /// Glob patterns, matched against repo-relative paths, for code this repo
     /// tracks but the graph should not hold.
     ///
@@ -1073,6 +1089,23 @@ impl InstanceConfig {
                         .is_some_and(|p| declared == normalize_repo_ref(p))
             })
             .map_or(&[][..], |r| r.exclude.as_slice())
+    }
+
+    /// The `SKIP_DIRS` names this repo re-admits. Resolves by URL or by local
+    /// checkout path, exactly as [`Self::exclude_globs_for`] does, so the two
+    /// halves of the same `[[repos]]` block can never resolve differently.
+    pub fn unskip_names_for(&self, repo_url: &str, repo_path: Option<&Path>) -> &[String] {
+        let path_str = repo_path.map(|p| p.to_string_lossy().to_string());
+        self.repos
+            .iter()
+            .find(|r| {
+                let declared = normalize_repo_ref(&r.url);
+                declared == normalize_repo_ref(repo_url)
+                    || path_str
+                        .as_deref()
+                        .is_some_and(|p| declared == normalize_repo_ref(p))
+            })
+            .map_or(&[][..], |r| r.unskip.as_slice())
     }
 
     /// The DB path declared by this instance, if any.

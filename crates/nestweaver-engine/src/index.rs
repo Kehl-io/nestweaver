@@ -1673,7 +1673,7 @@ pub(crate) fn open_store_for_writing_with_authority(
             db_path.display()
         );
     }
-    let store = GraphStore::open_or_create(db_path)
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("open/create store at {}", db_path.display()))?;
     recover_abandoned_index_publication_best_effort(&store, authority);
     Ok(store)
@@ -2074,7 +2074,45 @@ fn disclose_pruned_dir(pruned: crate::content_reader::SkippedDir) -> Option<Skip
     if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
         return None;
     }
-    let reason = if pruned.reason == crate::content_reader::CONFIGURED_EXCLUDE_REASON {
+    let reason = if pruned.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON {
+        // nw-394. THE THIRD REASON, AND THE ONE WHOSE REMEDY IS EASIEST TO GET
+        // WRONG. This file is COMMITTED — the user force-added it on purpose —
+        // so the message must not read as "you excluded this". It was dropped
+        // because the walk honours `.gitignore` and has no notion of the git
+        // index, while git applies `.gitignore` to untracked paths only; the
+        // two views diverge on exactly this population.
+        //
+        // Neither `unskip` (which re-admits `SKIP_DIRS` names) nor `exclude`
+        // (which removes things) can fix it, and offering either would repeat
+        // nw-387's defect of handing someone an instruction that does nothing.
+        //
+        // AND THE FIRST VERSION OF THIS MESSAGE REPEATED IT ANYWAY. It said
+        // "un-ignore it (`!<path>`)". **Git cannot re-include a file whose
+        // PARENT DIRECTORY is excluded** — and a directory pattern
+        // (`generated/`, `proto/gen/`, a vendored SDK) is this defect's entire
+        // stated population, so the remedy was inert on exactly the case it was
+        // written for. Verified: `.gitignore` of `generated/` plus
+        // `!generated/api_client.py` still reports the file ignored.
+        //
+        // The form that WORKS excludes the directory's CONTENTS rather than the
+        // directory itself, which leaves the directory traversable so a negation
+        // can take effect: `generated/*` then `!generated/api_client.py`.
+        // Verified re-included. That is what is named, because a remedy is only
+        // worth printing if running it fixes the thing.
+        format!(
+            "tracked by git but dropped by the indexer's `.gitignore`-honouring walk \
+             — git does not ignore tracked files, so a committed file matching an \
+             ignore pattern is in git and absent from the graph. A bare \
+             `!{path}` will NOT work if a parent directory is excluded: change the \
+             directory pattern to exclude its contents instead (`{dir}/*`), then \
+             add `!{path}` — or narrow the pattern so it never matches this file",
+            path = pruned.path,
+            dir = pruned
+                .path
+                .rsplit_once('/')
+                .map_or(".", |(parent, _)| parent)
+        )
+    } else if pruned.reason == crate::content_reader::CONFIGURED_EXCLUDE_REASON {
         "directory pruned before enumeration by a configured `[[repos]] exclude` \
          glob; drop or narrow that pattern to index it"
             .to_string()
@@ -2167,6 +2205,12 @@ pub struct IndexOptions {
     /// not hold. Empty for every caller that does not resolve an instance
     /// config. See `InstanceConfig::exclude_globs_for`.
     pub excludes: Vec<String>,
+    /// `[[repos]] unskip` names — [`SKIP_DIRS`] entries this repo re-admits
+    /// because they hold first-party source. nw-418: carried on the options
+    /// struct, not only inside the reader builder, so the incremental twin can
+    /// be handed the SAME set (see `incremental_index_with_excludes_and_unskip`)
+    /// and the two routes cannot disagree about what the repo contains.
+    pub unskip: Vec<String>,
 }
 
 impl IndexOptions {
@@ -2179,6 +2223,7 @@ impl IndexOptions {
             name: None,
             limits: crate::index_limits::IndexLimits::default(),
             excludes: Vec::new(),
+            unskip: Vec::new(),
         }
     }
 
@@ -2199,6 +2244,12 @@ impl IndexOptions {
 
     pub fn excludes(mut self, excludes: &[String]) -> Self {
         self.excludes = excludes.to_vec();
+        self
+    }
+
+    /// nw-418: `[[repos]] unskip` names for this repo.
+    pub fn unskip(mut self, unskip: &[String]) -> Self {
+        self.unskip = unskip.to_vec();
         self
     }
 }
@@ -2455,6 +2506,7 @@ fn index_directory_with_store_inner(
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
     let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .unskipping(&opts.unskip)
         .excluding(&opts.excludes)?;
     // Local filesystem index: the working tree location is `repo_path`.
     // Persisted as `root_path` on the Repo node so consumers never derive
@@ -4456,7 +4508,13 @@ where
 }
 
 /// Returns true if the given path has a supported language extension.
-fn is_parseable(path: &Path) -> bool {
+///
+/// `pub(crate)` for nw-394: `FilesystemReader::record_tracked_but_ignored` has
+/// to answer "would this file have contributed symbols had the walk seen it?"
+/// before it calls the file's absence a coverage loss, and this is the
+/// indexer's own answer to that question. Sharing it keeps the disclosure and
+/// the pipeline agreeing about what counts as source.
+pub(crate) fn is_parseable(path: &Path) -> bool {
     detect_language(path).is_some()
 }
 
@@ -5269,13 +5327,56 @@ pub(crate) fn is_minified_or_bundled(path: &Path) -> bool {
     false
 }
 
-/// Returns true if any component of `path` is in `SKIP_DIRS`.
-pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
+/// Returns true if any component of `path` is in [`SKIP_DIRS`] and has NOT been
+/// re-admitted by this repo's `[[repos]] unskip` set.
+///
+/// nw-418 GAVE THIS FUNCTION THE `unskip` SET, and that is the whole fix.
+/// `FilesystemReader::list_files` honoured `unskip` in its `filter_entry`
+/// closure; this predicate — the one the INCREMENTAL change loop uses — did
+/// not take the set and so could not. The two routes therefore disagreed about
+/// what the repo contained: a repo with `unskip = ["public"]` got `public/`
+/// indexed by `nestweaver index --force` and dropped, one file at a time, by
+/// every plain `nestweaver index`, with `coverage_status: "complete"` on both.
+///
+/// AND NOTHING COULD SEE IT. nw-387's disclosure channel reports directories
+/// the walk PRUNED, and on the incremental route `public/` is not pruned —
+/// `unskip` re-admitted it — so there was no `SkippedDir` row to drain and the
+/// loss happened below the level any disclosure watches.
+///
+/// Per nw-217 ("a guard present in one implementation and absent in its twin"),
+/// the fix is ONE predicate that both routes call with the same set, not a
+/// second copy of the rule taught to the incremental loop. The set reaches
+/// every caller through `ContentReader::unskipped_skip_dirs`, so it cannot
+/// drift from the set the walk itself used.
+pub(crate) fn path_in_skip_dir_with_unskip(
+    path: &Path,
+    unskip: &std::collections::HashSet<String>,
+) -> bool {
     path.components().any(|c| {
         c.as_os_str()
             .to_str()
-            .is_some_and(|name| SKIP_DIRS.contains(&name))
+            .is_some_and(|name| SKIP_DIRS.contains(&name) && !unskip.contains(name))
     })
+}
+
+/// [`path_in_skip_dir_with_unskip`] for the callers that carry no per-repo
+/// config and therefore re-admit nothing: the filesystem watchers
+/// (`watch_code.rs`) and [`crate::content_reader::GitBareReader`].
+///
+/// A THIN DELEGATION, NOT A SECOND RULE. It exists so those call sites keep
+/// compiling unchanged, and it must stay a one-liner: the moment it grows its
+/// own matching logic it becomes the drifted twin nw-217 describes. Those
+/// callers not honouring `unskip` is a real, smaller gap — a watcher will not
+/// pick up edits under a re-admitted `public/` — and it is stated here rather
+/// than hidden, because closing it needs the per-repo config plumbed into the
+/// watcher, which is a different change in different files.
+pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
+    static NONE_RE_ADMITTED: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    path_in_skip_dir_with_unskip(
+        path,
+        NONE_RE_ADMITTED.get_or_init(std::collections::HashSet::new),
+    )
 }
 
 /// nw-204: tombstone the embeddings of symbols an index run actually removed.
@@ -5452,6 +5553,7 @@ pub fn incremental_index_with_name_and_limits(
         name,
         limits,
         &[],
+        &[],
         &FileSystemIndexEpilogueIo,
     )
 }
@@ -5461,6 +5563,13 @@ pub fn incremental_index_with_name_and_limits(
 /// The full-index route resolves excludes through [`IndexOptions`]; this is its
 /// twin, so a `--no-daemon` incremental run does not quietly index a tree the
 /// configured excludes remove.
+///
+/// nw-418: `unskip` is the OTHER half of the same per-repo policy and this
+/// entry point cannot express it, so it passes the empty set. Use
+/// [`incremental_index_with_excludes_and_unskip`] wherever the repo's config
+/// has actually been resolved — an incremental run that forgets `unskip` drops
+/// the re-admitted files one at a time and still reports complete coverage.
+/// Kept at its current signature so existing callers compile unchanged.
 pub fn incremental_index_with_excludes(
     repo_path: &Path,
     db_path: &Path,
@@ -5470,6 +5579,43 @@ pub fn incremental_index_with_excludes(
     limits: crate::index_limits::IndexLimits,
     excludes: &[String],
 ) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_excludes_and_unskip(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        &[],
+    )
+}
+
+/// Incremental index honouring BOTH halves of the per-repo directory policy.
+///
+/// nw-418. `[[repos]] unskip` was honoured by the full scan (through
+/// `FilesystemReader::list_files`) and ignored by the incremental change loop
+/// (through the old `unskip`-less `path_in_skip_dir`), so the same repo yielded
+/// two different symbol sets depending on whether the caller passed `--force`,
+/// and BOTH runs reported `coverage_status: "complete"`. Worse, nw-387's
+/// disclosure could not catch it: `unskip` means the directory is not pruned,
+/// so there is no `SkippedDir` row to drain, and the files were dropped
+/// individually inside the loop, below the level any disclosure watches.
+///
+/// The set is pushed into the reader, and every skip decision downstream reads
+/// it back off the reader via `ContentReader::unskipped_skip_dirs`. One set,
+/// one predicate, both routes.
+#[allow(clippy::too_many_arguments)]
+pub fn incremental_index_with_excludes_and_unskip(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+    unskip: &[String],
+) -> Result<IncrementalResult, anyhow::Error> {
     incremental_index_with_name_and_io(
         repo_path,
         db_path,
@@ -5478,6 +5624,7 @@ pub fn incremental_index_with_excludes(
         name,
         limits,
         excludes,
+        unskip,
         &FileSystemIndexEpilogueIo,
     )
 }
@@ -5495,6 +5642,33 @@ pub fn incremental_index_with_excludes_and_write_lease(
     excludes: &[String],
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_excludes_and_unskip_and_write_lease(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        limits,
+        excludes,
+        &[],
+        authority,
+    )
+}
+
+/// Incremental index honouring both per-repo directory-policy halves under
+/// the caller's already-held exact database writer authority.
+#[allow(clippy::too_many_arguments)]
+pub fn incremental_index_with_excludes_and_unskip_and_write_lease(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    limits: crate::index_limits::IndexLimits,
+    excludes: &[String],
+    unskip: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<IncrementalResult, anyhow::Error> {
     incremental_index_with_name_and_io_and_authority(
         repo_path,
         db_path,
@@ -5503,6 +5677,7 @@ pub fn incremental_index_with_excludes_and_write_lease(
         name,
         limits,
         excludes,
+        unskip,
         &FileSystemIndexEpilogueIo,
         authority,
     )
@@ -5517,6 +5692,7 @@ fn incremental_index_with_name_and_io(
     name: Option<&str>,
     limits: crate::index_limits::IndexLimits,
     excludes: &[String],
+    unskip: &[String],
     epilogue_io: &dyn IndexEpilogueIo,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // nw-C1: reconcile BEFORE the `old_sha == new_sha` short-circuit below,
@@ -5537,6 +5713,7 @@ fn incremental_index_with_name_and_io(
         name,
         limits,
         excludes,
+        unskip,
         epilogue_io,
         &authority,
     )
@@ -5551,6 +5728,7 @@ fn incremental_index_with_name_and_io_and_authority(
     name: Option<&str>,
     limits: crate::index_limits::IndexLimits,
     excludes: &[String],
+    unskip: &[String],
     epilogue_io: &dyn IndexEpilogueIo,
     authority: &nestweaver_store::DbWriteLease,
 ) -> Result<IncrementalResult, anyhow::Error> {
@@ -5579,6 +5757,7 @@ fn incremental_index_with_name_and_io_and_authority(
                     force: false,
                     limits,
                     excludes,
+                    unskip,
                     epilogue_io,
                 },
             );
@@ -5601,6 +5780,7 @@ fn incremental_index_with_name_and_io_and_authority(
                     force: false,
                     limits,
                     excludes,
+                    unskip,
                     epilogue_io,
                 },
             );
@@ -5638,6 +5818,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 force: true,
                 limits,
                 excludes,
+                unskip,
                 epilogue_io,
             },
         );
@@ -5664,6 +5845,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 force: true,
                 limits,
                 excludes,
+                unskip,
                 epilogue_io,
             },
         );
@@ -5691,6 +5873,7 @@ fn incremental_index_with_name_and_io_and_authority(
         // deliberately: `nestweaver index` is user-invoked, and the alternative
         // is a coverage claim that is only true the first time.
         let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+            .unskipping(unskip)
             .excluding(excludes)?;
         let mut result = IncrementalResult::default();
         // Fully qualified because this module deliberately does not import the
@@ -5723,12 +5906,21 @@ fn incremental_index_with_name_and_io_and_authority(
     );
 
     let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .unskipping(unskip)
         .excluding(excludes)?;
+    // nw-418: read the re-admitted set BACK OFF THE READER rather than
+    // re-deriving it from `unskip` here. `unskipping` normalises the names
+    // (it trims them), and a second normalisation at this call site is exactly
+    // the drifting twin nw-217 describes — the loop below would then be able to
+    // disagree with the walk about whether `" public"` re-admits `public`.
+    // Fully qualified because this module deliberately does not import the
+    // `ContentReader` trait and `reader` here is the concrete type.
+    let unskip_dirs = crate::content_reader::ContentReader::unskipped_skip_dirs(&reader);
     let mut result = IncrementalResult::default();
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
-    let (changed_files, removed_files) = partition_changed_removed(&changes);
+    let (changed_files, removed_files) = partition_changed_removed(&changes, unskip_dirs);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
     let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
         Ok(plan) => plan,
@@ -5777,7 +5969,7 @@ fn incremental_index_with_name_and_io_and_authority(
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
-                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
                     continue;
                 }
                 match prepared_files
@@ -5801,7 +5993,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
-                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
                     continue;
                 }
                 let prepared = prepared_files
@@ -5893,7 +6085,7 @@ fn incremental_index_with_name_and_io_and_authority(
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
                     .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
 
-                if is_parseable(to) && !path_in_skip_dir(to) {
+                if is_parseable(to) && !path_in_skip_dir_with_unskip(to, unskip_dirs) {
                     // Re-read from disk and re-insert the file + symbols under the new path.
                     let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                         &txn, &r_uid, &to_str,
@@ -6031,10 +6223,16 @@ where
         "processing server incremental changes"
     );
 
+    // nw-418: same one predicate, same one set, on the daemon's route. The
+    // reader is supplied by the caller here, so whatever `unskip` it was built
+    // with is what this loop honours — the server twin cannot drift from the
+    // CLI's by construction.
+    let unskip_dirs = reader.unskipped_skip_dirs();
+
     // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
-    let (changed_files, removed_files) = partition_changed_removed(&changes);
+    let (changed_files, removed_files) = partition_changed_removed(&changes, unskip_dirs);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
     let prepared_files = prepare_incremental_files(reader, &changes)
@@ -6083,7 +6281,7 @@ where
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
-                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
                     continue;
                 }
                 match prepared_files
@@ -6107,7 +6305,7 @@ where
                 }
             }
             crate::git_diff::FileChange::Modified(rel_path) => {
-                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                if path_in_skip_dir_with_unskip(rel_path, unskip_dirs) || !is_parseable(rel_path) {
                     continue;
                 }
                 let prepared = prepared_files
@@ -6197,7 +6395,7 @@ where
                 nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
                     .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
 
-                if is_parseable(to) && !path_in_skip_dir(to) {
+                if is_parseable(to) && !path_in_skip_dir_with_unskip(to, unskip_dirs) {
                     let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
                         &txn, &r_uid, &to_str,
                     )
@@ -6363,6 +6561,12 @@ fn prepare_incremental_files(
     reader: &dyn crate::content_reader::ContentReader,
     changes: &[crate::git_diff::FileChange],
 ) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
+    // nw-418: the reader already knows which `SKIP_DIRS` names this repo
+    // re-admitted, so the preparation pass and the change loop that consumes it
+    // cannot disagree about which files exist. They used to: the loop's
+    // `expect("parseable added file was prepared")` is only sound because both
+    // sides apply the identical predicate.
+    let unskip_dirs = reader.unskipped_skip_dirs();
     let mut prepared = HashMap::new();
     for change in changes {
         let path = match change {
@@ -6372,7 +6576,7 @@ fn prepare_incremental_files(
             crate::git_diff::FileChange::Deleted(_) => None,
         };
         let Some(path) = path else { continue };
-        if path_in_skip_dir(path) || !is_parseable(path) {
+        if path_in_skip_dir_with_unskip(path, unskip_dirs) || !is_parseable(path) {
             continue;
         }
         prepared.insert(
@@ -6503,8 +6707,14 @@ fn write_prepared_incremental_file_txn(
 /// the change (`changed`: Added / Modified / Renamed.to) and the files that no
 /// longer exist (`removed`: Deleted / Renamed.from). Used to seed the
 /// transitive re-resolution pass (nw-008).
+///
+/// nw-418: takes the repo's `unskip` set for the same reason the change loop
+/// does. This seeds the reverse-dependency walk, so a re-admitted file dropped
+/// HERE would leave the edges INTO it unrebuilt even once the loop indexed it —
+/// a subtler version of the same divergence, and one no disclosure would show.
 fn partition_changed_removed(
     changes: &[crate::git_diff::FileChange],
+    unskip_dirs: &std::collections::HashSet<String>,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -6515,7 +6725,7 @@ fn partition_changed_removed(
     for change in changes {
         match change {
             FileChange::Added(p) | FileChange::Modified(p) => {
-                if !path_in_skip_dir(p) && is_parseable(p) {
+                if !path_in_skip_dir_with_unskip(p, unskip_dirs) && is_parseable(p) {
                     changed.insert(p.to_string_lossy().into_owned());
                 }
             }
@@ -6524,7 +6734,7 @@ fn partition_changed_removed(
             }
             FileChange::Renamed { from, to } => {
                 removed.insert(from.to_string_lossy().into_owned());
-                if !path_in_skip_dir(to) && is_parseable(to) {
+                if !path_in_skip_dir_with_unskip(to, unskip_dirs) && is_parseable(to) {
                     changed.insert(to.to_string_lossy().into_owned());
                 }
             }
@@ -6932,6 +7142,11 @@ struct FullIndexFallback<'a> {
     /// must carry these too — a fresh index takes this path, and without them
     /// the very first index of a repo silently ignored its excludes.
     excludes: &'a [String],
+    /// `[[repos]] unskip` names, carried for the same reason as `excludes` and
+    /// added by nw-418: the fallback builds its own reader, and a first index
+    /// that forgot `unskip` would leave the repo's re-admitted directories out
+    /// of the graph until someone happened to run `--force`.
+    unskip: &'a [String],
     epilogue_io: &'a dyn IndexEpilogueIo,
 }
 
@@ -6949,6 +7164,7 @@ fn full_index_fallback(
         force,
         limits,
         excludes,
+        unskip,
         epilogue_io,
     } = request;
     // Load filemeta sidecar for tiered change detection even in fallback.
@@ -6973,6 +7189,7 @@ fn full_index_fallback(
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
     let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
+        .unskipping(unskip)
         .excluding(excludes)?;
     let local_root = repo_path.display().to_string();
     // nw-022: capture a re-identified legacy file:// uid so its filemeta
@@ -7493,6 +7710,367 @@ mod tests {
             "a SKIP_DIRS prune IS re-admissible with `unskip` and must keep \
              saying so: {:?}",
             default_prune.reason
+        );
+    }
+
+    #[test]
+    fn a_git_tracked_file_that_also_matches_gitignore_is_disclosed_instead_of_vanishing() {
+        // nw-394. THE BELIEF THIS DISPROVES is nw-325's own remediation note:
+        // that because the walker honours `.gitignore`, coverage equals git's
+        // view. **Git does not ignore a tracked file** — `.gitignore` applies to
+        // untracked paths only — and `ignore::WalkBuilder` has no notion of the
+        // git index, so the two views diverge on exactly one population:
+        // committed-but-ignored files.
+        //
+        // This is the item's measured fixture. Before the fix it reported
+        // `files_processed: 1, symbols_found: 1, skipped_count: 0,
+        // coverage_status: "complete"` and `--fail-on-skip` exit 0, while
+        // `generated_api_call` was absent from the graph and `app.py`'s import
+        // edge to it could not exist. The caller half was indexed, the callee
+        // half was not, and `impact` stopped at the seam saying nothing.
+        //
+        // DECISION RECORDED: nw-394 allowed either honouring the git index or
+        // disclosing the drop, and this DISCLOSES. See
+        // `content_reader::TRACKED_BUT_IGNORED_REASON` for why: the realistic
+        // population is committed generated code, so silently pulling it into
+        // the graph trades one wrong answer for a costlier one. The walk's
+        // behaviour is therefore asserted UNCHANGED here, and the report is
+        // what moves.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("generated")).unwrap();
+        fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
+        fs::write(
+            repo.join("app.py"),
+            "from generated.api_client import generated_api_call\n\n\ndef app_main():\n    return generated_api_call()\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("generated/api_client.py"),
+            "def generated_api_call():\n    return 2\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        // `-f` is the whole fixture: this is a file the user COMMITTED ON
+        // PURPOSE despite the ignore pattern, which is why "we ignored it" is
+        // not an acceptable silent answer.
+        git(&["add", "-f", "generated/api_client.py"]);
+        git(&["commit", "-q", "-m", "force-add the generated client"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        assert!(
+            git(&["ls-files"]).contains("generated/api_client.py"),
+            "precondition: git tracks the file"
+        );
+
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &dir.path().join("graph.lbug"),
+            "test",
+            "https://example.test/tracked-but-ignored",
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files_count, 1,
+            "disclosure, not re-admission: the walk still drops the file"
+        );
+        let disclosed = result
+            .skipped_files
+            .iter()
+            .find(|skipped| skipped.path == "generated/api_client.py")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a committed-but-ignored source file must reach \
+                     IndexResult::skipped_files, which is what degrades \
+                     coverage_status and fails --fail-on-skip: {:?}",
+                    result.skipped_files
+                )
+            });
+        assert_eq!(
+            disclosed.reason_code,
+            nestweaver_parser::SkipReasonCode::Ignored,
+            "a policy drop is Ignored, not a read or parse defect"
+        );
+        // THE REMEDY HAS TO BE THE ONE THAT WORKS. nw-387 shipped a message
+        // offering `[[repos]] unskip` to a repo using `[[repos]] exclude` —
+        // an instruction that does nothing — and this is the same trap one
+        // reason over: `unskip` re-admits `SKIP_DIRS` NAMES and cannot touch a
+        // gitignore match, and `exclude` points the other way entirely. Only
+        // un-ignoring the path re-admits it, so only that is offered.
+        assert!(
+            disclosed.reason.contains("tracked by git"),
+            "the message must say the file is TRACKED, because the user \
+             committed it deliberately: {:?}",
+            disclosed.reason
+        );
+        assert!(
+            disclosed.reason.contains(".gitignore"),
+            "the message must name the mechanism that actually dropped it: {:?}",
+            disclosed.reason
+        );
+        assert!(
+            !disclosed.reason.contains("unskip") && !disclosed.reason.contains("[[repos]] exclude"),
+            "neither `unskip` nor `exclude` governs a gitignore match; offering \
+             either is a remedy that does nothing: {:?}",
+            disclosed.reason
+        );
+    }
+
+    #[test]
+    fn an_ordinary_ignored_file_git_does_not_track_is_not_reported_as_a_coverage_loss() {
+        // COUNTERWEIGHT to the test above, and the reason the disclosure
+        // consults the git INDEX rather than simply reporting everything the
+        // walk did not yield. `.gitignore` doing its job is the overwhelmingly
+        // common case: build output, caches, local `.env`s. If those degraded
+        // `coverage_status` the gate would fire on essentially every repository
+        // and carry exactly as little information as one that never fires,
+        // burying the committed-but-ignored finding nw-394 exists to surface.
+        //
+        // Two ignored files, one property: an untracked one is silent, and the
+        // tracked one beside it is still reported. Asserting only the first
+        // would pass on a fix that had simply been deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("build_output")).unwrap();
+        fs::create_dir_all(repo.join("generated")).unwrap();
+        fs::write(repo.join(".gitignore"), "build_output/\ngenerated/\n").unwrap();
+        fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("build_output/junk.py"),
+            "def never_committed():\n    return 2\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("generated/api_client.py"),
+            "def generated_api_call():\n    return 3\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        git(&["add", "-f", "generated/api_client.py"]);
+        git(&["commit", "-q", "-m", "force-add only the generated client"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &dir.path().join("graph.lbug"),
+            "test",
+            "https://example.test/untracked-ignored",
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        let paths: Vec<&str> = result
+            .skipped_files
+            .iter()
+            .map(|skipped| skipped.path.as_str())
+            .collect();
+        assert!(
+            !paths.contains(&"build_output/junk.py"),
+            "an ignored file git does not track is absent from git too — that \
+             is not a coverage loss and must not degrade the gate: {paths:?}"
+        );
+        assert_eq!(
+            paths,
+            vec!["generated/api_client.py"],
+            "the tracked-and-ignored file is the ONLY disclosure this repo owes"
+        );
+    }
+
+    #[test]
+    fn an_unskipped_directory_yields_one_symbol_set_from_both_a_forced_and_an_incremental_index() {
+        // nw-418, and the test shape the item asked for BY NAME: ONE test that
+        // runs BOTH routes over the same repo and compares, not two tests that
+        // each pass alone. Two passing tests were exactly the state before the
+        // fix — `--force` honoured `[[repos]] unskip` through
+        // `FilesystemReader::list_files`, the incremental change loop ignored it
+        // through an `unskip`-less `path_in_skip_dir`, and each route was
+        // internally consistent. Only comparing them shows the divergence.
+        //
+        // AND NOTHING ELSE COULD SHOW IT. nw-387's channel discloses PRUNED
+        // directories; here `unskip` means `public/` is not pruned, so there is
+        // no `SkippedDir` row to drain and the files were dropped one at a time
+        // inside the loop. Both runs reported `coverage_status: "complete"`
+        // while returning different graphs — which is why this asserts on the
+        // SYMBOL SET in the store rather than on the skip channel.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("public")).unwrap();
+        fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("public/widget.py"),
+            "def public_widget():\n    return 2\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let first_sha = git(&["rev-parse", "HEAD"]);
+
+        let unskip = vec!["public".to_string()];
+        let repo_url = "https://example.test/unskip-both-routes";
+        let r_uid = repo_uid("test", repo_url);
+        let incremental_db = dir.path().join("incremental.lbug");
+        let forced_db = dir.path().join("forced.lbug");
+
+        // Seed the incremental database at the FIRST commit, so the file added
+        // below arrives through the change loop's `Added` arm — the arm that
+        // `continue`d past it.
+        {
+            let authority = nestweaver_store::acquire_db_write_lease(&incremental_db).unwrap();
+            index_directory_with_opts_and_write_lease(
+                &repo,
+                &incremental_db,
+                &IndexOptions::new("test", repo_url, &first_sha)
+                    .force(true)
+                    .unskip(&unskip),
+                &authority,
+            )
+            .unwrap();
+        }
+
+        fs::write(
+            repo.join("public/added.py"),
+            "def public_added():\n    return 3\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add a second public source file"]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+
+        let incremental = {
+            let authority = nestweaver_store::acquire_db_write_lease(&incremental_db).unwrap();
+            incremental_index_with_excludes_and_unskip_and_write_lease(
+                &repo,
+                &incremental_db,
+                "test",
+                repo_url,
+                None,
+                crate::index_limits::IndexLimits::default(),
+                &[],
+                &unskip,
+                &authority,
+            )
+            .unwrap()
+        };
+        assert!(
+            !incremental.fell_back_to_full,
+            "precondition: this must exercise the incremental change loop, not \
+             the full-index fallback that would mask the bug"
+        );
+
+        {
+            let authority = nestweaver_store::acquire_db_write_lease(&forced_db).unwrap();
+            index_directory_with_opts_and_write_lease(
+                &repo,
+                &forced_db,
+                &IndexOptions::new("test", repo_url, &second_sha)
+                    .force(true)
+                    .unskip(&unskip),
+                &authority,
+            )
+            .unwrap();
+        }
+
+        let symbol_names = |db: &Path| {
+            let store = GraphStore::open_or_create(db).unwrap();
+            let mut names: Vec<String> = store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        let from_incremental = symbol_names(&incremental_db);
+        assert_eq!(
+            from_incremental,
+            symbol_names(&forced_db),
+            "an `unskip`ped repo must yield ONE symbol set; which flag the user \
+             passed is not allowed to change what the graph contains"
+        );
+        assert_eq!(
+            from_incremental,
+            vec![
+                "app_main".to_string(),
+                "public_added".to_string(),
+                "public_widget".to_string(),
+            ],
+            "and that one set must be the re-admitted one — equal-but-empty \
+             would satisfy the comparison above while losing every file"
+        );
+    }
+
+    #[test]
+    fn a_repo_without_unskip_still_prunes_public_on_both_routes() {
+        // COUNTERWEIGHT to the test above, and the failure mode it guards is
+        // blunt: giving the predicate an `unskip` set is one typo away from
+        // giving it a set that always matches, which would disable `SKIP_DIRS`
+        // wholesale. The equality assertion next door cannot see that — two
+        // routes that both over-index agree perfectly.
+        //
+        // Same fixture, same two routes, `unskip` withheld: `public/` must stay
+        // out of BOTH graphs, and the prune must still be disclosed so the loss
+        // is visible rather than silent.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("public")).unwrap();
+        fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
+        fs::write(
+            repo.join("public/widget.py"),
+            "def public_widget():\n    return 2\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let first_sha = git(&["rev-parse", "HEAD"]);
+
+        let repo_url = "https://example.test/no-unskip-still-prunes";
+        let r_uid = repo_uid("test", repo_url);
+        let db = dir.path().join("graph.lbug");
+        index_directory_with_opts(
+            &repo,
+            &db,
+            &IndexOptions::new("test", repo_url, &first_sha).force(true),
+        )
+        .unwrap();
+
+        fs::write(
+            repo.join("public/added.py"),
+            "def public_added():\n    return 3\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add a second public source file"]);
+
+        let incremental = incremental_index(&repo, &db, "test", repo_url).unwrap();
+        assert!(!incremental.fell_back_to_full);
+        assert!(
+            incremental
+                .skipped_files
+                .iter()
+                .any(|skipped| skipped.path == "public"),
+            "a genuinely pruned directory must still be disclosed: {:?}",
+            incremental.skipped_files
+        );
+
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let names: Vec<String> = store
+            .lookup_symbols_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["app_main".to_string()],
+            "without `unskip`, SKIP_DIRS must still prune `public/` on the \
+             incremental route too: {names:?}"
         );
     }
 
@@ -13697,6 +14275,7 @@ function hello(name) { return "Hello " + name; }
             None,
             crate::index_limits::IndexLimits::default(),
             &[],
+            &[],
             &InjectedIndexEpilogueIo {
                 fail_generation: true,
                 fail_compute: true,
@@ -13772,6 +14351,7 @@ function hello(name) { return "Hello " + name; }
             repo_url,
             None,
             crate::index_limits::IndexLimits::default(),
+            &[],
             &[],
             &InjectedIndexEpilogueIo {
                 fail_generation: true,

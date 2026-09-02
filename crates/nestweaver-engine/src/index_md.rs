@@ -181,6 +181,27 @@ pub fn index_markdown_directory_with_ignore(
     .map(|result| result.index)
 }
 
+/// Like [`index_markdown_directory_with_ignore`] under an exact writer
+/// authority already held by a wider CLI operation.
+pub fn index_markdown_directory_with_ignore_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        authority,
+    )
+    .map(|result| result.index)
+}
+
 /// Like [`index_markdown_directory_with_ignore`], but also returns the number
 /// of old notes deleted by the successfully committed replacement transaction.
 pub fn index_markdown_directory_with_ignore_and_deletion_count(
@@ -190,7 +211,33 @@ pub fn index_markdown_directory_with_ignore_and_deletion_count(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot index markdown database {}: {error:?}",
+            db_path.display()
+        )
+    })?;
+    index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        &authority,
+    )
+}
+
+/// Full markdown indexing under an exact writer authority already held by a
+/// wider CLI operation.
+pub fn index_markdown_directory_with_ignore_and_deletion_count_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_with_store_and_deletion_count(
         &store,
@@ -446,7 +493,35 @@ pub fn index_markdown_directory_since_with_ignore(
     since: std::time::SystemTime,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
-    let store = GraphStore::open_or_create(db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot refresh markdown database {}: {error:?}",
+            db_path.display()
+        )
+    })?;
+    index_markdown_directory_since_with_ignore_and_write_lease(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        since,
+        extra_ignore_patterns,
+        &authority,
+    )
+}
+
+/// Incremental markdown indexing under an exact writer authority already held
+/// by a wider CLI operation.
+pub fn index_markdown_directory_since_with_ignore_and_write_lease(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+    authority: &nestweaver_store::DbWriteLease,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
+    let store = GraphStore::open_or_create_with_authority(db_path, authority)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
     index_markdown_directory_since_with_store_and_ignore(
         &store,

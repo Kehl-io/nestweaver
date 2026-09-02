@@ -8708,3 +8708,123 @@ fn install_hook_refuses_unparseable_settings_and_names_the_position() {
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(after["env"]["MY_API_KEY"], "sk-live");
 }
+
+/// nw-399 / nw-400. The `--json` error contract, pinned as BEHAVIOUR.
+///
+/// The unit test in `src/main.rs` guards the WORDS of the contract in `--help`.
+/// It cannot guard the facts, and that gap is not hypothetical: the first
+/// version of that contract promised `{"error":"invalid argument"}` for exit
+/// 64, the documentation test passed, and the promise was false — clap raises a
+/// usage error before `--json` is ever read.
+///
+/// It is also the test nw-399 was missing. Its two existing tests call the
+/// payload builder directly and assert the help string exists, so removing every
+/// `print_json_not_found` call site leaves both green. This one goes through the
+/// real arm, so a revert fails it.
+#[test]
+fn the_json_error_contract_holds_as_behaviour_not_only_as_documentation() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn present() -> i32 { 1 }\n").unwrap();
+    let db = dir.path().join("t.lbug");
+
+    let index = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(index.status.success(), "fixture index failed: {index:?}");
+
+    // 1. TARGET NOT FOUND -> exit 2 AND a JSON envelope keyed `error`.
+    //    This is the arm nw-399 wired; before it, stdout was zero bytes.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "context",
+            "zzNoSuchSymbol",
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "not found must be the documented code 2"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json must emit a JSON object, got {stdout:?}: {e}"));
+    assert_eq!(
+        parsed["error"], "not found",
+        "the envelope must be keyed `error` so a script can branch on it, not on prose: {parsed}"
+    );
+
+    // 2. COUNTERWEIGHT: a target that EXISTS must not be reported as missing.
+    //    Without this, deleting the lookup entirely would satisfy the assertion
+    //    above.
+    let ok = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["context", "present", "--db", db.to_str().unwrap(), "--json"])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "a resolvable seed must succeed: {ok:?}"
+    );
+    let ok_json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&ok.stdout).trim()).expect("json");
+    assert!(
+        ok_json.get("error").is_none(),
+        "a success payload carries no error key"
+    );
+
+    // 3. THE EXCEPTION THE CONTRACT NOW STATES: a clap-rejected flag exits 64
+    //    and writes NOTHING to stdout. Pinned so the help text cannot drift back
+    //    to promising an envelope here.
+    let bad = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "brain",
+            "topic-clusters",
+            "--db",
+            db.to_str().unwrap(),
+            "--limit",
+            "0",
+            "--json",
+        ])
+        // Routing pinned even though clap rejects before either route is reached:
+        // `every_cli_invocation_pins_its_daemon_routing` requires it of any `--db`
+        // invocation, so a reader can tell which path a test exercises without
+        // reasoning about how far the command gets.
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        bad.status.code(),
+        Some(64),
+        "an out-of-range flag is a usage error"
+    );
+    assert!(
+        bad.stdout.is_empty(),
+        "clap rejects before --json is read. If this ever fails, the --help contract can \
+         finally promise an envelope for 64 — until then it must keep saying it cannot."
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("1..=1000"),
+        "the usage error must name the bound, not an MCP tool: {:?}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}

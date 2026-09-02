@@ -1171,7 +1171,7 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
     // A selected local graph remains writable after cutover, so its live size
     // and checksum legitimately advance beyond the sealed baseline. The graph
     // identity is the stable binding that must never change.
-    let store = nestweaver_store::GraphStore::open_read_only(&graph_path)
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
         .map_err(|error| anyhow::anyhow!("open selected publication graph: {error}"))?;
     let identity = store
         .publication_identity()

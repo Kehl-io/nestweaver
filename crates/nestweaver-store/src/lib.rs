@@ -24,7 +24,9 @@ pub use db::{
     PublicationIdentity,
 };
 pub use error::{
-    CancelReason, CorruptionKind, EngineCorruption, StoreError, classify_engine_corruption,
+    CancelReason, CorruptionKind, EngineCorruption, SelfHeldWriteLease, StoreError,
+    classify_engine_corruption, live_writer_holds_write_lease, note_self_held_write_lease,
+    self_holds_write_lease,
 };
 
 /// Re-export the LadybugDB connection type so callers can use transactional
@@ -70,7 +72,7 @@ pub use write::{
 pub use write_lease::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
     acquire_db_write_lease, acquire_db_write_lease_under_namespace, canonical_db_path,
-    write_lease_path, write_lease_state,
+    current_process_claims_write_lease, write_lease_path, write_lease_state,
 };
 
 #[cfg(test)]

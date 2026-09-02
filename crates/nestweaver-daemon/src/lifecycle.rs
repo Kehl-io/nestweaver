@@ -704,9 +704,11 @@ impl DbWriteLock {
     }
 }
 
-/// Records that THIS process holds a read-write store open on some database.
-/// Set by the daemon after `GraphStore::open_or_create`; read by
-/// [`db_write_lock`] to refuse a probe that would destroy that lock.
+/// Records that THIS process holds a read-write store open on some database
+/// without a canonical [`DbWriteLease`]. Set by the daemon after
+/// `GraphStore::open_or_create`; read by [`db_write_lock`] alongside the
+/// store's per-database self-ownership latch to refuse a probe that would
+/// destroy this process's POSIX lock.
 static LOCAL_STORE_WRITE_LOCK_HELD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -747,8 +749,9 @@ pub fn local_store_write_lock_held() -> bool {
 /// * and it sees `Free` regardless, because a process's own locks never
 ///   conflict with its own `F_GETLK`.
 ///
-/// So this is only safe from a process that does NOT have the store open — the
-/// CLI before it starts anything, or the daemon before its own store open.
+/// So this is only safe from a process that has neither the store open nor a
+/// canonical writer authority for this database — the CLI before it starts
+/// anything, or the daemon before its own store open.
 ///
 /// The guard below is a REAL RUNTIME BRANCH, not a `debug_assert`. Release
 /// builds disable debug assertions by default (this workspace sets no
@@ -763,7 +766,11 @@ pub fn local_store_write_lock_held() -> bool {
 /// equivalent, which would leave the hazard live on half the platforms. The
 /// runtime guard makes the question moot.)
 pub fn db_write_lock(db_path: &Path) -> DbWriteLock {
-    db_write_lock_probe(local_store_write_lock_held(), db_path)
+    db_write_lock_probe(
+        local_store_write_lock_held()
+            || nestweaver_store::current_process_claims_write_lease(db_path),
+        db_path,
+    )
 }
 
 /// [`db_write_lock`] with the "do I hold the store open?" answer passed in.
@@ -870,7 +877,7 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     if !db_path.exists() {
         return None;
     }
-    match nestweaver_store::GraphStore::open_read_only(db_path) {
+    match nestweaver_store::GraphStore::open_read_only_without_migration(db_path) {
         Ok(_) => None,
         Err(error) => (error.corruption_kind()
             == Some(nestweaver_store::CorruptionKind::WalUnreadable))
@@ -954,12 +961,15 @@ pub fn checkpoint_artifacts(db_path: &Path) -> CheckpointArtifacts {
 
 /// Canonical writer and destructive-namespace authority primitives.
 ///
-/// The writer lease deliberately holds three compatible claims for its full
-/// lifetime: lbug's POSIX database-lock class (to exclude older writers), a
-/// descriptor-scoped database flock (to exclude duplicate same-process
-/// authorities), and the stable sidecar flock (to survive database cutover).
-/// It is acquired before the store and dropped after the store, so routine
-/// store descriptors cannot shorten the authority lifetime.
+/// The writer lease holds its process-local canonical-path claim, shared data-
+/// directory namespace flock (outside system scratch roots), and stable
+/// sidecar flock for its full lifetime. At acquisition it also takes lbug's
+/// POSIX database-lock class to exclude a pre-upgrade incumbent; that process-
+/// scoped compatibility lock can later transfer to, or be shortened by, the
+/// store's own descriptor lifecycle without weakening the durable upgraded-
+/// writer claims. A diagnostic self-ownership latch is armed after the OS
+/// locks are held so the writer's own read-only open is not mistaken for an
+/// external writer.
 pub use nestweaver_store::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, acquire_db_namespace_lease,
     acquire_db_write_lease, acquire_db_write_lease_under_namespace, write_lease_path,
@@ -4429,6 +4439,24 @@ mod tests {
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"not really a database").unwrap();
         assert_eq!(db_write_lock(&db), db_write_lock_probe(false, &db));
+    }
+
+    /// The canonical store-level authority owns a POSIX compatibility lock as
+    /// well as its stable sidecar. Its per-database self-ownership latch must
+    /// therefore guard every lifecycle probe, including indirect callers such
+    /// as checkpoint-artifact classification.
+    #[test]
+    fn write_lock_probe_entry_point_refuses_a_canonical_self_held_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        assert_eq!(db_write_lock(&db), DbWriteLock::Unknown);
+        assert!(nestweaver_store::self_holds_write_lease(&db));
+
+        drop(authority);
+        assert!(!nestweaver_store::self_holds_write_lease(&db));
+        assert_eq!(db_write_lock(&db), DbWriteLock::Free);
     }
 
     /// Ownership survives an operator deleting the pidfile: the flock evidence

@@ -158,9 +158,10 @@ impl PublicationSourceManifest {
     }
 
     pub fn write_bound(&self, db_path: &Path) -> anyhow::Result<PathBuf> {
-        let store = nestweaver_store::GraphStore::open_read_only(db_path).map_err(|error| {
-            anyhow::anyhow!("open publication graph for source manifest: {error}")
-        })?;
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
+            .map_err(|error| {
+                anyhow::anyhow!("open publication graph for source manifest: {error}")
+            })?;
         let identity = store
             .publication_identity()
             .map_err(|error| anyhow::anyhow!("read publication identity: {error}"))?

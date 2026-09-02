@@ -133,14 +133,13 @@ pub fn seal_publication_slot(
             slot_root.display()
         );
     }
-    let store = nestweaver_store::GraphStore::open_read_only(db_path)
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
         .map_err(|error| anyhow::anyhow!("open staged publication graph: {error}"))?;
     let identity = store
         .publication_identity()
         .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
         .ok_or_else(|| anyhow::anyhow!("staged publication graph has no identity"))?;
     let source_graph_generation = store.graph_generation();
-    drop(store);
 
     let config = BackupConfig {
         db_path: db_path.to_path_buf(),
@@ -276,10 +275,17 @@ pub fn stage_backup_from_store(
 }
 
 pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
-    let store = nestweaver_store::GraphStore::open(&config.db_path)
+    let authority = nestweaver_store::acquire_db_write_lease(&config.db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to acquire writer authority for backup of {}: {error:?}",
+            config.db_path.display()
+        )
+    })?;
+    let store = nestweaver_store::GraphStore::open_with_authority(&config.db_path, &authority)
         .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
     let staged = stage_backup_from_store(&store, config)?;
     drop(store);
+    drop(authority);
     package_staged(config, staged)
 }
 
@@ -1058,9 +1064,10 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             .iter()
             .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
             .ok_or_else(|| anyhow::anyhow!("backup publication has no graph artifact"))?;
-        let graph_store =
-            nestweaver_store::GraphStore::open_read_only(&temp_dir.path().join(&graph.path))
-                .map_err(|error| anyhow::anyhow!("open restored graph identity: {error}"))?;
+        let graph_store = nestweaver_store::GraphStore::open_read_only_without_migration(
+            &temp_dir.path().join(&graph.path),
+        )
+        .map_err(|error| anyhow::anyhow!("open restored graph identity: {error}"))?;
         let graph_identity = graph_store
             .publication_identity()
             .map_err(|error| anyhow::anyhow!("read restored graph identity: {error}"))?

@@ -39,6 +39,18 @@ impl ProcessDbLeaseClaim {
     }
 }
 
+/// Whether this process is acquiring or already holds the canonical writer
+/// claim for `db_path`.
+///
+/// This predicate is intentionally armed before any database descriptor is
+/// opened and remains armed until every OS authority and diagnostic latch has
+/// dropped. Callers that probe POSIX lock state must consult it first: opening
+/// and closing another descriptor while it is true can release this process's
+/// compatibility lock.
+pub fn current_process_claims_write_lease(db_path: &Path) -> bool {
+    ProcessDbLeaseClaim::is_held(&canonical_db_path(db_path))
+}
+
 impl Drop for ProcessDbLeaseClaim {
     fn drop(&mut self) {
         PROCESS_DB_LEASES
@@ -118,8 +130,22 @@ pub struct DbWriteLease {
     _namespace_file: Option<std::fs::File>,
     _db_file: std::fs::File,
     _lease_file: std::fs::File,
+    /// Records that this process owns the sidecar flock. This is diagnostic,
+    /// not an additional authority: it prevents the corruption classifier's
+    /// second descriptor from mistaking our own lease for an external writer.
+    ///
+    /// Field order is load-bearing. Rust drops fields in declaration order, so
+    /// all OS lock descriptors above are closed before this latch is cleared.
+    /// A probe in that narrow window therefore sees "locks free, latch set"
+    /// rather than "locks held, latch clear", which fails toward reporting a
+    /// genuine corruption instead of suppressing it.
+    _self_latch: crate::SelfHeldWriteLease,
     db_path: PathBuf,
     lease_path: PathBuf,
+    /// True only when this acquisition atomically created the database inode.
+    /// This is creation provenance for staged-publication constructors; an
+    /// arbitrary pre-existing zero-byte file is not equivalent.
+    created_db_file: bool,
     // Declared last so every OS lock descriptor closes before another thread
     // in this process can claim the path.
     _process_claim: ProcessDbLeaseClaim,
@@ -151,6 +177,20 @@ impl DbWriteLease {
     /// Prove this authority belongs to the exact canonical database.
     pub fn authorizes(&self, db_path: &Path) -> bool {
         self.db_path == canonical_db_path(db_path)
+    }
+
+    /// Whether this exact authority atomically created `db_path` while taking
+    /// the canonical lease.
+    pub fn authorizes_fresh_creation(&self, db_path: &Path) -> bool {
+        self.created_db_file && self.authorizes(db_path)
+    }
+
+    /// Re-establish the legacy POSIX writer exclusion after another database
+    /// descriptor in this process closed. POSIX record locks are process-wide,
+    /// so a failed engine open can release `_db_file`'s lock before recovery
+    /// inspects or moves crash artifacts.
+    pub(crate) fn rearm_legacy_writer_exclusion(&self) -> Result<(), WriteLeaseError> {
+        lock_posix_write_nonblocking(&self._db_file)
     }
 }
 
@@ -301,15 +341,27 @@ fn acquire_db_write_lease_inner(
     }
     // The database descriptor is part of the authority, not merely a probe.
     // Open it first so every cooperating contender has the same lock order.
-    // `create(true)` preserves the pre-open use case: callers intentionally
-    // claim writer authority before GraphStore creates a new database.
-    let db_file = std::fs::OpenOptions::new()
-        .create(true)
+    // Atomic create-new preserves provenance for staged publication creation;
+    // falling back only on AlreadyExists prevents an arbitrary empty file from
+    // masquerading as one this authority created.
+    let (db_file, created_db_file) = match std::fs::OpenOptions::new()
+        .create_new(true)
         .read(true)
         .write(true)
-        .truncate(false)
         .open(&db_path)
-        .map_err(WriteLeaseError::Unavailable)?;
+    {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&db_path)
+                .map_err(WriteLeaseError::Unavailable)?;
+            (file, false)
+        }
+        Err(error) => return Err(WriteLeaseError::Unavailable(error)),
+    };
     // Take the same whole-file POSIX record-lock class used by lbug itself.
     // This is the compatibility bridge for a live pre-upgrade writer that
     // knows nothing about the sidecar: successful authority acquisition must
@@ -328,12 +380,17 @@ fn acquire_db_write_lease_inner(
         .open(&lease_path)
         .map_err(WriteLeaseError::Unavailable)?;
     lock_flock_with_inheritance_retry(&lease_file, libc::LOCK_EX)?;
+    // Arm only after every OS authority is held, and keep it in the lease so
+    // ownership knowledge cannot become stale or disappear early.
+    let self_latch = crate::note_self_held_write_lease(&db_path);
     Ok(DbWriteLease {
         _namespace_file: namespace_file,
         _db_file: db_file,
         _lease_file: lease_file,
+        _self_latch: self_latch,
         db_path,
         lease_path,
+        created_db_file,
         _process_claim: process_claim,
     })
 }
@@ -559,6 +616,34 @@ mod tests {
         assert_eq!(write_lease_state(&db), WriteLeaseState::Held);
         drop(authority);
         await_write_lease_free(&db);
+    }
+
+    #[test]
+    fn canonical_authority_arms_and_clears_the_self_ownership_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let wal_corruption = "Corrupted wal file. Read out invalid WAL record type.";
+
+        assert!(!crate::self_holds_write_lease(&db));
+        assert!(!current_process_claims_write_lease(&db));
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(crate::self_holds_write_lease(&db));
+        assert!(current_process_claims_write_lease(&db));
+        assert!(
+            !crate::live_writer_holds_write_lease(&db),
+            "our own canonical authority must not be reported as an external writer"
+        );
+        assert_eq!(
+            crate::error::classify_engine_corruption_for_db(wal_corruption, &db),
+            Some(crate::CorruptionKind::WalUnreadable),
+            "a self-held lease must not suppress a genuine WAL-corruption verdict"
+        );
+
+        drop(authority);
+        await_write_lease_free(&db);
+        assert!(!crate::self_holds_write_lease(&db));
+        assert!(!current_process_claims_write_lease(&db));
+        assert!(!crate::live_writer_holds_write_lease(&db));
     }
 
     #[test]
@@ -832,6 +917,73 @@ mod tests {
         assert!(
             stdout.contains("legacy-posix-lock-held"),
             "a failed duplicate acquisition released the incumbent POSIX lock: {stdout}"
+        );
+        drop(authority);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rearming_after_a_same_inode_close_restores_the_posix_compatibility_lock() {
+        use std::os::unix::io::AsRawFd as _;
+
+        const CHILD_ENV: &str = "NW_TEST_PROBE_REARMED_POSIX_DB_LOCK";
+        if let Some(db) = std::env::var_os(CHILD_ENV) {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(db)
+                .unwrap();
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as libc::c_short;
+            lock.l_whence = libc::SEEK_SET as libc::c_short;
+            lock.l_start = 0;
+            lock.l_len = 0;
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) };
+            if result == 0 {
+                println!("rearmed-posix-lock-free");
+            } else {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    error
+                        .raw_os_error()
+                        .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN),
+                    "unexpected POSIX lock error: {error}"
+                );
+                println!("rearmed-posix-lock-held");
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        // POSIX closes discard all record locks this process holds for the
+        // inode, even when the closed descriptor never acquired the lock.
+        let same_inode = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db)
+            .unwrap();
+        drop(same_inode);
+        authority.rearm_legacy_writer_exclusion().unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "write_lease::tests::rearming_after_a_same_inode_close_restores_the_posix_compatibility_lock",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("rearmed-posix-lock-held"),
+            "rearming did not restore legacy-writer exclusion: {stdout}"
         );
         drop(authority);
     }

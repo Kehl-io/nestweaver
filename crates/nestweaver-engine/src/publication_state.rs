@@ -59,7 +59,7 @@ impl PreservedStateSnapshot {
     }
 
     pub fn import_into(self, db_path: &Path) -> anyhow::Result<PreservedStateReceipt> {
-        let store = nestweaver_store::GraphStore::open_read_only(db_path)?;
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)?;
         let live = store.live_graph_node_uids()?;
         drop(store);
 
@@ -94,7 +94,7 @@ impl PreservedStateSnapshot {
 
 impl PreservedStateReceipt {
     pub fn write_bound(&self, db_path: &Path) -> anyhow::Result<PathBuf> {
-        let store = nestweaver_store::GraphStore::open_read_only(db_path)?;
+        let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)?;
         let identity = store
             .publication_identity()?
             .ok_or_else(|| anyhow::anyhow!("publication graph has no identity"))?;

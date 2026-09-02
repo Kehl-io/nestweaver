@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
+use crate::write_lease::{DbWriteLease, WriteLeaseError, acquire_db_write_lease};
 
 /// Dead fraction at which the embedding base is worth rewriting. 20% matches
 /// the threshold shape used by segment-merge reclaim in Lucene and by Milvus's
@@ -504,23 +505,11 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
 /// database another process was writing, on the strength of it. An inference
 /// about what a caller did NOT observe is not a proof of exclusivity.
 ///
-/// `read_write` is the gate that replaces the inference, and it is the same one
-/// [`quarantine_orphaned_wal`] has always had — these two arms of ONE recovery
-/// disagreed about whether a read-only caller may mutate the directory, and the
-/// arm that DELETES was the ungated one. A read-write open has at least taken
-/// lbug's own write lock on the database file, which is evidence; a read-only
-/// open has taken nothing. The self-heal that motivated this recovery is
-/// unaffected: it is the daemon that crash-loops, and the daemon opens
-/// read-write.
-///
-/// HANDOFF, and the reason this is a NARROWING rather than nw-373's fix: even a
-/// read-write open only PROBED exclusivity in the past — it holds lbug's lock,
-/// not the canonical write lease, across the delete. The property nw-373 asks
-/// for is a `DbWriteLease` HELD across the whole enumerate-and-delete, and
-/// `acquire_db_write_lease` lives in `nestweaver-daemon`, which depends on this
-/// crate. See the report for the signature; do not grow a second lease here.
-fn remove_stale_checkpoint_sidecars(path: &Path, read_write: bool) -> bool {
-    if !read_write {
+/// nw-373: mutation requires a matching borrowed [`DbWriteLease`]. The lease is
+/// held across the failed open, artifact inspection/removal, and retry; missing
+/// or sibling authority leaves every byte untouched.
+fn remove_stale_checkpoint_sidecars(path: &Path, authority: Option<&DbWriteLease>) -> bool {
+    if !authority.is_some_and(|authority| authority.authorizes(path)) {
         return false;
     }
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
@@ -741,16 +730,13 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 /// absent. A `.wal` with its `.shadow` intact is a normal recoverable log and
 /// must be left for the engine to replay.
 ///
-/// nw-373, unfixed and named: the caller gates this on a read-write open, which
-/// means lbug's write lock was taken — but nothing HOLDS the canonical write
-/// lease across the rename, so this is still a check-then-act on exclusivity.
-/// A probe answers a question about the past; the rename happens in the future.
-/// The blast radius is bounded by the fact that this only ever RENAMES (see
-/// above) and only on the orphan signature, which is why it is named here rather
-/// than papered over with a second probe. The fix needs
-/// `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which this crate
-/// cannot reach; see the report's HANDOFF.
-fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
+/// nw-373: like stale-checkpoint cleanup, the rename requires an exact borrowed
+/// [`DbWriteLease`]. A read-write engine open is not itself authority because
+/// it cannot close the check-then-act window around this filesystem mutation.
+fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
+    if !authority.is_some_and(|authority| authority.authorizes(path)) {
+        return None;
+    }
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     if !wal.exists() || shadow.exists() {
@@ -781,19 +767,30 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
 /// the corruption runbook — trading nw-404's false alarm for a silent one, on the
 /// exact recovery path nw-332's outage needed.
 ///
-/// `read_write` is the STRUCTURAL proxy for "not the holder", and it is exact
-/// rather than approximate: lbug takes its own write lock on the database file
-/// for a read-write open, so a read-write open by a NON-holder while someone
-/// else is writing fails with "Could not set lock" and never reaches a WAL
-/// verdict at all. The only read-write opener that can arrive here with a lease
-/// held is the holder. Read-only opens are the complement — the direct
-/// `impact --repo` / `brain context --no-tests` route that filed nw-404 — and
-/// they are the ones that get the veto.
+/// `read_write` is a STRUCTURAL PROXY for "not the holder", and it is
+/// APPROXIMATE — an earlier version of this docblock called it "exact rather
+/// than approximate" and that claim was wrong in both directions. What is true:
+/// lbug takes its own write lock on the database file for a read-write open, so
+/// a read-write open by a NON-holder while someone else is writing fails with
+/// "Could not set lock" and never reaches a WAL verdict, which is why
+/// `read_write: true` can safely skip the veto. What is NOT true is the
+/// converse — `read_write: false` does not mean "this open cannot be the
+/// writer". [`GraphStore::migrate_for_read_only`] passes `false` for an open
+/// that is fully write-capable (deliberately, to keep the orphaned-WAL
+/// quarantine arm shut), and nothing stops a caller from taking the lease and
+/// then opening read-only: `nestweaver brain reindex-search` does exactly that.
 ///
-/// HANDOFF, for the exact rather than the structural answer: a self-ownership
-/// latch (the shape `lifecycle::note_local_store_write_lock` already uses to stop
-/// `db_write_lock` destroying its own lock) set by `acquire_db_write_lease`. That
-/// is a `crates/nestweaver-daemon/src/lifecycle.rs` edit.
+/// The exact answer is `error::note_self_held_write_lease`, the process-local
+/// self-ownership latch nw-404's review added, which
+/// `live_writer_holds_write_lease` consults BEFORE the `flock` probe. It is what
+/// stops a self-held lease from suppressing a real `db_wal_corrupt` and blaming
+/// a process that does not exist. This gate stays as the second layer: it is
+/// free, and it holds even for a lease taken by a path that never armed the
+/// latch.
+///
+/// The canonical store-level lease producer arms that latch after acquiring all
+/// OS authorities and stores its guard in `DbWriteLease`, so latch and lease
+/// share one lifetime for daemon and direct-CLI callers alike.
 fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
     if read_write {
         // nw-346: the frame that knows WHICH database failed attaches the path,
@@ -806,15 +803,13 @@ fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
-/// `read_write` gates the orphaned-WAL arm. Replay is inherently a write
-/// operation, so a read-only open must report the condition rather than mutate
-/// the directory to clear it — and a read-only caller quarantining a log out
-/// from under a live writer would be a genuine hazard. It also gates nw-404's
-/// writer-liveness veto; see [`open_failure`] for why the two questions share
-/// one flag.
+/// `read_write` still selects diagnostics and forbids all recovery from a
+/// read-only open. Actual filesystem recovery additionally requires an exact
+/// `recovery_authority`, borrowed across this complete attempt and retry.
 fn open_lbug_with_recovery(
     path: &Path,
     read_write: bool,
+    recovery_authority: Option<&DbWriteLease>,
     make_config: impl Fn() -> lbug::SystemConfig,
 ) -> Result<lbug::Database, StoreError> {
     // nw-285. Every arm below inspects an `Err` that `lbug::Database::new`
@@ -829,7 +824,22 @@ fn open_lbug_with_recovery(
         Ok(db) => Ok(db),
         Err(e) => {
             let msg = e.to_string();
-            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, read_write)
+            // The failed engine open just closed its database descriptor.
+            // POSIX record locks are process-wide, so that close also released
+            // the compatibility lock held by `DbWriteLease::_db_file`. Re-arm
+            // it before any recovery mutation; if a pre-upgrade writer won the
+            // gap, preserve every artifact and return the original diagnostic.
+            let authority = read_write
+                .then_some(recovery_authority)
+                .flatten()
+                .filter(|authority| authority.authorizes(path))
+                .and_then(|authority| {
+                    authority
+                        .rearm_legacy_writer_exclusion()
+                        .map(|()| authority)
+                        .ok()
+                });
+            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, authority)
             {
                 tracing::warn!(
                     "recovered a stale WAL checkpoint for {} (a prior crash left \
@@ -839,9 +849,9 @@ fn open_lbug_with_recovery(
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
             }
-            if read_write
+            if authority.is_some()
                 && is_orphaned_wal_error(&msg)
-                && let Some(quarantined) = quarantine_orphaned_wal(path)
+                && let Some(quarantined) = quarantine_orphaned_wal(path, authority)
             {
                 tracing::warn!(
                     "recovered {} from an orphaned write-ahead log left by a prior \
@@ -1067,7 +1077,21 @@ fn is_column_already_present(message: &str) -> bool {
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        Self::create_inner(path, None)
+    }
+
+    /// Create a persistent database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn create_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::create_inner(path, Some(authority))
+    }
+
+    fn create_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
             access_mode: GraphStoreAccessMode::ReadWrite,
@@ -1121,8 +1145,48 @@ impl GraphStore {
                 path.display()
             )));
         }
+        Self::create_with_publication_identity_inner(path, identity, None)
+    }
 
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+    /// Create a staged publication under an authority that atomically created
+    /// the destination inode. Creation provenance prevents an arbitrary
+    /// pre-existing zero-byte file from being adopted as a fresh publication.
+    pub fn create_with_publication_identity_and_authority(
+        path: &Path,
+        identity: &PublicationIdentity,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        identity.validate()?;
+        Self::require_matching_authority(path, authority)?;
+        if !authority.authorizes_fresh_creation(path) {
+            return Err(StoreError::Query(format!(
+                "refusing to create staged publication over pre-existing database {}",
+                path.display()
+            )));
+        }
+        let size = std::fs::metadata(path)
+            .map_err(|error| {
+                StoreError::Query(format!(
+                    "inspect freshly authorized publication database {}: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        if size != 0 {
+            return Err(StoreError::Query(format!(
+                "fresh publication database {} changed before initialization",
+                path.display()
+            )));
+        }
+        Self::create_with_publication_identity_inner(path, identity, Some(authority))
+    }
+
+    fn create_with_publication_identity_inner(
+        path: &Path,
+        identity: &PublicationIdentity,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
             access_mode: GraphStoreAccessMode::ReadWrite,
@@ -1161,7 +1225,18 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
+        Self::open_inner(path, None)
+    }
+
+    /// Open an existing database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn open_with_authority(path: &Path, authority: &DbWriteLease) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::open_inner(path, Some(authority))
+    }
+
+    fn open_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
             db,
             access_mode: GraphStoreAccessMode::ReadWrite,
@@ -1212,8 +1287,56 @@ impl GraphStore {
     /// up-to-date database — the steady state — this costs one catalog query
     /// per migrated table and touches no lock at all.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let mut db =
-            open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+        Self::open_read_only_inner(path, None)
+    }
+
+    /// Open read-only while borrowing an already-held writer authority for a
+    /// schema migration, if the catalog proves one is necessary.
+    pub fn open_read_only_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        Self::open_read_only_inner(path, Some(authority))
+    }
+
+    /// Open read-only without ever attempting schema migration or crash-debris
+    /// recovery. Use this for forensic probes and sealed snapshot/backup
+    /// verification, where even a compatible DDL upgrade would invalidate the
+    /// bytes whose identity was just checked.
+    pub fn open_read_only_without_migration(path: &Path) -> Result<Self, StoreError> {
+        let db = open_lbug_with_recovery(path, false, None, || {
+            bounded_system_config().read_only(true)
+        })?;
+        Self::finish_read_only_open(path, db)
+    }
+
+    /// Catalog migrations this handle still needs, rendered as
+    /// `Table.column`. Strict read-only peers use this to fail with an
+    /// actionable upgrade requirement instead of surfacing later binder
+    /// errors or briefly becoming a writer themselves.
+    pub fn missing_schema_columns(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        Ok(Self::missing_migration_columns(&conn)
+            .iter()
+            .map(|migration| format!("{}.{}", migration.table, migration.column))
+            .collect())
+    }
+
+    fn open_read_only_inner(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<Self, StoreError> {
+        // A borrowed authority may already have survived descriptor churn in
+        // an earlier phase. Restore its compatibility lock before opening any
+        // new same-inode descriptor, then again after the attempt in case the
+        // engine opened and closed internal descriptors or failed outright.
+        Self::rearm_borrowed_authority(path, authority)?;
+        let initial = open_lbug_with_recovery(path, false, None, || {
+            bounded_system_config().read_only(true)
+        });
+        Self::rearm_borrowed_authority(path, authority)?;
+        let mut db = initial?;
         let stale = lbug::Connection::new(&db)
             .map(|conn| {
                 Self::missing_migration_columns(&conn)
@@ -1224,7 +1347,18 @@ impl GraphStore {
             .unwrap_or_default();
         if !stale.is_empty() {
             drop(db);
-            match Self::migrate_for_read_only(path) {
+            // Closing the probe releases every POSIX record lock this process
+            // held on the database inode, including the compatibility lock on
+            // a borrowed canonical authority. Re-arm before any DDL-capable
+            // open, and refuse the migration if a legacy writer won the gap.
+            Self::rearm_borrowed_authority(path, authority)?;
+            let migration = Self::migrate_for_read_only(path, authority);
+            // `migrate_for_read_only` normally restores this itself after its
+            // writable handle closes. Keep this second assertion at the call
+            // boundary as well so an early/error return cannot hand a caller
+            // a borrowed authority whose legacy exclusion silently vanished.
+            Self::rearm_borrowed_authority(path, authority)?;
+            match migration {
                 Ok(()) => tracing::info!(
                     "upgraded the schema of {} in place before a read-only open; \
                      added {} column(s): {}",
@@ -1241,8 +1375,23 @@ impl GraphStore {
                     stale.join(", ")
                 ),
             }
-            db = open_lbug_with_recovery(path, false, || bounded_system_config().read_only(true))?;
+            let reopened = open_lbug_with_recovery(path, false, None, || {
+                bounded_system_config().read_only(true)
+            });
+            // A failed engine open closes a same-inode descriptor too. Restore
+            // the borrowed authority before propagating either outcome.
+            Self::rearm_borrowed_authority(path, authority)?;
+            db = reopened?;
         }
+        let opened = Self::finish_read_only_open(path, db);
+        // A successful read-only engine open does not itself carry writer
+        // authority. Reassert the compatibility lock after all constructor
+        // descriptor churn so the caller's wider mutation remains protected.
+        Self::rearm_borrowed_authority(path, authority)?;
+        opened
+    }
+
+    fn finish_read_only_open(path: &Path, db: lbug::Database) -> Result<Self, StoreError> {
         let store = GraphStore {
             db,
             access_mode: GraphStoreAccessMode::ReadOnly,
@@ -1281,6 +1430,20 @@ impl GraphStore {
             Self::open(path)
         } else {
             Self::create(path)
+        }
+    }
+
+    /// Open or create a database while borrowing its canonical writer
+    /// authority. Crash-debris recovery is permitted only on this path.
+    pub fn open_or_create_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        if path.exists() {
+            Self::open_inner(path, Some(authority))
+        } else {
+            Self::create_inner(path, Some(authority))
         }
     }
 
@@ -3880,20 +4043,40 @@ impl GraphStore {
     /// Bring an out-of-date database up to the current schema before a
     /// read-only open, or explain why it could not be.
     ///
-    /// Best-effort by construction: if another process holds the writer lock we
+    /// Best-effort by construction: if another process holds canonical writer authority we
     /// cannot migrate, and must not fail the read — that process is normally a
     /// current-version daemon which has already migrated, and the reopen below
     /// will simply see the columns. What we must NOT do is stay silent when the
     /// columns really are absent, which is exactly how 8.0.1 shipped.
-    fn migrate_for_read_only(path: &Path) -> Result<(), StoreError> {
-        // `read_write: false` even though this open IS write-capable. That flag
-        // gates only the orphaned-WAL quarantine arm, and the hazard its doc
-        // describes — "a read-only caller quarantining a log out from under a
-        // live writer" — is exactly this caller. A missing column is worth
-        // taking the writer lock for; it is not worth moving someone else's
-        // write-ahead log aside for. An orphaned WAL here is reported, not
-        // cleared.
-        let db = open_lbug_with_recovery(path, false, hardened_system_config)?;
+    fn migrate_for_read_only(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<(), StoreError> {
+        if let Some(authority) = authority {
+            Self::require_matching_authority(path, authority)?;
+        }
+        let acquired = if authority.is_none() {
+            Some(acquire_db_write_lease(path).map_err(|error| match error {
+                WriteLeaseError::Held => StoreError::Query(format!(
+                    "canonical writer authority for {} is held by another operation",
+                    path.display()
+                )),
+                WriteLeaseError::Unavailable(error) => StoreError::Query(format!(
+                    "canonical writer authority for {} is unavailable: {error}",
+                    path.display()
+                )),
+            })?)
+        } else {
+            None
+        };
+        let authority = authority
+            .or(acquired.as_ref())
+            .expect("provided or acquired writer authority");
+        // `read_write: false` even though this open IS write-capable. Schema
+        // DDL is authorized by the borrowed lease above, but a read-only
+        // convenience open must never turn into WAL/checkpoint recovery. An
+        // orphaned WAL here is reported, not moved.
+        let db = open_lbug_with_recovery(path, false, Some(authority), hardened_system_config)?;
         let conn = lbug::Connection::new(&db)?;
         // Only what is actually missing, re-derived under the writer so the
         // decision is made against the schema we are about to change rather
@@ -3901,7 +4084,54 @@ impl GraphStore {
         // failure for a migration this database never needed would make the
         // warning below say something untrue.
         let missing = Self::missing_migration_columns(&conn);
-        Self::apply_migrations(&conn, missing.into_iter())
+        let migrated = Self::apply_migrations(&conn, missing.into_iter());
+        drop(conn);
+        drop(db);
+        // lbug's descriptor close releases process-wide POSIX locks on this
+        // inode. Restore the exact authority before returning it to a caller;
+        // if a legacy writer entered the gap, fail instead of continuing with
+        // a canonical lease that no longer excludes it.
+        authority
+            .rearm_legacy_writer_exclusion()
+            .map_err(|error| Self::write_authority_error(path, error))?;
+        migrated
+    }
+
+    fn rearm_borrowed_authority(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<(), StoreError> {
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        Self::require_matching_authority(path, authority)?;
+        authority
+            .rearm_legacy_writer_exclusion()
+            .map_err(|error| Self::write_authority_error(path, error))
+    }
+
+    fn write_authority_error(path: &Path, error: WriteLeaseError) -> StoreError {
+        match error {
+            WriteLeaseError::Held => StoreError::Query(format!(
+                "legacy writer exclusion for {} was lost to another process",
+                path.display()
+            )),
+            WriteLeaseError::Unavailable(error) => StoreError::Query(format!(
+                "could not restore legacy writer exclusion for {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn require_matching_authority(path: &Path, authority: &DbWriteLease) -> Result<(), StoreError> {
+        if authority.authorizes(path) {
+            Ok(())
+        } else {
+            Err(StoreError::Query(format!(
+                "writer authority does not cover database {}",
+                path.display()
+            )))
+        }
     }
 }
 
@@ -4003,6 +4233,56 @@ mod tests {
             reopened.publication_identity().unwrap(),
             Some(incumbent_identity)
         );
+    }
+
+    #[test]
+    fn staged_publication_authority_distinguishes_fresh_creation_from_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = PublicationIdentity {
+            brain_uuid: uuid::Uuid::new_v4().to_string(),
+            publication_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+
+        let fresh_path = dir.path().join("fresh.lbug");
+        let fresh = acquire_db_write_lease(&fresh_path).unwrap();
+        assert!(fresh.authorizes_fresh_creation(&fresh_path));
+        let store = GraphStore::create_with_publication_identity_and_authority(
+            &fresh_path,
+            &identity,
+            &fresh,
+        )
+        .unwrap();
+        assert_eq!(
+            store.publication_identity().unwrap(),
+            Some(identity.clone())
+        );
+        drop(store);
+        drop(fresh);
+
+        let existing_path = dir.path().join("existing-empty.lbug");
+        std::fs::write(&existing_path, b"").unwrap();
+        let existing = acquire_db_write_lease(&existing_path).unwrap();
+        assert!(!existing.authorizes_fresh_creation(&existing_path));
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &existing_path,
+            &identity,
+            &existing,
+        )
+        .err()
+        .expect("pre-existing empty file must not acquire creation provenance");
+        assert!(error.to_string().contains("pre-existing database"));
+        assert_eq!(std::fs::metadata(&existing_path).unwrap().len(), 0);
+
+        let wrong_path = dir.path().join("wrong.lbug");
+        let error = GraphStore::create_with_publication_identity_and_authority(
+            &wrong_path,
+            &identity,
+            &existing,
+        )
+        .err()
+        .expect("a sibling authority must be rejected");
+        assert!(error.to_string().contains("does not cover database"));
+        assert!(!wrong_path.exists());
     }
 
     #[test]
@@ -4136,8 +4416,19 @@ mod tests {
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(dir.path().join("brain.lbug.wal"), b"orphan-contents").unwrap();
+        assert!(quarantine_orphaned_wal(&db, None).is_none());
+        assert!(dir.path().join("brain.lbug.wal").exists());
 
-        let moved = quarantine_orphaned_wal(&db).expect("orphaned wal must be quarantined");
+        let sibling = dir.path().join("sibling.lbug");
+        let wrong = acquire_db_write_lease(&sibling).unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&wrong)).is_none());
+        assert!(dir.path().join("brain.lbug.wal").exists());
+        drop(wrong);
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        let moved = quarantine_orphaned_wal(&db, Some(&authority))
+            .expect("orphaned wal must be quarantined");
 
         assert!(
             !dir.path().join("brain.lbug.wal").exists(),
@@ -4161,9 +4452,10 @@ mod tests {
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(dir.path().join("brain.lbug.wal"), b"live").unwrap();
         std::fs::write(dir.path().join("brain.lbug.shadow"), b"shadow").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
 
         assert!(
-            quarantine_orphaned_wal(&db).is_none(),
+            quarantine_orphaned_wal(&db, Some(&authority)).is_none(),
             "a wal accompanied by its shadow must never be moved"
         );
         assert!(dir.path().join("brain.lbug.wal").exists());
@@ -4175,7 +4467,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         std::fs::write(&db, b"db").unwrap();
-        assert!(quarantine_orphaned_wal(&db).is_none());
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&authority)).is_none());
     }
 
     #[test]
@@ -4338,15 +4631,23 @@ mod tests {
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
 
-        assert!(
-            !remove_stale_checkpoint_sidecars(&db, false),
-            "a read-only open holds nothing and must not perform sidecar surgery"
-        );
+        assert!(!remove_stale_checkpoint_sidecars(&db, None));
         assert!(cp.exists(), "the checkpoint must survive a read-only open");
         assert!(shadow.exists(), "and so must the shadow");
 
+        let sibling = dir.path().join("sibling.lbug");
+        let wrong = acquire_db_write_lease(&sibling).unwrap();
         assert!(
-            remove_stale_checkpoint_sidecars(&db, true),
+            !remove_stale_checkpoint_sidecars(&db, Some(&wrong)),
+            "a sibling authority must preserve every artifact"
+        );
+        assert!(cp.exists());
+        assert!(shadow.exists());
+        drop(wrong);
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(
+            remove_stale_checkpoint_sidecars(&db, Some(&authority)),
             "the read-write self-heal is the reason this recovery exists and must \
              still fire — gating it into uselessness would restore the crash loop"
         );
@@ -4364,14 +4665,15 @@ mod tests {
         // Empty shadow + checkpoint present → recover (remove both).
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
-        assert!(remove_stale_checkpoint_sidecars(&db, true));
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(remove_stale_checkpoint_sidecars(&db, Some(&authority)));
         assert!(!cp.exists(), "stale checkpoint should be removed");
         assert!(!shadow.exists(), "empty shadow should be removed");
 
         // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
         std::fs::write(&cp, b"stale").unwrap();
         std::fs::write(&shadow, b"live-writer-state").unwrap();
-        assert!(!remove_stale_checkpoint_sidecars(&db, true));
+        assert!(!remove_stale_checkpoint_sidecars(&db, Some(&authority)));
         assert!(
             cp.exists(),
             "must not remove checkpoint when shadow is non-empty"
@@ -5283,6 +5585,7 @@ mod data_instance_identity_tests {
 #[cfg(test)]
 mod schema_migration_tests {
     use super::{COLUMN_MIGRATIONS, GraphStore, bounded_system_config, is_column_already_present};
+    use crate::{acquire_db_namespace_lease, acquire_db_write_lease};
 
     /// Column names of `table`, read straight from the catalog.
     fn columns(path: &std::path::Path, table: &str) -> Vec<String> {
@@ -5451,6 +5754,165 @@ mod schema_migration_tests {
                 migration.column
             );
         }
+    }
+
+    /// A read-only convenience open may migrate only after taking the same
+    /// shared namespace authority as every other database writer. Restore's
+    /// exclusive namespace therefore makes the migration stand down without
+    /// making ordinary reads unavailable.
+    #[test]
+    fn an_exclusive_namespace_prevents_read_only_schema_ddl() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join("old.lbug");
+        build_old_schema_database(&path);
+
+        let namespace = acquire_db_namespace_lease(&data_dir).unwrap();
+        let store = GraphStore::open_read_only(&path)
+            .expect("schema contention must not make compatible old-schema reads unavailable");
+        assert!(
+            !GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "read-only open performed DDL without shared namespace authority"
+        );
+        drop(store);
+        drop(namespace);
+
+        assert!(
+            COLUMN_MIGRATIONS.iter().any(|migration| {
+                !columns(&path, migration.table).contains(&migration.column.to_string())
+            }),
+            "the exclusive namespace must leave the catalog unchanged"
+        );
+    }
+
+    #[test]
+    fn a_strict_read_only_open_never_migrates_the_bytes_it_is_inspecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+
+        let store = GraphStore::open_read_only_without_migration(&path).unwrap();
+        assert!(
+            !GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "strict verification must observe, not rewrite, an old schema"
+        );
+        drop(store);
+        assert!(
+            COLUMN_MIGRATIONS.iter().any(|migration| {
+                !columns(&path, migration.table).contains(&migration.column.to_string())
+            }),
+            "strict verification changed the on-disk catalog"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_exact_authority_migrates_but_a_sibling_authority_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join("old.lbug");
+        build_old_schema_database(&path);
+
+        let sibling_path = data_dir.join("sibling.lbug");
+        let sibling = acquire_db_write_lease(&sibling_path).unwrap();
+        let error = match GraphStore::open_read_only_with_authority(&path, &sibling) {
+            Ok(_) => panic!("a sibling authority must not authorize schema DDL"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not cover database"),
+            "a sibling authority must be rejected explicitly: {error}"
+        );
+        drop(sibling);
+
+        let authority = acquire_db_write_lease(&path).unwrap();
+        let store = GraphStore::open_read_only_with_authority(&path, &authority).unwrap();
+        assert!(
+            GraphStore::missing_migration_columns(&store.conn().unwrap()).is_empty(),
+            "the exact borrowed authority must cover the complete DDL migration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_read_only_migration_restores_legacy_writer_exclusion() {
+        use std::os::unix::io::AsRawFd as _;
+
+        const CHILD_ENV: &str = "NW_TEST_PROBE_MIGRATION_POSIX_DB_LOCK";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as libc::c_short;
+            lock.l_whence = libc::SEEK_SET as libc::c_short;
+            lock.l_start = 0;
+            lock.l_len = 0;
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) };
+            if result == 0 {
+                println!("migration-posix-lock-free");
+            } else {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    error
+                        .raw_os_error()
+                        .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN),
+                    "unexpected POSIX lock error: {error}"
+                );
+                println!("migration-posix-lock-held");
+            }
+            return;
+        }
+
+        let probe = |path: &std::path::Path| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "db::schema_migration_tests::borrowed_read_only_migration_restores_legacy_writer_exclusion",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, path)
+                .output()
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.lbug");
+        build_old_schema_database(&path);
+        let authority = acquire_db_write_lease(&path).unwrap();
+
+        // Prove the child assertion is sensitive: an unrelated same-inode
+        // close really does release the process-scoped compatibility lock,
+        // and a strict read-only handle does not replace it on this path.
+        let descriptor = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        drop(descriptor);
+        let strict = GraphStore::open_read_only_without_migration(&path).unwrap();
+        let before = probe(&path);
+        assert!(before.status.success());
+        assert!(
+            String::from_utf8_lossy(&before.stdout).contains("migration-posix-lock-free"),
+            "control did not observe the released POSIX lock: {}",
+            String::from_utf8_lossy(&before.stdout)
+        );
+        drop(strict);
+
+        let migrated = GraphStore::open_read_only_with_authority(&path, &authority).unwrap();
+        let after = probe(&path);
+        assert!(after.status.success());
+        assert!(
+            String::from_utf8_lossy(&after.stdout).contains("migration-posix-lock-held"),
+            "borrowed migration returned without restoring legacy-writer exclusion: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
+        drop(migrated);
+        drop(authority);
     }
 
     /// The same database opened read-WRITE must recover too. `open` does run
@@ -5726,6 +6188,59 @@ mod live_writer_wal_tests {
             "a read-write open holds the lease itself, so the same probe would \
              be the writer asking about itself — it must keep the corruption \
              verdict and its recovery runbook"
+        );
+    }
+
+    /// nw-404, review defect 1, AT THE OPEN FUNNEL — the frame that decides
+    /// whether the operator sees `db_wal_corrupt`.
+    ///
+    /// `open_failure`'s `read_write` gate cannot cover this case, which is why
+    /// its docblock no longer calls itself exact: `brain reindex-search` takes
+    /// the write lease and then opens READ-ONLY, so it arrives here with
+    /// `read_write: false` while holding the very lease the probe is about to
+    /// find. Without the latch it is told to wait for a process that does not
+    /// exist, and a genuinely damaged log goes unreported.
+    ///
+    /// The counterweight is the same open, same lease, latch dropped: that is
+    /// the daemon-holds-it case nw-404 was filed for, and it must still retract
+    /// the verdict.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_open_by_the_lease_holder_itself_still_reports_a_corrupt_wal() {
+        use std::os::unix::io::AsRawFd;
+
+        const ENGINE: &str = "Corrupted wal file. Read out invalid WAL record type.";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.lbug");
+        std::fs::write(&db, b"").unwrap();
+
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(format!("{}.write.lock", db.display()))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test must actually hold the lease or it proves nothing"
+        );
+
+        let latch = crate::error::note_self_held_write_lease(&db);
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), false).corruption_kind(),
+            Some(crate::error::CorruptionKind::WalUnreadable),
+            "the process that holds the lease is not 'another process' — it must \
+             see the damage and get the runbook, even opening read-only"
+        );
+
+        drop(latch);
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), false).corruption_kind(),
+            None,
+            "and with the lease held by someone this process did not record, the \
+             read-only open must still report contention rather than damage"
         );
     }
 
