@@ -51,20 +51,28 @@ impl Drop for ProcessDbLeaseClaim {
 
 /// Canonicalize a database path even before the file exists.
 pub fn canonical_db_path(db_path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(db_path) {
-        return canonical;
+    let absolute = if db_path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(db_path))
+            .unwrap_or_else(|_| db_path.to_path_buf())
+    } else {
+        db_path.to_path_buf()
+    };
+    // Resolve the deepest ancestor that exists, then retain the unresolved
+    // suffix. Canonicalizing only the immediate parent loses aliases whenever
+    // more than one component is absent (for example while restore has renamed
+    // a data directory), allowing two spellings of one future database to
+    // bypass the pre-open process claim.
+    for ancestor in absolute.ancestors() {
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            let suffix = absolute
+                .strip_prefix(ancestor)
+                .expect("an ancestor must prefix its path");
+            canonical.push(suffix);
+            return lexical_normalize(&canonical);
+        }
     }
-    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
-        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
-    {
-        return canonical_parent.join(file_name);
-    }
-    if db_path.is_relative()
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        return lexical_normalize(&cwd.join(db_path));
-    }
-    db_path.to_path_buf()
+    lexical_normalize(&absolute)
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -418,11 +426,12 @@ pub fn write_lease_state(db_path: &Path) -> WriteLeaseState {
     if sidecar_state == WriteLeaseState::Held {
         return WriteLeaseState::Held;
     }
-    let states = [
-        sidecar_state,
-        probe_flock_state(&db_path),
-        probe_posix_write_lock_state(&db_path),
-    ];
+    // The database inode belongs exclusively to the POSIX compatibility
+    // protocol. Probing it with flock as well is harmless on Linux, where the
+    // lock families are independent, but on macOS that flock can conflict with
+    // a POSIX lock held by this very process and falsely report an external
+    // writer. Upgraded writers are already visible through the stable sidecar.
+    let states = [sidecar_state, probe_posix_write_lock_state(&db_path)];
     if states.contains(&WriteLeaseState::Held) {
         WriteLeaseState::Held
     } else if states.contains(&WriteLeaseState::Unknown) {
@@ -667,6 +676,44 @@ mod tests {
         assert_eq!(write_lease_path(&alias_db), write_lease_path(&canonical_db));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn canonical_aliases_survive_multiple_missing_path_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let canonical_db = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("missing")
+            .join("nested")
+            .join("brain.lbug");
+        let alias_db = alias.join("missing").join("nested").join("brain.lbug");
+
+        assert_eq!(canonical_db_path(&alias_db), canonical_db);
+        assert_eq!(write_lease_path(&alias_db), write_lease_path(&canonical_db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_authority_follows_a_symlinked_database_target() {
+        let root = tempfile::tempdir().unwrap();
+        let apparent_dir = root.path().join("apparent");
+        let target_dir = root.path().join("target");
+        std::fs::create_dir(&apparent_dir).unwrap();
+        std::fs::create_dir(&target_dir).unwrap();
+        let target_db = target_dir.join("brain.lbug");
+        std::fs::write(&target_db, b"database").unwrap();
+        let alias_db = apparent_dir.join("brain.lbug");
+        std::os::unix::fs::symlink(&target_db, &alias_db).unwrap();
+
+        let apparent = acquire_db_namespace_lease(&apparent_dir).unwrap();
+        assert!(!apparent.authorizes(&alias_db));
+        let target = acquire_db_namespace_lease(&target_dir).unwrap();
+        assert!(target.authorizes(&alias_db));
+    }
+
     #[test]
     fn unlinking_and_recreating_the_sidecar_cannot_mint_a_second_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -696,6 +743,36 @@ mod tests {
         );
         let replacement = acquire_db_write_lease(&db).unwrap();
         assert!(replacement.authorizes(&db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_lease_state_does_not_cross_probe_a_same_process_posix_lock() {
+        use std::os::unix::io::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&db)
+            .unwrap();
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) },
+            0
+        );
+
+        // This synthetic unclaimed lock is not a supported writer lifecycle:
+        // closing the probe descriptor also releases same-process POSIX locks.
+        // It exists only to prove the state query does not add a cross-family
+        // flock probe that self-contends on macOS. Production writers hold the
+        // process claim, so write_lease_state returns Held before opening here.
+        assert_eq!(write_lease_state(&db), WriteLeaseState::Free);
     }
 
     #[cfg(unix)]

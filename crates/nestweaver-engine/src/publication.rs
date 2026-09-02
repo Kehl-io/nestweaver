@@ -800,9 +800,9 @@ impl PublicationRootLock {
     ///
     /// A live external owner is refused without queueing: a publication rebuild
     /// can run for minutes, and a CLI must report that contention rather than
-    /// silently wait. On Unix, acquisition may retry for at most 500 ms after a
-    /// non-inherited POSIX lock proves that the only remaining contention is a
-    /// stale flock description in another thread's fork-before-exec window.
+    /// silently wait. On Unix, acquisition may retry for at most 500 ms so a
+    /// stale flock description in another thread's fork-before-exec window
+    /// cannot manufacture durable contention.
     pub fn acquire(publication_root: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(publication_root).with_context(|| {
             format!(
@@ -870,31 +870,17 @@ fn publication_lock_contention(path: &Path, error: std::io::Error) -> anyhow::Er
 
 #[cfg(unix)]
 fn lock_publication_file(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    // A POSIX record lock is not inherited across fork. It therefore remains
-    // the fail-fast authority for a live external process even when a child
-    // briefly retains the previous owner's flock description before exec.
-    let mut record_lock: libc::flock = unsafe { std::mem::zeroed() };
-    record_lock.l_type = libc::F_WRLCK as libc::c_short;
-    record_lock.l_whence = libc::SEEK_SET as libc::c_short;
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &record_lock) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return if error
-            .raw_os_error()
-            .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN)
-        {
-            Err(std::io::ErrorKind::WouldBlock.into())
-        } else {
-            Err(error)
-        };
-    }
-
-    // `flock` is tied to the open file description and that description is
-    // inherited by fork. Rust descriptors are CLOEXEC, but another thread's
-    // child can keep a just-dropped owner's lock alive until exec. Retry only
-    // after the non-inherited POSIX authority above succeeds; a genuine live
-    // external owner still fails immediately at that first gate.
+    // Keep this inode on one lock interface. Linux treats flock and POSIX
+    // record locks independently, while macOS makes them cooperate; layering
+    // both on one descriptor can therefore contend with this process's own
+    // lock. Publication roots have always coordinated through flock, so that
+    // is also the protocol compatible with a live pre-upgrade process. The
+    // process-local claim closes the same-process duplicate-descriptor gap.
+    //
+    // A flock is inherited across fork. Rust descriptors are CLOEXEC, but
+    // another thread's child can briefly keep a just-dropped owner's open file
+    // description alive until exec, so bound the retry instead of turning that
+    // window into false durable contention.
     for attempt in 0..=100 {
         match file.try_lock() {
             Ok(()) => return Ok(()),
@@ -2294,7 +2280,7 @@ mod tests {
 
         // A cloned descriptor shares the same open file description, exactly
         // as a forked child does before exec. Closing `owner` releases the
-        // process-scoped POSIX lock, but the clone keeps flock alive briefly.
+        // lock owner's description, so the clone keeps flock alive briefly.
         let inherited = owner.try_clone().unwrap();
         drop(owner);
         let child_window = std::thread::spawn(move || {

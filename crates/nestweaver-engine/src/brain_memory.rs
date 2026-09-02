@@ -2639,7 +2639,7 @@ mod tests {
 
         let entries = load_consolidation_journals(&vaults, &vault_roots).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, journal_path);
+        assert_eq!(entries[0].path, fs::canonicalize(&journal_path).unwrap());
         assert_eq!(entries[0].vault_root, fs::canonicalize(&root).unwrap());
     }
 
