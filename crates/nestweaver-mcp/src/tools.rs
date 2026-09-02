@@ -341,6 +341,61 @@ fn restricted_symbol_owners(
     ))
 }
 
+/// nw-416: every STRING spelling of a repo's identity, mapped to the
+/// `repo_uid` visibility is decided by.
+///
+/// [`VisibilityRedactor::row_allowed`] early-returned `true` for any array
+/// element that was not an object, so a bare `Vec<String>` of repo identities
+/// walked straight through the redactor untouched. `hub_nodes` and
+/// `bridge_nodes` are `RedactedAfterDispatch` and both publish
+/// `attach_ranking_staleness`'s `stale_repos` — an unfiltered list of the uids
+/// of every generation-stale repo in the brain. That is the SAME enumeration
+/// that earned `brain_status` its dedicated `EnforcedInArm` treatment under
+/// nw-403: a bare list of repo identities is exactly the payload the policy
+/// withholds, whether it arrives as a row or as a string.
+///
+/// Filtering here rather than at `attach_ranking_staleness` is deliberate.
+/// That function has no `visible` argument and is `pub` for the daemon's
+/// `repo_map_json`, so scoping it would mean a signature change across a crate
+/// boundary — and it is not the only field with this shape. nw-412's
+/// `resolver_stale_repos` is a string array of repo URLs on a refusal payload,
+/// `stale_check` publishes three more. One filter at the redactor covers the
+/// field that exists today and the one somebody adds next, which is the
+/// general form the item asks for.
+///
+/// THREE spellings, because the payloads disagree about which they use:
+/// `stale_repos` carries uids, `resolver_stale_repos` carries URLs, and
+/// `DeadCodeRefusal`'s remedies carry on-disk root paths. A repo NAME is
+/// deliberately not indexed: it is not a locator, and a short one ("core",
+/// "web") would collide with ordinary strings and start deleting array
+/// elements that name nothing.
+fn restricted_repo_identities(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<HashMap<String, String>, anyhow::Error> {
+    let Some(nestweaver_engine::authz::VisibleRepos::Only(_)) = visible else {
+        return Ok(HashMap::new());
+    };
+    let repos = store
+        .list_repos(None)
+        .context("loading repo identities for repository-scoped response")?;
+    let mut identities = HashMap::new();
+    for repo in repos {
+        for spelling in [
+            Some(repo.uid.clone()),
+            Some(repo.url.clone()),
+            repo.root_path,
+        ] {
+            if let Some(spelling) = spelling
+                && !spelling.is_empty()
+            {
+                identities.insert(spelling, repo.uid.clone());
+            }
+        }
+    }
+    Ok(identities)
+}
+
 fn repo_is_visible(
     repo_uid: &str,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
@@ -577,6 +632,10 @@ fn response_omits_identifiers(tool: &str, args: &Value) -> bool {
 /// predicate. A row it cannot attribute is dropped, not kept.
 struct VisibilityRedactor<'a> {
     owners: &'a HashMap<String, String>,
+    /// nw-416: identity string -> owning repo, for the string arrays
+    /// [`VisibilityRedactor::row_allowed`] used to wave through. See
+    /// [`restricted_repo_identities`].
+    repo_identities: &'a HashMap<String, String>,
     visible: Option<&'a nestweaver_engine::authz::VisibleRepos>,
     removed: usize,
 }
@@ -594,12 +653,36 @@ impl VisibilityRedactor<'_> {
         }
     }
 
+    /// nw-416: a bare STRING element that names an entity is filtered like a
+    /// row, because it leaks exactly what a row would.
+    ///
+    /// The predicate is deliberately narrow in the other direction: a string
+    /// that is neither a known repo identity nor a known symbol uid is KEPT.
+    /// These arrays also carry prose (`remedies`), the caller's own echoed
+    /// input (`changed_files`) and free text, and dropping an element merely
+    /// because it could not be attributed would mangle every one of them. The
+    /// asymmetry with `uid_allowed` — which drops an UNKNOWN `sym:` uid — is
+    /// intentional: there the key already asserted "this is an entity", so
+    /// unattributable means unreturnable; here nothing has asserted anything.
+    fn identity_string_allowed(&self, text: &str) -> bool {
+        if let Some(repo_uid) = self.repo_identities.get(text) {
+            return repo_is_visible(repo_uid, self.visible);
+        }
+        if let Some(repo_uid) = self.owners.get(text) {
+            return repo_is_visible(repo_uid, self.visible);
+        }
+        true
+    }
+
     /// A row with no identifying key at all is kept — it carries no entity to
     /// leak (a `{"path": ..., "count": ...}` echo of the caller's own input,
     /// a timings block). The tools routed here all emit an identifier on
     /// every ENTITY row; the concise renderings that do not are refused
     /// upstream in `dispatch_uncached` rather than silently trusted here.
     fn row_allowed(&self, row: &Value) -> bool {
+        if let Some(text) = row.as_str() {
+            return self.identity_string_allowed(text);
+        }
         let Some(object) = row.as_object() else {
             return true;
         };
@@ -655,8 +738,13 @@ fn redact_response_for_visibility(
     let Some(owners) = restricted_symbol_owners(store, visible)? else {
         return Ok(());
     };
+    // nw-416: a store error PROPAGATES here for the same reason it does above.
+    // A scoped response built without the identity map would pass every
+    // `stale_repos` entry through unfiltered, which is the bug.
+    let repo_identities = restricted_repo_identities(store, visible)?;
     let mut redactor = VisibilityRedactor {
         owners: &owners,
+        repo_identities: &repo_identities,
         visible,
         removed: 0,
     };
@@ -8869,8 +8957,11 @@ fn tool_flow_trace(
         return Err(anyhow!("symbol '{symbol}' not found"));
     }
 
-    let mut visited = HashSet::new();
-    visited.insert(root.uid.clone());
+    // nw-390: uids that must never be EXPANDED even when an edge reaches
+    // them. The class branch below renders one tree per method and none of
+    // them may re-descend into the class node that contains them.
+    let mut blocked = HashSet::new();
+    blocked.insert(root.uid.clone());
 
     let opts = FlowTraceOpts {
         max_depth,
@@ -8917,9 +9008,11 @@ fn tool_flow_trace(
                     .iter()
                     .take(MAX_METHODS)
                     .map(|s| {
-                        let mut v = visited.clone();
-                        v.insert(s.uid.clone());
-                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
+                        // Per-method frontier: the methods of one class are
+                        // independent traces and must not consume each other's
+                        // canonical expansions.
+                        let frontier = flow_frontier(store, &s.uid, &blocked, &opts)?;
+                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &frontier, &opts)
                     })
                     .collect::<Result<Vec<Value>, _>>()?
             } else {
@@ -8954,9 +9047,11 @@ fn tool_flow_trace(
                     .iter()
                     .take(MAX_METHODS)
                     .map(|s| {
-                        let mut v = visited.clone();
-                        v.insert(s.uid.clone());
-                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
+                        // Per-method frontier: the methods of one class are
+                        // independent traces and must not consume each other's
+                        // canonical expansions.
+                        let frontier = flow_frontier(store, &s.uid, &blocked, &opts)?;
+                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &frontier, &opts)
                     })
                     .collect::<Result<Vec<Value>, _>>()?
             };
@@ -8990,13 +9085,17 @@ fn tool_flow_trace(
         }
     }
 
+    // nw-390: depths BEFORE rendering. See `FlowFrontier` — the render pass
+    // can no longer decide which occurrence of a node is the canonical one,
+    // because DFS order was exactly what made the answer non-monotone.
+    let frontier = flow_frontier(store, &root.uid, &blocked, &opts)?;
     let tree = build_flow_tree(
         store,
         &root.uid,
         &root.name,
         &root.file_path,
         0,
-        &mut visited,
+        &frontier,
         &opts,
     )?;
 
@@ -9024,13 +9123,137 @@ struct FlowTraceOpts<'a> {
     visible: Option<&'a nestweaver_engine::authz::VisibleRepos>,
 }
 
+/// nw-390: the depth at which each reachable node is EXPANDED, computed
+/// BREADTH-first before a single node is rendered.
+///
+/// THE RESIDUAL DEFECT THIS EXISTS FOR, which disclosure alone did not fix.
+/// The walk used a depth-first `visited` set, so a node's one canonical
+/// expansion landed wherever DFS happened to reach it FIRST — which can be
+/// arbitrarily deeper than its shortest route from the root. When that first
+/// encounter landed ON the depth cap, the canonical expansion was itself a
+/// capped node (`children_omitted`, no children) and every OTHER parent —
+/// including a shallower one with budget to spare — got a `deduped_ref` stub
+/// with `children: []`. The subtree then existed nowhere in the document, and
+/// raising `--max-depth` could STILL delete it: at the smaller cap the deep
+/// path stopped short, the node was still unclaimed when the shallow parent
+/// reached it, and its children rendered. Marking the cut told the caller a
+/// cut happened; it did not make the answer monotone, which is what nw-390's
+/// DONE WHEN asks for.
+///
+/// Breadth-first assignment removes the order dependence entirely. A node is
+/// expanded at its SHORTEST distance from the root and nowhere else, so:
+///
+///  * the rendered node set is exactly `{u : dist(u) <= max_depth}`, and
+///  * the expanded (children-bearing) set is exactly `{u : dist(u) < max_depth}`.
+///
+/// Both sets are defined by `dist`, which does not depend on `max_depth` at
+/// all, so both can only GROW as the cap rises. Monotonicity is then a
+/// property of the walk rather than of whichever fixture a test happens to
+/// use — which is the difference between this and the previous attempt.
+///
+/// It also makes the `deduped_ref` claim true rather than aspirational: every
+/// reachable node is expanded EXACTLY once, so the document cannot blow up on
+/// a recursive graph, which is the reason a global visited set existed at all.
+struct FlowFrontier {
+    /// uid -> shortest distance from the root, for every node within
+    /// `max_depth` edges of it. A uid absent here is either out of reach or
+    /// deliberately blocked, and is never expanded.
+    depths: HashMap<String, usize>,
+    /// uid -> the callee rows already read while computing `depths`.
+    ///
+    /// This pass reads exactly the nodes the render pass expands, so handing
+    /// the rows over keeps the total edge-query count where it was before the
+    /// pass existed instead of doubling it. It also makes the two passes agree
+    /// by construction: a concurrent write between them cannot hand the
+    /// renderer an edge the depths were never computed over.
+    callees: HashMap<String, Vec<(nestweaver_schema::Symbol, String)>>,
+}
+
+/// One callee read, plus the cancellation check that must precede it.
+///
+/// A failed callee lookup is NOT "this function calls nothing". This was once
+/// `if let Ok(callees) = ...`, so a store error produced `"children": []` —
+/// byte-identical to a genuine leaf, with no flag and no note, on the flagship
+/// "what does this call" surface.
+fn read_flow_callees(
+    store: &GraphStore,
+    uid: &str,
+    opts: &FlowTraceOpts<'_>,
+) -> Result<Vec<(nestweaver_schema::Symbol, String)>, anyhow::Error> {
+    if opts
+        .cancel
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        // A cancelled trace is incomplete — propagate the store's typed
+        // cancellation error so the boundary never serves (or caches) a
+        // truncated tree as a real answer.
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+    store.callees_with_edge_types_of(uid).map_err(|error| {
+        anyhow::anyhow!(
+            "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
+             report an empty call tree, which is indistinguishable from a leaf."
+        )
+    })
+}
+
+/// Compute the [`FlowFrontier`] for one trace root.
+///
+/// `blocked` names uids that must never be expanded even when an edge reaches
+/// them — the CLASS root of a per-method trace, which the caller has already
+/// rendered as the container of the trees it is building. Recording them at
+/// depth 0 turns an edge back into them into a `deduped_ref` stub rather than
+/// a re-descent, which is what seeding the old `visited` set did.
+fn flow_frontier(
+    store: &GraphStore,
+    root_uid: &str,
+    blocked: &HashSet<String>,
+    opts: &FlowTraceOpts<'_>,
+) -> Result<FlowFrontier, anyhow::Error> {
+    let mut depths: HashMap<String, usize> =
+        blocked.iter().map(|uid| (uid.clone(), 0usize)).collect();
+    depths.insert(root_uid.to_string(), 0);
+    let mut callees: HashMap<String, Vec<(nestweaver_schema::Symbol, String)>> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([(root_uid.to_string(), 0usize)]);
+    while let Some((uid, depth)) = queue.pop_front() {
+        // A node ON the cap is rendered but not expanded, so its callees are
+        // read by the render pass instead — where they are COUNTED into
+        // `children_omitted` rather than walked. Reading them here would be a
+        // query whose result the renderer could only throw away.
+        if depth >= opts.max_depth {
+            continue;
+        }
+        let rows = read_flow_callees(store, &uid, opts)?;
+        for (callee, _) in &rows {
+            // nw-403: a callee in a repository this caller cannot see never
+            // enters the frontier, so it can neither be expanded nor claim a
+            // depth that would stub out a VISIBLE parent's edge to it. The
+            // render pass counts it into `children_redacted` and nothing else.
+            if !repo_is_visible(&callee.repo_uid, opts.visible) {
+                continue;
+            }
+            // First assignment wins, and breadth-first order means the first
+            // assignment IS the shortest distance. This is the whole fix.
+            if depths.contains_key(&callee.uid) {
+                continue;
+            }
+            depths.insert(callee.uid.clone(), depth + 1);
+            queue.push_back((callee.uid.clone(), depth + 1));
+        }
+        callees.insert(uid, rows);
+    }
+    Ok(FlowFrontier { depths, callees })
+}
+
 fn build_flow_tree(
     store: &GraphStore,
     uid: &str,
     name: &str,
     file_path: &str,
     depth: usize,
-    visited: &mut HashSet<String>,
+    frontier: &FlowFrontier,
     opts: &FlowTraceOpts<'_>,
 ) -> Result<Value, anyhow::Error> {
     if opts
@@ -9051,29 +9274,24 @@ fn build_flow_tree(
     let mut truncated_at_depth = false;
     let mut children_omitted = 0usize;
 
-    // A failed callee lookup is NOT "this function calls nothing".
-    //
-    // This was `if let Ok(callees) = ...`, so a store error produced
-    // `"children": []` — byte-identical to a genuine leaf, with no flag and no
-    // note, on the flagship "what does this call" surface. The cancellation
-    // path a few lines above already refuses to serve a truncated tree as a
-    // real answer; an unreadable one is no different, and this function
-    // already returns a `Result` to say so.
-    //
-    // nw-390: the callees are now read even AT the depth cap, where the old
-    // code returned without asking. That is one extra edge query per frontier
-    // node, and it buys the only fact that distinguishes "the cap stopped
-    // here" from "nothing is called here" — which is the whole complaint.
-    let callees = store.callees_with_edge_types_of(uid).map_err(|error| {
-        anyhow::anyhow!(
-            "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
-             report an empty call tree, which is indistinguishable from a leaf."
-        )
-    })?;
+    // nw-390: the callees are read even AT the depth cap, where the old code
+    // returned without asking. That buys the only fact that distinguishes "the
+    // cap stopped here" from "nothing is called here" — which is the whole
+    // complaint — and it is the ONLY read this pass still performs, because
+    // `flow_frontier` already read every node it expands. A node on the cap is
+    // the one case the frontier pass deliberately skipped.
+    let fetched;
+    let rows: &[(nestweaver_schema::Symbol, String)] = match frontier.callees.get(uid) {
+        Some(rows) => rows,
+        None => {
+            fetched = read_flow_callees(store, uid, opts)?;
+            &fetched
+        }
+    };
     // nw-403: attribute before anything is rendered or counted, so a hidden
     // callee contributes to `children_redacted` and to nothing else.
-    let (callees, redacted): (Vec<_>, Vec<_>) = callees
-        .into_iter()
+    let (callees, redacted): (Vec<_>, Vec<_>) = rows
+        .iter()
         .partition(|(callee, _)| repo_is_visible(&callee.repo_uid, opts.visible));
     let children_redacted = redacted.len();
 
@@ -9083,21 +9301,27 @@ fn build_flow_tree(
         truncated_at_depth = !callees.is_empty();
         children_omitted = callees.len();
     } else {
-        for (callee, edge_type) in &callees {
-            if visited.contains(&callee.uid) {
-                // nw-390, THE non-monotonicity. `visited` is GLOBAL to the
-                // traversal, so a callee claimed by an earlier branch used to
-                // be dropped from every later parent with no marker at all —
+        for (callee, edge_type) in callees {
+            if frontier.depths.get(&callee.uid) != Some(&(depth + 1)) {
+                // nw-390, THE non-monotonicity. The traversal's visited set
+                // was GLOBAL, so a callee claimed by an earlier branch was
+                // dropped from every later parent with no marker at all —
                 // which is why raising `--max-depth` REMOVED children: at
                 // greater depth an earlier branch reaches the node first and a
                 // later parent silently loses it.
                 //
-                // A `deduped_ref` stub restores monotonicity as a property of
-                // the RESPONSE rather than of the traversal: the edge is
-                // always present and always names its target, and the subtree
-                // is expanded exactly once somewhere in the document. The
-                // alternative — expanding it twice — is exponential on a
-                // recursive graph, which is why `visited` exists.
+                // A `deduped_ref` stub restores the EDGE unconditionally: it is
+                // always present and always names its target. WHICH occurrence
+                // is the stub is decided by `flow_frontier`, not by DFS order —
+                // a node is expanded at its shortest distance from the root
+                // (`dist == depth + 1` here) and stubbed everywhere else. That
+                // is the half the previous fix was missing: with DFS order the
+                // single expansion could itself land on the depth cap while a
+                // shallower parent with budget to spare got the stub, so the
+                // subtree appeared nowhere and a bigger `max_depth` could still
+                // delete it. The alternative — expanding at every occurrence —
+                // is exponential on a recursive graph, which is why a canonical
+                // expansion exists at all.
                 let mut stub = if opts.concise {
                     json!({ "name": callee.name, "deduped_ref": callee.uid, "children": [] })
                 } else {
@@ -9117,14 +9341,13 @@ fn build_flow_tree(
                 children.push(stub);
                 continue;
             }
-            visited.insert(callee.uid.clone());
             let mut child = build_flow_tree(
                 store,
                 &callee.uid,
                 &callee.name,
                 &callee.file_path,
                 depth + 1,
-                visited,
+                frontier,
                 opts,
             )?;
             // Label the edge that reached this node. The traversal spans CALLS,
@@ -19344,6 +19567,214 @@ mod repo_visibility_coverage_tests {
         assert_eq!(unscoped["results"].as_array().map(Vec::len), Some(1));
         assert!(unscoped.get("visibility").is_none(), "{unscoped}");
     }
+
+    // ── nw-416: repo identity leaked as a bare string, not as a row ─────────
+
+    /// The same two repos, on DISK, with `CURRENT_DB_PATH` set.
+    ///
+    /// **THE FIXTURE IS THE POINT OF THIS TEST.** `hidden_repo_store` is
+    /// `GraphStore::in_memory()`, so `current_db_path` fails,
+    /// `attach_ranking_staleness` takes its early-bail branch and writes
+    /// `stale_repos: []` — the coverage assertions above therefore pass against
+    /// an empty array on every run and CANNOT fail for this field. An in-memory
+    /// fixture is not a weaker test of `stale_repos`; it is not a test of it.
+    ///
+    /// On disk with no `.resolver_generation.json` sidecar, every repo reads as
+    /// generation 0 (`ResolverGenerations::generation_for`), which is below
+    /// `RESOLVER_GENERATION`, so `ranking_stale_repos` returns EVERY repo uid
+    /// in the brain — including the ones this caller may not see.
+    /// Restores `CURRENT_DB_PATH` when the fixture goes out of scope.
+    ///
+    /// The thread-local outlives the test; the `TempDir` does not. Leaving the
+    /// path set would point every LATER test on this thread — most of this
+    /// module's, which are in-memory — at a database directory that no longer
+    /// exists, which is an order-dependent flake rather than a failure anybody
+    /// could read.
+    struct DbPathGuard(Option<std::path::PathBuf>);
+
+    impl Drop for DbPathGuard {
+        fn drop(&mut self) {
+            CURRENT_DB_PATH.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+
+    fn hidden_repo_store_on_disk() -> (tempfile::TempDir, DbPathGuard, GraphStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nw416.lbug");
+        let store = GraphStore::open(&db_path).expect("on-disk store");
+        for (uid, url, name) in [
+            ("repo:alpha", "https://example.test/alpha", "alpha"),
+            (
+                "repo:hidden",
+                "https://example.test/hidden-secret",
+                "hidden-secret",
+            ),
+        ] {
+            store
+                .insert_repo(&Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "inst".to_string(),
+                    name: Some(name.to_string()),
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let guard = DbPathGuard(CURRENT_DB_PATH.with(|cell| cell.borrow().clone()));
+        set_current_db_path(db_path);
+        (dir, guard, store)
+    }
+
+    fn stale_repos_from(value: &Value) -> Vec<String> {
+        value["stale_repos"]
+            .as_array()
+            .unwrap_or_else(|| panic!("stale_repos must be present: {value}"))
+            .iter()
+            .filter_map(|entry| entry.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// THE bug: `hub_nodes` and `bridge_nodes` handed a repo-scoped caller the
+    /// uid of every stale repo in the brain, through `stale_repos`.
+    ///
+    /// Both tools are `RedactedAfterDispatch`, and the redactor could not see
+    /// the field: `row_allowed` early-returned `true` for any array element
+    /// that was not an object, so a `Vec<String>` walked through untouched.
+    /// Same enumeration class that earned `brain_status` its `EnforcedInArm`
+    /// treatment — a bare list of repo identities is the payload the policy
+    /// withholds, whatever JSON shape it arrives in.
+    #[test]
+    fn a_scoped_caller_cannot_enumerate_hidden_repos_through_stale_repos() {
+        let (_dir, _db_path, store) = hidden_repo_store_on_disk();
+        let visible = only_alpha();
+        for tool in ["hub_nodes", "bridge_nodes"] {
+            let value = dispatch_cancellable(
+                &store,
+                None,
+                tool,
+                json!({ "no_cache": true }),
+                None,
+                None,
+                Some(&visible),
+            )
+            .unwrap_or_else(|error| panic!("{tool} must still answer a scoped caller: {error:#}"));
+            assert_eq!(
+                stale_repos_from(&value),
+                vec!["repo:alpha".to_string()],
+                "{tool} named a repo outside the caller's scope: {value}"
+            );
+            // The disclosure must not be silently deleted along with the row:
+            // a scoped caller whose OWN repo is stale still needs to be told.
+            assert_eq!(value["rankings_stale"], json!(true), "{tool}: {value}");
+            assert!(
+                leaked(&value.to_string()).is_none(),
+                "{tool} leaked a hidden marker: {value}"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT, and the assertion that makes the one above non-vacuous:
+    /// on THIS fixture the field is genuinely populated with both repos, so the
+    /// scoped result is a filter and not an empty array.
+    ///
+    /// If a future refactor reverts the fixture to `GraphStore::in_memory()`,
+    /// this test fails and the one above starts passing for the wrong reason —
+    /// which is exactly what the in-memory version of it did.
+    #[test]
+    fn the_same_call_does_list_every_stale_repo_when_no_policy_is_configured() {
+        let (_dir, _db_path, store) = hidden_repo_store_on_disk();
+        let value = dispatch_cancellable(
+            &store,
+            None,
+            "hub_nodes",
+            json!({ "no_cache": true }),
+            None,
+            None,
+            None,
+        )
+        .expect("hub_nodes");
+        assert_eq!(
+            stale_repos_from(&value),
+            vec!["repo:alpha".to_string(), "repo:hidden".to_string()],
+            "the fixture must actually populate stale_repos, or the scoped \
+             assertion cannot fail: {value}"
+        );
+        assert!(value.get("visibility").is_none(), "{value}");
+    }
+
+    /// COUNTERWEIGHT: string filtering must not become string DELETION.
+    ///
+    /// These payloads also carry prose, remedies and the caller's own echoed
+    /// input as string arrays. A string that names no known entity is kept —
+    /// the opposite rule from `uid_allowed`, where a key has already asserted
+    /// "this is an entity" and unattributable therefore means unreturnable.
+    #[test]
+    fn string_array_filtering_only_removes_strings_that_name_a_hidden_entity() {
+        let (_dir, _db_path, store) = hidden_repo_store_on_disk();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:hidden:twin".to_string(),
+                name: "hiddenSecretTwin".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:hidden".to_string(),
+                file_path: "src/alpha.py".to_string(),
+                start_line: 2,
+                end_line: 2,
+                signature: "fn hiddenSecretTwin()".to_string(),
+                summary: None,
+                content_hash: "h_twin".to_string(),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        let visible = only_alpha();
+        let mut payload = json!({
+            // nw-412's shape: repo URLs, not uids.
+            "resolver_stale_repos": [
+                "https://example.test/alpha",
+                "https://example.test/hidden-secret",
+            ],
+            "stale_repos": ["repo:alpha", "repo:hidden"],
+            "dropped_symbols": ["sym:hidden:twin"],
+            "remedies": [
+                "Re-index every repo named above with `nestweaver index --repo <path> --force`.",
+                "run-full-suite",
+            ],
+            "changed_files": ["src/alpha.py", "src/beta.py"],
+        });
+        redact_response_for_visibility(&store, &mut payload, Some(&visible)).unwrap();
+        assert_eq!(
+            payload["resolver_stale_repos"],
+            json!(["https://example.test/alpha"]),
+            "{payload}"
+        );
+        assert_eq!(payload["stale_repos"], json!(["repo:alpha"]), "{payload}");
+        assert_eq!(payload["dropped_symbols"], json!([]), "{payload}");
+        // Prose and echoed input survive untouched: they name no entity.
+        assert_eq!(
+            payload["remedies"].as_array().map(Vec::len),
+            Some(2),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["changed_files"],
+            json!(["src/alpha.py", "src/beta.py"]),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["visibility"]["redacted_entries"],
+            json!(3),
+            "{payload}"
+        );
+    }
 }
 
 // ── nw-390: flow_trace must not render a suppressed expansion as a leaf ─────
@@ -19431,6 +19862,74 @@ mod flow_trace_truncation_tests {
         )
     }
 
+    /// A node reachable from two parents at DIFFERENT depths, where the walk
+    /// reaches the DEEPER parent first.
+    ///
+    /// `root -CALLS-> mid -> rung -> near` and `root -IMPORTS-> near -> far`.
+    /// `callees_with_edge_types_of` returns CALLS rows before IMPORTS rows, so
+    /// the traversal order is pinned by EDGE TYPE rather than by row order: the
+    /// walk always descends the three-hop CALLS chain before it takes the
+    /// root's own one-hop edge to `near`.
+    ///
+    /// This is what `diamond_store` could not express, and why the monotonicity
+    /// test that used it PASSED AGAINST THE UNFIXED CODE. On the diamond every
+    /// uid still appeared somewhere at every depth — a `deduped_ref` stub names
+    /// its target — so a union-of-uids comparison was already monotone before
+    /// anything was fixed. The loss this fixture produces is a node no stub
+    /// names: `far`, the child of the stubbed node.
+    ///
+    ///   `--max-depth 2` — the CALLS chain stops at `rung`, `near` is still
+    ///   unclaimed when the root's own edge reaches it at depth 1, it expands,
+    ///   and `far` is in the document.
+    ///   `--max-depth 3` — the CALLS chain claims `near` at depth 3, ON the
+    ///   cap, so the one canonical expansion has no children; the root's
+    ///   shallow edge then gets a `deduped_ref` stub and `far` is GONE.
+    ///
+    /// Asking for MORE depth returned strictly LESS, which is nw-390's
+    /// headline complaint, unfixed by disclosure alone.
+    fn ladder_store() -> GraphStore {
+        store_with(
+            &[
+                symbol("sym:root", "rootFn", SymbolKind::Function, 1),
+                symbol("sym:mid", "midFn", SymbolKind::Function, 10),
+                symbol("sym:rung", "rungFn", SymbolKind::Function, 20),
+                symbol("sym:near", "nearFn", SymbolKind::Function, 30),
+                symbol("sym:far", "farFn", SymbolKind::Function, 40),
+            ],
+            &[
+                ("sym:root", "sym:mid", EdgeType::Calls),
+                ("sym:mid", "sym:rung", EdgeType::Calls),
+                ("sym:rung", "sym:near", EdgeType::Calls),
+                // Sorted AFTER the CALLS rows by `callees_with_edge_types_of`,
+                // which is what makes the deep path win the race deterministically.
+                ("sym:root", "sym:near", EdgeType::Imports),
+                ("sym:near", "sym:far", EdgeType::Calls),
+            ],
+        )
+    }
+
+    /// Every node in a rendered tree that describes `uid`, expansions and
+    /// `deduped_ref` stubs alike.
+    fn occurrences<'a>(value: &'a Value, uid: &str) -> Vec<&'a Value> {
+        let mut found = Vec::new();
+        fn walk<'a>(value: &'a Value, uid: &str, found: &mut Vec<&'a Value>) {
+            match value {
+                Value::Object(map) => {
+                    if map.get("uid").and_then(Value::as_str) == Some(uid) {
+                        found.push(value);
+                    }
+                    for child in map.values() {
+                        walk(child, uid, found);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|item| walk(item, uid, found)),
+                _ => {}
+            }
+        }
+        walk(value, uid, &mut found);
+        found
+    }
+
     /// Every uid that appears anywhere in a rendered tree.
     fn uids(value: &Value) -> std::collections::BTreeSet<String> {
         let mut found = std::collections::BTreeSet::new();
@@ -19464,11 +19963,18 @@ mod flow_trace_truncation_tests {
 
     /// THE property nw-390 asks for: the callee set at depth N+1 is a superset
     /// of the set at depth N, for a fixed root.
+    ///
+    /// This runs on `ladder_store`, NOT on the diamond. The diamond version of
+    /// this test passed against the unfixed traversal — every uid survived as a
+    /// `deduped_ref` stub, so the union was monotone whether or not the
+    /// canonical expansion had been stranded on the depth cap. A monotonicity
+    /// test that cannot fail is worse than none: it certifies the property it
+    /// does not measure. See `ladder_store` for the shape that does measure it.
     #[test]
-    fn the_callee_set_at_depth_n_plus_one_is_a_superset_of_depth_n() {
-        let store = diamond_store();
+    fn raising_max_depth_cannot_delete_a_subtree_a_shallower_trace_showed() {
+        let store = ladder_store();
         let mut previous = uids(&trace(&store, 1));
-        for depth in 2..=5 {
+        for depth in 2..=6 {
             let current = uids(&trace(&store, depth));
             assert!(
                 previous.is_subset(&current),
@@ -19477,11 +19983,46 @@ mod flow_trace_truncation_tests {
             );
             previous = current;
         }
-        // COUNTERWEIGHT: monotone must not mean constant. Depth genuinely buys
-        // reach, or a walk that returned the root alone would pass above.
+        // The exact loss the fixture is built around, asserted by name so a
+        // regression reports WHICH node vanished rather than only that the set
+        // shrank. Under the DFS-order rule `sym:far` is present at depth 2 and
+        // absent from depth 3 onwards.
+        for depth in 2..=6 {
+            let current = uids(&trace(&store, depth));
+            assert!(
+                current.contains("sym:far"),
+                "max_depth {depth} lost farFn, the child of the stubbed node: {current:?}"
+            );
+        }
+        // COUNTERWEIGHT 1: monotone must not mean constant. Depth genuinely
+        // buys reach, or a walk that returned the root alone would pass above.
         assert!(
-            uids(&trace(&store, 1)).len() < uids(&trace(&store, 5)).len(),
+            uids(&trace(&store, 1)).len() < uids(&trace(&store, 3)).len(),
             "a deeper trace must actually reach further"
+        );
+        // COUNTERWEIGHT 2: pin the MECHANISM, not just the outcome. The one
+        // expansion of `nearFn` must sit at its shortest distance from the root
+        // (depth 1, the root's own IMPORTS edge) and carry real children — an
+        // implementation that restored monotonicity by expanding the node at
+        // every occurrence would satisfy the set comparison above while
+        // reintroducing the exponential blowup `deduped_ref` exists to prevent.
+        let deep = trace(&store, 3);
+        let near = occurrences(&deep["tree"], "sym:near");
+        let expanded: Vec<&&Value> = near
+            .iter()
+            .filter(|node| node.get("deduped_ref").is_none())
+            .collect();
+        assert_eq!(expanded.len(), 1, "exactly one expansion of nearFn: {deep}");
+        assert_eq!(expanded[0]["depth"], json!(1), "{deep}");
+        assert_eq!(
+            expanded[0]["children"][0]["uid"],
+            json!("sym:far"),
+            "{deep}"
+        );
+        assert!(
+            near.iter()
+                .any(|node| node["deduped_ref"] == json!("sym:near")),
+            "the deeper parent must still name the edge it did not expand: {deep}"
         );
     }
 
@@ -19500,17 +20041,40 @@ mod flow_trace_truncation_tests {
         };
         assert_eq!(root_children(1), root_children(2));
         assert_eq!(root_children(2), root_children(3));
-        // The second occurrence is a REFERENCE, not a second expansion: the
-        // subtree is rendered exactly once, which is why `visited` exists.
+        // The repeated callee is rendered exactly ONCE and referenced
+        // everywhere else, which is why a canonical expansion exists at all.
+        //
+        // nw-390 residual: WHICH occurrence is the expansion is now decided by
+        // shortest distance from the root, not by depth-first arrival order.
+        // `sharedFn` is one hop from the root, so the ROOT's edge carries the
+        // expansion and `aFn`'s edge carries the stub; DFS order used to put
+        // them the other way round, and that ordering is precisely what let a
+        // depth-capped occurrence become the canonical one on other shapes.
         let deeper = trace(&store, 3);
-        let dedup = deeper["tree"]["children"]
-            .as_array()
-            .unwrap()
+        let shared = occurrences(&deeper["tree"], "sym:shared");
+        assert_eq!(shared.len(), 2, "one expansion + one reference: {deeper}");
+        let expanded: Vec<&&Value> = shared
             .iter()
-            .find(|child| child["deduped_ref"].is_string())
-            .expect("the repeated callee must be marked, not dropped");
-        assert_eq!(dedup["deduped_ref"], json!("sym:shared"));
-        assert_eq!(dedup["children"], json!([]));
+            .filter(|node| node.get("deduped_ref").is_none())
+            .collect();
+        assert_eq!(expanded.len(), 1, "{deeper}");
+        assert_eq!(expanded[0]["depth"], json!(1), "{deeper}");
+        assert_eq!(
+            expanded[0]["children"][0]["uid"],
+            json!("sym:deep"),
+            "{deeper}"
+        );
+        let stub: Vec<&&Value> = shared
+            .iter()
+            .filter(|node| node.get("deduped_ref").is_some())
+            .collect();
+        assert_eq!(
+            stub.len(),
+            1,
+            "the repeated callee must be marked: {deeper}"
+        );
+        assert_eq!(stub[0]["deduped_ref"], json!("sym:shared"));
+        assert_eq!(stub[0]["children"], json!([]));
     }
 
     /// A node the depth cap stopped at and a node that genuinely calls nothing

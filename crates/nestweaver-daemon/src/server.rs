@@ -2173,8 +2173,12 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args_json: &str,
-        visible: nestweaver_engine::authz::VisibleRepos,
+        extensions: &tonic::Extensions,
     ) -> Result<Response<JsonResponse>, Status> {
+        // nw-415: the scope is RESOLVED here, from the request's own
+        // extensions, rather than accepted from the caller. See
+        // `dispatch_tool_json` for why the parameter changed shape.
+        let visible = self.state.visible_repos_for(extensions)?;
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
         nestweaver_web::routes::metrics::GRPC_REQUESTS
@@ -2381,8 +2385,25 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args: serde_json::Value,
-        visible: nestweaver_engine::authz::VisibleRepos,
+        extensions: &tonic::Extensions,
     ) -> Result<serde_json::Value, Status> {
+        // nw-415: TAKES THE REQUEST'S EXTENSIONS, NOT A CALLER-SUPPLIED SCOPE.
+        //
+        // Six typed RPCs used to hand this a literal `VisibleRepos::All` under
+        // the comment "Fixed non-blast_radius tool — pass `VisibleRepos::All`
+        // (no scoping)", throwing away the `Identity` the auth interceptor
+        // attaches to every request. That was not a misclassification nw-403's
+        // `repo_scope` table could correct: `dispatch_uncached` short-circuits
+        // on anything that is not `Only(_)`, so an `All` argument makes the
+        // entire table UNREACHABLE — those tools were never consulted, not
+        // wrongly consulted, and the coverage test (which derives from
+        // `tool_list()`) could never observe a caller that skipped dispatch.
+        //
+        // Fixing the six call sites would have left the seventh writable. The
+        // parameter is the request's extensions instead, so the ONLY way to
+        // reach `All` is for `visible_repos_for` to genuinely resolve it —
+        // "no scoping" is no longer something a call site can express.
+        let visible = self.state.visible_repos_for(extensions)?;
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
         nestweaver_web::routes::metrics::GRPC_REQUESTS
@@ -2782,16 +2803,17 @@ macro_rules! json_rpc {
                 )));
             }
         }
-        // R9/R9b: resolve the caller's per-repo visibility from the request's
-        // Identity extension BEFORE consuming the request. This covers the
-        // generic `/mcp` tool path and every typed RPC routed through this
-        // macro (including `blast_radius`), so their output is redacted to the
-        // caller's visible repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒
-        // no-op redaction (backward compatible).
-        let visible = $self.state.visible_repos_for($request.extensions())?;
-        let req = $request.into_inner();
+        // R9/R9b: carry the request's extensions THROUGH to dispatch, which
+        // resolves the caller's per-repo visibility from the `Identity` the
+        // auth interceptor attached. This covers the generic `/mcp` tool path
+        // and every typed RPC routed through this macro (including
+        // `blast_radius`), so their output is redacted to the caller's visible
+        // repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒ no-op redaction
+        // (backward compatible). nw-415: `into_parts` rather than
+        // `into_inner`, because the extensions must outlive the message.
+        let (_, extensions, req) = $request.into_parts();
         $self
-            .dispatch_json_tool($tool, &req.args_json, visible)
+            .dispatch_json_tool($tool, &req.args_json, &extensions)
             .await
     }};
 }
@@ -2923,6 +2945,93 @@ fn reconcile_deleted_extension_uids(
             format!("targeted extension metadata reconciliation failed: {error:#}"),
         ),
     }
+}
+
+/// The notification descriptor attached when a blast-radius run's graph is
+/// resolver-generation-stale.
+///
+/// Same string as `BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR` in the MCP crate
+/// (`tools.rs`) and in the CLI (`src/main.rs`), so a consumer matching on the
+/// descriptor sees ONE code from all three surfaces.
+const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale";
+
+/// Degrade a daemon-computed blast-radius result when this graph's edges
+/// predate the running resolver.
+///
+/// nw-412, the DAEMON twin of `degrade_blast_radius_if_resolver_stale` in
+/// `src/main.rs` and of the block in `tool_blast_radius`. It exists because
+/// `pr_impact_json` calls `nestweaver_engine::analyze_blast_radius` DIRECTLY
+/// rather than dispatching the `blast_radius` tool, so neither of the other
+/// two degrades could reach it — and the daemon route is the DEFAULT route,
+/// which made this the one path a user actually takes. On a stale graph
+/// `pr_impact_exit_code` still saw `GateState::Ok` over a shrunken affected
+/// set and `print_pr_impact_hook` printed nothing at all, because that banner
+/// is skipped for exactly `Ok` + `Low` + nothing-affected.
+///
+/// The degrade rather than a refusal is argued at
+/// `BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR` in the CLI: `pr-impact` is an
+/// assessment, not a selector, and a refusal payload is not a valid SARIF run.
+///
+/// `status` is only ever pushed DOWN (`.max` over the ordered ladder
+/// Complete < Partial < Degraded < Failed), matching nw-105's rule that a run
+/// already Degraded or Failed is never upgraded by a later finding, and
+/// `gate_state` is then forced to `DegradedUnknown`. That mirrors
+/// `derive_gate_state`'s "non-Complete => DegradedUnknown" without calling it
+/// (it is `pub(crate)` to the engine) and closes the direction that made this
+/// dangerous: a stale-resolver run can no longer report `ok` at all.
+///
+/// The repo set is filtered to the caller's VISIBLE repos first, mirroring
+/// `resolver_generation_refusal` in the MCP crate: `DeadCodeRefusal::message()`
+/// emits one `nestweaver index --repo <local path> --force` line per stale
+/// repo, so building it from every repo would hand a repo-scoped caller the
+/// on-disk paths of repos it cannot see.
+///
+/// `list_repos` PROPAGATES rather than becoming a degrade, for the same reason
+/// the CLI twin does: a store that cannot enumerate repos cannot have served
+/// the traversal either, so the caller should see the store's own failure and
+/// not a paragraph about resolver generations.
+fn degrade_blast_radius_if_resolver_stale(
+    store: &GraphStore,
+    db_path: &Path,
+    visible: &nestweaver_engine::authz::VisibleRepos,
+    result: &mut nestweaver_engine::blast_radius::BlastRadiusResult,
+) -> Result<(), Status> {
+    let repos: Vec<nestweaver_schema::Repo> = store
+        .list_repos(None)
+        .map_err(|error| {
+            // Log the chain server-side; the client gets no store internals.
+            tracing::error!("pr_impact: listing repos for resolver staleness: {error:#}");
+            Status::unavailable("repo listing unavailable")
+        })?
+        .into_iter()
+        .filter(|repo| visible.allows(&repo.uid))
+        .collect();
+    let Some(refusal) =
+        nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
+    else {
+        return Ok(());
+    };
+    result.status = result
+        .status
+        .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+    result.gate_state = nestweaver_engine::blast_radius::GateState::DegradedUnknown;
+    result
+        .notifications
+        .push(nestweaver_engine::blast_radius::Notification {
+            level: nestweaver_engine::blast_radius::NotificationLevel::Error,
+            message: refusal.message(),
+            descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
+        });
+    // `render_blast_summary` appends `[status: …]` for any non-Complete run
+    // and is `pub(crate)`, so the marker is restated here rather than leaving
+    // the human summary claiming a clean run. Guarded so a summary that
+    // already carries one is not double-tagged.
+    if !result.summary.contains("[status: ") {
+        result
+            .summary
+            .push_str(&format!(" [status: {}]", result.status.label()));
+    }
+    Ok(())
 }
 
 fn push_reconciliation_failure(
@@ -6206,8 +6315,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainSearchRequest>,
     ) -> Result<Response<BrainSearchResponse>, Status> {
-        let visible = self.state.visible_repos_for(r.extensions())?;
-        let req = r.into_inner();
+        let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({
             "query": req.query,
             "include_bodies": req.include_bodies,
@@ -6227,7 +6335,7 @@ impl NestWeaverDaemon for DaemonService {
         // `brain_search` includes repo-owned symbols, so the typed hot path
         // must enforce the same request-derived scope as generic JSON-RPC.
         let value = self
-            .dispatch_tool_json("brain_search", args, visible)
+            .dispatch_tool_json("brain_search", args, &extensions)
             .await?;
 
         // Parse JSON result into typed response.
@@ -6362,7 +6470,21 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainContextRequest>,
     ) -> Result<Response<BrainContextResponse>, Status> {
-        let req = r.into_inner();
+        // nw-415: `into_parts`, not `into_inner` — the request's extensions
+        // carry the `Identity` the auth interceptor attached, and dispatch
+        // resolves the caller's repo scope from them. This handler used to
+        // hand `dispatch_tool_json` a literal `VisibleRepos::All`, which made
+        // nw-403's whole `repo_scope` table unreachable (see the argument on
+        // `dispatch_tool_json`); `code_context`, one method away on the same
+        // surface, was scoped the whole time.
+        //
+        // `brain_context` is one of the tools nw-403's own measurement named
+        // as leaking (hidden-repo symbols, file paths and note prose). It is
+        // `RepoScope::RedactedAfterDispatch`, so a scoped caller now gets only
+        // the rows it owns, and a `response_format: "concise"` request — which
+        // omits the very uids attribution needs — is refused rather than
+        // served unfiltered.
+        let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({
             "seeds": req.seeds,
             "include_seeds": req.include_seeds,
@@ -6419,13 +6541,8 @@ impl NestWeaverDaemon for DaemonService {
             args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "brain_context",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_context", args, &extensions)
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
@@ -6455,7 +6572,12 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<ProjectContextRequest>,
     ) -> Result<Response<ProjectContextResponse>, Status> {
-        let req = r.into_inner();
+        // nw-415, argued at `dispatch_tool_json`. `project_context` is
+        // `RepoScope::RedactedAfterDispatch` AND its `response_format`
+        // DEFAULTS to concise, so a repo-scoped caller that sends no format at
+        // all is refused rather than handed uid-free rows that nothing
+        // downstream can attribute to a repo.
+        let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({
             "project": req.project,
             "include_seeds": req.include_seeds,
@@ -6500,13 +6622,8 @@ impl NestWeaverDaemon for DaemonService {
             args["exclude_tags"] = serde_json::json!(req.exclude_tags);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "project_context",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("project_context", args, &extensions)
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
@@ -6518,7 +6635,15 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<NoteGetRequest>,
     ) -> Result<Response<NoteGetResponse>, Status> {
-        let req = r.into_inner();
+        // nw-415, argued at `dispatch_tool_json`. `note_get` is the one of
+        // the six that carries a WRITTEN `RepoScope::NotRepoScoped` exemption
+        // (Note/Section/Heading nodes belong to a vault and have no
+        // `repo_uid`), so routing the identity here is not expected to change
+        // its answer. It is routed anyway because the exemption has to be the
+        // TABLE's decision — logged, falsifiable, and revisitable if `note_get`
+        // ever grows a repo-derived field — not a `VisibleRepos::All` literal
+        // at a call site no policy can reach.
+        let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({});
         // nw-316: omit when the caller did not say, so the tool's documented
         // default governs instead of proto3's zero value.
@@ -6535,13 +6660,8 @@ impl NestWeaverDaemon for DaemonService {
             args["sections"] = serde_json::json!(req.sections);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "note_get",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("note_get", args, &extensions)
             .await?;
 
         Ok(Response::new(NoteGetResponse {
@@ -6617,16 +6737,18 @@ impl NestWeaverDaemon for DaemonService {
 
     async fn brain_status(
         &self,
-        _r: Request<BrainStatusRequest>,
+        r: Request<BrainStatusRequest>,
     ) -> Result<Response<BrainStatusResponse>, Status> {
+        // nw-415, argued at `dispatch_tool_json`. `brain_status` is the most
+        // direct enumeration in the catalogue — nw-403 gave it its own
+        // `RepoScope::EnforcedInArm` treatment because `repos[]` carries each
+        // repo's URL and indexed git SHA, i.e. repo IDENTITY rather than repo
+        // content. Handing it `All` meant the enforcing arm was never reached
+        // and `repo_count` counted tenants the caller cannot see.
+        let (_, extensions, _) = r.into_parts();
         let args = serde_json::json!({});
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "brain_status",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_status", args, &extensions)
             .await?;
 
         let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
@@ -6686,7 +6808,10 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<HubNodesRequest>,
     ) -> Result<Response<HubNodesResponse>, Status> {
-        let req = r.into_inner();
+        // nw-415, argued at `dispatch_tool_json`. `hub_nodes` is the third
+        // tool nw-403's measurement named (8 hidden-repo tokens); it is
+        // `RepoScope::RedactedAfterDispatch`.
+        let (_, extensions, req) = r.into_parts();
         let mut args = serde_json::json!({});
         if req.top_n > 0 {
             args["top_n"] = serde_json::json!(req.top_n);
@@ -6695,13 +6820,8 @@ impl NestWeaverDaemon for DaemonService {
             args["response_format"] = serde_json::json!(req.response_format);
         }
 
-        // Fixed non-blast_radius tool — see brain_search above.
         let value = self
-            .dispatch_tool_json(
-                "hub_nodes",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("hub_nodes", args, &extensions)
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
@@ -6713,14 +6833,13 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let req = r.into_inner();
-        // Fixed non-blast_radius tool — pass `VisibleRepos::All` (no scoping).
+        // nw-415, argued at `dispatch_tool_json`. Same tool, same
+        // enumeration, SECOND DOOR: the JSON twin bypassed the gate
+        // independently of the typed `brain_status` RPC, so fixing only that
+        // one would have left the repo-identity leak fully reachable here.
+        let (_, extensions, req) = r.into_parts();
         let resp = self
-            .dispatch_json_tool(
-                "brain_status",
-                &req.args_json,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_json_tool("brain_status", &req.args_json, &extensions)
             .await?;
         // Inject server-side indexing status into the JSON response so
         // AI agents see it via the MCP tool path as well.
@@ -7689,6 +7808,17 @@ impl NestWeaverDaemon for DaemonService {
                         &repos,
                     );
                 }
+                // nw-412: a generation-stale graph is a run that did not
+                // complete. Applied HERE — after analysis and after the R9b
+                // redaction, before serialization — so the degrade is computed
+                // over the same repo set the caller is allowed to see, exactly
+                // where `tool_blast_radius` applies its own.
+                degrade_blast_radius_if_resolver_stale(
+                    &state.store,
+                    &state.db_path,
+                    &visible,
+                    &mut result,
+                )?;
                 serde_json::to_string(&result)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
             })
@@ -18703,6 +18833,558 @@ external_model = "unavailable-test-model"
         assert!(
             response.results.iter().all(|row| row.uid != "sym:hidden"),
             "typed Search must not leak hidden symbol rows"
+        );
+    }
+
+    // ── nw-415 ──────────────────────────────────────────────────────
+    //
+    // Six typed gRPC RPCs hand-built their args and called
+    // `dispatch_tool_json(tool, args, VisibleRepos::All)`, discarding the
+    // `Identity` the auth interceptor attaches to every request. That is not a
+    // misclassification nw-403's `repo_scope` table could correct:
+    // `dispatch_uncached` short-circuits on anything that is not `Only(_)`, so
+    // an `All` argument makes the entire table UNREACHABLE — the tools were
+    // never consulted, not wrongly consulted.
+    //
+    // THE TESTS BELOW GO THROUGH THE SERVICE, NOT THROUGH `dispatch`, and that
+    // is the point. `the_visibility_table_covers_every_tool` in the MCP crate
+    // derives its table from `tool_list()`, so it proves every DISPATCHED tool
+    // is classified and can never observe a caller that bypasses dispatch
+    // entirely. A per-tool table test is not a chokepoint test.
+
+    const NW415_HIDDEN_URL: &str = "https://github.com/acme/nw415-hidden.git";
+    const NW415_VISIBLE_URL: &str = "https://github.com/acme/nw415-visible.git";
+    const NW415_HIDDEN_SYMBOL: &str = "sym:nw415-hidden";
+    const NW415_VISIBLE_SYMBOL: &str = "sym:nw415-visible";
+    const NW415_TOKEN: &str = "nw415-repo-scoped-token";
+
+    /// Two repos, one symbol each, and a vault note — the smallest graph in
+    /// which "answered from the hidden repo" is observable on every one of the
+    /// six RPCs.
+    fn nw415_store() -> Arc<GraphStore> {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        for repo in [
+            test_repo("repo:nw415-visible", NW415_VISIBLE_URL, None),
+            test_repo("repo:nw415-hidden", NW415_HIDDEN_URL, None),
+        ] {
+            store.insert_repo(&repo).unwrap();
+        }
+        for (uid, repo_uid, name) in [
+            (
+                NW415_VISIBLE_SYMBOL,
+                "repo:nw415-visible",
+                "nw415needle_visible",
+            ),
+            (
+                NW415_HIDDEN_SYMBOL,
+                "repo:nw415-hidden",
+                "nw415needle_hidden",
+            ),
+        ] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: repo_uid.to_string(),
+                    file_path: format!("src/{name}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: format!("hash:{uid}"),
+                    embedding: None,
+                    pagerank_score: Some(0.5),
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: Some(format!("canonical:{uid}")),
+                })
+                .unwrap();
+        }
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:nw415".to_string(),
+                name: "nw415".to_string(),
+                root_path: "/tmp/nw415".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:nw415".to_string(),
+                vault_uid: "vlt:nw415".to_string(),
+                file_path: "nw415.md".to_string(),
+                title: "nw415 vault note".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 3,
+                content_hash: "hash:note:nw415".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_vault_note_edge("vlt:nw415", "note:nw415")
+            .unwrap();
+        store
+    }
+
+    /// A service whose `[authz]` policy is ENABLED and grants `NW415_TOKEN`
+    /// exactly one of the two repos.
+    fn nw415_service() -> DaemonService {
+        use nestweaver_engine::authz::StaticConfigPermissionSource;
+
+        let source = Arc::new(StaticConfigPermissionSource::new(
+            [(
+                NW415_TOKEN.to_string(),
+                vec!["repo:nw415-visible".to_string()],
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        DaemonService::new(test_state_with_authz(nw415_store(), source))
+    }
+
+    fn nw415_request<T>(message: T, identity: nestweaver_engine::authz::Identity) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(identity);
+        request
+    }
+
+    fn nw415_context_request() -> BrainContextRequest {
+        BrainContextRequest {
+            seeds: vec!["nw415needle".to_string()],
+            include_seeds: true,
+            token_budget: 4000,
+            response_format: "detailed".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn nw415_hub_request() -> HubNodesRequest {
+        HubNodesRequest {
+            top_n: 10,
+            response_format: "detailed".to_string(),
+        }
+    }
+
+    fn nw415_note_request() -> NoteGetRequest {
+        NoteGetRequest {
+            uid: Some("note:nw415".to_string()),
+            title: None,
+            sections: Vec::new(),
+            include_body: Some(false),
+        }
+    }
+
+    /// nw-415 — every one of the six RPCs now resolves the request `Identity`
+    /// the way `json_rpc!` already did, so nw-403's table actually decides.
+    ///
+    /// Each assertion is against the disposition the tool DECLARES, not
+    /// against a uniform "returns less":
+    ///   * `brain_status` (typed and JSON) — `EnforcedInArm`. It enumerates
+    ///     each repo's URL and indexed git SHA, which is repo IDENTITY and the
+    ///     most direct enumeration in the catalogue.
+    ///   * `brain_context` / `hub_nodes` — `RedactedAfterDispatch`. No token
+    ///     naming the hidden repo may survive anywhere in the payload.
+    ///   * `project_context` — `RedactedAfterDispatch` whose `response_format`
+    ///     DEFAULTS to concise, so an unattributable rendering is REFUSED.
+    ///   * `note_get` — `NotRepoScoped`, and it must still answer.
+    #[tokio::test]
+    async fn every_typed_grpc_rpc_that_bypassed_dispatch_now_scopes_to_the_request_identity() {
+        use nestweaver_engine::authz::Identity;
+
+        let service = nw415_service();
+        let scoped = || Identity::Token(NW415_TOKEN.to_string());
+        // Every RPC is exercised and every violation COLLECTED, rather than
+        // asserted one at a time. All six sites were the same defect committed
+        // six times; a test that stops at the first would have to be re-run
+        // six times to prove the other five, which is exactly the shape that
+        // lets one of them be missed.
+        let mut leaks: Vec<String> = Vec::new();
+
+        // `brain_status`, typed: `EnforcedInArm`, because `repos[]` carries
+        // each repo's URL and indexed git SHA — repo IDENTITY, the most direct
+        // enumeration in the catalogue.
+        let status = service
+            .brain_status(nw415_request(BrainStatusRequest {}, scoped()))
+            .await
+            .expect("a repo-scoped brain_status is scoped, not refused")
+            .into_inner();
+        if status.repo_count != 1 {
+            leaks.push(format!(
+                "typed brain_status counted {} repos; the caller may see 1",
+                status.repo_count
+            ));
+        }
+
+        // `brain_status`, JSON: the second door onto the same enumeration.
+        let status_json = service
+            .brain_status_json(nw415_request(
+                JsonRequest {
+                    args_json: "{}".to_string(),
+                },
+                scoped(),
+            ))
+            .await
+            .expect("a repo-scoped brain_status_json is scoped, not refused")
+            .into_inner();
+        if status_json.result_json.contains(NW415_HIDDEN_URL) {
+            leaks.push(format!(
+                "brain_status_json leaked the hidden repo's URL: {}",
+                status_json.result_json
+            ));
+        }
+        if !status_json.result_json.contains(NW415_VISIBLE_URL) {
+            leaks.push(format!(
+                "brain_status_json dropped the repo the caller DOES own: {}",
+                status_json.result_json
+            ));
+        }
+        let status_value: serde_json::Value =
+            serde_json::from_str(&status_json.result_json).unwrap();
+        if status_value["visibility"]["scoped"] != serde_json::json!(true) {
+            leaks.push(format!(
+                "brain_status_json did not disclose that it was scoped: {status_value}"
+            ));
+        }
+
+        // `brain_context`: `RedactedAfterDispatch`.
+        let context = service
+            .get_context(nw415_request(nw415_context_request(), scoped()))
+            .await
+            .expect("a repo-scoped brain_context is redacted, not refused")
+            .into_inner();
+        if context.result_json.contains(NW415_HIDDEN_SYMBOL)
+            || context.result_json.contains("nw415needle_hidden")
+        {
+            leaks.push(format!(
+                "brain_context leaked a hidden-repo symbol: {}",
+                context.result_json
+            ));
+        }
+
+        // `hub_nodes`: `RedactedAfterDispatch`.
+        //
+        // The assertion is over the hidden SYMBOL, not the hidden repo uid, on
+        // purpose: `hub_nodes` also returns `stale_repos`, a bare string array
+        // of repo uids that the redactor cannot see (it early-returns `true`
+        // for any array element that is not an object). That is [[nw-416]],
+        // whose fix lives in the MCP crate's redactor; asserting it here would
+        // pin a defect this change cannot reach.
+        let hubs = service
+            .hub_nodes(nw415_request(nw415_hub_request(), scoped()))
+            .await
+            .expect("a repo-scoped hub_nodes is redacted, not refused")
+            .into_inner();
+        if hubs.result_json.contains(NW415_HIDDEN_SYMBOL)
+            || hubs.result_json.contains("nw415needle_hidden")
+        {
+            leaks.push(format!(
+                "hub_nodes leaked a hidden-repo symbol: {}",
+                hubs.result_json
+            ));
+        }
+
+        // `project_context`: `RedactedAfterDispatch` whose `response_format`
+        // DEFAULTS to concise, so the rows carry no uid to attribute and the
+        // call is REFUSED rather than served unfiltered.
+        match service
+            .get_project_context(nw415_request(
+                ProjectContextRequest {
+                    project: "anything".to_string(),
+                    ..Default::default()
+                },
+                scoped(),
+            ))
+            .await
+        {
+            Ok(response) => leaks.push(format!(
+                "project_context served an unattributable concise rendering: {}",
+                response.into_inner().result_json
+            )),
+            Err(error) if !error.message().contains("response_format") => leaks.push(format!(
+                "project_context failed for the wrong reason (the refusal must name its remedy): {}",
+                error.message()
+            )),
+            Err(_) => {}
+        }
+
+        // `note_get`: the WRITTEN `NotRepoScoped` exemption must still answer.
+        // This leg is what keeps the fix from degenerating into "scope
+        // everything" — the table's opt-out has to survive it.
+        let note = service
+            .get_note(nw415_request(nw415_note_request(), scoped()))
+            .await
+            .expect("note_get carries a written not-repo-scoped exemption")
+            .into_inner();
+        if note.uid != "note:nw415" || note.title != "nw415 vault note" {
+            leaks.push(format!(
+                "note_get's not-repo-scoped exemption was over-applied: {note:?}"
+            ));
+        }
+
+        assert!(
+            leaks.is_empty(),
+            "gRPC RPCs that did not honour the caller's repo scope:\n  - {}",
+            leaks.join("\n  - ")
+        );
+    }
+
+    /// COUNTERWEIGHT to the test above, and the leg that keeps it from being
+    /// vacuous: an UNSCOPED identity must still see everything.
+    ///
+    /// Without this, "returns nothing" would pass the scoped assertions for
+    /// the wrong reason — a fixture whose hidden rows were never reachable at
+    /// all proves nothing about the gate. Every hidden-repo token asserted
+    /// ABSENT above is asserted PRESENT here, through the same six RPCs on the
+    /// same graph, under `Identity::Admin` (which an enabled policy resolves
+    /// to `VisibleRepos::All`).
+    #[tokio::test]
+    async fn an_unscoped_identity_still_sees_every_repo_through_those_same_grpc_rpcs() {
+        use nestweaver_engine::authz::Identity;
+
+        let service = nw415_service();
+
+        let status = service
+            .brain_status(nw415_request(BrainStatusRequest {}, Identity::Admin))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.repo_count, 2,
+            "an unscoped caller must still see both repos"
+        );
+
+        let status_json = service
+            .brain_status_json(nw415_request(
+                JsonRequest {
+                    args_json: "{}".to_string(),
+                },
+                Identity::Admin,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            status_json.result_json.contains(NW415_HIDDEN_URL)
+                && status_json.result_json.contains(NW415_VISIBLE_URL),
+            "an unscoped brain_status_json must enumerate both repos: {}",
+            status_json.result_json
+        );
+        assert!(
+            !status_json.result_json.contains("\"scoped\":true"),
+            "an unscoped response must not claim it was scoped: {}",
+            status_json.result_json
+        );
+
+        let context = service
+            .get_context(nw415_request(nw415_context_request(), Identity::Admin))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            context.result_json.contains(NW415_HIDDEN_SYMBOL),
+            "PRECONDITION: the hidden symbol must be reachable unscoped, or \
+             the scoped assertion proves nothing: {}",
+            context.result_json
+        );
+
+        let hubs = service
+            .hub_nodes(nw415_request(nw415_hub_request(), Identity::Admin))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            hubs.result_json.contains(NW415_HIDDEN_SYMBOL),
+            "PRECONDITION: hub_nodes must reach the hidden symbol unscoped: {}",
+            hubs.result_json
+        );
+
+        // `project_context` is refused for a SCOPED caller only because the
+        // rendering cannot be attributed — an unscoped caller must never meet
+        // that refusal.
+        let unscoped_project = service
+            .get_project_context(nw415_request(
+                ProjectContextRequest {
+                    project: "anything".to_string(),
+                    ..Default::default()
+                },
+                Identity::Admin,
+            ))
+            .await;
+        if let Err(error) = unscoped_project {
+            assert!(
+                !error.message().contains("response_format"),
+                "an unscoped caller must not be refused for being unattributable: {}",
+                error.message()
+            );
+        }
+
+        let note = service
+            .get_note(nw415_request(nw415_note_request(), Identity::Admin))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(note.uid, "note:nw415");
+    }
+
+    // ── nw-412 ──────────────────────────────────────────────────────
+    //
+    // `pr_impact_json` calls `nestweaver_engine::analyze_blast_radius`
+    // DIRECTLY rather than dispatching the `blast_radius` tool, so neither the
+    // CLI's `degrade_blast_radius_if_resolver_stale` nor `tool_blast_radius`'s
+    // own block could reach it. The daemon is the DEFAULT route, so this was
+    // the path a user actually takes.
+
+    const NW412_REPO: &str = "repo:nw412:aaaaaaaaaaaa";
+
+    /// A daemon over a real on-disk db (so the resolver-generation sidecar has
+    /// somewhere to live) holding one repo and one symbol in the file the
+    /// pr-impact call names.
+    ///
+    /// The symbol matters: a changed file with NO indexed symbol is already
+    /// `partial`/`degraded-unknown` on its own (`changed-file-no-symbols`), so
+    /// a fixture without it could not tell this degrade from the baseline —
+    /// the counterweight would be unfalsifiable.
+    fn nw412_state() -> Arc<DaemonState> {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                NW412_REPO,
+                "https://github.com/example/nw412",
+                Some("/tmp/nw412"),
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_symbol(&Symbol {
+                uid: "sym:nw412".to_string(),
+                name: "nw412_changed".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: NW412_REPO.to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn nw412_changed()".to_string(),
+                summary: None,
+                content_hash: "hash:sym:nw412".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: Some("canonical:sym:nw412".to_string()),
+            })
+            .unwrap();
+        state
+    }
+
+    async fn nw412_pr_impact(state: Arc<DaemonState>) -> serde_json::Value {
+        let response = DaemonService::new(state)
+            .pr_impact_json(Request::new(JsonRequest {
+                args_json: serde_json::json!({ "files": ["src/lib.rs"] }).to_string(),
+            }))
+            .await
+            .expect("pr_impact must answer, degraded or not")
+            .into_inner();
+        serde_json::from_str(&response.result_json).expect("pr_impact returns a JSON result")
+    }
+
+    /// nw-412 — the direction that made this dangerous is that a stale graph
+    /// UNDERSTATES impact, and the run that understates it most is the one
+    /// that looks cleanest. Driven through the RPC, because that is the route
+    /// the CLI's and MCP's twin degrades could not reach.
+    ///
+    /// `print_pr_impact_hook` is silent on exactly `Ok` + `Low` +
+    /// nothing-affected, and `pr_impact_exit_code` reads `gate_state`, so
+    /// before this the pre-push hook printed NOTHING on a stale graph. After
+    /// the degrade the run cannot report `ok` at all.
+    #[tokio::test]
+    async fn pr_impact_through_the_daemon_cannot_report_a_clean_gate_on_a_resolver_stale_graph() {
+        // No sidecar is written: an unrecorded repo reads as generation 0,
+        // which is the "indexed before this record existed" case by definition.
+        let value = nw412_pr_impact(nw412_state()).await;
+
+        assert_eq!(
+            value["gate_state"],
+            serde_json::json!("degraded-unknown"),
+            "a stale-resolver run must not report a gate verdict: {value}"
+        );
+        assert_eq!(
+            value["status"],
+            serde_json::json!("degraded"),
+            "status must be pushed down to at least degraded: {value}"
+        );
+        let notifications = value["notifications"].as_array().expect("notifications");
+        let stale = notifications
+            .iter()
+            .find(|n| n["descriptor"] == serde_json::json!("resolver.generation-stale"))
+            .unwrap_or_else(|| panic!("no resolver.generation-stale notification: {value}"));
+        assert_eq!(
+            stale["level"],
+            serde_json::json!("error"),
+            "the descriptor must arrive at error level, matching the CLI and MCP twins"
+        );
+        assert!(
+            stale["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("--force")),
+            "the notification must carry the runnable remedy: {stale}"
+        );
+        assert!(
+            value["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("[status: degraded]")),
+            "the human summary must not still read as a clean run: {value}"
+        );
+    }
+
+    /// COUNTERWEIGHT: a generation-CURRENT graph must NOT be degraded.
+    ///
+    /// Required by nw-412 explicitly, and it is what stops the fix from being
+    /// "always report degraded" — which would be honest about nothing and
+    /// would make the gate useless rather than safe.
+    #[tokio::test]
+    async fn a_generation_current_graph_still_reports_a_clean_pr_impact_gate_through_the_daemon() {
+        let state = nw412_state();
+        nestweaver_engine::resolver_generation::record(&state.db_path, NW412_REPO)
+            .expect("recording the current generation must succeed");
+
+        let value = nw412_pr_impact(state).await;
+
+        assert_eq!(
+            value["gate_state"],
+            serde_json::json!("ok"),
+            "a current graph must still be able to report a clean gate: {value}"
+        );
+        assert_eq!(value["status"], serde_json::json!("complete"), "{value}");
+        assert!(
+            value["notifications"]
+                .as_array()
+                .expect("notifications")
+                .iter()
+                .all(|n| n["descriptor"] != serde_json::json!("resolver.generation-stale")),
+            "a current graph must not be told its resolver is stale: {value}"
+        );
+        assert!(
+            value["summary"]
+                .as_str()
+                .is_some_and(|s| !s.contains("[status: ")),
+            "a complete run must not be tagged with a status marker: {value}"
         );
     }
 

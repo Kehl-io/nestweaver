@@ -2407,14 +2407,60 @@ fn render_blast_radius_text(payload: &serde_json::Value) {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
+    // nw-390. The JSON payload marks every place the tree was CUT — a
+    // depth-capped node, a node whose canonical expansion lives elsewhere, and
+    // rows a visibility policy removed. The text renderer read NONE of them, so
+    // the human surface still showed a capped node as an ordinary leaf: exactly
+    // the defect nw-390 exists to close, surviving on the route the item's own
+    // reproducer uses. A marker that only the machine payload carries has not
+    // fixed the confusion for the person reading it.
+    fn cut_marker(node: &serde_json::Value) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        // `deduped_ref` first: it explains WHERE the subtree went, which is the
+        // question a reader has on seeing an empty node. The uid is printed
+        // because it is the argument you would trace next.
+        if let Some(uid) = node.get("deduped_ref").and_then(|v| v.as_str()) {
+            parts.push(format!("expanded above as {uid}"));
+        }
+        if node
+            .get("truncated_at_depth")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            match node
+                .get("children_omitted")
+                .and_then(serde_json::Value::as_u64)
+            {
+                // Distinguish "cut, and this many were dropped" from "cut, count
+                // unknown". Printing `0 callees` for the second would state a
+                // census the payload never made.
+                Some(n) if n > 0 => parts.push(format!("depth cap: {n} callee(s) not shown")),
+                _ => parts.push("depth cap: callees not shown".to_string()),
+            }
+        }
+        if let Some(n) = node
+            .get("children_redacted")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            parts.push(format!("{n} hidden by policy"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", parts.join("; "))
+        }
+    }
+
     fn walk(node: &serde_json::Value, depth: usize) {
         let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let edge = node.get("edge_type").and_then(|v| v.as_str());
         let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let indent = "  ".repeat(depth + 1);
+        let cut = cut_marker(node);
         match edge {
-            Some(e) => println!("{indent}{name}  [{e}]  {path}"),
-            None => println!("{indent}{name}  {path}"),
+            Some(e) => println!("{indent}{name}  [{e}]  {path}{cut}"),
+            None => println!("{indent}{name}  {path}{cut}"),
         }
         for child in node
             .get("children")
@@ -2434,7 +2480,38 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
     println!("Flow trace from '{root_name}':");
 
     // A class root expands to one tree per method.
-    if let Some(trees) = payload.get("method_trees").and_then(|v| v.as_array()) {
+    //
+    // KEY FIX, and it was silent: this looked ONLY for `method_trees`, while the
+    // tool emits `methods`. So a class root fell through to the single-tree arm
+    // below and its per-method trees were never rendered at all on the text
+    // route. Both spellings are accepted rather than just swapped, because the
+    // daemon and direct routes are independently versioned and a payload built
+    // by an older peer must not silently render nothing.
+    if let Some(trees) = payload
+        .get("methods")
+        .or_else(|| payload.get("method_trees"))
+        .and_then(|v| v.as_array())
+    {
+        // nw-390's third cap: the class-to-methods expansion is capped at
+        // MAX_METHODS and the payload says so. Silence here would misreport a
+        // partial method list as the whole class.
+        if payload
+            .get("methods_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let shown = payload
+                .get("methods_returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(trees.len() as u64);
+            match payload
+                .get("methods_total")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(total) => println!("  (showing {shown} of {total} methods)"),
+                None => println!("  (method list truncated)"),
+            }
+        }
         for tree in trees {
             walk(tree, 0);
         }
@@ -20368,7 +20445,23 @@ fn resolve_uid_with_repo_filter(
 
 /// Print a human-readable representation of a `ContextResult`.
 fn print_context_text(result: &ContextResult) {
-    println!("Seeds ({} resolved):", result.seeds.len());
+    // nw-393: `Seeds (5 resolved):` was printed for a bare-name input that
+    // matched 200 symbols, so the human reader had no way to tell an arbitrary
+    // 5-of-200 seeding from a name with five definitions — while the JSON twin
+    // beside it already carried `seed_matches_total` / `seeds_truncated`.
+    // `ContextResult` has no semantic seed leg, so the provenance half of
+    // `seed_header` is always zero here; the shared function is used anyway so
+    // this line and `brain context`'s cannot describe the same cap differently.
+    println!(
+        "{}",
+        seed_header(
+            result.seeds.len(),
+            0,
+            result.seed_matches_total,
+            result.seed_matches_total_relation.as_deref(),
+            result.seeds_truncated,
+        )
+    );
     for node in &result.seeds {
         println!(
             "  {}  {}  {}:{}",
@@ -25480,12 +25573,63 @@ fn print_clusters_output_with_total(
 /// "blast radius" fails a direct lookup against the symbol `blast_radius` yet
 /// its semantic hits are excellent, so labelling them guesses would understate
 /// them exactly as counting them as direct matches overstated them.
-fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
+///
+/// nw-393: the header also carries the SEED-RESOLUTION disclosure, because
+/// `Seeds (5 resolved)` for a name that matched 200 symbols is
+/// indistinguishable from a name that genuinely has five definitions. The
+/// machine payloads (`seed_matches_total`, `seed_matches_total_relation`,
+/// `seeds_truncated`, `seed_resolution_limit`) already say the set was cut; a
+/// human line that does not is the human-vs-machine split nw-259(a) ruled
+/// against — the prose must not claim something the payload contradicts.
+/// Shared with `print_context_text` rather than given a second spelling: two
+/// surfaces drifting apart about the same query is the failure mode being
+/// fixed, not a shape to reproduce.
+fn seed_header(
+    total_seeds: usize,
+    semantic_seeds: usize,
+    seed_matches_total: Option<usize>,
+    seed_matches_total_relation: Option<&str>,
+    seeds_truncated: Option<bool>,
+) -> String {
     let matched = total_seeds.saturating_sub(semantic_seeds);
-    if semantic_seeds > 0 {
-        format!("Seeds ({matched} matched directly, {semantic_seeds} via semantic search):")
+    // Annotate ONLY when the cap actually BIT. `Some(false)` — a name with
+    // exactly `SEED_NAME_MATCH_LIMIT` definitions, all of them resolved — and
+    // `None` — no bare-name input reached symbol search at all, e.g. a `sym:`
+    // UID or note-title seed, where the cap was never in force — both leave
+    // the line byte-identical to before. "5 of 5" is noise and "0 of 0" is a
+    // false cut claim about an exhaustive seed form; either one trains the
+    // reader to skip the clause that matters.
+    let (of_total, cap) = if seeds_truncated == Some(true) {
+        let of_total = match (seed_matches_total, seed_matches_total_relation) {
+            // `gte` means the counted search stopped at
+            // `SYMBOL_SEARCH_COUNT_CAP`, so the number is a LOWER BOUND and
+            // printing it as exact would replace one false precision with
+            // another. Same wording `brain search` already uses for a `gte`
+            // total ("N of at least M result(s)"), so there is one human
+            // spelling of "this count is a floor", not two.
+            (Some(total), Some("gte")) => format!(" of at least {total}"),
+            (Some(total), _) => format!(" of {total}"),
+            // Flag set, count absent: a producer that predates the count, or a
+            // daemon payload that carried one field and not the other. Name the
+            // cut — it is the load-bearing half — but do not invent a total.
+            (None, _) => String::new(),
+        };
+        (of_total, ", seed-resolution cap")
     } else {
-        format!("Seeds ({matched} resolved):")
+        (String::new(), "")
+    };
+    if semantic_seeds > 0 {
+        // The cap bounds the DIRECT name-match leg only; semantic hits are
+        // injected by KNN and are not subject to it, so the `of N` rides on the
+        // "matched directly" count and never on the semantic one.
+        format!(
+            "Seeds ({matched}{of_total} matched directly, \
+             {semantic_seeds} via semantic search{cap}):"
+        )
+    } else if of_total.is_empty() {
+        format!("Seeds ({matched} resolved{cap}):")
+    } else {
+        format!("Seeds ({matched}{of_total}{cap}):")
     }
 }
 
@@ -25506,9 +25650,19 @@ fn print_brain_context_text(
     // both as "resolved" made the output contradict itself: a nonsense query
     // printed `Seeds (5 resolved)` while ALSO listing that same query under
     // `Unresolved seeds (1)`. Report the two separately.
+    // nw-393 rides on the same line: the seed set is also cut by the
+    // per-input name-match cap, and this route resolves seeds through its own
+    // loop, so the disclosure has to be attached here too or `brain context`
+    // and `context` would disagree about an identical query.
     println!(
         "{}",
-        seed_header(result.seeds.len(), result.semantic_seed_count)
+        seed_header(
+            result.seeds.len(),
+            result.semantic_seed_count,
+            result.seed_matches_total,
+            result.seed_matches_total_relation.as_deref(),
+            result.seeds_truncated,
+        )
     );
     for n in &result.seeds {
         if n.location.is_empty() {
@@ -33809,7 +33963,7 @@ credential_method = "ssh"
     #[test]
     fn seed_header_never_counts_semantic_hits_as_resolved() {
         // The reported case: nothing matched, five nearest neighbours injected.
-        let h = seed_header(5, 5);
+        let h = seed_header(5, 5, None, None, None);
         assert!(h.contains("0 matched directly"), "{h}");
         assert!(h.contains("5 via semantic search"), "{h}");
         assert!(
@@ -33818,10 +33972,10 @@ credential_method = "ssh"
         );
 
         // Genuine direct matches, no semantic leg.
-        assert_eq!(seed_header(3, 0), "Seeds (3 resolved):");
+        assert_eq!(seed_header(3, 0, None, None, None), "Seeds (3 resolved):");
 
         // Mixed: two direct, three semantic.
-        let m = seed_header(5, 3);
+        let m = seed_header(5, 3, None, None, None);
         assert!(
             m.contains("2 matched directly") && m.contains("3 via semantic search"),
             "{m}"
@@ -33832,8 +33986,80 @@ credential_method = "ssh"
     /// older payload must not underflow the subtraction.
     #[test]
     fn seed_header_does_not_underflow_on_inconsistent_counts() {
-        let h = seed_header(2, 9);
+        let h = seed_header(2, 9, None, None, None);
         assert!(h.contains("0 matched directly"), "{h}");
+    }
+
+    /// nw-393: the human line must not claim something the machine payload
+    /// beside it contradicts. `search validate --limit 200` reports >=200
+    /// symbols named `validate`, the seed cap keeps 5, and the JSON twin says
+    /// so via `seed_matches_total` / `seeds_truncated` — the text renderer
+    /// printed a bare `Seeds (5 resolved):`, which reads exactly like a name
+    /// that genuinely has five definitions.
+    #[test]
+    fn a_cut_seed_set_cannot_print_as_an_exhaustive_one() {
+        let h = seed_header(5, 0, Some(200), Some("eq"), Some(true));
+        assert_eq!(h, "Seeds (5 of 200, seed-resolution cap):");
+        assert!(
+            !h.contains("5 resolved"),
+            "a cut seed set must not read as a resolved-in-full one: {h}"
+        );
+
+        // The mixed case: the cap bounds the DIRECT leg only, so the `of N`
+        // must ride on the matched-directly count, never on the semantic one.
+        let m = seed_header(5, 3, Some(200), Some("eq"), Some(true));
+        assert_eq!(
+            m,
+            "Seeds (2 of 200 matched directly, 3 via semantic search, seed-resolution cap):"
+        );
+    }
+
+    /// nw-393: past `SYMBOL_SEARCH_COUNT_CAP` the store stops counting and
+    /// reports `gte`, so the total is a LOWER BOUND. Printing it as exact
+    /// would swap one false precision for another.
+    #[test]
+    fn a_lower_bound_seed_total_is_never_printed_as_an_exact_count() {
+        let h = seed_header(5, 0, Some(200), Some("gte"), Some(true));
+        assert_eq!(h, "Seeds (5 of at least 200, seed-resolution cap):");
+        assert!(
+            !h.contains("of 200"),
+            "a gte total must not be stated as an exact one: {h}"
+        );
+    }
+
+    /// COUNTERWEIGHT for nw-393, both halves. The disclosure must not
+    /// over-apply: when the cap did not bite, and when the cap was never in
+    /// force at all, the line is byte-identical to what it printed before.
+    #[test]
+    fn a_seed_set_the_cap_did_not_cut_prints_the_unchanged_line() {
+        // Cap IN FORCE and did not reach — a name with exactly
+        // `SEED_NAME_MATCH_LIMIT` definitions, all five resolved. "5 of 5" is
+        // noise, so the wording is unchanged.
+        assert_eq!(
+            seed_header(5, 0, Some(5), Some("eq"), Some(false)),
+            "Seeds (5 resolved):"
+        );
+
+        // Cap NOT APPLICABLE — a `sym:` UID seed never reaches the name
+        // search, so all three fields are absent. This is the case that must
+        // never print "0 of 0" about an exhaustive seed form.
+        assert_eq!(seed_header(2, 0, None, None, None), "Seeds (2 resolved):");
+        assert_eq!(seed_header(0, 0, None, None, None), "Seeds (0 resolved):");
+
+        // Semantic provenance (nw-102) survives untouched in both.
+        assert_eq!(
+            seed_header(5, 3, Some(5), Some("eq"), Some(false)),
+            "Seeds (2 matched directly, 3 via semantic search):"
+        );
+    }
+
+    /// Defensive twin of the underflow test: a daemon payload that carried the
+    /// flag but not the count must still disclose the cut, and must not invent
+    /// a total to do it.
+    #[test]
+    fn a_cut_seed_set_without_a_total_names_the_cap_without_inventing_a_number() {
+        let h = seed_header(5, 0, None, None, Some(true));
+        assert_eq!(h, "Seeds (5 resolved, seed-resolution cap):");
     }
 
     /// nw-123: the impact envelope's key set must not depend on which

@@ -236,12 +236,28 @@ pub struct FilesystemReader {
     skipped_dirs: std::sync::Arc<std::sync::Mutex<Vec<SkippedDir>>>,
 }
 
+/// The `reason` a [`SkippedDir`] carries when a configured `[[repos]] exclude`
+/// glob pruned the directory, rather than a `SKIP_DIRS` default.
+///
+/// nw-387 follow-up. The two reasons need DIFFERENT remedies and the first cut
+/// of the disclosure offered only one: `[[repos]] unskip` re-admits a
+/// `SKIP_DIRS` entry and governs NOTHING ELSE, so a repo that excluded a tree on
+/// purpose was told to "re-admit it with `[[repos]] unskip`" — an instruction
+/// that does nothing — while its coverage read `degraded` and `--fail-on-skip`
+/// exited 1. Named rather than left as a bare literal so the recorder here and
+/// the message builder in `index::disclose_pruned_dir` cannot drift apart
+/// silently; a rename breaks the build instead of the remedy.
+pub const CONFIGURED_EXCLUDE_REASON: &str = "configured exclude";
+
 /// A directory the walk pruned, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedDir {
     /// Repo-relative path of the pruned directory.
     pub path: String,
-    /// The `SKIP_DIRS` entry that matched, or the configured exclude pattern.
+    /// The `SKIP_DIRS` entry that matched, or [`CONFIGURED_EXCLUDE_REASON`]
+    /// when a `[[repos]] exclude` glob did. That second value is a MARKER, not
+    /// the glob itself: `filter_entry` matches against a compiled `GlobSet`,
+    /// which reports THAT something matched and not WHICH pattern.
     pub reason: String,
 }
 
@@ -479,7 +495,7 @@ impl ContentReader for FilesystemReader {
                         && !rel.as_os_str().is_empty()
                         && dir_is_excluded(dir_excludes.as_ref(), rel)
                     {
-                        note("configured exclude");
+                        note(CONFIGURED_EXCLUDE_REASON);
                         return false;
                     }
                 }
@@ -885,9 +901,48 @@ impl GitBareReader {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        String::from_utf8(output.stdout)
-            .with_context(|| format!("non-utf8 content in {}", rel_path.display()))
+        // nw-386: the fallback decodes through the same seam as the batch path.
+        // It fires on spawn failure and on mid-stream process death, so leaving
+        // it un-normalised would make correctness depend on whether a `git`
+        // subprocess happened to survive.
+        decode_git_blob(rel_path, output.stdout)
     }
+}
+
+/// Decode blob bytes handed back by git into the source string the parser sees.
+///
+/// nw-386, SECOND CALL SITE. `normalize_lone_cr` shipped wired only into
+/// [`FilesystemReader::read_file`], and the comment on its test called that
+/// "the seam every code-indexing read crosses". THAT WAS FALSE while
+/// [`GitBareReader`] existed: it is the body reader for `read_symbols` in
+/// SERVER mode and the enumeration/read pair for bare-clone indexing, and both
+/// of its decode points returned raw UTF-8. So both nw-386 symptoms survived
+/// verbatim on that reader — a lone-CR file contributed ZERO symbols (with no
+/// `\n` anywhere the leading `//`/`#` comment never terminates and tree-sitter
+/// swallows the whole source), and every surviving span collapsed to line 1 so
+/// `read_symbols` returned the WHOLE FILE for each symbol with
+/// `truncated: false`.
+///
+/// Funnelling BOTH git decode points (`cat-file --batch` and the `git show`
+/// fallback) through one function is the point: the fallback fires on spawn
+/// failure and on mid-stream process death, so a normalisation applied to only
+/// the batch arm would be correct until the day a `git` subprocess died and
+/// then silently wrong.
+///
+/// CRLF is stepped over verbatim and byte length is preserved — see
+/// [`normalize_lone_cr`]. Returns the original `String` untouched, with no
+/// second allocation, whenever there is no lone CR to rewrite.
+fn decode_git_blob(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("non-utf8 content in {}", rel_path.display()))?;
+    // Destructured rather than `.into_owned()`: on the overwhelmingly common
+    // `Cow::Borrowed` path `into_owned` would clone the entire file body for
+    // nothing, and this runs on every blob of every server-side read.
+    let rewritten = match normalize_lone_cr(&text) {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(normalized) => Some(normalized),
+    };
+    Ok(rewritten.unwrap_or(text))
 }
 
 impl ContentReader for GitBareReader {
@@ -910,8 +965,9 @@ impl ContentReader for GitBareReader {
 
         let batch = guard.as_mut().expect("batch initialized above");
         match batch.request(&self.sha, rel_path) {
-            Ok(BatchObject::Found(content)) => String::from_utf8(content)
-                .with_context(|| format!("non-utf8 content in {}", rel_path.display())),
+            // nw-386: normalise lone CR here, not at the caller — see
+            // `decode_git_blob`.
+            Ok(BatchObject::Found(content)) => decode_git_blob(rel_path, content),
             Ok(BatchObject::Missing) => anyhow::bail!(
                 "path {} not found at {} in {}",
                 rel_path.display(),
@@ -1038,8 +1094,16 @@ mod tests {
         // symbols: with no `\n` anywhere the leading `//` comment never
         // terminates and tree-sitter swallows the entire source, while the
         // index reported `coverage_status: "complete", skipped_count: 0`.
-        // `read_file` is the seam every code-indexing read crosses, so it is
-        // where the normalisation lives.
+        // `read_file` is where the normalisation lives, because it is the one
+        // place a reader turns bytes into the string the parser sees.
+        //
+        // THIS COMMENT USED TO CLAIM `read_file` WAS "THE SEAM EVERY
+        // CODE-INDEXING READ CROSSES", SINGULAR. It is not, and the claim let a
+        // whole reader ship unpatched: `GitBareReader` has its own decode points
+        // and both symptoms survived there verbatim. There are TWO seams, one
+        // per reader — this test covers `FilesystemReader`, and
+        // `a_lone_cr_blob_read_from_a_bare_clone_matches_its_lf_twin` covers the
+        // other.
         //
         // COUNTERWEIGHT, and the reason this is NOT a blanket
         // `replace('\r', "\n")`: CRLF is already correct today — exact line
@@ -1471,6 +1535,15 @@ mod tests {
             .current_dir(&src)
             .output()
             .unwrap();
+        // nw-386: pin end-of-line conversion OFF so the CRLF counterweight in
+        // `a_lone_cr_blob_read_from_a_bare_clone_matches_its_lf_twin` measures
+        // this crate's normalisation and not a globally-configured
+        // `core.autocrlf` on the machine running the suite.
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
 
         // Write files.
         for (path, content) in files {
@@ -1533,6 +1606,68 @@ mod tests {
         assert_eq!(
             reader.read_file(Path::new("lib/util.js")).unwrap(),
             "export const x = 1;"
+        );
+    }
+
+    #[test]
+    fn a_lone_cr_blob_read_from_a_bare_clone_matches_its_lf_twin() {
+        // nw-386 RESIDUAL. `normalize_lone_cr` shipped wired only into
+        // `FilesystemReader::read_file`, so both symptoms survived verbatim on
+        // `GitBareReader` — which is the body reader for `read_symbols` in
+        // SERVER mode and for bare-clone indexing. A lone-CR source contributed
+        // ZERO symbols (the leading `//` comment never terminates without a
+        // `\n`, so tree-sitter swallows the file) and every span collapsed to
+        // line 1, making `read_symbols` return the whole file per symbol.
+        //
+        // COUNTERWEIGHT, and the reason this is not `replace('\r', "\n")`: CRLF
+        // was ALREADY CORRECT on this reader too, so it must come back byte for
+        // byte. LF is asserted alongside it as the untouched control.
+        let lf = "// header\nfn one() {}\nfn two() {}\n";
+        let cr = lf.replace('\n', "\r");
+        let crlf = lf.replace('\n', "\r\n");
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("cr.rs", cr.as_str()),
+            ("lf.rs", lf),
+            ("crlf.rs", crlf.as_str()),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        assert_eq!(
+            reader.read_file(Path::new("cr.rs")).unwrap(),
+            lf,
+            "a lone-CR blob must read as its LF twin through GitBareReader too"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("lf.rs")).unwrap(),
+            lf,
+            "LF must be untouched"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("crlf.rs")).unwrap(),
+            crlf,
+            "CRLF is already correct and must survive byte for byte"
+        );
+        // Byte length is preserved, which is what keeps the byte offsets the
+        // store already holds valid.
+        assert_eq!(
+            reader.read_file(Path::new("cr.rs")).unwrap().len(),
+            cr.len()
+        );
+
+        // The `git show` fallback is a SEPARATE decode point, reached whenever
+        // the pooled `cat-file --batch` process fails to spawn or dies
+        // mid-stream. Exercised directly because that failure cannot be induced
+        // from the public surface, and a fix applied to only one of the two
+        // arms would be correct until the day a subprocess died.
+        assert_eq!(
+            reader.read_file_via_show(Path::new("cr.rs")).unwrap(),
+            lf,
+            "the git-show fallback must normalise identically to the batch path"
+        );
+        assert_eq!(
+            reader.read_file_via_show(Path::new("crlf.rs")).unwrap(),
+            crlf,
+            "the git-show fallback must leave CRLF alone"
         );
     }
 
