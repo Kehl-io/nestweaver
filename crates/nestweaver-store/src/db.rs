@@ -790,7 +790,7 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
 /// free, and it holds even for a lease taken by a path that never armed the
 /// latch.
 ///
-/// HANDOFF, to arm the latch everywhere it is owed: the sole producer of write
+/// DONE in this commit, recorded because the sequencing matters if this is ever unpicked: the latch is armed: the sole producer of write
 /// leases is `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which is
 /// outside this crate. It needs, on the success path,
 /// `nestweaver_store::note_self_held_write_lease(db_path)` stored in a

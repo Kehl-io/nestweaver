@@ -1474,9 +1474,14 @@ fn parse_cluster_resolution(value: &str) -> Result<f64, String> {
                   3   ambiguous match (several symbols share the name)\n  \
                   4   unauthorized (pull)      5   unavailable (pull)\n  \
                   64  usage error — unknown flag, out-of-range value, uncompilable --pattern\n\n\
-                  With --json every one of those outcomes also writes a JSON object to stdout:\n  \
-                  {\"error\":\"not found\", ...} for 2, {\"error\":\"ambiguous\", ...} for 3, and\n  \
-                  {\"error\":\"invalid argument\", ...} for 64. Branch on `error`, not on prose.\n\n\
+                  With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
+                  commands listed above; branch on `error`, not on prose.\n  \
+                  NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
+                  worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
+                  argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
+                  stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
+                  candidate list, and `impact` keys it \"status\", not \"error\". A few commands\n      \
+                  (cross-repo-refs, rank) still write nothing on 2. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
                   nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
@@ -2276,7 +2281,7 @@ impl RankingBounds {
     }
 
     /// What the DAEMON reply says, which today is nothing — the MCP
-    /// `hub_nodes`/`bridge_nodes` twins still emit `top_n`/`count` and are
+    /// `hub_nodes`/`bridge_nodes` twins emit these as of this commit; the `Option`s stay because an OLDER daemon on the other end of the RPC still answers with
     /// owned by `crates/nestweaver-mcp/src/tools.rs`. Read rather than assumed
     /// so this route publishes the honest totals the moment that half lands,
     /// without a second edit here.
@@ -6622,7 +6627,21 @@ enum BrainCommands {
     /// note-to-note wikilink graph. Each cluster is labelled by its most
     /// central member.
     TopicClusters {
-        #[arg(long, default_value = "0.5", help = "Community-detection resolution")]
+        // nw-400. Same parser as `clusters --resolution`, and it was MISSED on
+        // the first pass — leaving this one flag unbounded meant
+        // `--resolution nan` still reached the MCP validator and surfaced
+        // `invalid arguments for tool 'brain_topic_clusters': /resolution:
+        // schema keyword 'type' failed` at exit 1, naming a tool the CLI user
+        // never invoked. That is verbatim the defect nw-400 exists to remove,
+        // including the `nan` case the item singled out as worse — `nan`
+        // serialises to JSON `null`, so the schema reports a TYPE error for a
+        // value the user spelled as a number.
+        #[arg(
+            long,
+            default_value = "0.5",
+            value_parser = parse_cluster_resolution,
+            help = "Community-detection resolution (> 0, finite)"
+        )]
         resolution: f64,
         // nw-400: the reported case. `brain topic-clusters --limit 0` printed
         // `invalid arguments for tool 'brain_topic_clusters': /limit: schema
@@ -14052,7 +14071,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
                     // nw-398: captured BEFORE `strip_hybrid_meta` consumes
                     // `value`, alongside the other two. Empty today — the MCP
-                    // `bridge_nodes` twin still publishes `top_n`/`count` — so
+                    // `bridge_nodes` twin publishes these as of this commit; an older daemon does not, so
                     // the payload says `null`, which is the honest "this route
                     // was not told" rather than a fabricated `false`.
                     let bounds = RankingBounds::from_daemon_response(&value);
@@ -39474,7 +39493,7 @@ mod cli_honesty_sweep_tests {
 
     /// The daemon route must publish `null`, not `false`. "This route was not
     /// told" and "nothing was cut" are different claims and only one of them is
-    /// true of today's `hub_nodes` reply, which still carries `top_n`/`count`.
+    /// true of an OLDER daemon's `hub_nodes` reply, which carries only `top_n`/`count`. The current one carries the totals; this test pins the not-told path, which is why it builds the reply by hand.
     #[test]
     fn the_daemon_route_says_it_does_not_know_rather_than_saying_nothing_was_cut() {
         let todays_reply = serde_json::json!({
@@ -39588,9 +39607,43 @@ mod cli_honesty_sweep_tests {
             help.contains("TARGET NOT FOUND"),
             "the top-level help must name the one not-found code: {help}"
         );
-        for fragment in ["Exit codes", "64", "\"not found\"", "invalid argument"] {
+        for fragment in ["Exit codes", "64", "\"not found\""] {
             assert!(help.contains(fragment), "missing {fragment:?} from --help");
         }
+
+        // THE ORIGINAL VERSION OF THIS TEST ASSERTED THAT THE HELP CONTAINED
+        // "invalid argument" — and it passed while that promise was FALSE.
+        // Review measured `brain topic-clusters --limit 0 --json` -> exit 64
+        // with ZERO bytes on stdout, because clap raises the usage error before
+        // `--json` is ever read. The help claimed an envelope for exactly the
+        // class that cannot emit one.
+        //
+        // So the assertion is inverted: a documentation test whose only power is
+        // to check that a sentence EXISTS will happily pin a lie. This one now
+        // requires the exceptions to be stated, and forbids the unqualified
+        // promise from coming back.
+        assert!(
+            !help.contains("With --json every one of those outcomes"),
+            "the unqualified 'every outcome writes JSON' promise is false — exit 64 from a \
+             flag writes nothing to stdout. Do not restore it: {help}"
+        );
+        for exception in [
+            "NOT UNIVERSAL",
+            "BEFORE --json is read",
+            "uncompilable --pattern",
+        ] {
+            assert!(
+                help.contains(exception),
+                "the contract must state its exceptions; missing {exception:?}: {help}"
+            );
+        }
+
+        // The BEHAVIOUR half of this contract is pinned in `tests/cli_test.rs`
+        // (`a_clap_rejected_flag_writes_nothing_to_stdout_as_the_contract_says`),
+        // because only an integration test can spawn the binary. Keeping the two
+        // apart is deliberate: this test guards the WORDS, that one guards the
+        // FACT, and the lie this test now forbids was possible precisely because
+        // nothing guarded the fact.
     }
 
     // ── nw-400 / nw-411 ──────────────────────────────────────────────────

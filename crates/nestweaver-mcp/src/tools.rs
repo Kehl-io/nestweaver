@@ -12325,7 +12325,7 @@ fn tool_schema_get_summary() -> Value {
                 // for `clusters`, applied one level down.
                 //
                 // Cluster only, because `generate_cluster_summaries_bounded`
-                // already TAKES a cap. Hub's `HUB_COUNT` is a private constant
+                // already TAKES a cap. Hub's `HUB_COUNT` is a module constant
                 // inside `generate_hub_summaries_bounded`, so hub cannot be
                 // parameterised from here — it is disclosed as an internal
                 // bound instead (`cap_parameter: null`).
@@ -12637,6 +12637,23 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     };
     let truncated_by_budget = display.len() < after_filter_len;
     let note = if cap_dropped > 0 {
+        // nw-409, CORRECTED after review. This interpolated `display.len()` — the
+        // count AFTER `token_budget` had already cut the list — into a sentence
+        // claiming that many were "capped by an INTERNAL bound that no parameter
+        // raises" and that "`token_budget` cannot recover the rest". With
+        // `level:"hub", token_budget:300` it reported "capped at 12" while
+        // raising the budget returned 18 more. That is nw-409's own defect
+        // (naming a remedy that does not exist) inverted into DENYING a remedy
+        // that does — introduced by nw-409's fix.
+        //
+        // The generator cap is a property of the GENERATED set, so it is
+        // `total_returned` (pre-budget), never the post-budget render length.
+        let generator_cap = after_filter_len;
+        // Name the constant rather than restating 30 in prose. `HUB_COUNT` was
+        // made `pub` for exactly this and had NO consumer — a `pub` item with no
+        // caller is nw-422's shape in miniature: the capability exists, the
+        // surface that reaches it does not, and nothing fails.
+        let hub_cap = nestweaver_engine::summaries::HUB_COUNT;
         Some(match cap_parameter {
             Some(parameter) => format!(
                 "{level_str}-level summaries were capped by the generator ({} of {total_available} \
@@ -12645,11 +12662,17 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
                 display.len()
             ),
             None => format!(
-                "{level_str}-level summaries are capped at {} by an INTERNAL bound that no \
-                 parameter raises — `token_budget` cannot recover the rest, and `total` counts \
-                 {total_population}. Narrow with `target`, or use `hub_nodes`/`clusters`, whose \
-                 `limit` is caller-stated.",
-                display.len()
+                "{level_str}-level summaries are capped at {generator_cap} (the generator's \
+                 bound is {hub_cap}) by an INTERNAL bound that no parameter raises, and `total` \
+                 counts {total_population}. Narrow with `target`, or use `hub_nodes`/`clusters`, \
+                 whose `limit` is caller-stated.{}",
+                if truncated_by_budget {
+                    " `token_budget` ALSO cut this response, and raising it does recover rows \
+                     up to the generator cap."
+                } else {
+                    " `token_budget` cannot recover more: the generator cap, not the budget, \
+                     is what bounds this."
+                }
             ),
         })
     } else if truncated_by_budget {
@@ -19636,7 +19659,7 @@ mod summary_cap_disclosure_tests {
         assert_eq!(
             hub["cap_parameter"],
             Value::Null,
-            "hub's HUB_COUNT is a private engine constant — claiming a parameter \
+            "hub's HUB_COUNT is an engine constant with no parameter — claiming one \
              raises it would be the same wrong remedy in a new field: {hub}"
         );
         let population = hub["total_population"].as_str().unwrap_or_default();

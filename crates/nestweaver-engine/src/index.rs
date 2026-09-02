@@ -2072,15 +2072,32 @@ fn disclose_pruned_dir(pruned: crate::content_reader::SkippedDir) -> Option<Skip
         // Neither `unskip` (which re-admits `SKIP_DIRS` names) nor `exclude`
         // (which removes things) can fix it, and offering either would repeat
         // nw-387's defect of handing someone an instruction that does nothing.
-        // The one thing that works is un-ignoring the path, so that is what is
-        // named, with the negation spelled out because `!` in a `.gitignore` is
-        // not common knowledge.
+        //
+        // AND THE FIRST VERSION OF THIS MESSAGE REPEATED IT ANYWAY. It said
+        // "un-ignore it (`!<path>`)". **Git cannot re-include a file whose
+        // PARENT DIRECTORY is excluded** — and a directory pattern
+        // (`generated/`, `proto/gen/`, a vendored SDK) is this defect's entire
+        // stated population, so the remedy was inert on exactly the case it was
+        // written for. Verified: `.gitignore` of `generated/` plus
+        // `!generated/api_client.py` still reports the file ignored.
+        //
+        // The form that WORKS excludes the directory's CONTENTS rather than the
+        // directory itself, which leaves the directory traversable so a negation
+        // can take effect: `generated/*` then `!generated/api_client.py`.
+        // Verified re-included. That is what is named, because a remedy is only
+        // worth printing if running it fixes the thing.
         format!(
             "tracked by git but dropped by the indexer's `.gitignore`-honouring walk \
              — git does not ignore tracked files, so a committed file matching an \
-             ignore pattern is in git and absent from the graph; un-ignore it \
-             (`!{}` in `.gitignore`) or narrow the pattern to index it",
-            pruned.path
+             ignore pattern is in git and absent from the graph. A bare \
+             `!{path}` will NOT work if a parent directory is excluded: change the \
+             directory pattern to exclude its contents instead (`{dir}/*`), then \
+             add `!{path}` — or narrow the pattern so it never matches this file",
+            path = pruned.path,
+            dir = pruned
+                .path
+                .rsplit_once('/')
+                .map_or(".", |(parent, _)| parent)
         )
     } else if pruned.reason == crate::content_reader::CONFIGURED_EXCLUDE_REASON {
         "directory pruned before enumeration by a configured `[[repos]] exclude` \

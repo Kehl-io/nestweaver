@@ -157,10 +157,30 @@ pub fn find_bridge_nodes_bounded(store: &GraphStore, top_n: usize) -> Result<Bri
     } = brandes_sampled(&graph.adj, n);
 
     // Build bridge nodes.
+    //
+    // ZERO-DEGREE SYMBOLS ARE EXCLUDED, and this is a correctness fix rather
+    // than a tidy-up. `candidate_total` above counts symbols with at least one
+    // edge, but this list was built from EVERY symbol. A zero-degree symbol has
+    // betweenness 0.0 by definition — no path can run through it — so it TIES
+    // with every edge-bearing leaf, and `sort_by` is stable, so ties resolve by
+    // graph insertion order. A zero-degree symbol could therefore take a slot
+    // from a real candidate.
+    //
+    // That made `truncated()` LIE in the safe-looking direction: with symbols
+    // inserted `lone, s0, s1` and one edge `s0—s1`, `candidate_total` is 2, and
+    // `top_n = 2` returns `[lone, s0]` — `s1`, a candidate, was cut — while
+    // `truncated()` computed `2 > 2 == false` and published a cut answer as
+    // complete. It also let `returned` exceed `total`, which is not a ratio any
+    // consumer can use.
+    //
+    // `hubs` never had this because its heap key is degree-first, so a
+    // non-candidate can never outrank a candidate. Filtering here gives bridges
+    // the same property the two structs' shared docblock already claims.
     let mut bridges: Vec<BridgeNode> = graph
         .symbols
         .iter()
         .enumerate()
+        .filter(|(i, _)| !graph.adj[*i].is_empty())
         .map(|(i, sym)| BridgeNode {
             uid: sym.uid.clone(),
             name: sym.name.clone(),
@@ -526,11 +546,21 @@ mod tests {
         assert!(found.truncated(), "3 of 8 is a truncation");
     }
 
-    /// COUNTERWEIGHT. A ranking that was NOT cut must say so, including the
-    /// case where the caller asked for more than exists — there the heap pads
-    /// the tail with zero-degree symbols, so `bridges.len()` EXCEEDS
-    /// `candidate_total`, and a `!=` comparison would report truncation on a
-    /// complete answer.
+    /// COUNTERWEIGHT. A ranking that was NOT cut must say so, including the case
+    /// where the caller asked for more than exists.
+    ///
+    /// UPDATED when the zero-degree filter landed. This previously asserted that
+    /// asking for 50 returns all 10 SYMBOLS — the padded tail — and used that to
+    /// justify `truncated()` being `>` rather than `!=`. That padding was the
+    /// defect: a zero-degree symbol has betweenness 0.0, ties with every real
+    /// leaf, and won slots on insertion order, which let a CUT answer report
+    /// `truncated == false`. Now the ranking contains only candidates, so asking
+    /// for more than exists returns exactly the candidate population and
+    /// `returned` can never exceed `total`.
+    ///
+    /// `truncated()` remains `>` rather than `!=` deliberately: it is now
+    /// equivalent for bridges, and keeping the two structs' predicate identical
+    /// is worth more than tightening one of them.
     #[test]
     fn an_uncut_bridge_ranking_reports_no_truncation_even_when_asked_for_more() {
         let store = chain_store(8, 2);
@@ -544,8 +574,17 @@ mod tests {
         );
 
         let over = find_bridge_nodes_bounded(&store, 50).unwrap();
-        assert_eq!(over.bridges.len(), 10, "every symbol is returned");
+        assert_eq!(
+            over.bridges.len(),
+            8,
+            "asking for more than exists returns the CANDIDATE population, not every symbol — \
+             the two zero-degree symbols are not bridges and never were"
+        );
         assert_eq!(over.candidate_total, 8);
+        assert!(
+            over.bridges.len() <= over.candidate_total,
+            "`returned` may never exceed `total`"
+        );
         assert!(
             !over.truncated(),
             "asking for 50 and being given everything is not a truncation"
@@ -594,6 +633,54 @@ mod tests {
             found.sampled,
             "a {SAMPLE_LIMIT}-source estimate over {} nodes must be labelled one",
             SAMPLE_LIMIT + 20
+        );
+    }
+
+    /// nw-398, found by review. `truncated()` must be EXACT, not merely
+    /// plausible: it published a CUT answer as complete, because the ranking was
+    /// drawn from every symbol while `candidate_total` counted only those with
+    /// an edge.
+    ///
+    /// The fixture is the reviewer's: a zero-degree symbol inserted FIRST, then
+    /// a connected pair. Before the fix `lone` tied at 0.0 with the pair's leaf,
+    /// won on insertion order because `sort_by` is stable, and `top_n = 2`
+    /// returned `[lone, s0]` while reporting `truncated == false`.
+    #[test]
+    fn a_zero_degree_symbol_cannot_take_a_candidates_slot_and_hide_the_cut() {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["lone", "s0", "s1"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}"), "src/lib.rs"))
+                .unwrap();
+        }
+        store.insert_edge(&make_edge("s0", "s1")).unwrap();
+
+        let found = find_bridge_nodes_bounded(&store, 2).expect("bridges");
+        let names: Vec<&str> = found.bridges.iter().map(|b| b.uid.as_str()).collect();
+        assert!(
+            !names.contains(&"lone"),
+            "a zero-degree symbol can never be a bridge — no path runs through it: {names:?}"
+        );
+        assert_eq!(
+            found.candidate_total, 2,
+            "only edge-bearing symbols are candidates"
+        );
+        assert!(
+            !found.truncated(),
+            "asking for both candidates is a COMPLETE answer, not a truncated one"
+        );
+
+        // COUNTERWEIGHT: asking for fewer than the candidate population must
+        // still report the cut. Without it, excluding everything would satisfy
+        // the assertion above.
+        let cut = find_bridge_nodes_bounded(&store, 1).expect("bridges");
+        assert!(
+            cut.truncated(),
+            "one of two candidates is a cut and must say so"
+        );
+        assert!(
+            cut.bridges.len() <= cut.candidate_total,
+            "`returned` may never exceed `total` — that ratio is meaningless to a consumer"
         );
     }
 }
