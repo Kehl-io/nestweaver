@@ -908,17 +908,19 @@ fn apply_proposals(
     notes: &[nestweaver_schema::Note],
 ) -> Result<ApplyProposalsOutcome> {
     let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
-    let vault_roots: HashMap<&str, &Path> = vaults
+    let vault_roots: HashMap<&str, PathBuf> = vaults
         .iter()
-        .map(|v| (v.uid.as_str(), Path::new(v.root_path.as_str())))
-        .collect();
+        .map(|v| {
+            validate_vault_root(Path::new(v.root_path.as_str())).map(|root| (v.uid.as_str(), root))
+        })
+        .collect::<Result<_>>()?;
     let note_by_uid: HashMap<&str, &nestweaver_schema::Note> =
         notes.iter().map(|n| (n.uid.as_str(), n)).collect();
 
     // Loading and validating every existing journal is part of preflight. A
     // corrupt or foreign journal must stop application before any new note is
     // moved.
-    let mut entries = load_consolidation_journals(&vaults)?;
+    let mut entries = load_consolidation_journals(&vaults, &vault_roots)?;
     // Prepare every fresh proposal in memory first. This catches ambiguous
     // same-source/same-destination batches and all current read/path failures
     // before publishing even the first Prepared checkpoint.
@@ -958,7 +960,7 @@ fn apply_proposals(
         }
         let journal = prepare_consolidation_journal(proposal, note, vault_root, &note_by_uid)?;
         new_entries.push(JournalEntry {
-            vault_root: (*vault_root).to_path_buf(),
+            vault_root: vault_root.clone(),
             path,
             journal,
         });
@@ -1216,7 +1218,7 @@ fn validate_vault_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn validate_vault_root(vault_root: &Path) -> Result<()> {
+fn validate_vault_root(vault_root: &Path) -> Result<PathBuf> {
     let absolute = if vault_root.is_absolute() {
         vault_root.to_path_buf()
     } else {
@@ -1224,41 +1226,26 @@ fn validate_vault_root(vault_root: &Path) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("resolve current directory: {error}"))?
             .join(vault_root)
     };
-    let mut current = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !current.pop() {
-                    anyhow::bail!(
-                        "vault root escapes its filesystem root: {}",
-                        vault_root.display()
-                    );
-                }
-            }
-            Component::Normal(name) => {
-                current.push(name);
-                let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
-                    anyhow::anyhow!(
-                        "inspect vault root component {}: {error}",
-                        current.display()
-                    )
-                })?;
-                if metadata.file_type().is_symlink() {
-                    anyhow::bail!("vault root component is a symlink: {}", current.display());
-                }
-                if !metadata.is_dir() {
-                    anyhow::bail!(
-                        "vault root component is not a directory: {}",
-                        current.display()
-                    );
-                }
-            }
-        }
+    // `symlink_metadata("alias/")` follows `alias` on POSIX because the
+    // trailing separator requires directory traversal. Rebuild the lexical
+    // spelling from components first so the final component is always checked
+    // without a trailing separator or terminal `/.` bypass.
+    let lexical_root: PathBuf = absolute.components().collect();
+    let metadata = std::fs::symlink_metadata(&lexical_root).map_err(|error| {
+        anyhow::anyhow!("inspect vault root {}: {error}", lexical_root.display())
+    })?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("vault root is a symlink: {}", lexical_root.display());
     }
-    Ok(())
+    if !metadata.is_dir() {
+        anyhow::bail!("vault root is not a directory: {}", lexical_root.display());
+    }
+    std::fs::canonicalize(&lexical_root).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize vault root {}: {error}",
+            lexical_root.display()
+        )
+    })
 }
 
 /// Resolve one validated vault-relative path after rejecting symlinks and
@@ -1266,8 +1253,8 @@ fn validate_vault_root(vault_root: &Path) -> Result<()> {
 /// but an existing leaf is never allowed to be a symlink.
 fn validated_vault_path(vault_root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
     let relative = validate_vault_relative_path(relative)?;
-    validate_vault_root(vault_root)?;
-    let mut current = vault_root.to_path_buf();
+    let vault_root = validate_vault_root(vault_root)?;
+    let mut current = vault_root.clone();
     if let Some(parent) = relative.parent() {
         for component in parent.components() {
             let Component::Normal(name) = component else {
@@ -1334,8 +1321,7 @@ fn ensure_journal_directory(vault_root: &Path) -> Result<()> {
 
 fn ensure_vault_directory(vault_root: &Path, relative: &Path) -> Result<()> {
     let relative = validate_vault_relative_path(relative)?;
-    validate_vault_root(vault_root)?;
-    let mut current = vault_root.to_path_buf();
+    let mut current = validate_vault_root(vault_root)?;
     for component in relative.components() {
         let Component::Normal(name) = component else {
             unreachable!("validated path contains only normal components");
@@ -1415,10 +1401,18 @@ fn write_consolidation_journal(
         })
 }
 
-fn load_consolidation_journals(vaults: &[nestweaver_schema::Vault]) -> Result<Vec<JournalEntry>> {
+fn load_consolidation_journals(
+    vaults: &[nestweaver_schema::Vault],
+    vault_roots: &HashMap<&str, PathBuf>,
+) -> Result<Vec<JournalEntry>> {
     let mut entries = Vec::new();
     for vault in vaults {
-        let vault_root = Path::new(&vault.root_path);
+        let vault_root = vault_roots.get(vault.uid.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot load consolidation journals: vault uid '{}' has no snapshotted root",
+                vault.uid
+            )
+        })?;
         let directory = validated_vault_path(
             vault_root,
             Path::new(CONSOLIDATION_JOURNAL_DIR),
@@ -1499,7 +1493,7 @@ fn load_consolidation_journals(vaults: &[nestweaver_schema::Vault]) -> Result<Ve
                 })?;
             validate_loaded_journal(&journal, &vault.uid, vault_root, &path)?;
             entries.push(JournalEntry {
-                vault_root: vault_root.to_path_buf(),
+                vault_root: vault_root.clone(),
                 path,
                 journal,
             });
@@ -2568,6 +2562,85 @@ mod tests {
 
     fn read_test_journal(path: &Path) -> ConsolidationJournal {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_root_canonicalizes_platform_ancestor_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let real_vault = real_parent.join("vault");
+        fs::create_dir_all(&real_vault).unwrap();
+        fs::write(real_vault.join("note.md"), "# Note\n").unwrap();
+        let alias_parent = dir.path().join("platform-alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let resolved = validated_vault_path(
+            &alias_parent.join("vault"),
+            Path::new("note.md"),
+            "fixture note",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(real_vault.join("note.md")).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_root_rejects_a_final_symlink_even_with_a_trailing_separator() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_vault = dir.path().join("real-vault");
+        fs::create_dir(&real_vault).unwrap();
+        let alias = dir.path().join("vault-alias");
+        symlink(&real_vault, &alias).unwrap();
+        let trailing = PathBuf::from(format!("{}/", alias.display()));
+
+        let error = validate_vault_root(&trailing).unwrap_err();
+        assert!(error.to_string().contains("vault root is a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_recovery_uses_one_snapshotted_physical_vault_root() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root, store, journal) = journal_fixture();
+        let journal_path = persist_test_journal(&root, &journal);
+        let root_name = root.file_name().unwrap();
+        let alias_parent = dir.path().join("platform-alias");
+        symlink(dir.path(), &alias_parent).unwrap();
+        let configured_root = alias_parent.join(root_name);
+
+        let mut vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        vaults[0].root_path = configured_root.display().to_string();
+        let vault_roots: HashMap<&str, PathBuf> = vaults
+            .iter()
+            .map(|vault| {
+                (
+                    vault.uid.as_str(),
+                    validate_vault_root(Path::new(&vault.root_path)).unwrap(),
+                )
+            })
+            .collect();
+
+        fs::remove_file(&alias_parent).unwrap();
+        let other_parent = dir.path().join("other-parent");
+        fs::create_dir(&other_parent).unwrap();
+        fs::create_dir(other_parent.join(root_name)).unwrap();
+        symlink(&other_parent, &alias_parent).unwrap();
+
+        let entries = load_consolidation_journals(&vaults, &vault_roots).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, journal_path);
+        assert_eq!(entries[0].vault_root, fs::canonicalize(&root).unwrap());
     }
 
     #[cfg(unix)]

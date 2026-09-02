@@ -2137,7 +2137,15 @@ impl GraphStore {
                 "embedding identity is unreadable: {}; repair or re-embed from verified database metadata before semantic search or embedding writes",
                 identity_errors.join("; ")
             );
-            tracing::warn!(%message, "semantic subsystem is degraded");
+            // Keep the exact source chain available to typed semantic
+            // operations, but do not spray backend binder/parser text during
+            // an otherwise unrelated graph-only command. That output can
+            // contain implementation details and can obscure the command's
+            // own classified database diagnostic (for example, a schema-less
+            // zero-byte database).
+            tracing::warn!(
+                "semantic subsystem is degraded; typed semantic operations will return repair guidance"
+            );
             *self
                 .embedding_identity_error
                 .lock()

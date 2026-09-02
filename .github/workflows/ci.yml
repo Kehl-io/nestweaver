@@ -383,18 +383,22 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          OUTPUT_DIR="${OUTPUT_DIR:-$RUNNER_TEMP/nestweaver-metal-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}}"
           mkdir -p "$OUTPUT_DIR"
           BIN="$PWD/target/release/nestweaver"
           "$BIN" diagnostics capabilities --json \
             >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
-          "$BIN" daemon --db "$TARGET_DB" status \
-            >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
-          DAEMON_LOG="$RUNTIME_DIR/daemon.log"
-          if [ -f "$DAEMON_LOG" ]; then
-            cp "$DAEMON_LOG" "$OUTPUT_DIR/daemon.log"
+          if [ -n "${TARGET_DB:-}" ]; then
+            "$BIN" daemon --db "$TARGET_DB" status \
+              >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
           fi
-          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
-            >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+          if [ -n "${RUNTIME_DIR:-}" ] && [ -f "$RUNTIME_DIR/daemon.log" ]; then
+            cp "$RUNTIME_DIR/daemon.log" "$OUTPUT_DIR/daemon.log"
+          fi
+          if [ -n "${INSTANCE_ID:-}" ]; then
+            launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+              >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+          fi
       - name: Upload Metal smoke evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

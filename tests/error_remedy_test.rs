@@ -791,9 +791,12 @@ fn repair_still_names_a_lock_that_is_genuinely_held() {
 
     let output = direct().args(["repair", "--db"]).arg(&db).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let border_free = stderr.replace('│', " ");
+    let normalized = border_free.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!output.status.success(), "a held writer must refuse repair");
     assert!(
-        stderr.contains("write lock"),
-        "a genuinely held lock must still be reported as one: {stderr}"
+        normalized.contains("holds the write lease for"),
+        "a genuinely held writer authority must still be reported: {stderr}"
     );
     drop(dir);
 }

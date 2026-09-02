@@ -29644,9 +29644,10 @@ fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// The lease is the same one `index`, `watch`, `embed`, `brain watch`, the
 /// vault commands, the Tantivy rebuild and the daemon itself take. It combines
 /// lbug-compatible database ownership with descriptor-scoped database and
-/// sidecar locks, while restore additionally closes the stable parent
-/// namespace before enumeration. The kernel releases every claim on process
-/// exit, so there is no stale ownership record to reap.
+/// sidecar locks, while restore additionally closes the stable namespaces for
+/// both the live and rename-aside data directories before enumeration. The
+/// kernel releases every claim on process exit, so there is no stale ownership
+/// record to reap.
 ///
 /// A probe answers "was anyone holding this a moment ago". Only a HELD lease
 /// answers "is anyone holding this for as long as I am deleting their data",
@@ -29656,31 +29657,45 @@ fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
               is precisely the one in which the data directory is renamed aside \
               and unlinked"]
 fn require_exclusive_restore_access(data_dir: &Path) -> anyhow::Result<RestoreWriteAuthority> {
-    // Close the namespace before the first enumeration. Every upgraded
-    // database creator takes a shared claim on this stable parent inode before
-    // creating/opening its database; restore takes the exclusive form. Unlike
-    // a lock on `data_dir` itself, renaming that directory cannot swap this
-    // authority onto an obsolete inode.
-    let namespace = match nestweaver_daemon::lifecycle::acquire_db_namespace_lease(data_dir) {
-        Ok(lease) => lease,
-        Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held) => anyhow::bail!(
-            "cannot restore a backup over {}: a writer holds the database namespace write lease; stop every writer and retry",
-            data_dir.display()
-        ),
-        Err(nestweaver_daemon::lifecycle::WriteLeaseError::Unavailable(error)) => {
-            anyhow::bail!(
-                "cannot prove exclusive ownership of the database namespace containing {}: {error}; refusing destructive restore",
-                data_dir.display()
-            )
+    // Close both namespaces before the first enumeration. Every upgraded
+    // database creator takes a shared claim on a stable lock file in its data
+    // directory's parent before creating/opening a database; restore takes the
+    // exclusive form for both the live directory and the `.restoring`
+    // rename-aside directory it reconciles. Each file is keyed by the exact
+    // data-directory name, so unrelated siblings remain independent.
+    let mut namespaces = Vec::with_capacity(2);
+    for namespace_dir in [data_dir.to_path_buf(), data_dir.with_extension("restoring")] {
+        match nestweaver_daemon::lifecycle::acquire_db_namespace_lease(&namespace_dir) {
+            Ok(lease) => namespaces.push(lease),
+            Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held) => anyhow::bail!(
+                "cannot restore a backup over {}: a writer holds the database namespace write lease for {}; stop every writer and retry",
+                data_dir.display(),
+                namespace_dir.display()
+            ),
+            Err(nestweaver_daemon::lifecycle::WriteLeaseError::Unavailable(error)) => {
+                anyhow::bail!(
+                    "cannot prove exclusive ownership of the database namespace containing {}: {error}; refusing destructive restore",
+                    namespace_dir.display()
+                )
+            }
         }
-    };
+    }
     let targets = restore_lease_targets(data_dir)?;
     let leases = targets
         .iter()
         .map(|db| {
+            let namespace = namespaces
+                .iter()
+                .find(|namespace| namespace.authorizes(db))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no held restore namespace covers incumbent database {}",
+                        db.display()
+                    )
+                })?;
             match nestweaver_daemon::lifecycle::acquire_db_write_lease_under_namespace(
                 db,
-                &namespace,
+                namespace,
             ) {
                 Ok(lease) => Ok(lease),
                 Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held) => anyhow::bail!(
@@ -29707,7 +29722,7 @@ fn require_exclusive_restore_access(data_dir: &Path) -> anyhow::Result<RestoreWr
     );
 
     Ok(RestoreWriteAuthority {
-        _namespace: namespace,
+        _namespaces: namespaces,
         _leases: leases,
     })
 }
@@ -29715,9 +29730,9 @@ fn require_exclusive_restore_access(data_dir: &Path) -> anyhow::Result<RestoreWr
 #[must_use = "dropping this authority reopens the restore namespace"]
 #[derive(Debug)]
 struct RestoreWriteAuthority {
-    // Drop database leases before the enclosing namespace authority.
+    // Drop database leases before the enclosing namespace authorities.
     _leases: Vec<nestweaver_daemon::lifecycle::DbWriteLease>,
-    _namespace: nestweaver_daemon::lifecycle::DbNamespaceLease,
+    _namespaces: Vec<nestweaver_daemon::lifecycle::DbNamespaceLease>,
 }
 
 /// Run the destructive restore phase under exact database and namespace
@@ -32734,7 +32749,7 @@ mod restore_guard_tests {
         let restoring = data_dir.path().with_extension("restoring");
         std::fs::create_dir_all(&restoring).unwrap();
         std::fs::write(restoring.join("graph.lbug"), b"aside").unwrap();
-        let _held = require_exclusive_store_access(
+        let held = require_exclusive_store_access(
             &restoring.join("graph.lbug"),
             "hold the aside database",
         )
@@ -32743,6 +32758,25 @@ mod restore_guard_tests {
         let error = require_exclusive_restore_access(data_dir.path())
             .expect_err("a writer on the aside copy must stop the restore");
         assert!(error.to_string().contains("write lease"), "err: {error}");
+
+        drop(held);
+        let authority = require_exclusive_restore_access(data_dir.path())
+            .expect("a free aside database must be covered by restore authority");
+        assert_eq!(
+            authority.len(),
+            2,
+            "restore must lease the live fixture database and the free aside database"
+        );
+        let late_db = restoring.join("late.lbug");
+        assert!(matches!(
+            nestweaver_daemon::lifecycle::acquire_db_write_lease(&late_db),
+            Err(nestweaver_daemon::lifecycle::WriteLeaseError::Held)
+        ));
+        assert!(
+            !late_db.exists(),
+            "a late aside creator must lose namespace admission before file creation"
+        );
+        drop(authority);
 
         let _ = std::fs::remove_dir_all(&restoring);
     }

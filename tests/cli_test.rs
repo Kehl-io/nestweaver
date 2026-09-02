@@ -1695,6 +1695,7 @@ fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
     let evidence = workflow_step(job, "Collect Metal smoke evidence");
     for required in [
         "if: failure()",
+        "OUTPUT_DIR=\"${OUTPUT_DIR:-$RUNNER_TEMP/nestweaver-metal-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}}\"",
         "diagnostics capabilities --json",
         "daemon.log",
     ] {
@@ -1708,6 +1709,7 @@ fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
         "if: failure()",
         "actions/upload-artifact@",
         "metal-smoke-evidence",
+        "${{ runner.temp }}/nestweaver-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}-metal-smoke",
     ] {
         assert!(
             upload.contains(required),

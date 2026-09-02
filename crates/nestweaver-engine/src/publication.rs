@@ -734,6 +734,42 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".publications")
 }
 
+/// POSIX record locks do not conflict with another descriptor in the same
+/// process. Claim the canonical root before opening its lock file so a second
+/// in-process publication operation cannot slip past that compatibility gate.
+/// Spawned children are expected to exec before entering NestWeaver code; a
+/// fork-only child inherits a stale copy of this process-local registry.
+static PROCESS_PUBLICATION_ROOTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Debug)]
+struct ProcessPublicationRootClaim {
+    path: PathBuf,
+}
+
+impl ProcessPublicationRootClaim {
+    fn acquire(path: &Path) -> Option<Self> {
+        let mut claimed = PROCESS_PUBLICATION_ROOTS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claimed.insert(path.to_path_buf()).then(|| Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ProcessPublicationRootClaim {
+    fn drop(&mut self) {
+        PROCESS_PUBLICATION_ROOTS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
 /// Cross-process exclusion for one publication root.
 ///
 /// The `IndexPublicationLease` is an in-process coordinator — a `Mutex` plus a
@@ -752,15 +788,21 @@ pub fn default_publication_root(db_path: &Path) -> PathBuf {
 #[derive(Debug)]
 pub struct PublicationRootLock {
     _file: std::fs::File,
+    root: PathBuf,
     path: PathBuf,
+    // Declared last so the OS lock closes before another thread in this
+    // process can claim the root.
+    _process_claim: ProcessPublicationRootClaim,
 }
 
 impl PublicationRootLock {
     /// Take the lock, or fail fast if another operation holds it.
     ///
-    /// Deliberately non-blocking: a publication rebuild can run for minutes, and
-    /// a CLI that silently hangs behind one is worse than a CLI that says who is
-    /// holding it and exits.
+    /// A live external owner is refused without queueing: a publication rebuild
+    /// can run for minutes, and a CLI must report that contention rather than
+    /// silently wait. On Unix, acquisition may retry for at most 500 ms after a
+    /// non-inherited POSIX lock proves that the only remaining contention is a
+    /// stale flock description in another thread's fork-before-exec window.
     pub fn acquire(publication_root: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(publication_root).with_context(|| {
             format!(
@@ -768,7 +810,16 @@ impl PublicationRootLock {
                 publication_root.display()
             )
         })?;
-        let path = publication_root.join("LOCK");
+        let canonical_root = std::fs::canonicalize(publication_root).with_context(|| {
+            format!(
+                "resolve publication root {} for locking",
+                publication_root.display()
+            )
+        })?;
+        let path = canonical_root.join("LOCK");
+        let process_claim = ProcessPublicationRootClaim::acquire(&path).ok_or_else(|| {
+            publication_lock_contention(&path, std::io::ErrorKind::WouldBlock.into())
+        })?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -776,20 +827,92 @@ impl PublicationRootLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open publication lock {}", path.display()))?;
-        file.try_lock().map_err(|error| {
-            anyhow::anyhow!(
-                "another publication operation holds {} ({error}); wait for it to finish, \
-                 or check `nestweaver publication status`",
-                path.display()
-            )
-        })?;
-        Ok(Self { _file: file, path })
+        lock_publication_file(&file).map_err(|error| publication_lock_contention(&path, error))?;
+        Ok(Self {
+            _file: file,
+            root: canonical_root,
+            path,
+            _process_claim: process_claim,
+        })
     }
 
     /// The lock file backing this guard, for diagnostics.
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether this guard covers exactly this publication root after resolving
+    /// relative paths and symlink aliases.
+    pub fn authorizes(&self, publication_root: &Path) -> bool {
+        std::fs::canonicalize(publication_root).is_ok_and(|root| root == self.root)
+    }
+
+    fn ensure_authorizes(&self, publication_root: &Path) -> anyhow::Result<&Path> {
+        if self.authorizes(publication_root) {
+            Ok(&self.root)
+        } else {
+            anyhow::bail!(
+                "publication root lock for {} does not authorize {}",
+                self.root.display(),
+                publication_root.display()
+            )
+        }
+    }
+}
+
+fn publication_lock_contention(path: &Path, error: std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "another publication operation holds {} ({error}); wait for it to finish, \
+         or check `nestweaver publication status`",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn lock_publication_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // A POSIX record lock is not inherited across fork. It therefore remains
+    // the fail-fast authority for a live external process even when a child
+    // briefly retains the previous owner's flock description before exec.
+    let mut record_lock: libc::flock = unsafe { std::mem::zeroed() };
+    record_lock.l_type = libc::F_WRLCK as libc::c_short;
+    record_lock.l_whence = libc::SEEK_SET as libc::c_short;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &record_lock) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN)
+        {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        } else {
+            Err(error)
+        };
+    }
+
+    // `flock` is tied to the open file description and that description is
+    // inherited by fork. Rust descriptors are CLOEXEC, but another thread's
+    // child can keep a just-dropped owner's lock alive until exec. Retry only
+    // after the non-inherited POSIX authority above succeeds; a genuine live
+    // external owner still fails immediately at that first gate.
+    for attempt in 0..=100 {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < 100 => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    unreachable!("bounded publication flock retry always returns")
+}
+
+#[cfg(not(unix))]
+fn lock_publication_file(file: &std::fs::File) -> std::io::Result<()> {
+    file.try_lock().map_err(Into::into)
 }
 
 /// One slot considered by [`prune_slots`].
@@ -872,10 +995,10 @@ pub fn prune_slots(
     // discard — and what stops a cutover landing between the CURRENT read below
     // and the deletes further down, which would reclaim the slot that cutover
     // had just selected.
-    debug_assert!(
-        lock.path().starts_with(publication_root),
-        "the lock must guard the root being pruned"
-    );
+    // Continue through the canonical root held by the guard. Besides making
+    // authorization exact in release builds, this keeps a symlink alias from
+    // being retargeted between the coverage check and the filesystem work.
+    let publication_root = lock.ensure_authorizes(publication_root)?;
     let slots_dir = publication_root.join("slots");
     let entries = match std::fs::read_dir(&slots_dir) {
         Ok(entries) => entries,
@@ -1380,8 +1503,9 @@ pub fn rollback_current_under_lock(
     publication_root: &Path,
     lease: &nestweaver_store::IndexPublicationLease<'_>,
     expected_current: &str,
-    _root_lock: &PublicationRootLock,
+    root_lock: &PublicationRootLock,
 ) -> anyhow::Result<Option<CurrentPublicationPointer>> {
+    let publication_root = root_lock.ensure_authorizes(publication_root)?;
     lease
         .ensure_clean_for_snapshot()
         .map_err(|error| anyhow::anyhow!("refusing CURRENT rollback from dirty graph: {error}"))?;
@@ -2112,29 +2236,138 @@ mod tests {
             "the refusal must name the contention: {error}"
         );
 
-        // Cross-PROCESS, not merely cross-handle: a child that tries the same
-        // root must also be refused while this process holds it.
-        let probe = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "exec 9>>'{}' && flock -n 9 && echo FREE || echo HELD",
-                root.join("LOCK").display()
-            ))
-            .output();
-        if let Ok(probe) = probe {
-            let observed = String::from_utf8_lossy(&probe.stdout);
-            // `flock(1)` is absent on macOS; only assert where it exists.
-            if observed.contains("HELD") || observed.contains("FREE") {
-                assert!(
-                    observed.contains("HELD"),
-                    "another process must observe the lock as held: {observed}"
-                );
-            }
-        }
+        // Cross-PROCESS, through the production API rather than a platform
+        // shell utility: exec a fresh copy of this test binary and have its
+        // focused child test attempt the same canonical root.
+        let probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("publication::tests::publication_root_lock_child_probe")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("NESTWEAVER_PUBLICATION_LOCK_PROBE_ROOT", &root)
+            .output()
+            .expect("run publication lock child probe");
+        assert!(
+            probe.status.success(),
+            "another process must observe the production lock as held\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&probe.stdout).contains("running 1 test"),
+            "the exact child probe must actually run\nstdout:\n{}",
+            String::from_utf8_lossy(&probe.stdout)
+        );
 
         drop(held);
         PublicationRootLock::acquire(&root)
             .expect("the lock must be released when its guard drops");
+    }
+
+    #[test]
+    fn publication_root_lock_child_probe() {
+        let Some(root) = std::env::var_os("NESTWEAVER_PUBLICATION_LOCK_PROBE_ROOT") else {
+            return;
+        };
+        let error = PublicationRootLock::acquire(Path::new(&root))
+            .expect_err("the parent process must retain publication-root ownership");
+        assert!(
+            error.to_string().contains("another publication operation"),
+            "the production API must report cross-process contention: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_lock_description_does_not_outlive_publication_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("brain.lbug.publications");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("LOCK");
+        let owner = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        lock_publication_file(&owner).unwrap();
+
+        // A cloned descriptor shares the same open file description, exactly
+        // as a forked child does before exec. Closing `owner` releases the
+        // process-scoped POSIX lock, but the clone keeps flock alive briefly.
+        let inherited = owner.try_clone().unwrap();
+        drop(owner);
+        let child_window = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(inherited);
+        });
+
+        let replacement = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        lock_publication_file(&replacement)
+            .expect("a stale inherited flock must not manufacture live publication contention");
+        child_window.join().unwrap();
+    }
+
+    #[test]
+    fn publication_root_authorization_is_canonical_and_exact() {
+        let relative_parent = tempfile::Builder::new()
+            .prefix("publication-relative-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_root = relative_parent
+            .path()
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .join("publications");
+        assert!(
+            relative_root.is_relative(),
+            "fixture must exercise a relative root"
+        );
+        std::fs::create_dir(&relative_root).unwrap();
+        let lock = PublicationRootLock::acquire(&relative_root).unwrap();
+        assert!(lock.authorizes(&relative_root));
+        assert!(
+            prune_slots(&relative_root, &lock, true)
+                .unwrap()
+                .slots
+                .is_empty()
+        );
+
+        let unrelated = relative_parent.path().join("unrelated-publications");
+        std::fs::create_dir(&unrelated).unwrap();
+        assert!(!lock.authorizes(&unrelated));
+        let error = prune_slots(&unrelated, &lock, true).unwrap_err();
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "wrong-root prune must fail closed: {error}"
+        );
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        let error = rollback_current_under_lock(&unrelated, &lease, "unused", &lock).unwrap_err();
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "wrong-root rollback must fail before inspecting the target: {error}"
+        );
+        lease.release().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_root_authorization_accepts_a_symlink_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("publications");
+        let alias = dir.path().join("publications-alias");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+        let lock = PublicationRootLock::acquire(&alias).unwrap();
+        assert!(lock.authorizes(&alias));
+        assert!(lock.authorizes(&root));
+        assert!(prune_slots(&alias, &lock, true).unwrap().slots.is_empty());
     }
 
     #[test]

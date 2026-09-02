@@ -114,19 +114,20 @@ pub struct DbWriteLease {
 }
 
 /// Exclusive authority over creation/removal of databases below one stable
-/// directory namespace. Destructive directory replacement (restore) takes
-/// this before enumeration; ordinary database writers take a shared lock on
-/// the same ancestor as part of [`acquire_db_write_lease`].
+/// data-directory namespace. Destructive directory replacement (restore)
+/// takes this before enumeration; ordinary database writers take a shared
+/// lock on the same stable per-directory file as part of
+/// [`acquire_db_write_lease`].
 #[must_use = "the namespace lease must be held across enumeration and cutover"]
 #[derive(Debug)]
 pub struct DbNamespaceLease {
     _file: std::fs::File,
-    root: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl DbNamespaceLease {
     pub fn authorizes(&self, db_path: &Path) -> bool {
-        namespace_root_for_db(db_path).is_some_and(|root| root == self.root)
+        data_dir_for_db(db_path).is_some_and(|data_dir| data_dir == self.data_dir)
     }
 }
 
@@ -147,7 +148,9 @@ pub enum WriteLeaseError {
     Unavailable(std::io::Error),
 }
 
-/// Acquire the canonical exclusive writer authority without blocking.
+/// Acquire the canonical exclusive writer authority without queueing behind a
+/// live external canonical owner. Acquisition may briefly retry an inherited
+/// `flock` left in the fork-before-exec window of another thread.
 pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLeaseError> {
     acquire_db_write_lease_inner(db_path, None)
 }
@@ -169,55 +172,96 @@ pub fn acquire_db_write_lease_under_namespace(
 }
 
 /// Exclusively close the database-creation namespace for a destructive
-/// replacement of `data_dir`. The locked inode is the stable parent of the
-/// directory being replaced, so renaming `data_dir` cannot swap the lock out
-/// from under the operation.
+/// replacement of `data_dir`. The locked file lives in the stable parent and
+/// is keyed by the directory being replaced, so renaming `data_dir` cannot
+/// swap the lock out from under the operation and unrelated sibling data
+/// directories do not block one another.
 pub fn acquire_db_namespace_lease(data_dir: &Path) -> Result<DbNamespaceLease, WriteLeaseError> {
-    let canonical = canonical_db_path(data_dir);
-    let root = canonical.parent().ok_or_else(|| {
+    let data_dir = canonical_db_path(data_dir);
+    let lease_path = namespace_lease_path(&data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lease_path)
+        .map_err(WriteLeaseError::Unavailable)?;
+    // The POSIX record lock is not inherited across fork. Take it first so a
+    // live external namespace owner still fails immediately, while the flock
+    // retry below can be limited to same-process ownership or the brief
+    // fork-before-exec interval of an otherwise finished owner.
+    lock_posix_nonblocking(&file, libc::F_WRLCK as libc::c_short)?;
+    lock_flock_after_posix_authority(&file, libc::LOCK_EX)?;
+    Ok(DbNamespaceLease {
+        _file: file,
+        data_dir,
+    })
+}
+
+fn namespace_lease_path(data_dir: &Path) -> Result<PathBuf, WriteLeaseError> {
+    let parent = data_dir.parent().ok_or_else(|| {
         WriteLeaseError::Unavailable(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "database directory has no stable parent namespace",
         ))
     })?;
-    let file = std::fs::File::open(root).map_err(WriteLeaseError::Unavailable)?;
-    lock_flock_nonblocking(&file, libc::LOCK_EX)?;
-    Ok(DbNamespaceLease {
-        _file: file,
-        root: root.to_path_buf(),
-    })
+    let name = data_dir.file_name().ok_or_else(|| {
+        WriteLeaseError::Unavailable(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "database directory has no stable namespace name",
+        ))
+    })?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".nestweaver-write-namespace.lock");
+    Ok(parent.join(lock_name))
 }
 
 fn acquire_db_write_lease_inner(
     db_path: &Path,
     namespace: Option<&DbNamespaceLease>,
 ) -> Result<DbWriteLease, WriteLeaseError> {
-    use std::os::unix::io::AsRawFd;
-
     let db_path = canonical_db_path(db_path);
     // This must precede every database open. See PROCESS_DB_LEASES: even a
     // descriptor that never called F_SETLK would release the incumbent
     // process's record lock when the failed acquisition closed it.
     let process_claim = ProcessDbLeaseClaim::acquire(&db_path)?;
     let lease_path = write_lease_path(&db_path);
-    if let Some(parent) = db_path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent).map_err(WriteLeaseError::Unavailable)?;
-    }
     let namespace_file = if namespace.is_some() {
         None
     } else {
-        let root = namespace_root_for_db(&db_path).ok_or_else(|| {
+        let data_dir = data_dir_for_db(&db_path).ok_or_else(|| {
             WriteLeaseError::Unavailable(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "database path has no stable namespace ancestor",
             ))
         })?;
-        let file = std::fs::File::open(root).map_err(WriteLeaseError::Unavailable)?;
-        lock_flock_nonblocking(&file, libc::LOCK_SH)?;
+        if let Some(stable_parent) = data_dir.parent()
+            && !stable_parent.exists()
+        {
+            std::fs::create_dir_all(stable_parent).map_err(WriteLeaseError::Unavailable)?;
+        }
+        let lease_path = namespace_lease_path(&data_dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lease_path)
+            .map_err(WriteLeaseError::Unavailable)?;
+        lock_posix_nonblocking(&file, libc::F_RDLCK as libc::c_short)?;
+        lock_flock_after_posix_authority(&file, libc::LOCK_SH)?;
         Some(file)
     };
+    // The data directory may have been absent, or restore may have renamed it
+    // away immediately before this acquisition. Recreate it only after the
+    // shared namespace authority is held so a losing writer cannot leave an
+    // empty destination that obstructs restore cutover.
+    if let Some(parent) = db_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(WriteLeaseError::Unavailable)?;
+    }
     // The database descriptor is part of the authority, not merely a probe.
     // Open it first so every cooperating contender has the same lock order.
     // `create(true)` preserves the pre-open use case: callers intentionally
@@ -237,7 +281,7 @@ fn acquire_db_write_lease_inner(
     // POSIX locks are process-scoped, so a second descriptor in this process
     // would not conflict with the first. The additional flock is descriptor-
     // scoped and closes that same-process duplicate-authority hole.
-    lock_exclusive_nonblocking(&db_file)?;
+    lock_flock_after_posix_authority(&db_file, libc::LOCK_EX)?;
 
     let lease_file = std::fs::OpenOptions::new()
         .create(true)
@@ -246,13 +290,7 @@ fn acquire_db_write_lease_inner(
         .truncate(false)
         .open(&lease_path)
         .map_err(WriteLeaseError::Unavailable)?;
-    if unsafe { libc::flock(lease_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return match error.kind() {
-            std::io::ErrorKind::WouldBlock => Err(WriteLeaseError::Held),
-            _ => Err(WriteLeaseError::Unavailable(error)),
-        };
-    }
+    lock_flock_after_posix_authority(&lease_file, libc::LOCK_EX)?;
     Ok(DbWriteLease {
         _namespace_file: namespace_file,
         _db_file: db_file,
@@ -263,36 +301,47 @@ fn acquire_db_write_lease_inner(
     })
 }
 
-fn namespace_root_for_db(db_path: &Path) -> Option<PathBuf> {
+fn data_dir_for_db(db_path: &Path) -> Option<PathBuf> {
     let canonical = canonical_db_path(db_path);
-    canonical.parent()?.parent().map(Path::to_path_buf)
+    canonical.parent().map(Path::to_path_buf)
 }
 
-fn lock_flock_nonblocking(
+fn lock_flock_after_posix_authority(
     file: &std::fs::File,
     operation: libc::c_int,
 ) -> Result<(), WriteLeaseError> {
     use std::os::unix::io::AsRawFd;
 
-    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
-        return Ok(());
+    // `flock` follows the open file description across fork. Rust marks these
+    // descriptors CLOEXEC, but a child created by another thread can retain a
+    // just-dropped owner's description until exec completes. The preceding
+    // POSIX record lock is not inherited, so a live external canonical owner
+    // normally fails at that first gate. Bounded retry here covers inherited
+    // descriptions and retains the flock fallback for same-process authority.
+    for attempt in 0..=100 {
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(WriteLeaseError::Unavailable(error));
+        }
+        if attempt == 100 {
+            return Err(WriteLeaseError::Held);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let error = std::io::Error::last_os_error();
-    match error.kind() {
-        std::io::ErrorKind::WouldBlock => Err(WriteLeaseError::Held),
-        _ => Err(WriteLeaseError::Unavailable(error)),
-    }
+    unreachable!("bounded flock retry always returns")
 }
 
-fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), WriteLeaseError> {
-    lock_flock_nonblocking(file, libc::LOCK_EX)
-}
-
-fn lock_posix_write_nonblocking(file: &std::fs::File) -> Result<(), WriteLeaseError> {
+fn lock_posix_nonblocking(
+    file: &std::fs::File,
+    lock_type: libc::c_short,
+) -> Result<(), WriteLeaseError> {
     use std::os::unix::io::AsRawFd;
 
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_type = lock_type;
     lock.l_whence = libc::SEEK_SET as libc::c_short;
     lock.l_start = 0;
     lock.l_len = 0;
@@ -308,6 +357,10 @@ fn lock_posix_write_nonblocking(file: &std::fs::File) -> Result<(), WriteLeaseEr
     } else {
         Err(WriteLeaseError::Unavailable(error))
     }
+}
+
+fn lock_posix_write_nonblocking(file: &std::fs::File) -> Result<(), WriteLeaseError> {
+    lock_posix_nonblocking(file, libc::F_WRLCK as libc::c_short)
 }
 
 /// Non-mutating best-effort view of canonical writer ownership.
@@ -402,6 +455,28 @@ fn probe_posix_write_lock_state(path: &Path) -> WriteLeaseState {
 mod tests {
     use super::*;
 
+    fn await_write_lease_free(db: &Path) {
+        for _ in 0..100 {
+            let namespace_free = data_dir_for_db(db)
+                .and_then(|data_dir| namespace_lease_path(&data_dir).ok())
+                .is_some_and(|path| probe_flock_state(&path) == WriteLeaseState::Free);
+            if write_lease_state(db) == WriteLeaseState::Free && namespace_free {
+                return;
+            }
+            // Another parallel test may be between fork and exec. The forked
+            // child briefly inherits the open-file description; CLOEXEC drops
+            // it at exec, but an immediate probe can observe that real,
+            // transient ownership after the parent lease is dropped.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(write_lease_state(db), WriteLeaseState::Free);
+        let data_dir = data_dir_for_db(db).expect("database path has a data directory");
+        assert_eq!(
+            probe_flock_state(&namespace_lease_path(&data_dir).unwrap()),
+            WriteLeaseState::Free
+        );
+    }
+
     #[test]
     fn exact_authority_rejects_a_sibling_and_state_tracks_its_lifetime() {
         let dir = tempfile::tempdir().unwrap();
@@ -413,7 +488,107 @@ mod tests {
         assert!(!authority.authorizes(&sibling));
         assert_eq!(write_lease_state(&db), WriteLeaseState::Held);
         drop(authority);
-        assert_eq!(write_lease_state(&db), WriteLeaseState::Free);
+        await_write_lease_free(&db);
+    }
+
+    #[test]
+    fn destructive_namespaces_are_isolated_per_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let first_dir = root.path().join("first");
+        let second_dir = root.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+
+        let first = acquire_db_namespace_lease(&first_dir).unwrap();
+        let second = acquire_db_namespace_lease(&second_dir).unwrap();
+        assert!(matches!(
+            acquire_db_write_lease(&first_dir.join("blocked.lbug")),
+            Err(WriteLeaseError::Held)
+        ));
+        let second_db = second_dir.join("brain.lbug");
+        let second_writer = acquire_db_write_lease_under_namespace(&second_db, &second).unwrap();
+
+        assert!(first.authorizes(&first_dir.join("brain.lbug")));
+        assert!(!first.authorizes(&second_db));
+        assert!(second_writer.authorizes(&second_db));
+    }
+
+    #[test]
+    fn blocked_writer_does_not_recreate_a_restore_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let renamed = root.path().join("data-before-restore");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let namespace = acquire_db_namespace_lease(&data_dir).unwrap();
+        std::fs::rename(&data_dir, &renamed).unwrap();
+        assert!(matches!(
+            acquire_db_write_lease(&data_dir.join("brain.lbug")),
+            Err(WriteLeaseError::Held)
+        ));
+
+        assert!(namespace.authorizes(&data_dir.join("brain.lbug")));
+        assert!(
+            !data_dir.exists(),
+            "a writer that loses namespace admission must not obstruct restore cutover"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_cannot_create_false_writer_contention_after_owner_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fork-inheritance.lbug");
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork fixture failed");
+        if child == 0 {
+            // Keep every inherited flock description alive long enough for
+            // the parent to drop and reacquire its authority.
+            unsafe {
+                libc::usleep(50_000);
+                libc::_exit(0);
+            }
+        }
+
+        drop(authority);
+        let replacement = acquire_db_write_lease(&db).unwrap();
+        assert!(replacement.authorizes(&db));
+        drop(replacement);
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_cannot_create_false_namespace_contention_after_owner_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let namespace = acquire_db_namespace_lease(&data_dir).unwrap();
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork fixture failed");
+        if child == 0 {
+            unsafe {
+                libc::usleep(50_000);
+                libc::_exit(0);
+            }
+        }
+
+        drop(namespace);
+        let replacement = acquire_db_namespace_lease(&data_dir).unwrap();
+        assert!(replacement.authorizes(&data_dir.join("brain.lbug")));
+        drop(replacement);
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[cfg(unix)]
@@ -445,6 +620,19 @@ mod tests {
         ));
 
         drop(authority);
+        await_write_lease_free(&db);
+        let canonical = canonical_db_path(&db);
+        assert!(!ProcessDbLeaseClaim::is_held(&canonical));
+        assert_eq!(
+            probe_flock_state(&namespace_lease_path(dir.path()).unwrap()),
+            WriteLeaseState::Free
+        );
+        assert_eq!(probe_flock_state(&db), WriteLeaseState::Free);
+        assert_eq!(probe_posix_write_lock_state(&db), WriteLeaseState::Free);
+        assert_eq!(
+            probe_flock_state(&write_lease_path(&db)),
+            WriteLeaseState::Free
+        );
         let replacement = acquire_db_write_lease(&db).unwrap();
         assert!(replacement.authorizes(&db));
     }
