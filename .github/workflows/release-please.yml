@@ -474,9 +474,11 @@ jobs:
           fi
 
           echo "located release PR: ${NUM:-<none>} (${BRANCH:-<none>} @ ${HEAD_SHA:-<none>})"
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "number=$NUM"
+            echo "branch=$BRANCH"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
 
   prepare-release-lockfile:
     name: Prepare release lockfile without write authority
