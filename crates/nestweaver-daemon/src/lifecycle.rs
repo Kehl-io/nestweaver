@@ -1060,6 +1060,33 @@ pub fn write_lease_path(db_path: &Path) -> PathBuf {
 pub struct DbWriteLease {
     _file: std::fs::File,
     path: PathBuf,
+    /// nw-404. Arms the store's self-ownership latch for as long as this lease
+    /// lives.
+    ///
+    /// WHY IT IS NEEDED AT ALL: `flock` conflicts between open file
+    /// DESCRIPTIONS, not processes, so the store's live-writer probe opens a
+    /// second fd and gets `EWOULDBLOCK` against a lease THIS PROCESS ALREADY
+    /// HOLDS. Without the latch it therefore reads "another process is writing"
+    /// and retracts a `db_wal_corrupt` verdict — blaming a process that does not
+    /// exist and suppressing a real corruption report. `brain reindex-search` is
+    /// exactly that shape: it takes this lease, then opens the store read-only.
+    ///
+    /// THIS ONE SITE COVERS BOTH PRODUCERS — the daemon's boot lease and
+    /// `require_exclusive_store_access` — because both construct their claim
+    /// here. Dropping the lease clears the latch, so a stale `true` can never
+    /// outlive it and suppress corruption forever.
+    ///
+    /// **FIELD ORDER IS LOAD-BEARING — `_file` MUST be declared before this.**
+    /// Rust drops struct fields in declaration order, so the flock is released
+    /// FIRST and the latch clears second. That ordering is the safe one:
+    /// between the two, a probe sees "flock free, latch still set" -> treats the
+    /// lease as SELF-held -> does NOT veto -> a genuinely corrupt WAL is still
+    /// reported. Reversing the fields inverts it: "flock still held, latch
+    /// cleared" -> reads as ANOTHER process writing -> vetoes the verdict, which
+    /// silently suppresses a real corruption report for the duration of the
+    /// window. The two orderings fail in opposite directions and only one of
+    /// them fails safe.
+    _self_latch: nestweaver_store::SelfHeldWriteLease,
 }
 
 impl DbWriteLease {
@@ -1108,7 +1135,14 @@ pub fn acquire_db_write_lease(db_path: &Path) -> Result<DbWriteLease, WriteLease
             _ => Err(WriteLeaseError::Unavailable(error)),
         };
     }
-    Ok(DbWriteLease { _file: file, path })
+    // Arm the latch BEFORE returning, so no window exists in which the lease is
+    // held and the store would still call it another process's.
+    let _self_latch = nestweaver_store::note_self_held_write_lease(db_path);
+    Ok(DbWriteLease {
+        _file: file,
+        path,
+        _self_latch,
+    })
 }
 
 /// PID of the process on the other end of a connected unix socket, as

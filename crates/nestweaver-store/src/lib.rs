@@ -22,7 +22,9 @@ pub use db::{
     EmbeddingSnapshotState, GraphStore, IndexPublicationLease, PublicationIdentity,
 };
 pub use error::{
-    CancelReason, CorruptionKind, EngineCorruption, StoreError, classify_engine_corruption,
+    CancelReason, CorruptionKind, EngineCorruption, SelfHeldWriteLease, StoreError,
+    classify_engine_corruption, live_writer_holds_write_lease, note_self_held_write_lease,
+    self_holds_write_lease,
 };
 
 /// Re-export the LadybugDB connection type so callers can use transactional

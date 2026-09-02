@@ -769,19 +769,33 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
 /// the corruption runbook — trading nw-404's false alarm for a silent one, on the
 /// exact recovery path nw-332's outage needed.
 ///
-/// `read_write` is the STRUCTURAL proxy for "not the holder", and it is exact
-/// rather than approximate: lbug takes its own write lock on the database file
-/// for a read-write open, so a read-write open by a NON-holder while someone
-/// else is writing fails with "Could not set lock" and never reaches a WAL
-/// verdict at all. The only read-write opener that can arrive here with a lease
-/// held is the holder. Read-only opens are the complement — the direct
-/// `impact --repo` / `brain context --no-tests` route that filed nw-404 — and
-/// they are the ones that get the veto.
+/// `read_write` is a STRUCTURAL PROXY for "not the holder", and it is
+/// APPROXIMATE — an earlier version of this docblock called it "exact rather
+/// than approximate" and that claim was wrong in both directions. What is true:
+/// lbug takes its own write lock on the database file for a read-write open, so
+/// a read-write open by a NON-holder while someone else is writing fails with
+/// "Could not set lock" and never reaches a WAL verdict, which is why
+/// `read_write: true` can safely skip the veto. What is NOT true is the
+/// converse — `read_write: false` does not mean "this open cannot be the
+/// writer". [`GraphStore::migrate_for_read_only`] passes `false` for an open
+/// that is fully write-capable (deliberately, to keep the orphaned-WAL
+/// quarantine arm shut), and nothing stops a caller from taking the lease and
+/// then opening read-only: `nestweaver brain reindex-search` does exactly that.
 ///
-/// HANDOFF, for the exact rather than the structural answer: a self-ownership
-/// latch (the shape `lifecycle::note_local_store_write_lock` already uses to stop
-/// `db_write_lock` destroying its own lock) set by `acquire_db_write_lease`. That
-/// is a `crates/nestweaver-daemon/src/lifecycle.rs` edit.
+/// The exact answer is `error::note_self_held_write_lease`, the process-local
+/// self-ownership latch nw-404's review added, which
+/// `live_writer_holds_write_lease` consults BEFORE the `flock` probe. It is what
+/// stops a self-held lease from suppressing a real `db_wal_corrupt` and blaming
+/// a process that does not exist. This gate stays as the second layer: it is
+/// free, and it holds even for a lease taken by a path that never armed the
+/// latch.
+///
+/// DONE in this commit, recorded because the sequencing matters if this is ever unpicked: the latch is armed: the sole producer of write
+/// leases is `nestweaver_daemon::lifecycle::acquire_db_write_lease`, which is
+/// outside this crate. It needs, on the success path,
+/// `nestweaver_store::note_self_held_write_lease(db_path)` stored in a
+/// `DbWriteLease` field so latch and lease share a lifetime. That is a
+/// `crates/nestweaver-daemon/src/lifecycle.rs` edit.
 fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
     if read_write {
         // nw-346: the frame that knows WHICH database failed attaches the path,
@@ -5379,6 +5393,59 @@ mod live_writer_wal_tests {
             "a read-write open holds the lease itself, so the same probe would \
              be the writer asking about itself — it must keep the corruption \
              verdict and its recovery runbook"
+        );
+    }
+
+    /// nw-404, review defect 1, AT THE OPEN FUNNEL — the frame that decides
+    /// whether the operator sees `db_wal_corrupt`.
+    ///
+    /// `open_failure`'s `read_write` gate cannot cover this case, which is why
+    /// its docblock no longer calls itself exact: `brain reindex-search` takes
+    /// the write lease and then opens READ-ONLY, so it arrives here with
+    /// `read_write: false` while holding the very lease the probe is about to
+    /// find. Without the latch it is told to wait for a process that does not
+    /// exist, and a genuinely damaged log goes unreported.
+    ///
+    /// The counterweight is the same open, same lease, latch dropped: that is
+    /// the daemon-holds-it case nw-404 was filed for, and it must still retract
+    /// the verdict.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_open_by_the_lease_holder_itself_still_reports_a_corrupt_wal() {
+        use std::os::unix::io::AsRawFd;
+
+        const ENGINE: &str = "Corrupted wal file. Read out invalid WAL record type.";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.lbug");
+        std::fs::write(&db, b"").unwrap();
+
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(format!("{}.write.lock", db.display()))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test must actually hold the lease or it proves nothing"
+        );
+
+        let latch = crate::error::note_self_held_write_lease(&db);
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), false).corruption_kind(),
+            Some(crate::error::CorruptionKind::WalUnreadable),
+            "the process that holds the lease is not 'another process' — it must \
+             see the damage and get the runbook, even opening read-only"
+        );
+
+        drop(latch);
+        assert_eq!(
+            super::open_failure(&db, ENGINE.to_string(), false).corruption_kind(),
+            None,
+            "and with the lease held by someone this process did not record, the \
+             read-only open must still report contention rather than damage"
         );
     }
 

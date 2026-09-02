@@ -37,6 +37,12 @@ pub struct HubNode {
 /// graphs (80K+ symbols), this takes ~500-700ms, dominated by DB I/O.
 /// Degree counts require the full edge set and cannot use the PageRank
 /// cache (which stores centrality, not in/out degree).
+///
+/// nw-398: this wrapper DISCARDS `candidate_total`, so a caller that publishes
+/// a `total` or a `truncated` cannot use it — `hubs`/`brain_hub_nodes` did,
+/// and reported `count == len(list)`, which is true by construction and
+/// therefore says nothing. Use [`find_hub_nodes_bounded`] on any surface that
+/// makes a claim about completeness.
 pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> {
     find_hub_nodes_bounded(store, top_n).map(|found| found.hubs)
 }
@@ -48,6 +54,21 @@ pub struct HubNodes {
     /// A symbol with no edges cannot be a hub at any `top_n`, so counting it
     /// would overstate the population in the other direction.
     pub candidate_total: usize,
+}
+
+impl HubNodes {
+    /// Whether `top_n` cut the candidate population.
+    ///
+    /// The one definition, so the three surfaces that publish it cannot each
+    /// re-derive it from the already-cut list and each get `false` for free.
+    ///
+    /// Deliberately `>` and not `!=`: when the caller asks for MORE than the
+    /// graph has, the heap pads the tail with zero-degree symbols, so
+    /// `hubs.len()` can exceed `candidate_total`. That is a caller who was
+    /// given everything, which is the opposite of truncation.
+    pub fn truncated(&self) -> bool {
+        self.candidate_total > self.hubs.len()
+    }
 }
 
 /// [`find_hub_nodes`] with the candidate count retained.
@@ -392,6 +413,101 @@ mod tests {
             f.pagerank_score,
             s.pagerank_score
         );
+    }
+
+    /// nw-398. `find_hub_nodes_bounded` has computed `candidate_total` since
+    /// nw-299, and every caller took the discarding wrapper, so the number was
+    /// computed and thrown away on every call. This pins the reachable shape:
+    /// the population, and a `truncated` derived from it exactly once.
+    #[test]
+    fn a_cut_hub_ranking_reports_the_population_it_was_cut_from() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..10 {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("s{i}"),
+                    &format!("fn_{i}"),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+        }
+        for i in 0..9 {
+            store
+                .insert_edge(&make_edge(&format!("s{i}"), &format!("s{}", i + 1)))
+                .unwrap();
+        }
+        // Two symbols with no edges at all: they can never be hubs, so they
+        // are not candidates, but the heap will still pad the tail with them
+        // once the caller asks for more rows than there are candidates.
+        for i in 0..2 {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("lone{i}"),
+                    &format!("lone_{i}"),
+                    "src/lone.rs",
+                ))
+                .unwrap();
+        }
+
+        let found = find_hub_nodes_bounded(&store, 3).unwrap();
+        assert_eq!(found.hubs.len(), 3);
+        assert_eq!(
+            found.candidate_total, 10,
+            "the population is the edge-bearing symbols, not the 12 in the store"
+        );
+        assert!(found.truncated(), "3 of 10 is a truncation");
+    }
+
+    /// COUNTERWEIGHT: a ranking that took everything must report
+    /// `truncated == false`, including when the caller asked for MORE than the
+    /// graph has and got zero-degree padding back — `hubs.len()` then exceeds
+    /// `candidate_total`, and a `!=` would call a complete answer truncated.
+    #[test]
+    fn an_uncut_hub_ranking_reports_no_truncation_even_when_asked_for_more() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..10 {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("s{i}"),
+                    &format!("fn_{i}"),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+        }
+        for i in 0..9 {
+            store
+                .insert_edge(&make_edge(&format!("s{i}"), &format!("s{}", i + 1)))
+                .unwrap();
+        }
+        for i in 0..2 {
+            store
+                .insert_symbol(&make_symbol(
+                    &format!("lone{i}"),
+                    &format!("lone_{i}"),
+                    "src/lone.rs",
+                ))
+                .unwrap();
+        }
+
+        let exact = find_hub_nodes_bounded(&store, 10).unwrap();
+        assert!(
+            !exact.truncated(),
+            "10 of 10 candidates is complete: {} of {}",
+            exact.hubs.len(),
+            exact.candidate_total
+        );
+
+        let over = find_hub_nodes_bounded(&store, 50).unwrap();
+        assert_eq!(over.hubs.len(), 12, "every symbol is returned");
+        assert_eq!(over.candidate_total, 10);
+        assert!(
+            !over.truncated(),
+            "asking for 50 and being given everything is not a truncation"
+        );
+
+        let empty = find_hub_nodes_bounded(&GraphStore::in_memory().unwrap(), 5).unwrap();
+        assert_eq!(empty.candidate_total, 0);
+        assert!(!empty.truncated(), "an empty graph is complete, not cut");
     }
 
     #[test]

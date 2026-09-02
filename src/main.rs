@@ -98,14 +98,13 @@ use nestweaver_engine::{
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, discover_cross_domain_links,
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
-    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
-    generate_repo_map, generate_summaries, get_last_indexed_at,
-    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
-    index_markdown_directory_with_ignore_and_deletion_count, list_repos, list_services,
-    load_alias_sidecar, load_clusters, lookup_symbol, record_last_indexed_at, render_text,
-    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
-    truncate_to_budget,
+    filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
+    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
+    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
+    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
+    list_repos, list_services, load_alias_sidecar, load_clusters, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -1057,18 +1056,121 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
 ///
 /// The engine's message is printed VERBATIM. It already names the scope it
 /// actually searched, which is the thing no layer above it can reconstruct.
-fn report_context_lookup_failure(error: &anyhow::Error) -> i32 {
+///
+/// nw-399: `json` is a parameter because this function OWNS the exit path for
+/// both of `context`'s routes, so it was also the single point at which
+/// `context --json` produced its measured ZERO BYTES of stdout. The prose still
+/// goes to stderr in both modes — that is the engine's own scoped message and
+/// nothing here can improve it — but a `--json` caller now also gets a parsable
+/// object on stdout instead of an empty stream to scrape stderr for.
+fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[String]) -> i32 {
     let message = format!("{error:#}");
     if message.contains("No matching symbols") || message.contains("No symbols found") {
+        if json {
+            print_json_not_found_detail("seeds", &serde_json::json!(seeds), Some(&message));
+        }
         eprintln!("{message}");
         EXIT_NOT_FOUND
     } else if message.contains("Ambiguous") {
+        if json {
+            // Deliberately NOT the not-found envelope: an ambiguous seed is a
+            // DIFFERENT outcome with a different exit code (3) and a different
+            // remedy, and `impact` already learned the hard way that a shape a
+            // consumer cannot tell apart from a result is worse than none.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "ambiguous",
+                    "seeds": seeds,
+                    "message": message,
+                })
+            );
+        }
         eprintln!("{message}");
         EXIT_AMBIGUOUS
     } else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "failed", "seeds": seeds, "message": message })
+            );
+        }
         eprintln!("Error: {message}");
         EXIT_ERROR
     }
+}
+
+/// nw-399. The ONE `--json` payload for "the target you named does not exist".
+///
+/// COPIED FROM `symbol`'s arm, which was the only one of the ten read commands
+/// the sweep measured that emitted anything at all on stdout for a missing
+/// target: `{"error":"not found","name":"..."}` with exit 2. `context`,
+/// `project-context`, `service-summary`, `backlinks`, `flow-trace`,
+/// `cross-repo-contracts` and `cluster` all printed ZERO BYTES under `--json`
+/// and left the consumer scraping stderr — and four of them used exit 1 where
+/// their siblings used 2, so no single rule worked either.
+///
+/// Compact rather than pretty, and with no `_meta`, because it is `symbol`'s
+/// existing bytes: this is a de-duplication of a shape that already shipped,
+/// not a new one, and `symbol` routes through here so the two cannot drift.
+///
+/// `target_key` is the caller's own name for the thing (`name`, `symbol`,
+/// `title`, `cluster`), because a script that asked for a cluster should get
+/// its cluster id back, not a field called `name`.
+fn print_json_not_found(target_key: &str, target: &str) {
+    print_json_not_found_detail(target_key, &serde_json::json!(target), None);
+}
+
+/// [`print_json_not_found`] where the target is not a single string (`context`
+/// takes a seed LIST) or where the engine produced a message worth carrying.
+///
+/// The `error: "not found"` discriminator is identical in both, so a consumer
+/// branches on one key regardless of which command answered.
+fn print_json_not_found_detail(
+    target_key: &str,
+    target: &serde_json::Value,
+    message: Option<&str>,
+) {
+    println!("{}", json_not_found_payload(target_key, target, message));
+}
+
+/// [`print_json_not_found_detail`]'s payload, split out so the envelope can be
+/// asserted without capturing stdout.
+fn json_not_found_payload(
+    target_key: &str,
+    target: &serde_json::Value,
+    message: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "error": "not found" });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(target_key.to_string(), target.clone());
+        if let Some(message) = message {
+            object.insert("message".to_string(), serde_json::json!(message));
+        }
+    }
+    payload
+}
+
+/// nw-399's second population: an ARGUMENT the command cannot honour — in
+/// practice a malformed regex handed to `regex-search`/`count-patterns`.
+///
+/// Distinct from [`print_json_not_found`] on purpose. "Your pattern does not
+/// compile" and "nothing matched your pattern" demand opposite responses, and
+/// collapsing them into one envelope would hand a script the same object for a
+/// bug in its own code as for an empty result. The exit code splits them too:
+/// this is `EXIT_USAGE`, the code every clap-validated bad value already uses.
+fn print_json_argument_error(argument: &str, value: &str, message: &str) {
+    println!("{}", json_argument_error_payload(argument, value, message));
+}
+
+/// [`print_json_argument_error`]'s payload, split out for the same reason.
+fn json_argument_error_payload(argument: &str, value: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": "invalid argument",
+        "argument": argument,
+        "value": value,
+        "message": message,
+    })
 }
 
 // ── Environment-variable registry (S1/T2) ────────────────────────────────────
@@ -1308,6 +1410,36 @@ fn env_role(name: &str) -> Option<EnvRole> {
         .map(|entry| entry.role)
 }
 
+/// clap `value_parser` for `clusters --resolution` (nw-400).
+///
+/// Restates the ONE bound the `clusters` tool schema declares —
+/// `exclusiveMinimum: 0.0` — at the parser, so a bad value is refused with the
+/// bound named at `EXIT_USAGE` instead of travelling to the MCP validator and
+/// coming back as `schema keyword 'exclusiveMinimum' failed` at exit 1.
+///
+/// Non-finite values are rejected here and NOT left to the schema, because the
+/// schema cannot see them: `nan`/`inf` parse as valid `f64`, serialise to JSON
+/// `null`, and are then reported as a `type` failure — a true statement about
+/// the wire encoding and a useless one about the flag the user typed.
+///
+/// The error text mirrors clap's own range wording (`hubs --top` prints
+/// `0 is not in 1..=1000`) so the five commands nw-400 names read like their
+/// siblings rather than like a second dialect.
+fn parse_cluster_resolution(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if !parsed.is_finite() {
+        return Err(format!(
+            "`{value}` is not a finite number; resolution must be greater than 0"
+        ));
+    }
+    if parsed <= 0.0 {
+        return Err(format!("{parsed} is not greater than 0"));
+    }
+    Ok(parsed)
+}
+
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -1324,8 +1456,32 @@ fn env_role(name: &str) -> Option<EnvRole> {
                   nestweaver search \"UserService\"\n  \
                   nestweaver symbol \"processPayment\"\n  \
                   nestweaver repo-map --token-budget 2000",
+    // nw-399: the exit-code mapping lives HERE, in `nestweaver --help`, because
+    // the audience for it is a script author and that is the one place they will
+    // look without being told to. The item's defect was not only the zero-byte
+    // `--json` streams — it was that "not found" meant 2 for six commands and 1
+    // for four, so no single `case $rc in` worked. It is 2 everywhere now, and
+    // this table is the contract that says so.
     after_help = "Supported languages (32): JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Swift, Dart, COBOL, Lua, Bash, Scala, Elixir, Zig, Objective-C, Groovy, PowerShell, Julia, SQL, HCL/Terraform, Fortran, Pascal, Vue, Svelte, Astro, SystemVerilog\n\
                   Default database: ./nestweaver.lbug\n\n\
+                  Exit codes (scripting contract):\n  \
+                  0   success\n  \
+                  1   the command itself failed\n  \
+                  2   TARGET NOT FOUND — the one code for a symbol, service, project, note,\n      \
+                  cluster or seed that does not exist, on every read command and on both\n      \
+                  the daemon and --no-daemon routes. Also: stale-check found drift,\n      \
+                  pr-impact --strict blocked, dead-code refused on a stale graph.\n  \
+                  3   ambiguous match (several symbols share the name)\n  \
+                  4   unauthorized (pull)      5   unavailable (pull)\n  \
+                  64  usage error — unknown flag, out-of-range value, uncompilable --pattern\n\n\
+                  With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
+                  commands listed above; branch on `error`, not on prose.\n  \
+                  NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
+                  worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
+                  argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
+                  stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
+                  candidate list, and `impact` keys it \"status\", not \"error\". A few commands\n      \
+                  (cross-repo-refs, rank) still write nothing on 2. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
                   nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
@@ -2072,6 +2228,89 @@ impl ResolverStaleness {
     }
 }
 
+/// What `hubs`/`bridges` can honestly say about the CUT and about how the score
+/// in each row was computed.
+///
+/// nw-398. Both `--json` payloads carried `returned == len(list)` and nothing
+/// else — a number true by construction, so it said nothing — while the engine
+/// had `candidate_total` one call away in `find_hub_nodes_bounded` /
+/// `find_bridge_nodes_bounded`. Every field here is `Option` for one reason:
+/// the DAEMON route decodes an MCP `hub_nodes`/`bridge_nodes` reply that does
+/// not (yet) publish these keys, and "this route does not know" is a different
+/// claim from "nothing was cut". Emitting `false` for the first would be the
+/// same lie in a new place.
+///
+/// Deliberately NOT `Bounded::take`: the cut already happened inside the
+/// engine, so re-capturing a total from the returned Vec would recover exactly
+/// `len(list)` — the anti-pattern this item exists to remove.
+#[derive(Debug, Default, Clone, Copy)]
+struct RankingBounds {
+    /// The candidate population `top` selected FROM — symbols with at least one
+    /// code edge. `None` on a route that was not told.
+    total: Option<usize>,
+    /// Whether `top` cut that population. Computed by the engine's
+    /// `HubNodes::truncated`/`BridgeNodes::truncated`, never re-derived here
+    /// from the already-cut list.
+    truncated: Option<bool>,
+    /// Bridges only: whether `betweenness_score` is a SAMPLE-based estimate.
+    /// The digits in the score carry no information about this — an
+    /// `18866919.81139078` from 500 deterministically-spaced BFS sources
+    /// renders identically to an exact one.
+    sampled: Option<bool>,
+    /// Bridges only: how many BFS sources the estimate actually ran from.
+    sources_sampled: Option<usize>,
+}
+
+impl RankingBounds {
+    /// The disclosure the DIRECT route can make, from the engine's own numbers.
+    fn from_hubs(found: &nestweaver_engine::hubs::HubNodes) -> Self {
+        Self {
+            total: Some(found.candidate_total),
+            truncated: Some(found.truncated()),
+            ..Self::default()
+        }
+    }
+
+    fn from_bridges(found: &nestweaver_engine::bridges::BridgeNodes) -> Self {
+        Self {
+            total: Some(found.candidate_total),
+            truncated: Some(found.truncated()),
+            sampled: Some(found.sampled),
+            sources_sampled: Some(found.sources_sampled),
+        }
+    }
+
+    /// What the DAEMON reply says, which today is nothing — the MCP
+    /// `hub_nodes`/`bridge_nodes` twins emit these as of this commit; the `Option`s stay because an OLDER daemon on the other end of the RPC still answers with
+    /// owned by `crates/nestweaver-mcp/src/tools.rs`. Read rather than assumed
+    /// so this route publishes the honest totals the moment that half lands,
+    /// without a second edit here.
+    fn from_daemon_response(value: &serde_json::Value) -> Self {
+        Self {
+            total: value
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
+            truncated: value.get("truncated").and_then(|v| v.as_bool()),
+            sampled: value.get("sampled").and_then(|v| v.as_bool()),
+            sources_sampled: value
+                .get("sources_sampled")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
+        }
+    }
+
+    /// `"Top 10"` or `"Top 10 of 4182"` — the second only when the population
+    /// is KNOWN and larger than the page. The human branch printed `.len()`
+    /// alone, which is the same content-free number the payload's `count` was.
+    fn header_count(&self, shown: usize) -> String {
+        match self.total {
+            Some(total) if total > shown => format!("{shown} of {total}"),
+            _ => shown.to_string(),
+        }
+    }
+}
+
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
 /// the bare array that had nowhere to put it (nw-308).
 ///
@@ -2081,21 +2320,85 @@ impl ResolverStaleness {
 /// `serde_json::from_value` sees the same shape the direct store produces — and
 /// stripping for the decode used to mean the printer had nothing to put back.
 /// Strip for the decode, carry the provenance to the print (nw-347).
+///
+/// nw-398: `bounds` is where `total`/`truncated` (and, for bridges,
+/// `sampled`/`sources_sampled`) live. The keys are emitted UNCONDITIONALLY —
+/// `null` when the route cannot answer — for the reason `print_repo_map_json`
+/// states about staleness: an absent key and a `false` are the same observation
+/// to an agent, and only one of them is a reason to trust the list.
 fn print_ranking_json<T: serde::Serialize>(
     key: &str,
     rows: &T,
     staleness: &ResolverStaleness,
     daemon_meta: Option<serde_json::Value>,
+    bounds: &RankingBounds,
 ) -> anyhow::Result<()> {
+    print_json_payload(&ranking_json_payload(
+        key,
+        rows,
+        staleness,
+        daemon_meta,
+        bounds,
+    ))
+}
+
+/// [`print_ranking_json`]'s payload, split out so the disclosure keys can be
+/// asserted without capturing stdout.
+fn ranking_json_payload<T: serde::Serialize>(
+    key: &str,
+    rows: &T,
+    staleness: &ResolverStaleness,
+    daemon_meta: Option<serde_json::Value>,
+    bounds: &RankingBounds,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         key: rows,
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
+        // The candidate population, and whether `--top` cut it. `total` is NOT
+        // `len(list)`: it counts every symbol with at least one code edge, so
+        // `returned < total` is a real completeness ratio rather than a
+        // tautology.
+        "total": bounds.total,
+        "truncated": bounds.truncated,
+        // What `total` counts, spelled out — `hub_nodes`'s own
+        // `total_population` precedent. Without it `returned/total` invites the
+        // reading "N of M hubs", which is not what M is.
+        "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
     });
-    if let (Some(meta), Some(obj)) = (daemon_meta, payload.as_object_mut()) {
-        obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+    if let Some(obj) = payload.as_object_mut() {
+        // Bridges only. Absent on hubs rather than `false`, because a hub score
+        // is a degree count and is never an estimate — a `sampled: false` there
+        // would answer a question the surface cannot be asked.
+        if bounds.sampled.is_some() || bounds.sources_sampled.is_some() {
+            obj.insert("sampled".to_string(), serde_json::json!(bounds.sampled));
+            obj.insert(
+                "sources_sampled".to_string(),
+                serde_json::json!(bounds.sources_sampled),
+            );
+        }
+        if let Some(meta) = daemon_meta {
+            obj.insert(nestweaver_schema::provenance::META_KEY.to_string(), meta);
+        }
     }
-    print_json_payload(&payload)
+    payload
+}
+
+/// The one sentence that says `betweenness_score` is an ESTIMATE, for the human
+/// branch of `bridges` (nw-398 leg 2).
+///
+/// Returns `None` when the walk ran from every node — an exact result must not
+/// carry an approximation warning, or the warning stops distinguishing
+/// anything.
+fn bridge_sampling_note(bounds: &RankingBounds) -> Option<String> {
+    match (bounds.sampled, bounds.sources_sampled) {
+        (Some(true), Some(sources)) => Some(format!(
+            "betweenness_score is an ESTIMATE from {sources} sampled BFS sources \
+             (deterministic even spacing over graph insertion order, so the bias is \
+             systematic, not self-cancelling). Compare scores, do not read the digits."
+        )),
+        _ => None,
+    }
 }
 
 /// `repo-map --json`, as ONE shape for both routes.
@@ -4449,9 +4752,22 @@ enum Commands {
         after_help = "Examples:\n  nestweaver clusters\n  nestweaver clusters --resolution 0.5 --json"
     )]
     Clusters {
+        // nw-400. `--resolution 0` and `--resolution nan` both reached the
+        // `clusters` JSON-Schema validator. `0` came back as `schema keyword
+        // 'exclusiveMinimum' failed`; `nan` was WORSE — it parses as a valid
+        // f64, serialises to JSON `null`, and so was reported as `keyword
+        // 'type' failed`, a message about the serialisation rather than about
+        // the input. Both at exit 1, neither naming the bound.
+        //
+        // `parse_cluster_resolution` states the schema's own
+        // `exclusiveMinimum: 0` and additionally rejects the non-finite values
+        // JSON cannot represent at all. No UPPER bound is imposed here: the
+        // schema declares none, and choosing one is nw-401's open question, not
+        // this fix's to answer.
         #[arg(
             long,
-            help = "Resolution parameter (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
+            value_parser = parse_cluster_resolution,
+            help = "Resolution parameter, greater than 0 (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
         )]
         resolution: Option<f64>,
         #[arg(
@@ -4511,6 +4827,16 @@ enum Commands {
             help = "Filter to a specific target (file path, symbol name, or cluster name)"
         )]
         target: Option<String>,
+        // nw-414. `summary` took `--db` and nothing else, so it could not
+        // resolve an instance and could not take the daemon route — it always
+        // opened the database directly. On a live instance the daemon holds the
+        // WAL, so that direct open FAILS, and the sweep that found this had to
+        // run `summary` against a file copy of the database to measure anything
+        // at all. Declared exactly as `hubs`/`bridges`/`memory lint` declare it,
+        // because this is capability drift (nw-215's class), not a new feature:
+        // a flag present on three sibling read commands and absent on a fourth.
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Show details for a specific cluster
     ///
@@ -6229,9 +6555,19 @@ enum BrainCommands {
     BrokenLinks {
         #[arg(long, default_value = "5", help = "Max suggested targets per link")]
         max_suggestions: usize,
+        // nw-400: bounded HERE, not by the MCP JSON-Schema validator this
+        // command routes through. Unbounded, `--limit 0` reached
+        // `brain_broken_links`'s schema and came back as `invalid arguments for
+        // tool 'brain_broken_links': /limit: schema keyword 'minimum' failed`
+        // at exit 1 — an internal tool name the CLI user never invoked, no
+        // mention of the bound, and the one exit code every clap-validated flag
+        // in this binary spells 64. `1..=1000` is the schema's own
+        // `RESULT_LIMIT_MAX` range, restated at the parser so the validator is
+        // never the thing a CLI user meets.
         #[arg(
             long,
-            help = "Max broken links to return (default: 50, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max broken links to return (1-1000; default: 50, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
         /// nw-341: rows sort unresolved-first then by ASCENDING confidence, so
@@ -6268,9 +6604,13 @@ enum BrainCommands {
             help = "Note path/title to exclude (repeatable; overrides the default allowlist)"
         )]
         allow: Vec<String>,
+        // nw-400: the same bound `brain_orphan_documents`'s schema declares,
+        // enforced at the parser. See `BrokenLinks::limit` for why the
+        // validator must not be the first thing a CLI user hears from.
         #[arg(
             long,
-            help = "Max orphan documents to return (default: 50, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max orphan documents to return (1-1000; default: 50, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -6287,11 +6627,29 @@ enum BrainCommands {
     /// note-to-note wikilink graph. Each cluster is labelled by its most
     /// central member.
     TopicClusters {
-        #[arg(long, default_value = "0.5", help = "Community-detection resolution")]
-        resolution: f64,
+        // nw-400. Same parser as `clusters --resolution`, and it was MISSED on
+        // the first pass — leaving this one flag unbounded meant
+        // `--resolution nan` still reached the MCP validator and surfaced
+        // `invalid arguments for tool 'brain_topic_clusters': /resolution:
+        // schema keyword 'type' failed` at exit 1, naming a tool the CLI user
+        // never invoked. That is verbatim the defect nw-400 exists to remove,
+        // including the `nan` case the item singled out as worse — `nan`
+        // serialises to JSON `null`, so the schema reports a TYPE error for a
+        // value the user spelled as a number.
         #[arg(
             long,
-            help = "Max clusters to return (default: 50, or [limits].default_result_limit from config)"
+            default_value = "0.5",
+            value_parser = parse_cluster_resolution,
+            help = "Community-detection resolution (> 0, finite)"
+        )]
+        resolution: f64,
+        // nw-400: the reported case. `brain topic-clusters --limit 0` printed
+        // `invalid arguments for tool 'brain_topic_clusters': /limit: schema
+        // keyword 'minimum' failed`, exit 1. Same bound, stated by the parser.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max clusters to return (1-1000; default: 50, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -6310,9 +6668,11 @@ enum BrainCommands {
         /// Optional focus tag (with or without leading #). When omitted,
         /// prints the full tag co-occurrence graph for every tag.
         tag: Option<String>,
+        // nw-400: the same bound `brain_tag_graph`'s schema declares.
         #[arg(
             long,
-            help = "Max tags to return (default: 50, or [limits].default_result_limit from config). Ignored when a specific tag is queried."
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max tags to return (1-1000; default: 50, or [limits].default_result_limit from config). Ignored when a specific tag is queried."
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -6387,7 +6747,20 @@ enum MemoryCommands {
             help = "Edge type to follow (repeatable; default: all four)"
         )]
         edge_types: Vec<String>,
-        #[arg(long, default_value = "2", help = "Max BFS depth")]
+        // nw-411 CLI parity. The daemon route validates `depth` against the
+        // `brain_memory_related` schema, which declares `1..=15` — the range
+        // `flow_trace`, `brain_impact` and `blast_radius` already use for the
+        // same traversal shape. `--no-daemon` bypasses that validator entirely,
+        // so without this the SAME `--depth 100000` was accepted or rejected
+        // depending on whether a daemon happened to be running. Bounded at the
+        // parser so both routes agree, and so a bad value is a clap usage error
+        // (exit 64, bound named) rather than a schema-keyword string.
+        #[arg(
+            long,
+            default_value = "2",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=15),
+            help = "Max BFS depth (1-15; matches the MCP brain_memory_related schema)"
+        )]
         depth: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -7263,6 +7636,34 @@ fn default_db_path_with_source() -> (PathBuf, DbSource) {
 /// select a DB instead of being silently ignored (Bug #19).
 fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
     resolve_db_with_config_source(db, config).map(|(path, _)| path)
+}
+
+/// Both halves of a repo's `[[repos]]` DIRECTORY policy, resolved together.
+///
+/// nw-418. `exclude` (globs to drop) and `unskip` (`SKIP_DIRS` names to
+/// re-admit) point in opposite directions and are two fields of ONE config
+/// block, so they are read here from ONE `InstanceConfig` and against ONE
+/// (url, path) pair. Resolving them separately is how they could come to
+/// describe different repos — `unskip_names_for` and `exclude_globs_for` each
+/// do their own url-or-path match, and a caller that passed different arguments
+/// to the two would get a silently mismatched policy.
+///
+/// Returns two empty vectors when there is no config, or when the config
+/// declares no `[[repos]]` entry for this repo. That is the counterweight the
+/// item asks for: `unskip` must re-admit `public/` for the repo that DECLARED
+/// it and for no other, or the fix has simply switched `SKIP_DIRS` off.
+fn resolve_repo_directory_policy(
+    config: Option<&nestweaver_engine::InstanceConfig>,
+    repo_url: &str,
+    repo_path: &Path,
+) -> (Vec<String>, Vec<String>) {
+    match config {
+        Some(config) => (
+            config.exclude_globs_for(repo_url, Some(repo_path)).to_vec(),
+            config.unskip_names_for(repo_url, Some(repo_path)).to_vec(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
 }
 
 /// [`resolve_db_with_config`] with the nw-284/S2 provenance retained, for the
@@ -12274,7 +12675,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             let Some(summary) = summary.filter(|s| !s.service.uid.is_empty()) else {
-                if !out.quiet {
+                // nw-399. Under `--json` this printed the PROSE line on stdout,
+                // which is worse than the zero bytes its siblings emitted: a
+                // consumer that pipes to a JSON parser gets a syntax error
+                // rather than an empty document, and `--quiet` suppressed even
+                // that. The envelope is unconditional in `--json` mode for the
+                // same reason — `--quiet` governs chatter, not the payload.
+                if json {
+                    print_json_not_found("service", &name);
+                } else if !out.quiet {
                     println!("Service not found: {name}");
                 }
                 return Ok((EXIT_NOT_FOUND, None));
@@ -12387,15 +12796,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Some(limit) = limit {
                 args["limit"] = serde_json::json!(limit);
             }
-            let payload = match try_hybrid_json_rpc_checked(
+            // nw-399: BOTH routes classified in one place, so the answer to
+            // "does this symbol exist?" cannot depend on whether a daemon was
+            // running. `cross_repo_contracts` says `no symbol found: '<name>'`
+            // (`resolve_symbol_uid`, tools.rs) — matched on that specific
+            // phrase rather than on a bare "not found", because
+            // `require_existing_db` above has already ruled the DATABASE in and
+            // a broader substring test would reclassify a store failure as a
+            // missing symbol. That over-generalisation is exactly what nw-329's
+            // comment on `classify_cli_error` warns about.
+            let routed = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "cross_repo_contracts",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Ok(Some(value)) => Ok(Some(value)),
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::dispatch(
                         &store,
@@ -12403,8 +12821,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "cross_repo_contracts",
                         args,
                         None,
-                    )?
+                    )
+                    .map(Some)
                 }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error) if format!("{error:#}").contains("no symbol found") => {
+                    if json {
+                        print_json_not_found("symbol", &symbol);
+                    }
+                    eprintln!("Symbol '{symbol}' not found.");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
             };
             if json {
                 print_json_payload(&payload)?;
@@ -12450,18 +12882,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 serde_json::json!({ "title": target })
             };
-            let payload = match try_hybrid_json_rpc_checked(
+            // nw-399: same classification, both routes. The `backlinks` tool
+            // says `no note found with title '<t>'`, so that phrase — and not a
+            // bare "not found" — is what decides. Measured at exit 1 with zero
+            // bytes of stdout before; now exit 2, the code its siblings already
+            // used for a missing target.
+            let routed = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "backlinks",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Ok(Some(value)) => Ok(Some(value)),
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None)?
+                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None).map(Some)
                 }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error) if format!("{error:#}").contains("no note found") => {
+                    if json {
+                        print_json_not_found("target", &target);
+                    }
+                    eprintln!("Note '{target}' not found.");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
             };
             if json {
                 print_json_payload(&payload)?;
@@ -12833,11 +13283,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
                     Err(e) => {
+                        // nw-399: `--feature` is still `context`, so it answers
+                        // with the same envelope and the same exit codes as the
+                        // seed-based arms below. It printed nothing on stdout
+                        // for both outcomes before.
                         let msg = e.to_string();
                         if msg.contains("No symbols found") {
+                            if json {
+                                print_json_not_found_detail(
+                                    "feature",
+                                    &serde_json::json!(feature_name),
+                                    Some(&msg),
+                                );
+                            }
                             eprintln!("{msg}");
                             return Ok((EXIT_NOT_FOUND, None));
                         } else {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "error": "failed",
+                                        "feature": feature_name,
+                                        "message": msg,
+                                    })
+                                );
+                            }
                             eprintln!("Error: {msg}");
                             return Ok((EXIT_ERROR, None));
                         }
@@ -12890,7 +13361,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         routed_via_daemon = true;
                     }
                     Ok(None) => {}
-                    Err(error) => return Ok((report_context_lookup_failure(&error), None)),
+                    Err(error) => {
+                        return Ok((report_context_lookup_failure(&error, json, &seeds), None));
+                    }
                 }
             }
 
@@ -12994,7 +13467,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
-                Err(e) => Ok((report_context_lookup_failure(&e), None)),
+                Err(e) => Ok((report_context_lookup_failure(&e, json, &seeds), None)),
             }
         }
 
@@ -13447,15 +13920,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // test that the generation bump made useless. ONE verdict,
                 // both renderings.
                 let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                // nw-398: whatever the daemon said about the cut, which today
+                // is nothing — see `RankingBounds::from_daemon_response`. Read
+                // rather than re-derived from `hubs`, because deriving it from
+                // an already-cut list can only ever produce `truncated: false`.
+                let bounds = RankingBounds::from_daemon_response(&value);
                 if json {
                     // nw-308: the daemon route is the DEFAULT route, so the
                     // payload disclosure has to be here as well as on the
                     // direct path below.
-                    print_ranking_json("hubs", &hubs, &staleness, daemon_meta)?;
+                    print_ranking_json("hubs", &hubs, &staleness, daemon_meta, &bounds)?;
                 } else if hubs.is_empty() {
                     println!("No hub nodes found (graph may be empty).");
                 } else {
-                    println!("Top {} hub nodes (by total degree):\n", hubs.len());
+                    println!(
+                        "Top {} hub nodes (by total degree):\n",
+                        bounds.header_count(hubs.len())
+                    );
                     for h in &hubs {
                         let cluster = h
                             .cluster_id
@@ -13477,9 +13958,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // only ever fires on the direct path users are
                 // told not to use.
                 warn_stale_resolver_rankings_no_store(&staleness);
+                // nw-398: counted from the list this route DECODED and printed,
+                // not from `value["count"]`. The old read was coupled to one
+                // spelling in a payload this crate does not own
+                // (`crates/nestweaver-mcp/src/tools.rs`); the day that key is
+                // renamed — `returned` is the name every other tool moved to —
+                // `unwrap_or(0)` would have printed "0 hubs" beside a full
+                // listing, silently. The decoded length cannot drift from what
+                // was shown, because it IS what was shown.
                 let stats = format!(
                     "{} hubs in {} (via hybrid)",
-                    value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    hubs.len(),
                     format_elapsed(t0.elapsed())
                 );
                 return Ok((EXIT_SUCCESS, Some(stats)));
@@ -13487,7 +13976,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(Some(&db_path))?;
 
-            let mut hubs = find_hub_nodes(&store, top)?;
+            // nw-398: the `_bounded` variant, because this surface publishes a
+            // `total` and a `truncated`. `find_hub_nodes` discards
+            // `candidate_total`, which is why `hubs --json` used to carry
+            // nothing but a list.
+            let found = nestweaver_engine::hubs::find_hub_nodes_bounded(&store, top)?;
+            let bounds = RankingBounds::from_hubs(&found);
+            let mut hubs = found.hubs;
 
             // Attach cluster IDs if clustering sidecar exists.
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
@@ -13510,11 +14005,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &hubs,
                     &ResolverStaleness::from_store(&store, &db_path),
                     None,
+                    &bounds,
                 )?;
             } else if hubs.is_empty() {
                 println!("No hub nodes found (graph may be empty).");
             } else {
-                println!("Top {} hub nodes (by total degree):\n", hubs.len());
+                println!(
+                    "Top {} hub nodes (by total degree):\n",
+                    bounds.header_count(hubs.len())
+                );
                 for h in &hubs {
                     let cluster = h
                         .cluster_id
@@ -13570,6 +14069,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // daemon already computed this from `store.list_repos` and
                     // this layer cannot do better.
                     let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                    // nw-398: captured BEFORE `strip_hybrid_meta` consumes
+                    // `value`, alongside the other two. Empty today — the MCP
+                    // `bridge_nodes` twin publishes these as of this commit; an older daemon does not, so
+                    // the payload says `null`, which is the honest "this route
+                    // was not told" rather than a fabricated `false`.
+                    let bounds = RankingBounds::from_daemon_response(&value);
                     let bridges: Vec<nestweaver_engine::BridgeNode> =
                         match strip_hybrid_meta(value).get("bridges").cloned() {
                             Some(serde_json::Value::Null) | None => Vec::new(),
@@ -13579,14 +14084,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         // nw-308: same disclosure as `hubs`; bridges are
                         // downstream of the same edges.
-                        print_ranking_json("bridges", &bridges, &staleness, daemon_meta)?;
+                        print_ranking_json("bridges", &bridges, &staleness, daemon_meta, &bounds)?;
                     } else if bridges.is_empty() {
                         println!("No bridge nodes found (graph may be empty).");
                     } else {
                         println!(
                             "Top {} bridge nodes (by betweenness centrality):\n",
-                            bridges.len()
+                            bounds.header_count(bridges.len())
                         );
+                        if let Some(note) = bridge_sampling_note(&bounds) {
+                            println!("  NOTE: {note}\n");
+                        }
                         for b in &bridges {
                             let communities = if b.communities_connected.is_empty() {
                                 String::new()
@@ -13623,7 +14131,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             out.status("Computing betweenness centrality...");
-            let mut bridges = find_bridge_nodes(&store, top)?;
+            // nw-398: the `_bounded` variant, for both halves of this item at
+            // once — `candidate_total` says how much `--top` hid, and
+            // `sampled`/`sources_sampled` say that every `betweenness_score`
+            // below is a SAMPLE-based estimate rendered at full f64 precision.
+            // `find_bridge_nodes` discards all three.
+            let found = nestweaver_engine::bridges::find_bridge_nodes_bounded(&store, top)?;
+            let bounds = RankingBounds::from_bridges(&found);
+            let mut bridges = found.bridges;
             warn_stale_resolver_rankings(&store, &db_path);
 
             // Attach community connection info if clustering sidecar exists.
@@ -13637,14 +14152,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &bridges,
                     &ResolverStaleness::from_store(&store, &db_path),
                     None,
+                    &bounds,
                 )?;
             } else if bridges.is_empty() {
                 println!("No bridge nodes found (graph may be empty).");
             } else {
                 println!(
                     "Top {} bridge nodes (by betweenness centrality):\n",
-                    bridges.len()
+                    bounds.header_count(bridges.len())
                 );
+                if let Some(note) = bridge_sampling_note(&bounds) {
+                    println!("  NOTE: {note}\n");
+                }
                 for b in &bridges {
                     let communities = if b.communities_connected.is_empty() {
                         String::new()
@@ -13678,19 +14197,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             token_budget,
             target,
+            config,
         } => {
             let parsed_level: SummaryLevel =
                 level.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            let db_path = db.unwrap_or_else(default_db_path);
+            // nw-414: resolved through the same helper `hubs`/`bridges` use, so
+            // `--config` alone (no `--db`) selects the instance's database
+            // instead of falling back to `./nestweaver.lbug`. `db.unwrap_or_else(
+            // default_db_path)` was the whole reason this command could not
+            // reach a configured instance.
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             // ── daemon guard ──────────────────────────────────────
             // The daemon tool returns the rendered text under
             // "summaries" (not structured data), so it can only serve human
             // mode — for --json fall through to the direct path, whose bare
             // Vec<Summary> output the daemon shape cannot reproduce.
+            //
+            // nw-414, RECORDED RATHER THAN FIXED: that `!json` is why
+            // `summary --json` on a live instance STILL takes the direct open
+            // and still fails while the daemon holds the WAL. Adding `--config`
+            // gives the human route the daemon it never had; making `--json`
+            // follow it means giving `get_summary` a structured payload, which
+            // is a payload redesign and not this item's remit. After nw-404 the
+            // failure is at least an honest contention message rather than a
+            // corruption runbook.
             if use_daemon && !json {
                 let args = summary_tool_args(&level, token_budget, target.as_deref());
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
+                // nw-414: the resolved config is THREADED here. It was
+                // hardcoded `None`, so even a caller who had one could not use
+                // it — the daemon route silently ignored the instance and any
+                // upstream it declares.
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
                     // nw-370: `get_summary` attaches the verdict on hub level,
@@ -13713,7 +14252,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!();
                         }
                     }
-                    let count = value.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // `returned` first, `count` as the fallback: nw-321 made
+                    // `returned` the canonical name and kept `count` as an
+                    // alias "for one release", so reading only the alias is a
+                    // silent `0` waiting for that release to land.
+                    let count = value
+                        .get("returned")
+                        .or_else(|| value.get("count"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let tokens = value
                         .get("tokens_used")
                         .and_then(|v| v.as_u64())
@@ -14200,6 +14747,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
                 None => {
+                    // nw-399: zero bytes on stdout under `--json` before this.
+                    // The available-cluster list stays on stderr in both modes
+                    // — it is a remedy for a human, and putting an unbounded
+                    // 69,713-entry list into the payload would be a second
+                    // defect wearing a disclosure.
+                    if json {
+                        print_json_not_found("cluster", &id_or_name);
+                    }
                     eprintln!("Cluster '{}' not found.", id_or_name);
                     eprintln!(
                         "Available clusters: {}",
@@ -14536,19 +15091,50 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "max_depth": max_depth,
             });
 
-            let payload = match try_hybrid_json_rpc_checked(
+            // nw-399: same classification, both routes. TWO phrases, because
+            // `flow_trace` has two ways to miss: a bare name dies in
+            // `resolve_symbol_uid` as `no symbol found: '<s>'`, while a
+            // `sym:`-prefixed uid gets past it and dies in the store lookup as
+            // `symbol '<s>' not found`. Matching only the second is how the
+            // MEASURED case — a plain name — kept its exit 1 and its zero bytes.
+            // The second string is also, deliberately, what a root hidden by
+            // repo scope returns, so this arm inherits that non-disclosure
+            // rather than trying to see through it. The DATABASE-missing case
+            // cannot reach here — `require_existing_db` above already refused it
+            // — which is what makes a bare "not found" test safe in this arm and
+            // not in a general classifier.
+            let routed = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "flow_trace",
                 args.clone(),
-            )? {
-                Some(value) => value,
-                None => {
+            ) {
+                Ok(Some(value)) => Ok(Some(value)),
+                Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?
+                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)
+                        .map(Some)
                 }
+                Err(error) => Err(error),
+            };
+            let payload = match routed {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error)
+                    if {
+                        let rendered = format!("{error:#}");
+                        rendered.contains("not found") || rendered.contains("no symbol found")
+                    } =>
+                {
+                    if json {
+                        print_json_not_found("symbol", &symbol);
+                    }
+                    eprintln!("Symbol '{symbol}' not found.");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                Err(error) => return Err(error),
             };
 
             if json {
@@ -16090,15 +16676,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let res = store
-                .regex_search(
-                    &pattern,
-                    path_prefix.as_deref(),
-                    kinds.as_deref(),
-                    limit,
-                    max_millis,
-                )
-                .context("regex_search")?;
+            // nw-399: a pattern that does not COMPILE is a bad argument, not a
+            // failed query, and it used to escape as a bare `?` — exit 1 with
+            // zero bytes of stdout under `--json`. It now answers with the
+            // argument envelope at `EXIT_USAGE`, the code `hubs --top 0` and
+            // every other rejected flag value already use, so a script has one
+            // rule for "my input was wrong" across the binary.
+            let res = match store.regex_search(
+                &pattern,
+                path_prefix.as_deref(),
+                kinds.as_deref(),
+                limit,
+                max_millis,
+            ) {
+                Ok(res) => res,
+                Err(error) => {
+                    let message = format!("{error}");
+                    if json {
+                        print_json_argument_error("pattern", &pattern, &message);
+                    }
+                    eprintln!("Error: invalid --pattern '{pattern}': {message}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else if res.results.is_empty() {
@@ -16219,9 +16819,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(Some(&db_path))?;
-            let counts = store
-                .count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref())
-                .context("count_patterns")?;
+            // nw-399: identical treatment to `regex-search` above — the two
+            // commands take the same patterns from the same user and must not
+            // reject them in two different ways. `patterns` is a LIST, so the
+            // envelope reports the whole list as the offending value; the
+            // engine's message names the one that failed to compile.
+            let counts =
+                match store.count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref()) {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        let message = format!("{error}");
+                        if json {
+                            print_json_argument_error("patterns", &patterns.join(", "), &message);
+                        }
+                        eprintln!("Error: invalid --pattern: {message}");
+                        return Ok((EXIT_USAGE, None));
+                    }
+                };
             if json {
                 println!("{}", serde_json::to_string_pretty(&counts)?);
             } else {
@@ -16421,10 +17035,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         _ => {
                             // not_found
                             if json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({"error": "not found", "name": name_or_uid})
-                                );
+                                // nw-399: through the shared emitter. These
+                                // bytes are the MODEL every other not-found arm
+                                // was changed to copy, so they must not be a
+                                // second, independent copy of the shape.
+                                print_json_not_found("name", &name_or_uid);
                             } else {
                                 eprintln!("Symbol '{name_or_uid}' not found.");
                             }
@@ -16488,10 +17103,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 LookupResult::NotFound => {
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"error": "not found", "name": name_or_uid})
-                        );
+                        print_json_not_found("name", &name_or_uid);
                     } else {
                         eprintln!("Symbol '{name_or_uid}' not found.");
                     }
@@ -17616,6 +18228,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let daemon_value = match daemon_result {
                 Ok(value) => value,
                 Err(error) if format!("{error:#}").contains("not found") => {
+                    // nw-399: this arm already had the right EXIT code (2) and
+                    // the right remedy on stderr — and emitted zero bytes on
+                    // stdout, so a `--json` caller saw an empty stream and could
+                    // not tell it apart from a crash.
+                    if json {
+                        print_json_not_found("project", &name);
+                    }
                     eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
                     return Ok((EXIT_NOT_FOUND, None));
                 }
@@ -17670,6 +18289,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let value = match response {
                 Ok(value) => value,
                 Err(error) if format!("{error:#}").contains("not found") => {
+                    // nw-399: this arm already had the right EXIT code (2) and
+                    // the right remedy on stderr — and emitted zero bytes on
+                    // stdout, so a `--json` caller saw an empty stream and could
+                    // not tell it apart from a crash.
+                    if json {
+                        print_json_not_found("project", &name);
+                    }
                     eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
                     return Ok((EXIT_NOT_FOUND, None));
                 }
@@ -18338,12 +18964,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let (files_count, symbols_count, edges_count);
             let skipped_files;
 
-            // Per-repo `exclude` globs from `--config`. The daemon route
-            // resolves these from its own loaded config; this is the direct
-            // (`--no-daemon`) twin, so both routes exclude the same paths.
-            let repo_excludes: Vec<String> = load_instance_config_opt(config.as_deref())
-                .map(|cfg| cfg.exclude_globs_for(&repo_url, Some(&repo_path)).to_vec())
-                .unwrap_or_default();
+            // Per-repo `exclude` globs and `unskip` names from `--config`. The
+            // daemon route resolves these from its own loaded config; this is
+            // the direct (`--no-daemon`) twin, so both routes see the same
+            // per-repo directory policy.
+            //
+            // nw-418: `unskip` is the OTHER half of that policy and was never
+            // resolved here, so `[[repos]] unskip = ["public"]` PARSED (the key
+            // exists in `RepoConfig`) and then did nothing on this route — the
+            // exact "config key that is accepted and ignored" failure the key
+            // was added to prevent. Loaded ONCE and both halves taken from the
+            // same config, so they cannot resolve against different repos.
+            let (repo_excludes, repo_unskip) = resolve_repo_directory_policy(
+                load_instance_config_opt(config.as_deref()).as_ref(),
+                &repo_url,
+                &repo_path,
+            );
 
             if force {
                 // Full re-index requested explicitly.
@@ -18355,7 +18991,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .force(true)
                 .name(name.as_deref())
                 .limits(index_limits)
-                .excludes(&repo_excludes);
+                .excludes(&repo_excludes)
+                // nw-418: the full scan honours `unskip` through
+                // `FilesystemReader::list_files`, but only if it is HANDED the
+                // set. Without this the flag was configurable and inert.
+                .unskip(&repo_unskip);
                 let result = nestweaver_engine::index::index_directory_with_opts(
                     &repo_path, &db_path, &opts,
                 )
@@ -18375,7 +19015,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 skipped_files = result.skipped_files;
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = nestweaver_engine::index::incremental_index_with_excludes(
+                // nw-418: the `_and_unskip` entry point, not the
+                // `unskip`-less wrapper. The wrapper passes the EMPTY set, and
+                // an incremental run that forgets `unskip` drops the re-admitted
+                // files one at a time inside the change loop — below the level
+                // nw-387's `SkippedDir` disclosure watches, because `unskip`
+                // means the directory was never pruned and there is no row to
+                // drain. The user gets the files on `--force` and silently
+                // loses them on every incremental run, with
+                // `coverage_status: "complete"` both times.
+                let inc = nestweaver_engine::index::incremental_index_with_excludes_and_unskip(
                     &repo_path,
                     &db_path,
                     &instance_id,
@@ -18383,6 +19032,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     name.as_deref(),
                     index_limits,
                     &repo_excludes,
+                    &repo_unskip,
                 )
                 .context("incremental_index")?;
 
@@ -26352,6 +27002,12 @@ mod cli_help_contract_tests {
             "nestweaver server backup save",
             "nestweaver snapshot build",
             "nestweaver suggest-links",
+            // nw-414: `summary` joined this inventory. It took `--db` and no
+            // `--config`, so it could not resolve an instance, could not take
+            // the daemon route, and failed closed on a live instance whose
+            // daemon holds the WAL — the sweep had to measure it against a FILE
+            // COPY of the database.
+            "nestweaver summary",
             "nestweaver ui",
             "nestweaver watch",
             "nestweaver watch-stop",
@@ -38678,5 +39334,621 @@ mod resolver_generation_gate_tests {
             DeadCodeRefusal::for_repos(&db_path, &repos).is_none(),
             "a repo recorded at the current generation must not refuse"
         );
+    }
+}
+
+/// nw-398 / nw-399 / nw-400 / nw-411 / nw-414 / nw-418 — the CLI half of the
+/// honesty sweep.
+///
+/// Every test here is a COUNTERWEIGHT pair: one half asserts the defect is
+/// gone, the other asserts the remedy did not overshoot into a claim that is
+/// equally false in the other direction.
+#[cfg(test)]
+mod cli_honesty_sweep_tests {
+    use super::*;
+
+    /// Clap parsing has to run off the main test stack: `Cli` is a very large
+    /// enum and the derived parser recurses through all of it, exactly as
+    /// `init_tls_validity_days_range_enforced` already does.
+    fn parse_off_thread(argv: Vec<&'static str>) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(&argv))
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    fn staleness_fixture() -> ResolverStaleness {
+        ResolverStaleness {
+            rankings_stale: false,
+            stale_repos: vec![],
+        }
+    }
+
+    // ── nw-398 ───────────────────────────────────────────────────────────
+
+    /// The header must say how much `--top` HID, not merely how much it showed.
+    /// `hubs.len()` alone is true by construction and therefore says nothing —
+    /// the same tautology `count == len(list)` was in the payload.
+    #[test]
+    fn a_truncated_ranking_header_names_the_population_it_was_cut_from() {
+        let cut = RankingBounds {
+            total: Some(4182),
+            truncated: Some(true),
+            ..RankingBounds::default()
+        };
+        assert_eq!(cut.header_count(3), "3 of 4182");
+    }
+
+    /// COUNTERWEIGHT. Three cases that must NOT grow an "of M": a complete
+    /// answer, a route that was not told the total, and the padded-tail case
+    /// where the caller asked for more than the graph holds — `--top 1000` on a
+    /// 180-candidate graph is a caller who was given everything, which is the
+    /// opposite of truncation. "N of M" where M <= N would read as a cut that
+    /// did not happen.
+    #[test]
+    fn a_complete_or_unknowing_ranking_header_makes_no_truncation_claim() {
+        let complete = RankingBounds {
+            total: Some(3),
+            truncated: Some(false),
+            ..RankingBounds::default()
+        };
+        assert_eq!(complete.header_count(3), "3");
+
+        let padded_tail = RankingBounds {
+            total: Some(180),
+            truncated: Some(false),
+            ..RankingBounds::default()
+        };
+        assert_eq!(padded_tail.header_count(1000), "1000");
+
+        assert_eq!(RankingBounds::default().header_count(3), "3");
+    }
+
+    /// The payload carries the honest keys, and `total` is NOT `len(list)`.
+    #[test]
+    fn a_ranking_payload_publishes_a_total_that_is_not_the_returned_length() {
+        let rows = vec!["a", "b", "c"];
+        let payload = ranking_json_payload(
+            "hubs",
+            &rows,
+            &staleness_fixture(),
+            None,
+            &RankingBounds {
+                total: Some(4182),
+                truncated: Some(true),
+                ..RankingBounds::default()
+            },
+        );
+        assert_eq!(payload["total"], serde_json::json!(4182));
+        assert_eq!(payload["truncated"], serde_json::json!(true));
+        assert_ne!(
+            payload["total"],
+            serde_json::json!(rows.len()),
+            "a `total` equal to the returned length is the anti-pattern nw-398 exists to \
+             remove — it is true by construction and discloses nothing: {payload}"
+        );
+        assert!(
+            payload["total_population"]
+                .as_str()
+                .is_some_and(|text| text.contains("code edge")),
+            "`total` counts CANDIDATES, and the payload has to say so or `returned/total` \
+             reads as a hub ratio it is not: {payload}"
+        );
+        assert!(
+            payload.get("sampled").is_none(),
+            "hubs are a degree count and are never an estimate; a `sampled: false` here \
+             would answer a question this surface cannot be asked: {payload}"
+        );
+    }
+
+    /// Bridges carry the sampling provenance as well, because the score itself
+    /// cannot: an estimate from 500 sources renders to the same 14 significant
+    /// digits an exact one would.
+    #[test]
+    fn a_bridge_payload_declares_that_its_score_is_an_estimate() {
+        let rows: Vec<&str> = vec![];
+        let payload = ranking_json_payload(
+            "bridges",
+            &rows,
+            &staleness_fixture(),
+            None,
+            &RankingBounds {
+                total: Some(4182),
+                truncated: Some(true),
+                sampled: Some(true),
+                sources_sampled: Some(500),
+            },
+        );
+        assert_eq!(payload["sampled"], serde_json::json!(true));
+        assert_eq!(payload["sources_sampled"], serde_json::json!(500));
+
+        let note = bridge_sampling_note(&RankingBounds {
+            sampled: Some(true),
+            sources_sampled: Some(500),
+            ..RankingBounds::default()
+        })
+        .expect("a sampled walk must disclose itself");
+        assert!(note.contains("500"), "{note}");
+        assert!(note.contains("ESTIMATE"), "{note}");
+    }
+
+    /// COUNTERWEIGHT. A graph small enough for an EXACT Brandes run must not
+    /// carry an approximation warning — a caveat present on every answer
+    /// distinguishes nothing, which is how the tool description's "approximate
+    /// for large graphs" became invisible in the first place.
+    #[test]
+    fn an_exact_betweenness_walk_carries_no_approximation_warning() {
+        assert!(
+            bridge_sampling_note(&RankingBounds {
+                sampled: Some(false),
+                sources_sampled: Some(180),
+                ..RankingBounds::default()
+            })
+            .is_none()
+        );
+        assert!(bridge_sampling_note(&RankingBounds::default()).is_none());
+    }
+
+    /// The daemon route must publish `null`, not `false`. "This route was not
+    /// told" and "nothing was cut" are different claims and only one of them is
+    /// true of an OLDER daemon's `hub_nodes` reply, which carries only `top_n`/`count`. The current one carries the totals; this test pins the not-told path, which is why it builds the reply by hand.
+    #[test]
+    fn the_daemon_route_says_it_does_not_know_rather_than_saying_nothing_was_cut() {
+        let todays_reply = serde_json::json!({
+            "top_n": 3,
+            "count": 3,
+            "hubs": [],
+            "clustering_available": false,
+        });
+        let bounds = RankingBounds::from_daemon_response(&todays_reply);
+        assert_eq!(bounds.total, None);
+        assert_eq!(bounds.truncated, None);
+
+        let rows: Vec<&str> = vec![];
+        let payload = ranking_json_payload("hubs", &rows, &staleness_fixture(), None, &bounds);
+        assert!(
+            payload["truncated"].is_null(),
+            "an unknown cut must serialise as null; `false` would be a fabricated \
+             completeness claim: {payload}"
+        );
+    }
+
+    /// COUNTERWEIGHT to the above: the read is a READ, so the moment the MCP
+    /// half of nw-398 publishes the keys this route reports them without a
+    /// second edit here. A branch that always returned `None` would pass the
+    /// test above and be permanently useless.
+    #[test]
+    fn the_daemon_route_reports_the_totals_the_moment_the_reply_carries_them() {
+        let future_reply = serde_json::json!({
+            "returned": 3,
+            "total": 4182,
+            "truncated": true,
+            "sampled": true,
+            "sources_sampled": 500,
+            "bridges": [],
+        });
+        let bounds = RankingBounds::from_daemon_response(&future_reply);
+        assert_eq!(bounds.total, Some(4182));
+        assert_eq!(bounds.truncated, Some(true));
+        assert_eq!(bounds.sampled, Some(true));
+        assert_eq!(bounds.sources_sampled, Some(500));
+        assert_eq!(bounds.header_count(3), "3 of 4182");
+    }
+
+    // ── nw-399 ───────────────────────────────────────────────────────────
+
+    /// Every not-found envelope is `symbol`'s envelope, whatever the command
+    /// calls its target — one `error` discriminator, so a script branches once.
+    #[test]
+    fn every_not_found_envelope_carries_one_discriminator_and_the_callers_own_key() {
+        for (key, target) in [
+            ("name", "processPayment"),
+            ("project", "nope"),
+            ("service", "nope"),
+            ("cluster", "9999"),
+            ("symbol", "nope"),
+            ("target", "Missing Note"),
+        ] {
+            let payload = json_not_found_payload(key, &serde_json::json!(target), None);
+            assert_eq!(
+                payload["error"],
+                serde_json::json!("not found"),
+                "{payload}"
+            );
+            assert_eq!(payload[key], serde_json::json!(target), "{payload}");
+        }
+
+        // `context` takes a seed LIST, and the envelope must echo it rather
+        // than flattening it to a string a caller cannot match on.
+        let seeds = json_not_found_payload(
+            "seeds",
+            &serde_json::json!(["a", "b"]),
+            Some("No matching symbols"),
+        );
+        assert_eq!(seeds["seeds"], serde_json::json!(["a", "b"]));
+        assert_eq!(seeds["message"], serde_json::json!("No matching symbols"));
+    }
+
+    /// COUNTERWEIGHT. A pattern that does not COMPILE is not an absent target,
+    /// and the two must not share an envelope: one means "fix your regex" and
+    /// the other means "nothing matched", and a consumer that cannot tell them
+    /// apart will retry the broken one forever.
+    #[test]
+    fn a_bad_argument_is_not_reported_as_a_missing_target() {
+        let payload = json_argument_error_payload("pattern", "foo(", "unclosed group");
+        assert_eq!(payload["error"], serde_json::json!("invalid argument"));
+        assert_ne!(payload["error"], serde_json::json!("not found"));
+        assert_eq!(payload["argument"], serde_json::json!("pattern"));
+        assert_eq!(payload["value"], serde_json::json!("foo("));
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("unclosed group")),
+            "the engine's own diagnosis is the only thing that says WHAT is wrong \
+             with the pattern, so it must survive into the payload: {payload}"
+        );
+    }
+
+    /// The mapping has to be findable by the script author it exists for, and
+    /// `--help` is where they will look. nw-399's second defect was not the
+    /// empty stream — it was that "not found" meant 2 for six commands and 1
+    /// for four, so no single rule worked.
+    #[test]
+    fn the_exit_code_contract_is_written_where_a_script_author_will_find_it() {
+        let help = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| Cli::command().render_long_help().to_string())
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert!(
+            help.contains("TARGET NOT FOUND"),
+            "the top-level help must name the one not-found code: {help}"
+        );
+        for fragment in ["Exit codes", "64", "\"not found\""] {
+            assert!(help.contains(fragment), "missing {fragment:?} from --help");
+        }
+
+        // THE ORIGINAL VERSION OF THIS TEST ASSERTED THAT THE HELP CONTAINED
+        // "invalid argument" — and it passed while that promise was FALSE.
+        // Review measured `brain topic-clusters --limit 0 --json` -> exit 64
+        // with ZERO bytes on stdout, because clap raises the usage error before
+        // `--json` is ever read. The help claimed an envelope for exactly the
+        // class that cannot emit one.
+        //
+        // So the assertion is inverted: a documentation test whose only power is
+        // to check that a sentence EXISTS will happily pin a lie. This one now
+        // requires the exceptions to be stated, and forbids the unqualified
+        // promise from coming back.
+        assert!(
+            !help.contains("With --json every one of those outcomes"),
+            "the unqualified 'every outcome writes JSON' promise is false — exit 64 from a \
+             flag writes nothing to stdout. Do not restore it: {help}"
+        );
+        for exception in [
+            "NOT UNIVERSAL",
+            "BEFORE --json is read",
+            "uncompilable --pattern",
+        ] {
+            assert!(
+                help.contains(exception),
+                "the contract must state its exceptions; missing {exception:?}: {help}"
+            );
+        }
+
+        // The BEHAVIOUR half of this contract is pinned in `tests/cli_test.rs`
+        // (`a_clap_rejected_flag_writes_nothing_to_stdout_as_the_contract_says`),
+        // because only an integration test can spawn the binary. Keeping the two
+        // apart is deliberate: this test guards the WORDS, that one guards the
+        // FACT, and the lie this test now forbids was possible precisely because
+        // nothing guarded the fact.
+    }
+
+    // ── nw-400 / nw-411 ──────────────────────────────────────────────────
+
+    /// The five commands nw-400 names reject an out-of-range value AT THE
+    /// PARSER, with the bound in the message — never by shipping it to the MCP
+    /// JSON-Schema validator, which answered with an internal tool name, no
+    /// bound, and exit 1.
+    #[test]
+    fn out_of_range_bounds_are_refused_by_clap_and_name_the_bound() {
+        let limited: [(Vec<&'static str>, &str); 4] = [
+            (vec!["nestweaver", "brain", "topic-clusters"], "1..=1000"),
+            (vec!["nestweaver", "brain", "orphans"], "1..=1000"),
+            (vec!["nestweaver", "brain", "tag-graph"], "1..=1000"),
+            (vec!["nestweaver", "brain", "broken-links"], "1..=1000"),
+        ];
+        for (base, bound) in limited {
+            for bad in ["0", "1001", "99999"] {
+                let mut argv = base.clone();
+                argv.extend(["--limit", bad]);
+                let error = parse_off_thread(argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{base:?} --limit {bad} must be rejected"));
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(bound),
+                    "the bound must be NAMED, which is the whole defect — \
+                     `schema keyword 'minimum' failed` named none: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("schema keyword"),
+                    "a CLI user must never be shown the MCP validator: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("brain_"),
+                    "a CLI user must never be shown an MCP TOOL NAME they did not \
+                     invoke: {rendered}"
+                );
+            }
+        }
+
+        // `clusters --resolution` has a different KIND of bound — the schema
+        // declares `exclusiveMinimum: 0`, not a range — and its worst case was
+        // `nan`, which parses as a valid f64, serialises to JSON `null`, and so
+        // came back as `keyword 'type' failed`: a true statement about the wire
+        // encoding and a useless one about the flag.
+        // `--resolution=-1`, not `--resolution -1`: clap reads a leading `-` as
+        // the start of a flag, so the space form never reaches the parser at
+        // all. Both spellings are usage errors at exit 64 either way.
+        for bad in [
+            "--resolution=0",
+            "--resolution=-1",
+            "--resolution=nan",
+            "--resolution=inf",
+        ] {
+            let error = parse_off_thread(vec!["nestweaver", "clusters", bad])
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be rejected"));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("greater than 0") || rendered.contains("finite"),
+                "the bound must be named: {rendered}"
+            );
+            assert!(!rendered.contains("keyword"), "{rendered}");
+        }
+
+        // nw-411: the daemon route rejects `depth` outside 1..=15 at the
+        // schema; `--no-daemon` accepted anything. The two now agree.
+        for bad in ["0", "16", "100000"] {
+            let error = parse_off_thread(vec![
+                "nestweaver",
+                "memory",
+                "related",
+                "note:x",
+                "--depth",
+                bad,
+            ])
+            .err()
+            .unwrap_or_else(|| panic!("--depth {bad} must be rejected"));
+            assert!(error.to_string().contains("1..=15"), "{error}");
+        }
+    }
+
+    /// COUNTERWEIGHT. The bounds must not have swallowed the legal range, and
+    /// an OMITTED `--limit` must still parse — these four resolve their default
+    /// from `[limits].default_result_limit`, so requiring a value would break
+    /// every existing invocation.
+    #[test]
+    fn in_range_and_omitted_bounds_still_parse() {
+        for base in [
+            vec!["nestweaver", "brain", "topic-clusters"],
+            vec!["nestweaver", "brain", "orphans"],
+            vec!["nestweaver", "brain", "tag-graph"],
+            vec!["nestweaver", "brain", "broken-links"],
+        ] {
+            assert!(
+                parse_off_thread(base.clone()).is_ok(),
+                "{base:?} with no --limit must still parse"
+            );
+            for good in ["1", "50", "1000"] {
+                let mut argv = base.clone();
+                argv.extend(["--limit", good]);
+                assert!(
+                    parse_off_thread(argv).is_ok(),
+                    "{base:?} --limit {good} must parse"
+                );
+            }
+        }
+
+        for good in ["0.0001", "0.5", "5", "1e9"] {
+            assert!(
+                parse_off_thread(vec!["nestweaver", "clusters", "--resolution", good]).is_ok(),
+                "--resolution {good} must parse: no UPPER bound is claimed here, \
+                 because the schema declares none and choosing one is nw-401's question"
+            );
+        }
+        assert!(parse_off_thread(vec!["nestweaver", "clusters"]).is_ok());
+
+        for good in ["1", "2", "15"] {
+            assert!(
+                parse_off_thread(vec![
+                    "nestweaver",
+                    "memory",
+                    "related",
+                    "note:x",
+                    "--depth",
+                    good
+                ])
+                .is_ok(),
+                "--depth {good} must parse"
+            );
+        }
+    }
+
+    /// nw-400's DONE WHEN includes "the bound is in `--help`" — a message that
+    /// names a constraint the user has no way to look up is the defect, and
+    /// bisecting for it is not a remedy.
+    #[test]
+    fn the_bound_appears_in_help_and_not_only_in_the_rejection() {
+        let help = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut command = Cli::command();
+                let brain = command
+                    .find_subcommand_mut("brain")
+                    .expect("brain subcommand")
+                    .clone();
+                let mut rendered = String::new();
+                for name in ["topic-clusters", "orphans", "tag-graph", "broken-links"] {
+                    let mut subcommand = brain
+                        .clone()
+                        .find_subcommand_mut(name)
+                        .expect("brain leaf subcommand")
+                        .clone();
+                    rendered.push_str(&subcommand.render_long_help().to_string());
+                }
+                let mut clusters = command
+                    .find_subcommand_mut("clusters")
+                    .expect("clusters subcommand")
+                    .clone();
+                rendered.push_str(&clusters.render_long_help().to_string());
+                let mut related = command
+                    .find_subcommand_mut("memory")
+                    .expect("memory subcommand")
+                    .clone()
+                    .find_subcommand_mut("related")
+                    .expect("memory related")
+                    .clone();
+                rendered.push_str(&related.render_long_help().to_string());
+                rendered
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+
+        assert_eq!(
+            help.matches("1-1000").count(),
+            4,
+            "each of the four --limit flags must state its bound in --help: {help}"
+        );
+        assert!(help.contains("greater than 0"), "{help}");
+        assert!(help.contains("1-15"), "{help}");
+    }
+
+    // ── nw-414 ───────────────────────────────────────────────────────────
+
+    /// `summary` could not resolve an instance and so could not reach the
+    /// daemon: on a live instance the daemon holds the WAL and the direct open
+    /// fails. It now takes `--config` exactly as `hubs`/`bridges`/`memory lint`
+    /// do.
+    #[test]
+    fn summary_accepts_the_config_flag_its_siblings_have_always_had() {
+        let cli = parse_off_thread(vec![
+            "nestweaver",
+            "summary",
+            "--level",
+            "hub",
+            "--config",
+            "/tmp/instance.toml",
+        ])
+        .expect("summary --config must parse");
+        match cli.command {
+            Commands::Summary { config, .. } => assert_eq!(
+                config.as_deref(),
+                Some(Path::new("/tmp/instance.toml")),
+                "the flag must reach the handler, not merely be accepted"
+            ),
+            _ => panic!("expected Summary"),
+        }
+    }
+
+    /// COUNTERWEIGHT: adding the flag must not have made it REQUIRED. `summary`
+    /// with a bare `--db`, or with nothing at all, is the common invocation.
+    #[test]
+    fn summary_without_a_config_still_parses() {
+        let cli = parse_off_thread(vec!["nestweaver", "summary"]).expect("bare summary must parse");
+        match cli.command {
+            Commands::Summary { config, .. } => assert!(config.is_none()),
+            _ => panic!("expected Summary"),
+        }
+    }
+
+    // ── nw-418 ───────────────────────────────────────────────────────────
+
+    fn instance_config_with_unskip(
+        dir: &std::path::Path,
+        repo_url: &str,
+    ) -> nestweaver_engine::InstanceConfig {
+        let path = dir.join("instance.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "instance_id = \"test\"\n\
+                 [snapshot_storage]\nbackend = \"local\"\npath = \"/tmp/snap\"\n\
+                 [workspace]\nbackend = \"local\"\npath = \"/tmp/ws\"\n\
+                 [inference]\nendpoint = \"http://localhost:11434\"\n\
+                 embedding_model = \"m\"\nsummary_model = \"m\"\n\
+                 [git]\ncredential_method = \"ssh\"\n\
+                 [[repos]]\n\
+                 url = \"{repo_url}\"\n\
+                 unskip = [\"public\"]\n\
+                 exclude = [\"vendor/**\"]\n"
+            ),
+        )
+        .expect("write instance config fixture");
+        nestweaver_engine::InstanceConfig::from_file(&path).expect("instance config fixture")
+    }
+
+    /// The key PARSED before this change and did nothing: `src/main.rs` never
+    /// resolved it, so `IndexOptions` and the incremental twin both received
+    /// the empty set. Resolved now, and both halves of the block come from one
+    /// config against one repo.
+    #[test]
+    fn a_declared_unskip_reaches_the_index_options() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = instance_config_with_unskip(tmp.path(), "file:///srv/app");
+        let (excludes, unskip) =
+            resolve_repo_directory_policy(Some(&config), "file:///srv/app", Path::new("/srv/app"));
+        assert_eq!(unskip, vec!["public".to_string()]);
+        assert_eq!(excludes, vec!["vendor/**".to_string()]);
+
+        let opts = nestweaver_engine::index::IndexOptions::new("test", "file:///srv/app", "sha")
+            .excludes(&excludes)
+            .unskip(&unskip);
+        assert_eq!(opts.unskip, vec!["public".to_string()]);
+        assert_eq!(opts.excludes, vec!["vendor/**".to_string()]);
+    }
+
+    /// COUNTERWEIGHT, and the one the item names explicitly: a repo the config
+    /// does NOT declare must still prune, or the fix has disabled `SKIP_DIRS`
+    /// rather than made one repo's re-admission effective. Same for no config
+    /// at all.
+    #[test]
+    fn an_undeclared_repo_keeps_its_skip_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = instance_config_with_unskip(tmp.path(), "file:///srv/app");
+        let (excludes, unskip) = resolve_repo_directory_policy(
+            Some(&config),
+            "file:///srv/other",
+            Path::new("/srv/other"),
+        );
+        assert!(
+            unskip.is_empty(),
+            "one repo's `unskip` must not re-admit `public/` for every other repo"
+        );
+        assert!(excludes.is_empty());
+
+        let (excludes, unskip) =
+            resolve_repo_directory_policy(None, "file:///srv/app", Path::new("/srv/app"));
+        assert!(unskip.is_empty() && excludes.is_empty());
+    }
+
+    /// The `[[repos]]` block is matched by URL **or** by local checkout path —
+    /// the same rule `exclude_globs_for` uses — because the same repo is spelled
+    /// three ways in practice. A policy that resolved on only one spelling is
+    /// how a declared `unskip` silently does nothing.
+    #[test]
+    fn the_policy_resolves_by_checkout_path_as_well_as_by_url() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = instance_config_with_unskip(tmp.path(), "/srv/app");
+        let (_, unskip) = resolve_repo_directory_policy(
+            Some(&config),
+            "https://github.com/example/app.git",
+            Path::new("/srv/app"),
+        );
+        assert_eq!(unskip, vec!["public".to_string()]);
     }
 }
