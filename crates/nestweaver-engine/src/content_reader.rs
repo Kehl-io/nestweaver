@@ -134,6 +134,70 @@ pub trait ContentReader: Send + Sync {
     fn max_source_file_bytes(&self) -> u64 {
         DEFAULT_MAX_SOURCE_FILE_BYTES
     }
+
+    /// Directories the last [`Self::list_files`] pruned, for disclosure.
+    ///
+    /// nw-387 PUT THIS ON THE TRAIT. It existed only as an inherent method on
+    /// [`FilesystemReader`], and `index_into_store_with_write_gate` holds a
+    /// `&dyn ContentReader` — so the indexer *could not* reach it even in
+    /// principle, and the accessor's one and only caller in the whole workspace
+    /// was the `#[cfg(test)]` test that asserted it. nw-325 shipped the
+    /// recorder and the `unskip` re-admission but never the disclosure, so a
+    /// pruned `vendor/` produced `skipped_files: []`,
+    /// `coverage_status: "complete"` and `--fail-on-skip` exit 0 — a wrong
+    /// answer that was byte-identical to a complete one. Widening this to the
+    /// trait is what makes the drain at the indexer possible at all.
+    ///
+    /// Default is empty, i.e. "this reader prunes nothing it has not already
+    /// reported". That is honest for the mock readers in the test suites, and
+    /// KNOWINGLY INCOMPLETE for [`GitBareReader`], which drops `SKIP_DIRS`
+    /// paths per-entry via `crate::index::path_in_skip_dir` and records
+    /// nothing. Its prune is therefore still silent; the filesystem path —
+    /// which is what every local `index`/`--fail-on-skip` run uses, and what
+    /// nw-387 measured — is covered. Closing the bare-clone half needs a
+    /// recorder in `list_files` there and is deliberately not smuggled in here.
+    fn skipped_dirs(&self) -> Vec<SkippedDir> {
+        Vec::new()
+    }
+}
+
+/// Rewrite lone `\r` line endings to `\n`, leaving `\r\n` byte-for-byte alone.
+///
+/// nw-386. See the call site in [`FilesystemReader::read_file`] for the failure
+/// this exists to stop. Free and pure so it is testable without a filesystem.
+///
+/// Written as a scan-and-splice rather than a byte-level `replace` so no
+/// re-validation of UTF-8 is needed: `\r` is ASCII and cannot appear inside a
+/// multi-byte sequence, but building the result out of `&str` slices makes that
+/// a property of the code rather than a comment. Returns `Cow::Borrowed` — no
+/// allocation — for the overwhelmingly common LF and CRLF inputs.
+fn normalize_lone_cr(source: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: LF-only files have no `\r` at all, CRLF files have every `\r`
+    // followed by `\n`. Either way there is nothing to rewrite.
+    let has_lone_cr = source
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\r' && source.as_bytes().get(i + 1) != Some(&b'\n'));
+    if !has_lone_cr {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(idx) = rest.find('\r') {
+        out.push_str(&rest[..idx]);
+        if rest[idx + 1..].starts_with('\n') {
+            // CRLF: preserved verbatim. It is already correct, and rewriting it
+            // would change byte offsets the store holds.
+            out.push_str("\r\n");
+            rest = &rest[idx + 2..];
+        } else {
+            out.push('\n');
+            rest = &rest[idx + 1..];
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Whether a repo-relative directory is excluded outright, so the walker can
@@ -212,14 +276,6 @@ impl FilesystemReader {
     pub fn unskipping(mut self, names: &[String]) -> Self {
         self.unskip = names.iter().map(|n| n.trim().to_string()).collect();
         self
-    }
-
-    /// Directories the last [`Self::list_files`] pruned.
-    pub fn skipped_dirs(&self) -> Vec<SkippedDir> {
-        self.skipped_dirs
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default()
     }
 
     /// Attach `[[repos]] exclude` globs. These are matched against
@@ -312,6 +368,35 @@ impl ContentReader for FilesystemReader {
         // at `parse_markdown`, because the watcher reads notes with
         // `fs::read_to_string` and never passes through here.
         let source = nestweaver_parser::strip_nul_bytes(&source).into_owned();
+        // nw-386: normalise LONE CR (a `\r` not followed by `\n`) to `\n`.
+        //
+        // Classic-Mac / lone-CR files contributed ZERO symbols and said nothing
+        // about it. With no `\n` anywhere in the file, a leading `//` or `#`
+        // line comment never terminates and tree-sitter swallows the entire
+        // source: a measured 4-file fixture (`hdr.rs`, `hdr.py`, `hdr.go` plus
+        // one LF control) reported `files_processed: 4, symbols_found: 1,
+        // skipped_count: 0, coverage_status: "complete"`. Three files
+        // contributed nothing and the index called that complete.
+        //
+        // The second symptom needs no comment: every symbol's span collapses to
+        // line 1, so `read_symbols`' `read_span` — which splits on `text.lines()`
+        // — hands back the WHOLE FILE for each symbol with `truncated: false`.
+        //
+        // It is language-dependent, which is why no fixture caught it:
+        // JavaScript survives because tree-sitter honours CR as a line
+        // terminator per ECMAScript; Rust, Python, Ruby and Go do not.
+        //
+        // CRLF IS ALREADY CORRECT and must stay untouched — exact line numbers,
+        // byte-identical `read-symbols` bodies. So this rewrites only the LONE
+        // CR and steps over `\r\n` verbatim. Mixed CRLF-then-CR was already fine
+        // for the same reason (the first `\n` terminates the header).
+        //
+        // BYTE LENGTH IS PRESERVED: one ASCII `\r` becomes one ASCII `\n`, so
+        // every byte offset the store already holds stays valid and the
+        // oversize check below is unaffected. Borrows when there is no lone CR,
+        // so the overwhelmingly common path costs one scan and no allocation —
+        // the same shape as `strip_nul_bytes` next door.
+        let source = normalize_lone_cr(&source).into_owned();
         if source.len() as u64 > self.limits.max_source_file_bytes() {
             return Err(SourceTooLarge {
                 path: rel_path.display().to_string(),
@@ -447,6 +532,20 @@ impl ContentReader for FilesystemReader {
 
     fn max_source_file_bytes(&self) -> u64 {
         self.limits.max_source_file_bytes()
+    }
+
+    /// The prunes recorded by the most recent [`Self::list_files`].
+    ///
+    /// nw-387: lives on the trait impl, not as an inherent method, so the
+    /// indexer's `&dyn ContentReader` can actually call it. An inherent method
+    /// here would compile, satisfy the existing test, and remain unreachable
+    /// from the only place that needed it — which is precisely how nw-325
+    /// shipped half-done.
+    fn skipped_dirs(&self) -> Vec<SkippedDir> {
+        self.skipped_dirs
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -934,6 +1033,79 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_cr_source_reads_as_lf_while_crlf_and_lf_stay_byte_identical() {
+        // nw-386. A lone-CR file (`\r` never followed by `\n`) contributed ZERO
+        // symbols: with no `\n` anywhere the leading `//` comment never
+        // terminates and tree-sitter swallows the entire source, while the
+        // index reported `coverage_status: "complete", skipped_count: 0`.
+        // `read_file` is the seam every code-indexing read crosses, so it is
+        // where the normalisation lives.
+        //
+        // COUNTERWEIGHT, and the reason this is NOT a blanket
+        // `replace('\r', "\n")`: CRLF is already correct today — exact line
+        // numbers, byte-identical `read-symbols` bodies — so it must come back
+        // unchanged, byte for byte, as must LF.
+        let dir = TempDir::new().unwrap();
+        let lf = "// header\nfn one() {}\nfn two() {}\n";
+        let cr = lf.replace('\n', "\r");
+        let crlf = lf.replace('\n', "\r\n");
+        std::fs::write(dir.path().join("cr.rs"), &cr).unwrap();
+        std::fs::write(dir.path().join("lf.rs"), lf).unwrap();
+        std::fs::write(dir.path().join("crlf.rs"), &crlf).unwrap();
+        let reader = FilesystemReader::new(dir.path());
+
+        assert_eq!(
+            reader.read_file(Path::new("cr.rs")).unwrap(),
+            lf,
+            "a lone-CR source must read as its LF twin"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("lf.rs")).unwrap(),
+            lf,
+            "LF must be untouched"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("crlf.rs")).unwrap(),
+            crlf,
+            "CRLF is already correct and must survive byte for byte"
+        );
+        // Byte length is preserved in every case, which is what keeps the byte
+        // offsets already recorded in the store valid.
+        assert_eq!(
+            reader.read_file(Path::new("cr.rs")).unwrap().len(),
+            cr.len()
+        );
+    }
+
+    #[test]
+    fn normalising_a_lone_cr_does_not_disturb_an_adjacent_crlf_and_borrows_when_idle() {
+        // nw-386, the boundary cases the file-level test above cannot reach.
+        // Mixed CRLF-then-CR was ALREADY fine before the fix (the first `\n`
+        // terminates the header), so the rewrite must step over the `\r\n`
+        // rather than consuming its `\n` and turning the pair into `\n\n`.
+        assert_eq!(normalize_lone_cr("a\r\n\rb").into_owned(), "a\r\n\nb");
+        // A lone CR at EOF has no following byte to inspect.
+        assert_eq!(normalize_lone_cr("a\r").into_owned(), "a\n");
+        // `\r` is ASCII and cannot occur inside a multi-byte sequence, but pin
+        // that the splice is done on char boundaries and not byte-mangled.
+        assert_eq!(normalize_lone_cr("é\rß").into_owned(), "é\nß");
+        // The common paths allocate nothing, matching `strip_nul_bytes` next
+        // door — this runs on every file of every index.
+        assert!(matches!(
+            normalize_lone_cr("a\nb"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_lone_cr("a\r\nb"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_lone_cr("a\rb"),
+            std::borrow::Cow::Owned(_)
+        ));
+    }
+
+    #[test]
     fn filesystem_reader_read_missing_file_errors() {
         let dir = TempDir::new().unwrap();
         let reader = FilesystemReader::new(dir.path());
@@ -1078,6 +1250,17 @@ mod tests {
         // SkippedFile channel already carries the minified-bundle policy and
         // carried nothing here, because the prune happens inside
         // WalkBuilder::filter_entry before the file is ever enumerated.
+        //
+        // THIS TEST IS NOT THE GUARD FOR THAT PROPERTY — read nw-387 before
+        // trusting it. It asserts the RECORDER, and the recorder always worked;
+        // what was missing for a whole release was the wiring from here into
+        // `IndexResult::skipped_files`, so a pruned `vendor/` still reported
+        // `coverage_status: \"complete\"` and `--fail-on-skip` exit 0. A test at
+        // this level cannot fail for that reason and so cannot detect it. It is
+        // kept as a unit-level check on the recorder itself; the property that
+        // actually matters is pinned end-to-end by
+        // `a_pruned_directory_is_disclosed_on_the_index_result_not_only_on_the_recorder`
+        // in `index.rs`. Do not delete that one in favour of this one.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("packages/app/dist")).unwrap();
         std::fs::write(dir.path().join("packages/app/dist/bundle.js"), "").unwrap();

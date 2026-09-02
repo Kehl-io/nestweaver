@@ -70,6 +70,67 @@ fn open_direct_read_only_store(db_path: &Path) -> Result<GraphStore, anyhow::Err
         .with_context(|| format!("open read-only GraphStore at {}", db_path.display()))
 }
 
+/// Warm the in-memory PageRank cache from the `<db>.lbug.pagerank.json`
+/// sidecar, RETURNING the loader's refusal instead of discarding it.
+///
+/// nw-391. Every front end did this — the CLI's `open_store`, the daemon's
+/// boot, and the stdio server below — with the identical three lines, the last
+/// of which was literally `let _ = store.load_pagerank_cache(&pr_path);`. The
+/// loader is strict and correct: it validates the artifact envelope's brain
+/// UUID, publication UUID, source graph generation, producer version,
+/// algorithm fingerprint and payload BLAKE3, and on any mismatch it invalidates
+/// the ranking caches and returns a message that names the file, names the
+/// field that did not match, and prescribes a re-index. All three callers threw
+/// that away — so a sidecar one generation behind, which is exactly what a
+/// restored backup, a copied database or the 9.0.0 resolver-generation bump
+/// leaves, was refused in total silence at exit 0 while every ranked surface
+/// (`hubs`, `bridges`, `repo-map`, `context`, `investigate`) answered from
+/// whatever the store did next.
+///
+/// WHAT IS FIXED HERE IS THE SILENCE, and the scope is worth stating precisely
+/// because nw-391 reports a worse symptom than reproduced on this branch. The
+/// item measured an 11-symbol graph collapsing to a uniform 0.0909 = 1/11 after
+/// any one of three envelope fields was tampered with. Re-measuring 9.0.5 on a
+/// scratch graph through `hubs` and `repo-map`, both routes returned ranks
+/// byte-identical to the untampered baseline: the loader invalidates the cache
+/// BEFORE it validates, so the next `pagerank_scores()` finds an empty cache
+/// and recomputes from the graph. That is also why the item's own perverse
+/// finding holds — an unparseable sidecar, a truncated one, a directory and a
+/// `chmod 000` file all fail earlier in the same function and all rank
+/// correctly. The recompute is therefore not something this change adds; it is
+/// something the tests below now PIN, alongside the disclosure that was
+/// missing.
+///
+/// Returns `None` when the sidecar loaded, when it is absent (the loader treats
+/// that as a no-op), or during a dirty index publication (also a no-op, and
+/// deliberately not an error — see `load_pagerank_cache`). `Some(message)` is
+/// an operator-facing sentence; the caller chooses the channel, because a CLI
+/// writes to stderr and a daemon writes to `tracing`.
+///
+/// It lives in this crate because it is the only one both the `nestweaver`
+/// binary and `nestweaver-daemon` depend on, and a single function is the only
+/// way three front ends can be made to AGREE rather than to each remember.
+pub fn warm_pagerank_from_sidecar(store: &GraphStore, db_path: &Path) -> Option<String> {
+    // nw-029: the canonical sidecar name. `with_extension` yielded
+    // `<db>.pagerank.json` and the writers all produce `<db>.lbug.pagerank.json`,
+    // so a front end that reinvents this path warm-loads nothing at all.
+    nestweaver_engine::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
+    let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
+    match store.load_pagerank_cache(&pr_path) {
+        Ok(()) => None,
+        // The loader's own sentence is carried verbatim rather than
+        // paraphrased. It already names the field that did not match and ends
+        // in a runnable `nestweaver index --repo <path> --force`, and a
+        // paraphrase here is how three front ends start describing the same
+        // file three different ways again.
+        Err(error) => Some(format!(
+            "ranking sidecar {} was not loaded, so ranks are recomputed from \
+             the graph and the sidecar stays stale: {error}",
+            pr_path.display()
+        )),
+    }
+}
+
 /// Run the brain server on stdio until the client closes stdin or sends
 /// no more lines. Returns Ok on clean shutdown; errors only on truly
 /// unrecoverable conditions (the database failing to open, etc.). Per-call
@@ -102,9 +163,16 @@ pub fn run_stdio_server(
 
     let store = open_direct_read_only_store(db_path)?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
-    nestweaver_engine::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
-    let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
-    let _ = store.load_pagerank_cache(&pr_path);
+    //
+    // nw-391: and disclose a refusal. stderr is the only channel available
+    // here that is not the MCP wire — stdout carries JSON-RPC frames and
+    // NOTHING else may go there (see the module header), and this runs before
+    // any request exists to attach a notification to. `tracing` is configured
+    // by the caller to write to stderr, which is where an MCP client shows
+    // server diagnostics.
+    if let Some(disclosure) = warm_pagerank_from_sidecar(&store, db_path) {
+        tracing::warn!("{disclosure}");
+    }
 
     // Load interaction memory scores so PPR can apply a small bias toward
     // frequently-accessed nodes.
@@ -1641,5 +1709,178 @@ mod line_separator_framing_tests {
         assert_eq!(line, frame, "an escaped sequence is left exactly as it was");
         let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(parsed["result"]["text"].as_str().unwrap(), "a\u{2028}b");
+    }
+}
+
+/// nw-391. The PageRank sidecar disclosure, and the counterweight that a VALID
+/// sidecar still loads silently.
+#[cfg(test)]
+mod pagerank_sidecar_disclosure_tests {
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphScope, GraphStore};
+
+    use super::warm_pagerank_from_sidecar;
+
+    fn symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo-1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn calls(source: &str, target: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_uid: source.to_string(),
+            target_uid: target.to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// A graph whose ranks are demonstrably NOT uniform, so "flat" is a
+    /// detectable outcome rather than an assumption. `sink` is called by both
+    /// of the others; `source` is called by nobody.
+    fn seeded_store(db: &std::path::Path) -> GraphStore {
+        let store = GraphStore::create(db).unwrap();
+        for (uid, name) in [("A", "source"), ("B", "middle"), ("C", "sink")] {
+            store.insert_symbol(&symbol(uid, name)).unwrap();
+        }
+        store.insert_edge(&calls("A", "B")).unwrap();
+        store.insert_edge(&calls("B", "C")).unwrap();
+        store.insert_edge(&calls("A", "C")).unwrap();
+        store
+    }
+
+    fn spread(scores: &std::collections::HashMap<String, f64>) -> f64 {
+        let max = scores.values().cloned().fold(f64::MIN, f64::max);
+        let min = scores.values().cloned().fold(f64::MAX, f64::min);
+        max - min
+    }
+
+    /// nw-391. The whole item in one test: a sidecar the loader REFUSES must
+    /// not pass unremarked, and the ranks that come out must not be the flat
+    /// 1/N the refusal used to leave behind.
+    ///
+    /// The tamper is `source_graph_generation`, which is the field a restored
+    /// backup, a copied database and the 9.0.0 resolver-generation bump all
+    /// change in the real world — the reason this is not an academic
+    /// corruption case.
+    #[test]
+    fn a_generation_mismatched_sidecar_is_disclosed_and_does_not_yield_flat_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+
+        let store = seeded_store(&db);
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+        drop(store);
+
+        // COUNTERWEIGHT, and it runs FIRST so a disclosure that fires for every
+        // sidecar cannot pass this test: the artifact just written is valid,
+        // must load, and must say nothing at all.
+        let store = GraphStore::open(&db).unwrap();
+        assert_eq!(
+            warm_pagerank_from_sidecar(&store, &db),
+            None,
+            "a valid sidecar must load silently — a warning on every open is \
+             noise that trains the operator to ignore the real one"
+        );
+        let loaded = store.pagerank_scores().unwrap();
+        assert!(
+            spread(&loaded) > 1e-6,
+            "the fixture must produce non-uniform ranks or the flat check below \
+             asserts nothing: {loaded:?}"
+        );
+        drop(store);
+
+        // Now the reported state: a well-formed envelope that does not match.
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        let generation = envelope["source_graph_generation"].as_u64().unwrap();
+        envelope["source_graph_generation"] = serde_json::json!(generation + 7);
+        std::fs::write(&sidecar, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        let store = GraphStore::open(&db).unwrap();
+        let disclosure = warm_pagerank_from_sidecar(&store, &db)
+            .expect("a refused sidecar must reach the caller, not `let _ =`");
+        assert!(
+            disclosure.contains("nestweaver index"),
+            "the loader's own RUNNABLE remedy must survive the trip: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("generation"),
+            "the disclosure must name what did not match: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("graph.lbug.pagerank.json"),
+            "the disclosure must name the file it refused: {disclosure}"
+        );
+
+        // And the ranks themselves: 1/N for every symbol is the silent-wrong
+        // -answer this item is about, and it is what the caller gets if the
+        // refusal leaves an empty cache nobody refills.
+        let after = store.pagerank_scores().unwrap();
+        assert!(
+            spread(&after) > 1e-6,
+            "a refused sidecar collapsed ranking to uniform 1/N: {after:?}"
+        );
+    }
+
+    /// The other two envelope fields nw-391 measured, checked because they fail
+    /// at DIFFERENT validation stages — identity before the payload digest — and
+    /// a fix that only reached one stage would look complete against a single
+    /// tamper.
+    #[test]
+    fn a_foreign_brain_or_a_tampered_payload_is_disclosed_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+
+        let store = seeded_store(&db);
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+        let valid = std::fs::read(&sidecar).unwrap();
+        drop(store);
+
+        for field in ["brain_uuid", "payload_blake3"] {
+            let mut envelope: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            // A well-FORMED value of the right shape, not garbage: an
+            // unparseable file already behaved correctly before this fix.
+            envelope[field] = serde_json::json!("00000000-0000-4000-8000-000000000000");
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+            let store = GraphStore::open(&db).unwrap();
+            assert!(
+                warm_pagerank_from_sidecar(&store, &db).is_some(),
+                "a mismatched `{field}` must be disclosed"
+            );
+            assert!(
+                spread(&store.pagerank_scores().unwrap()) > 1e-6,
+                "a mismatched `{field}` collapsed ranking to uniform 1/N"
+            );
+        }
     }
 }

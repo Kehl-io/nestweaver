@@ -471,11 +471,16 @@ enum CliDiagnostic {
     },
 
     /// nw-285. A zero-length `.lbug`, or one that was created but never
-    /// indexed. `require_openable_db` passes a zero-byte file on purpose (it
-    /// is what the store itself initialises), and a read-only open does not
-    /// run `init_schema`, so the first query fails in the engine's binder with
-    /// `Table <X> does not exist` — an internal sentence with no remedy, for a
-    /// condition whose remedy is obvious and safe to name.
+    /// indexed.
+    ///
+    /// STALE UNTIL nw-385, corrected here: this used to say
+    /// `require_openable_db` "passes a zero-byte file on purpose". It no longer
+    /// does — passing it is what let a READ command initialise a store over a
+    /// user's 0-byte file, create four sidecars and spawn a daemon, all at exit
+    /// 0. The guard now RAISES this variant directly, so this diagnostic is
+    /// reached from the guard rather than from the binder failure downstream of
+    /// it. The binder arm below is kept because a database can still reach a
+    /// query with no schema by other routes.
     ///
     /// This is the one database-shaped diagnostic that MAY prescribe a write:
     /// `read_path_diagnostics_never_prescribe_a_write` bars a write when the
@@ -781,6 +786,18 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                 }
                 .into()
             }
+            // nw-385. `require_openable_db` raises this one directly, so it
+            // needs an arm: without it the `_` fallback below renders the
+            // sentence and DROPS `nestweaver::db_no_schema`, and a read
+            // against a zero-byte `--db` would report the right words with no
+            // code for `error_remedy_test` — or any operator's grep — to key
+            // on. The text arm at the top of this function still produces the
+            // same variant for the binder-exception route.
+            CliDiagnostic::DatabaseNoSchema { path, detail } => CliDiagnostic::DatabaseNoSchema {
+                path: path.clone(),
+                detail: detail.clone(),
+            }
+            .into(),
             // Every other variant is currently produced BY this function rather
             // than raised as an error, so there is nothing to pass through.
             // A variant that starts being raised directly adds its arm here.
@@ -848,10 +865,16 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         return corruption_diagnostic(kind, path, message);
     }
 
-    // nw-285. A zero-length `.lbug` passes `require_openable_db` by design, and
-    // `open_read_only` does not run `init_schema`, so the first query dies in
-    // the binder. `Table Symbol does not exist` / `Table Vault does not exist`
-    // is an internal sentence for a condition with an obvious remedy.
+    // nw-285. `open_read_only` does not run `init_schema`, so a query against a
+    // schema-less database dies in the binder. `Table Symbol does not exist` /
+    // `Table Vault does not exist` is an internal sentence for a condition with
+    // an obvious remedy.
+    //
+    // NOTE, corrected under nw-385: this comment used to say a zero-length
+    // `.lbug` "passes `require_openable_db` by design". That is no longer true —
+    // the guard refuses it up front. This arm is now the BACKSTOP for a
+    // schema-less database that reached a query some other way, not the primary
+    // path for the zero-byte case.
     if lower.contains("does not exist")
         && (lower.contains("binder exception") || lower.contains("table "))
     {
@@ -7966,9 +7989,17 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     // `sidecar_path(db, ".pagerank.json")`; the old `with_extension` idiom
     // yielded `<db>.pagerank.json`, so a direct (non-daemon) `ui`/query never
     // warm-loaded ranks. Mirror the daemon's idiom (server.rs).
-    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
-    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
-    let _ = store.load_pagerank_cache(&pr_path);
+    //
+    // nw-391: and SAY SO when the loader refuses it. This was
+    // `let _ = store.load_pagerank_cache(&pr_path);` — one of three sites that
+    // discarded a fully composed, correct diagnostic, so a stale or foreign
+    // sidecar degraded every ranked surface at exit 0 with no output at all.
+    // stderr, not stdout: `--json` consumers parse stdout, and this is exactly
+    // the split `warn_stale_resolver_rankings` already uses for the same class
+    // of ranking-provenance warning.
+    if let Some(disclosure) = nestweaver_mcp::warm_pagerank_from_sidecar(&store, path) {
+        eprintln!("Warning: {disclosure}");
+    }
 
     // Load interaction memory scores so PPR can apply a small bias toward
     // frequently-accessed nodes.
@@ -9971,9 +10002,15 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// same answer to the caller and were being given wildly different service.
 ///
 /// Deliberately a cheap header probe and NOT an open: an open is what costs,
-/// and this runs before every daemon-routed read. It is also deliberately
-/// conservative — an empty file passes, because a zero-byte `.lbug` is what
-/// the store itself initialises.
+/// and this runs before every daemon-routed read.
+///
+/// nw-385: this is a READ guard, and every one of its callers is a read —
+/// `open_store` (which only ever performs `open_read_only`) and
+/// `try_hybrid_json_rpc_checked` (the daemon-routed read funnel, which `index`
+/// deliberately does not route through). It used to exempt a zero-byte file
+/// "because the store initialises it", which is a statement about the CREATE
+/// path and was therefore an exemption for a caller that has never existed.
+/// See the `Ok(0)` arm for what that cost.
 ///
 /// This does NOT claim to detect corruption. A `.lbug` whose header is intact
 /// and whose index region is not still passes here, by construction; see
@@ -9999,9 +10036,37 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
              at a database you can read.",
             db_path.display()
         ),
-        // A zero-byte file is what an interrupted create leaves; the store
-        // initialises it. Not this guard's business.
-        Ok(0) => Ok(()),
+        // nw-385. A `--db` that yields NO bytes is REFUSED on the read path,
+        // and the exemption this arm replaces is the whole bug.
+        //
+        // The old arm read: "a zero-byte file is what an interrupted create
+        // leaves; the store initialises it. Not this guard's business." Every
+        // clause of that is true of a CREATE path, and no create path calls
+        // this guard — `index` opens read-write directly and never funnels
+        // through either call site. So the exemption protected nobody while
+        // admitting the entire READ surface to the route whose very next step
+        // is "the store initialises it", against a file the USER created.
+        //
+        // MEASURED: `nestweaver search --db ./important-notes.txt user`
+        // overwrote a 0-byte `important-notes.txt` with a 4096-byte LadybugDB
+        // header, created `.publications/`, `.tantivy/`, `.wal` and
+        // `.write.lock` beside it, left a persistent daemon running against
+        // it, printed "No symbols found matching 'user'." and exited 0. A read
+        // command destroyed the file it was pointed at and called it success.
+        //
+        // `index` keeps today's behaviour BY CONSTRUCTION rather than by
+        // exception: it does not consult this guard, and the store still
+        // initialises a zero-byte file on the create path — pinned by
+        // `the_create_path_still_initialises_a_zero_byte_database` so the
+        // justification the old comment gave is asserted where it is actually
+        // true instead of where it was actually harmful.
+        //
+        // Refusing HERE, before the dial, is also what fixes the adjacent leg:
+        // `--db /dev/null` reads EOF, so it took this arm and then paid the
+        // full 30s `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` ceiling and
+        // registered a launchd instance directory for `/dev/null` — exactly
+        // the cost nw-309 (see above) exists to eliminate.
+        Ok(0) => Err(no_bytes_refusal(db_path)),
         Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
         Ok(_) => anyhow::bail!(
             "{} is not a NestWeaver database (its header is not `LBUG`). \
@@ -10010,6 +10075,43 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
             db_path.display()
         ),
     }
+}
+
+/// The refusal for a `--db` that opens but yields no bytes at all (nw-385).
+///
+/// Two different shapes reach it and they have earned two different sentences.
+///
+/// A zero-byte REGULAR file is nw-285's `db_no_schema`: an interrupted create,
+/// or a file the user made with `touch` / `: >`. That variant already states
+/// the size, already names `nestweaver index` as the remedy, and is the one
+/// database diagnostic explicitly ALLOWED to prescribe a write, because a file
+/// with no schema demonstrably holds no data (see the variant's own doc). It is
+/// raised as the typed `CliDiagnostic` rather than as prose so the code survives
+/// to `into_diagnostic` instead of being re-derived from a sentence — the shrink
+/// -the-domain move nw-360 added the pass-through for.
+///
+/// A path that reads EOF but is NOT a regular file — `/dev/null`, the reported
+/// case, and any fifo or device — can never hold a database however often it is
+/// indexed, so prescribing `index` against it would be a remedy nobody can
+/// follow to a good end. It gets the same "not a NestWeaver database" sentence
+/// the non-`LBUG` header arm gives, which points at a different `--db` instead.
+fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
+    let regular_file = std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file());
+    if !regular_file {
+        return anyhow::anyhow!(
+            "{} is not a NestWeaver database (it is not a regular file, and it \
+             yields no bytes to read). Point --db at a `.lbug` file, or run \
+             `nestweaver index --repo <path> --db <new path>` to create one.",
+            db_path.display()
+        );
+    }
+    anyhow::Error::new(CliDiagnostic::DatabaseNoSchema {
+        path: db_path.display().to_string(),
+        detail: format!(
+            "{} is 0 bytes — an interrupted create leaves exactly this.",
+            db_path.display()
+        ),
+    })
 }
 
 /// Stable machine name for a recovery outcome, for `--json` consumers.
@@ -26493,17 +26595,195 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
         let error = require_openable_db(&directory).unwrap_err().to_string();
         assert!(error.contains("is a directory"), "{error}");
 
-        // A zero-byte file is what an interrupted create leaves and what the
-        // store itself initialises. Refusing it would break creation.
+        // nw-385: a zero-byte file is now REFUSED, because every caller of
+        // this guard is a read and "the store initialises it" is precisely
+        // what a read must never do. Fully asserted in
+        // `a_zero_byte_db_is_refused_on_the_read_path_without_writing_to_it`;
+        // named here so this inventory of shapes stays complete.
         let empty = dir.path().join("empty.lbug");
         std::fs::write(&empty, b"").unwrap();
-        require_openable_db(&empty).expect("an empty file is the store's business");
+        let error = require_openable_db(&empty).unwrap_err().to_string();
+        assert!(error.contains("no graph schema"), "{error}");
 
         // And a real header passes, so the guard cannot be satisfied by
         // rejecting everything.
         let real = dir.path().join("real.lbug");
         std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
         require_openable_db(&real).expect("a real LadybugDB header must pass");
+    }
+
+    /// nw-385. A READ command WROTE, and what it wrote over was a file the
+    /// user had made themselves.
+    ///
+    /// Reproduced verbatim before the fix: `: > important-notes.txt` then
+    /// `nestweaver search --db ./important-notes.txt user` turned the 0-byte
+    /// file into a 4096-byte LadybugDB, dropped `.publications/`, `.tantivy/`,
+    /// `.wal` and `.write.lock` next to it, left a daemon running against it,
+    /// and exited **0** with "No symbols found matching 'user'." The guard was
+    /// the one thing standing between a read and that route, and it waved the
+    /// file through on purpose.
+    ///
+    /// So this asserts all three halves of the DONE WHEN — refused, named
+    /// `db_no_schema`, and the file byte-for-byte untouched — plus the
+    /// counterweights that keep the other `--db` shapes exactly as they were.
+    #[test]
+    fn a_zero_byte_db_is_refused_on_the_read_path_without_writing_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("important-notes.txt");
+        std::fs::write(&notes, b"").unwrap();
+
+        let error = require_openable_db(&notes).unwrap_err();
+
+        // The typed variant, not a lookalike sentence: `into_diagnostic`
+        // renders `nestweaver::db_no_schema` from the TYPE, and
+        // `error_remedy_test::a_zero_length_database_says_what_to_run` greps
+        // stderr for that code.
+        let diagnostic = error
+            .downcast_ref::<CliDiagnostic>()
+            .expect("the refusal must carry its code, not just its words");
+        assert!(
+            matches!(diagnostic, CliDiagnostic::DatabaseNoSchema { .. }),
+            "expected db_no_schema, got {diagnostic:?}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("no graph schema"), "{message}");
+
+        // What the operator actually sees. The size is the diagnosis and the
+        // remedy has to be runnable — the same two facts
+        // `error_remedy_test::a_zero_length_database_says_what_to_run` greps
+        // for, asserted here so the wiring cannot rot silently between the
+        // guard, the pass-through arm and the rendered report.
+        let rendered = format!("{:?}", into_diagnostic(error));
+        assert!(rendered.contains("nestweaver::db_no_schema"), "{rendered}");
+        assert!(rendered.contains("0 bytes"), "{rendered}");
+        assert!(rendered.contains("nestweaver index"), "{rendered}");
+
+        // The point of the item: the file is still the user's empty file.
+        let after = std::fs::metadata(&notes).unwrap();
+        assert_eq!(after.len(), 0, "a read guard must not have written a byte");
+
+        // …and no sidecar was materialised beside it. `.tantivy`,
+        // `.publications`, `.wal` and `.write.lock` are the four the repro
+        // produced; asserting the directory is otherwise empty catches any
+        // fifth a future route might add.
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "a refused read left artifacts behind: {siblings:?}"
+        );
+
+        // COUNTERWEIGHT 1 — the refusal must not swallow the whole read
+        // surface. A real database still passes the guard untouched.
+        let real = dir.path().join("real.lbug");
+        std::fs::write(&real, b"LBUG\x00\x00\x00\x00").unwrap();
+        require_openable_db(&real).expect("a real LadybugDB header must still pass");
+
+        // COUNTERWEIGHT 2 — the four shapes nw-385 explicitly says are handled
+        // WELL today keep their own accurate, distinct sentences. A single
+        // catch-all refusal would pass the assertions above and destroy these.
+        let missing = dir.path().join("nope.lbug");
+        assert!(
+            require_openable_db(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("not found")
+        );
+        let text = dir.path().join("fake.lbug");
+        std::fs::write(&text, b"hello not a db").unwrap();
+        assert!(
+            require_openable_db(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("not a NestWeaver database")
+        );
+        let directory = dir.path().join("adir.lbug");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            require_openable_db(&directory)
+                .unwrap_err()
+                .to_string()
+                .contains("is a directory")
+        );
+    }
+
+    /// nw-385, the adjacent leg. `--db /dev/null` reads EOF, so it took the
+    /// zero-byte exemption and then paid the FULL 30s daemon-boot ceiling
+    /// before failing — the exact cost nw-309 was written to eliminate — and
+    /// registered a launchd instance directory for `/dev/null` on the way.
+    ///
+    /// It is refused by shape now, before any dial. `/dev/null` is not a
+    /// regular file, so it earns the "point --db somewhere else" sentence
+    /// rather than an `index` invocation that could never help it.
+    #[cfg(unix)]
+    #[test]
+    fn a_character_device_db_is_refused_by_shape_rather_than_by_daemon_timeout() {
+        let error = require_openable_db(std::path::Path::new("/dev/null"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a NestWeaver database"), "{error}");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    /// nw-385 COUNTERWEIGHT for the create path, which must keep today's
+    /// behaviour.
+    ///
+    /// The exemption that was removed justified itself with "the store
+    /// initialises it", and that sentence is TRUE — it is just true of the
+    /// create path, which never consulted the guard. Asserted here, where it
+    /// holds, so a future change that breaks `index` against an interrupted
+    /// create fails a test instead of the user.
+    #[test]
+    fn the_create_path_still_initialises_a_zero_byte_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("interrupted.lbug");
+        std::fs::write(&empty, b"").unwrap();
+
+        // This is what `index` does with a zero-byte `--db`: a read-write open,
+        // no guard in front of it.
+        let store = GraphStore::open(&empty).expect("the store initialises a zero-byte file");
+        drop(store);
+
+        assert!(
+            std::fs::metadata(&empty).unwrap().len() > 0,
+            "the create path must still turn a zero-byte file into a database"
+        );
+        require_openable_db(&empty)
+            .expect("and the database it created is then readable by the guard");
+    }
+
+    /// nw-385. The daemon leg, which is where the damage actually happened:
+    /// `try_hybrid_json_rpc_checked` autostarts a daemon, and an autostarted
+    /// daemon opens the store READ-WRITE, which is what materialised a database
+    /// on top of the user's file. The guard has to fire before the dial, not
+    /// after it.
+    #[test]
+    fn a_zero_byte_db_is_refused_before_any_daemon_can_be_dialled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("zero.lbug");
+        std::fs::write(&db, b"").unwrap();
+
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &db,
+            None,
+            "search_symbols",
+            serde_json::json!({ "query": "user" }),
+        )
+        .expect_err("a zero-byte --db must not reach the daemon route");
+        assert!(
+            format!("{error:#}").contains("no graph schema"),
+            "{error:#}"
+        );
+
+        // The daemon opens read-write; if one had been dialled and started,
+        // the file would no longer be empty and its sidecars would exist.
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), 0);
+        assert!(!dir.path().join("zero.lbug.tantivy").exists());
+        assert!(!dir.path().join("zero.lbug.publications").exists());
     }
 
     /// S1/T1 — the cheap FLOOR, and explicitly not evidence of anything else.
@@ -27269,6 +27549,34 @@ fn brain_context_json_value(
         "degraded_components": result.degraded_components,
     });
 
+    // nw-393. The SEED cap, one layer upstream of the connected-list disclosure
+    // above. `seeds_expanded` alone cannot distinguish a name with five
+    // definitions from a name with two hundred, and `truncated_by: "limit"`
+    // MISDIRECTS here, because no caller-settable knob can recover a seed that
+    // was never resolved.
+    //
+    // Independent fields rather than a `truncated_by: "seed_resolution"`
+    // variant, deliberately: the two caps do NOT compose. `truncated_by:
+    // "limit"` stays a correct, actionable statement about `connected` even
+    // when the seed set was separately cut, so folding them into one scalar
+    // would have to discard one true answer to state the other.
+    //
+    // Emitted only when the cap was IN FORCE (a uid-form seed is exhaustive and
+    // reports nothing), so a "0 of 0" is never printed for a seed form the cap
+    // cannot bound.
+    if let Some(total) = result.seed_matches_total {
+        resp["seed_matches_total"] = serde_json::json!(total);
+    }
+    if let Some(relation) = result.seed_matches_total_relation.as_deref() {
+        resp["seed_matches_total_relation"] = serde_json::json!(relation);
+    }
+    if let Some(t) = result.seeds_truncated {
+        resp["seeds_truncated"] = serde_json::json!(t);
+    }
+    if let Some(l) = result.seed_resolution_limit {
+        resp["seed_resolution_limit"] = serde_json::json!(l);
+    }
+
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
     }
@@ -27303,6 +27611,14 @@ mod context_json_renderer_tests {
             semantic_applied: false,
             semantic_seed_count: 0,
             degraded_components: vec!["semantic".to_string()],
+            // nw-393 added the seed-cap disclosure to `BrainContextResult`.
+            // This fixture is about the SEMANTIC degradation contract, so the
+            // cap fields stay at their "no bare-name seed was capped" values —
+            // the disclosure has its own tests.
+            seed_matches_total: None,
+            seed_matches_total_relation: None,
+            seeds_truncated: None,
+            seed_resolution_limit: None,
         }
     }
 

@@ -10488,9 +10488,16 @@ pub async fn run_server(
     // `.pagerank.json` is 13 MB of JSON), which is a candidate but not yet a
     // conclusion.
     let sidecar_started = std::time::Instant::now();
-    nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
-    let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
-    let _ = store.load_pagerank_cache(&pr_path);
+    // nw-391: the daemon is the DEFAULT route, so a sidecar it silently
+    // declines to load degrades ranking for every client of this process for
+    // as long as it runs — and this is the one load that happened before any
+    // request existed to carry a notification. `warn`, not `debug`: the
+    // git-activity sidecar below is neutral when absent (a missing score is a
+    // multiplier of exactly 1.0), while a REFUSED PageRank artifact means the
+    // ranks being served are not the ranks that were computed and published.
+    if let Some(disclosure) = nestweaver_mcp::warm_pagerank_from_sidecar(&store, &db_path) {
+        tracing::warn!("{disclosure}");
+    }
     let pagerank_load_ms = sidecar_started.elapsed().as_millis() as u64;
 
     let interactions_started = std::time::Instant::now();

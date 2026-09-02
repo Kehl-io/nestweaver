@@ -82,24 +82,242 @@ fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, a
     }
 }
 
-/// Build a map from repo UID → display name for repo filter matching.
-fn build_repo_name_map(store: &GraphStore) -> std::collections::HashMap<String, String> {
-    store
+// ── nw-405/406/407: scope filters for brain_context / project_context ───────
+
+/// Which container owns a graph node, decided from the node's UID alone.
+///
+/// nw-405. `brain_context`'s and `project_context`'s `repos:` / `vaults:`
+/// filters used to answer this question with
+/// `n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)`,
+/// commented "Fallback: UID or location substring". That is a text search, not
+/// an ownership test, and it was wrong in FOUR separately measured directions
+/// on the live 44-repo + 1-vault graph:
+///
+///  * OVER-INCLUDE, vault: `repos:["nestweaver"]` returned 14 of 20 rows as
+///    `note:`/`sec:`/`head:` nodes under `Workspaces/NestWeaver/` — vault
+///    content, which belongs to no repo at all. On a consulting vault that is
+///    `repos:["clientA"]` returning clientB's notes because the PATH happens
+///    to contain the string.
+///  * OVER-INCLUDE, collision: `repos:["website"]` returned symbols from TWO
+///    different repos, because display names collide under `.contains()`.
+///  * UNDER-INCLUDE: `--repos website` returned ZERO symbols from the repo it
+///    named — a symbol's `location` is REPO-RELATIVE and therefore never
+///    contains its own repo name.
+///  * The documented UID form `repos:["repo:kory-brain:21ada82cccf0"]`
+///    answered `connected: 0`.
+///
+/// The UID is the authority because it is the only field on a `BrainNode` that
+/// NAMES an owner: `sym:`/`file:`/`svc:` embed the whole `repo:{inst}:{hash}`,
+/// and `note:`/`sec:`/`head:`/`tag:` embed the whole `vlt:{inst}:{hash}`.
+/// `location` names neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeOwner {
+    /// Owned by this repo UID.
+    Repo(String),
+    /// Owned by this vault UID. Vault content carries no `repo_uid` at all —
+    /// the same fact `RepoScope::NotRepoScoped` is written on.
+    Vault(String),
+    /// Nothing in the UID names an owner.
+    Unattributable,
+}
+
+/// The owner of `uid`.
+///
+/// The match is over [`nestweaver_schema::uid::UidKind`] rather than an `if`
+/// chain of `starts_with`, for nw-301's reason: an `if` chain cannot be
+/// exhaustive, so a twelfth UID domain would fall silently into whatever the
+/// trailing arm does instead of failing this build.
+fn node_owner(uid: &str) -> NodeOwner {
+    use nestweaver_schema::uid::UidKind;
+
+    /// `{prefix}{owner_uid}:{…}` — an owner UID is always exactly three
+    /// colon-separated components (`repo:{inst}:{hash}`, `vlt:{inst}:{hash}`),
+    /// so take three and discard the node-specific tail.
+    fn owner_head(rest: &str) -> Option<String> {
+        let parts: Vec<&str> = rest.splitn(4, ':').collect();
+        (parts.len() >= 3).then(|| format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+    }
+
+    let Some(kind) = UidKind::of(uid) else {
+        return NodeOwner::Unattributable;
+    };
+    let rest = &uid[kind.prefix().len()..];
+    match kind {
+        // The container node itself.
+        UidKind::Repo => NodeOwner::Repo(uid.to_string()),
+        UidKind::Vault => NodeOwner::Vault(uid.to_string()),
+        // `{prefix}{repo_uid}:{…}`
+        UidKind::File | UidKind::Service | UidKind::Symbol => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Repo)
+        }
+        // `{prefix}{vault_uid}:{…}`
+        UidKind::Note | UidKind::Tag => {
+            owner_head(rest).map_or(NodeOwner::Unattributable, NodeOwner::Vault)
+        }
+        // `sec:{note_uid}:{…}` / `head:{note_uid}:{…}`, and a note UID is
+        // itself `note:{vault_uid}:{…}`, so the inner `note:` comes off too.
+        UidKind::Section | UidKind::Heading => rest
+            .strip_prefix(UidKind::Note.prefix())
+            .and_then(owner_head)
+            .map_or(NodeOwner::Unattributable, NodeOwner::Vault),
+        // `proj:{instance}:{hash}` names an INSTANCE, not a repo, and a
+        // contract UID carries no repo component at all (see
+        // `tool_cross_repo_contracts`'s `FailClosed` reason). Neither can be
+        // attributed, so neither survives a scope filter.
+        UidKind::Project | UidKind::Contract => NodeOwner::Unattributable,
+    }
+}
+
+/// Resolve caller-supplied `repos:` entries to concrete repo UIDs.
+///
+/// nw-405's acceptance criterion is "each entry resolves to a concrete
+/// `repo_uid` (exact name / uid / url, erroring on unresolvable)". The
+/// resolution is [`nestweaver_engine::resolve_repo_selector`] — the SAME
+/// resolver `--repo` already uses everywhere else — so these two tools cannot
+/// grow a second, drifting notion of what a repo name means, and an ambiguous
+/// selector (`website` under two orgs) FAILS naming both candidates instead of
+/// quietly merging two tenants' code into one answer.
+///
+/// `visible` filters the candidate set first. Without it the resolver's own
+/// "not found" / "ambiguous, candidates are …" messages would enumerate repos
+/// a repo-scoped caller cannot see — an error string is not walked by
+/// `redact_response_for_visibility`, so this would have re-opened nw-403 on
+/// the error path. Filtered, a hidden repo is indistinguishable from one that
+/// does not exist.
+fn resolve_repo_filter(
+    store: &GraphStore,
+    selectors: &[String],
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<HashSet<String>, anyhow::Error> {
+    let repos: Vec<nestweaver_schema::Repo> = store
         .list_repos(None)
-        .unwrap_or_default()
+        .context("listing repositories to resolve the `repos` filter")?
+        .into_iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .collect();
+    selectors
         .iter()
-        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+        .map(|selector| {
+            nestweaver_engine::resolve_repo_selector(&repos, selector)
+                .map(|repo| repo.uid.clone())
+                // Flattened with `{error:#}` rather than `.context(…)`: an MCP
+                // client renders `Error::to_string()`, which shows only the
+                // OUTERMOST context — so a `.context()` here would hide the
+                // resolver's own "ambiguous; use an exact UID: …" candidate
+                // list, which is the only actionable part of the message.
+                .map_err(|error| anyhow!("`repos` filter entry {selector:?}: {error:#}"))
+        })
         .collect()
 }
 
-/// Build a map from vault UID → display name for vault filter matching.
-fn build_vault_name_map(store: &GraphStore) -> std::collections::HashMap<String, String> {
-    store
+/// Resolve caller-supplied `vaults:` entries to concrete vault UIDs.
+///
+/// The mirror of [`resolve_repo_filter`], written here rather than shared with
+/// it because there is no engine-side vault selector to reuse: `--repo` is a
+/// first-class CLI selector and `--vault` is not. The precedence deliberately
+/// matches `resolve_repo_selector`'s (exact UID, then case-insensitive exact
+/// name, then exact root path), and it is exact-only — no substring leg —
+/// because the substring leg is precisely what nw-405 is removing.
+fn resolve_vault_filter(
+    store: &GraphStore,
+    selectors: &[String],
+) -> Result<HashSet<String>, anyhow::Error> {
+    let vaults = store
         .list_vaults(None)
-        .unwrap_or_default()
+        .context("listing vaults to resolve the `vaults` filter")?;
+    selectors
         .iter()
-        .map(|v| (v.uid.clone(), v.name.clone()))
+        .map(|selector| {
+            let needle = selector.to_lowercase();
+            let matches: Vec<&nestweaver_schema::Vault> = vaults
+                .iter()
+                .filter(|vault| {
+                    vault.uid == *selector
+                        || vault.name.to_lowercase() == needle
+                        || vault.root_path == *selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [vault] => Ok(vault.uid.clone()),
+                // An unresolvable entry ERRORS. The old predicate matched
+                // nothing and returned a confident empty result, which reads
+                // as "this vault has no relevant content" rather than "you
+                // named a vault that is not here".
+                [] => {
+                    let known: Vec<&str> = vaults.iter().map(|vault| vault.name.as_str()).collect();
+                    Err(anyhow!(
+                        "`vaults` filter entry {selector:?} matches no indexed vault; \
+                         known vaults: {}",
+                        if known.is_empty() {
+                            "(none indexed)".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    ))
+                }
+                ambiguous => Err(anyhow!(
+                    "`vaults` filter entry {selector:?} is ambiguous; use an exact UID: {}",
+                    ambiguous
+                        .iter()
+                        .map(|vault| format!("{} ({})", vault.name, vault.uid))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        })
         .collect()
+}
+
+/// Keep only nodes owned by one of `repo_uids`.
+///
+/// **VAULT NODES ARE DROPPED.** This is nw-405's required recorded decision,
+/// and the schema text for `repos` says so in the same words. A Note, Section,
+/// Heading or Tag belongs to a VAULT and carries no `repo_uid`, so it is not
+/// "in repo X" under any reading — keeping it is exactly the measured
+/// over-include where `repos:["clientA"]` returns clientB's notes because
+/// their path contains the string. Vault content is scoped with `vaults:`,
+/// which is the parameter that can actually answer the question.
+///
+/// A node whose UID names no owner is dropped for the reason nw-403's
+/// redactor drops one: "I cannot tell what owns this" is not a reason to
+/// return it under a scope argument.
+fn retain_nodes_in_repos(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    repo_uids: &HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Repo(uid) if repo_uids.contains(&uid)),
+    );
+}
+
+/// Keep only nodes owned by one of `vault_uids`.
+///
+/// The mirror of [`retain_nodes_in_repos`]: Symbol/File/Service nodes belong
+/// to a repo, so they cannot satisfy a vault scope and are dropped.
+fn retain_nodes_in_vaults(
+    nodes: &mut Vec<nestweaver_engine::BrainNode>,
+    vault_uids: &HashSet<String>,
+) {
+    nodes.retain(
+        |node| matches!(node_owner(&node.uid), NodeOwner::Vault(uid) if vault_uids.contains(&uid)),
+    );
+}
+
+/// Apply `path_prefix`, exempting nodes that have no path at all.
+///
+/// nw-406. The predicate was the bare
+/// `nodes.retain(|n| n.location.starts_with(prefix))`, and a Tag node carries
+/// `location: ""`: `"".starts_with("Workspaces/")` is false, so
+/// `--kinds Tag --path-prefix Workspaces/` measured 25 Tag nodes -> 0 on a
+/// vault whose 606 tags ALL live under `Workspaces/`. A confident zero with no
+/// disclosure.
+///
+/// A tag is not "outside" the prefix — it has no path concept for the prefix
+/// to test, which is the same unhandled-kind omission as the `tags`-vs-Symbol
+/// carve-out. An empty location is therefore EXEMPT rather than excluded: a
+/// filter that cannot decide a kind must not silently delete all of it.
+fn retain_nodes_under_path_prefix(nodes: &mut Vec<nestweaver_engine::BrainNode>, prefix: &str) {
+    nodes.retain(|node| node.location.is_empty() || node.location.starts_with(prefix));
 }
 
 /// Resolve authoritative symbol ownership only when repository scoping is
@@ -133,6 +351,330 @@ fn repo_is_visible(
         }
         _ => true,
     }
+}
+
+// ── nw-403: per-repo visibility, per tool ───────────────────────────────────
+
+/// What repo-scoped visibility MEANS for one MCP tool.
+///
+/// nw-403. The rule used to be written on `dispatch_cancellable` as "tools
+/// whose data is not repo-scoped ignore it", and that second clause was the
+/// bug: only 5 of the 42 dispatch arms were ever HANDED `visible`, so
+/// `brain_context`, `code_context`, `regex_search`, `count_patterns`,
+/// `get_summary`, `flow_trace`, `dead_code`, `hub_nodes`, `clusters`,
+/// `detect_changes`, `read_symbols` and `brain_status` returned hidden-repo
+/// symbols, file paths, prose and repo identity (URL + indexed git SHA) to a
+/// repo-restricted bearer token. Every one of those returns symbol-, file- or
+/// path-derived data, which is exactly repo-scoped.
+///
+/// The failure survived because `brain_search` — the one tool an operator
+/// spot-checks to validate an `[authz]` policy — is in the enforcing five, so
+/// the boundary LOOKED like it worked.
+///
+/// The default is INVERTED here. [`repo_scope`] is a match whose fallback arm
+/// is [`RepoScope::FailClosed`], so a tool added tomorrow refuses a
+/// repo-scoped call until somebody writes down which of these four
+/// dispositions applies to it. The previous default was "leak".
+///
+/// The PREDICATE is unchanged and is not re-implemented: everything here
+/// decides visibility through [`repo_is_visible`] (which is what guards
+/// `VisibleRepos::allows`'s empty-`repo_uid` early return) over the ownership
+/// map [`restricted_symbol_owners`] already builds.
+#[derive(Debug, Clone, Copy)]
+enum RepoScope {
+    /// The dispatch arm receives `visible` and filters — or fails closed —
+    /// itself. Used where the filter needs the TYPED rows: the response is
+    /// keyed by repo rather than by node uid (`brain_status`, `stale_check`),
+    /// or dropping a node has to leave a marker behind rather than vanish
+    /// (`flow_trace`, whose empty `children` is nw-390's defect).
+    EnforcedInArm,
+    /// Filtered after dispatch by [`redact_response_for_visibility`], which
+    /// walks the response and removes every row whose owning repo is not
+    /// visible.
+    ///
+    /// Sound only because every row of these tools names the entity it
+    /// describes (`uid` / `repo_uid` / `target_uid` / ...). A
+    /// `response_format: "concise"` response drops exactly that field, which
+    /// is why a concise call from a repo-scoped caller is REFUSED rather than
+    /// served unfiltered — an unidentifiable row cannot be attributed to a
+    /// repo, and "cannot attribute" must mean "do not return".
+    RedactedAfterDispatch,
+    /// Opt-out. The response is provably free of repo-, symbol-, file- and
+    /// path-derived data — the vault surfaces, whose Note/Section/Heading/Tag
+    /// nodes belong to a vault and carry no `repo_uid` at all.
+    ///
+    /// The `&'static str` is mandatory so an opt-out is a WRITTEN claim
+    /// somebody can falsify, not an omission nobody notices. That is the
+    /// difference between this arm and the 37 silent drops it replaces.
+    NotRepoScoped(&'static str),
+    /// Refuse. Either the response cannot be filtered without lying about its
+    /// own aggregates (graph-wide counts, generated prose, cross-repo link
+    /// tables computed over every repo), or it mutates brain-wide state that a
+    /// repo-restricted identity does not own.
+    ///
+    /// Returning a scoped-looking answer built from unscoped data would be
+    /// worse than refusing: it is the shape that let nw-403 survive.
+    FailClosed(&'static str),
+}
+
+/// UID prefixes that name a VAULT-owned node. A vault node has no `repo_uid`,
+/// so repo visibility neither permits nor forbids it and it survives
+/// redaction. Everything else — `sym:`, `proc:`, cluster ids, anything a
+/// future indexer invents — is treated as unattributable and DROPPED, because
+/// "I cannot tell which repo owns this" is not a reason to return it.
+const VAULT_OWNED_UID_PREFIXES: &[&str] = &["note:", "sec:", "head:", "tag:", "vlt:"];
+
+/// The keys under which a response row names the entity it describes. A row
+/// carrying any of them is attributed through that uid; `repo_uid` (checked
+/// first, since it is the direct answer) short-circuits the lookup.
+const IDENTIFYING_UID_KEYS: &[&str] = &[
+    "uid",
+    "target_uid",
+    "source_uid",
+    "symbol_uid",
+    "node_uid",
+    "root_uid",
+];
+
+/// The reason attached to a tool nobody has classified. Named so the coverage
+/// test can assert that no REAL tool carries it — a fail-closed default only
+/// helps if somebody notices when it fires.
+const UNDECLARED_TOOL_SCOPE: &str = "this tool has no recorded repo-visibility disposition; \
+     nw-403 inverted the default, so a tool must declare one in `repo_scope` before it may \
+     answer a repository-scoped caller";
+
+/// The scoping disposition of every tool in the dispatch table.
+///
+/// This is deliberately ONE match rather than per-arm judgement scattered
+/// through `dispatch_uncached`: the count that made nw-403 critical ("5 of 42")
+/// is only checkable if the dispositions live in one place, and
+/// `every_dispatch_arm_declares_a_repo_scope_disposition` checks it.
+fn repo_scope(tool: &str) -> RepoScope {
+    match tool {
+        // ── Enforced inside the arm ──────────────────────────────────────
+        // The original five. Each takes `visible` and filters over
+        // `repo_is_visible` / `restricted_symbol_owners`.
+        "brain_search" | "brain_impact" | "brain_diff" | "blast_radius" | "affected_tests" => {
+            RepoScope::EnforcedInArm
+        }
+        // nw-403: `brain_status` enumerated every repo's URL and indexed git
+        // SHA — repo IDENTITY, the most direct enumeration of a hidden tenant
+        // in the catalogue. Its rows are keyed by url/name, not by node uid,
+        // so the generic redactor cannot see them.
+        "brain_status" => RepoScope::EnforcedInArm,
+        // Keyed by repo, same reason as `brain_status`.
+        "stale_check" => RepoScope::EnforcedInArm,
+        // Filtering has to happen DURING the walk. Redacting a call tree
+        // afterwards would delete a subtree and leave `children: []`, which is
+        // precisely the "looks like a leaf" defect nw-390 exists to remove.
+        "flow_trace" => RepoScope::EnforcedInArm,
+
+        // ── Redacted after dispatch ──────────────────────────────────────
+        // Every row of these carries a uid, so one walk attributes them all.
+        "brain_context" | "code_context" | "project_context" | "regex_search" | "dead_code"
+        | "hub_nodes" | "bridge_nodes" | "detect_changes" | "read_symbols" => {
+            RepoScope::RedactedAfterDispatch
+        }
+
+        // ── Opt-outs: genuinely not repo-scoped ──────────────────────────
+        "note_get" | "backlinks" => RepoScope::NotRepoScoped(
+            "vault notes and wikilink edges; Note/Section/Heading nodes belong to a vault \
+             and carry no repo_uid",
+        ),
+        "brain_broken_links"
+        | "brain_orphan_documents"
+        | "brain_topic_clusters"
+        | "brain_tag_graph"
+        | "brain_doc_stats" => RepoScope::NotRepoScoped(
+            "document-graph analytics computed over vault notes, sections and tags only",
+        ),
+        "brain_memory_lint" | "brain_memory_consolidate" | "brain_memory_related" => {
+            RepoScope::NotRepoScoped(
+                "memory notes live in a vault and carry no repo_uid; the lint/consolidate/related \
+                 graphs never traverse a Symbol edge",
+            )
+        }
+
+        // ── Fail closed ──────────────────────────────────────────────────
+        "get_summary" => RepoScope::FailClosed(
+            "summaries are generated PROSE that enumerates a file's exported symbols \
+             (\"src/beta.py: exports 2 symbols: betaSecretHelper (Function)\"), the sidecar \
+             they are cached in is graph-wide, and there is no per-repo generation path — \
+             so a scoped answer cannot be built from it",
+        ),
+        "count_patterns" => RepoScope::FailClosed(
+            "the response is corpus-wide aggregates (total_matches, files_matched, top_files) \
+             with no node uid to attribute; a count filtered to nothing and a count of zero \
+             are indistinguishable, and top_files leaks hidden repo paths outright",
+        ),
+        "clusters" => RepoScope::FailClosed(
+            "communities are computed over the WHOLE graph — modularity, cohesion, size and \
+             key_files describe cross-repo partitions, so redacting members would leave every \
+             surviving number describing a population the caller cannot see",
+        ),
+        "brain_guide" => RepoScope::FailClosed(
+            "the guide is generated prose over the whole graph, including cross-repo edges \
+             and repo names, with no structure to filter",
+        ),
+        "cross_repo_contracts" => RepoScope::FailClosed(
+            "the tool's entire output is links that CROSS repo boundaries, plus a \
+             degraded_repos list of repo identities; a repo-scoped caller asking it is asking \
+             for exactly the data the policy withholds",
+        ),
+        "contract_drift" => RepoScope::FailClosed(
+            "contract UIDs carry no repo component (see tool_cross_repo_contracts), so drift \
+             rows cannot be attributed to a repo even when a `repo` argument narrows the \
+             analysis",
+        ),
+        "investigate" | "investigate_expand" | "investigate_hydrate" => RepoScope::FailClosed(
+            "the investigation bundle interleaves symbols, notes, hypotheses and rendered \
+             evidence text, so a row-level filter cannot bound what the prose already quoted",
+        ),
+        "brain_add_source" | "brain_remove_source" | "prune_stale" | "compact_embeddings" => {
+            RepoScope::FailClosed(
+                "a mutation of brain-wide state (source registration, stale-repo pruning, \
+                 embedding sidecar rewrite) that a repo-restricted identity does not own; \
+                 prune_stale additionally returns the pruned repos by identity",
+            )
+        }
+        "set_extension" | "query_extensions" => RepoScope::FailClosed(
+            "the extension store is keyed by scope uid (a repo or vault uid), so both reading \
+             and writing it enumerate or address repos outside the caller's scope",
+        ),
+
+        // ── The inverted default ─────────────────────────────────────────
+        // A tool with no recorded disposition does not answer a repo-scoped
+        // caller. nw-403's whole shape was 37 tools defaulting the other way.
+        _ => RepoScope::FailClosed(UNDECLARED_TOOL_SCOPE),
+    }
+}
+
+/// True when this call asked for the identifier-free rendering.
+///
+/// `project_context` is the exception the generic [`is_concise`] cannot
+/// express: its `response_format` DEFAULTS to concise (anything but
+/// "detailed" is concise), so a scoped caller who sends no `response_format`
+/// at all would otherwise receive uid-free rows that nothing can attribute.
+/// The default is restated rather than shared because the two live far apart
+/// and the safe reading of an absent field differs between them.
+fn response_omits_identifiers(tool: &str, args: &Value) -> bool {
+    match tool {
+        "project_context" => args
+            .get("response_format")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.eq_ignore_ascii_case("detailed"))
+            .unwrap_or(true),
+        _ => is_concise(args),
+    }
+}
+
+/// Walks a tool response and removes every row whose owning repo is not
+/// visible to the caller.
+///
+/// It attributes a row through the ownership map `restricted_symbol_owners`
+/// already builds, so there is exactly ONE symbol→repo authority in this file,
+/// and it decides through [`repo_is_visible`], so there is exactly one
+/// predicate. A row it cannot attribute is dropped, not kept.
+struct VisibilityRedactor<'a> {
+    owners: &'a HashMap<String, String>,
+    visible: Option<&'a nestweaver_engine::authz::VisibleRepos>,
+    removed: usize,
+}
+
+impl VisibilityRedactor<'_> {
+    /// A uid is allowed when its owning repo is visible. An unknown `sym:`
+    /// uid (a row the ownership scan did not see, e.g. a tombstoned symbol)
+    /// is NOT allowed: unattributable is not the same as unowned.
+    fn uid_allowed(&self, uid: &str) -> bool {
+        match self.owners.get(uid) {
+            Some(repo_uid) => repo_is_visible(repo_uid, self.visible),
+            None => VAULT_OWNED_UID_PREFIXES
+                .iter()
+                .any(|prefix| uid.starts_with(prefix)),
+        }
+    }
+
+    /// A row with no identifying key at all is kept — it carries no entity to
+    /// leak (a `{"path": ..., "count": ...}` echo of the caller's own input,
+    /// a timings block). The tools routed here all emit an identifier on
+    /// every ENTITY row; the concise renderings that do not are refused
+    /// upstream in `dispatch_uncached` rather than silently trusted here.
+    fn row_allowed(&self, row: &Value) -> bool {
+        let Some(object) = row.as_object() else {
+            return true;
+        };
+        if let Some(repo_uid) = object.get("repo_uid").and_then(Value::as_str)
+            && !repo_uid.is_empty()
+        {
+            return repo_is_visible(repo_uid, self.visible);
+        }
+        IDENTIFYING_UID_KEYS.iter().all(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_none_or(|uid| self.uid_allowed(uid))
+        })
+    }
+
+    fn redact(&mut self, value: &mut Value) {
+        match value {
+            Value::Array(items) => {
+                let before = items.len();
+                items.retain(|item| self.row_allowed(item));
+                self.removed += before - items.len();
+                for item in items.iter_mut() {
+                    self.redact(item);
+                }
+            }
+            Value::Object(map) => {
+                for (_key, child) in map.iter_mut() {
+                    self.redact(child);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply [`VisibilityRedactor`] to one tool response and DISCLOSE the cut.
+///
+/// The disclosure is not decoration. Aggregate scalars in these payloads
+/// (`total`, `total_symbols`, `dead_percentage`, `posting_hits`) are computed
+/// over the whole graph before any row is dropped, so a scoped caller reading
+/// `returned` against `total` would otherwise conclude the tool truncated for
+/// budget reasons. `visibility.redacted_entries` names the real cause.
+fn redact_response_for_visibility(
+    store: &GraphStore,
+    value: &mut Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<(), anyhow::Error> {
+    // `None` for an unrestricted caller, so this is a no-op (and costs no
+    // ownership scan) on the single-trust-domain default. A store error
+    // PROPAGATES: a scoped response built without the ownership map would be
+    // unfiltered, which is the bug.
+    let Some(owners) = restricted_symbol_owners(store, visible)? else {
+        return Ok(());
+    };
+    let mut redactor = VisibilityRedactor {
+        owners: &owners,
+        visible,
+        removed: 0,
+    };
+    redactor.redact(value);
+    let removed = redactor.removed;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "visibility".to_string(),
+            json!({
+                "scoped": true,
+                "redacted_entries": removed,
+                 "note": "Rows owned by repositories outside this caller's [authz] visibility \
+                 were removed. Aggregate counts in this response are computed over the \
+                 whole graph BEFORE that removal, so they may exceed the rows returned.",
+            }),
+        );
+    }
+    Ok(())
 }
 
 // ── Tool catalogue ──────────────────────────────────────────────────────────
@@ -1291,14 +1833,14 @@ mod tool_schema_validation_tests {
             })
             .unwrap();
 
-        let all = tool_dead_code(&store, json!({}), None).expect("dead_code low");
+        let all = tool_dead_code(&store, json!({}), None, None).expect("dead_code low");
         assert_eq!(all["unreachable_count"], 1);
         assert_eq!(all["matching_count"], 1);
         assert_eq!(all["returned"], 1);
 
         // Inferred visibility maps to Medium confidence, so a High filter
         // drops it from the results but NOT from the unfiltered total.
-        let high = tool_dead_code(&store, json!({ "min_confidence": "high" }), None)
+        let high = tool_dead_code(&store, json!({ "min_confidence": "high" }), None, None)
             .expect("dead_code high");
         assert_eq!(
             high["unreachable_count"], 1,
@@ -1813,9 +2355,23 @@ pub fn dispatch(
 /// `visible` carries the caller's per-repo visibility, resolved by the
 /// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
 /// means no scoping — the backward-compatible single-trust-domain default, in
-/// which repo-scoped authorization is a no-op. `brain_search`, `brain_impact`,
-/// `blast_radius`, and `affected_tests` enforce it; tools whose data is not
-/// repo-scoped ignore it.
+/// which repo-scoped authorization is a no-op.
+///
+/// THE RULE, restated by nw-403 because the sentence that used to be here was
+/// false. It read "`brain_search`, `brain_impact`, `blast_radius`, and
+/// `affected_tests` enforce it; tools whose data is not repo-scoped ignore
+/// it", and that second clause was the bug: it granted a silent exemption to
+/// 37 of the 42 dispatch arms, including `brain_context`, `code_context`,
+/// `regex_search`, `get_summary`, `flow_trace`, `dead_code`, `hub_nodes`,
+/// `clusters`, `detect_changes`, `read_symbols` and `brain_status` — all of
+/// which return symbol-, file- or path-derived data, which IS repo-scoped.
+///
+/// The real rule is: **every tool is repo-scoped until it is written down
+/// that it is not.** `repo_scope` records one of four dispositions for every
+/// tool in the catalogue and `dispatch_uncached` enforces it before the arm
+/// runs; a tool with no recorded disposition fails closed. Nothing "ignores"
+/// visibility any more — a tool either filters, declares itself vault-only,
+/// or refuses.
 pub fn dispatch_cancellable(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -1986,7 +2542,21 @@ fn classify_index_publication_error(store: &GraphStore, error: anyhow::Error) ->
     }
 }
 
-/// The actual tool dispatch table, after cache handling.
+/// The repo-visibility gate, then the tool dispatch table.
+///
+/// nw-403. The gate sits HERE, above the match, because "did this arm receive
+/// `visible`?" is exactly the question nobody could answer while the answer
+/// was spread across 42 call expressions — and the answer was "5 of them".
+/// `repo_scope` now answers it for every tool in one place, and an unlisted
+/// tool refuses rather than leaks.
+///
+/// The gate is inert unless an `[authz]` policy actually restricts this
+/// caller: `VisibleRepos::All` and `None` take the identical path they always
+/// took, so a single-trust-domain deployment sees no behaviour change.
+///
+/// Placing it below the response cache is safe because the cache key is
+/// already visibility-salted (`visibility_cache_salt`), so a redacted response
+/// can never be served to a different scope.
 fn dispatch_uncached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -1996,13 +2566,74 @@ fn dispatch_uncached(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    if !matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) {
+        return dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible);
+    }
+    match repo_scope(name) {
+        // The arm takes `visible` itself; nothing to do here.
+        RepoScope::EnforcedInArm => {
+            dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)
+        }
+        // A written, falsifiable claim that this response contains no
+        // repo-owned data. Dispatched unchanged — and the justification is
+        // LOGGED, so an operator auditing an `[authz]` policy can see which
+        // tools claimed an exemption and why, rather than having to infer the
+        // exemptions from source the way nw-403 had to be.
+        RepoScope::NotRepoScoped(reason) => {
+            tracing::debug!(
+                tool = name,
+                reason,
+                "tool answered a repository-scoped caller under a not-repo-scoped exemption"
+            );
+            dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)
+        }
+        RepoScope::RedactedAfterDispatch => {
+            // A concise rendering omits the very uid the redactor attributes
+            // rows by, so it cannot be filtered — and an unfilterable
+            // response is refused, not served. The remedy is in the message
+            // because `project_context` defaults to concise and its callers
+            // never sent the field at all.
+            if response_omits_identifiers(name, &args) {
+                return Err(anyhow!(
+                    "{name}: response_format \"concise\" omits the per-row UIDs that repository \
+                     visibility filtering attributes rows by, so it cannot be scoped to this \
+                     caller's repositories. Re-request with response_format \"detailed\"."
+                ));
+            }
+            let mut value =
+                dispatch_tool_arm(store, tantivy, name, args, embed_model, cancel, visible)?;
+            redact_response_for_visibility(store, &mut value, visible)?;
+            Ok(value)
+        }
+        RepoScope::FailClosed(reason) => Err(anyhow!(
+            "{name} is not available to a repository-scoped caller: {reason}. Refusing rather \
+             than returning data from outside the caller's visible repositories (nw-403)."
+        )),
+    }
+}
+
+/// The actual tool dispatch table, after cache handling and the nw-403
+/// visibility gate.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_tool_arm(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     match name {
-        "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
+        "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel, visible),
         "code_context" => tool_code_context(store, args),
         "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
-        "brain_status" => tool_brain_status(store, tantivy),
+        "brain_status" => tool_brain_status(store, tantivy, visible),
         "brain_add_source" => tool_brain_add_source(store, args),
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
@@ -2010,15 +2641,17 @@ fn dispatch_uncached(
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
         "brain_impact" => tool_brain_impact(store, args, cancel, visible),
         "brain_guide" => tool_brain_guide(store, args),
-        "flow_trace" => tool_flow_trace(store, args, cancel),
+        "flow_trace" => tool_flow_trace(store, args, cancel, visible),
         "detect_changes" => tool_detect_changes(store, args),
         "clusters" => tool_clusters(store, args),
-        "stale_check" => tool_stale_check(store),
+        "stale_check" => tool_stale_check(store, visible),
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args, visible),
-        "project_context" => tool_project_context(store, tantivy, args, embed_model, cancel),
-        "dead_code" => tool_dead_code(store, args, cancel),
+        "project_context" => {
+            tool_project_context(store, tantivy, args, embed_model, cancel, visible)
+        }
+        "dead_code" => tool_dead_code(store, args, cancel, visible),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args, cancel, visible),
@@ -2610,26 +3243,65 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
 
 /// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
 /// FQNs, optionally includes adjacent symbols, and respects a token budget.
+/// The largest list of client-supplied identifiers a tool will accept, and the
+/// longest single identifier in it. Both are also declared as `maxItems` /
+/// `maxLength` on `read_symbols.targets` and `affected_tests.changed_files`,
+/// so the MCP path is rejected by schema validation before a handler runs;
+/// this pair is the backstop for the routes that do not validate against the
+/// schema (the daemon's `dispatch_tool_json`, direct/internal calls, unit
+/// tests) — the same belt-and-braces arrangement `flow_trace.max_depth` uses.
+pub(crate) const MAX_IDENTIFIER_COUNT: usize = 1000;
+pub(crate) const MAX_IDENTIFIER_LEN: usize = 512;
+
 /// Bound a list of client-supplied identifiers (symbol UIDs/names/FQNs, repo-
 /// relative paths) so an oversized entry or an over-long list can't be echoed
-/// back verbatim (a response-amplification lever) or waste work. A real
-/// identifier is at most a few hundred bytes, so truncating a huge one keeps it
-/// non-matching (→ not_found) while capping the response. Truncation is
-/// char-boundary safe.
-fn bound_identifiers(mut v: Vec<String>) -> Vec<String> {
-    const MAX_LEN: usize = 512;
-    const MAX_COUNT: usize = 1000;
-    v.truncate(MAX_COUNT);
-    for s in &mut v {
-        if s.len() > MAX_LEN {
-            let mut end = MAX_LEN;
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            s.truncate(end);
-        }
+/// back verbatim (a response-amplification lever) or waste work.
+///
+/// nw-392: this REJECTS. It used to `v.truncate(MAX_COUNT)` and truncate each
+/// over-long string in place, silently narrowing the caller's own REQUEST, and
+/// both callers then reported the narrowed run as whole:
+///
+/// * `read_symbols` with 1000 junk targets plus one real symbol as the 1001st
+///   returned that symbol in NEITHER `symbols` nor `not_found` nor `dropped`,
+///   with `truncated: false` — and `dropped` is an existing, empty array that
+///   was the obvious home for the disclosure.
+/// * `affected_tests.changed_files` is the selector that decides which tests a
+///   PR must run. Measured on the live graph, a changed file at index 1001 was
+///   dropped before analysis and the run still reported `status: complete` /
+///   `recommendation: selection-usable` with `notifications: []`, hiding 113
+///   test files the tool itself said the change required. The tool's contract
+///   is fail-safe WIDENING ("run-full-suite on any non-complete run"); silently
+///   narrowing its input inverts it. A safety selector must refuse a request it
+///   cannot honour rather than answer a smaller one.
+///
+/// The per-string cap rejects for a sharper reason: truncating a long FQN did
+/// not drop it, it MUTATED it into a different identifier that then reported
+/// back as `not_found`. A corrupted identifier is harder to notice than a
+/// missing one, and "not found" is an answer about a symbol the caller never
+/// asked about.
+fn bound_identifiers(v: Vec<String>, field: &str) -> Result<Vec<String>, anyhow::Error> {
+    if v.len() > MAX_IDENTIFIER_COUNT {
+        anyhow::bail!(
+            "'{field}' has {} entries; the maximum is {MAX_IDENTIFIER_COUNT}. The request is \
+             REJECTED rather than silently shortened: a truncated request answered as though it \
+             were whole is indistinguishable from a complete one. Split it into batches of \
+             {MAX_IDENTIFIER_COUNT} or fewer.",
+            v.len()
+        );
     }
-    v
+    if let Some((index, over_long)) = v
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.len() > MAX_IDENTIFIER_LEN)
+    {
+        anyhow::bail!(
+            "'{field}[{index}]' is {} bytes; the maximum is {MAX_IDENTIFIER_LEN}. The request is \
+             REJECTED rather than shortened: truncating an identifier does not drop it, it \
+             changes it into a DIFFERENT identifier that then reports back as not-found.",
+            over_long.len()
+        );
+    }
+    Ok(v)
 }
 
 fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
@@ -2643,7 +3315,12 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                     .collect()
             })
             .unwrap_or_default(),
-    );
+        if args.get("targets").is_some() {
+            "targets"
+        } else {
+            "uids_or_fqns"
+        },
+    )?;
     if targets.is_empty() {
         return Err(anyhow!(
             "'targets' must be a non-empty array of symbol UIDs, names, or FQNs"
@@ -2926,17 +3603,25 @@ fn tool_schema_read_symbols() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
+                // nw-392: `maxItems`/`maxLength` are the REJECTION path. The
+                // handler used to accept any length and quietly cut the list
+                // at 1000 and each entry at 512 bytes, then report
+                // `truncated: false` with an empty `dropped`. Declaring the
+                // bounds here makes an oversized call a validation error at
+                // the boundary instead of a narrowed answer that looks whole.
                 "targets": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "maxLength": MAX_IDENTIFIER_LEN },
                     "minItems": 1,
-                    "description": "Symbol UIDs (sym:...), names, or FQNs to read. One of 'targets' or 'uids_or_fqns' is required."
+                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "description": "Symbol UIDs (sym:...), names, or FQNs to read. One of 'targets' or 'uids_or_fqns' is required. At most 1000 entries of at most 512 bytes each; an oversized request is REJECTED, never silently shortened."
                 },
                 "uids_or_fqns": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "maxLength": MAX_IDENTIFIER_LEN },
                     "minItems": 1,
-                    "description": "Backward-compatible alias for targets."
+                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "description": "Backward-compatible alias for targets. Same 1000-entry / 512-byte bounds."
                 },
                 "include_neighbors": {
                     "type": "integer",
@@ -3593,12 +4278,12 @@ fn tool_schema_brain_context() -> Value {
                 "repos": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Filter to specific repo UIDs or names (post-PPR). Only nodes whose location matches one of these strings are kept."
+                    "description": "Filter to specific repositories (post-PPR). Each entry must RESOLVE to one repo — exact repo UID (\"repo:{instance}:{hash}\"), exact display name (case-insensitive), or exact clone URL / local root; an entry that names no repo, or that names two, is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept. Vault content (Note/Section/Heading/Tag) belongs to a vault and not to any repository, so it is DROPPED when this is set — use `vaults` to scope vault content."
                 },
                 "vaults": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Filter to specific vault UIDs or names (post-PPR). Only note/heading/section nodes whose UID or location matches are kept."
+                    "description": "Filter to specific vaults (post-PPR). Each entry must RESOLVE to one vault — exact vault UID (\"vlt:{instance}:{hash}\"), exact name (case-insensitive), or exact root path; an unresolvable or ambiguous entry is an ERROR. Only nodes OWNED by a resolved vault (Note/Section/Heading/Tag) are kept; Symbol nodes belong to a repository and are DROPPED when this is set."
                 },
                 "kinds": {
                     "type": "array",
@@ -3607,12 +4292,12 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "path_prefix": {
                     "type": "string",
-                    "description": "Include only nodes whose location (file path) starts with this prefix."
+                    "description": "Include only nodes whose location (file path) starts with this prefix. Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded — a filter that cannot decide a kind does not delete all of it."
                 },
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Include only nodes tagged with any of these tags. Applies to Note and Section nodes; Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
@@ -3796,6 +4481,28 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "connected": result.connected.iter().map(render).collect::<Vec<_>>(),
         "cross_repo_links": serde_json::to_value(&result.cross_repo_links)?,
         "seeds_resolved": result.seeds.len(),
+        // nw-393. The SEED cap, one layer upstream of the connected-list
+        // disclosure: `seeds_resolved`/`seeds_expanded` alone cannot distinguish
+        // a name with five definitions from a name with two hundred, and
+        // `truncated_by: "limit"` misdirects because no caller-settable knob can
+        // recover a seed that was never resolved.
+        //
+        // FOUR INDEPENDENT FIELDS rather than a `truncated_by: "seed_resolution"`
+        // variant, because the two caps do not compose: `truncated_by: "limit"`
+        // stays a correct statement about `connected` even when the seed set was
+        // ALSO cut, so collapsing them into the scalar makes one of two true
+        // things unsayable. The relation label is `search_total_relation_label`'s
+        // "eq"/"gte" — `brain_search`'s spelling, not a second convention.
+        //
+        // Hand-built here because the engine computes these on
+        // `ContextResult`/`BrainContextResult` and this payload is assembled
+        // field by field; without these four lines the numbers exist and reach
+        // nobody, and the CLI's DAEMON route (which parses this very payload back
+        // into `ContextResult`) discloses only on its local fallback.
+        "seed_matches_total": result.seed_matches_total,
+        "seed_matches_total_relation": result.seed_matches_total_relation.clone(),
+        "seeds_truncated": result.seeds_truncated,
+        "seed_resolution_limit": result.seed_resolution_limit,
         // Retained as the returned count, which is what it has always meant
         // and what `merge_json_results` recomputes after a federated cap.
         // `total` is the field that was missing.
@@ -3819,6 +4526,10 @@ fn tool_brain_context(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // nw-405: the arm still returns rows through `RepoScope::RedactedAfterDispatch`;
+    // `visible` is taken here only so `resolve_repo_filter`'s ERROR text — which
+    // no redactor walks — cannot enumerate repos this caller may not see.
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
@@ -3949,16 +4660,17 @@ fn tool_brain_context(
     // ResponseConfig::default()), so there is no `[ranking]` to load. Priors are
     // applied on the CLI `brain context` / `brain search` paths instead.
 
-    // Build name maps once if filters are present.
-    let repo_names = if filter_repos.is_some() {
-        build_repo_name_map(store)
-    } else {
-        std::collections::HashMap::new()
+    // nw-405: resolve the scope arguments to CONCRETE container UIDs before
+    // filtering anything. Resolution happens here, outside the per-list
+    // closure, so an unresolvable entry is one ERROR for the call rather than
+    // a predicate that silently matches nothing on both lists.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
     };
-    let vault_names = if filter_vaults.is_some() {
-        build_vault_name_map(store)
-    } else {
-        std::collections::HashMap::new()
+    let vault_scope = match filter_vaults {
+        Some(ref selectors) => Some(resolve_vault_filter(store, selectors)?),
+        None => None,
     };
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
@@ -3969,77 +4681,35 @@ fn tool_brain_context(
                 kinds.iter().any(|k| kind_lower.starts_with(k.as_str()))
             });
         }
-        if let Some(ref repos) = filter_repos {
-            nodes.retain(|n| {
-                let filter_lower: Vec<String> = repos.iter().map(|r| r.to_lowercase()).collect();
-                // Extract repo_uid from symbol UIDs (sym:repo:{inst}:{hash}:...)
-                let node_repo_uid = if n.uid.starts_with("sym:") {
-                    let parts: Vec<&str> = n.uid[4..].splitn(4, ':').collect();
-                    if parts.len() >= 3 {
-                        Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                filter_lower.iter().any(|r| {
-                    // Match by repo display name
-                    if let Some(ref repo_uid) = node_repo_uid
-                        && let Some(name) = repo_names.get(repo_uid)
-                        && name.to_lowercase().contains(r)
-                    {
-                        return true;
-                    }
-                    // Fallback: UID or location substring
-                    n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)
-                })
-            });
+        if let Some(ref repo_uids) = repo_scope {
+            retain_nodes_in_repos(nodes, repo_uids);
         }
-        if let Some(ref vaults) = filter_vaults {
-            nodes.retain(|n| {
-                let filter_lower: Vec<String> = vaults.iter().map(|v| v.to_lowercase()).collect();
-                // Extract vault_uid from note UIDs (note:vlt:{inst}:{hash}:...)
-                // or section/heading UIDs (sec:note:vlt:... / head:note:vlt:...)
-                let node_vault_uid = {
-                    let search = if n.uid.starts_with("note:") {
-                        Some(&n.uid[5..])
-                    } else if n.uid.starts_with("sec:note:") {
-                        Some(&n.uid[9..])
-                    } else if n.uid.starts_with("head:note:") {
-                        Some(&n.uid[10..])
-                    } else {
-                        None
-                    };
-                    search.and_then(|s| {
-                        let parts: Vec<&str> = s.splitn(4, ':').collect();
-                        if parts.len() >= 3 {
-                            Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
-                        } else {
-                            None
-                        }
-                    })
-                };
-                filter_lower.iter().any(|v| {
-                    if let Some(ref vault_uid) = node_vault_uid
-                        && let Some(name) = vault_names.get(vault_uid)
-                        && name.to_lowercase().contains(v)
-                    {
-                        return true;
-                    }
-                    n.uid.to_lowercase().contains(v) || n.location.to_lowercase().contains(v)
-                })
-            });
+        if let Some(ref vault_uids) = vault_scope {
+            retain_nodes_in_vaults(nodes, vault_uids);
         }
         if let Some(ref prefix) = path_prefix {
-            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+            retain_nodes_under_path_prefix(nodes, prefix.as_str());
         }
     };
     apply_filters(&mut result.seeds);
     apply_filters(&mut result.connected);
 
     // tags filter: keep only note/section nodes tagged with any of these tags.
-    // Symbol nodes are always kept (no tag concept for code).
+    //
+    // nw-407: Symbol nodes used to be kept UNCONDITIONALLY here, commented
+    // "Symbol nodes are always kept (no tag concept for code)". That made
+    // `tags` an EXPANSION rather than a filter. Measured on the live graph at
+    // the same seed and budget: `brain_context{seeds:["authentication"],
+    // tags:["security"]}` returned n=71 of which 70 were Symbols and ONE was a
+    // tagged Note, while the same call with no `tags` returned n=30 with 22 of
+    // 30 vault content. Adding the filter GREW the result 30 -> 71 and drove
+    // the tagged share from 22/30 to 1/71.
+    //
+    // The budget leg is why this is not cosmetic: the pass-through happens
+    // before the token budget is spent, so untagged symbols eat the budget the
+    // tagged notes were asked for. "No tag concept for code" means a symbol
+    // cannot SATISFY a tag scope, not that it is exempt from one — the comment
+    // documented the mechanism and never the consequence.
     if let Some(tags) = args.get("tags").and_then(|v| v.as_array()) {
         let tag_names: Vec<String> = tags
             .iter()
@@ -4054,9 +4724,6 @@ fn tool_brain_context(
                 .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
             let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
                 nodes.retain(|item| {
-                    if item.kind.to_lowercase().contains("symbol") {
-                        return true;
-                    }
                     tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
                 });
             };
@@ -4257,6 +4924,28 @@ fn tool_brain_context(
     let truncated_by = nestweaver_engine::TruncationCause::resolve(truncated, false);
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
+        // nw-393. The SEED cap, one layer upstream of the connected-list
+        // disclosure: `seeds_resolved`/`seeds_expanded` alone cannot distinguish
+        // a name with five definitions from a name with two hundred, and
+        // `truncated_by: "limit"` misdirects because no caller-settable knob can
+        // recover a seed that was never resolved.
+        //
+        // FOUR INDEPENDENT FIELDS rather than a `truncated_by: "seed_resolution"`
+        // variant, because the two caps do not compose: `truncated_by: "limit"`
+        // stays a correct statement about `connected` even when the seed set was
+        // ALSO cut, so collapsing them into the scalar makes one of two true
+        // things unsayable. The relation label is `search_total_relation_label`'s
+        // "eq"/"gte" — `brain_search`'s spelling, not a second convention.
+        //
+        // Hand-built here because the engine computes these on
+        // `ContextResult`/`BrainContextResult` and this payload is assembled
+        // field by field; without these four lines the numbers exist and reach
+        // nobody, and the CLI's DAEMON route (which parses this very payload back
+        // into `ContextResult`) discloses only on its local fallback.
+        "seed_matches_total": result.seed_matches_total,
+        "seed_matches_total_relation": result.seed_matches_total_relation.clone(),
+        "seeds_truncated": result.seeds_truncated,
+        "seed_resolution_limit": result.seed_resolution_limit,
         "connected": connected_json,
         "returned": returned,
         "total": total,
@@ -6346,8 +7035,107 @@ fn tool_schema_brain_status() -> Value {
 fn tool_brain_status(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    brain_status_json(store, tantivy)
+    let mut value = brain_status_json(store, tantivy)?;
+    scope_brain_status_to_visible_repos(store, &mut value, visible)?;
+    Ok(value)
+}
+
+/// nw-403: cut `brain_status`'s repo-derived fields down to the caller's
+/// visible repositories.
+///
+/// This is the most direct enumeration in the catalogue — `repos[]` carries
+/// each repo's URL and indexed git SHA, i.e. repo IDENTITY rather than repo
+/// CONTENT — and it was reachable by any repo-restricted bearer token.
+///
+/// It redacts the FINISHED document rather than taking `visible` into
+/// [`brain_status_json`] on purpose: that builder is the single document
+/// shared by the daemon's gRPC surface, the in-process MCP server and the
+/// CLI's direct fallback, and those routes have no `[authz]` identity to pass.
+/// Changing its signature would push an argument every other caller has to
+/// invent through three crates; redacting here keeps the scoping where the
+/// identity actually is.
+///
+/// `warnings` and `staleness_warnings` are matched by SUBSTRING against the
+/// hidden repos' urls and names because those rows are prose keyed by display
+/// name, with no uid to join on. That over-drops when one repo's name is a
+/// substring of another's — which is the safe direction: a scoped caller
+/// losing a warning about a repo they can see is a degraded answer, whereas
+/// keeping one is a disclosure.
+fn scope_brain_status_to_visible_repos(
+    store: &GraphStore,
+    value: &mut Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<(), anyhow::Error> {
+    let Some(nestweaver_engine::authz::VisibleRepos::Only(_)) = visible else {
+        return Ok(());
+    };
+    // Fails closed: a status document that could not be scoped is not served
+    // unscoped.
+    let repos = store
+        .list_repos(None)
+        .context("brain_status: listing repos for repository-scoped redaction")?;
+    let vaults = store
+        .list_vaults(None)
+        .context("brain_status: listing vaults for repository-scoped redaction")?;
+    let (shown, hidden): (Vec<_>, Vec<_>) = repos
+        .iter()
+        .partition(|repo| repo_is_visible(&repo.uid, visible));
+    let hidden_labels: Vec<String> = hidden
+        .iter()
+        .flat_map(|repo| {
+            [
+                Some(repo.url.clone()),
+                repo.name.clone(),
+                Some(repo.uid.clone()),
+            ]
+        })
+        .flatten()
+        .filter(|label| !label.is_empty())
+        .collect();
+
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        "repos".to_string(),
+        json!(
+            shown
+                .iter()
+                .map(|repo| json!({ "url": repo.url, "sha": repo.indexed_sha }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    object.insert("repo_count".to_string(), json!(shown.len()));
+    for key in ["warnings", "staleness_warnings"] {
+        if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+            rows.retain(|row| {
+                let rendered = row.to_string();
+                !hidden_labels.iter().any(|label| rendered.contains(label))
+            });
+        }
+    }
+    // Rebuilt from the surviving repos plus every vault, matching how
+    // `brain_status_json` derives it. A hidden repo's instance id names the
+    // instance a hidden repo was indexed on.
+    let mut instance_ids: std::collections::BTreeSet<&str> =
+        vaults.iter().map(|v| v.instance_id.as_str()).collect();
+    instance_ids.extend(shown.iter().map(|repo| repo.instance_id.as_str()));
+    object.insert(
+        "instance_ids".to_string(),
+        json!(instance_ids.into_iter().collect::<Vec<_>>()),
+    );
+    object.insert(
+        "visibility".to_string(),
+        json!({
+            "scoped": true,
+            "repos_hidden": hidden.len(),
+            "note": "repos, repo_count, instance_ids and the warning lists are scoped to this \
+                     caller's [authz] visibility; vault and corpus counts are graph-wide.",
+        }),
+    );
+    Ok(())
 }
 
 /// Build one `vaults[]` row, and say whether its note count could be READ.
@@ -8047,6 +8835,7 @@ fn tool_flow_trace(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
@@ -8071,6 +8860,15 @@ fn tool_flow_trace(
         .lookup_symbol(&resolved_uid)
         .map_err(|_| anyhow!("symbol '{symbol}' not found"))?;
 
+    // nw-403. A root in a repository this caller cannot see answers exactly as
+    // an absent symbol does. Deliberately the SAME error string as the lookup
+    // failure above: distinguishing "hidden" from "does not exist" would turn
+    // this tool into an existence oracle for the hidden repo, which is the
+    // property `brain_impact`'s ambiguity handling already protects.
+    if !repo_is_visible(&root.repo_uid, visible) {
+        return Err(anyhow!("symbol '{symbol}' not found"));
+    }
+
     let mut visited = HashSet::new();
     visited.insert(root.uid.clone());
 
@@ -8078,6 +8876,7 @@ fn tool_flow_trace(
         max_depth,
         concise,
         cancel,
+        visible,
     };
 
     // Classes don't have CALLS edges — only their methods do. When the root
@@ -8101,11 +8900,21 @@ fn tool_flow_trace(
                 s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
             };
 
+            // nw-390: the THIRD undisclosed cap. The response `note` explained
+            // the class-to-methods expansion and never mentioned that the
+            // expansion stops at 20, so a 60-method class reported 20 methods
+            // with no total and no flag. `methods_total` is captured on both
+            // branches below and published beside `methods`.
             const MAX_METHODS: usize = 20;
+            // Assigned on both branches below, so it is declared without an
+            // initialiser: a placeholder zero here would be a number nobody
+            // computed, which is the shape this fix exists to remove.
+            let methods_total: usize;
             let method_trees: Vec<Value> = if !members.is_empty() {
-                members
+                let methods: Vec<_> = members.iter().filter(|s| is_method(s)).collect();
+                methods_total = methods.len();
+                methods
                     .iter()
-                    .filter(|s| is_method(s))
                     .take(MAX_METHODS)
                     .map(|s| {
                         let mut v = visited.clone();
@@ -8128,7 +8937,7 @@ fn tool_flow_trace(
                     })
                     .map(|s| (s.start_line, s.end_line))
                     .collect();
-                file_symbols
+                let methods: Vec<_> = file_symbols
                     .iter()
                     .filter(|s| {
                         s.uid != root.uid
@@ -8139,6 +8948,10 @@ fn tool_flow_trace(
                                 .iter()
                                 .any(|&(start, end)| s.start_line >= start && s.start_line <= end)
                     })
+                    .collect();
+                methods_total = methods.len();
+                methods
+                    .iter()
                     .take(MAX_METHODS)
                     .map(|s| {
                         let mut v = visited.clone();
@@ -8148,12 +8961,30 @@ fn tool_flow_trace(
                     .collect::<Result<Vec<Value>, _>>()?
             };
 
+            let methods_truncated = methods_total > method_trees.len();
             return Ok(json!({
                 "root_uid": root.uid,
                 "root_name": root.name,
                 "root_kind": "class",
                 "max_depth": max_depth,
-                "note": "Class expanded to its methods — classes have no direct CALLS edges. Methods filtered to this class only.",
+                "note": if methods_truncated {
+                    format!(
+                        "Class expanded to its methods — classes have no direct CALLS edges. \
+                         Methods filtered to this class only. Showing {} of {methods_total} \
+                         methods (cap {MAX_METHODS}); the cut is positional, not by importance.",
+                        method_trees.len()
+                    )
+                } else {
+                    "Class expanded to its methods — classes have no direct CALLS edges. \
+                     Methods filtered to this class only."
+                        .to_string()
+                },
+                // nw-390: the TOTAL, next to the returned list, so a caller can
+                // see the cut without counting the array against a cap that was
+                // never published.
+                "methods_returned": method_trees.len(),
+                "methods_total": methods_total,
+                "methods_truncated": methods_truncated,
                 "methods": method_trees,
             }));
         }
@@ -8185,6 +9016,12 @@ struct FlowTraceOpts<'a> {
     /// Cooperative cancellation flag, checked once per recursion level. See
     /// [`nestweaver_store::StoreError::Cancelled`] for the contract.
     cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// nw-403: the caller's per-repo visibility. A callee in a repository this
+    /// caller cannot see is dropped DURING the walk and counted into
+    /// `children_redacted`, rather than removed from a finished tree — a
+    /// silently deleted subtree is `children: []`, which is exactly the
+    /// "indistinguishable from a leaf" defect the rest of this function fixes.
+    visible: Option<&'a nestweaver_engine::authz::VisibleRepos>,
 }
 
 fn build_flow_tree(
@@ -8209,6 +9046,10 @@ fn build_flow_tree(
     }
 
     let mut children = Vec::new();
+    // nw-390. Three things used to make a suppressed expansion look like a
+    // genuine leaf, and all three are now stated on the node itself.
+    let mut truncated_at_depth = false;
+    let mut children_omitted = 0usize;
 
     // A failed callee lookup is NOT "this function calls nothing".
     //
@@ -8218,15 +9059,62 @@ fn build_flow_tree(
     // path a few lines above already refuses to serve a truncated tree as a
     // real answer; an unreadable one is no different, and this function
     // already returns a `Result` to say so.
-    if depth < opts.max_depth {
-        let callees = store.callees_with_edge_types_of(uid).map_err(|error| {
-            anyhow::anyhow!(
-                "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
-                 report an empty call tree, which is indistinguishable from a leaf."
-            )
-        })?;
+    //
+    // nw-390: the callees are now read even AT the depth cap, where the old
+    // code returned without asking. That is one extra edge query per frontier
+    // node, and it buys the only fact that distinguishes "the cap stopped
+    // here" from "nothing is called here" — which is the whole complaint.
+    let callees = store.callees_with_edge_types_of(uid).map_err(|error| {
+        anyhow::anyhow!(
+            "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
+             report an empty call tree, which is indistinguishable from a leaf."
+        )
+    })?;
+    // nw-403: attribute before anything is rendered or counted, so a hidden
+    // callee contributes to `children_redacted` and to nothing else.
+    let (callees, redacted): (Vec<_>, Vec<_>) = callees
+        .into_iter()
+        .partition(|(callee, _)| repo_is_visible(&callee.repo_uid, opts.visible));
+    let children_redacted = redacted.len();
+
+    if depth >= opts.max_depth {
+        // The cap fired. Say so, and say how many callees it hid — previously
+        // `children` simply stayed empty and was serialized as a leaf.
+        truncated_at_depth = !callees.is_empty();
+        children_omitted = callees.len();
+    } else {
         for (callee, edge_type) in &callees {
             if visited.contains(&callee.uid) {
+                // nw-390, THE non-monotonicity. `visited` is GLOBAL to the
+                // traversal, so a callee claimed by an earlier branch used to
+                // be dropped from every later parent with no marker at all —
+                // which is why raising `--max-depth` REMOVED children: at
+                // greater depth an earlier branch reaches the node first and a
+                // later parent silently loses it.
+                //
+                // A `deduped_ref` stub restores monotonicity as a property of
+                // the RESPONSE rather than of the traversal: the edge is
+                // always present and always names its target, and the subtree
+                // is expanded exactly once somewhere in the document. The
+                // alternative — expanding it twice — is exponential on a
+                // recursive graph, which is why `visited` exists.
+                let mut stub = if opts.concise {
+                    json!({ "name": callee.name, "deduped_ref": callee.uid, "children": [] })
+                } else {
+                    json!({
+                        "uid": callee.uid,
+                        "name": callee.name,
+                        "file_path": callee.file_path,
+                        "depth": depth + 1,
+                        "repo_uid": callee.repo_uid,
+                        "deduped_ref": callee.uid,
+                        "children": [],
+                    })
+                };
+                if let Some(object) = stub.as_object_mut() {
+                    object.insert("edge_type".to_string(), json!(edge_type));
+                }
+                children.push(stub);
                 continue;
             }
             visited.insert(callee.uid.clone());
@@ -8254,14 +9142,37 @@ fn build_flow_tree(
         }
     }
 
+    // nw-390: the markers ride on the node in BOTH renderings. A concise tree
+    // is read by exactly the caller who cannot afford to mistake a capped node
+    // for a leaf, and omitting them there would reproduce the bug in the
+    // compact shape. Only non-zero/true values are attached, so a genuine leaf
+    // stays byte-identical to what it always was and the flags remain
+    // falsifiable rather than decorative.
+    let attach_markers = |node: &mut Value| {
+        let Some(object) = node.as_object_mut() else {
+            return;
+        };
+        if truncated_at_depth {
+            object.insert("truncated_at_depth".to_string(), json!(true));
+        }
+        if children_omitted > 0 {
+            object.insert("children_omitted".to_string(), json!(children_omitted));
+        }
+        if children_redacted > 0 {
+            object.insert("children_redacted".to_string(), json!(children_redacted));
+        }
+    };
+
     if opts.concise {
         // The label ships in concise mode too: a caller scanning a compact tree
         // is exactly the one who cannot afford to mistake a cross-repo guess for
         // a call.
-        Ok(json!({
+        let mut node = json!({
             "name": name,
             "children": children,
-        }))
+        });
+        attach_markers(&mut node);
+        Ok(node)
     } else {
         // Look up repo_uid and canonical_id for boundary detection.
         let (repo_uid, canonical_id) = store
@@ -8274,7 +9185,7 @@ fn build_flow_tree(
                 )
             })
             .unwrap_or_default();
-        Ok(json!({
+        let mut node = json!({
             "uid": uid,
             "name": name,
             "file_path": file_path,
@@ -8282,7 +9193,9 @@ fn build_flow_tree(
             "repo_uid": repo_uid,
             "canonical_id": canonical_id,
             "children": children,
-        }))
+        });
+        attach_markers(&mut node);
+        Ok(node)
     }
 }
 
@@ -8430,15 +9343,23 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                // nw-392. This is a merge-gate input: a changed file past the
+                // 1000th used to be dropped before analysis, absent from the
+                // echoed `changed_files` and from the notifications, while the
+                // run still reported `status: complete` /
+                // `recommendation: selection-usable`. A safety selector must
+                // REFUSE a request it cannot fully honour rather than answer a
+                // narrowed one, so the bound is declared and enforced.
                 "changed_files": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]."
+                    "items": { "type": "string", "maxLength": MAX_IDENTIFIER_LEN },
+                    "maxItems": MAX_IDENTIFIER_COUNT,
+                    "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]. At most 1000 entries of at most 512 bytes each; an oversized request is REJECTED rather than silently narrowed, because a test selection computed from a shortened change set is not a selection for that change."
                 },
                 "base_ref": {
                     "type": "string",
@@ -8454,6 +9375,16 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    // nw-412: REFUSE before doing any work, the way `dead_code` does. On a
+    // resolver-generation-stale graph a MISSING edge makes the affected-test
+    // set SMALLER, so the regression test that should have run is silently
+    // dropped while the gate reports success. See
+    // `affected_tests_refusal_payload` for why this refuses where
+    // `blast_radius` degrades.
+    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
+        return Ok(affected_tests_refusal_payload(&refusal));
+    }
+
     let owners = restricted_symbol_owners(store, visible)?;
 
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
@@ -8466,7 +9397,8 @@ fn tool_affected_tests(
                     .collect()
             })
             .unwrap_or_default(),
-    );
+        "changed_files",
+    )?;
 
     let base_ref = args.get("base_ref").and_then(|v| v.as_str());
     if changed_files.is_empty()
@@ -8794,10 +9726,23 @@ fn tool_schema_stale_check() -> Value {
     })
 }
 
-fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
-    let repos = store
+fn tool_stale_check(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    // nw-403: scoped at the SOURCE, not on the way out. Every number this tool
+    // publishes — `repo_count`, `any_stale`, `any_needs_reindex` and the three
+    // pre-summarised url lists — is derived from `repos` further down, so
+    // filtering the input is what keeps the summaries and the rows describing
+    // the same population. Filtering the output would have left
+    // `any_needs_reindex: true` with an empty `needs_reindex_repos`, which is
+    // the self-contradictory shape nw-163 and nw-370 spent two items removing.
+    let repos: Vec<_> = store
         .list_repos(None)
-        .map_err(|e| anyhow!("list_repos: {e}"))?;
+        .map_err(|e| anyhow!("list_repos: {e}"))?
+        .into_iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .collect();
 
     // nw-370: the FOURTH rung of the ladder. `missing` / `incomplete` /
     // behind-HEAD all ask "is the input newer than the index?"; this one asks
@@ -9362,16 +10307,16 @@ fn tool_schema_project_context() -> Value {
                 "repos": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Scope results to these repos (display name, uid, or path substring). Use on a returning session to skip the broad load."
+                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Use on a returning session to skip the broad load."
                 },
                 "path_prefix": {
                     "type": "string",
-                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\")."
+                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\"). Nodes that have NO path at all (Tag nodes carry an empty location) are exempt rather than excluded."
                 },
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
                 },
                 "exclude_tags": {
                     "type": "array",
@@ -9393,6 +10338,8 @@ fn tool_project_context(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // See `tool_brain_context` — same reason, same parameter.
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     // Reject an empty/whitespace project — otherwise the UID-substring fallback below
     // (`uid.contains(project_str)`) matches EVERY project on "" and silently resolves to the
@@ -9649,44 +10596,28 @@ fn tool_project_context(
 
     // 5b. repos + path_prefix scope filters (mirror brain_context so the two tools scope
     //     identically — the "load project_context, then narrow" handoff keeps the same params).
-    let repo_names = if filter_repos.is_some() {
-        build_repo_name_map(store)
-    } else {
-        std::collections::HashMap::new()
+    //     nw-405/406: this was a byte-for-byte COPY of brain_context's substring
+    //     predicate, which is why one grooming pass had to fix the same defect
+    //     in two places. Both now route through the shared resolver and the
+    //     shared retain helpers, so the next correction lands once.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
     };
     let apply_scope = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
-        if let Some(ref repos) = filter_repos {
-            let filter_lower: Vec<String> = repos.iter().map(|r| r.to_lowercase()).collect();
-            nodes.retain(|n| {
-                let node_repo_uid = if n.uid.starts_with("sym:") {
-                    let parts: Vec<&str> = n.uid[4..].splitn(4, ':').collect();
-                    if parts.len() >= 3 {
-                        Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                filter_lower.iter().any(|r| {
-                    if let Some(ref repo_uid) = node_repo_uid
-                        && let Some(name) = repo_names.get(repo_uid)
-                        && name.to_lowercase().contains(r)
-                    {
-                        return true;
-                    }
-                    n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)
-                })
-            });
+        if let Some(ref repo_uids) = repo_scope {
+            retain_nodes_in_repos(nodes, repo_uids);
         }
         if let Some(ref prefix) = path_prefix {
-            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+            retain_nodes_under_path_prefix(nodes, prefix.as_str());
         }
     };
     apply_scope(&mut result.seeds);
     apply_scope(&mut result.connected);
 
-    // 5c. tags filter: keep only note/section nodes tagged with any of these (symbols kept).
+    // 5c. tags filter: keep only note/section nodes tagged with any of these.
+    //     nw-407: symbols are no longer passed through unconditionally — see
+    //     the argument at brain_context's twin of this block.
     if let Some(tags) = args.get("tags").and_then(|v| v.as_array()) {
         let tag_names: Vec<String> = tags
             .iter()
@@ -9701,9 +10632,6 @@ fn tool_project_context(
                 .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
             let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
                 nodes.retain(|item| {
-                    if item.kind.to_lowercase().contains("symbol") {
-                        return true;
-                    }
                     tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
                 });
             };
@@ -9994,12 +10922,22 @@ fn tool_dead_code(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     // nw-372: REFUSE before doing any work. Every other resolver-generation
     // surface discloses and prints anyway; this one is a list of symbols to
     // delete, and a missing edge can only move a LIVE symbol onto it. See
     // `DeadCodeRefusal` for the full argument.
-    if let Some(refusal) = dead_code_refusal(store)? {
+    // nw-403 (review finding): the refusal payload is built from the STALE REPO
+    // SET, and `DeadCodeRefusal::payload()` emits `resolver_stale_repos` as a
+    // string array plus a `note` carrying one `index --repo <LOCAL PATH> --force`
+    // line per stale repo. Neither survives redaction — `row_allowed` only walks
+    // objects — so an unfiltered refusal hands a repo-scoped bearer token the
+    // UIDs *and the on-disk paths* of repos it may not see. `affected_tests` and
+    // `blast_radius` were given `visible` when nw-412 generalised this helper;
+    // `dead_code`, the ORIGINAL consumer, was left on `None`. Same bug, and the
+    // doc on `resolver_generation_refusal` already spells it out.
+    if let Some(refusal) = dead_code_refusal(store, visible)? {
         return Ok(refusal.payload());
     }
 
@@ -10268,7 +11206,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, results are redacted to the caller's visible repos.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, results are redacted to the caller's visible repos.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10395,6 +11333,46 @@ fn tool_blast_radius(
         })?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
         nestweaver_engine::blast_radius::apply_affected_symbol_limit(&mut result, requested_limit);
+    }
+
+    // nw-412: a generation-stale graph is a run that did not complete.
+    //
+    // Applied HERE — after analysis and after the R9b redaction, before either
+    // rendering — so the SARIF leg carries it too; `pr-impact --sarif` is the
+    // merge-gate surface most likely to be read by a machine that never sees
+    // the JSON. Degrading rather than refusing is argued at
+    // `BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR`.
+    //
+    // `status` is only ever pushed DOWN (`.max` over the ordered ladder
+    // Complete < Partial < Degraded < Failed), matching nw-105's rule that a
+    // run already Degraded or Failed is never upgraded by a later finding, and
+    // `gate_state` is then forced to DegradedUnknown. That mirrors
+    // `derive_gate_state`'s "non-Complete => DegradedUnknown" without calling
+    // it (it is `pub(crate)` to the engine) and, crucially, closes the
+    // direction that made this dangerous: a stale-resolver run reported
+    // `gate_state: ok` over a shrunken affected set, and can no longer report
+    // `ok` at all.
+    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
+        result.status = result
+            .status
+            .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+        result.gate_state = nestweaver_engine::blast_radius::GateState::DegradedUnknown;
+        result
+            .notifications
+            .push(nestweaver_engine::blast_radius::Notification {
+                level: nestweaver_engine::blast_radius::NotificationLevel::Error,
+                message: refusal.message(),
+                descriptor: BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR.to_string(),
+            });
+        // `render_blast_summary` appends `[status: …]` for any non-Complete
+        // run and is `pub(crate)`, so the marker is restated here rather than
+        // leaving the human summary claiming a clean run. Guarded so a summary
+        // that already carries one is not double-tagged.
+        if !result.summary.contains("[status: ") {
+            result
+                .summary
+                .push_str(&format!(" [status: {}]", result.status.label()));
+        }
     }
 
     // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
@@ -12558,6 +13536,30 @@ pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
 /// binary. There is nothing there that can predate the running resolver.
 fn dead_code_refusal(
     store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
+    resolver_generation_refusal(store, visible)
+}
+
+/// The resolver-generation verdict for the repos this caller can SEE, or
+/// `None` when every one of them is current.
+///
+/// nw-412 generalised `dead_code_refusal` (nw-372) to a second and third
+/// consumer rather than growing a parallel detector: the item's instruction is
+/// "the mechanism is already built and just not wired here — reuse both; do
+/// not invent a second mechanism". The computation underneath is still the
+/// single `ResolverGenerations::stale_repos` nw-358 collapsed everything onto.
+///
+/// `visible` narrows the repo set because `affected_tests` is
+/// `RepoScope::EnforcedInArm` — nothing redacts its response afterwards, so a
+/// refusal payload built from every repo in the graph would enumerate hidden
+/// repo UIDs to a repo-scoped bearer token, which is nw-403 exactly. It also
+/// makes the verdict CORRECT for that caller: a stale repo they cannot see can
+/// contribute no edge to an answer that is already filtered to their scope, so
+/// refusing on it would be refusing on someone else's data.
+fn resolver_generation_refusal(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
     let db_path = match (current_db_path(store), store.db_path()) {
         (Ok(path), _) => path,
@@ -12569,9 +13571,101 @@ fn dead_code_refusal(
     // error (and, on the CLI, the diagnostic nw-285 built for a schema-less
     // database) rather than a binder exception quoted inside a paragraph about
     // resolver generations.
-    let repos = store.list_repos(None)?;
+    let repos: Vec<nestweaver_schema::Repo> = store
+        .list_repos(None)?
+        .into_iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .collect();
     Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
+
+/// Why `affected_tests` refuses a generation-stale graph instead of answering
+/// a narrower question.
+///
+/// nw-412. This is the counterpart of `WHY_DEAD_CODE_REFUSES` and it is worded
+/// separately because the ERROR DIRECTION is the opposite one and that is the
+/// whole argument. `dead-code` on a stale graph puts a LIVE symbol on a
+/// deletion list — bad, but a human reviewing the list can catch it. Here a
+/// missing edge makes the affected-test set SMALLER: the regression test that
+/// would have caught the change is never selected, the gate reports success,
+/// and there is no list for anyone to review. A test selector that refuses is
+/// safe; one that silently narrows is not.
+const WHY_AFFECTED_TESTS_REFUSES: &str = "affected-tests will not produce a selection on this graph. Its output is the set of tests a \
+     change can reach through the call/import graph, so a MISSING edge cannot make the selection \
+     safer — it can only drop a test that should have run, while `status` still reads complete. \
+     The error is one-directional and it is silent: nothing downstream can tell a test that was \
+     not selected from a test that does not exist.";
+
+/// Turn the shared resolver-generation verdict into `affected_tests`'
+/// refusal.
+///
+/// nw-412. The payload is `DeadCodeRefusal::payload()` — same `refused: true`,
+/// same `reason: "outdated_resolver"` token `stale-check` puts in a repo's
+/// `status`, same `remedies` array of ready-to-run
+/// `nestweaver index --repo <path> --force` commands, same `needs_reindex` key
+/// a CI job already gates on. Only two things are tool-specific:
+///
+///  * `note` is replaced, because `DeadCodeRefusal::message()` opens with
+///    "dead-code will not produce a list on this graph", which is the wrong
+///    sentence in front of the right remedies.
+///  * `recommendation: "run-full-suite"` is ADDED. It is the one key a CI
+///    consumer of this tool acts on, and the refusal deliberately carries no
+///    `tier_1`/`tier_2`/`tier_3` — so without it a caller that keys off "did I
+///    get tiers" would read the refusal as "no tests affected", which is the
+///    exact silent narrowing this refusal exists to prevent. It is the same
+///    fail-safe widening value the tool already emits for any non-complete
+///    run, so the vocabulary is unchanged.
+fn affected_tests_refusal_payload(
+    refusal: &nestweaver_engine::resolver_generation::DeadCodeRefusal,
+) -> Value {
+    let mut payload = refusal.payload();
+    let mut note = WHY_AFFECTED_TESTS_REFUSES.to_string();
+    for remedy in payload
+        .get("remedies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match remedy.get("command").and_then(Value::as_str) {
+            Some(command) => note.push_str(&format!("\n  {command}")),
+            None => note.push_str(&format!(
+                "\n  {} — indexed from a bare clone, so this machine has no working tree to \
+                 pass to `--repo`; re-index it where it lives",
+                remedy
+                    .get("uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unnamed repo)")
+            )),
+        }
+    }
+    payload["note"] = json!(note);
+    payload["recommendation"] = json!("run-full-suite");
+    payload
+}
+
+/// The notification `blast_radius` attaches when its graph is
+/// generation-stale.
+///
+/// nw-412 asked for a decision between refusing and degrading, per surface,
+/// and these two land differently:
+///
+///  * `affected_tests` REFUSES. It is a selector: its answer is consumed as
+///    "run exactly these", there is no field a caller can read to widen it
+///    back, and a narrowed selection is indistinguishable from a correct one.
+///  * `blast_radius` DEGRADES. It is an assessment, not a selector, and it
+///    already ships the exact contract this condition wants: `status` +
+///    `gate_state`, whose documented rule is that a run which did not complete
+///    is `degraded-unknown` and NEVER `risk-flagged` — "unknown, review
+///    manually", not "safe". A stale-resolver run IS a run that did not
+///    complete. Degrading also preserves `coverage`, `blind_spots` and the
+///    changed-file echo, which are what a human uses to decide whether to
+///    trust it, and it keeps the SARIF rendering valid; a refusal payload is
+///    not a SARIF run and would break `pr-impact --sarif` outright.
+///
+/// The direction that made nw-412 dangerous is closed either way: on a stale
+/// graph `blast_radius` used to report `gate_state: ok` with a shrunken
+/// affected set, and it can no longer report `ok` at all.
+const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale";
 
 /// Attach a disclosure to a tool result without dropping one already there.
 ///
@@ -12687,7 +13781,7 @@ mod server_mode_tests {
         let store = GraphStore::in_memory().unwrap();
 
         set_server_mode(true);
-        let status = tool_brain_status(&store, None).unwrap();
+        let status = tool_brain_status(&store, None, None).unwrap();
         assert_eq!(
             status["server_mode"],
             serde_json::json!(true),
@@ -12695,7 +13789,7 @@ mod server_mode_tests {
         );
 
         set_server_mode(false);
-        let status = tool_brain_status(&store, None).unwrap();
+        let status = tool_brain_status(&store, None, None).unwrap();
         assert_eq!(
             status["server_mode"],
             serde_json::json!(false),
@@ -12874,6 +13968,7 @@ mod project_context_bug12_tests {
                 }),
                 None,
                 None,
+                None,
             )
             .unwrap();
             resp["connected"]
@@ -12982,6 +14077,7 @@ mod project_context_bug12_tests {
             json!({ "project": "Parallel Paths", "token_budget": 5000, "response_format": "detailed" }),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -13012,6 +14108,7 @@ mod project_context_bug12_tests {
             &store,
             None,
             json!({ "seeds": ["LeafOnlySymbol"], "token_budget": 5000 }),
+            None,
             None,
             None,
         )
@@ -13054,6 +14151,7 @@ mod project_context_bug12_tests {
             json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
             None,
             None,
+            None,
         )
         .unwrap();
         let any_body_off = off["connected"]
@@ -13074,6 +14172,7 @@ mod project_context_bug12_tests {
                 "include_bodies": true,
                 "root": root,
             }),
+            None,
             None,
             None,
         )
@@ -13374,7 +14473,7 @@ mod cache_dispatch_tests {
         set_current_db_path(db_path.clone());
         let store = GraphStore::open(&db_path).unwrap();
 
-        let value = tool_stale_check(&store).unwrap();
+        let value = tool_stale_check(&store, None).unwrap();
         for field in ["stale_repos", "needs_reindex_repos"] {
             assert!(
                 value[field].is_array(),
@@ -15727,6 +16826,7 @@ mod arg_alias_tests {
             json!({ "seeds": ["x"], "kinds": ["Banana"] }),
             None,
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -15755,6 +16855,7 @@ mod arg_alias_tests {
             &store,
             None,
             json!({ "seeds": ["x"], "kinds": ["note", "SYMBOL", "Symbol/Function"] }),
+            None,
             None,
             None,
         )
@@ -16737,7 +17838,7 @@ mod stale_check_tool_tests {
         // Delete the working tree after indexing.
         std::fs::remove_dir_all(gone.path()).unwrap();
 
-        let result = tool_stale_check(&store).expect("stale check");
+        let result = tool_stale_check(&store, None).expect("stale check");
         assert_eq!(result["any_needs_reindex"], true, "{result}");
         let repo = &result["repos"][0];
         assert_eq!(repo["status"], "missing", "{result}");
@@ -16776,7 +17877,7 @@ mod stale_check_tool_tests {
             .expect("insert repo");
         std::fs::remove_dir_all(gone.path()).unwrap();
 
-        let result = tool_stale_check(&store).expect("stale check");
+        let result = tool_stale_check(&store, None).expect("stale check");
         let repo = &result["repos"][0];
         assert_eq!(repo["status"], "missing", "{result}");
         assert_eq!(repo["needs_reindex"], true, "{result}");
@@ -16818,7 +17919,7 @@ mod stale_check_tool_tests {
             })
             .expect("insert repo");
 
-        let result = tool_stale_check(&store).expect("stale check");
+        let result = tool_stale_check(&store, None).expect("stale check");
         assert_eq!(result["any_needs_reindex"], true, "{result}");
         assert_eq!(
             result["any_stale"], false,
@@ -16840,7 +17941,7 @@ mod stale_check_tool_tests {
                 content_hash: "h".to_string(),
             })
             .expect("insert file");
-        let healed = tool_stale_check(&store).expect("stale check");
+        let healed = tool_stale_check(&store, None).expect("stale check");
         assert_eq!(healed["any_stale"], false, "{healed}");
         assert_eq!(healed["any_needs_reindex"], false, "{healed}");
         assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
@@ -16899,7 +18000,7 @@ mod stale_check_tool_tests {
             .insert_vault_note_edge("vlt:1", "note:1")
             .expect("insert vault note edge");
 
-        let result = tool_stale_check(&store).expect("stale check");
+        let result = tool_stale_check(&store, None).expect("stale check");
         assert_eq!(result["any_stale"], false, "{result}");
         assert_eq!(result["repos"][0]["status"], "ok", "{result}");
     }
@@ -17713,5 +18814,1615 @@ mod detect_changes_gate_disclosure_tests {
         assert_eq!(payload["gate_state"], json!("ok"), "{payload}");
         assert_eq!(payload["status"], json!("complete"), "{payload}");
         assert_eq!(payload["notifications"], json!([]), "{payload}");
+    }
+}
+
+// ── nw-403: repository visibility, per tool ─────────────────────────────────
+
+/// nw-403 was a CRITICAL confidentiality bug whose entire shape was
+/// "somebody spot-checked one tool". `brain_search` enforced `[authz]`
+/// correctly, so the boundary looked healthy while 37 of the 42 dispatch arms
+/// never received the caller's visibility at all.
+///
+/// These tests are therefore TABLE-DRIVEN OVER EVERY TOOL. A per-tool table is
+/// the only shape in which "which arms enforce this?" has an answer, and the
+/// counterweight tests below exist so the table cannot pass vacuously — a
+/// fixture that stopped reaching the hidden repo would make every leak
+/// assertion trivially true, which is exactly how this survived.
+#[cfg(test)]
+mod repo_visibility_coverage_tests {
+    use super::*;
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    /// Tokens that appear ONLY in the hidden repo's data — never in any
+    /// argument this test sends. That distinction matters: an argument echoed
+    /// back is not a leak, and a marker a test can smuggle in through its own
+    /// input would make every assertion below meaningless.
+    const HIDDEN_MARKERS: &[&str] = &["hiddenSecret", "hidden-secret", "repo:hidden"];
+
+    /// The visible repo owns `src/alpha.py`; the hidden repo owns a symbol in
+    /// a file at the SAME repo-relative path (paths are repo-relative, so this
+    /// is the ordinary case, not a contrived one) plus a caller and a callee
+    /// of the visible symbol. Every leak route the bug report measured —
+    /// file→symbol, forward call, reverse call, repo identity — is reachable
+    /// from arguments that name only visible things.
+    fn hidden_repo_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let repo = |uid: &str, url: &str, name: &str| Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: Some(name.to_string()),
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str, line: u32| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: line,
+            end_line: line,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: Some(0.5),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_repo(&repo("repo:alpha", "https://example.test/alpha", "alpha"))
+            .unwrap();
+        store
+            .insert_repo(&repo(
+                "repo:hidden",
+                "https://example.test/hidden-secret",
+                "hidden-secret",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "sym:alpha:public",
+                "alphaPublicHelper",
+                "repo:alpha",
+                "src/alpha.py",
+                1,
+            ))
+            .unwrap();
+        // Same repo-relative path, different repo: the file→symbol route.
+        store
+            .insert_symbol(&symbol(
+                "sym:hidden:twin",
+                "hiddenSecretTwin",
+                "repo:hidden",
+                "src/alpha.py",
+                2,
+            ))
+            .unwrap();
+        // Forward call route (flow_trace, code_context).
+        store
+            .insert_symbol(&symbol(
+                "sym:hidden:callee",
+                "hiddenSecretCallee",
+                "repo:hidden",
+                "secret/hidden.py",
+                3,
+            ))
+            .unwrap();
+        // Reverse call route (impact, blast_radius, dead_code reachability).
+        store
+            .insert_symbol(&symbol(
+                "sym:hidden:caller",
+                "hiddenSecretCaller",
+                "repo:hidden",
+                "secret/hidden.py",
+                4,
+            ))
+            .unwrap();
+        for (source, target) in [
+            ("sym:alpha:public", "sym:hidden:callee"),
+            ("sym:hidden:caller", "sym:alpha:public"),
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.to_string(),
+                    target_uid: target.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// Every tool in the catalogue, with arguments that name ONLY visible
+    /// things. Kept as one table so a new tool that is added to
+    /// `dispatch_tool_arm` without a row here fails
+    /// `the_visibility_table_covers_every_tool` rather than going untested.
+    fn tool_call_table() -> Vec<(&'static str, Value)> {
+        vec![
+            ("brain_context", json!({ "query": "alphaPublicHelper" })),
+            ("code_context", json!({ "seeds": ["alphaPublicHelper"] })),
+            ("brain_search", json!({ "query": "alphaPublicHelper" })),
+            ("note_get", json!({ "uid": "note:absent" })),
+            ("backlinks", json!({ "uid": "note:absent" })),
+            ("brain_status", json!({})),
+            ("brain_add_source", json!({ "path": "/tmp/nw-403-absent" })),
+            ("brain_remove_source", json!({ "uid": "repo:alpha" })),
+            ("prune_stale", json!({})),
+            ("compact_embeddings", json!({ "dry_run": true })),
+            (
+                "cross_repo_contracts",
+                json!({ "name": "alphaPublicHelper" }),
+            ),
+            ("brain_impact", json!({ "symbol": "alphaPublicHelper" })),
+            ("brain_guide", json!({})),
+            ("flow_trace", json!({ "symbol": "alphaPublicHelper" })),
+            (
+                "detect_changes",
+                json!({ "changed_files": ["src/alpha.py"] }),
+            ),
+            ("clusters", json!({})),
+            ("stale_check", json!({})),
+            (
+                "set_extension",
+                json!({ "scope_uid": "repo:alpha", "key": "k", "value": "v" }),
+            ),
+            ("query_extensions", json!({ "scope_uid": "repo:alpha" })),
+            ("brain_diff", json!({})),
+            (
+                "project_context",
+                json!({ "project": "alpha", "response_format": "detailed" }),
+            ),
+            ("dead_code", json!({})),
+            ("hub_nodes", json!({})),
+            ("bridge_nodes", json!({})),
+            ("blast_radius", json!({ "changed_files": ["src/alpha.py"] })),
+            ("get_summary", json!({ "level": "file" })),
+            (
+                "read_symbols",
+                json!({ "targets": ["alphaPublicHelper"], "include_neighbors": 5 }),
+            ),
+            ("regex_search", json!({ "pattern": "Helper" })),
+            ("count_patterns", json!({ "patterns": ["Helper"] })),
+            ("brain_broken_links", json!({})),
+            ("brain_orphan_documents", json!({})),
+            ("brain_topic_clusters", json!({})),
+            ("brain_tag_graph", json!({})),
+            ("brain_doc_stats", json!({})),
+            (
+                "affected_tests",
+                json!({ "changed_files": ["src/alpha.py"] }),
+            ),
+            (
+                "investigate",
+                json!({ "question": "what calls alphaPublicHelper" }),
+            ),
+            ("investigate_expand", json!({ "card_id": "absent" })),
+            ("investigate_hydrate", json!({ "card_id": "absent" })),
+            ("contract_drift", json!({})),
+            ("brain_memory_lint", json!({})),
+            ("brain_memory_consolidate", json!({})),
+            ("brain_memory_related", json!({ "uid": "note:absent" })),
+        ]
+    }
+
+    fn rendered(result: Result<Value, anyhow::Error>) -> String {
+        match result {
+            // An error cannot leak rows, but it can still name a repo, so the
+            // message is asserted over too.
+            Err(error) => format!("{error:#}"),
+            Ok(value) => value.to_string(),
+        }
+    }
+
+    fn call(
+        store: &GraphStore,
+        name: &str,
+        args: &Value,
+        visible: Option<&VisibleRepos>,
+    ) -> String {
+        rendered(dispatch_cancellable(
+            store,
+            None,
+            name,
+            args.clone(),
+            None,
+            None,
+            visible,
+        ))
+    }
+
+    fn only_alpha() -> VisibleRepos {
+        VisibleRepos::Only(["repo:alpha".to_string()].into_iter().collect())
+    }
+
+    fn leaked(rendered: &str) -> Option<&'static str> {
+        HIDDEN_MARKERS
+            .iter()
+            .copied()
+            .find(|marker| rendered.contains(marker))
+    }
+
+    #[test]
+    fn the_visibility_table_covers_every_tool() {
+        let declared: std::collections::BTreeSet<String> = tool_list(false)["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
+        let covered: std::collections::BTreeSet<String> = tool_call_table()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            declared, covered,
+            "every tool must have a repo-visibility row; nw-403 was 37 tools nobody had a row for"
+        );
+    }
+
+    /// The inverted default. A tool nobody wrote a disposition for must refuse
+    /// a repo-scoped caller, and every REAL tool must have one — the two halves
+    /// together are what make the default safe rather than merely documented.
+    #[test]
+    fn every_tool_declares_a_repo_scope_disposition_and_the_default_fails_closed() {
+        for (name, _) in tool_call_table() {
+            match repo_scope(name) {
+                RepoScope::FailClosed(reason) => assert_ne!(
+                    reason, UNDECLARED_TOOL_SCOPE,
+                    "{name} has no recorded repo-visibility disposition"
+                ),
+                RepoScope::NotRepoScoped(reason) => assert!(
+                    !reason.is_empty(),
+                    "{name} opts out of scoping without a justification"
+                ),
+                RepoScope::EnforcedInArm | RepoScope::RedactedAfterDispatch => {}
+            }
+        }
+        // Counterweight: the fallback really is fail-closed, so a tool added
+        // tomorrow cannot inherit the old "leak" default.
+        match repo_scope("a_tool_that_was_added_without_thinking_about_authz") {
+            RepoScope::FailClosed(reason) => assert_eq!(reason, UNDECLARED_TOOL_SCOPE),
+            other => panic!("an undeclared tool must fail closed, got {other:?}"),
+        }
+    }
+
+    /// THE bug: a bearer token authorized for `repo:alpha` only must not
+    /// receive `repo:hidden` data from ANY tool.
+    #[test]
+    fn no_tool_returns_hidden_repo_data_to_a_repo_scoped_caller() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, args) in tool_call_table() {
+            let body = call(&store, name, &args, Some(&visible));
+            if let Some(marker) = leaked(&body) {
+                offenders.push(format!("{name} leaked {marker:?}: {body}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "tools leaked hidden-repo data to a repo-scoped caller:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// COUNTERWEIGHT, and the most important test in this module: the
+    /// assertion above must not be passing because the fixture stopped
+    /// reaching the hidden repo. Without a policy every one of these tools
+    /// DOES surface it, which is precisely what nw-403 measured — so the
+    /// unscoped run has to leak from a broad set of tools, including the ones
+    /// the bug report named by hand.
+    #[test]
+    fn the_same_calls_do_return_hidden_repo_data_when_no_policy_is_configured() {
+        let store = hidden_repo_store();
+        let leaking: std::collections::BTreeSet<String> = tool_call_table()
+            .into_iter()
+            .filter(|(name, args)| leaked(&call(&store, name, args, None)).is_some())
+            .map(|(name, _)| name.to_string())
+            .collect();
+        // Every one of these was named in nw-403's measured leak table.
+        // `regex_search` and `count_patterns` were too, but their corpus is
+        // the trigram/posting index rather than the graph rows, so an
+        // in-memory fixture cannot reach them here; the redactor's own unit
+        // test covers a regex_search-shaped payload instead.
+        for required in [
+            "brain_status",
+            "clusters",
+            "code_context",
+            "dead_code",
+            "detect_changes",
+            "flow_trace",
+            "get_summary",
+            "hub_nodes",
+            "read_symbols",
+            "stale_check",
+        ] {
+            assert!(
+                leaking.contains(required),
+                "fixture no longer reaches the hidden repo through {required}, so the scoped \
+                 assertion for it would pass vacuously (leaking: {leaking:?})"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT: scoping must not be over-applied. A caller authorized
+    /// for BOTH repos is not restricted at all in effect, and an unconfigured
+    /// deployment (`None`) must be byte-identical to the pre-nw-403 behaviour.
+    #[test]
+    fn a_caller_authorized_for_every_repo_still_sees_every_repo() {
+        let store = hidden_repo_store();
+        let all = VisibleRepos::Only(
+            ["repo:alpha".to_string(), "repo:hidden".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let scoped = call(&store, "brain_status", &json!({}), Some(&all));
+        assert!(
+            scoped.contains("hidden-secret"),
+            "a caller authorized for repo:hidden must still see it: {scoped}"
+        );
+        let unscoped = call(&store, "brain_status", &json!({}), None);
+        assert!(unscoped.contains("hidden-secret"), "{unscoped}");
+        assert!(
+            !unscoped.contains("\"visibility\""),
+            "an unscoped caller must not receive a scoping disclosure: {unscoped}"
+        );
+    }
+
+    /// `brain_status` is called out separately because it leaks repo IDENTITY
+    /// (URL + indexed git SHA) rather than repo content, and because its
+    /// summaries have to stay consistent with the list they summarise.
+    #[test]
+    fn brain_status_scopes_the_repo_list_without_erasing_the_visible_repo() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let value = dispatch_cancellable(
+            &store,
+            None,
+            "brain_status",
+            json!({}),
+            None,
+            None,
+            Some(&visible),
+        )
+        .expect("brain_status must still answer a scoped caller");
+        assert_eq!(value["repo_count"], json!(1), "{value}");
+        let repos = value["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 1, "{value}");
+        assert_eq!(
+            repos[0]["url"],
+            json!("https://example.test/alpha"),
+            "{value}"
+        );
+        assert_eq!(value["visibility"]["scoped"], json!(true), "{value}");
+        assert_eq!(value["visibility"]["repos_hidden"], json!(1), "{value}");
+    }
+
+    /// `stale_check` is scoped at its INPUT so its pre-summarised lists cannot
+    /// disagree with its rows — a scoped `any_needs_reindex: true` with an
+    /// empty `needs_reindex_repos` would be the self-contradictory shape
+    /// nw-163/nw-370 removed.
+    #[test]
+    fn stale_check_summaries_describe_only_the_repos_it_returned() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let value = dispatch_cancellable(
+            &store,
+            None,
+            "stale_check",
+            json!({}),
+            None,
+            None,
+            Some(&visible),
+        )
+        .expect("stale_check must still answer a scoped caller");
+        assert_eq!(value["repo_count"], json!(1), "{value}");
+        assert_eq!(value["repos"].as_array().map(Vec::len), Some(1), "{value}");
+        for key in ["stale_repos", "needs_reindex_repos", "resolver_stale_repos"] {
+            for url in value[key].as_array().expect(key) {
+                assert_ne!(
+                    url.as_str(),
+                    Some("https://example.test/hidden-secret"),
+                    "{key} named a hidden repo: {value}"
+                );
+            }
+        }
+    }
+
+    /// A concise rendering drops the uid the redactor attributes rows by. It
+    /// is REFUSED rather than served unfiltered, and the message has to name
+    /// the remedy because `project_context` defaults to concise.
+    #[test]
+    fn a_concise_request_is_refused_rather_than_served_unfiltered() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let error = dispatch_cancellable(
+            &store,
+            None,
+            "dead_code",
+            json!({ "response_format": "concise" }),
+            None,
+            None,
+            Some(&visible),
+        )
+        .expect_err("a concise response cannot be repo-scoped");
+        let text = format!("{error:#}");
+        assert!(text.contains("concise"), "{text}");
+        assert!(text.contains("detailed"), "{text}");
+        // Counterweight: the refusal is about SCOPING, not about concise mode.
+        // An unscoped caller keeps the concise rendering it always had.
+        assert!(
+            dispatch_cancellable(
+                &store,
+                None,
+                "dead_code",
+                json!({ "response_format": "concise" }),
+                None,
+                None,
+                None,
+            )
+            .is_ok(),
+            "concise must keep working for an unscoped caller"
+        );
+    }
+
+    /// A fail-closed tool must SAY it refused, not return an empty answer that
+    /// reads as "no findings" — that inversion is what made the original bug
+    /// invisible.
+    #[test]
+    fn a_fail_closed_tool_refuses_out_loud() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let error = dispatch_cancellable(
+            &store,
+            None,
+            "get_summary",
+            json!({ "level": "file" }),
+            None,
+            None,
+            Some(&visible),
+        )
+        .expect_err("get_summary cannot be scoped");
+        let text = format!("{error:#}");
+        assert!(text.contains("repository-scoped caller"), "{text}");
+        assert!(text.contains("nw-403"), "{text}");
+    }
+
+    /// The redactor, exercised directly on a `regex_search`-shaped payload.
+    ///
+    /// `regex_search` answers out of the trigram/posting corpus rather than
+    /// the graph rows, so the in-memory fixture above cannot drive a hit
+    /// through it — and a tool whose filtering is untested because the fixture
+    /// could not reach it is the exact position nw-403 started from. This
+    /// pins the rule on the shape the tool actually returns.
+    #[test]
+    fn the_redactor_drops_hidden_rows_and_keeps_vault_rows_it_cannot_own() {
+        let store = hidden_repo_store();
+        let visible = only_alpha();
+        let mut payload = json!({
+            "results": [
+                { "uid": "sym:alpha:public", "title": "alphaPublicHelper", "location": "src/alpha.py" },
+                { "uid": "sym:hidden:twin", "title": "hiddenSecretTwin", "location": "src/alpha.py" },
+                { "uid": "sec:note:vlt:1:2:intro", "title": "Intro", "location": "notes/intro.md" },
+                { "uid": "sym:deleted:unknown", "title": "TombstonedRow", "location": "x.py" },
+            ],
+            "truncated": false,
+        });
+        redact_response_for_visibility(&store, &mut payload, Some(&visible)).unwrap();
+        let titles: Vec<&str> = payload["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["title"].as_str())
+            .collect();
+        // The hidden symbol goes. The vault section stays: it has no repo, so
+        // repo visibility neither permits nor forbids it.
+        assert_eq!(titles, vec!["alphaPublicHelper", "Intro"], "{payload}");
+        // A `sym:` uid the ownership scan never saw is UNATTRIBUTABLE, and
+        // unattributable is not the same as unowned — it is dropped.
+        assert_eq!(
+            payload["visibility"]["redacted_entries"],
+            json!(2),
+            "{payload}"
+        );
+        // COUNTERWEIGHT: the same payload is untouched for an unscoped caller,
+        // and carries no disclosure claiming it was scoped.
+        let mut unscoped = json!({ "results": [ { "uid": "sym:hidden:twin" } ] });
+        redact_response_for_visibility(&store, &mut unscoped, None).unwrap();
+        assert_eq!(unscoped["results"].as_array().map(Vec::len), Some(1));
+        assert!(unscoped.get("visibility").is_none(), "{unscoped}");
+    }
+}
+
+// ── nw-390: flow_trace must not render a suppressed expansion as a leaf ─────
+
+#[cfg(test)]
+mod flow_trace_truncation_tests {
+    use super::*;
+    use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    fn symbol(uid: &str, name: &str, kind: SymbolKind, line: u32) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind,
+            repo_uid: "repo:only".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: line,
+            end_line: line + 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: Some(0.5),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn store_with(symbols: &[Symbol], edges: &[(&str, &str, EdgeType)]) -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:only".to_string(),
+                url: "https://example.test/only".to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "inst".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        for sym in symbols {
+            store.insert_symbol(sym).unwrap();
+        }
+        for (source, target, edge_type) in edges {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.to_string(),
+                    target_uid: target.to_string(),
+                    edge_type: *edge_type,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// `root -> a`, `root -> shared`, `a -> shared`.
+    ///
+    /// This is the minimal shape of the reported non-monotonicity. At
+    /// `max_depth 1` the root lists both callees. At `max_depth 2` the walk
+    /// reaches `shared` through `a` first, marks it globally visited, and the
+    /// root's own edge to `shared` used to be `continue`d away — so asking for
+    /// MORE depth returned FEWER children.
+    fn diamond_store() -> GraphStore {
+        store_with(
+            &[
+                symbol("sym:root", "rootFn", SymbolKind::Function, 1),
+                symbol("sym:a", "aFn", SymbolKind::Function, 10),
+                symbol("sym:shared", "sharedFn", SymbolKind::Function, 20),
+                symbol("sym:deep", "deepFn", SymbolKind::Function, 30),
+            ],
+            &[
+                ("sym:root", "sym:a", EdgeType::Calls),
+                ("sym:root", "sym:shared", EdgeType::Calls),
+                ("sym:a", "sym:shared", EdgeType::Calls),
+                ("sym:shared", "sym:deep", EdgeType::Calls),
+            ],
+        )
+    }
+
+    /// Every uid that appears anywhere in a rendered tree.
+    fn uids(value: &Value) -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        fn walk(value: &Value, found: &mut std::collections::BTreeSet<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(uid) = map.get("uid").and_then(Value::as_str) {
+                        found.insert(uid.to_string());
+                    }
+                    for child in map.values() {
+                        walk(child, found);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+                _ => {}
+            }
+        }
+        walk(value, &mut found);
+        found
+    }
+
+    fn trace(store: &GraphStore, max_depth: u64) -> Value {
+        tool_flow_trace(
+            store,
+            json!({ "symbol": "rootFn", "max_depth": max_depth }),
+            None,
+            None,
+        )
+        .expect("flow_trace")
+    }
+
+    /// THE property nw-390 asks for: the callee set at depth N+1 is a superset
+    /// of the set at depth N, for a fixed root.
+    #[test]
+    fn the_callee_set_at_depth_n_plus_one_is_a_superset_of_depth_n() {
+        let store = diamond_store();
+        let mut previous = uids(&trace(&store, 1));
+        for depth in 2..=5 {
+            let current = uids(&trace(&store, depth));
+            assert!(
+                previous.is_subset(&current),
+                "raising max_depth to {depth} REMOVED callees: {:?} vanished",
+                previous.difference(&current).collect::<Vec<_>>()
+            );
+            previous = current;
+        }
+        // COUNTERWEIGHT: monotone must not mean constant. Depth genuinely buys
+        // reach, or a walk that returned the root alone would pass above.
+        assert!(
+            uids(&trace(&store, 1)).len() < uids(&trace(&store, 5)).len(),
+            "a deeper trace must actually reach further"
+        );
+    }
+
+    /// The per-node form of the same regression, which is how it was reported:
+    /// a parent that listed two children at `--max-depth 2` listed none at 3.
+    #[test]
+    fn a_globally_visited_callee_still_appears_under_every_parent_that_calls_it() {
+        let store = diamond_store();
+        let root_children = |depth: u64| -> Vec<String> {
+            trace(&store, depth)["tree"]["children"]
+                .as_array()
+                .expect("children")
+                .iter()
+                .filter_map(|child| child["uid"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert_eq!(root_children(1), root_children(2));
+        assert_eq!(root_children(2), root_children(3));
+        // The second occurrence is a REFERENCE, not a second expansion: the
+        // subtree is rendered exactly once, which is why `visited` exists.
+        let deeper = trace(&store, 3);
+        let dedup = deeper["tree"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["deduped_ref"].is_string())
+            .expect("the repeated callee must be marked, not dropped");
+        assert_eq!(dedup["deduped_ref"], json!("sym:shared"));
+        assert_eq!(dedup["children"], json!([]));
+    }
+
+    /// A node the depth cap stopped at and a node that genuinely calls nothing
+    /// used to be byte-identical.
+    #[test]
+    fn a_depth_capped_node_is_distinguishable_from_a_real_leaf() {
+        let store = diamond_store();
+        let capped = trace(&store, 1);
+        let frontier = &capped["tree"]["children"][0];
+        assert_eq!(frontier["truncated_at_depth"], json!(true), "{capped}");
+        assert!(
+            frontier["children_omitted"].as_u64().unwrap_or(0) > 0,
+            "{capped}"
+        );
+        // COUNTERWEIGHT: a genuine leaf must NOT be marked, or the flag stops
+        // distinguishing anything. `deepFn` calls nothing at any depth.
+        let full = trace(&store, 5);
+        let leaf = uids(&full);
+        assert!(leaf.contains("sym:deep"), "{full}");
+        fn find<'a>(value: &'a Value, uid: &str) -> Option<&'a Value> {
+            if value["uid"] == json!(uid) {
+                return Some(value);
+            }
+            value["children"]
+                .as_array()?
+                .iter()
+                .find_map(|child| find(child, uid))
+        }
+        let deep = find(&full["tree"], "sym:deep").expect("deepFn in the tree");
+        assert!(deep.get("truncated_at_depth").is_none(), "{deep}");
+        assert!(deep.get("children_omitted").is_none(), "{deep}");
+        assert_eq!(deep["children"], json!([]));
+    }
+
+    /// `MAX_METHODS = 20` was applied silently while the response `note`
+    /// explained the class expansion and said nothing about the cut.
+    #[test]
+    fn a_class_expansion_reports_how_many_methods_it_did_not_show() {
+        let mut symbols = vec![symbol("sym:cls", "BigClass", SymbolKind::Class, 1)];
+        let mut edges = Vec::new();
+        for index in 0..25u32 {
+            symbols.push(symbol(
+                Box::leak(format!("sym:m{index}").into_boxed_str()),
+                Box::leak(format!("method{index}").into_boxed_str()),
+                SymbolKind::Method,
+                100 + index,
+            ));
+            edges.push((
+                Box::leak(format!("sym:m{index}").into_boxed_str()) as &str,
+                "sym:cls",
+                EdgeType::MemberOf,
+            ));
+        }
+        let store = store_with(&symbols, &edges);
+        let value = tool_flow_trace(&store, json!({ "symbol": "BigClass" }), None, None).unwrap();
+        assert_eq!(value["root_kind"], json!("class"), "{value}");
+        assert_eq!(value["methods_total"], json!(25), "{value}");
+        assert_eq!(value["methods_returned"], json!(20), "{value}");
+        assert_eq!(value["methods_truncated"], json!(true), "{value}");
+        assert!(
+            value["note"].as_str().unwrap_or_default().contains("of 25"),
+            "the note must name the cut it performs: {value}"
+        );
+
+        // COUNTERWEIGHT: a class under the cap must not claim truncation.
+        let small = store_with(
+            &[
+                symbol("sym:small", "SmallClass", SymbolKind::Class, 1),
+                symbol("sym:only", "onlyMethod", SymbolKind::Method, 5),
+            ],
+            &[("sym:only", "sym:small", EdgeType::MemberOf)],
+        );
+        let value = tool_flow_trace(&small, json!({ "symbol": "SmallClass" }), None, None).unwrap();
+        assert_eq!(value["methods_total"], json!(1), "{value}");
+        assert_eq!(value["methods_truncated"], json!(false), "{value}");
+    }
+}
+
+// ── nw-392: a bounded request is rejected, never silently shortened ─────────
+
+#[cfg(test)]
+mod request_bound_tests {
+    use super::*;
+
+    fn store() -> GraphStore {
+        GraphStore::in_memory().expect("in_memory store")
+    }
+
+    fn targets(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("junkTarget{index}"))
+            .collect()
+    }
+
+    /// The exact boundary the item asks for: 1000 accepted, 1001 handled.
+    ///
+    /// The old code truncated at 1000 and then reported `truncated: false`
+    /// with an empty `dropped`, so a real symbol sent as the 1001st target
+    /// appeared in NEITHER `symbols` nor `not_found` nor `dropped`.
+    #[test]
+    fn read_symbols_accepts_one_thousand_targets_and_rejects_one_thousand_and_one() {
+        let store = store();
+        let accepted = tool_read_symbols(&store, json!({ "targets": targets(1000) }));
+        assert!(accepted.is_ok(), "1000 targets must be accepted");
+
+        let error = tool_read_symbols(&store, json!({ "targets": targets(1001) }))
+            .expect_err("1001 targets must not be silently shortened");
+        let text = format!("{error:#}");
+        assert!(text.contains("1001"), "{text}");
+        assert!(text.contains("REJECTED"), "{text}");
+        assert!(text.contains("targets"), "{text}");
+    }
+
+    /// The safety leg. `affected_tests` decides which tests a PR must run; its
+    /// contract is fail-safe WIDENING, and silently narrowing its own input
+    /// inverted that — 113 required test files were dropped while the payload
+    /// reported `status: complete` / `recommendation: selection-usable`.
+    #[test]
+    fn affected_tests_refuses_a_change_set_it_cannot_fully_honour() {
+        let store = store();
+        let files = |count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("src/f{index}.rs")).collect()
+        };
+        assert!(
+            tool_affected_tests(&store, json!({ "changed_files": files(1000) }), None).is_ok(),
+            "1000 changed files must be accepted"
+        );
+        let error = tool_affected_tests(&store, json!({ "changed_files": files(1001) }), None)
+            .expect_err("a safety selector must refuse a request it cannot honour");
+        let text = format!("{error:#}");
+        assert!(text.contains("changed_files"), "{text}");
+        assert!(text.contains("REJECTED"), "{text}");
+    }
+
+    /// The second, sharper cap: a 512-byte truncation did not DROP a long FQN,
+    /// it MUTATED it into a different identifier which then reported back as
+    /// not-found — an answer about a symbol the caller never asked about.
+    #[test]
+    fn an_over_long_identifier_is_rejected_rather_than_mutated_into_another_one() {
+        let store = store();
+        let long = "a".repeat(MAX_IDENTIFIER_LEN + 1);
+        let error = tool_read_symbols(&store, json!({ "targets": [long] }))
+            .expect_err("an over-long identifier must not be silently rewritten");
+        let text = format!("{error:#}");
+        assert!(text.contains("targets[0]"), "{text}");
+        assert!(text.contains("513"), "{text}");
+
+        // COUNTERWEIGHT: exactly at the cap is a legal identifier and must
+        // still be accepted, so the bound rejects only what it must.
+        let at_cap = "a".repeat(MAX_IDENTIFIER_LEN);
+        assert!(
+            tool_read_symbols(&store, json!({ "targets": [at_cap] })).is_ok(),
+            "an identifier exactly at the cap must be accepted"
+        );
+    }
+
+    /// Both schemas must DECLARE the bound they enforce, so the oversized call
+    /// is rejected by validation at the MCP boundary rather than reaching a
+    /// handler that used to shorten it. Neither declared `maxItems` before.
+    #[test]
+    fn the_schemas_declare_the_request_bounds_they_enforce() {
+        for (tool, field) in [
+            ("read_symbols", "targets"),
+            ("read_symbols", "uids_or_fqns"),
+            ("affected_tests", "changed_files"),
+        ] {
+            let schema = all_tool_schemas_undecorated()
+                .into_iter()
+                .find(|value| value["name"] == json!(tool))
+                .unwrap_or_else(|| panic!("{tool} schema"));
+            let property = &schema["inputSchema"]["properties"][field];
+            assert_eq!(
+                property["maxItems"],
+                json!(MAX_IDENTIFIER_COUNT),
+                "{tool}.{field} must declare maxItems"
+            );
+            assert_eq!(
+                property["items"]["maxLength"],
+                json!(MAX_IDENTIFIER_LEN),
+                "{tool}.{field} must declare maxLength"
+            );
+        }
+        // And validation must actually reject on that declaration.
+        assert!(
+            validate_tool_arguments("read_symbols", &json!({ "targets": targets(1001) })).is_err(),
+            "schema validation must reject an oversized targets array"
+        );
+        assert!(
+            validate_tool_arguments("read_symbols", &json!({ "targets": targets(1000) })).is_ok(),
+            "schema validation must accept exactly 1000"
+        );
+    }
+}
+
+// ── nw-405 / nw-406 / nw-407: the scope filters actually scope ───────────────
+
+#[cfg(test)]
+mod context_scope_filter_tests {
+    use super::*;
+    use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Tag, Vault, Visibility};
+
+    /// Two repos whose DISPLAY NAMES collide, plus a vault whose note paths
+    /// mention one of them. This is the live-graph shape all four of nw-405's
+    /// measured wrong answers came from, minimised.
+    const REPO_A: &str = "repo:default:aaaaaaaaaaaa";
+    const REPO_B: &str = "repo:default:bbbbbbbbbbbb";
+    const VAULT: &str = "vlt:default:cccccccccccc";
+
+    fn node(uid: &str, kind: &str, location: &str) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: uid.to_string(),
+            location: location.to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    /// One node of every shape the filters have to decide, with the LOCATIONS
+    /// that made the substring predicate wrong:
+    ///  * the repo-A symbol's location is repo-relative and never contains
+    ///    "alpha" — the under-include leg;
+    ///  * the repo-B symbol's location DOES contain "alpha", so a location
+    ///    substring keeps it — the collision leg;
+    ///  * the note lives under `Workspaces/Alpha/`, so a location substring
+    ///    keeps it too even though it belongs to no repo — the vault leg.
+    fn mixed_nodes() -> Vec<nestweaver_engine::BrainNode> {
+        vec![
+            node(&format!("sym:{REPO_A}:f1:n1:10"), "Symbol", "src/lib.rs"),
+            node(
+                &format!("sym:{REPO_B}:f2:n2:20"),
+                "Symbol",
+                "vendor/alpha/shim.rs",
+            ),
+            node(
+                &format!("note:{VAULT}:n1"),
+                "Note",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(
+                &format!("sec:note:{VAULT}:n1:1:abc"),
+                "Section",
+                "Workspaces/Alpha/design.md",
+            ),
+            node(&format!("tag:{VAULT}:t1"), "Tag", ""),
+        ]
+    }
+
+    fn uids(nodes: &[nestweaver_engine::BrainNode]) -> Vec<String> {
+        nodes.iter().map(|n| n.uid.clone()).collect()
+    }
+
+    /// nw-405, all three keep/drop legs at once.
+    ///
+    /// COUNTERWEIGHT: scoping to repo B must return repo B's symbol and
+    /// nothing else. Without it a filter that simply deleted everything would
+    /// pass the "no foreign rows" half of this test.
+    #[test]
+    fn a_repos_scope_keeps_the_named_repos_own_symbols_and_no_one_elses() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_A}:f1:n1:10")],
+            "repo A's own symbol must survive despite a repo-relative location \
+             that never contains its repo name, and nothing else may"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_B.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![format!("sym:{REPO_B}:f2:n2:20")],
+            "the filter must SELECT by owner, not merely delete"
+        );
+    }
+
+    /// nw-405's recorded vault decision, pinned so it cannot be reverted by
+    /// accident: `repos:` drops vault content because a note belongs to a
+    /// vault and to no repo. On a consulting vault the old behaviour returned
+    /// clientB's notes for `repos:["clientA"]`.
+    ///
+    /// COUNTERWEIGHT: an UNFILTERED list keeps every one of those rows, so the
+    /// drop is attributable to the scope argument and not to the fixture.
+    #[test]
+    fn a_repos_scope_drops_vault_content_that_merely_mentions_the_repo_in_its_path() {
+        let unfiltered = mixed_nodes();
+        assert_eq!(
+            unfiltered.len(),
+            5,
+            "the fixture must carry the vault rows this test claims are dropped"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_repos(&mut nodes, &HashSet::from([REPO_A.to_string()]));
+        assert!(
+            !nodes.iter().any(|n| n.uid.starts_with("note:")
+                || n.uid.starts_with("sec:")
+                || n.uid.starts_with("tag:")),
+            "vault content belongs to no repo and must not pass a repo scope: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// The mirror image, so `vaults:` is a scope in the same sense.
+    #[test]
+    fn a_vaults_scope_keeps_that_vaults_content_and_drops_repo_symbols() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(&mut nodes, &HashSet::from([VAULT.to_string()]));
+        assert_eq!(
+            uids(&nodes),
+            vec![
+                format!("note:{VAULT}:n1"),
+                format!("sec:note:{VAULT}:n1:1:abc"),
+                format!("tag:{VAULT}:t1"),
+            ],
+            "notes, sections and tags are vault-owned; symbols are not"
+        );
+
+        let mut nodes = mixed_nodes();
+        retain_nodes_in_vaults(
+            &mut nodes,
+            &HashSet::from(["vlt:default:999999999999".to_string()]),
+        );
+        assert!(
+            nodes.is_empty(),
+            "a vault nobody owns must select nothing, not everything"
+        );
+    }
+
+    /// nw-406. `path_prefix` must not silently delete a whole KIND it has no
+    /// way to judge.
+    ///
+    /// COUNTERWEIGHT: a node that HAS a path and does not match is still
+    /// dropped — the exemption is for "no path concept", not for everything.
+    #[test]
+    fn a_path_prefix_exempts_nodes_with_no_path_but_still_drops_non_matching_paths() {
+        let mut nodes = mixed_nodes();
+        retain_nodes_under_path_prefix(&mut nodes, "Workspaces/");
+        assert!(
+            nodes.iter().any(|n| n.uid.starts_with("tag:")),
+            "a Tag carries location \"\"; \"\".starts_with(prefix) is false, which \
+             deleted every tag in the vault: {:?}",
+            uids(&nodes)
+        );
+        assert!(
+            !nodes.iter().any(|n| n.location == "src/lib.rs"),
+            "a node with a real, non-matching path must still be dropped: {:?}",
+            uids(&nodes)
+        );
+    }
+
+    /// A UID shape the filters cannot attribute is dropped rather than kept,
+    /// matching nw-403's redactor: "I cannot tell what owns this" is not a
+    /// reason to return it under a scope argument.
+    #[test]
+    fn an_unattributable_uid_survives_no_scope_at_all() {
+        assert_eq!(node_owner("proj:default:abc"), NodeOwner::Unattributable);
+        assert_eq!(node_owner("banana"), NodeOwner::Unattributable);
+        assert_eq!(
+            node_owner(&format!("sym:{REPO_A}:f:n:1")),
+            NodeOwner::Repo(REPO_A.to_string())
+        );
+        assert_eq!(
+            node_owner(&format!("head:note:{VAULT}:n1:h:3")),
+            NodeOwner::Vault(VAULT.to_string())
+        );
+    }
+
+    fn store_with_two_repos_named_website() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, url, name) in [
+            (REPO_A, "https://github.com/coyote/website", "website"),
+            (REPO_B, "https://github.com/wavelength/website", "website"),
+        ] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "deadbeef".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".to_string(),
+                    name: Some(name.to_string()),
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    /// nw-405 legs (2) and (4): a colliding display name must FAIL naming both
+    /// candidates rather than quietly merging two tenants, and the documented
+    /// UID form must resolve — it used to return `connected: 0`.
+    #[test]
+    fn a_colliding_repo_name_is_refused_while_the_documented_uid_form_resolves() {
+        let store = store_with_two_repos_named_website();
+
+        let err = resolve_repo_filter(&store, &["website".to_string()], None)
+            .expect_err("two repos share this display name; merging them silently is the bug")
+            .to_string();
+        assert!(
+            err.contains("ambiguous") && err.contains(REPO_A) && err.contains(REPO_B),
+            "the error must name both candidates so the caller can disambiguate: {err}"
+        );
+
+        // COUNTERWEIGHT: the disambiguated form the error recommends works.
+        let resolved = resolve_repo_filter(&store, &[REPO_A.to_string()], None).unwrap();
+        assert_eq!(resolved, HashSet::from([REPO_A.to_string()]));
+    }
+
+    /// nw-405: an entry that names no repo is an ERROR. The old predicate
+    /// matched nothing and returned a confident empty result, which a caller
+    /// reads as "this repo has no relevant content" rather than "you named a
+    /// repo that is not here".
+    #[test]
+    fn an_unresolvable_repos_entry_errors_instead_of_matching_nothing() {
+        let store = store_with_two_repos_named_website();
+        let err = resolve_repo_filter(&store, &["not-a-repo".to_string()], None)
+            .expect_err("an unresolvable scope must not silently answer")
+            .to_string();
+        assert!(
+            err.contains("not-a-repo"),
+            "the error must name the entry that failed: {err}"
+        );
+    }
+
+    /// The same contract for `vaults:`, including the counterweight that a
+    /// real vault still resolves.
+    #[test]
+    fn an_unresolvable_vaults_entry_errors_while_a_real_vault_resolves() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: VAULT.to_string(),
+                name: "brain".to_string(),
+                root_path: "/home/k/brain".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+
+        let err = resolve_vault_filter(&store, &["nope".to_string()])
+            .expect_err("an unresolvable vault scope must not silently answer")
+            .to_string();
+        assert!(err.contains("nope") && err.contains("brain"), "{err}");
+
+        for selector in [VAULT, "brain", "BRAIN", "/home/k/brain"] {
+            assert_eq!(
+                resolve_vault_filter(&store, &[selector.to_string()]).unwrap(),
+                HashSet::from([VAULT.to_string()]),
+                "selector {selector:?} must resolve"
+            );
+        }
+    }
+
+    /// nw-407, end to end through the tool.
+    ///
+    /// `tags` used to keep every Symbol unconditionally, which made it an
+    /// EXPANSION: on the live graph a tag-scoped call returned MORE rows than
+    /// the unscoped one (30 -> 71) and drove the tagged share from 22/30 to
+    /// 1/71. Asserted on the `seeds` list because it is filtered by the same
+    /// `filter_tagged` closure and is deterministic on a fixture with no
+    /// edges, unlike the PPR-driven `connected` list.
+    ///
+    /// COUNTERWEIGHT: the same call WITHOUT `tags` still returns the symbol,
+    /// so the drop is attributable to the filter and not to seed resolution.
+    #[test]
+    fn a_tag_scoped_context_cannot_return_more_rows_than_the_unscoped_one() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: VAULT.to_string(),
+                name: "brain".to_string(),
+                root_path: "/v".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        let note_uid = format!("note:{VAULT}:n1");
+        store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: VAULT.to_string(),
+                file_path: "Workspaces/Sec/threat-model.md".to_string(),
+                title: "threatmodel".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: "h1".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let section_uid = format!("sec:{note_uid}:1:abc");
+        store
+            .insert_section(&Section {
+                uid: section_uid.clone(),
+                note_uid: note_uid.clone(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 2,
+                text_hash: "th".to_string(),
+                text_content: "threat model".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[(note_uid.as_str(), section_uid.as_str())])
+            .unwrap();
+        let tag_uid = format!("tag:{VAULT}:security");
+        store
+            .insert_tag(&Tag {
+                uid: tag_uid.clone(),
+                vault_uid: VAULT.to_string(),
+                name: "security".to_string(),
+            })
+            .unwrap();
+        store
+            .batch_insert_note_tag_edges(&[(note_uid.as_str(), tag_uid.as_str())])
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: format!("sym:{REPO_A}:f1:n1:1"),
+                name: "authenticate".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: REPO_A.to_string(),
+                file_path: "src/auth.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn authenticate()".to_string(),
+                summary: None,
+                content_hash: "h2".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let seed_uids = |args: Value| -> Vec<String> {
+            let resp = tool_brain_context(&store, None, args, None, None, None).unwrap();
+            resp["seeds"]
+                .as_array()
+                .expect("include_seeds was requested")
+                .iter()
+                .filter_map(|n| n["uid"].as_str().map(String::from))
+                .collect()
+        };
+
+        let base = json!({
+            "seeds": ["authenticate", "threatmodel"],
+            "token_budget": 5000,
+            "include_seeds": true,
+        });
+        let unscoped = seed_uids(base.clone());
+        assert!(
+            unscoped.iter().any(|u| u.starts_with("sym:")),
+            "COUNTERWEIGHT: without `tags` the symbol must be present, else this \
+             test proves nothing about the filter: {unscoped:?}"
+        );
+
+        let mut tagged_args = base;
+        tagged_args["tags"] = json!(["security"]);
+        let scoped = seed_uids(tagged_args);
+        assert!(
+            !scoped.iter().any(|u| u.starts_with("sym:")),
+            "code carries no tags, so a symbol cannot satisfy a tag scope: {scoped:?}"
+        );
+        assert!(
+            scoped.len() <= unscoped.len(),
+            "a filter that grows the result is not a filter: {} -> {}",
+            unscoped.len(),
+            scoped.len()
+        );
+        assert!(
+            scoped.contains(&note_uid),
+            "the tagged note is what the caller asked for: {scoped:?}"
+        );
+    }
+}
+
+// ── nw-412: the merge-gate surfaces refuse or degrade on a stale resolver ────
+
+#[cfg(test)]
+mod resolver_stale_merge_gate_tests {
+    use super::*;
+    use std::fs;
+
+    /// Rewrite the on-disk generation sidecar so every recorded repo sits one
+    /// generation BEHIND the running binary — the exact 9.0.0 upgrade shape
+    /// (present, well-formed, behind), not the pre-nw-103 "absent" one.
+    fn downgrade(db_path: &std::path::Path) {
+        let sidecar = nestweaver_engine::sidecar_path(
+            db_path,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        let mut generations = nestweaver_engine::resolver_generation::load(db_path);
+        assert!(
+            !generations.repos.is_empty(),
+            "the fixture recorded no generations, so the downgrade would be vacuous"
+        );
+        let behind = nestweaver_engine::resolver_generation::RESOLVER_GENERATION - 1;
+        for generation in generations.repos.values_mut() {
+            *generation = behind;
+        }
+        fs::write(&sidecar, serde_json::to_string(&generations).unwrap()).unwrap();
+    }
+
+    /// nw-412. A test SELECTOR that silently narrows is the dangerous
+    /// direction: on a generation-stale graph a MISSING edge makes the
+    /// affected-test set SMALLER, so the regression test that should have run
+    /// is dropped and the gate still reports success. It refuses instead, with
+    /// `dead_code`'s vocabulary and `dead_code`'s remedy.
+    ///
+    /// COUNTERWEIGHT (required by the item): the SAME fixture at the CURRENT
+    /// generation must not refuse. A gate that always refuses is not a gate.
+    #[test]
+    fn a_resolver_stale_graph_cannot_yield_a_narrowed_affected_test_selection() {
+        let (_dir, db_path) = super::cache_dispatch_tests::index_on_disk_for_merge_guard();
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+
+        // COUNTERWEIGHT first, so a fixture that never refuses cannot pass the
+        // refusal half by accident.
+        let current = tool_affected_tests(&store, args.clone(), None).unwrap();
+        assert!(
+            current.get("refused").is_none(),
+            "a generation-CURRENT graph must answer, not refuse: {current}"
+        );
+        assert!(
+            current.get("tier_1").is_some(),
+            "the current-generation answer must carry the tiers it is asked for: {current}"
+        );
+
+        downgrade(&db_path);
+        let stale = tool_affected_tests(&store, args, None).unwrap();
+        assert_eq!(stale["refused"], json!(true), "{stale}");
+        assert_eq!(stale["reason"], json!("outdated_resolver"), "{stale}");
+        assert_eq!(stale["needs_reindex"], json!(true), "{stale}");
+        assert!(
+            stale.get("tier_1").is_none()
+                && stale.get("tier_2").is_none()
+                && stale.get("tier_3").is_none(),
+            "an empty tier is a claim, and it is the wrong one — the refusal must \
+             carry no selection at all: {stale}"
+        );
+        assert_eq!(
+            stale["recommendation"],
+            json!("run-full-suite"),
+            "a CI job that only reads `recommendation` must be widened, not left \
+             to read the missing tiers as 'no tests affected': {stale}"
+        );
+        assert!(
+            stale["remedies"]
+                .as_array()
+                .is_some_and(|remedies| remedies.iter().any(|remedy| remedy["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("--force")))),
+            "the remedy must be the one that WORKS: a generation-stale repo is \
+             already at HEAD, so a plain incremental index writes nothing: {stale}"
+        );
+        assert!(
+            stale["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("affected-tests")),
+            "the refusal must explain ITSELF, not quote dead-code's paragraph: {stale}"
+        );
+    }
+
+    /// nw-412, the other half of the decision. `blast_radius` is an
+    /// assessment rather than a selector and already ships a trust contract
+    /// for "this run did not complete", so it DEGRADES: it may no longer
+    /// report `gate_state: ok` over an understated affected set, but it keeps
+    /// returning `coverage` / `blind_spots` / the SARIF rendering that a human
+    /// or a code-scanning tool uses to judge it.
+    ///
+    /// COUNTERWEIGHT: the generation-current run is untouched and still
+    /// reports a non-degraded gate.
+    #[test]
+    fn a_resolver_stale_blast_radius_cannot_report_an_ok_gate() {
+        let (_dir, db_path) = super::cache_dispatch_tests::index_on_disk_for_merge_guard();
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+
+        let current = tool_blast_radius(&store, args.clone(), None, None).unwrap();
+        assert_eq!(
+            current["gate_state"],
+            json!("ok"),
+            "COUNTERWEIGHT: a generation-CURRENT graph must not be degraded: {current}"
+        );
+        assert!(
+            !current["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["descriptor"] == json!(BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR)),
+            "nothing is stale here: {current}"
+        );
+
+        downgrade(&db_path);
+        let stale = tool_blast_radius(&store, args, None, None).unwrap();
+        assert_eq!(
+            stale["gate_state"],
+            json!("degraded-unknown"),
+            "an understated blast radius must never read as a clean gate: {stale}"
+        );
+        assert_eq!(stale["status"], json!("degraded"), "{stale}");
+        assert!(
+            stale["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["descriptor"] == json!(BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR)),
+            "the degrade must be NAMED so a consumer can act on the reason: {stale}"
+        );
+        assert!(
+            stale["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("[status: degraded]")),
+            "the human summary must not claim a clean run: {stale}"
+        );
+        // It DEGRADES rather than refusing: the fields a reviewer judges it by
+        // survive.
+        assert!(
+            stale.get("coverage").is_some() && stale.get("blind_spots").is_some(),
+            "degrading must not strip the trust contract it degrades: {stale}"
+        );
+    }
+}
+
+// ── nw-393: the seed cap reaches the caller, on BOTH payloads ────────────────
+
+#[cfg(test)]
+mod seed_cap_disclosure_tests {
+    use super::*;
+    use nestweaver_engine::query::SEED_NAME_MATCH_LIMIT;
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+    /// `count` distinct symbols whose names all contain `validate`, plus one
+    /// control that does not — so a total that accidentally counted the whole
+    /// symbol table is caught rather than passing by coincidence. Mirrors the
+    /// engine-side fixture deliberately: this test is about the PAYLOAD, and
+    /// diverging fixtures is how a payload test comes to disagree with the
+    /// computation it is supposed to be exposing.
+    fn store_with_validate_definitions(count: usize) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let mk = |uid: &str, name: &str| Symbol {
+            uid: format!("sym:repo:default:aaaaaaaaaaaa:f:{uid}:1"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:default:aaaaaaaaaaaa".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for i in 0..count {
+            store
+                .insert_symbol(&mk(&format!("v{i}"), &format!("validate{i}")))
+                .unwrap();
+        }
+        store.insert_symbol(&mk("other", "unrelated")).unwrap();
+        store
+    }
+
+    /// The two payloads under test, by the key each one already used for the
+    /// resolved-seed COUNT — the number nw-393 exists because callers were
+    /// forced to reason from.
+    fn payloads(store: &GraphStore) -> [(&'static str, Value); 2] {
+        [
+            (
+                "code_context",
+                tool_code_context(store, json!({ "seeds": ["validate"] })).unwrap(),
+            ),
+            (
+                "brain_context",
+                tool_brain_context(
+                    store,
+                    None,
+                    json!({ "seeds": ["validate"], "token_budget": 5000 }),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// nw-393. The engine computes the honest seed numbers; these payloads are
+    /// hand-built field by field, so without an explicit emit the numbers exist
+    /// and reach nobody. `seeds_resolved`/`seeds_expanded` cannot carry this:
+    /// 5 of 5 and 5 of 200 are the same integer.
+    #[test]
+    fn a_capped_seed_resolution_is_disclosed_on_both_context_payloads() {
+        let store = store_with_validate_definitions(50);
+        for (tool, payload) in payloads(&store) {
+            assert_eq!(
+                payload["seed_matches_total"],
+                json!(50),
+                "{tool} must report what the name MATCHED, not what survived: {payload}"
+            );
+            assert_eq!(
+                payload["seed_matches_total_relation"],
+                json!("eq"),
+                "{tool}: 50 is far below the store's count cap, so this is a census \
+                 not a floor — and the spelling is brain_search's: {payload}"
+            );
+            assert_eq!(
+                payload["seeds_truncated"],
+                json!(true),
+                "{tool}: 45 of 50 definitions never entered the PPR seed set: {payload}"
+            );
+            assert_eq!(
+                payload["seed_resolution_limit"],
+                json!(SEED_NAME_MATCH_LIMIT),
+                "{tool}: naming the cut without naming the bound leaves the caller \
+                 unable to judge the loss: {payload}"
+            );
+            // The seed cap and the connected-list cap are INDEPENDENT: this
+            // must not have been folded into `truncated_by`, because
+            // `truncated_by: "limit"` stays a correct statement about
+            // `connected` even when the seed set was also cut.
+            assert_ne!(
+                payload["truncated_by"],
+                json!("seed_resolution"),
+                "{tool}: the two caps do not compose into one scalar: {payload}"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT. A name with exactly as many definitions as the cap
+    /// allows is complete, and must not be reported as cut — that case is
+    /// indistinguishable from the bug by seed COUNT alone, which is exactly
+    /// why the count was never a disclosure. The bound is still echoed,
+    /// because `limit: 5, truncated: false` says more than an absent field.
+    #[test]
+    fn an_uncapped_seed_resolution_is_not_reported_as_truncated() {
+        let store = store_with_validate_definitions(SEED_NAME_MATCH_LIMIT);
+        for (tool, payload) in payloads(&store) {
+            assert_eq!(
+                payload["seeds_truncated"],
+                json!(false),
+                "{tool}: a complete seed set must not be reported as cut: {payload}"
+            );
+            assert_eq!(
+                payload["seed_matches_total"],
+                json!(SEED_NAME_MATCH_LIMIT),
+                "{tool}: every definition matched: {payload}"
+            );
+            assert_eq!(
+                payload["seed_resolution_limit"],
+                json!(SEED_NAME_MATCH_LIMIT),
+                "{tool}: the bound is echoed whenever it was in force: {payload}"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT, the other direction: a seed form the cap does not bound
+    /// at all reports NOTHING rather than `0 of 0`. A second false disclosure
+    /// is not a fix.
+    #[test]
+    fn a_seed_form_the_cap_does_not_bound_discloses_nothing_on_either_payload() {
+        let store = store_with_validate_definitions(50);
+        let uid = "sym:repo:default:aaaaaaaaaaaa:f:v0:1";
+        for (tool, payload) in [
+            (
+                "code_context",
+                tool_code_context(&store, json!({ "seeds": [uid] })).unwrap(),
+            ),
+            (
+                "brain_context",
+                tool_brain_context(
+                    &store,
+                    None,
+                    json!({ "seeds": [uid], "token_budget": 5000 }),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                payload["seed_matches_total"],
+                Value::Null,
+                "{tool}: UID lookup is exhaustive; it has no match total: {payload}"
+            );
+            assert_eq!(payload["seeds_truncated"], Value::Null, "{tool}: {payload}");
+            assert_eq!(
+                payload["seed_resolution_limit"],
+                Value::Null,
+                "{tool}: {payload}"
+            );
+        }
     }
 }

@@ -1945,11 +1945,19 @@ fn tiered_change_check(
 ///
 /// This is a DEFAULT, not a definition of coverage. Three properties hold:
 ///
-///  1. Every prune is DISCLOSED (`FilesystemReader::skipped_dirs`, surfaced as
-///     `IndexResult::skipped_files`). nw-325: the prune runs inside
-///     `WalkBuilder::filter_entry`, which cuts the subtree before enumeration,
-///     so nothing below it could ever reach the `SkippedFile` channel and a
-///     wrong answer was indistinguishable from a complete one.
+///  1. Every prune is DISCLOSED (`ContentReader::skipped_dirs`, drained into
+///     `IndexResult::skipped_files` in `index_into_store_with_write_gate`'s
+///     scan phase). nw-325: the prune runs inside `WalkBuilder::filter_entry`,
+///     which cuts the subtree before enumeration, so nothing below it could
+///     ever reach the `SkippedFile` channel and a wrong answer was
+///     indistinguishable from a complete one.
+///
+///     THIS SENTENCE WAS FALSE FOR A RELEASE. nw-325 shipped the recorder and
+///     never the drain, so the accessor's only caller was its own test and a
+///     pruned `vendor/` still reported `coverage_status: "complete"`. nw-387
+///     wired it up. The exception is `.git`, which is deliberately not
+///     disclosed — see `UNDISCLOSED_PRUNES` for why a universally-present
+///     finding would destroy the signal.
 ///  2. A repo can opt any entry back in (`FilesystemReader::unskipping`).
 ///  3. `ios` and `android` are NOT here. In an Expo / React Native / Capacitor
 ///     layout they are first-party source by default — a nested
@@ -1997,6 +2005,29 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".output",
     "storybook-static",
 ];
+
+/// `SKIP_DIRS` entries whose prune is NOT reported as a coverage loss.
+///
+/// nw-387 wired `FilesystemReader::skipped_dirs` into
+/// `IndexResult::skipped_files`, which is what `coverage_status` and
+/// `--fail-on-skip` read. That drain needs exactly one exception, because
+/// EVERY repository contains a `.git` and recording it would leave
+/// `coverage_status` permanently `"degraded"` and `--fail-on-skip` permanently
+/// exiting 1. A gate that always fires carries the same amount of information
+/// as one that never fires — and it would bury the pruned-`vendor/` case this
+/// disclosure exists to surface underneath a finding present in 100% of runs.
+///
+/// `.git` earns the carve-out by NOT being a heuristic: it is git's own object
+/// store, git itself never tracks it, and it holds no first-party source by
+/// construction. Every other `SKIP_DIRS` entry is a GUESS about content —
+/// `public/`, `build/`, `vendor/` and `out/` all hold hand-written source in
+/// real repositories, which is the entire reason `FilesystemReader::unskipping`
+/// exists — and a guess is precisely the thing that has to be disclosed.
+///
+/// DO NOT grow this list to quiet a noisy repo. The supported answers are
+/// `[[repos]] unskip` (re-admit the directory) or accepting the degraded
+/// status as the true statement it is.
+const UNDISCLOSED_PRUNES: &[&str] = &[".git"];
 
 /// Index a directory into a persistent GraphStore at `db_path`.
 ///
@@ -2849,6 +2880,55 @@ where
     let discovered_files = reader
         .list_files()
         .context("ContentReader::list_files failed")?;
+
+    // nw-387: DRAIN THE PRUNE RECORDER INTO THE SKIP CHANNEL.
+    //
+    // nw-325 built `FilesystemReader::skipped_dirs` and stopped there. Its only
+    // caller in the workspace was the test that asserted it, so the recorder
+    // was write-only in production: a repo of `canary.py` plus a committed
+    // `vendor/v.py` indexed 1 file and reported `skipped_files: []`,
+    // `coverage_status: "complete"` and `--fail-on-skip` exit 0. `vendor/v.py`
+    // vanished with no trace, and the doc on `SKIP_DIRS` above asserted the
+    // opposite as an invariant. This loop is that invariant's implementation.
+    //
+    // The prune runs inside `WalkBuilder::filter_entry`, which cuts the SUBTREE
+    // before enumeration — the files below it are never listed, so they can
+    // never arrive as a per-file `ParseOutcome::Skipped`. The pruned DIRECTORY
+    // is the only artefact that survives, which is why it is what gets
+    // reported.
+    //
+    // MUST STAY IMMEDIATELY AFTER `list_files`. The recorder is cleared at the
+    // top of every `list_files` call, and this same `reader` is walked again
+    // later in the run — `crate::manifest::parse_manifest` -> `find_csproj`
+    // calls `list_files` — which would refill it against a different question.
+    // Reading it here, while it still describes the walk that produced
+    // `discovered_files`, is what makes the two consistent.
+    //
+    // `Ignored` is the reason code because this is a POLICY skip, the same
+    // class as the minified-bundle skip below, not a read or parse defect.
+    //
+    // KNOWN ASYMMETRY, stated rather than hidden: the recorder also captures
+    // `[[repos]] exclude` patterns that prune a whole DIRECTORY, so those are
+    // disclosed here too, while the same feature's per-FILE matches are still
+    // dropped silently in `FilesystemReader::list_files`. Disclosing the half
+    // that is recorded is strictly better than disclosing neither, and this
+    // channel is deliberately not scoped to `SKIP_DIRS` alone — nw-394 (the
+    // git-tracked/gitignored divergence) is sequenced behind this item and
+    // needs to add its own rows to exactly this list.
+    for pruned in reader.skipped_dirs() {
+        if UNDISCLOSED_PRUNES.contains(&pruned.reason.as_str()) {
+            continue;
+        }
+        scan_skipped_files.push(SkippedFile::new(
+            pruned.path,
+            SkipReasonCode::Ignored,
+            format!(
+                "directory pruned before enumeration by skip-dir policy ({}); \
+                 re-admit it with `[[repos]] unskip`",
+                pruned.reason
+            ),
+        ));
+    }
 
     for rel_path in &discovered_files {
         let path = repo_path.join(rel_path);
@@ -6853,6 +6933,234 @@ mod tests {
         assert_eq!(
             result.skipped_files[0].observed_bytes,
             Some(200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn a_pruned_directory_is_disclosed_on_the_index_result_not_only_on_the_recorder() {
+        // nw-387. nw-325 built `FilesystemReader::skipped_dirs` and shipped the
+        // `unskip` re-admission half, but never drained the recorder into the
+        // result — its ONLY caller in the workspace was the `#[cfg(test)]` test
+        // that asserted it. So this exact fixture (`canary.py` plus a committed
+        // `vendor/v.py`) reported `files_processed: 1, skipped_files: [],
+        // coverage_status: "complete"` and `--fail-on-skip` exit 0. `vendor/v.py`
+        // was gone with no trace.
+        //
+        // THE ASSERTION IS ON `IndexResult`, DELIBERATELY. A test that calls
+        // `reader.skipped_dirs()` cannot fail for the reason this item was
+        // filed — the recorder always worked; the WIRING was missing. That
+        // vacuous shape is what let the gap ship, so it is not repeated here.
+        // `coverage_status` and `--fail-on-skip` are both derived from
+        // `skipped_files` being non-empty (src/main.rs, the daemon and the MCP
+        // layer all agree), so a non-empty `skipped_files` is exactly the
+        // condition that degrades coverage and fails the gate.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor")).unwrap();
+        fs::write(repo.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        fs::write(repo.join("vendor/v.py"), "def vendored():\n    return 2\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        let result = index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            "https://example.test/pruned-vendor",
+            "fixture",
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        // The prune itself is unchanged — this item is about disclosure, not
+        // about indexing `vendor/`.
+        assert_eq!(result.files_count, 1, "vendor/ is still pruned");
+        let disclosed: Vec<&nestweaver_parser::SkippedFile> = result
+            .skipped_files
+            .iter()
+            .filter(|skipped| skipped.path == "vendor")
+            .collect();
+        assert_eq!(
+            disclosed.len(),
+            1,
+            "the pruned directory must reach IndexResult::skipped_files: {:?}",
+            result.skipped_files
+        );
+        assert_eq!(
+            disclosed[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Ignored,
+            "a policy prune is Ignored, not a read or parse defect"
+        );
+        assert!(
+            disclosed[0].reason.contains("vendor"),
+            "the reason must name the matched SKIP_DIRS entry: {:?}",
+            disclosed[0].reason
+        );
+    }
+
+    #[test]
+    fn a_repo_with_nothing_pruned_but_its_own_git_dir_still_reports_complete_coverage() {
+        // COUNTERWEIGHT to the test above, and the reason `UNDISCLOSED_PRUNES`
+        // exists. `.git` is in SKIP_DIRS and every repository has one, so a
+        // naive drain would report a skip on 100% of indexes: `coverage_status`
+        // would be permanently `"degraded"`, `--fail-on-skip` would permanently
+        // exit 1, and the pruned-`vendor/` finding nw-387 exists to surface
+        // would be buried under a finding that is always present.
+        //
+        // Two repos, one property: an index that omitted nothing a user would
+        // call source must still report an EMPTY `skipped_files`.
+        let dir = tempfile::tempdir().unwrap();
+
+        let clean = dir.path().join("clean");
+        fs::create_dir_all(&clean).unwrap();
+        fs::write(clean.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        let clean_result = index_directory_with_options_and_limits(
+            &clean,
+            &dir.path().join("clean.lbug"),
+            "test",
+            "https://example.test/clean-coverage",
+            "fixture",
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            clean_result.skipped_files.is_empty(),
+            "a repo with no pruned directory must not report degraded coverage: {:?}",
+            clean_result.skipped_files
+        );
+
+        let with_git = dir.path().join("with_git");
+        fs::create_dir_all(with_git.join(".git/objects")).unwrap();
+        fs::write(with_git.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(with_git.join(".git/objects/pack.idx"), "not source\n").unwrap();
+        fs::write(with_git.join("canary.py"), "def canary():\n    return 1\n").unwrap();
+        let git_result = index_directory_with_options_and_limits(
+            &with_git,
+            &dir.path().join("with_git.lbug"),
+            "test",
+            "https://example.test/git-dir-coverage",
+            "fixture",
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            git_result.skipped_files.is_empty(),
+            "pruning `.git` is not a coverage loss and must not degrade the gate: {:?}",
+            git_result.skipped_files
+        );
+        assert_eq!(
+            git_result.files_count, 1,
+            "precondition: the canary was indexed in both repos"
+        );
+    }
+
+    #[test]
+    fn a_lone_cr_source_yields_the_same_symbols_and_line_numbers_as_its_lf_twin() {
+        // nw-386. A lone-CR file (`\r` with no `\n` anywhere) contributed ZERO
+        // symbols: the leading line comment never terminates, so tree-sitter
+        // swallows the whole source. The measured 4-file fixture reported
+        // `files_processed: 4, symbols_found: 1, skipped_count: 0,
+        // coverage_status: "complete"` — three files contributed nothing and
+        // NOTHING SAID SO. The second symptom is the span: every symbol
+        // collapsed to line 1, so `read-symbols` returned the whole file per
+        // symbol with `truncated: false`. Line numbers are therefore asserted,
+        // not just the symbol names.
+        //
+        // It is language-dependent, which is why no fixture caught it: JS
+        // survives (tree-sitter honours CR per ECMAScript), Rust/Python/Go do
+        // not — so all three named languages are exercised here.
+        //
+        // COUNTERWEIGHT: CRLF was ALREADY CORRECT before the fix (exact line
+        // numbers, byte-identical bodies). It is asserted identical to the LF
+        // control too, so a normalisation that over-applied — collapsing
+        // `\r\n` and shifting every byte offset the store holds — would fail
+        // here rather than ship.
+        const FIXTURES: [(&str, &str); 3] = [
+            (
+                "hdr.rs",
+                "// module header\npub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n",
+            ),
+            (
+                "hdr.py",
+                "# module header\ndef alpha():\n    return 1\n\n\ndef beta():\n    return 2\n",
+            ),
+            (
+                "hdr.go",
+                "// module header\npackage hdr\n\nfunc Alpha() int {\n\treturn 1\n}\n\nfunc Beta() int {\n\treturn 2\n}\n",
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let scan = |label: &str, eol: &str| -> Vec<(String, String, u32, u32)> {
+            let repo = dir.path().join(label);
+            fs::create_dir_all(&repo).unwrap();
+            for (name, body) in FIXTURES {
+                fs::write(repo.join(name), body.replace('\n', eol)).unwrap();
+            }
+            let result = index_directory_with_options_and_limits(
+                &repo,
+                &dir.path().join(format!("{label}.lbug")),
+                "test",
+                &format!("https://example.test/eol-{label}"),
+                "fixture",
+                true,
+                None,
+                crate::index_limits::IndexLimits::default(),
+            )
+            .unwrap();
+            assert!(
+                result.skipped_files.is_empty(),
+                "{label}: {:?}",
+                result.skipped_files
+            );
+            let store =
+                GraphStore::open_or_create(&dir.path().join(format!("{label}.lbug"))).unwrap();
+            let mut rows: Vec<(String, String, u32, u32)> = store
+                .list_all_symbols()
+                .unwrap()
+                .into_iter()
+                .map(|symbol| {
+                    (
+                        symbol.file_path,
+                        symbol.name,
+                        symbol.start_line,
+                        symbol.end_line,
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let lf = scan("lf", "\n");
+        // Guard against a vacuous pass: if the LF control found nothing, an
+        // empty-equals-empty comparison would "prove" the bug fixed.
+        let lf_files: std::collections::HashSet<&String> =
+            lf.iter().map(|(path, ..)| path).collect();
+        assert_eq!(
+            lf_files.len(),
+            3,
+            "precondition: all three languages must contribute symbols: {lf:?}"
+        );
+        assert!(
+            lf.iter().any(|(_, _, start, _)| *start > 1),
+            "precondition: the control must have symbols below line 1, or the \
+             collapsed-span symptom is untestable: {lf:?}"
+        );
+
+        assert_eq!(
+            scan("cr", "\r"),
+            lf,
+            "nw-386: a lone-CR source must yield its LF twin's symbols AND line numbers"
+        );
+        assert_eq!(
+            scan("crlf", "\r\n"),
+            lf,
+            "counterweight: CRLF was already correct and must not regress"
         );
     }
 
